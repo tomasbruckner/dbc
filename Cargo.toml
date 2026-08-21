@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dbc-core", "crates/dbc-ui"]
+members = ["crates/dbc-core", "crates/dbc-buffer", "crates/dbc-ui"]
 
 [workspace.package]
 edition = "2021"
