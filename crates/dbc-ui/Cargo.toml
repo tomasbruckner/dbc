@@ -1,0 +1,8 @@
+[package]
+name = "dbc-ui"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "907ed09c9f4476caf250e6ce4bbffb23b4622f3b" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "907ed09c9f4476caf250e6ce4bbffb23b4622f3b" }
