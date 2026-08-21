@@ -1,11 +1,30 @@
+use std::error::Error as StdError;
 use std::sync::Arc;
 use dbc_core::arrow::array::{
     ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
     Int64Builder, StringBuilder,
 };
 use dbc_core::arrow::datatypes::DataType;
-use tokio_postgres::types::Type;
+use tokio_postgres::types::{FromSql, Type};
 use tokio_postgres::Row;
+
+/// Accepts a value of *any* Postgres type without decoding it. Used to
+/// detect NULL vs. non-NULL for the placeholder fallback in `text_value`
+/// without needing a concrete Rust type for every OID (interval, jsonb,
+/// bytea, arrays, ranges, ...). `Option<AnyValue>` relies on tokio-postgres
+/// short-circuiting NULL columns to `None` before ever calling
+/// `AnyValue::from_sql`, so the raw bytes are never actually inspected.
+struct AnyValue;
+
+impl<'a> FromSql<'a> for AnyValue {
+    fn from_sql(_ty: &Type, _raw: &'a [u8]) -> Result<Self, Box<dyn StdError + Sync + Send>> {
+        Ok(AnyValue)
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+}
 
 pub fn arrow_type(t: &Type) -> DataType {
     match *t {
@@ -85,6 +104,8 @@ fn text_value(row: &Row, i: usize) -> Option<String> {
         Type::DATE => row.get::<_, Option<chrono::NaiveDate>>(i).map(|v| v.to_string()),
         Type::TIME => row.get::<_, Option<chrono::NaiveTime>>(i).map(|v| v.to_string()),
         Type::UUID => row.get::<_, Option<uuid::Uuid>>(i).map(|v| v.to_string()),
-        _ => Some(format!("<oid {}>", t.oid())),
+        _ => row
+            .get::<_, Option<AnyValue>>(i)
+            .map(|_| format!("<oid {}>", t.oid())),
     }
 }

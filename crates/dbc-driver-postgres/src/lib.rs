@@ -60,18 +60,36 @@ impl Connection for PostgresConnection {
         let col_types: Vec<tokio_postgres::types::Type> =
             stmt.columns().iter().map(|c| c.type_().clone()).collect();
 
-        // Protocol-level cancel goes over a separate connection.
+        // Protocol-level cancel goes over a separate connection. The watcher
+        // must not outlive the query: once it's done (normally, on error, or
+        // because the consumer dropped the stream), a `done_tx` drop races
+        // against `cancelled()` so the watcher task exits either way. Without
+        // this, the watcher lives until the CancelToken is cancelled (often
+        // never), and a *late* cancel() — fired well after this query
+        // finished — would still send a CancelRequest carrying this
+        // connection's backend process id, potentially killing an unrelated
+        // query that's since started using the same connection.
         let cancel_handle = self.client.cancel_token();
         let watcher_cancel = cancel.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
-            watcher_cancel.cancelled().await;
-            let _ = cancel_handle.cancel_query(NoTls).await;
+            tokio::select! {
+                _ = watcher_cancel.cancelled() => {
+                    let _ = cancel_handle.cancel_query(NoTls).await;
+                }
+                _ = done_rx => {
+                    // Query already finished; nothing to cancel.
+                }
+            }
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
         let batch_schema = schema.clone();
         let client = self.client.clone();
         tokio::spawn(async move {
+            // Keep `done_tx` alive for exactly this task's lifetime; its
+            // drop (on any exit path below) wakes the watcher above.
+            let _done_tx = done_tx;
             // IMPORTANT: query_raw() itself is awaited *inside* this task,
             // not in the `query()` method above. Bind/Execute/Sync are sent
             // as a single batch, and Postgres only flushes its response

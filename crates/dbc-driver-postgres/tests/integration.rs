@@ -76,3 +76,49 @@ async fn error_carries_sqlstate_and_position() {
     assert_eq!(err.code.as_deref(), Some("42601"));
     assert!(err.position.is_some());
 }
+
+#[tokio::test]
+#[ignore]
+async fn null_in_fallback_type_renders_as_null_not_placeholder() {
+    use dbc_core::arrow::array::{Array, StringArray};
+    let node = Postgres::default().start().await.unwrap();
+    let mut c = PostgresConnection::connect(&pg_url(&node).await).await.unwrap();
+    let mut s = c
+        .query("SELECT NULL::interval AS a, '1 day'::interval AS b", CancelToken::new())
+        .await
+        .unwrap();
+    let batch = s.batches.recv().await.unwrap().unwrap();
+    let a = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let b = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    assert!(a.is_null(0), "NULL interval must render as null, not the oid placeholder");
+    assert_eq!(b.value(0), "<oid 1186>");
+}
+
+#[tokio::test]
+#[ignore]
+async fn stale_cancel_after_completion_does_not_kill_later_query() {
+    let node = Postgres::default().start().await.unwrap();
+    let mut c = PostgresConnection::connect(&pg_url(&node).await).await.unwrap();
+
+    // Run a query to completion and drain it fully.
+    let cancel1 = CancelToken::new();
+    let mut s1 = c.query("SELECT 1", cancel1.clone()).await.unwrap();
+    while let Some(r) = s1.batches.recv().await {
+        r.unwrap();
+    }
+    // Give the watcher task a moment to observe completion and exit.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // A cancel fired well after the query finished must be a no-op: the
+    // watcher for that query should already be gone, so this must not send
+    // a CancelRequest that could hit a later query on the same connection.
+    cancel1.cancel();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // A brand new query on the same connection must succeed normally.
+    let mut s2 = c.query("SELECT 2", CancelToken::new()).await.unwrap();
+    match s2.batches.recv().await.unwrap() {
+        Ok(_) => {}
+        Err(e) => panic!("unrelated query was killed by a stale cancel: {e:?}"),
+    }
+}
