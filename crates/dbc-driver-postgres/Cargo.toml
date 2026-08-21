@@ -1,0 +1,19 @@
+[package]
+name = "dbc-driver-postgres"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+dbc-core = { path = "../dbc-core" }
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
+rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
+chrono = "0.4"
+uuid = "1"
+futures-util = "0.3"
+
+[dev-dependencies]
+testcontainers-modules = { version = "0.13", features = ["postgres"] }
+tokio = { version = "1", features = ["full"] }
