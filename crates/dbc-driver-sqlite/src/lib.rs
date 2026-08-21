@@ -82,6 +82,20 @@ impl Connection for SqliteConnection {
             };
 
             loop {
+                // Cooperative check: sqlite3_interrupt() is a no-op if it fires
+                // before statement execution starts (the interrupt flag clears
+                // when the running-statement count is zero), so a cancel issued
+                // immediately after query() returns can be lost by the watcher
+                // alone. Checking the token between rows guarantees cancellation
+                // lands at row granularity regardless of interrupt timing.
+                if cancel.is_cancelled() {
+                    let _ = tx.blocking_send(Err(QueryError {
+                        code: Some("cancelled".into()),
+                        message: "query cancelled".into(),
+                        position: None,
+                    }));
+                    break;
+                }
                 match rows.next() {
                     Ok(Some(row)) => {
                         for (i, b) in builders.iter_mut().enumerate() {
@@ -208,19 +222,27 @@ mod tests {
         let f = fixture_db();
         let mut c = SqliteConnection::new(f.path());
         let cancel = CancelToken::new();
-        // Cross join = 25M rows; must not complete before interrupt.
+        // Triple cross join = 125e9 rows; cannot complete before interrupt
+        // even under heavy parallel-test CPU contention (a 25M double join
+        // proved flaky when the whole workspace suite ran concurrently).
         let mut s = c
-            .query("SELECT a.id FROM t a, t b", cancel.clone())
+            .query("SELECT a.id FROM t a, t b, t c", cancel.clone())
             .await
             .unwrap();
         cancel.cancel();
         let mut saw_cancel = false;
-        while let Some(r) = s.batches.recv().await {
-            if let Err(e) = r {
-                assert_eq!(e.code.as_deref(), Some("cancelled"));
-                saw_cancel = true;
+        let drain = async {
+            while let Some(r) = s.batches.recv().await {
+                if let Err(e) = r {
+                    assert_eq!(e.code.as_deref(), Some("cancelled"));
+                    saw_cancel = true;
+                }
             }
-        }
+        };
+        // Safety net: if interrupt never lands, fail loudly instead of hanging.
+        tokio::time::timeout(std::time::Duration::from_secs(30), drain)
+            .await
+            .expect("query was not interrupted within 30s");
         assert!(saw_cancel, "stream ended without a cancelled error");
     }
 
