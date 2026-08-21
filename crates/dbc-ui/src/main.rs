@@ -138,6 +138,7 @@ fn main() {
             KeyBinding::new("escape", CancelQuery, None),
         ]);
         sql_input::bind_keys(cx);
+        grid::bind_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         cx.open_window(
@@ -147,7 +148,7 @@ fn main() {
             },
             |window, cx| {
                 cx.new(|cx| {
-                    let grid = cx.new(|_| ResultGrid::new());
+                    let grid = cx.new(ResultGrid::new);
                     let sql = cx.new(|cx| SqlInput::new(cx, "Type SQL, then Ctrl+Enter…"));
                     window.focus(&sql.focus_handle(cx), cx);
                     AppView {
