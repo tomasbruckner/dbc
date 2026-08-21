@@ -128,16 +128,18 @@ impl Connection for SqliteConnection {
                 .query_map([], |r| r.get(0)).map_err(q_err)?
                 .filter_map(Result::ok).collect();
             for name in names {
-                let mut cstmt = conn
-                    .prepare(&format!("PRAGMA table_info({})", name))
-                    .map_err(q_err)?;
-                let columns: Vec<ColumnInfo> = cstmt
-                    .query_map([], |r| {
-                        Ok(ColumnInfo { name: r.get(1)?, data_type: r.get(2)? })
-                    })
-                    .map_err(q_err)?
-                    .filter_map(Result::ok)
-                    .collect();
+                let mut columns = Vec::new();
+                // Use rusqlite's `pragma` helper rather than formatting the
+                // table name into the SQL text directly: it passes `name` as
+                // a properly quoted/escaped SQL string literal, so table
+                // names that are reserved words (e.g. "order", "group") or
+                // contain spaces/hyphens/leading digits don't break the
+                // query and abort the whole schema snapshot.
+                conn.pragma(None, "table_info", name.as_str(), |r| {
+                    columns.push(ColumnInfo { name: r.get(1)?, data_type: r.get(2)? });
+                    Ok(())
+                })
+                .map_err(q_err)?;
                 tables.push(TableInfo { schema: None, name, columns });
             }
             Ok(SchemaSnapshot { tables })
@@ -230,5 +232,33 @@ mod tests {
         let t = snap.tables.iter().find(|t| t.name == "t").unwrap();
         assert_eq!(t.columns.len(), 2);
         assert_eq!(t.columns[0].name, "id");
+    }
+
+    #[tokio::test]
+    async fn schema_handles_reserved_word_and_spaced_table_names() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let conn = rusqlite::Connection::open(f.path()).unwrap();
+        // "order" is a reserved word and must be quoted to use as a table
+        // name; "weird name" contains a space. Both require the schema()
+        // implementation to properly quote/escape the name when querying
+        // `PRAGMA table_info(...)`, rather than interpolating it raw.
+        conn.execute_batch(
+            "CREATE TABLE \"order\" (id INTEGER, total REAL);
+             CREATE TABLE \"weird name\" (a TEXT, b TEXT);",
+        )
+        .unwrap();
+
+        let mut c = SqliteConnection::new(f.path());
+        let snap = c.schema().await.unwrap();
+
+        let order = snap.tables.iter().find(|t| t.name == "order").unwrap();
+        assert_eq!(order.columns.len(), 2);
+        assert_eq!(order.columns[0].name, "id");
+        assert_eq!(order.columns[1].name, "total");
+
+        let weird = snap.tables.iter().find(|t| t.name == "weird name").unwrap();
+        assert_eq!(weird.columns.len(), 2);
+        assert_eq!(weird.columns[0].name, "a");
+        assert_eq!(weird.columns[1].name, "b");
     }
 }
