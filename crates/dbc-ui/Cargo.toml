@@ -9,4 +9,6 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "907ed09c
 dbc-core = { path = "../dbc-core" }
 dbc-buffer = { path = "../dbc-buffer" }
 dbc-driver-sqlite = { path = "../dbc-driver-sqlite" }
+dbc-driver-postgres = { path = "../dbc-driver-postgres" }
+unicode-segmentation = "1"
 tokio.workspace = true

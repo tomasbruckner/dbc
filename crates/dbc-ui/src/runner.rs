@@ -28,6 +28,10 @@ impl QueryRunner {
         }
     }
 
+    pub fn handle(&self) -> tokio::runtime::Handle {
+        self.runtime.handle().clone()
+    }
+
     pub fn run(
         &self,
         mut conn: Box<dyn Connection>,

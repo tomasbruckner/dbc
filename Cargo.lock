@@ -1864,10 +1864,12 @@ version = "0.1.0"
 dependencies = [
  "dbc-buffer",
  "dbc-core",
+ "dbc-driver-postgres",
  "dbc-driver-sqlite",
  "gpui",
  "gpui_platform",
  "tokio",
+ "unicode-segmentation",
 ]
 
 [[package]]
