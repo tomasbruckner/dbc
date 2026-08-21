@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/dbc-core"]
+
+[workspace.package]
+edition = "2021"
+
+[workspace.dependencies]
+anyhow = "1"
+arrow = "59"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = "0.7"
