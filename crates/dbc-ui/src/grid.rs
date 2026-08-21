@@ -212,7 +212,9 @@ impl Render for ResultGrid {
                 .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _w, cx| {
                     if let Some((col, start_x, start_w)) = this.resizing {
                         let dx: f32 = f32::from(e.position.x) - start_x;
-                        this.col_widths[col] = (start_w + dx).max(40.0);
+                        if let Some(w) = this.col_widths.get_mut(col) {
+                            *w = (start_w + dx).max(40.0);
+                        }
                         cx.notify();
                     }
                 }))

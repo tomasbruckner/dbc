@@ -61,14 +61,24 @@ impl ColBuilder {
         }
     }
 
+    /// Uses `try_get` (not `get`) everywhere: `get` panics on a decode
+    /// failure, which would kill the streaming task inside the runtime
+    /// silently — the channel's tx side drops, the UI sees a clean stream
+    /// end, and reports SUCCESS with truncated data. `arrow_type` only maps
+    /// BOOL/INT2/INT4/INT8/FLOAT4/FLOAT8 to these typed builders, so the
+    /// known decode hazards (NUMERIC 'NaN', 'infinity' timestamps/dates,
+    /// out-of-range dates) can't actually reach this method today — they're
+    /// all routed to `text_value` via the `Utf8` fallback in `arrow_type`.
+    /// The `try_get` + `append_null` here is defense in depth in case that
+    /// mapping ever changes.
     pub fn append(&mut self, row: &Row, i: usize) {
         match self {
-            Self::Bool(b) => b.append_option(row.get::<_, Option<bool>>(i)),
-            Self::I16(b) => b.append_option(row.get::<_, Option<i16>>(i)),
-            Self::I32(b) => b.append_option(row.get::<_, Option<i32>>(i)),
-            Self::I64(b) => b.append_option(row.get::<_, Option<i64>>(i)),
-            Self::F32(b) => b.append_option(row.get::<_, Option<f32>>(i)),
-            Self::F64(b) => b.append_option(row.get::<_, Option<f64>>(i)),
+            Self::Bool(b) => b.append_option(row.try_get::<_, Option<bool>>(i).unwrap_or(None)),
+            Self::I16(b) => b.append_option(row.try_get::<_, Option<i16>>(i).unwrap_or(None)),
+            Self::I32(b) => b.append_option(row.try_get::<_, Option<i32>>(i).unwrap_or(None)),
+            Self::I64(b) => b.append_option(row.try_get::<_, Option<i64>>(i).unwrap_or(None)),
+            Self::F32(b) => b.append_option(row.try_get::<_, Option<f32>>(i).unwrap_or(None)),
+            Self::F64(b) => b.append_option(row.try_get::<_, Option<f64>>(i).unwrap_or(None)),
             Self::Text(b) => b.append_option(text_value(row, i)),
         }
     }
@@ -86,26 +96,49 @@ impl ColBuilder {
     }
 }
 
+/// Legal Postgres values exist that the target Rust type can't represent —
+/// NUMERIC 'NaN' (`rust_decimal` has no NaN), 'infinity'/'-infinity'
+/// timestamps and dates (chrono has no such value), and dates outside
+/// chrono's range. `row.get` panics on these, which would silently kill the
+/// streaming task; `try_get` turns that into a renderable placeholder
+/// instead, so a stream never truncates without surfacing an error.
 fn text_value(row: &Row, i: usize) -> Option<String> {
     let t = row.columns()[i].type_();
+    let decode_error = || Some(format!("<decode error: {}>", t));
     match *t {
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => {
-            row.get::<_, Option<String>>(i)
+            match row.try_get::<_, Option<String>>(i) {
+                Ok(v) => v,
+                Err(_) => decode_error(),
+            }
         }
-        Type::NUMERIC => row
-            .get::<_, Option<rust_decimal::Decimal>>(i)
-            .map(|d| d.to_string()),
-        Type::TIMESTAMP => row
-            .get::<_, Option<chrono::NaiveDateTime>>(i)
-            .map(|v| v.to_string()),
-        Type::TIMESTAMPTZ => row
-            .get::<_, Option<chrono::DateTime<chrono::Utc>>>(i)
-            .map(|v| v.to_rfc3339()),
-        Type::DATE => row.get::<_, Option<chrono::NaiveDate>>(i).map(|v| v.to_string()),
-        Type::TIME => row.get::<_, Option<chrono::NaiveTime>>(i).map(|v| v.to_string()),
-        Type::UUID => row.get::<_, Option<uuid::Uuid>>(i).map(|v| v.to_string()),
-        _ => row
-            .get::<_, Option<AnyValue>>(i)
-            .map(|_| format!("<oid {}>", t.oid())),
+        Type::NUMERIC => match row.try_get::<_, Option<rust_decimal::Decimal>>(i) {
+            Ok(v) => v.map(|d| d.to_string()),
+            Err(_) => decode_error(),
+        },
+        Type::TIMESTAMP => match row.try_get::<_, Option<chrono::NaiveDateTime>>(i) {
+            Ok(v) => v.map(|v| v.to_string()),
+            Err(_) => decode_error(),
+        },
+        Type::TIMESTAMPTZ => match row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(i) {
+            Ok(v) => v.map(|v| v.to_rfc3339()),
+            Err(_) => decode_error(),
+        },
+        Type::DATE => match row.try_get::<_, Option<chrono::NaiveDate>>(i) {
+            Ok(v) => v.map(|v| v.to_string()),
+            Err(_) => decode_error(),
+        },
+        Type::TIME => match row.try_get::<_, Option<chrono::NaiveTime>>(i) {
+            Ok(v) => v.map(|v| v.to_string()),
+            Err(_) => decode_error(),
+        },
+        Type::UUID => match row.try_get::<_, Option<uuid::Uuid>>(i) {
+            Ok(v) => v.map(|v| v.to_string()),
+            Err(_) => decode_error(),
+        },
+        _ => match row.try_get::<_, Option<AnyValue>>(i) {
+            Ok(v) => v.map(|_| format!("<oid {}>", t.oid())),
+            Err(_) => decode_error(),
+        },
     }
 }

@@ -69,9 +69,6 @@ async fn cancel_kills_server_side_query() {
 async fn error_carries_sqlstate_and_position() {
     let node = Postgres::default().start().await.unwrap();
     let mut c = PostgresConnection::connect(&pg_url(&node).await).await.unwrap();
-    // Note: dbc_core::QueryStream doesn't derive Debug, so `unwrap_err()`
-    // (which requires the Ok type to be Debug) won't compile here; use
-    // err().unwrap() instead, which only needs QueryError: Debug.
     let err = c.query("SELEC 1", CancelToken::new()).await.err().unwrap();
     assert_eq!(err.code.as_deref(), Some("42601"));
     assert!(err.position.is_some());
@@ -121,4 +118,65 @@ async fn stale_cancel_after_completion_does_not_kill_later_query() {
         Ok(_) => {}
         Err(e) => panic!("unrelated query was killed by a stale cancel: {e:?}"),
     }
+}
+
+/// NUMERIC 'NaN' has no `rust_decimal` representation, and 'infinity' /
+/// '-infinity' have no `chrono` representation — both are legal Postgres
+/// values that used to panic inside the streaming task via `row.get`
+/// (a panic there silently ends the stream: the sender task dies, the
+/// channel closes cleanly, and the UI reports SUCCESS with truncated rows).
+/// After the fix these decode as a placeholder string instead of panicking,
+/// and the row is not dropped.
+#[tokio::test]
+#[ignore]
+async fn decode_hazards_render_as_placeholders() {
+    use dbc_core::arrow::array::{Array, Int32Array, StringArray};
+    let node = Postgres::default().start().await.unwrap();
+    let mut c = PostgresConnection::connect(&pg_url(&node).await).await.unwrap();
+    let mut s = c
+        .query(
+            "SELECT 'NaN'::numeric AS a, 'infinity'::timestamp AS b, '-infinity'::date AS c, 1 AS ok",
+            CancelToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let mut rows = 0usize;
+    let mut last_batch = None;
+    while let Some(item) = s.batches.recv().await {
+        let b = item.unwrap_or_else(|e| panic!("stream failed instead of rendering a placeholder: {e:?}"));
+        rows += b.num_rows();
+        last_batch = Some(b);
+    }
+    assert_eq!(rows, 1, "row must not be dropped/truncated by a decode panic");
+
+    let batch = last_batch.expect("expected one batch");
+    let a = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let b = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    let c_col = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+    let ok = batch.column(3).as_any().downcast_ref::<Int32Array>().unwrap();
+
+    assert_eq!(ok.value(0), 1, "unrelated column must read correctly");
+    assert!(
+        !a.is_null(0) && !a.value(0).is_empty(),
+        "numeric NaN must render as a non-null placeholder, got: {:?}",
+        a.is_null(0).then_some("<null>").unwrap_or(a.value(0))
+    );
+    assert!(
+        !b.is_null(0) && !b.value(0).is_empty(),
+        "infinity timestamp must render as a non-null placeholder, got: {:?}",
+        b.is_null(0).then_some("<null>").unwrap_or(b.value(0))
+    );
+    assert!(
+        !c_col.is_null(0) && !c_col.value(0).is_empty(),
+        "-infinity date must render as a non-null placeholder, got: {:?}",
+        c_col.is_null(0).then_some("<null>").unwrap_or(c_col.value(0))
+    );
+    eprintln!(
+        "decode_hazards_render_as_placeholders actual values: a={:?} b={:?} c={:?} ok={}",
+        a.value(0),
+        b.value(0),
+        c_col.value(0),
+        ok.value(0)
+    );
 }
