@@ -6,7 +6,7 @@ use dbc_core::arrow::array::{ArrayRef, RecordBatch, StringBuilder};
 use dbc_core::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use dbc_core::{
     CancelToken, ColumnInfo, Connection, QueryError, QueryStream, SchemaSnapshot, TableInfo,
-    BATCH_ROWS, CHANNEL_CAPACITY,
+    TableKind, BATCH_ROWS, CHANNEL_CAPACITY,
 };
 
 pub struct SqliteConnection {
@@ -179,13 +179,28 @@ impl Connection for SqliteConnection {
                 // contain spaces/hyphens/leading digits don't break the
                 // query and abort the whole schema snapshot.
                 conn.pragma(None, "table_info", name.as_str(), |r| {
-                    columns.push(ColumnInfo { name: r.get(1)?, data_type: r.get(2)? });
+                    columns.push(ColumnInfo {
+                        name: r.get(1)?,
+                        data_type: r.get(2)?,
+                        nullable: true,
+                        default: None,
+                        is_pk: false,
+                        fk: None,
+                    });
                     Ok(())
                 })
                 .map_err(q_err)?;
-                tables.push(TableInfo { schema: None, name, columns });
+                tables.push(TableInfo {
+                    schema: None,
+                    name,
+                    kind: TableKind::Table,
+                    columns,
+                    indexes: Vec::new(),
+                    constraints: Vec::new(),
+                    ddl: None,
+                });
             }
-            Ok(SchemaSnapshot { tables })
+            Ok(SchemaSnapshot { tables, ..Default::default() })
         })
         .await
         .map_err(|_| QueryError::msg("driver task died"))?

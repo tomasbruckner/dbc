@@ -7,7 +7,7 @@ use dbc_core::arrow::array::RecordBatch;
 use dbc_core::arrow::datatypes::{Field, Schema, SchemaRef};
 use dbc_core::{
     CancelToken, ColumnInfo, Connection, QueryError, QueryStream, SchemaSnapshot, TableInfo,
-    BATCH_LATENCY, BATCH_ROWS, CHANNEL_CAPACITY,
+    TableKind, BATCH_LATENCY, BATCH_ROWS, CHANNEL_CAPACITY,
 };
 use futures_util::StreamExt;
 use tokio_postgres::NoTls;
@@ -207,12 +207,27 @@ impl Connection for PostgresConnection {
         let mut tables: Vec<TableInfo> = Vec::new();
         for row in rows {
             let (ts, tn): (String, String) = (row.get(0), row.get(1));
-            let col = ColumnInfo { name: row.get(2), data_type: row.get(3) };
+            let col = ColumnInfo {
+                name: row.get(2),
+                data_type: row.get(3),
+                nullable: true,
+                default: None,
+                is_pk: false,
+                fk: None,
+            };
             match tables.last_mut() {
                 Some(t) if t.schema.as_deref() == Some(&ts) && t.name == tn => t.columns.push(col),
-                _ => tables.push(TableInfo { schema: Some(ts), name: tn, columns: vec![col] }),
+                _ => tables.push(TableInfo {
+                    schema: Some(ts),
+                    name: tn,
+                    kind: TableKind::Table,
+                    columns: vec![col],
+                    indexes: Vec::new(),
+                    constraints: Vec::new(),
+                    ddl: None,
+                }),
             }
         }
-        Ok(SchemaSnapshot { tables })
+        Ok(SchemaSnapshot { tables, ..Default::default() })
     }
 }
