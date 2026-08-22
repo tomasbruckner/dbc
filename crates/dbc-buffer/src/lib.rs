@@ -182,6 +182,27 @@ impl ResultBuffer {
         array_value_to_string(array, ri).unwrap_or_default()
     }
 
+    /// Null-aware companion to `cell_text` (G4 Task 4: exports need to tell
+    /// a real SQL NULL apart from a merely-empty/"NULL"-looking string —
+    /// `cell_text` collapses both to `""`/the literal text, which is fine
+    /// for display but ambiguous for `INSERT`/JSON export). Goes through the
+    /// same slot lookup as `cell_text`, so it pays the same spill-read cost;
+    /// out-of-range coordinates and a spill-read failure both degrade to
+    /// `false` (non-null) rather than panicking or silently exporting a
+    /// wrong-but-plausible NULL — `cell_text`'s `"<spill read error>"`
+    /// marker is what actually surfaces the read failure to the user in
+    /// that case, so treating it as NULL here would silently swallow it.
+    pub fn cell_is_null(&mut self, row: usize, col: usize) -> bool {
+        if row >= self.row_count() || col >= self.column_count() {
+            return false;
+        }
+        let (si, ri) = self.locate(row);
+        let Some(batch) = self.slot_batch(si) else {
+            return false;
+        };
+        batch.column(col).is_null(ri)
+    }
+
     #[cfg(test)]
     fn spilled_slots(&self) -> usize {
         self.slots.iter().filter(|s| matches!(s, Slot::Spilled { .. })).count()
@@ -234,6 +255,29 @@ mod tests {
         let mut buf = ResultBuffer::new(b.schema());
         buf.push(b).unwrap();
         assert_eq!(buf.cell_text(0, 1), ""); // i % 7 == 0 → None
+    }
+
+    #[test]
+    fn cell_is_null_reports_arrow_nulls_and_out_of_range_as_non_null() {
+        let b = batch(0, 10);
+        let mut buf = ResultBuffer::new(b.schema());
+        buf.push(b).unwrap();
+        assert!(buf.cell_is_null(0, 1)); // i % 7 == 0 → None
+        assert!(!buf.cell_is_null(1, 1)); // i % 7 == 1 → Some
+        assert!(!buf.cell_is_null(0, 0)); // non-nullable id column
+        assert!(!buf.cell_is_null(999, 0)); // out of range
+    }
+
+    #[test]
+    fn cell_is_null_spill_read_error_is_treated_as_non_null() {
+        let b0 = batch(0, 10);
+        let mut buf = ResultBuffer::with_cap(b0.schema(), 0); // cap at 0 rows: everything spills
+        buf.push(b0).unwrap();
+        let dir = buf.spill_dir().expect("spill dir created").to_path_buf();
+        std::fs::remove_file(dir.join("spill-0.arrow")).unwrap();
+        // Row 0, col 1 would otherwise be null (i % 7 == 0) — the read
+        // failure must win over that, so this must NOT report null.
+        assert!(!buf.cell_is_null(0, 1));
     }
 
     #[test]

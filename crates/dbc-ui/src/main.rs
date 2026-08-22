@@ -1,5 +1,6 @@
 mod connect;
 mod connections_ui;
+mod export;
 mod grid;
 mod history_panel;
 mod palette;
@@ -67,6 +68,13 @@ fn preview_sql(schema: Option<&str>, table: &str) -> String {
 struct PreviewTarget {
     title: String,
     key: String,
+    /// G4 Task 4: bare table name (no schema/quoting), threaded through to
+    /// `ResultGrid::set_table_name` once the tab's grid exists (see
+    /// `QueryEvent::Started` below) — used as the `INSERT INTO` target for
+    /// this tab's exports. `key`/`title` both embed this too, but as
+    /// free-form text meant for tab identity/display, not as a value a
+    /// caller should parse back out.
+    table: String,
 }
 
 struct AppView {
@@ -319,7 +327,18 @@ impl AppView {
                                 let buf = Rc::new(RefCell::new(ResultBuffer::new(columns)));
                                 buffer = Some(buf.clone());
                                 let grid = cx.new(ResultGrid::new);
-                                grid.update(cx, |g, cx| g.set_buffer(buf.clone(), cx));
+                                grid.update(cx, |g, cx| {
+                                    g.set_buffer(buf.clone(), cx);
+                                    // G4 Task 4: a preview tab knows its
+                                    // source table (used as the `INSERT
+                                    // INTO` target for exports) — an
+                                    // ad-hoc SQL-editor run doesn't, and
+                                    // keeps `set_buffer`'s "export"
+                                    // placeholder.
+                                    if let Some(p) = &preview {
+                                        g.set_table_name(p.table.clone());
+                                    }
+                                });
                                 let title = preview
                                     .as_ref()
                                     .map(|p| p.title.clone())
@@ -706,6 +725,7 @@ impl AppView {
                 let preview = PreviewTarget {
                     title: format!("Náhled: {name}"),
                     key: format!("{}.{name}", schema.unwrap_or_default()),
+                    table: name.clone(),
                 };
                 self.run_query_with(sql, Some(preview), true, cx);
             }
@@ -927,6 +947,7 @@ impl AppView {
                 let preview = PreviewTarget {
                     title: format!("Náhled: {table}"),
                     key: format!("{}.{table}", schema.clone().unwrap_or_default()),
+                    table: table.clone(),
                 };
                 self.run_query_with(sql, Some(preview), true, cx);
             }

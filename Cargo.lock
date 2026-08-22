@@ -2054,6 +2054,7 @@ dependencies = [
  "dbc-driver-postgres",
  "dbc-driver-sqlite",
  "dbc-state",
+ "dirs",
  "gpui",
  "gpui_platform",
  "tokio",

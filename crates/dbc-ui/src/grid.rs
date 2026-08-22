@@ -9,6 +9,7 @@ use gpui::{
 };
 
 use crate::connections_ui::TextField;
+use crate::export::{self, ExportFormat};
 use crate::row_view::{self, RowView};
 
 pub const ROW_HEIGHT: f32 = 24.0;
@@ -23,6 +24,12 @@ const LARGE_SORT_ROWS: usize = 100_000;
 /// collected matches; the "i z n" indicator shows "n+" when capped.
 const FIND_MAX_ROWS: usize = 100_000;
 const FIND_MAX_MATCHES: usize = 1_000;
+/// G4 Task 4: above this row count, export's formatting+write pass is
+/// offloaded to `cx.background_executor()` instead of running inline in the
+/// same UI-thread task that read the buffer (see `start_export`'s doc
+/// comment for why only that half can move — `ResultBuffer` itself is
+/// `Rc<RefCell<_>>`, not `Send`).
+const LARGE_EXPORT_ROWS: usize = 50_000;
 
 actions!(grid, [CopySelection, FindInResult, FindNext, FindPrev]);
 
@@ -156,6 +163,16 @@ pub struct ResultGrid {
     /// `find_step`/`toolbar`'s auto-jump-to-first-match scroll a matched
     /// row into view (`UniformListScrollHandle::scroll_to_item`).
     scroll_handle: UniformListScrollHandle,
+    /// G4 Task 4: source table name for `INSERT` exports. `"export"` is the
+    /// placeholder for an ad-hoc SQL-editor result (no single source table
+    /// is known); a schema-tree/palette preview tab overrides this via
+    /// `set_table_name` right after `set_buffer` since it DOES know its
+    /// table (`main.rs`'s `QueryEvent::Started` handling).
+    pub table_name: String,
+    /// "Export ▾" dropdown open/closed.
+    export_open: bool,
+    /// "Sloupce ▾" dropdown open/closed.
+    columns_open: bool,
 }
 
 impl ResultGrid {
@@ -177,6 +194,9 @@ impl ResultGrid {
             find: None,
             cell_detail: None,
             scroll_handle: UniformListScrollHandle::new(),
+            table_name: "export".to_string(),
+            export_open: false,
+            columns_open: false,
         }
     }
 
@@ -199,6 +219,17 @@ impl ResultGrid {
         self.filter_cache = vec![String::new(); ncols];
         self.find = None;
         self.cell_detail = None;
+        self.table_name = "export".to_string();
+        self.export_open = false;
+        self.columns_open = false;
+    }
+
+    /// Public seam (Task 4): called by `main.rs` right after `set_buffer`
+    /// for a tab whose source table IS known (a schema-tree/palette
+    /// preview) — overrides the `"export"` placeholder default (see
+    /// `table_name`'s doc comment) used for ad-hoc SQL-editor results.
+    pub fn set_table_name(&mut self, name: String) {
+        self.table_name = name;
     }
 
     /// Re-derives `view.order` from the current buffer contents. Sets
@@ -445,6 +476,190 @@ impl ResultGrid {
         false
     }
 
+    /// "Export ▾" button click — opens/closes the format menu; opening it
+    /// closes "Sloupce ▾" first (the two menus never show at once, same
+    /// "only one popover open" convention the connection dropdown/palette
+    /// already follow implicitly by being singletons).
+    fn toggle_export_menu(&mut self, cx: &mut Context<Self>) {
+        self.export_open = !self.export_open;
+        if self.export_open {
+            self.columns_open = false;
+        }
+        cx.notify();
+    }
+
+    /// "Sloupce ▾" button click — see `toggle_export_menu`.
+    fn toggle_columns_menu(&mut self, cx: &mut Context<Self>) {
+        self.columns_open = !self.columns_open;
+        if self.columns_open {
+            self.export_open = false;
+        }
+        cx.notify();
+    }
+
+    /// "Sloupce ▾" checkbox click. Refuses to hide the LAST visible column
+    /// (brief: "at least one column must stay visible") — a no-op rather
+    /// than leaving `header`/the row list with nothing to render. Hiding a
+    /// column ALSO clears its filter (a decision, not forced by the brief):
+    /// once hidden, the filter row skips it entirely (see `filter_row`), so
+    /// a stale filter would keep silently narrowing `view.filters` with no
+    /// UI left to see or clear it — same "toggle-off-clears" rationale
+    /// `toggle_filters` already applies to the whole filter row. Re-showing
+    /// a column needs no special handling: hiding always cleared whatever
+    /// filter it had, so there's nothing to restore.
+    fn toggle_column_visibility(&mut self, col: usize, cx: &mut Context<Self>) {
+        let Some(&was_hidden) = self.hidden_cols.get(col) else { return };
+        if !was_hidden {
+            let visible_count = self.hidden_cols.iter().filter(|&&h| !h).count();
+            if visible_count <= 1 {
+                return; // refuse to hide the last visible column
+            }
+        }
+        self.hidden_cols[col] = !was_hidden;
+        if self.hidden_cols[col] {
+            if let Some(input) = self.filter_inputs.get(col).cloned() {
+                input.update(cx, |f, cx| f.set_text("", cx));
+            }
+            if let Some(c) = self.filter_cache.get_mut(col) {
+                c.clear();
+            }
+            let had_filter = self.view.filters.iter().any(|(c, _)| *c == col);
+            self.view.filters.retain(|(c, _)| *c != col);
+            if had_filter {
+                self.rebuild_view();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Visible-only headers (display order == source order; hiding doesn't
+    /// reorder columns, only sort does that at the ROW level) plus the
+    /// SOURCE column index each one came from — used both by the header/row
+    /// renderers (already inline) and by `start_export`'s accessor.
+    fn export_headers_and_cols(&self) -> (Vec<String>, Vec<usize>) {
+        let Some(buf) = &self.buffer else { return (Vec::new(), Vec::new()) };
+        let buf = buf.borrow();
+        let mut headers = Vec::new();
+        let mut cols = Vec::new();
+        for (i, field) in buf.schema().fields().iter().enumerate() {
+            if self.hidden_cols.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            headers.push(field.name().clone());
+            cols.push(i);
+        }
+        (headers, cols)
+    }
+
+    /// "Export ▾" format click. Exports the CURRENT VIEW: rows in display
+    /// order (`view.source_row`), hidden columns excluded (brief contract).
+    ///
+    /// `ResultBuffer` lives behind `Rc<RefCell<_>>` (not `Send`), so it can
+    /// never cross `cx.background_executor()`'s background thread pool —
+    /// the row/column snapshot into owned `Option<String>` data (the
+    /// `rows_data` loop below) unavoidably runs on the UI thread no matter
+    /// the row count, same cost the grid's own render already pays per
+    /// visible window, just done once for the whole export. What DOES move
+    /// to a background thread above `LARGE_EXPORT_ROWS` is the part that
+    /// scales with output size and I/O — formatting every cell into
+    /// CSV/TSV/JSON/INSERT text and writing it to disk — since `rows_data`
+    /// (plain `String`s) IS `Send`. Below the threshold both halves just
+    /// run inline; either way the save-dialog await and the final status
+    /// update happen through the same `cx.spawn` task, matching the
+    /// existing "UI thread awaits a channel/future via cx.spawn" shape used
+    /// for query runs (`main.rs`) rather than introducing a raw
+    /// `std::thread` + channel (brief allows either; this reuses the
+    /// existing pattern).
+    fn start_export(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
+        let Some(buf) = self.buffer.clone() else { return };
+        let (headers, cols) = self.export_headers_and_cols();
+        if headers.is_empty() {
+            self.status_note = Some("error: žádné viditelné sloupce k exportu".to_string());
+            cx.notify();
+            return;
+        }
+        let table_name = self.table_name.clone();
+        let ext = format.extension();
+        let suggested_name = format!("{table_name}.{ext}");
+        let n = self.view.len();
+
+        let mut rows_data: Vec<Vec<Option<String>>> = Vec::with_capacity(n);
+        {
+            let mut buf_mut = buf.borrow_mut();
+            for r in 0..n {
+                let source_row = self.view.source_row(r);
+                let mut row = Vec::with_capacity(cols.len());
+                for &c in &cols {
+                    let val = if buf_mut.cell_is_null(source_row, c) {
+                        None
+                    } else {
+                        Some(buf_mut.cell_text(source_row, c))
+                    };
+                    row.push(val);
+                }
+                rows_data.push(row);
+            }
+        }
+
+        self.status_note = Some("volím cíl exportu…".to_string());
+        cx.notify();
+
+        let dialog = cx.prompt_for_new_path(&std::path::PathBuf::new(), Some(&suggested_name));
+        cx.spawn(async move |this, cx| {
+            let path = match dialog.await {
+                Ok(Ok(Some(p))) => p,
+                Ok(Ok(None)) => {
+                    let _ = this.update(cx, |g, cx| {
+                        g.status_note = Some("export zrušen".to_string());
+                        cx.notify();
+                    });
+                    return;
+                }
+                // Save dialog unavailable or errored (brief's documented
+                // fallback for a platform picker that isn't usable) — write
+                // a timestamped file into the user's Downloads instead.
+                _ => match dirs::download_dir() {
+                    Some(dir) => {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        dir.join(format!("dbc-export-{ts}.{ext}"))
+                    }
+                    None => {
+                        let _ = this.update(cx, |g, cx| {
+                            g.status_note =
+                                Some("error: dialog pro uložení i složka Stažené nejsou dostupné".to_string());
+                            cx.notify();
+                        });
+                        return;
+                    }
+                },
+            };
+
+            let large = n > LARGE_EXPORT_ROWS;
+            let result: Result<(), String> = if large {
+                let write_path = path.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        write_export_file(&write_path, format, &headers, &table_name, n, &rows_data)
+                    })
+                    .await
+            } else {
+                write_export_file(&path, format, &headers, &table_name, n, &rows_data)
+            };
+
+            let _ = this.update(cx, |g, cx| {
+                g.status_note = Some(match result {
+                    Ok(()) => format!("exportováno: {} ({n} řádků)", path.display()),
+                    Err(e) => format!("error: {e}"),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn is_selected(&self, row: usize, col: usize) -> bool {
         let Some(((r0, c0), (r1, c1))) = self.selection else {
             return false;
@@ -526,6 +741,30 @@ impl ResultGrid {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_filters(cx);
                     })),
+            )
+            .child(
+                div()
+                    .id("toggle-export-menu")
+                    .cursor_pointer()
+                    .px_2()
+                    .rounded_md()
+                    .bg(if self.export_open { rgb(0x45475a) } else { rgb(0x313244) })
+                    .child("Export ▾")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_export_menu(cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id("toggle-columns-menu")
+                    .cursor_pointer()
+                    .px_2()
+                    .rounded_md()
+                    .bg(if self.columns_open { rgb(0x45475a) } else { rgb(0x313244) })
+                    .child("Sloupce ▾")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_columns_menu(cx);
+                    })),
             );
 
         if filtered {
@@ -604,6 +843,114 @@ impl ResultGrid {
             }
         }
         row
+    }
+
+    /// "Export ▾" dropdown (brief contract): a flat list of the four
+    /// formats, anchored under the toolbar. Same overlay shape as
+    /// `connections_ui::render_dropdown_overlay` — `.occlude()` +
+    /// `on_mouse_down_out` closes it on an outside click, positioned
+    /// `.absolute()` under the (`.relative()`) root `render` builds.
+    fn render_export_menu_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut panel = div()
+            .id("export-menu")
+            .absolute()
+            .top(px(ROW_HEIGHT))
+            .left(px(70.))
+            .w(px(140.))
+            .bg(rgb(0x1e1e2e))
+            .border_1()
+            .border_color(rgb(0x45475a))
+            .rounded_md()
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_color(rgb(0xcdd6f4))
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.export_open = false;
+                cx.notify();
+            }));
+        for (label, format) in [
+            ("CSV", ExportFormat::Csv),
+            ("TSV", ExportFormat::Tsv),
+            ("JSON", ExportFormat::Json),
+            ("INSERT", ExportFormat::Insert),
+        ] {
+            panel = panel.child(
+                div()
+                    .id(gpui::SharedString::from(format!("export-item-{label}")))
+                    .cursor_pointer()
+                    .px_2()
+                    .rounded_md()
+                    .hover(|s| s.bg(rgb(0x313244)))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.export_open = false;
+                        this.start_export(format, cx);
+                    })),
+            );
+        }
+        panel.into_any_element()
+    }
+
+    /// "Sloupce ▾" dropdown (brief contract): a checkbox per SOURCE column
+    /// (checked = visible), toggling `hidden_cols` via
+    /// `toggle_column_visibility`. Iterates ALL source columns, not just
+    /// visible ones (unlike `filter_row`/`header`) — this is the one place
+    /// a hidden column is ever shown again, so it can be re-checked.
+    fn render_columns_menu_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut panel = div()
+            .id("columns-menu")
+            .absolute()
+            .top(px(ROW_HEIGHT))
+            .left(px(190.))
+            .w(px(220.))
+            .max_h(px(320.))
+            .overflow_hidden()
+            .bg(rgb(0x1e1e2e))
+            .border_1()
+            .border_color(rgb(0x45475a))
+            .rounded_md()
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_color(rgb(0xcdd6f4))
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.columns_open = false;
+                cx.notify();
+            }));
+        if let Some(buf) = &self.buffer {
+            let ncols = buf.borrow().column_count();
+            let visible_count = self.hidden_cols.iter().filter(|&&h| !h).count();
+            for i in 0..ncols {
+                let name = buf.borrow().schema().fields()[i].name().clone();
+                let hidden = self.hidden_cols.get(i).copied().unwrap_or(false);
+                // Disabled (can't uncheck) when this is the LAST visible
+                // column — see `toggle_column_visibility`'s doc comment.
+                let disabled = !hidden && visible_count <= 1;
+                panel = panel.child(
+                    div()
+                        .id(("columns-item", i))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .rounded_md()
+                        .when(!disabled, |d| d.cursor_pointer().hover(|s| s.bg(rgb(0x313244))))
+                        .text_color(if disabled { rgb(0x6c7086) } else { rgb(0xcdd6f4) })
+                        .child(if hidden { "☐" } else { "☑" })
+                        .child(name)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_column_visibility(i, cx);
+                        })),
+                );
+            }
+        }
+        panel.into_any_element()
     }
 
     /// Cell-detail popup (brief contract #3): same centered-overlay shape
@@ -775,6 +1122,36 @@ impl ResultGrid {
     }
 }
 
+/// Formats `data` (already-snapshotted visible cells, display order — see
+/// `ResultGrid::start_export`) via `export::export` and writes it to
+/// `path`, going through a `.tmp` sibling file + rename (brief contract:
+/// never leave a half-written file at the final name if the write is
+/// interrupted midway).
+fn write_export_file(
+    path: &std::path::Path,
+    format: ExportFormat,
+    headers: &[String],
+    table_name: &str,
+    rows: usize,
+    data: &[Vec<Option<String>>],
+) -> Result<(), String> {
+    let tmp_path = {
+        let mut s = path.as_os_str().to_owned();
+        s.push(".tmp");
+        std::path::PathBuf::from(s)
+    };
+    {
+        let file = std::fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
+        let mut w = std::io::BufWriter::new(file);
+        export::export(&mut w, format, headers, table_name, rows, &mut |r, c| {
+            data.get(r).and_then(|row| row.get(c)).cloned().flatten()
+        })?;
+        std::io::Write::flush(&mut w).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&tmp_path, path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 impl Focusable for ResultGrid {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus_handle.clone()
@@ -938,6 +1315,13 @@ impl Render for ResultGrid {
                         cx.notify();
                     }),
                 );
+        }
+
+        if has_buffer && self.export_open {
+            root = root.child(self.render_export_menu_overlay(cx));
+        }
+        if has_buffer && self.columns_open {
+            root = root.child(self.render_columns_menu_overlay(cx));
         }
 
         if let Some(overlay) = self.render_cell_detail_overlay(cx) {
