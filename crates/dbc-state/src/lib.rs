@@ -1,6 +1,6 @@
 mod config;
 pub use config::{
-    default_config_path, AppConfig, ConnectionConfig, Engine, SshTunnelConfig, StateError,
+    default_config_path, AppConfig, ConnectionConfig, Engine, FavouriteObject, SshTunnelConfig, StateError,
 };
 
 mod vault;

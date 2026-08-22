@@ -50,10 +50,20 @@ pub struct ConnectionConfig {
     pub favourite: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FavouriteObject {
+    pub connection_id: String,
+    pub schema: Option<String>,
+    pub name: String,
+    pub kind: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub connections: Vec<ConnectionConfig>,
+    #[serde(default)]
+    pub favourite_objects: Vec<FavouriteObject>,
 }
 
 impl AppConfig {
@@ -72,6 +82,20 @@ impl AppConfig {
         }
         std::fs::rename(&tmp, path)?;
         Ok(())
+    }
+
+    pub fn is_favourite(&self, f: &FavouriteObject) -> bool {
+        self.favourite_objects.contains(f)
+    }
+
+    pub fn toggle_favourite(&mut self, f: FavouriteObject) -> bool {
+        if let Some(pos) = self.favourite_objects.iter().position(|x| x == &f) {
+            self.favourite_objects.remove(pos);
+            false
+        } else {
+            self.favourite_objects.push(f);
+            true
+        }
     }
 }
 
@@ -102,6 +126,7 @@ mod tests {
                 }),
                 favourite: false,
             }],
+            favourite_objects: vec![],
         }
     }
 
@@ -137,5 +162,55 @@ mod tests {
         sample().save(&p).unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
         assert!(!raw.to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn favourite_objects_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+
+        let mut config = sample();
+        let fav = FavouriteObject {
+            connection_id: "c1".into(),
+            schema: Some("public".into()),
+            name: "users".into(),
+            kind: "table".into(),
+        };
+
+        // Toggle on
+        let state = config.toggle_favourite(fav.clone());
+        assert_eq!(state, true);
+        assert_eq!(config.is_favourite(&fav), true);
+
+        // Save and load
+        config.save(&p).unwrap();
+        let loaded = AppConfig::load(&p).unwrap();
+        assert_eq!(loaded.is_favourite(&fav), true);
+
+        // Toggle off
+        let mut config2 = loaded;
+        let state = config2.toggle_favourite(fav.clone());
+        assert_eq!(state, false);
+        assert_eq!(config2.is_favourite(&fav), false);
+
+        // Save and load again
+        config2.save(&p).unwrap();
+        let loaded2 = AppConfig::load(&p).unwrap();
+        assert_eq!(loaded2.is_favourite(&fav), false);
+    }
+
+    #[test]
+    fn old_config_without_favourites_loads() {
+        let toml_str = r#"
+[[connections]]
+id = "c1"
+name = "demo"
+engine = "postgres"
+host = "localhost"
+database = "postgres"
+user = "postgres"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.favourite_objects, vec![]);
     }
 }
