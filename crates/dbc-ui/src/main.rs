@@ -3,6 +3,7 @@ mod grid;
 mod runner;
 mod sql_input;
 mod text_model;
+mod tunnel;
 
 use std::cell::RefCell;
 use std::rc::Rc;
