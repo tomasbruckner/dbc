@@ -38,6 +38,32 @@ const WRITE_KEYWORDS: &[&str] = &[
 /// Leading keywords that may start a read-only statement.
 const READ_LEADING_KEYWORDS: &[&str] = &["SELECT", "WITH", "EXPLAIN", "SHOW", "VALUES", "PRAGMA"];
 
+/// SQLite pragmas that are pure getters. `PRAGMA name = value` and
+/// `PRAGMA name(value)` are *both* setter syntaxes ("yield identical
+/// results" per the SQLite docs), and once the tokenizer drops punctuation
+/// `PRAGMA name(arg)` is indistinguishable from `PRAGMA schema.name` -- so
+/// instead of guessing getter vs. setter from shape, only pragmas on this
+/// allowlist count as reads. Schema-qualified pragmas are rejected
+/// (fail closed; rare in interactive use).
+const READ_PRAGMAS: &[&str] = &[
+    "TABLE_INFO",
+    "TABLE_XINFO",
+    "INDEX_LIST",
+    "INDEX_INFO",
+    "INDEX_XINFO",
+    "FOREIGN_KEY_LIST",
+    "DATABASE_LIST",
+    "COLLATION_LIST",
+    "FUNCTION_LIST",
+    "MODULE_LIST",
+    "PRAGMA_LIST",
+    "COMPILE_OPTIONS",
+    "INTEGRITY_CHECK",
+    "QUICK_CHECK",
+    "FREELIST_COUNT",
+    "PAGE_COUNT",
+];
+
 /// Tokenizes `sql` into a flat sequence of [`Item`]s, tracking:
 /// - single-quoted string literals (`''` is an escaped quote),
 /// - double-quoted identifiers (`""` is an escaped quote),
@@ -220,16 +246,22 @@ fn is_single_statement_read(stmt: &[Item]) -> bool {
         }
     }
 
-    // PRAGMA is only a read statement in getter form. `PRAGMA name` and
-    // `PRAGMA name(value)` (the paren form used by e.g. `PRAGMA
-    // table_info(t)`) are reads; any top-level `=` (e.g. `PRAGMA
-    // journal_mode=DELETE`) is a setter and must be rejected. Note this
-    // means a hypothetical setter pragma using bare paren syntax with no
-    // `=` would NOT be caught here -- SQLite's setter pragmas overwhelmingly
-    // use `=`, so this is the pragmatic high-value check, not a complete
-    // pragma grammar.
-    if first == "PRAGMA" && stmt.iter().any(|i| matches!(i, Item::Eq)) {
-        return false;
+    // PRAGMA: only pragmas on the READ_PRAGMAS allowlist, and never with a
+    // top-level `=`, count as reads. Both `PRAGMA name = value` and
+    // `PRAGMA name(value)` are setter syntaxes in SQLite, so shape alone
+    // cannot prove a pragma is a getter.
+    if first == "PRAGMA" {
+        if stmt.iter().any(|i| matches!(i, Item::Eq)) {
+            return false;
+        }
+        let name = stmt.iter().filter_map(|i| match i {
+            Item::Word(w) => Some(w.as_str()),
+            _ => None,
+        }).nth(1);
+        match name {
+            Some(n) if READ_PRAGMAS.contains(&n) => {}
+            _ => return false,
+        }
     }
 
     true
@@ -374,6 +406,15 @@ mod tests {
     fn pragma_setter_vs_getter() {
         assert!(!is_read_statement("PRAGMA journal_mode=DELETE"));
         assert!(is_read_statement("PRAGMA table_info(t)"));
+        // Paren-form setters ("PRAGMA name(value)" == "PRAGMA name = value"):
+        assert!(!is_read_statement("PRAGMA journal_mode(WAL)"));
+        assert!(!is_read_statement("PRAGMA writable_schema(1)"));
+        assert!(!is_read_statement("PRAGMA foreign_keys(0)"));
+        // Allowlisted getters without arguments:
+        assert!(is_read_statement("PRAGMA integrity_check"));
+        assert!(is_read_statement("PRAGMA database_list"));
+        // Non-allowlisted getter → fail closed (accepted cost):
+        assert!(!is_read_statement("PRAGMA journal_mode"));
     }
 
     #[test]
