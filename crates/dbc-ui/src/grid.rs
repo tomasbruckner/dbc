@@ -7,8 +7,15 @@ use gpui::{
     Focusable, KeyBinding, Window,
 };
 
+use crate::row_view::RowView;
+
 pub const ROW_HEIGHT: f32 = 24.0;
 pub const DEFAULT_COL_WIDTH: f32 = 160.0;
+/// G4 Task 2: above this many rows, a sort click sets `status_note` to
+/// "řadím…" before `rebuild_view` runs. `rebuild` is synchronous today, so
+/// this note is a retroactive "that sort was over a big set" marker rather
+/// than a live in-progress spinner — see `status_note`'s doc comment.
+const LARGE_SORT_ROWS: usize = 100_000;
 
 actions!(grid, [CopySelection]);
 
@@ -26,10 +33,36 @@ pub struct ResultGrid {
     pub buffer: Option<Rc<RefCell<ResultBuffer>>>,
     pub col_widths: Vec<f32>,
     focus_handle: FocusHandle,
-    /// (anchor cell, focus cell) as (row, col). Not normalized until copy.
+    /// (anchor cell, focus cell) as (row, col) — DISPLAY-order coordinates
+    /// (post `view`, not source rows); normalized (and mapped through
+    /// `view.source_row`) only at copy time, see `on_copy`.
     selection: Option<((usize, usize), (usize, usize))>,
     /// (col index, mouse-down start x, start width) while a resize drag is active.
     resizing: Option<(usize, f32, f32)>,
+    /// G4 Task 2: local sort (+ Task 3's filters) view over `buffer`.
+    /// `uniform_list`'s row count is `view.len()`, and every row index used
+    /// to read/select a cell is first mapped through `view.source_row`.
+    pub view: RowView,
+    /// By SOURCE column index — `true` hides that column from the header,
+    /// cells, and `col_widths` iteration. Sized to `column_count()` in
+    /// `set_buffer`, all `false` initially.
+    pub hidden_cols: Vec<bool>,
+    /// Set when a sort/filter is active and a streamed `Batch` arrived
+    /// while it was — resorting per-batch would be wasted work, so
+    /// `on_batch_grown` just marks this and `on_stream_finished` does the
+    /// one deferred rebuild (see `main.rs`'s `QueryEvent::Batch`/`Finished`
+    /// handling).
+    dirty: bool,
+    /// Set by `rebuild_view` right before a rebuild over more than
+    /// `LARGE_SORT_ROWS` rows, read (and cleared) by `main.rs`'s
+    /// `render_tab_content` into `AppView::status` — `ResultGrid` doesn't
+    /// own a status bar itself, so this is the minimal one-field seam
+    /// rather than a full event/callback plumbing just for this note.
+    /// Since `rebuild` is synchronous, this ends up describing the sort
+    /// that JUST happened rather than one still in flight; documented here
+    /// because the brief's "in-progress" framing doesn't quite hold for a
+    /// synchronous rebuild.
+    pub status_note: Option<String>,
 }
 
 impl ResultGrid {
@@ -40,14 +73,95 @@ impl ResultGrid {
             focus_handle: cx.focus_handle(),
             selection: None,
             resizing: None,
+            view: RowView::identity(0),
+            hidden_cols: Vec::new(),
+            dirty: false,
+            status_note: None,
         }
     }
 
     pub fn set_buffer(&mut self, buffer: Rc<RefCell<ResultBuffer>>) {
         let ncols = buffer.borrow().column_count();
+        let nrows = buffer.borrow().row_count();
         self.col_widths = vec![DEFAULT_COL_WIDTH; ncols];
         self.buffer = Some(buffer);
         self.selection = None;
+        self.view = RowView::identity(nrows);
+        self.hidden_cols = vec![false; ncols];
+        self.dirty = false;
+        self.status_note = None;
+    }
+
+    /// Re-derives `view.order` from the current buffer contents. Sets
+    /// `status_note` first when the source is large (see its doc comment)
+    /// so a caller that immediately re-renders after this has a chance to
+    /// surface it.
+    fn rebuild_view(&mut self) {
+        let Some(buf) = self.buffer.clone() else { return };
+        let rows = buf.borrow().row_count();
+        self.status_note =
+            if rows > LARGE_SORT_ROWS { Some("řadím…".to_string()) } else { None };
+        let mut buf = buf.borrow_mut();
+        self.view.rebuild(rows, &mut |r, c| buf.cell_text(r, c));
+    }
+
+    /// Called from `main.rs`'s `QueryEvent::Batch` handling for the tab
+    /// that just grew. When no sort/filter is active this is the cheap
+    /// `RowView::rebuild` early-return (just refreshes the identity count);
+    /// otherwise resorting the whole set on every batch would be wasted
+    /// work, so it's deferred — see `dirty` and `on_stream_finished`.
+    pub fn on_batch_grown(&mut self) {
+        if self.view.sort.is_some() || !self.view.filters.is_empty() {
+            self.dirty = true;
+        } else {
+            self.rebuild_view();
+        }
+    }
+
+    /// Called from `main.rs`'s `QueryEvent::Finished` handling. If a sort/
+    /// filter was deferred during streaming (`dirty`), does the one
+    /// rebuild now and returns a status note to append; `None` when there
+    /// was nothing deferred (identity view — already up to date).
+    pub fn on_stream_finished(&mut self) -> Option<String> {
+        if !self.dirty {
+            return None;
+        }
+        self.dirty = false;
+        self.rebuild_view();
+        Some("seřazeno po dokončení".to_string())
+    }
+
+    /// Header click (outside the resize-handle strip): cycles this
+    /// column's sort none → asc → desc → none, replacing any previous
+    /// sort column (only one sort column at a time), then rebuilds.
+    fn on_header_click(&mut self, col: usize, cx: &mut Context<Self>) {
+        self.view.sort = match self.view.sort {
+            Some((c, true)) if c == col => Some((col, false)),
+            Some((c, false)) if c == col => None,
+            _ => Some((col, true)),
+        };
+        self.rebuild_view();
+        cx.notify();
+    }
+
+    /// Public seam for Task 6 persistence (view_prefs): applies a saved
+    /// sort + hidden-column set and rebuilds. `hidden` is by SOURCE column
+    /// index, same convention as `hidden_cols`. Not called anywhere yet —
+    /// Task 6 wires it up once `dbc-state::ViewPrefsStore` (Task 1) is
+    /// loaded and a preview tab's schema is known.
+    #[allow(dead_code)]
+    pub fn set_view_state(&mut self, sort: Option<(usize, bool)>, hidden: Vec<bool>) {
+        self.view.sort = sort;
+        self.hidden_cols = hidden;
+        self.rebuild_view();
+    }
+
+    /// Public seam for Task 6 persistence: current sort + hidden-column
+    /// state, by SOURCE column index. Not called anywhere yet — see
+    /// `set_view_state`.
+    #[allow(dead_code)]
+    pub fn view_state(&self) -> (Option<(usize, bool)>, Vec<bool>) {
+        (self.view.sort, self.hidden_cols.clone())
     }
 
     fn is_selected(&self, row: usize, col: usize) -> bool {
@@ -59,6 +173,12 @@ impl ResultGrid {
         row >= rmin && row <= rmax && col >= cmin && col <= cmax
     }
 
+    /// `self.selection` is in DISPLAY coordinates (row = position in
+    /// `view`, same as `is_selected`/the click handler below) — each row is
+    /// mapped through `view.source_row` before reading it from the buffer,
+    /// otherwise a sorted/filtered grid would copy the wrong rows (G4 Task
+    /// 2 fix). Hidden columns within the selected column range are skipped
+    /// rather than copied blank.
     fn on_copy(&mut self, _: &CopySelection, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(((r0, c0), (r1, c1))) = self.selection else {
             return;
@@ -74,21 +194,43 @@ impl ResultGrid {
             if r > rmin {
                 out.push('\n');
             }
+            let source_row = self.view.source_row(r);
+            let mut first_col = true;
             for c in cmin..=cmax {
-                if c > cmin {
+                if self.hidden_cols.get(c).copied().unwrap_or(false) {
+                    continue;
+                }
+                if !first_col {
                     out.push('\t');
                 }
-                out.push_str(&buf.cell_text(r, c));
+                first_col = false;
+                out.push_str(&buf.cell_text(source_row, c));
             }
         }
         cx.write_to_clipboard(ClipboardItem::new_string(out));
     }
 
+    /// Skips hidden source columns entirely (brief: "header + cells +
+    /// widths skip hidden"). The label area (everything except the 5px
+    /// resize-handle strip) is clickable and cycles that column's sort
+    /// none → asc → desc → none via `on_header_click`, showing a ▲/▼
+    /// indicator next to the name when it's the active sort column — the
+    /// resize handle is a separate sibling element so a resize drag never
+    /// also fires a sort toggle.
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut row = div().flex().flex_row().bg(rgb(0x313244)).text_color(rgb(0xf9e2af));
         if let Some(buf) = &self.buffer {
             let buf = buf.borrow();
             for (i, field) in buf.schema().fields().iter().enumerate() {
+                if self.hidden_cols.get(i).copied().unwrap_or(false) {
+                    continue;
+                }
+                let mut label = field.name().clone();
+                match self.view.sort {
+                    Some((c, true)) if c == i => label.push_str(" \u{25B2}"), // ▲
+                    Some((c, false)) if c == i => label.push_str(" \u{25BC}"), // ▼
+                    _ => {}
+                }
                 // Resize handle overlays the last 5px of the column (absolute,
                 // anchored to the right edge) instead of adding extra width
                 // after the cell — that would push header columns out of
@@ -101,10 +243,15 @@ impl ResultGrid {
                         .h(px(ROW_HEIGHT))
                         .child(
                             div()
+                                .id(("header-label", i))
                                 .px_2()
                                 .h(px(ROW_HEIGHT))
                                 .overflow_hidden()
-                                .child(field.name().clone()),
+                                .cursor_pointer()
+                                .child(label)
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    this.on_header_click(i, cx);
+                                })),
                         )
                         .child(
                             div()
@@ -139,7 +286,11 @@ impl Focusable for ResultGrid {
 
 impl Render for ResultGrid {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let row_count = self.buffer.as_ref().map_or(0, |b| b.borrow().row_count());
+        // Row count/order goes through `view` (G4 Task 2: local sort), not
+        // the buffer's raw row count directly — `row_ix` below is a
+        // DISPLAY index, mapped to the buffer's actual row via
+        // `this.view.source_row` before every read/selection use.
+        let row_count = self.view.len();
         let buffer = self.buffer.clone();
         let widths = self.col_widths.clone();
         let is_resizing = self.resizing.is_some();
@@ -162,6 +313,7 @@ impl Render for ResultGrid {
                             let mut buf = buf.borrow_mut();
                             let ncols = buf.column_count();
                             for row_ix in range {
+                                let source_row = this.view.source_row(row_ix);
                                 let mut row = div()
                                     .id(row_ix)
                                     .flex()
@@ -169,6 +321,9 @@ impl Render for ResultGrid {
                                     .h(px(ROW_HEIGHT))
                                     .bg(if row_ix % 2 == 0 { rgb(0x1e1e2e) } else { rgb(0x232334) });
                                 for col in 0..ncols {
+                                    if this.hidden_cols.get(col).copied().unwrap_or(false) {
+                                        continue;
+                                    }
                                     let selected = this.is_selected(row_ix, col);
                                     let mut cell = div()
                                         .id(("cell", row_ix * 10_000 + col))
@@ -194,7 +349,7 @@ impl Render for ResultGrid {
                                                 cx.notify();
                                             }),
                                         )
-                                        .child(buf.cell_text(row_ix, col));
+                                        .child(buf.cell_text(source_row, col));
                                     if selected {
                                         cell = cell.bg(rgb(0x45475a));
                                     }

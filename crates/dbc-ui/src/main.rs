@@ -3,6 +3,7 @@ mod connections_ui;
 mod grid;
 mod history_panel;
 mod palette;
+mod row_view;
 mod runner;
 mod schema_tree;
 mod sql_input;
@@ -368,6 +369,21 @@ impl AppView {
                                     let secs =
                                         view.started_at.map_or(0.0, |t| t.elapsed().as_secs_f32());
                                     view.status = format!("{rows} rows… {secs:.1}s{limit_suffix}");
+                                    // G4 Task 2: let this tab's grid know it
+                                    // grew. When no sort/filter is active
+                                    // this is a cheap identity-count refresh;
+                                    // when one IS active it just marks dirty
+                                    // rather than resorting on every batch
+                                    // (see `ResultGrid::on_batch_grown`) —
+                                    // the actual resort is deferred to
+                                    // `Finished` below.
+                                    if let Some(id) = tab_id {
+                                        if let Some(TabContent::Grid { grid, .. }) =
+                                            view.tabs.iter().find(|t| t.id == id).map(|t| &t.content)
+                                        {
+                                            grid.update(cx, |g, _| g.on_batch_grown());
+                                        }
+                                    }
                                 }
                             }
                             // The driver sends exactly one terminal event
@@ -387,12 +403,32 @@ impl AppView {
                             // event's own outcome and update the status bar
                             // as before.
                             QueryEvent::Finished { elapsed } => {
+                                // G4 Task 2: if a sort/filter was active on
+                                // this tab's grid while batches streamed in,
+                                // `on_batch_grown` deferred resorting rather
+                                // than doing it per-batch — do the one
+                                // deferred rebuild now. `None` when there was
+                                // nothing deferred (identity view, already
+                                // current).
+                                let sort_note = tab_id.and_then(|id| {
+                                    view.tabs.iter().find(|t| t.id == id).and_then(|t| {
+                                        match &t.content {
+                                            TabContent::Grid { grid, .. } => {
+                                                grid.update(cx, |g, _| g.on_stream_finished())
+                                            }
+                                            TabContent::Text { .. } => None,
+                                        }
+                                    })
+                                });
                                 match &errored {
                                     None => {
                                         let rows =
                                             buffer.as_ref().map_or(0, |b| b.borrow().row_count());
                                         view.status =
                                             format!("{rows} rows in {elapsed:.2?}{limit_suffix}");
+                                        if let Some(note) = &sort_note {
+                                            view.status.push_str(&format!(" · {note}"));
+                                        }
                                         // G3 Task 3: record the run (previews
                                         // included — they run real SQL too).
                                         // Fire-and-forget; a write failure never
@@ -1003,7 +1039,17 @@ impl AppView {
         };
 
         match &active.content {
-            TabContent::Grid { grid, .. } => grid.clone().into_any_element(),
+            TabContent::Grid { grid, .. } => {
+                // G4 Task 2: `ResultGrid` doesn't own a status bar itself —
+                // `status_note` (currently just the large-sort "řadím…"
+                // marker set by `rebuild_view`) is the minimal seam for
+                // surfacing grid-originated notices in `AppView::status`.
+                // `take()`'d so it's shown exactly once, not stuck forever.
+                if let Some(note) = grid.update(cx, |g, _| g.status_note.take()) {
+                    self.status = note;
+                }
+                grid.clone().into_any_element()
+            }
             TabContent::Text { text, scroll_lines } => {
                 let lines: Vec<&str> = text.lines().collect();
                 let scroll = (*scroll_lines).min(lines.len());
