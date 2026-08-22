@@ -1,5 +1,5 @@
 //! Docker required. Run with: cargo test -p dbc-driver-postgres -- --ignored
-use dbc_core::{CancelToken, Connection};
+use dbc_core::{CancelToken, Connection, RoutineKind, TableKind};
 use dbc_driver_postgres::PostgresConnection;
 use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 
@@ -178,5 +178,128 @@ async fn decode_hazards_render_as_placeholders() {
         b.value(0),
         c_col.value(0),
         ok.value(0)
+    );
+}
+
+/// Full catalog snapshot: table+FK+index+view+matview+function+procedure+
+/// trigger+sequence, mirroring T2's sqlite fixture (same shapes, exercised
+/// against real Postgres catalogs this time).
+#[tokio::test]
+#[ignore]
+async fn schema_returns_full_catalog_snapshot() {
+    let node = Postgres::default().start().await.unwrap();
+    let url = pg_url(&node).await;
+
+    // Extended query protocol (what `PostgresConnection::query` uses via
+    // `prepare()`) can't Parse a string containing multiple statements, so
+    // the fixture DDL is loaded through a plain `tokio_postgres` connection
+    // via `batch_execute` (simple query protocol) instead — mirrors how the
+    // sqlite integration test builds its fixture directly through rusqlite
+    // rather than through the driver under test.
+    let (setup_client, setup_conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = setup_conn.await;
+    });
+    setup_client
+        .batch_execute(
+            "CREATE SEQUENCE cust_seq;
+             CREATE TABLE customers (
+                 id integer PRIMARY KEY DEFAULT nextval('cust_seq'),
+                 name text NOT NULL
+             );
+             CREATE TABLE orders (
+                 id integer PRIMARY KEY,
+                 customer_id integer NOT NULL REFERENCES customers(id),
+                 amount numeric DEFAULT 0,
+                 note text
+             );
+             CREATE INDEX orders_customer_idx ON orders(customer_id);
+             CREATE VIEW order_view AS
+                 SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id;
+             CREATE MATERIALIZED VIEW order_mv AS
+                 SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id;
+             CREATE FUNCTION add_nums(a integer, b integer) RETURNS integer AS
+                 $$ SELECT a + b $$ LANGUAGE sql;
+             CREATE PROCEDURE do_nothing() LANGUAGE sql AS $$ SELECT 1; $$;
+             CREATE FUNCTION orders_touch() RETURNS trigger AS
+                 $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;
+             CREATE TRIGGER orders_touch_trigger BEFORE INSERT ON orders
+                 FOR EACH ROW EXECUTE FUNCTION orders_touch();",
+        )
+        .await
+        .unwrap();
+
+    let mut c = PostgresConnection::connect(&url).await.unwrap();
+    let snap = c.schema().await.unwrap();
+
+    let customers = snap.tables.iter().find(|t| t.name == "customers").unwrap();
+    assert_eq!(customers.kind, TableKind::Table);
+    assert_eq!(customers.ddl, None, "tables have no server-side ddl; UI synthesizes it");
+    let cust_id = customers.columns.iter().find(|c| c.name == "id").unwrap();
+    assert!(cust_id.is_pk, "customers.id must be marked as the primary key");
+    assert!(
+        cust_id.default.as_deref().unwrap_or("").contains("nextval"),
+        "customers.id default should reference the sequence, got: {:?}",
+        cust_id.default
+    );
+
+    let orders = snap.tables.iter().find(|t| t.name == "orders").unwrap();
+    assert_eq!(orders.kind, TableKind::Table);
+    assert_eq!(orders.ddl, None);
+    let order_id = orders.columns.iter().find(|c| c.name == "id").unwrap();
+    assert!(order_id.is_pk, "orders.id must be marked as the primary key");
+    let cust_fk_col = orders.columns.iter().find(|c| c.name == "customer_id").unwrap();
+    assert!(!cust_fk_col.nullable, "customer_id is NOT NULL");
+    let fk = cust_fk_col.fk.as_ref().expect("customer_id should carry an FkRef");
+    assert_eq!(fk.table, "customers");
+    assert_eq!(fk.column, "id");
+    assert_eq!(fk.schema.as_deref(), Some("public"));
+
+    let idx = orders.indexes.iter().find(|i| i.name == "orders_customer_idx").unwrap();
+    assert_eq!(idx.columns, vec!["customer_id".to_string()]);
+    assert!(!idx.unique);
+
+    let fk_constraint = orders.constraints.iter().find(|c| c.kind == "FOREIGN KEY").unwrap();
+    assert!(fk_constraint.definition.contains("REFERENCES"));
+
+    let view = snap.tables.iter().find(|t| t.name == "order_view").unwrap();
+    assert_eq!(view.kind, TableKind::View);
+    assert!(
+        view.ddl.as_deref().unwrap_or("").contains("CREATE VIEW"),
+        "view ddl: {:?}",
+        view.ddl
+    );
+
+    let matview = snap.tables.iter().find(|t| t.name == "order_mv").unwrap();
+    assert_eq!(matview.kind, TableKind::MaterializedView);
+    assert!(
+        matview.ddl.as_deref().unwrap_or("").contains("CREATE MATERIALIZED VIEW"),
+        "matview ddl: {:?}",
+        matview.ddl
+    );
+
+    let func = snap.routines.iter().find(|r| r.name == "add_nums").unwrap();
+    assert_eq!(func.kind, RoutineKind::Function);
+    assert!(
+        func.ddl.as_deref().unwrap_or("").contains("CREATE OR REPLACE FUNCTION"),
+        "function ddl: {:?}",
+        func.ddl
+    );
+    assert!(func.signature.contains("integer"));
+
+    let proc = snap.routines.iter().find(|r| r.name == "do_nothing").unwrap();
+    assert_eq!(proc.kind, RoutineKind::Procedure);
+
+    let trigger = snap.triggers.iter().find(|t| t.name == "orders_touch_trigger").unwrap();
+    assert_eq!(trigger.table, "orders");
+    assert!(
+        trigger.ddl.as_deref().unwrap_or("").contains("CREATE TRIGGER"),
+        "trigger ddl: {:?}",
+        trigger.ddl
+    );
+
+    assert!(
+        snap.sequences.iter().any(|s| s.name == "cust_seq"),
+        "cust_seq should be listed among sequences"
     );
 }
