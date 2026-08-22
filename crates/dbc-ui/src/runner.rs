@@ -176,6 +176,78 @@ impl QueryRunner {
         });
         rx
     }
+
+    /// G4 Task 5: one-shot batched lookup for the ad-hoc-tab FK join path
+    /// (`fk_join::build_lookup_sql`'s output) — opens `spec` (same
+    /// `open_spec` dispatch as every other one-shot here), runs `sql`, and
+    /// drains the resulting `QueryStream` fully into materialized rows
+    /// (`Vec<Vec<Option<String>>>`, `None` = SQL NULL) rather than streaming
+    /// batches back — the caller (`AppView::start_lookup`) just needs a
+    /// small `HashMap<value, row>` built from the WHOLE result, not
+    /// incremental rendering. Draining goes through a throwaway
+    /// `dbc_buffer::ResultBuffer` (reusing its tested batch-push/cell-read
+    /// logic rather than re-implementing arrow value extraction here), and
+    /// is capped at `LOOKUP_ROW_CAP` rows defensively — a lookup query is
+    /// always `WHERE key IN (<= 1000 values)`, so a normal schema returns at
+    /// most one row per value; the cap only guards against a pathological
+    /// one-to-many FK "reference" or a misbehaving driver, not the expected
+    /// case.
+    pub fn fetch_lookup(
+        &self,
+        spec: ConnectSpec,
+        sql: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<LookupResult, QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            let result = fetch_lookup_inner(spec, sql, handle).await;
+            let _ = tx.send(result);
+        });
+        rx
+    }
+}
+
+/// Defensive cap on materialized lookup rows — see `QueryRunner::fetch_lookup`.
+const LOOKUP_ROW_CAP: usize = 100_000;
+
+/// `(column names, rows)` — `rows[r][c]` is `None` for a real SQL NULL.
+/// `rows[r][0]` is always the key column (see `fk_join::build_lookup_sql`,
+/// which puts it first); `rows[r][1..]` line up with the caller's
+/// `wanted_cols`, in order.
+type LookupResult = (Vec<String>, Vec<Vec<Option<String>>>);
+
+async fn fetch_lookup_inner(
+    spec: ConnectSpec,
+    sql: String,
+    handle: tokio::runtime::Handle,
+) -> Result<LookupResult, QueryError> {
+    let mut opened = open_spec(spec, handle).await?;
+    let mut stream = opened.conn.query(&sql, CancelToken::new()).await?;
+    let col_names: Vec<String> =
+        stream.columns.fields().iter().map(|f| f.name().to_string()).collect();
+    let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+    while let Some(item) = stream.batches.recv().await {
+        match item {
+            Ok(b) => {
+                buf.push(b).map_err(|e| QueryError::msg(e.to_string()))?;
+                if buf.row_count() >= LOOKUP_ROW_CAP {
+                    break;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let n = buf.row_count().min(LOOKUP_ROW_CAP);
+    let ncols = buf.column_count();
+    let mut rows = Vec::with_capacity(n);
+    for r in 0..n {
+        let mut row = Vec::with_capacity(ncols);
+        for c in 0..ncols {
+            row.push(if buf.cell_is_null(r, c) { None } else { Some(buf.cell_text(r, c)) });
+        }
+        rows.push(row);
+    }
+    Ok((col_names, rows))
 }
 
 /// Dispatches a `ConnectSpec` to the right driver inside `spawn_blocking`

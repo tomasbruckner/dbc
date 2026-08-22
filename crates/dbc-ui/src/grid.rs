@@ -1,15 +1,18 @@
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use dbc_buffer::ResultBuffer;
+use dbc_core::FkRef;
 use gpui::{
     actions, div, prelude::*, px, rgb, rgba, uniform_list, AnyElement, ClipboardItem, Context,
-    Entity, FocusHandle, Focusable, KeyBinding, ScrollDelta, ScrollStrategy, ScrollWheelEvent,
-    UniformListScrollHandle, Window,
+    Entity, EventEmitter, FocusHandle, Focusable, KeyBinding, ScrollDelta, ScrollStrategy,
+    ScrollWheelEvent, UniformListScrollHandle, Window,
 };
 
 use crate::connections_ui::TextField;
 use crate::export::{self, ExportFormat};
+use crate::fk_join::{self, JoinSpec, VirtualCol};
 use crate::row_view::{self, RowView};
 
 pub const ROW_HEIGHT: f32 = 24.0;
@@ -39,6 +42,36 @@ const LARGE_EXPORT_ROWS: usize = 50_000;
 const EXPORT_SNAPSHOT_CHUNK_ROWS: usize = 25_000;
 
 actions!(grid, [CopySelection, FindInResult, FindNext, FindPrev]);
+
+/// G4 Task 5: what a `ResultGrid` asks `main.rs` to DO on its behalf when the
+/// ☰ FK menu's checkboxes change — the grid itself has no connection/runner
+/// access (same reasoning `TreeEvent` and the export-dialog seam already
+/// follow: I/O stays in `main.rs`/`runner.rs`, the widget only decides
+/// intent). Carries everything `main.rs` needs to act without having to
+/// search `self.tabs` for "which tab is this" — for `RerunPreviewJoins` that
+/// means the whole preview identity (schema/table/key/title) travels with
+/// the event even though `main.rs` already "knows" it in principle, because
+/// the emitting grid is about to be REPLACED by a brand new grid entity
+/// (`Tabs::close_by_preview_key` + a fresh `cx.new(ResultGrid::new)` — see
+/// `QueryEvent::Started`), so there is no "this tab" to look up by the time
+/// the event is handled. `RunLookup` instead updates the SAME (never
+/// replaced) ad-hoc grid entity — `main.rs`'s subscribe closure captures the
+/// `emitter` handle for that.
+pub enum GridEvent {
+    RerunPreviewJoins {
+        schema: Option<String>,
+        table: String,
+        key: String,
+        title: String,
+        joins: Vec<JoinSpec>,
+    },
+    RunLookup {
+        sql: String,
+        ref_table: String,
+        wanted_cols: Vec<String>,
+        src_col: usize,
+    },
+}
 
 /// Bind ResultGrid's own keys. Scoped to the `"ResultGrid"` key context so
 /// ctrl-c only fires `CopySelection` while the grid (not `SqlInput`) is
@@ -180,6 +213,55 @@ pub struct ResultGrid {
     export_open: bool,
     /// "Sloupce ▾" dropdown open/closed.
     columns_open: bool,
+    // --- G4 Task 5: FK joined columns ---
+    /// By SOURCE column index (sized to `column_count()` in `set_buffer`,
+    /// same convention as `hidden_cols`) — `Some(fk)` marks a column as an
+    /// FK the ☰ menu can offer to join, populated by `main.rs` via
+    /// `set_fk_info` right after `set_buffer`/`set_table_name` (a preview
+    /// tab looks up the previewed `TableInfo`; an ad-hoc tab uses the
+    /// "exactly one snapshot table has all these column names" heuristic —
+    /// see `set_fk_info`'s doc comment).
+    fk_info: Vec<Option<FkRef>>,
+    /// Parallel to `fk_info`: the referenced table's column names (from the
+    /// same schema snapshot main.rs already has), precomputed at the same
+    /// time as `fk_info` rather than making the grid hold the whole
+    /// snapshot itself — the simplest of the two shapes the brief allows
+    /// (precompute vs. grid-emits-event-main-answers).
+    fk_ref_columns: Vec<Option<Vec<String>>>,
+    /// Which SOURCE column's ☰ dropdown is open, if any. Mutually exclusive
+    /// with `export_open`/`columns_open` (same "only one popover" rule).
+    fk_menu_open: Option<usize>,
+    /// By SOURCE column index (sized to `fk_info.len()`) — the ref-table
+    /// columns currently checked in that column's ☰ menu. Preview tabs: a
+    /// change here is what `build_active_joins` turns into the
+    /// `RerunPreviewJoins` event's `joins`. Ad-hoc tabs: a change here
+    /// drives `RunLookup`/`virtual_cols` for that one FK column only.
+    fk_checked: Vec<HashSet<String>>,
+    /// `true` once `set_preview_context` has been called — distinguishes
+    /// the PREVIEW re-run path (☰ toggle → `RerunPreviewJoins`) from the
+    /// AD-HOC lookup path (☰ toggle → `RunLookup` + `virtual_cols`) in
+    /// `toggle_fk_column`. `false` (the `set_buffer` default) for every
+    /// SQL-editor result.
+    is_preview: bool,
+    /// Preview-tab identity, set together by `set_preview_context` — `None`
+    /// on an ad-hoc tab. Threaded back out on `RerunPreviewJoins` since the
+    /// re-run replaces this very grid entity (see `GridEvent`'s doc
+    /// comment).
+    preview_schema: Option<String>,
+    preview_key: Option<String>,
+    preview_title: Option<String>,
+    /// PREVIEW tabs only: by SOURCE column index (sized to `fk_info.len()`
+    /// — i.e. to the CURRENT, post-join result's column count), `true` when
+    /// that column's header name is one of the active joins' `"{ref_table}.
+    /// {col}"` aliases — computed once by `apply_active_joins` right after
+    /// a (re-)run rather than re-derived every render. Drives the tinted
+    /// header/cell background (brief: bg 0x2a2a3d).
+    joined_cols: Vec<bool>,
+    /// AD-HOC tabs only: looked-up columns rendered AFTER the source
+    /// columns — see `fk_join::VirtualCol` and the module's
+    /// "effective-column" indexing doc comment (sources `0..n`, virtuals
+    /// `n..n+m`). Populated/replaced per-FK-column by `set_virtual_cols_for_src`.
+    virtual_cols: Vec<VirtualCol>,
 }
 
 impl ResultGrid {
@@ -204,6 +286,16 @@ impl ResultGrid {
             table_name: "export".to_string(),
             export_open: false,
             columns_open: false,
+            fk_info: Vec::new(),
+            fk_ref_columns: Vec::new(),
+            fk_menu_open: None,
+            fk_checked: Vec::new(),
+            is_preview: false,
+            preview_schema: None,
+            preview_key: None,
+            preview_title: None,
+            joined_cols: Vec::new(),
+            virtual_cols: Vec::new(),
         }
     }
 
@@ -229,6 +321,16 @@ impl ResultGrid {
         self.table_name = "export".to_string();
         self.export_open = false;
         self.columns_open = false;
+        self.fk_info = vec![None; ncols];
+        self.fk_ref_columns = vec![None; ncols];
+        self.fk_menu_open = None;
+        self.fk_checked = vec![HashSet::new(); ncols];
+        self.is_preview = false;
+        self.preview_schema = None;
+        self.preview_key = None;
+        self.preview_title = None;
+        self.joined_cols = vec![false; ncols];
+        self.virtual_cols = Vec::new();
     }
 
     /// Public seam (Task 4): called by `main.rs` right after `set_buffer`
@@ -237,6 +339,292 @@ impl ResultGrid {
     /// `table_name`'s doc comment) used for ad-hoc SQL-editor results.
     pub fn set_table_name(&mut self, name: String) {
         self.table_name = name;
+    }
+
+    /// G4 Task 5: marks this grid as a PREVIEW tab and records its identity
+    /// — called by `main.rs` right after `set_buffer`/`set_table_name` for a
+    /// preview (schema-tree/palette) tab, mirroring `set_table_name`'s "own
+    /// public seam" shape. `key`/`title` are exactly `PreviewTarget`'s
+    /// fields (see main.rs) — carried here only so `toggle_fk_column` can
+    /// hand them back out on `GridEvent::RerunPreviewJoins` (this grid
+    /// entity is about to be replaced by the re-run, see `GridEvent`'s doc
+    /// comment, so `main.rs` can't just "look up the active tab" when the
+    /// event arrives).
+    pub fn set_preview_context(&mut self, schema: Option<String>, key: String, title: String) {
+        self.is_preview = true;
+        self.preview_schema = schema;
+        self.preview_key = Some(key);
+        self.preview_title = Some(title);
+    }
+
+    /// G4 Task 5: FK metadata for the ☰ menu — `fk_info`/`ref_columns` are
+    /// parallel to the CURRENT result's columns (sized/ordered the same as
+    /// `buf.schema().fields()`), computed by `main.rs`:
+    /// - PREVIEW tabs: `fk_info[i]` is the previewed table's `ColumnInfo::fk`
+    ///   for the column named `fields[i].name()` (or `None` if the column
+    ///   has no such name in the base table — e.g. an already-joined
+    ///   `"ref.col"` alias from a previous re-run).
+    /// - AD-HOC tabs: matched against ALL snapshot tables that contain every
+    ///   result column name; if exactly one such table exists, its FK data
+    ///   is used the same way, otherwise `fk_info` stays all-`None` (brief:
+    ///   ambiguous match = no ☰, documented heuristic — a result that could
+    ///   plausibly come from two different tables with overlapping column
+    ///   sets doesn't get FK-menu treatment rather than guessing wrong).
+    ///
+    /// Resets `fk_checked` to empty (no columns joined yet) — callers that
+    /// need to restore a previous selection (a preview re-run) call
+    /// `apply_active_joins` right after this.
+    pub fn set_fk_info(&mut self, fk_info: Vec<Option<FkRef>>, ref_columns: Vec<Option<Vec<String>>>) {
+        self.fk_checked = vec![HashSet::new(); fk_info.len()];
+        self.fk_info = fk_info;
+        self.fk_ref_columns = ref_columns;
+    }
+
+    /// G4 Task 5, PREVIEW tabs only: restores `fk_checked` (so the ☰ menu
+    /// shows the right checkmarks after a re-run) and computes `joined_cols`
+    /// (tinting) from `joins` — the SAME join list that was just used to
+    /// build this result's SQL (`fk_join::build_join_sql`), matched back
+    /// against THIS result's actual columns: `fk_checked` by finding each
+    /// join's `fk_col` name among the base columns, `joined_cols` by
+    /// checking which header names equal one of the joins' `"{ref_table}.
+    /// {col}"` aliases (exactly the aliases `build_join_sql` emitted — a
+    /// column named that way is unambiguously "this session's join
+    /// output", not a coincidentally-dotted real column name, since none of
+    /// the drivers' catalog columns contain a literal `.`).
+    pub fn apply_active_joins(&mut self, joins: &[JoinSpec]) {
+        let Some(buf) = &self.buffer else { return };
+        let buf = buf.borrow();
+        let names: Vec<String> =
+            buf.schema().fields().iter().map(|f| f.name().to_string()).collect();
+        drop(buf);
+        for j in joins {
+            if let Some(ix) = names.iter().position(|n| n == &j.fk_col) {
+                if let Some(set) = self.fk_checked.get_mut(ix) {
+                    *set = j.cols.iter().cloned().collect();
+                }
+            }
+        }
+        let mut expected: HashSet<String> = HashSet::new();
+        for j in joins {
+            for c in &j.cols {
+                expected.insert(format!("{}.{}", j.ref_table, c));
+            }
+        }
+        self.joined_cols = names.iter().map(|n| expected.contains(n)).collect();
+    }
+
+    /// "☰" click (header, FK columns only). Mutually exclusive with
+    /// `export_open`/`columns_open`, same "only one popover" convention
+    /// `toggle_export_menu`/`toggle_columns_menu` already follow.
+    fn toggle_fk_menu(&mut self, col: usize, cx: &mut Context<Self>) {
+        self.fk_menu_open = if self.fk_menu_open == Some(col) { None } else { Some(col) };
+        self.export_open = false;
+        self.columns_open = false;
+        cx.notify();
+    }
+
+    /// Sum of the visible SOURCE column widths strictly before `col` — used
+    /// to roughly anchor the ☰ dropdown under its own column instead of
+    /// always in one fixed spot like `export`/`columns` menus (whose
+    /// triggers live in the fixed toolbar, not a column that can be
+    /// anywhere in a wide, scrolled header).
+    fn fk_menu_left_offset(&self, col: usize) -> f32 {
+        let mut x = 0.0;
+        for i in 0..col.min(self.hidden_cols.len()) {
+            if !self.hidden_cols.get(i).copied().unwrap_or(false) {
+                x += self.col_widths.get(i).copied().unwrap_or(DEFAULT_COL_WIDTH);
+            }
+        }
+        x
+    }
+
+    /// A ☰-menu checkbox click for `col`'s `ref_col`. Toggles membership in
+    /// `fk_checked[col]`, then dispatches per tab kind (brief contract #2 vs
+    /// #3):
+    /// - PREVIEW: rebuilds the FULL active-join list across every FK column
+    ///   (not just `col` — `build_join_sql` needs the complete set for one
+    ///   SQL rewrite) and emits `RerunPreviewJoins`; `main.rs` re-runs
+    ///   through the normal preview pipeline, which replaces this tab.
+    /// - AD-HOC: unchecking down to zero columns for `col` just clears its
+    ///   `virtual_cols` locally (no query needed — nothing left to show).
+    ///   Otherwise collects the CURRENT VIEW's distinct `col` values (capped
+    ///   at 1000, brief contract #3) and emits `RunLookup`; an over-cap
+    ///   result aborts locally with the brief's exact status text instead of
+    ///   firing a query at all.
+    fn toggle_fk_column(&mut self, col: usize, ref_col: String, cx: &mut Context<Self>) {
+        let Some(set) = self.fk_checked.get_mut(col) else { return };
+        if !set.remove(&ref_col) {
+            set.insert(ref_col);
+        }
+        let checked_ordered: Vec<String> = self
+            .fk_ref_columns
+            .get(col)
+            .and_then(|o| o.as_ref())
+            .map(|all| {
+                all.iter().filter(|c| self.fk_checked[col].contains(*c)).cloned().collect()
+            })
+            .unwrap_or_default();
+
+        if self.is_preview {
+            let joins = self.build_active_joins();
+            cx.emit(GridEvent::RerunPreviewJoins {
+                schema: self.preview_schema.clone(),
+                table: self.table_name.clone(),
+                key: self.preview_key.clone().unwrap_or_default(),
+                title: self.preview_title.clone().unwrap_or_default(),
+                joins,
+            });
+            cx.notify();
+            return;
+        }
+
+        if checked_ordered.is_empty() {
+            self.virtual_cols.retain(|v| v.src_col != col);
+            self.sync_virtual_aux(cx);
+            cx.notify();
+            return;
+        }
+        let Some(fk) = self.fk_info.get(col).cloned().flatten() else { return };
+        let Some(distinct) = self.collect_distinct_fk_values(col) else {
+            self.status_note = Some("příliš mnoho hodnot pro dočasný join".to_string());
+            cx.notify();
+            return;
+        };
+        if distinct.is_empty() {
+            // Nothing to look up (every visible value is NULL, or the view
+            // is empty) — clear rather than firing a pointless `IN ()`.
+            self.virtual_cols.retain(|v| v.src_col != col);
+            self.sync_virtual_aux(cx);
+            cx.notify();
+            return;
+        }
+        let sql = fk_join::build_lookup_sql(
+            fk.schema.as_deref(),
+            &fk.table,
+            &fk.column,
+            &checked_ordered,
+            &distinct,
+        );
+        cx.emit(GridEvent::RunLookup {
+            sql,
+            ref_table: fk.table.clone(),
+            wanted_cols: checked_ordered,
+            src_col: col,
+        });
+        cx.notify();
+    }
+
+    /// PREVIEW tabs: rebuilds the complete `JoinSpec` list from `fk_info` +
+    /// `fk_checked` across EVERY fk column (not just the one that was just
+    /// toggled) — `build_join_sql` needs the whole set to emit one SQL
+    /// rewrite with every active join, since a re-run replaces the entire
+    /// query rather than adding one `LEFT JOIN` incrementally.
+    fn build_active_joins(&self) -> Vec<JoinSpec> {
+        let Some(buf) = &self.buffer else { return Vec::new() };
+        let buf = buf.borrow();
+        let mut joins = Vec::new();
+        for (i, fk) in self.fk_info.iter().enumerate() {
+            let Some(fk) = fk else { continue };
+            let Some(checked) = self.fk_checked.get(i) else { continue };
+            if checked.is_empty() {
+                continue;
+            }
+            let cols: Vec<String> = self
+                .fk_ref_columns
+                .get(i)
+                .and_then(|o| o.as_ref())
+                .map(|all| all.iter().filter(|c| checked.contains(*c)).cloned().collect())
+                .unwrap_or_default();
+            if cols.is_empty() {
+                continue;
+            }
+            let Some(field) = buf.schema().fields().get(i) else { continue };
+            joins.push(JoinSpec {
+                fk_col: field.name().to_string(),
+                ref_schema: fk.schema.clone(),
+                ref_table: fk.table.clone(),
+                ref_key: fk.column.clone(),
+                cols,
+            });
+        }
+        joins
+    }
+
+    /// AD-HOC tabs: distinct values of SOURCE column `col` over the CURRENT
+    /// VIEW (brief contract #3 — filtered/sorted rows the user is actually
+    /// looking at, not the whole underlying result), capped at 1000 via
+    /// `fk_join::collect_distinct_capped`. `None` = over cap.
+    fn collect_distinct_fk_values(&self, col: usize) -> Option<Vec<String>> {
+        let buf = self.buffer.clone()?;
+        let mut buf = buf.borrow_mut();
+        let n = self.view.len();
+        let values: Vec<Option<String>> = (0..n)
+            .map(|r| {
+                let source_row = self.view.source_row(r);
+                if buf.cell_is_null(source_row, col) {
+                    None
+                } else {
+                    Some(buf.cell_text(source_row, col))
+                }
+            })
+            .collect();
+        fk_join::collect_distinct_capped(values, 1000)
+    }
+
+    /// AD-HOC tabs: replaces every `virtual_cols` entry whose `src_col ==
+    /// col` with `new_cols` (a fresh lookup always supersedes — the
+    /// checkbox set it was built from IS the full desired state for that FK
+    /// column, not an incremental add) and re-syncs the width/filter
+    /// plumbing that's sized to the effective (source + virtual) column
+    /// count (see `sync_virtual_aux`).
+    pub fn set_virtual_cols_for_src(&mut self, col: usize, new_cols: Vec<VirtualCol>, cx: &mut Context<Self>) {
+        self.virtual_cols.retain(|v| v.src_col != col);
+        self.virtual_cols.extend(new_cols);
+        self.sync_virtual_aux(cx);
+    }
+
+    /// Keeps `col_widths`/`filter_inputs`/`filter_cache` sized to the
+    /// EFFECTIVE column count (`ncols + virtual_cols.len()`, see the
+    /// `fk_join` module doc comment) after `virtual_cols` changes. Source
+    /// portion (`0..ncols`) is left untouched; the virtual portion is
+    /// dropped and rebuilt from scratch each time — simpler than diffing,
+    /// and cheap since `virtual_cols` is small (one entry per checked
+    /// ref-column) and this only runs on a checkbox click, never per-frame.
+    /// Rebuilding loses any per-virtual-column width a user had dragged,
+    /// which is an accepted, documented trade-off (Task 5 scope) rather
+    /// than an oversight.
+    fn sync_virtual_aux(&mut self, cx: &mut Context<Self>) {
+        let ncols = self.buffer.as_ref().map_or(0, |b| b.borrow().column_count());
+        let total = ncols + self.virtual_cols.len();
+        self.col_widths.truncate(ncols);
+        self.col_widths.resize(total, DEFAULT_COL_WIDTH);
+        self.filter_inputs.truncate(ncols);
+        self.filter_cache.truncate(ncols);
+        while self.filter_inputs.len() < total {
+            self.filter_inputs.push(cx.new(|cx| TextField::new(cx, "filtr…", false)));
+            self.filter_cache.push(String::new());
+        }
+        // A source-column filter/sort surviving a virtual-column add/remove
+        // is unaffected (indices `< ncols` never move); but a filter/sort
+        // that was targeting a NOW-DROPPED virtual index would silently
+        // point at a different (or no) column — clear anything targeting
+        // the virtual range so a stale index can't linger. Only a genuine
+        // clear triggers a full `rebuild_view` (which can change row
+        // order/count); otherwise this is a column-shape-only change with
+        // the same "don't flash řadím… for a mere UI toggle" reasoning
+        // `toggle_column_visibility` already documents — a plain
+        // `view_generation` bump is enough to invalidate `find`'s cache.
+        let had_filter = self.view.filters.iter().any(|(c, _)| *c >= ncols);
+        self.view.filters.retain(|(c, _)| *c < ncols);
+        let had_sort = self.view.sort.is_some_and(|(c, _)| c >= ncols);
+        if had_sort {
+            self.view.sort = None;
+        }
+        if had_filter || had_sort {
+            self.rebuild_view();
+        } else {
+            self.view_generation += 1;
+        }
     }
 
     /// Re-derives `view.order` from the current buffer contents. Sets
@@ -248,8 +636,14 @@ impl ResultGrid {
         let rows = buf.borrow().row_count();
         self.status_note =
             if rows > LARGE_SORT_ROWS { Some("řadím…".to_string()) } else { None };
+        let ncols = buf.borrow().column_count();
+        // G4 Task 5: `virtual_cols` borrowed as its OWN field (disjoint from
+        // `self.view`, which `self.view.rebuild(..)` below borrows
+        // mutably) — see `effective_text`'s doc comment for why this has to
+        // be a free function taking both pieces separately.
+        let virtual_cols = &self.virtual_cols;
         let mut buf = buf.borrow_mut();
-        self.view.rebuild(rows, &mut |r, c| buf.cell_text(r, c));
+        self.view.rebuild(rows, &mut |r, c| effective_text(ncols, virtual_cols, &mut buf, r, c));
         drop(buf);
         // G4 Task 3: any active find's `matches` were computed against the
         // PREVIOUS display order — bump so `toolbar`'s staleness check
@@ -430,14 +824,21 @@ impl ResultGrid {
         if query == f.last_query && f.computed_generation == self.view_generation {
             return;
         }
-        let visible_cols: Vec<usize> =
-            (0..self.hidden_cols.len()).filter(|&c| !self.hidden_cols.get(c).copied().unwrap_or(false)).collect();
+        let ncols = self.hidden_cols.len();
+        // G4 Task 5: visible SOURCE columns, same as before, PLUS every
+        // virtual column — those have no `hidden_cols` entry (never
+        // hideable, see `virtual_cols`' doc comment) so they're always
+        // included, matching the brief's "find must see virtual columns".
+        let mut visible_cols: Vec<usize> =
+            (0..ncols).filter(|&c| !self.hidden_cols.get(c).copied().unwrap_or(false)).collect();
+        visible_cols.extend(ncols..ncols + self.virtual_cols.len());
         let rows = self.view.len();
         let gen = self.view_generation;
         // Capped scan (Task 3 review issue 2): synchronous per-keystroke
         // work on the UI thread must be bounded for huge/spilled results.
         let (matches, capped) = if let Some(buf) = self.buffer.clone() {
             let view = &self.view;
+            let virtual_cols = &self.virtual_cols;
             let mut buf = buf.borrow_mut();
             row_view::find_matches_capped(
                 rows,
@@ -445,7 +846,7 @@ impl ResultGrid {
                 &query,
                 FIND_MAX_ROWS,
                 FIND_MAX_MATCHES,
-                &mut |r, c| buf.cell_text(view.source_row(r), c),
+                &mut |r, c| effective_text(ncols, virtual_cols, &mut buf, view.source_row(r), c),
             )
         } else {
             (Vec::new(), false)
@@ -491,6 +892,7 @@ impl ResultGrid {
         self.export_open = !self.export_open;
         if self.export_open {
             self.columns_open = false;
+            self.fk_menu_open = None;
         }
         cx.notify();
     }
@@ -500,6 +902,7 @@ impl ResultGrid {
         self.columns_open = !self.columns_open;
         if self.columns_open {
             self.export_open = false;
+            self.fk_menu_open = None;
         }
         cx.notify();
     }
@@ -567,6 +970,13 @@ impl ResultGrid {
             }
             headers.push(field.name().clone());
             cols.push(i);
+        }
+        // G4 Task 5: virtual columns are never hideable — always included
+        // in exports, same "find/copy see them too" treatment.
+        let ncols = buf.column_count();
+        for (vi, vcol) in self.virtual_cols.iter().enumerate() {
+            headers.push(vcol.name.clone());
+            cols.push(ncols + vi);
         }
         (headers, cols)
     }
@@ -707,16 +1117,24 @@ impl ResultGrid {
                     if !Rc::ptr_eq(&current_buf, &buf) || g.view_generation != view_generation {
                         return None;
                     }
+                    // G4 Task 5: `cols` (from `export_headers_and_cols`) may
+                    // include virtual-column indices (`>= ncols`) — route
+                    // every read through `effective_is_null`/`effective_text`
+                    // so those export the looked-up value (and a real NULL
+                    // when unmatched) instead of panicking/reading garbage
+                    // past the real buffer's column count.
+                    let ncols = g.buffer.as_ref().map_or(0, |b| b.borrow().column_count());
+                    let virtual_cols = &g.virtual_cols;
                     let mut buf_mut = buf.borrow_mut();
                     let mut chunk_rows = Vec::with_capacity(chunk_end - row);
                     for r in row..chunk_end {
                         let source_row = g.view.source_row(r);
                         let mut vals = Vec::with_capacity(cols.len());
                         for &c in &cols {
-                            let val = if buf_mut.cell_is_null(source_row, c) {
+                            let val = if effective_is_null(ncols, virtual_cols, &mut buf_mut, source_row, c) {
                                 None
                             } else {
-                                Some(buf_mut.cell_text(source_row, c))
+                                Some(effective_text(ncols, virtual_cols, &mut buf_mut, source_row, c))
                             };
                             vals.push(val);
                         }
@@ -794,9 +1212,11 @@ impl ResultGrid {
         };
         let (rmin, rmax) = (r0.min(r1), r0.max(r1));
         let (cmin, cmax) = (c0.min(c1), c0.max(c1));
-        let Some(buf) = &self.buffer else {
+        let Some(buf) = self.buffer.clone() else {
             return;
         };
+        let ncols = buf.borrow().column_count();
+        let virtual_cols = &self.virtual_cols;
         let mut buf = buf.borrow_mut();
         let mut out = String::new();
         for r in rmin..=rmax {
@@ -806,14 +1226,17 @@ impl ResultGrid {
             let source_row = self.view.source_row(r);
             let mut first_col = true;
             for c in cmin..=cmax {
-                if self.hidden_cols.get(c).copied().unwrap_or(false) {
+                // G4 Task 5: hidden_cols only covers SOURCE columns
+                // (`c < ncols`) — virtual columns (`c >= ncols`) are never
+                // hideable, so they're always copied, same as `find`.
+                if c < ncols && self.hidden_cols.get(c).copied().unwrap_or(false) {
                     continue;
                 }
                 if !first_col {
                     out.push('\t');
                 }
                 first_col = false;
-                out.push_str(&buf.cell_text(source_row, c));
+                out.push_str(&effective_text(ncols, virtual_cols, &mut buf, source_row, c));
             }
         }
         cx.write_to_clipboard(ClipboardItem::new_string(out));
@@ -938,16 +1361,21 @@ impl ResultGrid {
     /// an entry for them.
     fn filter_row(&self) -> impl IntoElement {
         let mut row = div().flex().flex_row().bg(rgb(0x181825));
-        if let Some(buf) = &self.buffer {
-            let ncols = buf.borrow().column_count();
-            for i in 0..ncols {
+        if self.buffer.is_some() {
+            // G4 Task 5: `filter_inputs`/`filter_cache` are kept sized to
+            // the EFFECTIVE column count by `sync_virtual_aux` — iterating
+            // the whole thing (rather than just `buf.column_count()`)
+            // naturally picks up virtual-column filter inputs too. Hidden
+            // only applies to the source range (`hidden_cols.get(i)` is
+            // `None`, i.e. "not hidden", past it).
+            for i in 0..self.filter_inputs.len() {
                 if self.hidden_cols.get(i).copied().unwrap_or(false) {
                     continue;
                 }
                 if let Some(input) = self.filter_inputs.get(i) {
                     row = row.child(
                         div()
-                            .w(px(self.col_widths[i]))
+                            .w(px(self.col_widths.get(i).copied().unwrap_or(DEFAULT_COL_WIDTH)))
                             .h(px(ROW_HEIGHT))
                             .px_1()
                             .child(input.clone()),
@@ -1171,68 +1599,244 @@ impl ResultGrid {
     /// also fires a sort toggle.
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut row = div().flex().flex_row().bg(rgb(0x313244)).text_color(rgb(0xf9e2af));
-        if let Some(buf) = &self.buffer {
-            let buf = buf.borrow();
-            for (i, field) in buf.schema().fields().iter().enumerate() {
-                if self.hidden_cols.get(i).copied().unwrap_or(false) {
-                    continue;
-                }
-                let mut label = field.name().clone();
-                match self.view.sort {
-                    Some((c, true)) if c == i => label.push_str(" \u{25B2}"), // ▲
-                    Some((c, false)) if c == i => label.push_str(" \u{25BC}"), // ▼
-                    _ => {}
-                }
-                // Resize handle overlays the last 5px of the column (absolute,
-                // anchored to the right edge) instead of adding extra width
-                // after the cell — that would push header columns out of
-                // alignment with the (handle-less) data columns below as the
-                // column index grows.
-                row = row.child(
+        let Some(buf) = &self.buffer else { return row };
+        let buf = buf.borrow();
+        let ncols = buf.column_count();
+        for (i, field) in buf.schema().fields().iter().enumerate() {
+            if self.hidden_cols.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let mut label = field.name().clone();
+            match self.view.sort {
+                Some((c, true)) if c == i => label.push_str(" \u{25B2}"), // ▲
+                Some((c, false)) if c == i => label.push_str(" \u{25BC}"), // ▼
+                _ => {}
+            }
+            // G4 Task 5: joined columns (preview re-run output) render
+            // tinted (brief: bg 0x2a2a3d).
+            let joined = self.joined_cols.get(i).copied().unwrap_or(false);
+            let bg = if joined { rgb(0x2a2a3d) } else { rgb(0x313244) };
+            // ☰ only on columns the ☰-menu can actually do something with —
+            // `fk_info[i].is_some()`.
+            let has_fk = matches!(self.fk_info.get(i), Some(Some(_)));
+            // Resize handle overlays the last 5px of the column (absolute,
+            // anchored to the right edge) instead of adding extra width
+            // after the cell — that would push header columns out of
+            // alignment with the (handle-less) data columns below as the
+            // column index grows.
+            let mut cell = div()
+                .relative()
+                .w(px(self.col_widths[i]))
+                .h(px(ROW_HEIGHT))
+                .bg(bg)
+                .child(
                     div()
-                        .relative()
-                        .w(px(self.col_widths[i]))
+                        .id(("header-label", i))
+                        .px_2()
                         .h(px(ROW_HEIGHT))
-                        .child(
-                            div()
-                                .id(("header-label", i))
-                                .px_2()
-                                .h(px(ROW_HEIGHT))
-                                .overflow_hidden()
-                                .cursor_pointer()
-                                .child(label)
-                                .on_click(cx.listener(move |this, _e, _w, cx| {
-                                    this.on_header_click(i, cx);
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id(("resize", i))
-                                .absolute()
-                                .top_0()
-                                .right_0()
-                                .w(px(5.))
-                                .h(px(ROW_HEIGHT))
-                                // Blocks the label's hitbox underneath —
-                                // without this a resize drag ALSO fires the
-                                // label's on_click and toggles the sort
-                                // (Task 2 review issue 1).
-                                .occlude()
-                                .cursor_col_resize()
-                                .on_mouse_down(
-                                    gpui::MouseButton::Left,
-                                    cx.listener(move |this, e: &gpui::MouseDownEvent, _w, cx| {
-                                        this.resizing =
-                                            Some((i, f32::from(e.position.x), this.col_widths[i]));
-                                        cx.notify();
-                                    }),
-                                ),
+                        .overflow_hidden()
+                        .cursor_pointer()
+                        .child(label)
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.on_header_click(i, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .id(("resize", i))
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .w(px(5.))
+                        .h(px(ROW_HEIGHT))
+                        // Blocks the label's hitbox underneath —
+                        // without this a resize drag ALSO fires the
+                        // label's on_click and toggles the sort
+                        // (Task 2 review issue 1).
+                        .occlude()
+                        .cursor_col_resize()
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, e: &gpui::MouseDownEvent, _w, cx| {
+                                this.resizing =
+                                    Some((i, f32::from(e.position.x), this.col_widths[i]));
+                                cx.notify();
+                            }),
                         ),
                 );
+            if has_fk {
+                cell = cell.child(
+                    div()
+                        .id(("fk-menu-btn", i))
+                        .absolute()
+                        .top_0()
+                        .right(px(7.))
+                        .w(px(12.))
+                        .h(px(ROW_HEIGHT))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        // Blocks the label's hitbox underneath, same
+                        // reasoning as the resize handle above — otherwise
+                        // clicking ☰ would ALSO toggle the column's sort.
+                        .occlude()
+                        .child("☰")
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.toggle_fk_menu(i, cx);
+                        })),
+                );
             }
+            row = row.child(cell);
+        }
+        // G4 Task 5: virtual columns render AFTER every source column
+        // (brief), always tinted (there's no "un-joined" virtual column),
+        // sortable/clickable exactly like a source column via the same
+        // effective column index (`ncols + vi`) — `on_header_click`/
+        // `rebuild_view` don't distinguish source vs. virtual at all.
+        for (vi, vcol) in self.virtual_cols.iter().enumerate() {
+            let col_ix = ncols + vi;
+            let mut label = vcol.name.clone();
+            match self.view.sort {
+                Some((c, true)) if c == col_ix => label.push_str(" \u{25B2}"),
+                Some((c, false)) if c == col_ix => label.push_str(" \u{25BC}"),
+                _ => {}
+            }
+            row = row.child(
+                div()
+                    .w(px(self.col_widths.get(col_ix).copied().unwrap_or(DEFAULT_COL_WIDTH)))
+                    .h(px(ROW_HEIGHT))
+                    .bg(rgb(0x2a2a3d))
+                    .child(
+                        div()
+                            .id(("header-label-v", vi))
+                            .px_2()
+                            .h(px(ROW_HEIGHT))
+                            .overflow_hidden()
+                            .cursor_pointer()
+                            .child(label)
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.on_header_click(col_ix, cx);
+                            })),
+                    ),
+            );
         }
         row
     }
+
+    /// ☰-menu dropdown (brief contract #1): "Přidat sloupce z {ref_table}"
+    /// listing the referenced table's columns (`fk_ref_columns`, from the
+    /// schema snapshot `main.rs` already has — see `set_fk_info`'s doc
+    /// comment) with checkboxes reflecting `fk_checked[col]`. Same overlay
+    /// shape/`.occlude()`+`on_mouse_down_out` convention as
+    /// `render_export_menu_overlay`/`render_columns_menu_overlay`, anchored
+    /// under its own column via `fk_menu_left_offset` rather than a fixed
+    /// toolbar position (this menu's trigger can be anywhere in a wide,
+    /// scrolled header, unlike Export/Sloupce which live in the fixed
+    /// toolbar).
+    fn render_fk_menu_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let col = self.fk_menu_open?;
+        let fk = self.fk_info.get(col)?.clone()?;
+        let ref_cols = self.fk_ref_columns.get(col).cloned().flatten().unwrap_or_default();
+        let checked = self.fk_checked.get(col).cloned().unwrap_or_default();
+        let left = self.fk_menu_left_offset(col);
+        let top = if self.filters_open { ROW_HEIGHT * 2.0 } else { ROW_HEIGHT };
+        let mut panel = div()
+            .id("fk-menu")
+            .absolute()
+            .top(px(top))
+            .left(px(left))
+            .w(px(220.))
+            .max_h(px(320.))
+            .overflow_hidden()
+            .bg(rgb(0x1e1e2e))
+            .border_1()
+            .border_color(rgb(0x45475a))
+            .rounded_md()
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_color(rgb(0xcdd6f4))
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.fk_menu_open = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .px_2()
+                    .text_color(rgb(0xa6adc8))
+                    .child(format!("Přidat sloupce z {}", fk.table)),
+            );
+        for c in ref_cols {
+            let is_checked = checked.contains(&c);
+            let c_for_click = c.clone();
+            panel = panel.child(
+                div()
+                    .id(gpui::SharedString::from(format!("fk-item-{col}-{c}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x313244)))
+                    .child(if is_checked { "☑" } else { "☐" })
+                    .child(c)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_fk_column(col, c_for_click.clone(), cx);
+                    })),
+            );
+        }
+        Some(panel.into_any_element())
+    }
+}
+
+/// G4 Task 5: effective-column (`fk_join`'s "sources 0..n, virtuals
+/// n..n+m") text accessor over a REAL `ResultBuffer` — every non-render
+/// consumer (`rebuild_view`'s sort/filter closure, `poll_find`, `on_copy`,
+/// export) reads cells through this instead of `buf.cell_text` directly,
+/// which is the entire mechanism by which they "see" virtual columns for
+/// free (per `fk_join::effective_cell_text`'s doc comment: swap the
+/// closure's inner call). Free function (not a `ResultGrid` method) so
+/// callers can pass `&self.virtual_cols` (one field, immutably) alongside a
+/// SEPARATELY held `&mut ResultBuffer` (either `self.buffer`'s own
+/// `RefCell` borrow, or — inside `rebuild_view` — while `self.view` is ALSO
+/// borrowed mutably via `self.view.rebuild(..)`); a method taking `&mut
+/// self` would conflict with that partial borrow, a free function taking
+/// disjoint pieces does not.
+fn effective_text(
+    ncols: usize,
+    virtual_cols: &[VirtualCol],
+    buf: &mut ResultBuffer,
+    source_row: usize,
+    col: usize,
+) -> String {
+    fk_join::effective_cell_text(ncols, virtual_cols, &mut |r, c| buf.cell_text(r, c), source_row, col)
+}
+
+/// Null-aware companion to `effective_text` (same "None = real SQL NULL"
+/// convention `ResultBuffer::cell_is_null` uses for source columns) — used
+/// only by `start_export`'s snapshot loop, which needs to tell a genuine
+/// NULL apart from an empty string for JSON/`INSERT` export. A virtual
+/// cell is NULL when its fk value has no matching ref row at all OR the
+/// matched row's joined value is itself NULL — both cases `fk_join::
+/// VirtualCol::map` represents as "no `Some(Some(_))` entry".
+fn effective_is_null(
+    ncols: usize,
+    virtual_cols: &[VirtualCol],
+    buf: &mut ResultBuffer,
+    source_row: usize,
+    col: usize,
+) -> bool {
+    if col < ncols {
+        return buf.cell_is_null(source_row, col);
+    }
+    let Some(vcol) = virtual_cols.get(col - ncols) else { return true };
+    let fk_val = buf.cell_text(source_row, vcol.src_col);
+    !matches!(vcol.map.get(&fk_val), Some(Some(_)))
 }
 
 /// Unix-seconds timestamp used to name a `start_export` Downloads fallback
@@ -1289,6 +1893,10 @@ impl Focusable for ResultGrid {
     }
 }
 
+/// G4 Task 5: lets `main.rs` `cx.subscribe(&grid, AppView::on_grid_event)`
+/// per grid entity — see `GridEvent`'s doc comment.
+impl EventEmitter<GridEvent> for ResultGrid {}
+
 impl Render for ResultGrid {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let buffer = self.buffer.clone();
@@ -1339,6 +1947,11 @@ impl Render for ResultGrid {
                     if let Some(buf) = &buffer {
                         let mut buf = buf.borrow_mut();
                         let ncols = buf.column_count();
+                        // G4 Task 5: effective column range — source columns
+                        // `0..ncols` unchanged, then every virtual column
+                        // (`ncols..ncols+virtual_cols.len()`), never
+                        // hideable (see `virtual_cols`' doc comment).
+                        let effective_ncols = ncols + this.virtual_cols.len();
                         for row_ix in range {
                             let source_row = this.view.source_row(row_ix);
                             let mut row = div()
@@ -1347,10 +1960,24 @@ impl Render for ResultGrid {
                                 .flex_row()
                                 .h(px(ROW_HEIGHT))
                                 .bg(if row_ix % 2 == 0 { rgb(0x1e1e2e) } else { rgb(0x232334) });
-                            for col in 0..ncols {
-                                if this.hidden_cols.get(col).copied().unwrap_or(false) {
+                            for col in 0..effective_ncols {
+                                if col < ncols && this.hidden_cols.get(col).copied().unwrap_or(false) {
                                     continue;
                                 }
+                                let is_virtual = col >= ncols;
+                                let text = if !is_virtual {
+                                    buf.cell_text(source_row, col)
+                                } else {
+                                    let vcol = &this.virtual_cols[col - ncols];
+                                    let fk_val = buf.cell_text(source_row, vcol.src_col);
+                                    fk_join::virtual_cell_text(&fk_val, &vcol.map)
+                                };
+                                // G4 Task 5: joined (preview) / virtual
+                                // (ad-hoc) columns render tinted (brief: bg
+                                // 0x2a2a3d) — checked before selection/find
+                                // so those still take visual priority below.
+                                let joined = is_virtual
+                                    || this.joined_cols.get(col).copied().unwrap_or(false);
                                 let selected = this.is_selected(row_ix, col);
                                 // G4 Task 3: the current find match gets its
                                 // own distinct bg, taking priority over the
@@ -1362,7 +1989,7 @@ impl Render for ResultGrid {
                                     == Some((row_ix, col));
                                 let mut cell = div()
                                     .id(("cell", row_ix * 10_000 + col))
-                                    .w(px(widths[col]))
+                                    .w(px(widths.get(col).copied().unwrap_or(DEFAULT_COL_WIDTH)))
                                     .px_2()
                                     .overflow_hidden()
                                     .text_color(rgb(0xcdd6f4))
@@ -1378,11 +2005,28 @@ impl Render for ResultGrid {
                                             // `view` rather than capturing
                                             // the render-time `source_row`,
                                             // in case sort/filter changed
-                                            // between render and click.
+                                            // between render and click. G4
+                                            // Task 5: a virtual column has no
+                                            // real buffer cell — its detail
+                                            // text is the same
+                                            // `virtual_cell_text` lookup the
+                                            // row rendering above used.
                                             if e.click_count >= 2 {
                                                 if let Some(buf) = this.buffer.clone() {
                                                     let source_row = this.view.source_row(row_ix);
-                                                    let text = buf.borrow_mut().cell_text(source_row, col);
+                                                    let ncols = buf.borrow().column_count();
+                                                    let text = if col < ncols {
+                                                        buf.borrow_mut().cell_text(source_row, col)
+                                                    } else if let Some(vcol) =
+                                                        this.virtual_cols.get(col - ncols).cloned()
+                                                    {
+                                                        let fk_val = buf
+                                                            .borrow_mut()
+                                                            .cell_text(source_row, vcol.src_col);
+                                                        fk_join::virtual_cell_text(&fk_val, &vcol.map)
+                                                    } else {
+                                                        String::new()
+                                                    };
                                                     this.cell_detail =
                                                         Some(CellDetail { text, scroll_lines: 0 });
                                                 }
@@ -1403,11 +2047,13 @@ impl Render for ResultGrid {
                                             cx.notify();
                                         }),
                                     )
-                                    .child(buf.cell_text(source_row, col));
+                                    .child(text);
                                 if is_find_match {
                                     cell = cell.bg(rgb(0x585b70));
                                 } else if selected {
                                     cell = cell.bg(rgb(0x45475a));
+                                } else if joined {
+                                    cell = cell.bg(rgb(0x2a2a3d));
                                 }
                                 row = row.child(cell);
                             }
@@ -1453,6 +2099,11 @@ impl Render for ResultGrid {
         }
         if has_buffer && self.columns_open {
             root = root.child(self.render_columns_menu_overlay(cx));
+        }
+        if has_buffer && self.fk_menu_open.is_some() {
+            if let Some(overlay) = self.render_fk_menu_overlay(cx) {
+                root = root.child(overlay);
+            }
         }
 
         if let Some(overlay) = self.render_cell_detail_overlay(cx) {

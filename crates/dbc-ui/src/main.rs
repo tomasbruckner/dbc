@@ -1,6 +1,7 @@
 mod connect;
 mod connections_ui;
 mod export;
+mod fk_join;
 mod grid;
 mod history_panel;
 mod palette;
@@ -17,7 +18,10 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use dbc_buffer::ResultBuffer;
-use dbc_core::{apply_auto_limit, is_read_statement, quote_qualified, CancelToken, QueryError};
+use dbc_core::{
+    apply_auto_limit, is_read_statement, quote_qualified, CancelToken, FkRef, QueryError,
+    SchemaSnapshot, TableInfo,
+};
 use dbc_state::{AppConfig, HistoryDb, HistoryEntry, Vault};
 use gpui::{
     actions, div, prelude::*, px, rgb, rgba, size, AnyElement, App, Bounds, ClipboardItem,
@@ -25,7 +29,7 @@ use gpui::{
     WindowOptions,
 };
 use gpui_platform::application;
-use grid::ResultGrid;
+use grid::{GridEvent, ResultGrid};
 use palette::{PaletteAction, PaletteItem};
 use runner::{ConnectSpec, QueryEvent, QueryRunner};
 use schema_tree::{SchemaTree, TreeEvent};
@@ -58,6 +62,37 @@ fn preview_sql(schema: Option<&str>, table: &str) -> String {
     format!("SELECT * FROM {} LIMIT 1000", quote_qualified(schema, table))
 }
 
+/// G4 Task 5: shared per-column FK lookup against an already-resolved
+/// `TableInfo` (either the previewed table, or `fk_info_for_adhoc`'s
+/// single-match heuristic result) — `result_cols` are the CURRENT result's
+/// column names in order; for each, finds the same-named `ColumnInfo` in
+/// `t` and reads its `fk`, plus (when present) the referenced table's own
+/// column names from `snapshot` for the ☰ menu. A result column with no
+/// same-named base column (e.g. an already-joined `"ref.col"` alias from a
+/// previous preview re-run) gets `None` in both outputs — it's not treated
+/// as an error, just "not an FK column".
+fn fk_info_from_table(
+    snapshot: &SchemaSnapshot,
+    t: &TableInfo,
+    result_cols: &[String],
+) -> (Vec<Option<FkRef>>, Vec<Option<Vec<String>>>) {
+    let mut fk_info = Vec::with_capacity(result_cols.len());
+    let mut ref_cols = Vec::with_capacity(result_cols.len());
+    for name in result_cols {
+        let fk = t.columns.iter().find(|c| &c.name == name).and_then(|c| c.fk.clone());
+        let refcols = fk.as_ref().and_then(|fk| {
+            snapshot
+                .tables
+                .iter()
+                .find(|rt| rt.schema.as_deref() == fk.schema.as_deref() && rt.name == fk.table)
+                .map(|rt| rt.columns.iter().map(|c| c.name.clone()).collect())
+        });
+        fk_info.push(fk);
+        ref_cols.push(refcols);
+    }
+    (fk_info, ref_cols)
+}
+
 /// Set by `TreeEvent::OpenPreview` and threaded through `run_query_with` so
 /// a preview runs through the exact same guarded pipeline as an
 /// editor-typed query, without ever touching `self.sql`'s text: `title`
@@ -75,6 +110,18 @@ struct PreviewTarget {
     /// free-form text meant for tab identity/display, not as a value a
     /// caller should parse back out.
     table: String,
+    /// G4 Task 5: the previewed table's schema — `None` for a plain
+    /// preview open (`preview_sql`'s own quoting already handles that), set
+    /// alongside `table` so `fk_info_for_table`/a `GridEvent::
+    /// RerunPreviewJoins` re-run can look the base `TableInfo` up in the
+    /// snapshot again.
+    schema: Option<String>,
+    /// G4 Task 5: active FK joins for THIS run — empty for a plain preview
+    /// open; populated when `on_grid_event`'s `RerunPreviewJoins` arm
+    /// re-runs the preview with `fk_join::build_join_sql`'s rewritten SQL,
+    /// so the brand-new grid entity `QueryEvent::Started` creates can
+    /// restore checkbox/tint state via `ResultGrid::apply_active_joins`.
+    joins: Vec<fk_join::JoinSpec>,
 }
 
 struct AppView {
@@ -326,6 +373,24 @@ impl AppView {
                             QueryEvent::Started { columns } => {
                                 let buf = Rc::new(RefCell::new(ResultBuffer::new(columns)));
                                 buffer = Some(buf.clone());
+                                // G4 Task 5: FK metadata for the ☰ menu —
+                                // computed BEFORE the grid entity exists
+                                // (needs `view`/`cx` to read the schema-tree
+                                // snapshot) so it can be handed to
+                                // `set_fk_info` in the same `grid.update`
+                                // below as `set_buffer`/`set_table_name`.
+                                let result_cols: Vec<String> = buf
+                                    .borrow()
+                                    .schema()
+                                    .fields()
+                                    .iter()
+                                    .map(|f| f.name().to_string())
+                                    .collect();
+                                let (fk_info, ref_cols) = if let Some(p) = &preview {
+                                    view.fk_info_for_table(p.schema.as_deref(), &p.table, &result_cols, cx)
+                                } else {
+                                    view.fk_info_for_adhoc(&result_cols, cx)
+                                };
                                 let grid = cx.new(ResultGrid::new);
                                 grid.update(cx, |g, cx| {
                                     g.set_buffer(buf.clone(), cx);
@@ -337,8 +402,27 @@ impl AppView {
                                     // placeholder.
                                     if let Some(p) = &preview {
                                         g.set_table_name(p.table.clone());
+                                        g.set_preview_context(p.schema.clone(), p.key.clone(), p.title.clone());
+                                    }
+                                    g.set_fk_info(fk_info, ref_cols);
+                                    // G4 Task 5: restores ☰-menu checkmarks
+                                    // + join tinting on the FRESH grid
+                                    // entity a preview re-run just created
+                                    // (this grid replaces the one that
+                                    // emitted `RerunPreviewJoins` — see
+                                    // `GridEvent`'s doc comment). A no-op
+                                    // (empty `joins`) for a plain preview
+                                    // open or an ad-hoc tab.
+                                    if let Some(p) = &preview {
+                                        g.apply_active_joins(&p.joins);
                                     }
                                 });
+                                // G4 Task 5: one subscription per grid
+                                // entity — see `GridEvent`'s doc comment for
+                                // why the event payload carries everything
+                                // `on_grid_event` needs rather than this
+                                // callback searching `self.tabs`.
+                                cx.subscribe(&grid, AppView::on_grid_event).detach();
                                 let title = preview
                                     .as_ref()
                                     .map(|p| p.title.clone())
@@ -724,8 +808,10 @@ impl AppView {
                 let sql = preview_sql(schema.as_deref(), &name);
                 let preview = PreviewTarget {
                     title: format!("Náhled: {name}"),
-                    key: format!("{}.{name}", schema.unwrap_or_default()),
+                    key: format!("{}.{name}", schema.clone().unwrap_or_default()),
                     table: name.clone(),
+                    schema,
+                    joins: Vec::new(),
                 };
                 self.run_query_with(sql, Some(preview), true, cx);
             }
@@ -870,6 +956,145 @@ impl AppView {
         }
     }
 
+    /// G4 Task 5, PREVIEW tabs: looks the previewed `(schema, table)` up in
+    /// the CURRENT schema-tree snapshot and delegates to `fk_info_from_table`.
+    /// Empty (`None` for every column) when there's no snapshot yet, or the
+    /// table isn't in it (schema fetch still in flight, or a connection that
+    /// can't see its own catalog) — same "degrade gracefully" precedent
+    /// `TreeEvent::OpenPreview` already sets for a missing snapshot.
+    fn fk_info_for_table(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+        result_cols: &[String],
+        cx: &Context<Self>,
+    ) -> (Vec<Option<FkRef>>, Vec<Option<Vec<String>>>) {
+        let empty = (vec![None; result_cols.len()], vec![None; result_cols.len()]);
+        let Some(snapshot) = self.tree.read(cx).snapshot() else { return empty };
+        let Some(t) =
+            snapshot.tables.iter().find(|t| t.schema.as_deref() == schema && t.name == table)
+        else {
+            return empty;
+        };
+        fk_info_from_table(snapshot, t, result_cols)
+    }
+
+    /// G4 Task 5, AD-HOC tabs (brief contract #2's documented heuristic):
+    /// matches EVERY result column name against each snapshot table's
+    /// columns — if exactly ONE table contains all of them, its FK data is
+    /// used the same way `fk_info_for_table` does; otherwise (no snapshot,
+    /// no match, or more than one plausible source table) returns
+    /// all-`None` — no ☰ menu rather than guessing which table an
+    /// ambiguous/multi-table-join result actually came from.
+    fn fk_info_for_adhoc(
+        &self,
+        result_cols: &[String],
+        cx: &Context<Self>,
+    ) -> (Vec<Option<FkRef>>, Vec<Option<Vec<String>>>) {
+        let empty = (vec![None; result_cols.len()], vec![None; result_cols.len()]);
+        let Some(snapshot) = self.tree.read(cx).snapshot() else { return empty };
+        let mut matches = snapshot
+            .tables
+            .iter()
+            .filter(|t| result_cols.iter().all(|rc| t.columns.iter().any(|c| &c.name == rc)));
+        let Some(t) = matches.next() else { return empty };
+        if matches.next().is_some() {
+            return empty; // ambiguous — more than one table has every column
+        }
+        fk_info_from_table(snapshot, t, result_cols)
+    }
+
+    /// G4 Task 5, AD-HOC tabs: `GridEvent::RunLookup`'s handler — resolves
+    /// the active connection (brief: "no connection → status error", same
+    /// guard `run_query_with` applies), dispatches `runner.fetch_lookup`,
+    /// and on success builds one `VirtualCol` per `wanted_cols` entry from
+    /// the materialized `(cols, rows)` (`rows[i][0]` is always the key
+    /// column — `fk_join::build_lookup_sql` puts it first — `rows[i][1 +
+    /// j]` is `wanted_cols[j]`), replacing `grid`'s virtual columns for
+    /// `src_col` via `set_virtual_cols_for_src`. `grid` is the SAME entity
+    /// that emitted the event (ad-hoc tabs are never replaced, unlike a
+    /// preview re-run) — captured from `on_grid_event`'s `emitter` rather
+    /// than looked up from `self.tabs`.
+    fn start_lookup(
+        &mut self,
+        grid: Entity<ResultGrid>,
+        sql: String,
+        ref_table: String,
+        wanted_cols: Vec<String>,
+        src_col: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(spec) = self.active_conn_spec() else {
+            self.status = "Bez připojení — vyberte připojení nahoře.".into();
+            cx.notify();
+            return;
+        };
+        self.status = "hledám hodnoty pro join…".into();
+        cx.notify();
+        let rx = self.runner.fetch_lookup(spec, sql);
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(Ok((_cols, rows))) => {
+                        let mut maps: Vec<std::collections::HashMap<String, Option<String>>> =
+                            vec![std::collections::HashMap::new(); wanted_cols.len()];
+                        for row in rows {
+                            let Some(Some(key_val)) = row.first().cloned() else { continue };
+                            for (i, m) in maps.iter_mut().enumerate() {
+                                m.insert(key_val.clone(), row.get(i + 1).cloned().flatten());
+                            }
+                        }
+                        let virtual_cols: Vec<fk_join::VirtualCol> = wanted_cols
+                            .into_iter()
+                            .zip(maps)
+                            .map(|(c, map)| fk_join::VirtualCol {
+                                name: format!("{ref_table}.{c}"),
+                                map,
+                                src_col,
+                            })
+                            .collect();
+                        grid.update(cx, |g, cx| {
+                            g.set_virtual_cols_for_src(src_col, virtual_cols, cx);
+                        });
+                        view.status = "join přidán".into();
+                    }
+                    Ok(Err(e)) => {
+                        view.status = format!("error: {e}");
+                    }
+                    Err(_) => {
+                        view.status = "lookup zrušen".into();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// G4 Task 5: `ResultGrid`'s `GridEvent` subscription (wired per grid
+    /// entity in `QueryEvent::Started`, see `run_query_with`) — see
+    /// `GridEvent`'s doc comment for why the preview path needs the whole
+    /// identity payload while the lookup path just needs `emitter`.
+    fn on_grid_event(&mut self, emitter: Entity<ResultGrid>, event: &GridEvent, cx: &mut Context<Self>) {
+        match event {
+            GridEvent::RerunPreviewJoins { schema, table, key, title, joins } => {
+                let sql = fk_join::build_join_sql(schema.as_deref(), table, joins);
+                let preview = PreviewTarget {
+                    title: title.clone(),
+                    key: key.clone(),
+                    table: table.clone(),
+                    schema: schema.clone(),
+                    joins: joins.clone(),
+                };
+                self.run_query_with(sql, Some(preview), true, cx);
+            }
+            GridEvent::RunLookup { sql, ref_table, wanted_cols, src_col } => {
+                self.start_lookup(emitter, sql.clone(), ref_table.clone(), wanted_cols.clone(), *src_col, cx);
+            }
+        }
+    }
+
     /// Dispatches `runner.fetch_schema(spec)` off the UI thread and updates
     /// `self.tree`'s loading/snapshot/error state as it resolves — same
     /// "UI thread only ever awaits a channel via `cx.spawn`" shape as
@@ -948,6 +1173,8 @@ impl AppView {
                     title: format!("Náhled: {table}"),
                     key: format!("{}.{table}", schema.clone().unwrap_or_default()),
                     table: table.clone(),
+                    schema: schema.clone(),
+                    joins: Vec::new(),
                 };
                 self.run_query_with(sql, Some(preview), true, cx);
             }
