@@ -181,12 +181,22 @@ impl AppView {
                             }
                         }
                         QueryEvent::Finished { elapsed } => {
-                            let rows = buffer.as_ref().map_or(0, |b| b.borrow().row_count());
-                            view.status = format!("{rows} rows in {elapsed:.2?}{limit_suffix}");
+                            // A queued Finished must not clobber a spill
+                            // error with a fake success status.
+                            if !errored {
+                                let rows =
+                                    buffer.as_ref().map_or(0, |b| b.borrow().row_count());
+                                view.status =
+                                    format!("{rows} rows in {elapsed:.2?}{limit_suffix}");
+                            }
                             view.cancel = None;
                         }
                         QueryEvent::Failed(e) => {
-                            view.status = format!("error: {e}");
+                            // Same guard: the push error is the root cause;
+                            // the driver's follow-up "cancelled" is noise.
+                            if !errored {
+                                view.status = format!("error: {e}");
+                            }
                             view.cancel = None;
                         }
                     }
