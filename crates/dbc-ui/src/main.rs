@@ -319,7 +319,7 @@ impl AppView {
                                 let buf = Rc::new(RefCell::new(ResultBuffer::new(columns)));
                                 buffer = Some(buf.clone());
                                 let grid = cx.new(ResultGrid::new);
-                                grid.update(cx, |g, _| g.set_buffer(buf.clone()));
+                                grid.update(cx, |g, cx| g.set_buffer(buf.clone(), cx));
                                 let title = preview
                                     .as_ref()
                                     .map(|p| p.title.clone())
@@ -538,6 +538,20 @@ impl AppView {
                 self.close_modal(cx);
             }
             return;
+        }
+        // G4 Task 3: Esc closes an open cell-detail popup / find bar on the
+        // active tab's grid before falling through to query-cancel — same
+        // "no scoped-binding shortcut, the check here IS the mechanism"
+        // reasoning as the palette/modal cases above (a `"ResultGrid"`-
+        // scoped `escape` binding would lose to this unscoped one).
+        if let Some(active) = self.tabs.active() {
+            if let TabContent::Grid { grid, .. } = &active.content {
+                let closed = grid.update(cx, |g, _| g.close_overlay_if_open());
+                if closed {
+                    cx.notify();
+                    return;
+                }
+            }
         }
         if let Some(c) = self.cancel.take() {
             c.cancel();

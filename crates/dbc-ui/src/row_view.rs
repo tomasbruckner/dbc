@@ -109,6 +109,66 @@ impl RowView {
     }
 }
 
+/// G4 Task 3: pure match-finding for the Ctrl+F in-result search — given
+/// `rows` DISPLAY-order rows and an explicit list of (visible) SOURCE
+/// column indices, returns every `(display_row, source_col)` whose cell
+/// text contains `needle` (case-insensitive), in row-major order. `cell`
+/// is called with the SAME coordinates that end up in the result, so
+/// `grid.rs`'s caller closure is responsible for mapping `display_row`
+/// through `RowView::source_row` before reading the buffer — this function
+/// itself has no notion of a buffer or a `RowView`, only cell text, same
+/// "closure-supplied cell access" shape as `RowView::rebuild`. An empty
+/// `needle` yields no matches (nothing to jump to, rather than "everything
+/// matches" like an empty filter) since a find-bar's whole purpose is
+/// jumping between specific matches.
+pub fn find_matches(
+    rows: usize,
+    cols: &[usize],
+    needle: &str,
+    cell: &mut dyn FnMut(usize, usize) -> String,
+) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let needle_lower = needle.to_lowercase();
+    let mut out = Vec::new();
+    for r in 0..rows {
+        for &c in cols {
+            if cell(r, c).to_lowercase().contains(&needle_lower) {
+                out.push((r, c));
+            }
+        }
+    }
+    out
+}
+
+/// Wrap-around next/prev index into a match list of length `len`. `None`
+/// when `len == 0` (nothing to jump to). `current == None` (no selection
+/// yet) lands on the first match going forward, or the last one going
+/// backward — so a fresh Ctrl+F followed immediately by Shift+Enter still
+/// does something sensible instead of no-op'ing.
+pub fn wrapped_index(current: Option<usize>, len: usize, forward: bool) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match current {
+        None => {
+            if forward {
+                0
+            } else {
+                len - 1
+            }
+        }
+        Some(cur) => {
+            if forward {
+                (cur + 1) % len
+            } else {
+                (cur + len - 1) % len
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +301,82 @@ mod tests {
         v.rebuild(4, &mut cell);
         assert_eq!(v.len(), 4);
         assert_eq!(v.source_row(3), 3);
+    }
+
+    #[test]
+    fn combined_sort_and_filter_reflects_both() {
+        // Filter keeps rows containing "a" in col 0, then sorts by the
+        // numeric col 1 descending — exercises both RowView knobs active at
+        // once, on top of the existing filter-then-sort test above.
+        let rows = vec![
+            vec!["banana", "2"], // src 0 — no "a"? actually has "a"
+            vec!["kiwi", "5"],   // src 1 — filtered out (no "a")
+            vec!["papaya", "9"], // src 2
+            vec!["grape", "1"],  // src 3
+        ];
+        let mut v = RowView::identity(rows.len());
+        v.filters = vec![(0, "a".to_string())];
+        v.sort = Some((1, false)); // descending numeric
+        let mut cell = accessor(rows);
+        v.rebuild(4, &mut cell);
+        // Survivors of the filter: banana(2), papaya(9), grape(1) — src 1
+        // (kiwi) has no "a" and is dropped. Descending by col 1: papaya(9),
+        // banana(2), grape(1).
+        assert_eq!(v.len(), 3);
+        assert_eq!(v.source_row(0), 2); // papaya
+        assert_eq!(v.source_row(1), 0); // banana
+        assert_eq!(v.source_row(2), 3); // grape
+    }
+
+    // --- find_matches / wrapped_index (G4 Task 3) ---
+
+    #[test]
+    fn find_matches_is_case_insensitive_and_row_major() {
+        let rows = vec![
+            vec!["Apple", "melon"],  // row 0
+            vec!["kiwi", "APPLE"],   // row 1
+            vec!["pear", "grape"],   // row 2
+        ];
+        let mut cell = accessor(rows);
+        let matches = find_matches(3, &[0, 1], "app", &mut cell);
+        assert_eq!(matches, vec![(0, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn find_matches_only_searches_given_columns() {
+        // Column 1 ("hidden") is deliberately excluded from `cols` — a
+        // match there must not appear, same as grid.rs excluding hidden
+        // columns from the search.
+        let rows = vec![vec!["cat", "apple"]];
+        let mut cell = accessor(rows);
+        let matches = find_matches(1, &[0], "apple", &mut cell);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn find_matches_empty_needle_yields_no_matches() {
+        let rows = vec![vec!["a"], vec!["b"]];
+        let mut cell = accessor(rows);
+        assert!(find_matches(2, &[0], "", &mut cell).is_empty());
+    }
+
+    #[test]
+    fn wrapped_index_forward_wraps_past_the_end() {
+        assert_eq!(wrapped_index(None, 3, true), Some(0));
+        assert_eq!(wrapped_index(Some(0), 3, true), Some(1));
+        assert_eq!(wrapped_index(Some(2), 3, true), Some(0));
+    }
+
+    #[test]
+    fn wrapped_index_backward_wraps_past_the_start() {
+        assert_eq!(wrapped_index(None, 3, false), Some(2));
+        assert_eq!(wrapped_index(Some(0), 3, false), Some(2));
+        assert_eq!(wrapped_index(Some(2), 3, false), Some(1));
+    }
+
+    #[test]
+    fn wrapped_index_empty_list_is_always_none() {
+        assert_eq!(wrapped_index(None, 0, true), None);
+        assert_eq!(wrapped_index(Some(0), 0, false), None);
     }
 }
