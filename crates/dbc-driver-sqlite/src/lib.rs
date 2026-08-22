@@ -185,8 +185,11 @@ impl Connection for SqliteConnection {
                 if obj_type == "table" || obj_type == "view" {
                     let kind = if obj_type == "view" { TableKind::View } else { TableKind::Table };
 
-                    // Get columns via PRAGMA table_info
+                    // Get columns via PRAGMA table_info. `pk` is the 1-based
+                    // position of the column within the primary key (0 = not
+                    // part of it) — kept alongside for PK-order sorting below.
                     let mut columns = Vec::new();
+                    let mut pk_seq: Vec<(i32, String)> = Vec::new();
                     conn.pragma(None, "table_info", name.as_str(), |r| {
                         let col_name: String = r.get(1)?;
                         let data_type: String = r.get(2)?;
@@ -194,6 +197,9 @@ impl Connection for SqliteConnection {
                         let default: Option<String> = r.get(4)?;
                         let pk: i32 = r.get(5)?;
 
+                        if pk > 0 {
+                            pk_seq.push((pk, col_name.clone()));
+                        }
                         columns.push(ColumnInfo {
                             name: col_name,
                             data_type,
@@ -265,9 +271,11 @@ impl Connection for SqliteConnection {
                     // Build constraints
                     let mut constraints = Vec::new();
 
-                    // Primary key constraint
-                    let pk_cols: Vec<String> =
-                        columns.iter().filter(|c| c.is_pk).map(|c| c.name.clone()).collect();
+                    // Primary key constraint — columns in PK sequence order
+                    // (a composite PRIMARY KEY(b, a) must not read (a, b)).
+                    let mut pk_seq = pk_seq.clone();
+                    pk_seq.sort_by_key(|(seq, _)| *seq);
+                    let pk_cols: Vec<String> = pk_seq.into_iter().map(|(_, n)| n).collect();
                     if !pk_cols.is_empty() {
                         constraints.push(ConstraintInfo {
                             name: String::new(),
@@ -518,7 +526,7 @@ mod tests {
         assert!(!name_col.nullable);
         assert_eq!(name_col.default, Some("'x'".to_string()));
         assert!(customers.ddl.is_some());
-        customers.ddl.as_ref().unwrap().contains("CREATE TABLE");
+        assert!(customers.ddl.as_ref().unwrap().contains("CREATE TABLE"));
 
         // Check orders table
         let orders = snap.tables.iter().find(|t| t.name == "orders").unwrap();
