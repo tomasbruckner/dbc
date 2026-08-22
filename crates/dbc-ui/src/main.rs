@@ -475,14 +475,14 @@ impl AppView {
         // deliberately NOT closed by Escape — same "no accidental dismissal
         // while a password is typed" reasoning as the overlay `.occlude()`
         // fix.
-        // G3 Task 5: the palette's own scoped "escape" binding (key context
-        // "Palette", see palette.rs's `bind_keys`) already intercepts Esc
-        // before it ever reaches this unscoped handler as long as focus is
-        // captured inside the palette (guaranteed by `on_open_palette`
-        // moving focus there in the same update). This check is defense in
-        // depth for the case focus somehow isn't there — Esc must still
-        // close the palette first rather than fall through to cancelling a
-        // running query underneath it.
+        // G3 Task 5: this check is THE mechanism that makes Esc close the
+        // palette — do not remove it as "redundant". The palette's scoped
+        // "escape" binding (context "Palette", palette.rs `bind_keys`) does
+        // NOT win GPUI's keymap resolution: focus sits on the palette's
+        // nested TextField, so "Palette" is an ancestor context, and per the
+        // pinned gpui's `keymap.rs::bindings_for_input` an unscoped binding
+        // (this `escape → CancelQuery`) outranks ancestor-scoped ones.
+        // Verified against the vendored source in the Task 5 review.
         if self.palette.is_some() {
             self.palette = None;
             cx.notify();
