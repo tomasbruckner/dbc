@@ -1264,16 +1264,23 @@ fn write_export_file(
         s.push(".tmp");
         std::path::PathBuf::from(s)
     };
-    {
+    // On any failure past this point, remove the partial .tmp so a
+    // disk-full/AV-locked run doesn't leave orphans (Task 4 re-review
+    // issue 5).
+    let write = || -> Result<(), String> {
         let file = std::fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
         let mut w = std::io::BufWriter::new(file);
         export::export(&mut w, format, headers, table_name, rows, &mut |r, c| {
             data.get(r).and_then(|row| row.get(c)).cloned().flatten()
         })?;
         std::io::Write::flush(&mut w).map_err(|e| e.to_string())?;
+        Ok(())
+    };
+    let result = write().and_then(|()| std::fs::rename(&tmp_path, path).map_err(|e| e.to_string()));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
     }
-    std::fs::rename(&tmp_path, path).map_err(|e| e.to_string())?;
-    Ok(())
+    result
 }
 
 impl Focusable for ResultGrid {
