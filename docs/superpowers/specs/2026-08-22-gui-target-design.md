@@ -3,7 +3,7 @@
 Date: 2026-08-22
 Status: awaiting user review
 Scope: target ("fairly final") UI for the dbc client and its decomposition into
-phases G1–G11. Each phase gets its own implementation plan; G5+ get their own
+phases G1–G12. Each phase gets its own implementation plan; G5+ get their own
 design pass before implementation. This spec supersedes the UI portions of the
 phase 4/5 roadmap sketch in the 2026-08-21 spec; driver phases (MSSQL, DuckDB,
 MCP) are unchanged and orthogonal.
@@ -104,6 +104,7 @@ lands last) and pays the biggest pains first.
 | **G8 ER diagram** | FK-graph rendering of a schema in GPUI canvas; export image | Future; own brainstorm when reached |
 | **G9 Sessions monitor** | Active connections and running queries (pg_stat_activity / sp_who2), kill query/session | Read-mostly + one KILL action; may be pulled forward (after G4) since it is useful while debugging. Not applicable to SQLite |
 | **G10 Server admin** | Users and roles (create, password, membership), privileges matrix (GRANT/REVOKE), database/schema DDL with sizes | Pure DDL write paths — lands after G5 establishes the "show SQL → confirm → transaction" pattern; heavily engine-specific (pg roles vs MSSQL logins; SQLite exempt); privileges matrix gets its own design pass |
+| **G12 Script runner** | Run an external .sql file (streamed statement-by-statement, never loaded into the editor) or a whole folder (files in name order, per-file progress) against a chosen connection; requires a statement splitter (also unlocks multi-statement SQL in the editor); error policy (stop/continue), transaction scope and progress UI get their own design pass | Future; own brainstorm when reached |
 | **G11 Backup & restore** | Whole-DB export and restore per engine: Postgres via pg_dump/pg_restore (external binaries orchestrated by the app, streamed progress, format/compression options), MSSQL via BACKUP/RESTORE DATABASE (server-side, writes to the server's disk — path picker must reflect that), SQLite via file copy/VACUUM INTO | Two fundamentally different mechanics behind one UI; requires detecting client tools on the machine; own design pass when reached |
 
 Orthogonal, unscheduled here: MSSQL driver (odbc-api), DuckDB driver, MCP
@@ -123,5 +124,5 @@ server (original phases 3/6 — unchanged).
 ## 4. Out of scope of this spec
 
 Detailed design of G5 (SQL generation rules, conflict handling), G6
-(autocomplete engine), and G7–G11 — each gets its own brainstorm + spec when
+(autocomplete engine), and G7–G12 — each gets its own brainstorm + spec when
 its turn comes. This spec fixes the target UX and the phase boundaries.
