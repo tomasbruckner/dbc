@@ -2,6 +2,7 @@ mod connect;
 mod connections_ui;
 mod grid;
 mod history_panel;
+mod palette;
 mod runner;
 mod schema_tree;
 mod sql_input;
@@ -17,18 +18,34 @@ use dbc_buffer::ResultBuffer;
 use dbc_core::{apply_auto_limit, is_read_statement, quote_qualified, CancelToken, QueryError};
 use dbc_state::{AppConfig, HistoryDb, HistoryEntry, Vault};
 use gpui::{
-    actions, div, prelude::*, px, rgb, size, AnyElement, App, Bounds, ClipboardItem, Context,
-    Entity, Focusable, KeyBinding, ScrollDelta, ScrollWheelEvent, Window, WindowBounds,
+    actions, div, prelude::*, px, rgb, rgba, size, AnyElement, App, Bounds, ClipboardItem,
+    Context, Entity, Focusable, KeyBinding, ScrollDelta, ScrollWheelEvent, Window, WindowBounds,
     WindowOptions,
 };
 use gpui_platform::application;
 use grid::ResultGrid;
+use palette::{PaletteAction, PaletteItem};
 use runner::{ConnectSpec, QueryEvent, QueryRunner};
 use schema_tree::{SchemaTree, TreeEvent};
 use sql_input::SqlInput;
 use tabs::{collapse_title, ResultTab, TabContent, Tabs};
 
-actions!(dbc, [RunQuery, RunQueryUnlimited, CancelQuery, ToggleTree, ToggleHistory]);
+actions!(dbc, [RunQuery, RunQueryUnlimited, CancelQuery, ToggleTree, ToggleHistory, OpenPalette]);
+
+/// G3 Task 5: Ctrl+K command palette state — created on `OpenPalette`,
+/// dropped on close/execute. `items`/`selected` are recomputed from
+/// `input`'s text (see `AppView::refresh_palette_items`), polled lazily at
+/// render time the same way `history_search`/`last_history_query` are (see
+/// history_panel.rs's module doc comment) rather than via an on-change hook
+/// `connections_ui::TextField` doesn't have.
+struct PaletteState {
+    input: Entity<connections_ui::TextField>,
+    items: Vec<PaletteItem>,
+    selected: usize,
+    /// The text `items` was last computed from — compared against `input`'s
+    /// live text each render to detect an edit.
+    last_query: String,
+}
 
 /// G2 Task 7: SQL builder for `TreeEvent::OpenPreview`. Pure — no GPUI, no
 /// I/O — so quoting can be unit-tested directly. `quote_qualified` (shared
@@ -134,6 +151,11 @@ struct AppView {
     /// against `history_search`'s live text each render to decide whether a
     /// refresh is needed (see `history_search`'s doc comment).
     last_history_query: String,
+    // --- G3 Task 5: Ctrl+K command palette ---
+    /// `None` when the palette isn't open — same "not rendered at all"
+    /// convention as `modal`, and mutually exclusive with it (see
+    /// `on_open_palette`/`render_palette_overlay`).
+    palette: Option<PaletteState>,
 }
 
 /// Stable identity for a `ConnectSpec`, used only to decide whether two
@@ -453,6 +475,19 @@ impl AppView {
         // deliberately NOT closed by Escape — same "no accidental dismissal
         // while a password is typed" reasoning as the overlay `.occlude()`
         // fix.
+        // G3 Task 5: the palette's own scoped "escape" binding (key context
+        // "Palette", see palette.rs's `bind_keys`) already intercepts Esc
+        // before it ever reaches this unscoped handler as long as focus is
+        // captured inside the palette (guaranteed by `on_open_palette`
+        // moving focus there in the same update). This check is defense in
+        // depth for the case focus somehow isn't there — Esc must still
+        // close the palette first rather than fall through to cancelling a
+        // running query underneath it.
+        if self.palette.is_some() {
+            self.palette = None;
+            cx.notify();
+            return;
+        }
         if self.dropdown_open {
             self.dropdown_open = false;
             cx.notify();
@@ -490,6 +525,254 @@ impl AppView {
             self.refresh_history_cache(cx);
         }
         cx.notify();
+    }
+
+    /// Ctrl+K (brief contract #1). Guarded against another modal being up
+    /// (contract #5) — the reverse (a modal opening while the palette is up)
+    /// is prevented for free by the palette overlay's `.occlude()` blocking
+    /// the clicks that would open one (top-bar/dropdown), same as the
+    /// existing modal overlay does for the dropdown. Also closes the
+    /// connection dropdown if it happened to be open, so the two overlays
+    /// never stack. Sources are assembled fresh on every open (contract #2).
+    fn on_open_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal.is_some() || self.palette.is_some() {
+            return;
+        }
+        self.dropdown_open = false;
+        let input = cx.new(|cx| connections_ui::TextField::new(cx, "Ctrl+K – tabulky, historie, spojení, akce…", false));
+        let focus = input.focus_handle(cx);
+        let items = self.build_palette_items("", cx);
+        self.palette = Some(PaletteState { input, items, selected: 0, last_query: String::new() });
+        // G1 lesson (binding per the brief): focus must move to the
+        // palette's own input in the SAME update the overlay appears in, or
+        // a stray keystroke lands on whatever had focus before Ctrl+K.
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    fn on_palette_up(&mut self, _: &palette::PaletteUp, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(p) = &mut self.palette {
+            p.selected = p.selected.saturating_sub(1);
+        }
+        cx.notify();
+    }
+
+    fn on_palette_down(&mut self, _: &palette::PaletteDown, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(p) = &mut self.palette {
+            if p.selected + 1 < p.items.len() {
+                p.selected += 1;
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_palette_confirm(&mut self, _: &palette::PaletteConfirm, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.palette.as_ref().and_then(|p| p.items.get(p.selected).cloned()) else { return };
+        self.execute_palette_item(item, window, cx);
+    }
+
+    fn on_palette_close(&mut self, _: &palette::PaletteClose, _window: &mut Window, cx: &mut Context<Self>) {
+        self.palette = None;
+        cx.notify();
+    }
+
+    /// Recomputes `palette.items` from `palette.input`'s current text — same
+    /// lazy "compare against last-computed text at render time" trigger as
+    /// `history_panel`'s `refresh_history_cache` (see `render_palette_overlay`).
+    /// Resets `selected` to 0 since a re-ranked list makes the previous
+    /// index meaningless.
+    fn refresh_palette_items(&mut self, cx: &mut Context<Self>) {
+        let Some(query) = self.palette.as_ref().map(|p| p.input.read(cx).text()) else { return };
+        let items = self.build_palette_items(&query, cx);
+        if let Some(p) = &mut self.palette {
+            p.items = items;
+            p.selected = 0;
+            p.last_query = query;
+        }
+    }
+
+    /// Assembles + ranks every palette source (brief contract #2): tables/
+    /// views from the tree's current snapshot (with the favourite bonus —
+    /// matched against `config.favourite_objects` filtered to the active
+    /// connection, kind "table"|"view"), history top-20 for `query` (via
+    /// `HistoryDb::search`, same call `history_panel` makes), every saved
+    /// connection, and the 5 fixed actions — delegated to `palette::rank_items`,
+    /// the pure scoring/assembly function.
+    fn build_palette_items(&self, query: &str, cx: &Context<Self>) -> Vec<PaletteItem> {
+        let is_favourite_table = |schema: &Option<String>, name: &str| {
+            self.active_connection_id.as_deref().is_some_and(|conn_id| {
+                self.config.favourite_objects.iter().any(|f| {
+                    f.connection_id == conn_id
+                        && &f.schema == schema
+                        && f.name == name
+                        && (f.kind == "table" || f.kind == "view")
+                })
+            })
+        };
+        let tables: Vec<palette::TableSource> = self
+            .tree
+            .read(cx)
+            .snapshot()
+            .map(|s| {
+                s.tables
+                    .iter()
+                    .map(|t| palette::TableSource {
+                        schema: t.schema.clone(),
+                        name: t.name.clone(),
+                        favourite: is_favourite_table(&t.schema, &t.name),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let history: Vec<palette::HistorySource> = self
+            .history
+            .as_ref()
+            .and_then(|h| h.search(query, 20).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| palette::HistorySource { id: e.id, sql: e.sql })
+            .collect();
+
+        let connections: Vec<palette::ConnectionSource> = self
+            .config
+            .connections
+            .iter()
+            .map(|c| palette::ConnectionSource { id: c.id.clone(), name: c.name.clone(), favourite: c.favourite })
+            .collect();
+
+        palette::rank_items(query, &tables, &history, &connections, 30)
+    }
+
+    /// Brief contract #4: execution routes through EXISTING paths only —
+    /// no new execution logic here, just dispatch to the same
+    /// methods/pipeline the tree/history-panel/dropdown/actions already use.
+    fn execute_palette_item(&mut self, item: PaletteItem, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette = None;
+        match item {
+            PaletteItem::Table { schema, name } => {
+                // Exactly `on_tree_event`'s `TreeEvent::OpenPreview` arm.
+                let sql = preview_sql(schema.as_deref(), &name);
+                let preview = PreviewTarget {
+                    title: format!("Náhled: {name}"),
+                    key: format!("{}.{name}", schema.unwrap_or_default()),
+                };
+                self.run_query_with(sql, Some(preview), true, cx);
+            }
+            PaletteItem::HistoryEntry { sql, .. } => {
+                // Exactly the history panel's row click: load into the
+                // editor and focus it, never run it.
+                self.sql.update(cx, |s, cx| s.set_text(&sql, cx));
+                let editor_focus = self.sql.focus_handle(cx);
+                window.focus(&editor_focus, cx);
+            }
+            PaletteItem::Connection { id, .. } => {
+                self.switch_to_connection(&id, cx);
+            }
+            PaletteItem::Action { action, .. } => match action {
+                PaletteAction::RunQuery => self.run_query(false, cx),
+                PaletteAction::ToggleTree => {
+                    self.tree_visible = !self.tree_visible;
+                }
+                PaletteAction::ToggleHistory => {
+                    self.history_visible = !self.history_visible;
+                    if self.history_visible {
+                        self.refresh_history_cache(cx);
+                    }
+                }
+                PaletteAction::NewConnection => {
+                    // Exactly the dropdown's "Nové spojení…" click — sets
+                    // its own focus, which must win over anything below.
+                    self.open_connection_dialog(None, window, cx);
+                }
+                PaletteAction::RefreshSchema => {
+                    // Exactly `on_tree_event`'s `TreeEvent::RefreshRequested` arm.
+                    if let Some(spec) = self.active_conn_spec() {
+                        self.trigger_schema_fetch(spec, cx);
+                    } else {
+                        self.schema_tree_connection_key = None;
+                        self.tree.update(cx, |t, cx| t.clear(cx));
+                    }
+                }
+            },
+        }
+        cx.notify();
+    }
+
+    /// Centered overlay (brief contract #1), same full-screen-backdrop +
+    /// `.occlude()` shape as `connections_ui::render_modal_overlay` — key
+    /// context "Palette" on the panel wraps the input so Up/Down/Enter/Esc
+    /// (`palette::bind_keys`) resolve even though focus sits on the input's
+    /// own nested "TextField" context. `None` (renders nothing) both when
+    /// the palette is closed and — belt and suspenders alongside the guard
+    /// in `on_open_palette` — while a modal is up.
+    fn render_palette_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.palette.is_none() || self.modal.is_some() {
+            return None;
+        }
+        let current_query = self.palette.as_ref().unwrap().input.read(cx).text();
+        if current_query != self.palette.as_ref().unwrap().last_query {
+            self.refresh_palette_items(cx);
+        }
+        let p = self.palette.as_ref()?;
+        let items = p.items.clone();
+        let selected = p.selected;
+        let input = p.input.clone();
+
+        let mut list = div().id("palette-list").flex().flex_col().flex_1().overflow_hidden();
+        for (ix, item) in items.into_iter().enumerate() {
+            let label = palette::display_label(&item);
+            let is_selected = ix == selected;
+            let bg = if is_selected { rgb(0x45475a) } else { rgb(0x1e1e2e) };
+            list = list.child(
+                div()
+                    .id(("palette-item", ix))
+                    .px_2()
+                    .py_1()
+                    .cursor_pointer()
+                    .bg(bg)
+                    .text_color(rgb(0xcdd6f4))
+                    .hover(|s| s.bg(rgb(0x313244)))
+                    .child(label)
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.execute_palette_item(item.clone(), window, cx);
+                    })),
+            );
+        }
+
+        let panel = div()
+            .id("palette-panel")
+            .key_context("Palette")
+            .w(px(560.))
+            .max_h(px(420.))
+            .bg(rgb(0x1e1e2e))
+            .border_1()
+            .border_color(rgb(0x45475a))
+            .rounded_md()
+            .flex()
+            .flex_col()
+            .on_action(cx.listener(Self::on_palette_up))
+            .on_action(cx.listener(Self::on_palette_down))
+            .on_action(cx.listener(Self::on_palette_confirm))
+            .on_action(cx.listener(Self::on_palette_close))
+            .child(div().px_2().py_2().border_b_1().border_color(rgb(0x45475a)).child(input))
+            .child(list);
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000099))
+                .occlude()
+                .child(panel)
+                .into_any_element(),
+        )
     }
 
     /// Builds the `ConnectSpec` for the *currently active* connection (saved
@@ -836,6 +1119,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_cancel_query))
             .on_action(cx.listener(Self::on_toggle_tree))
             .on_action(cx.listener(Self::on_toggle_history))
+            .on_action(cx.listener(Self::on_open_palette))
             .child(self.render_top_bar(cx))
             .child(body)
             .child(
@@ -851,6 +1135,9 @@ impl Render for AppView {
             root = root.child(self.render_dropdown_overlay(cx));
         }
         if let Some(overlay) = self.render_modal_overlay(cx) {
+            root = root.child(overlay);
+        }
+        if let Some(overlay) = self.render_palette_overlay(cx) {
             root = root.child(overlay);
         }
         root
@@ -889,11 +1176,13 @@ fn main() {
             KeyBinding::new("escape", CancelQuery, None),
             KeyBinding::new("ctrl-b", ToggleTree, None),
             KeyBinding::new("ctrl-h", ToggleHistory, None),
+            KeyBinding::new("ctrl-k", OpenPalette, None),
         ]);
         sql_input::bind_keys(cx);
         grid::bind_keys(cx);
         connections_ui::bind_keys(cx);
         schema_tree::bind_keys(cx);
+        palette::bind_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         let window_handle = cx
@@ -952,6 +1241,7 @@ fn main() {
                             history_search,
                             history_cache: Vec::new(),
                             last_history_query: String::new(),
+                            palette: None,
                         }
                     })
                 },

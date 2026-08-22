@@ -703,6 +703,14 @@ impl SchemaTree {
         cx.notify();
     }
 
+    /// G3 Task 5: read-only access to the current snapshot for the command
+    /// palette's table/view source (`main.rs`'s `build_palette_items`) —
+    /// `None` before any fetch has resolved, same as every other accessor
+    /// here.
+    pub fn snapshot(&self) -> Option<&SchemaSnapshot> {
+        self.snapshot.as_ref()
+    }
+
     pub fn set_error(&mut self, message: String, cx: &mut Context<Self>) {
         self.loading = false;
         self.error = Some(message);

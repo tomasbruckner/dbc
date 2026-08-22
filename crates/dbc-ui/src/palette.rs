@@ -1,0 +1,402 @@
+// G3 Task 5: Ctrl+K command palette.
+//
+// Layout of this file:
+//   1. `fuzzy_score` — pure, GPUI-free case-insensitive subsequence scorer.
+//   2. `PaletteItem`/`PaletteAction` — the palette's result rows and the
+//      fixed actions it can dispatch.
+//   3. Source structs (`TableSource`/`HistorySource`/`ConnectionSource`) +
+//      `rank_items` — pure assembly/scoring of everything the palette shows,
+//      unit-tested directly below with no GPUI dependency at all.
+//   4. `display_label` — the "T "/"H "/"C "/"A " prefixed row text
+//      `main.rs`'s render helper uses.
+//   5. `bind_keys` + the palette's own scoped actions (Up/Down/Confirm/Close,
+//      key context "Palette") — same pattern as `schema_tree::bind_keys`/
+//      `connections_ui::bind_keys`. `main.rs` owns `OpenPalette` itself
+//      (an app-level action alongside `RunQuery`/`ToggleTree`/etc.), since
+//      Ctrl+K needs to fire regardless of what currently has focus.
+//
+// `main.rs` owns all GPUI wiring (overlay render, `PaletteState`, execution
+// routing through the existing `run_query_with`/`switch_to_connection`/
+// `open_connection_dialog`/history paths) — this file is intentionally
+// GPUI-App-free except for the `actions!`/`bind_keys` plumbing in section 5.
+
+use gpui::{actions, App, KeyBinding};
+
+/// Case-insensitive subsequence match: every character of `query` must
+/// appear in `target`, in order (not necessarily contiguous), or this
+/// returns `None`. When it matches, higher is better:
+/// - each matched character contributes a base point,
+/// - a character matched immediately after the previous match (a
+///   consecutive run) contributes an extra bonus,
+/// - a character matched at a word boundary (start of `target`, or preceded
+///   by a non-alphanumeric character) contributes another bonus,
+/// - the whole per-character sum is scaled up so a shorter `target` — all
+///   else equal — still nudges the final score higher (ties broken toward
+///   the more specific/shorter match), without a length difference ever
+///   overriding a genuine bonus difference.
+pub fn fuzzy_score(query: &str, target: &str) -> Option<i64> {
+    const CONSECUTIVE_BONUS: i64 = 15;
+    const WORD_BOUNDARY_BONUS: i64 = 10;
+    const SCALE: i64 = 1000;
+
+    let target_chars: Vec<char> = target.chars().collect();
+    let target_lower: Vec<char> = target.to_lowercase().chars().collect();
+
+    if query.is_empty() {
+        return Some(-(target_chars.len() as i64));
+    }
+
+    let mut search_from = 0usize;
+    let mut score = 0i64;
+    let mut prev_match: Option<usize> = None;
+
+    for qc in query.to_lowercase().chars() {
+        let idx = target_lower[search_from..].iter().position(|&c| c == qc).map(|i| i + search_from)?;
+
+        let mut char_score = 1i64;
+        if idx > 0 && prev_match == Some(idx - 1) {
+            char_score += CONSECUTIVE_BONUS;
+        }
+        let is_boundary = idx == 0 || !target_chars[idx - 1].is_alphanumeric();
+        if is_boundary {
+            char_score += WORD_BOUNDARY_BONUS;
+        }
+
+        score += char_score;
+        prev_match = Some(idx);
+        search_from = idx + 1;
+    }
+
+    Some(score * SCALE - target_chars.len() as i64)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PaletteItem {
+    /// → open a preview tab, same SQL/tab-replace logic as
+    /// `TreeEvent::OpenPreview`.
+    Table { schema: Option<String>, name: String },
+    /// → load into the SQL editor + focus it (never runs it).
+    HistoryEntry { id: i64, sql: String },
+    /// → `switch_to_connection`.
+    Connection { id: String, name: String },
+    /// → dispatch the respective existing `AppView` method.
+    Action { label: String, action: PaletteAction },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteAction {
+    RunQuery,
+    ToggleTree,
+    ToggleHistory,
+    NewConnection,
+    RefreshSchema,
+}
+
+/// One table/view from the current schema snapshot, plus whether it's
+/// favourited (drives the ranking bonus — brief: palette ranking).
+pub struct TableSource {
+    pub schema: Option<String>,
+    pub name: String,
+    pub favourite: bool,
+}
+
+/// One history entry, already resolved via `HistoryDb::search` by the
+/// caller (main.rs) — this module never touches the DB itself.
+pub struct HistorySource {
+    pub id: i64,
+    pub sql: String,
+}
+
+pub struct ConnectionSource {
+    pub id: String,
+    pub name: String,
+    pub favourite: bool,
+}
+
+/// Favourite objects/connections rank first among otherwise-equal matches
+/// (brief: palette ranking bonus). Applied on top of `fuzzy_score`'s output,
+/// never in place of it — a poor match with the bonus still loses to a
+/// strong match without it.
+const FAVOURITE_BONUS: i64 = 1000;
+
+/// The fixed action rows, in display order, with their Czech labels (brief
+/// contract #3).
+pub fn fixed_actions() -> Vec<(String, PaletteAction)> {
+    vec![
+        ("Spustit dotaz".to_string(), PaletteAction::RunQuery),
+        ("Přepnout strom".to_string(), PaletteAction::ToggleTree),
+        ("Přepnout historii".to_string(), PaletteAction::ToggleHistory),
+        ("Nové spojení…".to_string(), PaletteAction::NewConnection),
+        ("Obnovit schéma".to_string(), PaletteAction::RefreshSchema),
+    ]
+}
+
+fn table_search_text(t: &TableSource) -> String {
+    match &t.schema {
+        Some(s) if !s.is_empty() => format!("{s}.{}", t.name),
+        _ => t.name.clone(),
+    }
+}
+
+/// Pure assembly + scoring of every palette source into the final ranked
+/// row list, capped to `cap` rows.
+///
+/// Empty `query` (brief contract #3): a fixed category order — favourite
+/// tables/views first (alphabetical), then `history` as given (the caller
+/// already asked `HistoryDb::search` for the top-N recent), then
+/// `connections` as given, then the fixed actions — rather than
+/// `fuzzy_score`-based ordering (an empty query trivially "matches"
+/// everything, so scoring it would be meaningless).
+///
+/// Non-empty `query`: every source is scored via `fuzzy_score` against its
+/// searchable text (table: `schema.name` or just `name`; history: the raw
+/// SQL; connection: its name; action: its Czech label); non-matches
+/// (`None`) are dropped, matches get the favourite bonus where applicable,
+/// and the whole set is sorted by score descending.
+pub fn rank_items(
+    query: &str,
+    tables: &[TableSource],
+    history: &[HistorySource],
+    connections: &[ConnectionSource],
+    cap: usize,
+) -> Vec<PaletteItem> {
+    if query.trim().is_empty() {
+        let mut out = Vec::new();
+
+        let mut favourite_tables: Vec<&TableSource> = tables.iter().filter(|t| t.favourite).collect();
+        favourite_tables.sort_by(|a, b| a.name.cmp(&b.name));
+        for t in favourite_tables {
+            out.push(PaletteItem::Table { schema: t.schema.clone(), name: t.name.clone() });
+        }
+        for h in history {
+            out.push(PaletteItem::HistoryEntry { id: h.id, sql: h.sql.clone() });
+        }
+        for c in connections {
+            out.push(PaletteItem::Connection { id: c.id.clone(), name: c.name.clone() });
+        }
+        for (label, action) in fixed_actions() {
+            out.push(PaletteItem::Action { label, action });
+        }
+
+        out.truncate(cap);
+        return out;
+    }
+
+    let mut scored: Vec<(i64, PaletteItem)> = Vec::new();
+
+    for t in tables {
+        if let Some(mut score) = fuzzy_score(query, &table_search_text(t)) {
+            if t.favourite {
+                score += FAVOURITE_BONUS;
+            }
+            scored.push((score, PaletteItem::Table { schema: t.schema.clone(), name: t.name.clone() }));
+        }
+    }
+    for h in history {
+        if let Some(score) = fuzzy_score(query, &h.sql) {
+            scored.push((score, PaletteItem::HistoryEntry { id: h.id, sql: h.sql.clone() }));
+        }
+    }
+    for c in connections {
+        if let Some(mut score) = fuzzy_score(query, &c.name) {
+            if c.favourite {
+                score += FAVOURITE_BONUS;
+            }
+            scored.push((score, PaletteItem::Connection { id: c.id.clone(), name: c.name.clone() }));
+        }
+    }
+    for (label, action) in fixed_actions() {
+        if let Some(score) = fuzzy_score(query, &label) {
+            scored.push((score, PaletteItem::Action { label, action }));
+        }
+    }
+
+    // `sort_by` (stable) rather than `sort_unstable_by`: ties preserve the
+    // tables → history → connections → actions assembly order above, which
+    // gives non-empty-query results the same category precedence as the
+    // empty-query fixed order when scores happen to tie.
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.truncate(cap);
+    scored.into_iter().map(|(_, item)| item).collect()
+}
+
+/// The "T "/"H "/"C "/"A " prefixed row text (brief contract #3) `main.rs`
+/// renders for each item.
+pub fn display_label(item: &PaletteItem) -> String {
+    match item {
+        PaletteItem::Table { schema, name } => {
+            let full = match schema {
+                Some(s) if !s.is_empty() => format!("{s}.{name}"),
+                _ => name.clone(),
+            };
+            format!("T {full}")
+        }
+        PaletteItem::HistoryEntry { sql, .. } => {
+            format!("H {}", crate::history_panel::collapse_sql(sql, 48))
+        }
+        PaletteItem::Connection { name, .. } => format!("C {name}"),
+        PaletteItem::Action { label, .. } => format!("A {label}"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// GPUI plumbing: the palette's own scoped actions (Up/Down/Confirm/Close),
+// key-context "Palette" — same "scoped binding wins over the app-level
+// unscoped one" pattern as `TextField`/`SchemaTree` (see their module doc
+// comments). `main.rs` attaches these via `cx.listener` on the palette
+// overlay's root div, which also carries `.key_context("Palette")` so the
+// palette's `TextField` child (its own `key_context("TextField")` has no
+// Up/Down/Enter/Escape bindings of its own) still resolves them.
+// ---------------------------------------------------------------------
+
+actions!(palette, [PaletteUp, PaletteDown, PaletteConfirm, PaletteClose]);
+
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("up", PaletteUp, Some("Palette")),
+        KeyBinding::new("down", PaletteDown, Some("Palette")),
+        KeyBinding::new("enter", PaletteConfirm, Some("Palette")),
+        KeyBinding::new("escape", PaletteClose, Some("Palette")),
+    ]);
+}
+
+#[cfg(test)]
+mod fuzzy_score_tests {
+    use super::*;
+
+    #[test]
+    fn subsequence_miss_returns_none() {
+        assert_eq!(fuzzy_score("xyz", "abc"), None);
+        assert_eq!(fuzzy_score("orders", "products"), None);
+    }
+
+    #[test]
+    fn subsequence_hit_returns_some() {
+        assert!(fuzzy_score("odr", "orders").is_some());
+        assert!(fuzzy_score("ORD", "orders").is_some()); // case-insensitive
+    }
+
+    #[test]
+    fn consecutive_run_beats_scattered_match() {
+        let consecutive = fuzzy_score("ab", "xabx").unwrap();
+        let scattered = fuzzy_score("ab", "xaxbx").unwrap();
+        assert!(consecutive > scattered, "consecutive={consecutive} scattered={scattered}");
+    }
+
+    #[test]
+    fn word_boundary_hit_beats_mid_word_hit() {
+        let boundary = fuzzy_score("b", "foo_bar").unwrap(); // 'b' right after '_'
+        let mid_word = fuzzy_score("b", "foobar").unwrap(); // 'b' right after 'o'
+        assert!(boundary > mid_word, "boundary={boundary} mid_word={mid_word}");
+    }
+
+    #[test]
+    fn shorter_target_wins_ties() {
+        let short = fuzzy_score("cat", "cat").unwrap();
+        let long = fuzzy_score("cat", "cats_table").unwrap();
+        assert!(short > long, "short={short} long={long}");
+    }
+}
+
+#[cfg(test)]
+mod rank_items_tests {
+    use super::*;
+
+    fn table(schema: Option<&str>, name: &str, favourite: bool) -> TableSource {
+        TableSource { schema: schema.map(str::to_string), name: name.to_string(), favourite }
+    }
+
+    fn history(id: i64, sql: &str) -> HistorySource {
+        HistorySource { id, sql: sql.to_string() }
+    }
+
+    fn conn(id: &str, name: &str, favourite: bool) -> ConnectionSource {
+        ConnectionSource { id: id.to_string(), name: name.to_string(), favourite }
+    }
+
+    #[test]
+    fn empty_query_orders_favourites_then_history_then_connections_then_actions() {
+        let tables =
+            vec![table(None, "zzz_fav", true), table(None, "aaa_normal", false), table(None, "aaa_fav", true)];
+        let history = vec![history(1, "select 1"), history(2, "select 2")];
+        let connections = vec![conn("c1", "prod", false)];
+
+        let items = rank_items("", &tables, &history, &connections, 30);
+
+        // Favourites (alphabetical) first, then history (as given), then
+        // connections, then the 5 fixed actions.
+        assert_eq!(
+            items[0],
+            PaletteItem::Table { schema: None, name: "aaa_fav".into() }
+        );
+        assert_eq!(items[1], PaletteItem::Table { schema: None, name: "zzz_fav".into() });
+        assert_eq!(items[2], PaletteItem::HistoryEntry { id: 1, sql: "select 1".into() });
+        assert_eq!(items[3], PaletteItem::HistoryEntry { id: 2, sql: "select 2".into() });
+        assert_eq!(items[4], PaletteItem::Connection { id: "c1".into(), name: "prod".into() });
+        assert!(matches!(items[5], PaletteItem::Action { .. }));
+        assert_eq!(items.len(), 2 + 2 + 1 + 5);
+    }
+
+    #[test]
+    fn empty_query_is_capped() {
+        // Only favourites contribute to the "tables" category on an empty
+        // query (brief contract #3 lists favourites/history/connections/
+        // actions — not the whole unfiltered table list).
+        let tables: Vec<TableSource> = (0..50).map(|i| table(None, &format!("t{i}"), true)).collect();
+        let items = rank_items("", &tables, &[], &[], 30);
+        assert_eq!(items.len(), 30);
+    }
+
+    #[test]
+    fn non_matching_query_drops_items_that_dont_subsequence_match() {
+        let tables = vec![table(None, "orders", false)];
+        let items = rank_items("zzz", &tables, &[], &[], 30);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn favourite_ranks_first_among_otherwise_equal_matches() {
+        // Same-length schema prefixes ("aaaaa"/"bbbbb") + identical table
+        // name -> identical base fuzzy_score (same match positions, same
+        // target length) -> the favourite bonus is the only thing that can
+        // separate them.
+        let tables = vec![table(Some("aaaaa"), "orders", false), table(Some("bbbbb"), "orders", true)];
+        assert_eq!(
+            fuzzy_score("orders", &table_search_text(&tables[0])),
+            fuzzy_score("orders", &table_search_text(&tables[1])),
+            "test setup must produce a genuine base-score tie"
+        );
+        let items = rank_items("orders", &tables, &[], &[], 30);
+        assert_eq!(
+            items[0],
+            PaletteItem::Table { schema: Some("bbbbb".into()), name: "orders".into() }
+        );
+    }
+
+    #[test]
+    fn better_fuzzy_match_beats_a_favourite_with_a_much_weaker_match() {
+        // A long, scattered, no-boundary, non-consecutive match on a
+        // favourite must not beat a tight consecutive+boundary match on a
+        // non-favourite — the +1000 bonus tips a genuine tie, it doesn't
+        // override a real quality gap.
+        let mut weak_match = String::from("z");
+        for (i, c) in "orders".chars().enumerate() {
+            if i > 0 {
+                weak_match.push_str("zzzz"); // breaks the consecutive-run bonus
+            }
+            weak_match.push(c); // each hit is preceded by 'z' (alnum): no boundary bonus either
+        }
+        weak_match.push_str(&"z".repeat(30)); // long target: length penalty on top
+
+        let tables = vec![table(None, &weak_match, true), table(None, "orders", false)];
+        let items = rank_items("orders", &tables, &[], &[], 30);
+        assert_eq!(items[0], PaletteItem::Table { schema: None, name: "orders".into() });
+    }
+
+    #[test]
+    fn results_are_capped_at_30() {
+        let tables: Vec<TableSource> = (0..50).map(|i| table(None, &format!("orders_{i}"), false)).collect();
+        let items = rank_items("orders", &tables, &[], &[], 30);
+        assert_eq!(items.len(), 30);
+    }
+}

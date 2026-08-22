@@ -1354,7 +1354,10 @@ impl AppView {
     /// status synchronously, then flips to the connected/error status and
     /// (only on success) switches `active_connection_id` once the result
     /// comes back.
-    fn switch_to_connection(&mut self, id: &str, cx: &mut Context<Self>) {
+    /// `pub(crate)` (rather than private) so the command palette's
+    /// `Connection` item (G3 Task 5, main.rs) can route through this exact
+    /// switch path — brief contract #4: "no new execution logic".
+    pub(crate) fn switch_to_connection(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(cfg) = self.config.connections.iter().find(|c| c.id == id).cloned() else { return };
         let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
         let engine_lbl = engine_label(cfg.engine);
