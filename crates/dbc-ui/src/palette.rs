@@ -39,8 +39,19 @@ pub fn fuzzy_score(query: &str, target: &str) -> Option<i64> {
     const WORD_BOUNDARY_BONUS: i64 = 10;
     const SCALE: i64 = 1000;
 
+    // G3 final-review fix (F1): `target_lower` must stay index-aligned with
+    // `target_chars` 1:1, since `idx` computed against one is used to index
+    // the other below. `target.to_lowercase()` (whole-string) can *expand*
+    // for some characters (e.g. 'İ' U+0130 → "i\u{307}", 2 chars), which
+    // desyncs the two Vecs and panics on out-of-bounds indexing. Lowering
+    // each `char` independently and keeping only its first lowered char
+    // (falling back to the original on an empty iterator, which never
+    // happens for `char::to_lowercase`) guarantees the same length by
+    // construction — a minor ranking-quality loss for chars whose lowercase
+    // expansion carries real information, acceptable for a fuzzy scorer.
     let target_chars: Vec<char> = target.chars().collect();
-    let target_lower: Vec<char> = target.to_lowercase().chars().collect();
+    let target_lower: Vec<char> =
+        target_chars.iter().map(|&c| c.to_lowercase().next().unwrap_or(c)).collect();
 
     if query.is_empty() {
         return Some(-(target_chars.len() as i64));
@@ -295,6 +306,36 @@ mod fuzzy_score_tests {
         let short = fuzzy_score("cat", "cat").unwrap();
         let long = fuzzy_score("cat", "cats_table").unwrap();
         assert!(short > long, "short={short} long={long}");
+    }
+
+    // G3 final-review regression (F1): 'İ' (U+0130, Turkish capital dotted
+    // I) lowercases to a 2-char sequence ("i\u{307}"), which used to desync
+    // `target_lower`'s index space from `target_chars`'s and panic on
+    // out-of-bounds indexing. Neither call should panic, and both should
+    // still find a genuine subsequence match.
+    #[test]
+    fn lowercase_expanding_char_in_target_does_not_panic() {
+        // Empirical repro from the final review: target "İİİa" has 4
+        // original chars but 'İ' (U+0130) lowercases to 2 chars each, so a
+        // whole-string `target.to_lowercase()` desyncs to 7 chars — a query
+        // matching near the end used to index `target_chars` out of bounds.
+        // Query "a" matches the trailing 'a' — must not panic, must match.
+        assert!(fuzzy_score("a", "İİİa").is_some());
+        // Query "İ" itself lowercases (query-side, unrelated to the target
+        // fix) to a 2-char sequence whose second char has no counterpart in
+        // the per-char-lowered target — must not panic, even though it
+        // correctly fails to match.
+        assert_eq!(fuzzy_score("İ", "İİİa"), None);
+    }
+
+    #[test]
+    fn lowercase_expanding_char_in_query_does_not_panic() {
+        // Query-side lowering was never the source of the panic (its index
+        // space is never reused to index back into anything), but it's
+        // cheap to cover it too: this must not panic regardless of the
+        // Some/None outcome.
+        let _ = fuzzy_score("İ", "istanbul");
+        assert_eq!(fuzzy_score("İ", "xyz"), None);
     }
 }
 

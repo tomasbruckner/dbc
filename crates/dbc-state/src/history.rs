@@ -211,10 +211,16 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
     })
 }
 
-/// Wraps a user search string as an FTS5 phrase query so special MATCH
-/// syntax characters in `q` are treated as literal text, not query syntax.
+/// Wraps a user search string as an FTS5 *prefix* phrase query so special
+/// MATCH syntax characters in `q` are treated as literal text, not query
+/// syntax, AND partial words typed so far still match (live search re-runs
+/// on every keystroke — a whole-token-only phrase query like `"ord"` finds
+/// nothing against `orders` until the whole word is typed; `"ord"*` matches
+/// as a prefix). The `*` sits outside the closing quote so it applies to
+/// the phrase as a prefix operator rather than becoming literal text inside
+/// it; quote-doubling for literal `"` in `q` is unaffected.
 fn fts_phrase(q: &str) -> String {
-    format!("\"{}\"", q.replace('"', "\"\""))
+    format!("\"{}\"*", q.replace('"', "\"\""))
 }
 
 /// Escapes `%`, `_`, and the escape character itself for use inside a
@@ -268,6 +274,20 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert!(r[0].sql.contains("orders"));
         assert!(h.search("nonexistent_zzz", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fulltext_matches_on_partial_word_prefix() {
+        // G3 final-review regression (F2): live search re-queries on every
+        // keystroke, so a partial word typed so far ("ord") must already
+        // match "orders" — a whole-token-only phrase query finds nothing
+        // until the full word is typed, which broke the live-search UX.
+        let (_d, mut h) = db();
+        h.add("select * from orders where id = 1", "demo", 1000, None, None, None).unwrap();
+        h.add("update inventory set qty = 0", "demo", 2000, None, None, None).unwrap();
+        let r = h.search("ord", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert!(r[0].sql.contains("orders"));
     }
 
     #[test]

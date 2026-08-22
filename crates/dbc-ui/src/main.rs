@@ -667,7 +667,16 @@ impl AppView {
                 window.focus(&editor_focus, cx);
             }
             PaletteItem::Connection { id, .. } => {
-                self.switch_to_connection(&id, cx);
+                // G3 final-review fix (F3): route through the SAME
+                // vault-prompt path the dropdown uses, not straight to
+                // `switch_to_connection` — otherwise a locked vault (the
+                // normal state at every app start) makes the palette's
+                // connection switch dispatch without the secret and die
+                // with a connect error instead of prompting for the master
+                // password. The palette is already closed (line above)
+                // before this call, so `on_dropdown_item_click` opening the
+                // `MasterPasswordPrompt` modal cannot conflict with it.
+                self.on_dropdown_item_click(id, window, cx);
             }
             PaletteItem::Action { action, .. } => match action {
                 PaletteAction::RunQuery => self.run_query(false, cx),

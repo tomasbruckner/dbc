@@ -31,13 +31,20 @@
 // query) and `refresh_history_cache` only runs when they differ.
 
 use dbc_state::HistoryEntry;
-use gpui::{div, prelude::*, px, rgb, AnyElement, Context, Focusable};
+use gpui::{div, prelude::*, px, rgb, uniform_list, AnyElement, Context, Focusable};
 
 use crate::AppView;
 
 /// Right-panel fixed width (brief contract #3), mirroring the schema tree
 /// panel's `w(px(260.))` in `main.rs`'s `render`.
 pub const PANEL_WIDTH: f32 = 280.;
+
+/// Fixed per-row height (brief: G3 final-review fix F4) — `uniform_list`
+/// (the same mechanism `grid.rs`/`schema_tree.rs` use for their scrollable
+/// rows) requires every row the same height; a two-line entry (SQL +
+/// meta/error line) needs more than the tree's single-line 22px, so this is
+/// taller.
+const HISTORY_ROW_HEIGHT: f32 = 44.;
 
 /// First line of a history entry: SQL collapsed to one line, truncated to
 /// this many chars (brief contract #3). Same algorithm as
@@ -138,66 +145,85 @@ impl AppView {
             self.refresh_history_cache(cx);
         }
 
-        let mut list = div().id("history-list").flex().flex_col().flex_1().overflow_hidden();
-        for entry in &self.history_cache {
-            let id = entry.id;
-            let sql_for_click = entry.sql.clone();
-            let line1 = collapse_sql(&entry.sql, SQL_COLLAPSE_MAX_CHARS);
-            let (line2, is_error) = format_meta_line(entry);
-            let line2_color = if is_error { rgb(0xf38ba8) } else { rgb(0xa6adc8) };
-            let starred = entry.starred;
-            let star = if starred { "★" } else { "☆" };
-            let star_color = if starred { rgb(0xf9e2af) } else { rgb(0x6c7086) };
+        // G3 final-review fix (F4): `uniform_list` — same mechanism as
+        // `grid.rs`'s result rows and `schema_tree.rs`'s tree rows — instead
+        // of a plain clipped `div`, so all fetched entries (up to 100) are
+        // reachable by scrolling, not just the ~15-20 that fit one
+        // screenful. Reads `this.history_cache[ix]` directly inside the
+        // processor rather than capturing a separate clone, since the cache
+        // already lives on `AppView`.
+        let entry_count = self.history_cache.len();
+        let list = uniform_list(
+            "history-list",
+            entry_count,
+            cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                let mut items = Vec::with_capacity(range.len());
+                for ix in range {
+                    let entry = &this.history_cache[ix];
+                    let id = entry.id;
+                    let sql_for_click = entry.sql.clone();
+                    let line1 = collapse_sql(&entry.sql, SQL_COLLAPSE_MAX_CHARS);
+                    let (line2, is_error) = format_meta_line(entry);
+                    let line2_color = if is_error { rgb(0xf38ba8) } else { rgb(0xa6adc8) };
+                    let starred = entry.starred;
+                    let star = if starred { "★" } else { "☆" };
+                    let star_color = if starred { rgb(0xf9e2af) } else { rgb(0x6c7086) };
 
-            list = list.child(
-                div()
-                    .id(("history-entry", id as usize))
-                    .flex()
-                    .flex_row()
-                    .items_start()
-                    .gap_1()
-                    .px_2()
-                    .py_1()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x313244)))
-                    // Brief contract #4: click loads the SQL into the editor
-                    // and focuses it, but NEVER runs it.
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        view.sql.update(cx, |sql, cx| sql.set_text(&sql_for_click, cx));
-                        let editor_focus = view.sql.focus_handle(cx);
-                        window.focus(&editor_focus, cx);
-                        cx.notify();
-                    }))
-                    .child(
+                    items.push(
                         div()
-                            .id(("history-star", id as usize))
-                            .cursor_pointer()
-                            .text_color(star_color)
-                            .child(star)
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                cx.stop_propagation();
-                                if let Some(h) = view.history.as_mut() {
-                                    let _ = h.set_starred(id, !starred);
-                                }
-                                // Review Issue 1: the star order (starred
-                                // entries sort first) changed, so the cache
-                                // must be refreshed, not just the window
-                                // re-notified.
-                                view.refresh_history_cache(cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
+                            .id(("history-entry", id as usize))
                             .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .child(div().text_color(rgb(0xcdd6f4)).child(line1))
-                            .child(div().text_size(px(11.)).text_color(line2_color).child(line2)),
-                    ),
-            );
-        }
+                            .flex_row()
+                            .items_start()
+                            .gap_1()
+                            .h(px(HISTORY_ROW_HEIGHT))
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x313244)))
+                            // Brief contract #4: click loads the SQL into
+                            // the editor and focuses it, but NEVER runs it.
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.sql.update(cx, |sql, cx| sql.set_text(&sql_for_click, cx));
+                                let editor_focus = view.sql.focus_handle(cx);
+                                window.focus(&editor_focus, cx);
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .id(("history-star", id as usize))
+                                    .cursor_pointer()
+                                    .text_color(star_color)
+                                    .child(star)
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(h) = view.history.as_mut() {
+                                            let _ = h.set_starred(id, !starred);
+                                        }
+                                        // Review Issue 1: the star order
+                                        // (starred entries sort first)
+                                        // changed, so the cache must be
+                                        // refreshed, not just the window
+                                        // re-notified.
+                                        view.refresh_history_cache(cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(div().text_color(rgb(0xcdd6f4)).child(line1))
+                                    .child(div().text_size(px(11.)).text_color(line2_color).child(line2)),
+                            ),
+                    );
+                }
+                items
+            }),
+        )
+        .flex_1();
 
         div()
             .id("history-panel")
