@@ -16,7 +16,8 @@ fn bench_1m(c: &mut Criterion) {
                 let start = chunk as i64 * 1000;
                 let ids = Int64Array::from_iter_values(start..start + 1000);
                 let names = StringArray::from_iter_values((0..1000).map(|i| format!("row{}", start + i)));
-                buf.push(RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(names)]).unwrap());
+                buf.push(RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(names)]).unwrap())
+                    .unwrap();
             }
             assert_eq!(buf.row_count(), 1_000_000);
             for i in (0..1_000_000).step_by(1000) {

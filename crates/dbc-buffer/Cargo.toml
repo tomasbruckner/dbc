@@ -9,7 +9,6 @@ tempfile = "3"
 
 [dev-dependencies]
 criterion = "0.5"
-tempfile = "3"
 
 [[bench]]
 name = "push_1m"

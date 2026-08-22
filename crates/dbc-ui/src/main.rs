@@ -148,6 +148,10 @@ impl AppView {
         let grid = self.grid.clone();
         cx.spawn(async move |this, cx| {
             let mut buffer: Option<Rc<RefCell<ResultBuffer>>> = None;
+            // Set once a buffer push fails; suppresses further batch
+            // processing for this run while the cancel we just fired
+            // propagates through the driver.
+            let mut errored = false;
             while let Some(ev) = rx.recv().await {
                 let _ = this.update(cx, |view, cx| {
                     match ev {
@@ -158,12 +162,23 @@ impl AppView {
                             view.status = format!("running…{limit_suffix}");
                         }
                         QueryEvent::Batch(b) => {
-                            if let Some(buf) = &buffer {
-                                buf.borrow_mut().push(b);
+                            if errored {
+                                // Already failed and cancelled this run —
+                                // drop any further in-flight batches.
+                            } else if let Some(Err(e)) =
+                                buffer.as_ref().map(|buf| buf.borrow_mut().push(b))
+                            {
+                                errored = true;
+                                view.status = format!("error: {e}");
+                                if let Some(token) = view.cancel.take() {
+                                    token.cancel();
+                                }
+                            } else {
+                                let rows = buffer.as_ref().map_or(0, |b| b.borrow().row_count());
+                                let secs =
+                                    view.started_at.map_or(0.0, |t| t.elapsed().as_secs_f32());
+                                view.status = format!("{rows} rows… {secs:.1}s{limit_suffix}");
                             }
-                            let rows = buffer.as_ref().map_or(0, |b| b.borrow().row_count());
-                            let secs = view.started_at.map_or(0.0, |t| t.elapsed().as_secs_f32());
-                            view.status = format!("{rows} rows… {secs:.1}s{limit_suffix}");
                         }
                         QueryEvent::Finished { elapsed } => {
                             let rows = buffer.as_ref().map_or(0, |b| b.borrow().row_count());

@@ -71,13 +71,15 @@ impl ResultGrid {
         let mut buf = buf.borrow_mut();
         let mut out = String::new();
         for r in rmin..=rmax {
+            if r > rmin {
+                out.push('\n');
+            }
             for c in cmin..=cmax {
                 if c > cmin {
                     out.push('\t');
                 }
                 out.push_str(&buf.cell_text(r, c));
             }
-            out.push('\n');
         }
         cx.write_to_clipboard(ClipboardItem::new_string(out));
     }
