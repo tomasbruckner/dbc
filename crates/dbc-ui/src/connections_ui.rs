@@ -1304,12 +1304,19 @@ impl AppView {
             }
             Ok(spec) => {
                 self.status = "connecting…".into();
+                self.switch_generation += 1;
+                let my_generation = self.switch_generation;
                 cx.notify();
 
                 let rx = self.runner.test_connect(spec);
                 cx.spawn(async move |this, cx| {
                     let result = rx.await;
                     let _ = this.update(cx, |view, cx| {
+                        // A newer switch was dispatched meanwhile — this
+                        // result is stale, drop it (last-dispatched wins).
+                        if view.switch_generation != my_generation {
+                            return;
+                        }
                         match result {
                             Ok(Ok(())) => {
                                 view.status = format!("Připojeno ({engine_lbl})");

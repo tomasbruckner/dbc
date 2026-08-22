@@ -43,6 +43,10 @@ struct AppView {
     /// master password once (brief: prompt on first use, not at startup).
     vault: Option<Vault>,
     active_connection_id: Option<String>,
+    /// Bumped on every dropdown connection switch; a switch result only
+    /// applies if the generation still matches (last-dispatched wins, not
+    /// last-resolved).
+    switch_generation: u64,
     dropdown_open: bool,
     modal: Option<connections_ui::ModalState>,
     /// Cached folder/favourite grouping of `config.connections`, recomputed
@@ -293,6 +297,7 @@ fn main() {
                         vault_path,
                         vault: None,
                         active_connection_id: None,
+                        switch_generation: 0,
                         dropdown_open: false,
                         modal: None,
                         grouped_cache,
