@@ -30,6 +30,13 @@ const FIND_MAX_MATCHES: usize = 1_000;
 /// comment for why only that half can move — `ResultBuffer` itself is
 /// `Rc<RefCell<_>>`, not `Send`).
 const LARGE_EXPORT_ROWS: usize = 50_000;
+/// Review fix (Task 4 round 1, Issue 1): `start_export`'s row/column
+/// snapshot reads this many display rows per iteration of a `cx.spawn` loop
+/// on the FOREGROUND executor, yielding (a real, non-zero timer await — see
+/// that loop's comment for why zero-duration doesn't actually yield) between
+/// chunks so the window keeps painting/handling input even for a full
+/// spilled 500k-row export, instead of one unbounded synchronous pass.
+const EXPORT_SNAPSHOT_CHUNK_ROWS: usize = 25_000;
 
 actions!(grid, [CopySelection, FindInResult, FindNext, FindPrev]);
 
@@ -529,6 +536,19 @@ impl ResultGrid {
                 self.rebuild_view();
             }
         }
+        // Review fix (Task 4 round 1, Issue 2): bump `view_generation`
+        // UNCONDITIONALLY on every visibility flip, not only when a filter
+        // was also cleared above. `poll_find` only recomputes `find.matches`
+        // when `view_generation` changed (or the query text did) — without
+        // this, hiding a column that has no active filter (the common case)
+        // left stale matches pointing at a column the row-rendering loop no
+        // longer draws, overcounting the "i z n" indicator and letting
+        // next/prev jump to a row with no visible highlight. A plain bump
+        // (rather than a full `rebuild_view()`) is deliberate: visibility
+        // never changes row order/count, so re-deriving `view.order` would
+        // be pure waste and would incorrectly flash the "řadím…" status note
+        // for a large result on a mere show/hide click.
+        self.view_generation += 1;
         cx.notify();
     }
 
@@ -554,22 +574,39 @@ impl ResultGrid {
     /// "Export ▾" format click. Exports the CURRENT VIEW: rows in display
     /// order (`view.source_row`), hidden columns excluded (brief contract).
     ///
-    /// `ResultBuffer` lives behind `Rc<RefCell<_>>` (not `Send`), so it can
-    /// never cross `cx.background_executor()`'s background thread pool —
-    /// the row/column snapshot into owned `Option<String>` data (the
-    /// `rows_data` loop below) unavoidably runs on the UI thread no matter
-    /// the row count, same cost the grid's own render already pays per
-    /// visible window, just done once for the whole export. What DOES move
-    /// to a background thread above `LARGE_EXPORT_ROWS` is the part that
-    /// scales with output size and I/O — formatting every cell into
-    /// CSV/TSV/JSON/INSERT text and writing it to disk — since `rows_data`
-    /// (plain `String`s) IS `Send`. Below the threshold both halves just
-    /// run inline; either way the save-dialog await and the final status
-    /// update happen through the same `cx.spawn` task, matching the
-    /// existing "UI thread awaits a channel/future via cx.spawn" shape used
-    /// for query runs (`main.rs`) rather than introducing a raw
-    /// `std::thread` + channel (brief allows either; this reuses the
-    /// existing pattern).
+    /// Review fix (Task 4 round 1, Issue 1/4): restructured from the
+    /// original "snapshot everything synchronously, THEN show the dialog"
+    /// shape into dialog-first, chunked-snapshot-second:
+    ///
+    /// 1. The save-destination dialog is awaited FIRST, before any row data
+    ///    is touched — a cancel now costs nothing instead of throwing away a
+    ///    full synchronous read.
+    /// 2. Once a destination is resolved, `status_note` is set to
+    ///    "exportuji…" and `cx.notify()`d so it actually PAINTS before the
+    ///    heavy work starts (previously the note was set only after the
+    ///    snapshot had already completed).
+    /// 3. The row/column snapshot into owned `Option<String>` data then runs
+    ///    in `EXPORT_SNAPSHOT_CHUNK_ROWS`-sized chunks, each a separate
+    ///    `this.update` on the FOREGROUND executor (so it can safely touch
+    ///    `self.view`/`self.buffer`), with a real (non-zero-duration —
+    ///    `BackgroundExecutor::timer` short-circuits `Duration::ZERO` to an
+    ///    already-`Ready` task that never actually yields control back to
+    ///    the platform run loop, so it wouldn't let the window repaint)
+    ///    timer await between chunks. This keeps the window responsive
+    ///    (repaint, input, even closing the tab) for the entire snapshot,
+    ///    including a full spilled 500k-row export, instead of one
+    ///    unbounded synchronous UI-thread pass.
+    /// 4. Each chunk re-checks that this grid entity and its buffer are
+    ///    still the ones we started with (`Rc::ptr_eq` + `view_generation`)
+    ///    — if the tab was closed or a new query/sort/filter/visibility
+    ///    change replaced the view mid-export, the export aborts with a
+    ///    status note instead of silently mixing rows from two different
+    ///    views or writing into a torn-down entity.
+    /// 5. Formatting+write is unchanged: still offloaded to
+    ///    `cx.background_executor()` above `LARGE_EXPORT_ROWS` (the
+    ///    completed `rows_data` — plain `String`s — IS `Send`, unlike
+    ///    `ResultBuffer` itself which is `Rc<RefCell<_>>`), inline
+    ///    otherwise, fed by the now-completed snapshot.
     fn start_export(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
         let Some(buf) = self.buffer.clone() else { return };
         let (headers, cols) = self.export_headers_and_cols();
@@ -582,30 +619,19 @@ impl ResultGrid {
         let ext = format.extension();
         let suggested_name = format!("{table_name}.{ext}");
         let n = self.view.len();
+        let view_generation = self.view_generation;
 
-        let mut rows_data: Vec<Vec<Option<String>>> = Vec::with_capacity(n);
-        {
-            let mut buf_mut = buf.borrow_mut();
-            for r in 0..n {
-                let source_row = self.view.source_row(r);
-                let mut row = Vec::with_capacity(cols.len());
-                for &c in &cols {
-                    let val = if buf_mut.cell_is_null(source_row, c) {
-                        None
-                    } else {
-                        Some(buf_mut.cell_text(source_row, c))
-                    };
-                    row.push(val);
-                }
-                rows_data.push(row);
-            }
-        }
-
+        // Fix 1a: resolve the destination FIRST — cancelling the dialog now
+        // costs nothing since no snapshot work has happened yet.
         self.status_note = Some("volím cíl exportu…".to_string());
         cx.notify();
-
         let dialog = cx.prompt_for_new_path(&std::path::PathBuf::new(), Some(&suggested_name));
         cx.spawn(async move |this, cx| {
+            // Fix 3 (Issue 3): keep a genuine dialog error's text separate
+            // from a plain cancelled/unavailable dialog so it isn't silently
+            // discarded — surfaced in the final status note if the Downloads
+            // fallback is used.
+            let mut dialog_error: Option<String> = None;
             let path = match dialog.await {
                 Ok(Ok(Some(p))) => p,
                 Ok(Ok(None)) => {
@@ -615,17 +641,31 @@ impl ResultGrid {
                     });
                     return;
                 }
-                // Save dialog unavailable or errored (brief's documented
-                // fallback for a platform picker that isn't usable) — write
-                // a timestamped file into the user's Downloads instead.
-                _ => match dirs::download_dir() {
-                    Some(dir) => {
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        dir.join(format!("dbc-export-{ts}.{ext}"))
+                // A genuine platform error from the dialog itself (invalid
+                // initial directory, permission issue, ...) — fall back to
+                // Downloads like the "unavailable" case below, but keep the
+                // error text to surface once the export finishes.
+                Ok(Err(e)) => {
+                    dialog_error = Some(e.to_string());
+                    match dirs::download_dir() {
+                        Some(dir) => dir.join(format!("dbc-export-{}.{ext}", export_timestamp())),
+                        None => {
+                            let _ = this.update(cx, |g, cx| {
+                                g.status_note = Some(format!(
+                                    "error: dialog pro uložení selhal ({e}) a složka Stažené není dostupná"
+                                ));
+                                cx.notify();
+                            });
+                            return;
+                        }
                     }
+                }
+                // Dropped/cancelled oneshot channel — dialog unavailable
+                // (brief's documented fallback for a platform picker that
+                // isn't usable) — write a timestamped file into the user's
+                // Downloads instead.
+                Err(_canceled) => match dirs::download_dir() {
+                    Some(dir) => dir.join(format!("dbc-export-{}.{ext}", export_timestamp())),
                     None => {
                         let _ = this.update(cx, |g, cx| {
                             g.status_note =
@@ -636,6 +676,73 @@ impl ResultGrid {
                     }
                 },
             };
+
+            // Fix 1b: paint "exporting…" BEFORE the heavy snapshot work
+            // starts, not after (the previous version set this note *after*
+            // the synchronous snapshot loop had already completed).
+            if this
+                .update(cx, |g, cx| {
+                    g.status_note = Some(format!("exportuji… ({n} řádků)"));
+                    cx.notify();
+                })
+                .is_err()
+            {
+                return; // grid entity gone already
+            }
+
+            // Fix 1c: snapshot in chunks, yielding between them so the UI
+            // thread keeps painting/handling input.
+            let mut rows_data: Vec<Vec<Option<String>>> = Vec::with_capacity(n);
+            let mut row = 0usize;
+            while row < n {
+                let chunk_end = (row + EXPORT_SNAPSHOT_CHUNK_ROWS).min(n);
+                let chunk = this.update(cx, |g, _cx| {
+                    // Fix 1d: abort if the buffer/view changed out from
+                    // under us mid-export (tab closed and entity gone is
+                    // handled by `this.update`'s own `Err` below; this
+                    // covers "entity alive but pointing at a different
+                    // result now" — new query, or a sort/filter/visibility
+                    // change, since all of those bump `view_generation`).
+                    let current_buf = g.buffer.clone()?;
+                    if !Rc::ptr_eq(&current_buf, &buf) || g.view_generation != view_generation {
+                        return None;
+                    }
+                    let mut buf_mut = buf.borrow_mut();
+                    let mut chunk_rows = Vec::with_capacity(chunk_end - row);
+                    for r in row..chunk_end {
+                        let source_row = g.view.source_row(r);
+                        let mut vals = Vec::with_capacity(cols.len());
+                        for &c in &cols {
+                            let val = if buf_mut.cell_is_null(source_row, c) {
+                                None
+                            } else {
+                                Some(buf_mut.cell_text(source_row, c))
+                            };
+                            vals.push(val);
+                        }
+                        chunk_rows.push(vals);
+                    }
+                    Some(chunk_rows)
+                });
+                match chunk {
+                    Ok(Some(mut chunk_rows)) => rows_data.append(&mut chunk_rows),
+                    Ok(None) => {
+                        let _ = this.update(cx, |g, cx| {
+                            g.status_note =
+                                Some("export přerušen: data se mezitím změnila".to_string());
+                            cx.notify();
+                        });
+                        return;
+                    }
+                    Err(_) => return, // grid entity dropped mid-export
+                }
+                row = chunk_end;
+                if row < n {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(1))
+                        .await;
+                }
+            }
 
             let large = n > LARGE_EXPORT_ROWS;
             let result: Result<(), String> = if large {
@@ -651,7 +758,13 @@ impl ResultGrid {
 
             let _ = this.update(cx, |g, cx| {
                 g.status_note = Some(match result {
-                    Ok(()) => format!("exportováno: {} ({n} řádků)", path.display()),
+                    Ok(()) => match &dialog_error {
+                        Some(err) => format!(
+                            "exportováno (dialog pro uložení selhal: {err}; použita složka Stažené): {} ({n} řádků)",
+                            path.display()
+                        ),
+                        None => format!("exportováno: {} ({n} řádků)", path.display()),
+                    },
                     Err(e) => format!("error: {e}"),
                 });
                 cx.notify();
@@ -1120,6 +1233,17 @@ impl ResultGrid {
         }
         row
     }
+}
+
+/// Unix-seconds timestamp used to name a `start_export` Downloads fallback
+/// file (`dbc-export-{ts}.{ext}`) — shared by both fallback arms (a real
+/// dialog error and a dropped/cancelled dialog channel) so they don't
+/// duplicate the `SystemTime` dance.
+fn export_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Formats `data` (already-snapshotted visible cells, display order — see
