@@ -64,12 +64,37 @@ pub enum GridEvent {
         key: String,
         title: String,
         joins: Vec<JoinSpec>,
+        /// Review fix (Task 5 round 1, Issue 2): the SOURCE column/ref-column
+        /// this specific checkbox click toggled — `main.rs::on_grid_event`
+        /// needs this to undo exactly that flip via
+        /// `ResultGrid::revert_fk_toggle` if the re-run can't actually start
+        /// (one-query-at-a-time guard already busy). `toggle_fk_column`
+        /// already mutated `fk_checked` and `cx.notify()`'d before emitting,
+        /// so without this the checkbox would stay visibly checked/unchecked
+        /// while the SQL behind it never changed.
+        col: usize,
+        ref_col: String,
     },
+    /// Review fix (Task 5 round 1, Issue 5, informational): unlike
+    /// `RerunPreviewJoins` (routed through `run_query_with`'s
+    /// one-query-at-a-time guard), `main.rs::start_lookup` dispatches this
+    /// regardless of whether a query is already running — deliberately safe,
+    /// since `QueryRunner::fetch_lookup` opens its own independent
+    /// connection rather than sharing one with an in-flight run (see
+    /// `start_lookup`'s own doc comment for the full reasoning).
     RunLookup {
         sql: String,
         ref_table: String,
         wanted_cols: Vec<String>,
         src_col: usize,
+        /// Review fix (Task 5 round 1, Issue 1): this `src_col`'s
+        /// `ResultGrid::lookup_generation` value AT THE MOMENT this event
+        /// was emitted — threaded through `main.rs::start_lookup` and back
+        /// into `ResultGrid::accept_lookup_result` when the response
+        /// arrives, so a response can tell whether a newer request for the
+        /// same column has been dispatched since (last-dispatched wins, not
+        /// last-arrived).
+        generation: u64,
     },
 }
 
@@ -262,6 +287,19 @@ pub struct ResultGrid {
     /// "effective-column" indexing doc comment (sources `0..n`, virtuals
     /// `n..n+m`). Populated/replaced per-FK-column by `set_virtual_cols_for_src`.
     virtual_cols: Vec<VirtualCol>,
+    /// AD-HOC tabs only, review fix (Task 5 round 1, Issue 1): by SOURCE
+    /// column index (sized to `fk_info.len()`, same convention as
+    /// `fk_checked`) — bumped by `toggle_fk_column` on EVERY ad-hoc state
+    /// transition for that column, whether it fires a fresh `RunLookup` or
+    /// just clears `virtual_cols` locally (an uncheck-to-zero never
+    /// dispatches a request, but still needs to invalidate any earlier
+    /// still-in-flight one). `GridEvent::RunLookup::generation` carries the
+    /// value captured at dispatch time; `accept_lookup_result` compares it
+    /// against the CURRENT value here when the response arrives — a
+    /// mismatch means a newer request (or a local clear) has superseded it,
+    /// so the stale response is dropped (last-dispatched wins, not
+    /// last-arrived).
+    lookup_generation: Vec<u64>,
 }
 
 impl ResultGrid {
@@ -296,6 +334,7 @@ impl ResultGrid {
             preview_title: None,
             joined_cols: Vec::new(),
             virtual_cols: Vec::new(),
+            lookup_generation: Vec::new(),
         }
     }
 
@@ -331,6 +370,7 @@ impl ResultGrid {
         self.preview_title = None;
         self.joined_cols = vec![false; ncols];
         self.virtual_cols = Vec::new();
+        self.lookup_generation = vec![0; ncols];
     }
 
     /// Public seam (Task 4): called by `main.rs` right after `set_buffer`
@@ -376,6 +416,7 @@ impl ResultGrid {
     /// `apply_active_joins` right after this.
     pub fn set_fk_info(&mut self, fk_info: Vec<Option<FkRef>>, ref_columns: Vec<Option<Vec<String>>>) {
         self.fk_checked = vec![HashSet::new(); fk_info.len()];
+        self.lookup_generation = vec![0; fk_info.len()];
         self.fk_info = fk_info;
         self.fk_ref_columns = ref_columns;
     }
@@ -453,8 +494,11 @@ impl ResultGrid {
     ///   firing a query at all.
     fn toggle_fk_column(&mut self, col: usize, ref_col: String, cx: &mut Context<Self>) {
         let Some(set) = self.fk_checked.get_mut(col) else { return };
+        // Clones into `insert` (rather than moving `ref_col`) so the PREVIEW
+        // branch below can still hand `ref_col` to `GridEvent::RerunPreviewJoins`
+        // (Task 5 round 1, Issue 2's revert path needs it).
         if !set.remove(&ref_col) {
-            set.insert(ref_col);
+            set.insert(ref_col.clone());
         }
         let checked_ordered: Vec<String> = self
             .fk_ref_columns
@@ -473,10 +517,28 @@ impl ResultGrid {
                 key: self.preview_key.clone().unwrap_or_default(),
                 title: self.preview_title.clone().unwrap_or_default(),
                 joins,
+                col,
+                ref_col,
             });
             cx.notify();
             return;
         }
+
+        // Review fix (Task 5 round 1, Issue 1): EVERY ad-hoc state
+        // transition for this column bumps its lookup generation first —
+        // whether it goes on to fire a fresh `RunLookup` below or just
+        // clears `virtual_cols` locally (the empty/over-cap/no-distinct-
+        // values paths). Bumping on the local-clear paths too is what lets
+        // `accept_lookup_result` catch "check, then quickly uncheck again"
+        // (uncheck never dispatches a new request — without this the
+        // earlier still-in-flight response would have nothing newer to lose
+        // to) as well as the "check A, then check B before A resolves" race
+        // (both dispatch, only B's generation is current). See
+        // `lookup_generation`'s doc comment.
+        if let Some(g) = self.lookup_generation.get_mut(col) {
+            *g += 1;
+        }
+        let generation = self.lookup_generation.get(col).copied().unwrap_or(0);
 
         if checked_ordered.is_empty() {
             self.virtual_cols.retain(|v| v.src_col != col);
@@ -510,7 +572,52 @@ impl ResultGrid {
             ref_table: fk.table.clone(),
             wanted_cols: checked_ordered,
             src_col: col,
+            generation,
         });
+        cx.notify();
+    }
+
+    /// Review fix (Task 5 round 1, Issue 1): decides whether a `RunLookup`
+    /// response for `col` should still be applied, given the generation
+    /// `main.rs::start_lookup` captured at dispatch time and the ref-columns
+    /// that response was fetched for (`wanted_cols`). Two independent
+    /// staleness checks, either one alone is enough to reject:
+    /// - `generation` no longer matches `lookup_generation[col]` — a newer
+    ///   ad-hoc state transition for this column (another toggle, in either
+    ///   direction) has happened since this request was dispatched.
+    /// - any of `wanted_cols` is no longer in `fk_checked[col]` — the user
+    ///   has since unchecked at least one column this response covers.
+    ///   Redundant with the generation check for every path THIS file
+    ///   drives (every transition bumps the generation), but kept as an
+    ///   explicit, independently-correct second condition per the review
+    ///   recommendation rather than relying solely on every future call site
+    ///   remembering to bump — cheap defense in depth for a HashSet compare
+    ///   this small.
+    pub fn accept_lookup_result(&self, col: usize, generation: u64, wanted_cols: &[String]) -> bool {
+        let current = self.lookup_generation.get(col).copied().unwrap_or(0);
+        let Some(checked) = self.fk_checked.get(col) else { return false };
+        should_apply_lookup(generation, current, checked, wanted_cols)
+    }
+
+    /// Review fix (Task 5 round 1, Issue 2), PREVIEW tabs only: undoes
+    /// exactly the checkbox flip `toggle_fk_column` just applied to
+    /// `fk_checked[col]` — called by `main.rs::on_grid_event` when the
+    /// `RerunPreviewJoins` this same toggle emitted arrives while a query is
+    /// already running (`run_query_with`'s one-query-at-a-time guard).
+    /// `toggle_fk_column` already mutated `fk_checked` and `cx.notify()`'d
+    /// before emitting the event that got dropped, so without this the
+    /// checkbox would stay visibly flipped while the SQL behind it never
+    /// actually changed — a silent desync between what the ☰ menu shows and
+    /// what the tab's data actually reflects. Toggling membership is its own
+    /// inverse (remove-if-present else insert), so this is the exact same
+    /// operation `toggle_fk_column` opened with, just without emitting a new
+    /// event.
+    pub fn revert_fk_toggle(&mut self, col: usize, ref_col: &str, cx: &mut Context<Self>) {
+        if let Some(set) = self.fk_checked.get_mut(col) {
+            if !set.remove(ref_col) {
+                set.insert(ref_col.to_string());
+            }
+        }
         cx.notify();
     }
 
@@ -1794,6 +1901,21 @@ impl ResultGrid {
     }
 }
 
+/// Review fix (Task 5 round 1, Issue 1): pure decision logic behind
+/// `ResultGrid::accept_lookup_result` — pulled out as a free function over
+/// plain values (no `ResultGrid`/entity needed) so it's directly unit
+/// testable. See `ResultGrid::lookup_generation`'s doc comment for the two
+/// races this guards against.
+fn should_apply_lookup(
+    requested_generation: u64,
+    current_generation: u64,
+    currently_checked: &HashSet<String>,
+    wanted_cols: &[String],
+) -> bool {
+    requested_generation == current_generation
+        && wanted_cols.iter().all(|c| currently_checked.contains(c))
+}
+
 /// G4 Task 5: effective-column (`fk_join`'s "sources 0..n, virtuals
 /// n..n+m") text accessor over a REAL `ResultBuffer` — every non-render
 /// consumer (`rebuild_view`'s sort/filter closure, `poll_find`, `on_copy`,
@@ -2111,5 +2233,81 @@ impl Render for ResultGrid {
         }
 
         root
+    }
+}
+
+/// Review fix (Task 5 round 1, Issue 1): pure unit tests for
+/// `should_apply_lookup` — the extractable decision logic behind
+/// `ResultGrid::accept_lookup_result`. Doesn't need a `Context`/`App` at
+/// all, unlike the rest of `ResultGrid`'s behaviour, so it's tested
+/// directly rather than through a GPUI test harness.
+#[cfg(test)]
+mod lookup_generation_tests {
+    use super::should_apply_lookup;
+    use std::collections::HashSet;
+
+    fn set(cols: &[&str]) -> HashSet<String> {
+        cols.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn accepts_when_generation_matches_and_all_wanted_cols_still_checked() {
+        let checked = set(&["name", "email"]);
+        assert!(should_apply_lookup(3, 3, &checked, &["name".to_string()]));
+        assert!(should_apply_lookup(
+            3,
+            3,
+            &checked,
+            &["name".to_string(), "email".to_string()]
+        ));
+    }
+
+    #[test]
+    fn rejects_when_a_newer_request_has_since_been_dispatched() {
+        // Simulates: lookup A dispatched at generation 1 (wanted=[name]),
+        // then lookup B dispatched at generation 2 (wanted=[name,email]) —
+        // A's response arrives after B was dispatched (reordering).
+        let checked = set(&["name", "email"]);
+        assert!(!should_apply_lookup(1, 2, &checked, &["name".to_string()]));
+    }
+
+    #[test]
+    fn rejects_when_checked_uncheck_happened_with_no_new_dispatch() {
+        // Simulates: lookup A dispatched at generation 1 (wanted=[name]),
+        // then the user unchecks "name" — `checked_ordered` goes empty, the
+        // local-clear path bumps the generation to 2 with NO new
+        // `RunLookup` dispatched. A's response arrives late.
+        let checked: HashSet<String> = HashSet::new();
+        assert!(!should_apply_lookup(1, 2, &checked, &["name".to_string()]));
+    }
+
+    #[test]
+    fn rejects_when_generation_matches_but_a_wanted_col_was_unchecked() {
+        // Defense-in-depth: even if the generation happened to match, a
+        // response is rejected if any column it covers is no longer in the
+        // checked set.
+        let checked = set(&["email"]);
+        assert!(!should_apply_lookup(5, 5, &checked, &["name".to_string()]));
+    }
+
+    #[test]
+    fn rejects_when_wanted_cols_is_a_strict_subset_of_checked() {
+        // Response for an OLDER, smaller wanted-set arriving while a newer
+        // dispatch (different generation) is in flight for a larger set —
+        // generation alone already rejects this, checked here for the
+        // "checked cols is a superset" combination specifically.
+        let checked = set(&["name", "email", "phone"]);
+        assert!(!should_apply_lookup(
+            1,
+            2,
+            &checked,
+            &["name".to_string(), "email".to_string()]
+        ));
+    }
+
+    #[test]
+    fn accepts_empty_wanted_cols_vacuously_when_generation_matches() {
+        let checked: HashSet<String> = HashSet::new();
+        assert!(should_apply_lookup(0, 0, &checked, &[]));
     }
 }

@@ -124,6 +124,18 @@ struct PreviewTarget {
     joins: Vec<fk_join::JoinSpec>,
 }
 
+/// Review fix (Task 5 round 1, clippy `too_many_arguments`): bundles
+/// `GridEvent::RunLookup`'s payload for `AppView::start_lookup`, which
+/// otherwise sits at 8 parameters once `generation` (Issue 1's fix) is
+/// added — one struct beats a `#[allow]`.
+struct LookupRequest {
+    sql: String,
+    ref_table: String,
+    wanted_cols: Vec<String>,
+    src_col: usize,
+    generation: u64,
+}
+
 struct AppView {
     tabs: Tabs,
     status: String,
@@ -992,6 +1004,15 @@ impl AppView {
         cx: &Context<Self>,
     ) -> (Vec<Option<FkRef>>, Vec<Option<Vec<String>>>) {
         let empty = (vec![None; result_cols.len()], vec![None; result_cols.len()]);
+        // Review fix (Task 5 round 1, Issue 4): with an empty `result_cols`,
+        // `.all(...)` below is vacuously true for EVERY table in the
+        // snapshot, so the "exactly one table matches" ambiguity check would
+        // incorrectly treat a single-table snapshot as an unambiguous match
+        // for a result that has no columns to match against at all. Guard
+        // explicitly rather than relying on snapshot cardinality to save us.
+        if result_cols.is_empty() {
+            return empty;
+        }
         let Some(snapshot) = self.tree.read(cx).snapshot() else { return empty };
         let mut matches = snapshot
             .tables
@@ -1015,15 +1036,37 @@ impl AppView {
     /// that emitted the event (ad-hoc tabs are never replaced, unlike a
     /// preview re-run) — captured from `on_grid_event`'s `emitter` rather
     /// than looked up from `self.tabs`.
-    fn start_lookup(
-        &mut self,
-        grid: Entity<ResultGrid>,
-        sql: String,
-        ref_table: String,
-        wanted_cols: Vec<String>,
-        src_col: usize,
-        cx: &mut Context<Self>,
-    ) {
+    ///
+    /// Review fix (Task 5 round 1, Issue 5, informational): this dispatches
+    /// `runner.fetch_lookup` regardless of `self.cancel` — no
+    /// one-query-at-a-time check here, unlike `run_query_with`. Deliberate,
+    /// and safe: `fetch_lookup` opens its own independent connection (same
+    /// `open_spec` dispatch every one-shot in `runner.rs` uses —
+    /// `connect_and_run`, `fetch_schema`, `test_connect`), so there is no
+    /// shared/pooled connection object it could contend with an already-
+    /// running query over. Confirmed by reading `open_spec`/every one-shot's
+    /// connect path, not assumed.
+    ///
+    /// Review fix (Task 5 round 1, Issue 1): `generation` is
+    /// `GridEvent::RunLookup`'s captured `ResultGrid::lookup_generation`
+    /// value at dispatch time. On success, before applying anything, the
+    /// completion re-checks two things against the grid's CURRENT state:
+    /// - the originating tab is still open with THIS exact grid entity
+    ///   (`Entity::update` on a strong handle never fails even if every tab
+    ///   referencing it was closed — `grid` here is a strong handle kept
+    ///   alive by this very closure — so a missing-entity `Result` can't be
+    ///   relied on to detect "tab closed"; `self.tabs` has to be searched
+    ///   for a matching `entity_id()` instead), and
+    /// - `grid.accept_lookup_result(..)` — generation still current AND
+    ///   every `wanted_cols` entry still checked (see that method's doc
+    ///   comment for the two races this catches).
+    ///
+    /// A response that fails either check is dropped silently (no status
+    /// override): the newer request that superseded it (if any) will set its
+    /// own status when IT resolves, and clobbering that with a stale
+    /// "join přidán"/error here would just reintroduce the same class of bug.
+    fn start_lookup(&mut self, grid: Entity<ResultGrid>, req: LookupRequest, cx: &mut Context<Self>) {
+        let LookupRequest { sql, ref_table, wanted_cols, src_col, generation } = req;
         let Some(spec) = self.active_conn_spec() else {
             self.status = "Bez připojení — vyberte připojení nahoře.".into();
             cx.notify();
@@ -1035,8 +1078,23 @@ impl AppView {
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |view, cx| {
+                let tab_alive = view.tabs.iter().any(|t| {
+                    matches!(&t.content, TabContent::Grid { grid: g, .. } if g.entity_id() == grid.entity_id())
+                });
+                if !tab_alive {
+                    // Originating ad-hoc tab was closed mid-flight — nothing
+                    // left to apply this to.
+                    return;
+                }
                 match result {
                     Ok(Ok((_cols, rows))) => {
+                        if !grid.read(cx).accept_lookup_result(src_col, generation, &wanted_cols) {
+                            // Stale: a newer request for this column has
+                            // since been dispatched (or the user unchecked a
+                            // wanted column) — drop rather than resurrect an
+                            // outdated selection (last-dispatched wins).
+                            return;
+                        }
                         let mut maps: Vec<std::collections::HashMap<String, Option<String>>> =
                             vec![std::collections::HashMap::new(); wanted_cols.len()];
                         for row in rows {
@@ -1078,7 +1136,25 @@ impl AppView {
     /// identity payload while the lookup path just needs `emitter`.
     fn on_grid_event(&mut self, emitter: Entity<ResultGrid>, event: &GridEvent, cx: &mut Context<Self>) {
         match event {
-            GridEvent::RerunPreviewJoins { schema, table, key, title, joins } => {
+            GridEvent::RerunPreviewJoins { schema, table, key, title, joins, col, ref_col } => {
+                // Review fix (Task 5 round 1, Issue 2): `run_query_with`
+                // would silently no-op here under the same guards (a modal
+                // is open, or another query is already running) — but
+                // `toggle_fk_column` already flipped `fk_checked` and
+                // `cx.notify()`'d before emitting this event, so the
+                // checkbox is already showing the NEW state. Left alone,
+                // that's a silent lie: the tab's actual data never changes
+                // because the re-run never starts. Check the same guards
+                // here FIRST, and if either is set, revert exactly the
+                // toggle that caused this event and surface why, instead of
+                // routing through `run_query_with` and letting it drop the
+                // request with no trace.
+                if self.modal.is_some() || self.cancel.is_some() {
+                    emitter.update(cx, |g, cx| g.revert_fk_toggle(*col, ref_col, cx));
+                    self.status = "počkejte — běží dotaz".into();
+                    cx.notify();
+                    return;
+                }
                 let sql = fk_join::build_join_sql(schema.as_deref(), table, joins);
                 let preview = PreviewTarget {
                     title: title.clone(),
@@ -1089,8 +1165,15 @@ impl AppView {
                 };
                 self.run_query_with(sql, Some(preview), true, cx);
             }
-            GridEvent::RunLookup { sql, ref_table, wanted_cols, src_col } => {
-                self.start_lookup(emitter, sql.clone(), ref_table.clone(), wanted_cols.clone(), *src_col, cx);
+            GridEvent::RunLookup { sql, ref_table, wanted_cols, src_col, generation } => {
+                let req = LookupRequest {
+                    sql: sql.clone(),
+                    ref_table: ref_table.clone(),
+                    wanted_cols: wanted_cols.clone(),
+                    src_col: *src_col,
+                    generation: *generation,
+                };
+                self.start_lookup(emitter, req, cx);
             }
         }
     }
