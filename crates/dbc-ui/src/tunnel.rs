@@ -60,6 +60,9 @@ impl Tunnel {
         args.push(cfg.port.to_string());
         args.push("-L".into());
         args.push(format!("{local_port}:{target_host}:{target_port}"));
+        // End-of-options marker: a host starting with "-" must not be parsed
+        // as an ssh option.
+        args.push("--".into());
         args.push(format!("{}@{}", cfg.user, cfg.host));
 
         let mut child = spawn_ssh(program, &args)?;
