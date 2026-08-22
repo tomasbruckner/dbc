@@ -1229,6 +1229,24 @@ impl AppView {
     }
 
     fn finish_save(&mut self, data: ConnectionFormData, cx: &mut Context<Self>) {
+        if self.config_load_error.is_some() {
+            // final-review must-fix #2: never silently overwrite a config
+            // file that failed to parse at startup. Move it aside first;
+            // if that fails (permissions, file vanished, etc.), abort the
+            // whole save rather than risk clobbering data the user may
+            // still want to recover by hand.
+            let backup = self.config_path.with_extension("toml.corrupt-bak");
+            match std::fs::rename(&self.config_path, &backup) {
+                Ok(()) => self.config_load_error = None,
+                Err(e) => {
+                    self.status = format!(
+                        "error: nelze zálohovat poškozený config.toml ({e}) – uložení zrušeno"
+                    );
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         if !data.password.is_empty() {
             let Some(vault) = self.vault.as_mut() else {
                 // finish_save is only reached with a non-empty password once
@@ -1499,15 +1517,44 @@ fn checkbox(id: &'static str, label: &'static str, checked: bool) -> Stateful<Di
 
 fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) -> impl IntoElement {
     let id = c.id.clone();
+    let editing = c.clone();
     let label = format!("{}{} — {} {}", "  ".repeat(depth), c.name, engine_label(c.engine), c.host);
     div()
-        .id(SharedString::from(format!("dropdown-item-{}", c.id)))
-        .cursor_pointer()
+        .id(SharedString::from(format!("dropdown-item-row-{}", c.id)))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
         .hover(|s| s.bg(rgb(0x313244)))
-        .child(label)
-        .on_click(cx.listener(move |view, _, window, cx| {
-            view.on_dropdown_item_click(id.clone(), window, cx);
-        }))
+        .child(
+            div()
+                .id(SharedString::from(format!("dropdown-item-{}", c.id)))
+                .flex_1()
+                .cursor_pointer()
+                .child(label)
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    view.on_dropdown_item_click(id.clone(), window, cx);
+                })),
+        )
+        .child(
+            // Edit affordance (must-fix #1 from the whole-branch review):
+            // the row's own on_click always connects, so editing (or
+            // fixing a typo, or setting a favourite) an existing
+            // connection needs a separate path into `open_connection_dialog`.
+            // `cx.stop_propagation()` keeps this click from also bubbling
+            // to the row's connect handler above.
+            div()
+                .id(SharedString::from(format!("dropdown-item-edit-{}", c.id)))
+                .px_1()
+                .cursor_pointer()
+                .text_color(rgb(0xa6adc8))
+                .hover(|s| s.bg(rgb(0x45475a)))
+                .child("✎")
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    cx.stop_propagation();
+                    view.open_connection_dialog(Some(editing.clone()), window, cx);
+                })),
+        )
 }
 
 fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppView>) -> AnyElement {

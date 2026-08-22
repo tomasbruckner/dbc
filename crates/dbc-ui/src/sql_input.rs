@@ -256,6 +256,7 @@ impl SqlInput {
     }
 
     /// Replaces the whole buffer (for history-load; not wired up in G1).
+    #[allow(dead_code)] // consumed by history-load (G3)
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.buffer.set_text(text);
         self.marked_range = None;

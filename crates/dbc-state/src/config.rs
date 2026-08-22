@@ -122,6 +122,15 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_file_is_load_error_not_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "this is not valid toml {{{").unwrap();
+        let result = AppConfig::load(&p);
+        assert!(result.is_err(), "a parse error must surface as Err, not silently become default");
+    }
+
+    #[test]
     fn no_password_field_serialized() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.toml");

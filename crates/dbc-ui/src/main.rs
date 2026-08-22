@@ -38,6 +38,12 @@ struct AppView {
     // --- Task 7: connection manager state ---
     config: AppConfig,
     config_path: PathBuf,
+    /// Set when `AppConfig::load` failed to parse an existing config.toml at
+    /// startup (surfaced in the status bar; see `main`). Cleared by
+    /// `finish_save` once the corrupt file has been safely moved aside to
+    /// `config.toml.corrupt-bak` — never overwritten silently (final-review
+    /// must-fix #2).
+    config_load_error: Option<String>,
     vault_path: PathBuf,
     /// Unlocked vault, kept for the session once the user has entered the
     /// master password once (brief: prompt on first use, not at startup).
@@ -260,7 +266,15 @@ fn main() {
     let conn_url = std::env::args().nth(1);
     let config_path = dbc_state::default_config_path();
     let vault_path = dbc_state::default_vault_path();
-    let config = AppConfig::load(&config_path).unwrap_or_default();
+    // A parse error (as opposed to a missing file, which `AppConfig::load`
+    // treats as an empty default) means an existing config.toml is
+    // corrupt — surfaced in the status bar below rather than silently
+    // discarded (final-review must-fix #2). `finish_save` refuses to
+    // overwrite the file until it's been moved aside.
+    let (config, config_load_error) = match AppConfig::load(&config_path) {
+        Ok(cfg) => (cfg, None),
+        Err(e) => (AppConfig::default(), Some(e.to_string())),
+    };
 
     application().run(move |cx: &mut App| {
         cx.bind_keys([
@@ -284,9 +298,15 @@ fn main() {
                     let sql = cx.new(|cx| SqlInput::new(cx, "Type SQL, then Ctrl+Enter…"));
                     window.focus(&sql.focus_handle(cx), cx);
                     let grouped_cache = connections_ui::group_connections(&config.connections);
+                    let status = match &config_load_error {
+                        Some(detail) => {
+                            format!("error: config.toml je poškozený – oprav nebo smaž soubor ({detail})")
+                        }
+                        None => "ready".into(),
+                    };
                     AppView {
                         grid,
-                        status: "ready".into(),
+                        status,
                         runner: QueryRunner::new(),
                         conn_url,
                         sql,
@@ -294,6 +314,7 @@ fn main() {
                         started_at: None,
                         config,
                         config_path,
+                        config_load_error,
                         vault_path,
                         vault: None,
                         active_connection_id: None,
