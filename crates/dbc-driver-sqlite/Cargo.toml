@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 dbc-core = { path = "../dbc-core" }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 
