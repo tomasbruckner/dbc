@@ -261,6 +261,11 @@ impl ResultGrid {
                                 .right_0()
                                 .w(px(5.))
                                 .h(px(ROW_HEIGHT))
+                                // Blocks the label's hitbox underneath —
+                                // without this a resize drag ALSO fires the
+                                // label's on_click and toggles the sort
+                                // (Task 2 review issue 1).
+                                .occlude()
                                 .cursor_col_resize()
                                 .on_mouse_down(
                                     gpui::MouseButton::Left,
