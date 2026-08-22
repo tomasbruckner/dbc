@@ -45,6 +45,10 @@ struct AppView {
     active_connection_id: Option<String>,
     dropdown_open: bool,
     modal: Option<connections_ui::ModalState>,
+    /// Cached folder/favourite grouping of `config.connections`, recomputed
+    /// on dropdown-open and after config mutations (see
+    /// `AppView::refresh_grouped_cache`) rather than on every render frame.
+    grouped_cache: connections_ui::GroupedConnections,
 }
 
 impl AppView {
@@ -125,6 +129,28 @@ impl AppView {
     }
 
     fn on_cancel_query(&mut self, _: &CancelQuery, _window: &mut Window, cx: &mut Context<Self>) {
+        // M6: Escape closes the dropdown / a modal first, rather than
+        // falling through to query-cancel underneath it. A modal holding
+        // unsaved password state (a master-password prompt/creation modal,
+        // or the connection dialog with a non-empty password field) is
+        // deliberately NOT closed by Escape — same "no accidental dismissal
+        // while a password is typed" reasoning as the overlay `.occlude()`
+        // fix.
+        if self.dropdown_open {
+            self.dropdown_open = false;
+            cx.notify();
+            return;
+        }
+        if let Some(modal) = self.modal.clone() {
+            let closable = match &modal {
+                connections_ui::ModalState::ConnectionDialog(ui) => ui.password.read(cx).text().is_empty(),
+                _ => false,
+            };
+            if closable {
+                self.close_modal(cx);
+            }
+            return;
+        }
         if let Some(c) = self.cancel.take() {
             c.cancel();
             self.status = "cancelling…".into();
@@ -203,6 +229,7 @@ fn main() {
                     let grid = cx.new(ResultGrid::new);
                     let sql = cx.new(|cx| SqlInput::new(cx, "Type SQL, then Ctrl+Enter…"));
                     window.focus(&sql.focus_handle(cx), cx);
+                    let grouped_cache = connections_ui::group_connections(&config.connections);
                     AppView {
                         grid,
                         status: "ready".into(),
@@ -218,6 +245,7 @@ fn main() {
                         active_connection_id: None,
                         dropdown_open: false,
                         modal: None,
+                        grouped_cache,
                     }
                 })
             },

@@ -413,7 +413,12 @@ impl EntityInputHandler for TextField {
     ) -> Option<String> {
         let range = self.range_from_utf16(&range_utf16);
         actual_range.replace(self.range_to_utf16(&range));
-        Some(self.buffer.text()[range].to_string())
+        let real = &self.buffer.text()[range];
+        if self.masked {
+            Some(masked_display(real))
+        } else {
+            Some(real.to_string())
+        }
     }
 
     fn selected_text_range(
@@ -803,7 +808,7 @@ impl ConnectionDialogUi {
 /// and to carry a pending save across a master-password prompt/creation
 /// modal (which replaces `AppView::modal`, so the dialog's `Entity<TextField>`
 /// handles themselves don't need to survive that detour).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectionFormData {
     pub id: String,
     pub name: String,
@@ -820,6 +825,32 @@ pub struct ConnectionFormData {
     pub timeout_secs: Option<u64>,
     pub auto_limit: Option<u64>,
     pub ssh: Option<SshTunnelConfig>,
+}
+
+/// Hand-written `Debug` (instead of `#[derive(Debug)]`) so `password` is
+/// redacted rather than printed in plaintext — same pattern as
+/// `dbc_state::vault::Vault`'s hand-written `Debug`. Guards against a stray
+/// `dbg!`/`tracing::debug!` on this struct or `PendingAfterUnlock` leaking
+/// the master/connection password to logs or stdout.
+impl std::fmt::Debug for ConnectionFormData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionFormData")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("engine", &self.engine)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("password", &"[REDACTED]")
+            .field("folder", &self.folder)
+            .field("read_only", &self.read_only)
+            .field("favourite", &self.favourite)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("auto_limit", &self.auto_limit)
+            .field("ssh", &self.ssh)
+            .finish()
+    }
 }
 
 impl ConnectionFormData {
@@ -882,6 +913,14 @@ impl AppView {
         "Bez připojení".to_string()
     }
 
+    /// Recompute the cached folder/favourite grouping from `self.config`.
+    /// Called on dropdown-open and after any config mutation, rather than
+    /// per render frame (`render_dropdown_overlay` may be re-invoked many
+    /// times per second while the dropdown stays open, e.g. on hover).
+    pub(crate) fn refresh_grouped_cache(&mut self) {
+        self.grouped_cache = group_connections(&self.config.connections);
+    }
+
     pub(crate) fn render_top_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let label = self.current_connection_label();
         div()
@@ -897,12 +936,15 @@ impl AppView {
             .child(format!("Připojení: {label} ▾"))
             .on_click(cx.listener(|view, _, _, cx| {
                 view.dropdown_open = !view.dropdown_open;
+                if view.dropdown_open {
+                    view.refresh_grouped_cache();
+                }
                 cx.notify();
             }))
     }
 
     pub(crate) fn render_dropdown_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let grouped = group_connections(&self.config.connections);
+        let grouped = self.grouped_cache.clone();
         let mut panel = div()
             .absolute()
             .top(px(32.))
@@ -917,6 +959,7 @@ impl AppView {
             .flex_col()
             .gap_1()
             .text_color(rgb(0xcdd6f4))
+            .occlude()
             .on_mouse_down_out(cx.listener(|view, _, _, cx| {
                 view.dropdown_open = false;
                 cx.notify();
@@ -975,6 +1018,7 @@ impl AppView {
                 .items_center()
                 .justify_center()
                 .bg(rgba(0x00000099))
+                .occlude()
                 .child(panel)
                 .into_any_element(),
         )
@@ -1095,7 +1139,7 @@ impl AppView {
         cx.notify();
     }
 
-    fn on_save_clicked(&mut self, cx: &mut Context<Self>) {
+    fn on_save_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ModalState::ConnectionDialog(ui)) = self.modal.clone() else { return };
         let data = ui.to_form_data(cx);
         if data.password.is_empty() || self.vault.is_some() {
@@ -1104,20 +1148,24 @@ impl AppView {
         }
         if Vault::exists(&self.vault_path) {
             let input = cx.new(|cx| TextField::new(cx, "Heslo", true));
+            let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt {
                 input,
                 error: None,
                 pending: PendingAfterUnlock::SaveConnection(Box::new(data)),
             });
+            window.focus(&focus, cx);
         } else {
             let input1 = cx.new(|cx| TextField::new(cx, "Nové heslo", true));
             let input2 = cx.new(|cx| TextField::new(cx, "Zopakujte heslo", true));
+            let focus = input1.focus_handle(cx);
             self.modal = Some(ModalState::CreateMasterPassword {
                 input1,
                 input2,
                 error: None,
                 pending: PendingAfterUnlock::SaveConnection(Box::new(data)),
             });
+            window.focus(&focus, cx);
         }
         cx.notify();
     }
@@ -1149,12 +1197,13 @@ impl AppView {
             Ok(()) => "Uloženo".to_string(),
             Err(e) => format!("error saving config: {}", e.message),
         };
+        self.refresh_grouped_cache();
         self.modal = None;
         self.dropdown_open = false;
         cx.notify();
     }
 
-    pub(crate) fn on_dropdown_item_click(&mut self, id: String, cx: &mut Context<Self>) {
+    pub(crate) fn on_dropdown_item_click(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let needs_secret = self
             .config
             .connections
@@ -1163,12 +1212,14 @@ impl AppView {
             .map_or(false, |c| c.engine != Engine::Sqlite);
         if needs_secret && self.vault.is_none() && Vault::exists(&self.vault_path) {
             let input = cx.new(|cx| TextField::new(cx, "Heslo", true));
+            let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt {
                 input,
                 error: None,
                 pending: PendingAfterUnlock::Connect(id),
             });
             self.dropdown_open = false;
+            window.focus(&focus, cx);
             cx.notify();
             return;
         }
@@ -1223,7 +1274,7 @@ impl AppView {
         cx.notify();
     }
 
-    fn on_create_master_password_submit(&mut self, cx: &mut Context<Self>) {
+    fn on_create_master_password_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ModalState::CreateMasterPassword { input1, input2, pending, .. }) = self.modal.clone() else { return };
         let p1 = input1.read(cx).text();
         let p2 = input2.read(cx).text();
@@ -1242,7 +1293,9 @@ impl AppView {
         // clobbering it.
         if Vault::exists(&self.vault_path) {
             let input = cx.new(|cx| TextField::new(cx, "Heslo", true));
+            let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt { input, error: None, pending });
+            window.focus(&focus, cx);
             cx.notify();
             return;
         }
@@ -1360,8 +1413,8 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
         .cursor_pointer()
         .hover(|s| s.bg(rgb(0x313244)))
         .child(label)
-        .on_click(cx.listener(move |view, _, _, cx| {
-            view.on_dropdown_item_click(id.clone(), cx);
+        .on_click(cx.listener(move |view, _, window, cx| {
+            view.on_dropdown_item_click(id.clone(), window, cx);
         }))
 }
 
@@ -1446,7 +1499,7 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
             .justify_end()
             .mt_2()
             .child(styled_button("dlg-test", "Test").on_click(cx.listener(|v, _, _, cx| v.on_test_clicked(cx))))
-            .child(styled_button("dlg-save", "Uložit").on_click(cx.listener(|v, _, _, cx| v.on_save_clicked(cx))))
+            .child(styled_button("dlg-save", "Uložit").on_click(cx.listener(|v, _, window, cx| v.on_save_clicked(window, cx))))
             .child(styled_button("dlg-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx)))),
     );
 
@@ -1514,7 +1567,7 @@ fn render_create_master_password_panel(
             .justify_end()
             .mt_2()
             .child(styled_button("cmp-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
-            .child(styled_button("cmp-submit", "Vytvořit").on_click(cx.listener(|v, _, _, cx| v.on_create_master_password_submit(cx)))),
+            .child(styled_button("cmp-submit", "Vytvořit").on_click(cx.listener(|v, _, window, cx| v.on_create_master_password_submit(window, cx)))),
     );
     panel.into_any_element()
 }
