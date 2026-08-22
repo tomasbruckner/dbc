@@ -8,6 +8,7 @@ pub struct MultilineBuffer {
     goal_column: Option<usize>,
 }
 
+#[allow(dead_code)] // full surface lands in the editor element (G1 Task 4)
 impl MultilineBuffer {
     pub fn new() -> Self {
         Self {
@@ -360,13 +361,12 @@ mod tests {
     #[test]
     fn vertical_movement_keeps_goal_column() {
         let mut b = MultilineBuffer::from_text("abcdef\nxy\nabcdef");
-        // cursor at end of first line (col 6)
-        for _ in 0..10 { b.move_right(false); }
-        assert_eq!(b.cursor_position(), (0, 6));
-        b.move_down(false);              // line "xy" only has 2 cols → clamp
-        assert_eq!(b.cursor_position(), (1, 2));
-        b.move_down(false);              // back to a long line → goal col 6 restored
+        // from_text leaves the cursor at the end of the text = (2, 6)
         assert_eq!(b.cursor_position(), (2, 6));
+        b.move_up(false);                // line "xy" only has 2 cols → clamp
+        assert_eq!(b.cursor_position(), (1, 2));
+        b.move_up(false);                // back to a long line → goal col 6 restored
+        assert_eq!(b.cursor_position(), (0, 6));
     }
 
     #[test]
@@ -414,9 +414,9 @@ mod tests {
     fn delete_selection_across_lines() {
         let mut b = MultilineBuffer::from_text("aaa\nbbb\nccc");
         b.set_cursor_for_test(1);
-        for _ in 0..6 { b.move_right(true); } // selects "aa\nbbb"... byte-wise 1..7
+        for _ in 0..5 { b.move_right(true); } // selects "aa\nbb" = bytes 1..6
+        assert_eq!(b.selection(), Some(1..6));
         b.delete();
-        assert_eq!(b.text(), "ab\nccc".replace("bb\n", "b\n")); // = "ab\nccc"? — compute: "aaa\nbbb\nccc" minus 1..7 = "a" + "b\nccc" = "ab\nccc"
         assert_eq!(b.text(), "ab\nccc");
     }
 }
