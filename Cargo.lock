@@ -2056,6 +2056,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "tokio",
+ "tokio-postgres",
  "unicode-segmentation",
 ]
 

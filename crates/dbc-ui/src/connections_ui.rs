@@ -42,6 +42,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::connect;
 use crate::text_model::MultilineBuffer;
 use crate::AppView;
 
@@ -1132,7 +1133,7 @@ impl AppView {
             self.vault.as_ref().and_then(|v| v.get_secret(&data.id))
         };
         let cfg = data.to_connection_config();
-        let result = pending_connect(&cfg, secret.as_deref());
+        let result = pending_connect(&cfg, secret.as_deref(), &self.runner.handle());
         if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
             ui.test_result = Some(result);
         }
@@ -1229,7 +1230,7 @@ impl AppView {
     fn switch_to_connection(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(cfg) = self.config.connections.iter().find(|c| c.id == id).cloned() else { return };
         let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
-        match pending_connect(&cfg, secret.as_deref()) {
+        match pending_connect(&cfg, secret.as_deref(), &self.runner.handle()) {
             Ok(msg) => {
                 self.status = msg;
                 self.active_connection_id = Some(cfg.id.clone());
@@ -1349,26 +1350,34 @@ fn generate_connection_id() -> String {
     format!("conn-{nanos:x}")
 }
 
-/// SEAM for Task 8. Everything upstream (Test button, dropdown/connection
-/// switching) funnels through this single function, which Task 8 replaces
-/// with a real call into the connect flow — expected shape:
-/// `connect::open_config(cfg, secret, runtime_handle) -> Result<OpenConnection, QueryError>`,
-/// run off the UI thread (like `QueryRunner::run` does for queries) with the
-/// result reported back via the same `cx.spawn` pattern `on_run_query` uses.
-/// `Ok(_)` here should become "connection established" (and stash the open
-/// connection somewhere `on_run_query` can find it instead of building a
-/// fresh one from `conn_url` every time); `Err(_)` becomes the inline
-/// Test-button error / status-bar message, unchanged.
+/// Validates a connection (Test button / dropdown connection switch) by
+/// actually opening it — tunnel included — and immediately dropping the
+/// result. This runs synchronously on the UI thread (via `runtime.block_on`
+/// inside `connect::open_config`): acceptable here because both call sites
+/// are explicit, deliberate user actions (click Test / pick a connection),
+/// unlike `on_run_query`'s connect, which Task 8 moved off the UI thread
+/// (see `runner::connect_and_run`) specifically because it fires on every
+/// query run. v1 has no persistent connection cache (see `AppView::conn_url`
+/// doc comment), so there is nothing to stash on success — `on_run_query`
+/// opens its own fresh connection per query regardless of what this
+/// validated.
 ///
-/// The MSSQL case is intentionally NOT a stub: it is a permanent behaviour
-/// per the brief (driver is a separate roadmap item), not something Task 8
-/// removes — Task 8 should keep this early return when wiring in real
-/// connect logic.
-fn pending_connect(cfg: &ConnectionConfig, _secret: Option<&str>) -> Result<String, String> {
+/// The MSSQL case is called out explicitly (rather than just falling through
+/// to `open_config`'s own MSSQL rejection) because it's a permanent
+/// behaviour per the brief (the driver is a separate roadmap item), not a
+/// placeholder this function is expected to eventually replace.
+fn pending_connect(
+    cfg: &ConnectionConfig,
+    secret: Option<&str>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<String, String> {
     if cfg.engine == Engine::Mssql {
         return Err("MSSQL driver zatím není k dispozici".into());
     }
-    Err("connect flow lands in Task 8".into())
+    match connect::open_config(cfg, secret.map(|s| s.to_string()), runtime) {
+        Ok(_opened) => Ok(format!("Připojeno ({})", engine_label(cfg.engine))),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn field_row(label: &str, field: Entity<TextField>) -> impl IntoElement {

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use dbc_buffer::ResultBuffer;
-use dbc_core::CancelToken;
+use dbc_core::{apply_auto_limit, is_read_statement, CancelToken, QueryError};
 use dbc_state::{AppConfig, Vault};
 use gpui::{
     actions, div, prelude::*, px, rgb, size, App, Bounds, Context, Entity, Focusable, KeyBinding,
@@ -19,10 +19,10 @@ use gpui::{
 };
 use gpui_platform::application;
 use grid::ResultGrid;
-use runner::{QueryEvent, QueryRunner};
+use runner::{ConnectSpec, QueryEvent, QueryRunner};
 use sql_input::SqlInput;
 
-actions!(dbc, [RunQuery, CancelQuery]);
+actions!(dbc, [RunQuery, RunQueryUnlimited, CancelQuery]);
 
 struct AppView {
     grid: Entity<ResultGrid>,
@@ -53,6 +53,26 @@ struct AppView {
 
 impl AppView {
     fn on_run_query(&mut self, _: &RunQuery, _window: &mut Window, cx: &mut Context<Self>) {
+        self.run_query(false, cx);
+    }
+
+    /// `Ctrl+Shift+Enter`: bypasses ONLY the auto-limit guard. Read-only
+    /// enforcement is not a "per-run convenience" the way auto-limit is —
+    /// it stays enforced regardless of how the query was launched.
+    fn on_run_query_unlimited(
+        &mut self,
+        _: &RunQueryUnlimited,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_query(true, cx);
+    }
+
+    /// Guard order (brief, Task 8): (1) read-only — rejected without ever
+    /// connecting; (2) auto-limit — rewrites the SQL text, unless bypassed;
+    /// (3) timeout — enforced inside `QueryRunner::connect_and_run`, since it
+    /// must race the whole connect+query sequence, not just this call.
+    fn run_query(&mut self, bypass_auto_limit: bool, cx: &mut Context<Self>) {
         if self.modal.is_some() {
             return; // don't run queries under a modal
         }
@@ -63,31 +83,58 @@ impl AppView {
         if sql.trim().is_empty() {
             return;
         }
-        // Back-compat CLI-arg path only for now — connecting via a saved
-        // ConnectionConfig (`active_connection_id`) is Task 8's seam; see
-        // connections_ui::pending_connect's doc comment.
-        let Some(url) = self.conn_url.clone() else {
-            self.status = if self.active_connection_id.is_some() {
-                "connect flow lands in Task 8".into()
-            } else {
-                "Bez připojení — vyberte připojení nahoře.".into()
+
+        let spec = if let Some(id) = self.active_connection_id.clone() {
+            let Some(cfg) = self.config.connections.iter().find(|c| c.id == id).cloned() else {
+                self.status = "connection no longer exists".into();
+                cx.notify();
+                return;
             };
+            let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+            (cfg.read_only, cfg.auto_limit, cfg.timeout_secs, ConnectSpec::Config { cfg: Box::new(cfg), secret })
+        } else if let Some(url) = self.conn_url.clone() {
+            // CLI-arg back-compat path: no read-only/auto-limit/timeout
+            // config exists for it (no ConnectionConfig backs it).
+            (false, None, None, ConnectSpec::Url(url))
+        } else {
+            self.status = "Bez připojení — vyberte připojení nahoře.".into();
             cx.notify();
             return;
         };
-        let conn = match connect::open(&url, &self.runner.handle()) {
-            Ok(c) => c,
-            Err(e) => {
-                self.status = format!("error: {e}");
-                cx.notify();
-                return;
+        let (read_only, auto_limit, timeout_secs, spec) = spec;
+
+        // Guard 1: read-only — rejected client-side without connecting.
+        // (Server-side enforcement lives in connect::open_config: Postgres
+        // `default_transaction_read_only=on`, SQLite `SQLITE_OPEN_READ_ONLY`
+        // — this check is the fast, no-connection-needed first line, not the
+        // only line.)
+        if read_only && !is_read_statement(&sql) {
+            let err = QueryError::msg("connection is read-only");
+            self.status = format!("error: {err}");
+            cx.notify();
+            return;
+        }
+
+        // Guard 2: auto-limit.
+        let mut sql = sql;
+        let mut limit_suffix = String::new();
+        if !bypass_auto_limit {
+            if let Some(n) = auto_limit {
+                let (rewritten, changed) = apply_auto_limit(&sql, n);
+                if changed {
+                    sql = rewritten;
+                    limit_suffix = format!(" · auto-LIMIT {n}");
+                }
             }
-        };
+        }
+
         let cancel = CancelToken::new();
         self.cancel = Some(cancel.clone());
         self.started_at = Some(std::time::Instant::now());
-        self.status = "running…".into();
-        let mut rx = self.runner.run(conn, sql, cancel);
+        self.status = format!("connecting…{limit_suffix}");
+        cx.notify();
+
+        let mut rx = self.runner.connect_and_run(spec, sql, cancel, timeout_secs);
         let grid = self.grid.clone();
         cx.spawn(async move |this, cx| {
             let mut buffer: Option<Rc<RefCell<ResultBuffer>>> = None;
@@ -98,6 +145,7 @@ impl AppView {
                             let buf = Rc::new(RefCell::new(ResultBuffer::new(columns)));
                             buffer = Some(buf.clone());
                             grid.update(cx, |g, _| g.set_buffer(buf));
+                            view.status = format!("running…{limit_suffix}");
                         }
                         QueryEvent::Batch(b) => {
                             if let Some(buf) = &buffer {
@@ -105,11 +153,11 @@ impl AppView {
                             }
                             let rows = buffer.as_ref().map_or(0, |b| b.borrow().row_count());
                             let secs = view.started_at.map_or(0.0, |t| t.elapsed().as_secs_f32());
-                            view.status = format!("{rows} rows… {secs:.1}s");
+                            view.status = format!("{rows} rows… {secs:.1}s{limit_suffix}");
                         }
                         QueryEvent::Finished { elapsed } => {
                             let rows = buffer.as_ref().map_or(0, |b| b.borrow().row_count());
-                            view.status = format!("{rows} rows in {elapsed:.2?}");
+                            view.status = format!("{rows} rows in {elapsed:.2?}{limit_suffix}");
                             view.cancel = None;
                         }
                         QueryEvent::Failed(e) => {
@@ -168,6 +216,7 @@ impl Render for AppView {
             .size_full()
             .bg(rgb(0x1e1e2e))
             .on_action(cx.listener(Self::on_run_query))
+            .on_action(cx.listener(Self::on_run_query_unlimited))
             .on_action(cx.listener(Self::on_cancel_query))
             .child(self.render_top_bar(cx))
             .child(
@@ -212,6 +261,7 @@ fn main() {
     application().run(move |cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("ctrl-enter", RunQuery, None),
+            KeyBinding::new("ctrl-shift-enter", RunQueryUnlimited, None),
             KeyBinding::new("escape", CancelQuery, None),
         ]);
         sql_input::bind_keys(cx);

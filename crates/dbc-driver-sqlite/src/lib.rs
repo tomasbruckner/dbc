@@ -11,16 +11,43 @@ use dbc_core::{
 
 pub struct SqliteConnection {
     path: PathBuf,
+    read_only: bool,
 }
 
 impl SqliteConnection {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self { path: path.into(), read_only: false }
+    }
+
+    /// Like [`SqliteConnection::new`], but opens the database with
+    /// `SQLITE_OPEN_READ_ONLY` (no `SQLITE_OPEN_CREATE`/`READ_WRITE`) when
+    /// `read_only` is set — server-side enforcement of a connection's
+    /// read-only flag, so a client-side guard bypass can't still mutate the
+    /// file. See dbc-ui's `connect::open_config`, which selects this
+    /// constructor when `ConnectionConfig::read_only` is set.
+    pub fn new_with_options(path: impl Into<PathBuf>, read_only: bool) -> Self {
+        Self { path: path.into(), read_only }
     }
 }
 
 fn q_err(e: rusqlite::Error) -> QueryError {
     QueryError { code: None, message: e.to_string(), position: None }
+}
+
+/// `rusqlite::Connection::open` mirrored with `SQLITE_OPEN_READ_ONLY` swapped
+/// in for `SQLITE_OPEN_READ_WRITE | SQLITE_OPEN_CREATE` when `read_only` is
+/// set (same `URI | NO_MUTEX` flags `open`'s default otherwise uses).
+fn open_conn(path: &std::path::Path, read_only: bool) -> rusqlite::Result<rusqlite::Connection> {
+    if read_only {
+        rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+    } else {
+        rusqlite::Connection::open(path)
+    }
 }
 
 fn value_to_text(v: rusqlite::types::ValueRef<'_>) -> Option<String> {
@@ -40,11 +67,12 @@ impl Connection for SqliteConnection {
         let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
         let (schema_tx, schema_rx) = tokio::sync::oneshot::channel::<Result<SchemaRef, QueryError>>();
         let path = self.path.clone();
+        let read_only = self.read_only;
         let sql = sql.to_owned();
         let handle = tokio::runtime::Handle::current();
 
         tokio::task::spawn_blocking(move || {
-            let conn = match rusqlite::Connection::open(&path) {
+            let conn = match open_conn(&path, read_only) {
                 Ok(c) => c,
                 Err(e) => { let _ = schema_tx.send(Err(q_err(e))); return; }
             };
@@ -132,8 +160,9 @@ impl Connection for SqliteConnection {
 
     async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError> {
         let path = self.path.clone();
+        let read_only = self.read_only;
         tokio::task::spawn_blocking(move || {
-            let conn = rusqlite::Connection::open(&path).map_err(q_err)?;
+            let conn = open_conn(&path, read_only).map_err(q_err)?;
             let mut tables = Vec::new();
             let mut stmt = conn
                 .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
@@ -282,5 +311,44 @@ mod tests {
         assert_eq!(weird.columns.len(), 2);
         assert_eq!(weird.columns[0].name, "a");
         assert_eq!(weird.columns[1].name, "b");
+    }
+
+    #[tokio::test]
+    async fn read_only_connection_allows_select() {
+        let f = fixture_db();
+        let mut c = SqliteConnection::new_with_options(f.path(), true);
+        let mut s = c
+            .query("SELECT id FROM t ORDER BY id LIMIT 1", CancelToken::new())
+            .await
+            .unwrap();
+        let mut rows = 0usize;
+        while let Some(b) = s.batches.recv().await {
+            rows += b.unwrap().num_rows();
+        }
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn read_only_connection_rejects_writes() {
+        // Server-side enforcement (Task 6 security review requirement):
+        // `SQLITE_OPEN_READ_ONLY` must reject a write regardless of any
+        // client-side `is_read_statement` guard.
+        let f = fixture_db();
+        let mut c = SqliteConnection::new_with_options(f.path(), true);
+        let mut s = match c.query("INSERT INTO t(id, name) VALUES (9999, 'x')", CancelToken::new()).await {
+            Ok(s) => s,
+            Err(e) => {
+                assert!(e.message.to_lowercase().contains("read"), "expected a read-only error, got: {}", e.message);
+                return;
+            }
+        };
+        let mut saw_error = false;
+        while let Some(item) = s.batches.recv().await {
+            if let Err(e) = item {
+                assert!(e.message.to_lowercase().contains("read"), "expected a read-only error, got: {}", e.message);
+                saw_error = true;
+            }
+        }
+        assert!(saw_error, "expected the write to be rejected by the read-only connection");
     }
 }

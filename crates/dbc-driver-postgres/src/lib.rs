@@ -42,6 +42,19 @@ impl PostgresConnection {
         });
         Ok(Self { client: Arc::new(client) })
     }
+
+    /// Like [`Self::connect`], but takes a `tokio_postgres::Config` builder
+    /// instead of a URL string. Used by the saved-connection path
+    /// (`dbc-ui`'s `connect::open_config`) so a password containing `@`,
+    /// `/`, or other URL-special characters never has to be percent-encoded
+    /// into a connection string in the first place.
+    pub async fn connect_with_config(config: tokio_postgres::Config) -> Result<Self, QueryError> {
+        let (client, connection) = config.connect(NoTls).await.map_err(pg_err)?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(Self { client: Arc::new(client) })
+    }
 }
 
 #[async_trait]

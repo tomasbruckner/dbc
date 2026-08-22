@@ -13,3 +13,4 @@ dbc-driver-sqlite = { path = "../dbc-driver-sqlite" }
 dbc-driver-postgres = { path = "../dbc-driver-postgres" }
 unicode-segmentation = "1"
 tokio.workspace = true
+tokio-postgres = "0.7"
