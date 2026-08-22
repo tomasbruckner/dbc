@@ -675,6 +675,9 @@ mod tests {
     }
 
     #[test]
+    // The reversed range is a deliberate input value, not an iteration —
+    // clippy::reversed_empty_ranges is a false positive here.
+    #[allow(clippy::reversed_empty_ranges)]
     fn select_range_reversed_input_selects_backward_from_anchor() {
         // Documented/chosen behaviour: a "reversed" input range
         // (range.start > range.end) is a deliberate, supported way to
