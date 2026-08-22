@@ -76,7 +76,18 @@ One window, hybrid layout (user choice "C"):
   JSON, or INSERT statements.
 - **Column visibility:** a ☰ menu on the grid header opens a checkbox list
   of columns; unchecked columns are hidden locally (buffer unchanged,
-  display-only). Per result tab, not persisted.
+  display-only).
+- **Favourites (★ on anything):** starring a schema-tree object (table,
+  view, function, …) adds it to a "Favourites" section at the top of the
+  tree (cross-schema); starring a connection pins it to the top of the
+  dropdown and manager regardless of folders; history stars keep working
+  as before. The palette ranks favourites first. All persisted in
+  dbc-state, keyed per connection for objects.
+- **Per-table view memory:** keyed by (connection, schema, table), the app
+  remembers column visibility, column widths, local sort, and the chosen
+  FK joined columns, and reapplies them to every new preview tab of that
+  table. Ad-hoc query results keep per-tab settings only (an arbitrary
+  result set cannot reliably be identified as "the same table").
 - **FK joined columns (user choice "B"):** on a column that is a foreign
   key, the ☰ menu offers "add columns from <referenced table>" with a
   checkbox list; selected columns appear inline next to the FK column,
@@ -102,8 +113,8 @@ lands last) and pays the biggest pains first.
 |---|---|---|
 | **G1 Editor & connections** | Multiline editor (plain); connection manager (form dialog, folders, Argon2id master-password vault, top-bar switcher); connect off the UI thread; per-connection options: SSH tunnel (host/user/key, app-managed), read-only flag (blocks every write path app-wide: sandbox Apply, admin, script runner), query timeout; auto-LIMIT guard (bare SELECT gets a configurable LIMIT, overridable per run) | Kills the two worst pains from the first human test; includes the block_on-freeze follow-up |
 | **G2 Tabs & tree** | Result-tab infrastructure (buffer per tab); schema tree panel with speed search; double-click preview/DDL tabs; Ctrl+B; `SchemaSnapshot` in dbc-core grows from tables+columns to the full object model (views, functions, procedures, triggers, indexes, sequences, constraints, column defaults) with per-driver catalog queries; "Generate DDL" on tables/views (CREATE statement into a read-only tab) | Also the natural home for the spill-off-UI-thread and byte-cap follow-ups (buffer work is touched anyway) |
-| **G3 History & palette** | Persistent history (SQLite), right panel, fulltext, pins, click-to-load; Ctrl+K palette | History and palette share data sources |
-| **G4 Grid+** | Local sort, column filters, cell detail popup, export CSV/TSV/JSON/INSERT; column visibility menu; FK joined columns; Ctrl+F search within the fetched result | Mostly local additions over the buffer; FK joins need FK metadata from G2 and are the meaty half of this phase |
+| **G3 History & palette** | Persistent history (SQLite), right panel, fulltext, pins, click-to-load; Ctrl+K palette; generalized favourites (★ on tree objects and connections, Favourites tree section, palette ranking) | History and palette share data sources |
+| **G4 Grid+** | Local sort, column filters, cell detail popup, export CSV/TSV/JSON/INSERT; column visibility menu; FK joined columns; Ctrl+F search within the fetched result; per-table view memory (visibility, widths, sort, FK joins) in dbc-state | Mostly local additions over the buffer; FK joins need FK metadata from G2 and are the meaty half of this phase |
 | **G5 Sandbox editing** | PK detection, local diff edits, Apply dialog with generated SQL, single transaction | First write path in the app; gets its own design pass before implementation |
 | **G6 Editor pro** | Tree-sitter highlighting; schema autocomplete; parametrized queries (:name placeholders prompt a values dialog before run, last values remembered) | Most expensive single feature, functionally least urgent |
 | **G7 DB compare** | Schema diff between two saved connections (SchemaSnapshot-based); data diff via DuckDB over Arrow buffers | Future; own brainstorm when reached |
