@@ -224,7 +224,14 @@ async fn schema_returns_full_catalog_snapshot() {
              CREATE FUNCTION orders_touch() RETURNS trigger AS
                  $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;
              CREATE TRIGGER orders_touch_trigger BEFORE INSERT ON orders
-                 FOR EACH ROW EXECUTE FUNCTION orders_touch();",
+                 FOR EACH ROW EXECUTE FUNCTION orders_touch();
+             CREATE TABLE posts (
+                 id integer PRIMARY KEY,
+                 title text NOT NULL,
+                 body text
+             );
+             CREATE INDEX posts_lower_title_idx ON posts (lower(title));
+             CREATE INDEX posts_mixed_idx ON posts (id, lower(body));",
         )
         .await
         .unwrap();
@@ -302,4 +309,57 @@ async fn schema_returns_full_catalog_snapshot() {
         snap.sequences.iter().any(|s| s.name == "cust_seq"),
         "cust_seq should be listed among sequences"
     );
+
+    // Expression/functional indexes: pure-expression and mixed plain+expr
+    // must both be represented in full, in column order, rather than
+    // dropped or truncated (indkey entries for expression columns are 0,
+    // which has no backing pg_attribute row).
+    let posts = snap.tables.iter().find(|t| t.name == "posts").unwrap();
+    let expr_idx = posts.indexes.iter().find(|i| i.name == "posts_lower_title_idx").unwrap();
+    assert_eq!(
+        expr_idx.columns,
+        vec!["lower(title)".to_string()],
+        "pure expression index must render the expression text, not be dropped"
+    );
+    let mixed_idx = posts.indexes.iter().find(|i| i.name == "posts_mixed_idx").unwrap();
+    assert_eq!(
+        mixed_idx.columns,
+        vec!["id".to_string(), "lower(body)".to_string()],
+        "mixed plain+expression index must keep both columns, in order"
+    );
+}
+
+/// A `CREATE TEMP TABLE` issued by a *different* concurrently-open session
+/// creates a real `pg_class` row in a `pg_temp_N` namespace, visible to
+/// every other backend's catalog queries for as long as that session's temp
+/// schema exists. `schema()` must not surface it as a user table.
+#[tokio::test]
+#[ignore]
+async fn temp_table_from_other_session_does_not_leak_into_schema() {
+    let node = Postgres::default().start().await.unwrap();
+    let url = pg_url(&node).await;
+
+    // Second, independent session — kept open across the schema() call so
+    // its pg_temp_N namespace still exists when the catalog is queried.
+    let (temp_client, temp_conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = temp_conn.await;
+    });
+    temp_client
+        .batch_execute("CREATE TEMP TABLE session_scratch (id integer, note text)")
+        .await
+        .unwrap();
+
+    let mut c = PostgresConnection::connect(&url).await.unwrap();
+    let snap = c.schema().await.unwrap();
+
+    assert!(
+        snap.tables.iter().all(|t| t.name != "session_scratch"),
+        "a temp table from another session must not leak into the snapshot: {:?}",
+        snap.tables.iter().map(|t| (t.schema.clone(), t.name.clone())).collect::<Vec<_>>()
+    );
+
+    // Keep the temp session alive until here so its temp schema existed for
+    // the whole schema() call above.
+    drop(temp_client);
 }

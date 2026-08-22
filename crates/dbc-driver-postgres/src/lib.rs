@@ -16,8 +16,15 @@ use tokio_postgres::NoTls;
 use types::{arrow_type, ColBuilder};
 
 /// Every catalog query in `schema()` excludes these — internal Postgres
-/// namespaces, not user objects.
-const SCHEMA_EXCLUDE: &str = "n.nspname NOT IN ('pg_catalog', 'information_schema')";
+/// namespaces, not user objects. This also excludes session-temp namespaces
+/// (`pg_temp_N` / `pg_toast_temp_N`): without this, a `CREATE TEMP TABLE`
+/// issued by *any* concurrently-open session creates a real `pg_class` row
+/// visible to every other backend's catalog queries for as long as that
+/// session's temp schema exists, and would otherwise leak into the snapshot
+/// indistinguishable from a genuine user table.
+const SCHEMA_EXCLUDE: &str = "n.nspname NOT IN ('pg_catalog', 'information_schema') \
+     AND n.nspname NOT LIKE 'pg\\_temp\\_%' AND n.nspname NOT LIKE 'pg\\_toast\\_temp\\_%' \
+     AND n.nspname NOT LIKE 'pg\\_toast%'";
 
 pub struct PostgresConnection {
     client: Arc<tokio_postgres::Client>,
@@ -397,6 +404,14 @@ impl PostgresConnection {
     /// `WITH ORDINALITY` and aggregated back into an ordered `Vec<String>`.
     /// PK-backing indexes are skipped — they're already represented via
     /// `ColumnInfo::is_pk` and `ConstraintInfo`.
+    ///
+    /// Expression/functional index columns have `indkey` entries of `0`
+    /// (there is no backing `pg_attribute` row for attnum 0), so the join to
+    /// `pg_attribute` is a LEFT JOIN and, when it doesn't match (`ord.attnum
+    /// = 0`), the expression text is rendered instead via
+    /// `pg_get_indexdef(indexrelid, position, true)` — this keeps a mixed
+    /// index like `(id, lower(body))` reporting both columns, in order,
+    /// rather than silently dropping the expression one.
     async fn attach_indexes(
         &self,
         tables: &mut [TableInfo],
@@ -404,15 +419,20 @@ impl PostgresConnection {
     ) -> Result<(), QueryError> {
         let sql = format!(
             "SELECT i.indrelid, ic.relname, i.indisunique,
-                    array_agg(a.attname ORDER BY ord.n) AS cols
+                    array_agg(
+                        CASE WHEN ord.attnum = 0
+                             THEN pg_get_indexdef(i.indexrelid, ord.n::int, true)
+                             ELSE a.attname
+                        END ORDER BY ord.n
+                    ) AS cols
              FROM pg_index i
              JOIN pg_class ic ON ic.oid = i.indexrelid
              JOIN pg_class c ON c.oid = i.indrelid
              JOIN pg_namespace n ON n.oid = c.relnamespace
              JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS ord(attnum, n) ON true
-             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ord.attnum
+             LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ord.attnum
              WHERE NOT i.indisprimary AND {SCHEMA_EXCLUDE}
-             GROUP BY i.indrelid, ic.relname, i.indisunique, n.nspname, c.relname
+             GROUP BY i.indrelid, i.indexrelid, ic.relname, i.indisunique, n.nspname, c.relname
              ORDER BY n.nspname, c.relname, ic.relname"
         );
         let rows = self.client.query(&sql, &[]).await.map_err(pg_err)?;
