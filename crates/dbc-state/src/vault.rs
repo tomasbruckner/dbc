@@ -25,12 +25,21 @@ struct Envelope {
     ciphertext: String,
 }
 
-#[derive(Debug)]
 pub struct Vault {
     path: PathBuf,
     key: Key, // derived once per unlock; lives only in memory
     salt: [u8; 16],
     secrets: BTreeMap<String, String>,
+}
+
+// Hand-written: the derived impl would print the raw key and every secret.
+impl std::fmt::Debug for Vault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Vault")
+            .field("path", &self.path)
+            .field("secrets_len", &self.secrets.len())
+            .finish_non_exhaustive()
+    }
 }
 
 fn err(m: impl Into<String>) -> StateError { StateError { message: m.into() } }
@@ -64,6 +73,12 @@ impl Vault {
         let salt: [u8; 16] = B64.decode(&env.salt)
             .ok().and_then(|v| v.try_into().ok())
             .ok_or_else(|| err("vault unlock failed: bad salt"))?;
+        // On-disk KDF params keep old vaults working after param bumps, but the
+        // envelope is unauthenticated until decrypt — cap them so a corrupted
+        // file can't force a multi-GiB allocation (m_cost is in KiB).
+        if env.m_cost > 2 * 1024 * 1024 || env.t_cost > 64 || env.p_cost > 64 {
+            return Err(err("vault unlock failed: implausible KDF params"));
+        }
         let key = derive_key(master, &salt, env.m_cost, env.t_cost, env.p_cost)?;
         let nonce_bytes = B64.decode(&env.nonce).map_err(|_| err("vault unlock failed: bad nonce"))?;
         let ct = B64.decode(&env.ciphertext).map_err(|_| err("vault unlock failed: bad ciphertext"))?;
