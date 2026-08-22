@@ -18,6 +18,11 @@ pub const DEFAULT_COL_WIDTH: f32 = 160.0;
 /// this note is a retroactive "that sort was over a big set" marker rather
 /// than a live in-progress spinner — see `status_note`'s doc comment.
 const LARGE_SORT_ROWS: usize = 100_000;
+/// G4 Task 3 review issue 2: the Ctrl+F scan runs synchronously on the UI
+/// thread on every keystroke — bound both the scanned display rows and the
+/// collected matches; the "i z n" indicator shows "n+" when capped.
+const FIND_MAX_ROWS: usize = 100_000;
+const FIND_MAX_MATCHES: usize = 1_000;
 
 actions!(grid, [CopySelection, FindInResult, FindNext, FindPrev]);
 
@@ -28,14 +33,15 @@ actions!(grid, [CopySelection, FindInResult, FindNext, FindPrev]);
 /// never contend even without scoping, but the explicit context makes the
 /// intent unambiguous and future-proof.
 ///
-/// G4 Task 3: `enter`/`shift-enter` are ALSO scoped to `"ResultGrid"`
-/// (not a narrower "find bar" context) — same trick `palette.rs` uses for
-/// its up/down/enter bindings on the `"Palette"` context wrapping its
-/// input: the find bar's `TextField` sits nested inside this grid's own
-/// `key_context("ResultGrid")` root, so focus being on the input's own
-/// (unscoped-relative) `"TextField"` context still resolves these as
-/// ancestor bindings. Harmless no-ops via `on_find_next`/`on_find_prev`
-/// when the find bar isn't open.
+/// G4 Task 3: `enter`/`shift-enter` are scoped to `"ResultGrid"`. Precision
+/// note (Task 3 review issue 4): per the pinned gpui's depth-based keymap
+/// precedence, SqlInput's UNSCOPED `enter → Newline` binding actually
+/// outranks these scoped ones and is tried FIRST — it just has no handler
+/// anywhere in the find bar's dispatch path (SqlInput is a sibling subtree),
+/// so dispatch falls through to the next binding, which is our scoped
+/// `FindNext`/`FindPrev` with a handler on the grid root. It works by
+/// binding-fallthrough, NOT by "ancestor scope wins". Harmless no-ops via
+/// `on_find_next`/`on_find_prev` when the find bar isn't open.
 pub fn bind_keys(cx: &mut gpui::App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-c", CopySelection, Some("ResultGrid")),
@@ -55,6 +61,9 @@ pub fn bind_keys(cx: &mut gpui::App) {
 struct FindState {
     input: Entity<TextField>,
     matches: Vec<(usize, usize)>,
+    /// True when the last scan hit `FIND_MAX_ROWS`/`FIND_MAX_MATCHES` —
+    /// the indicator shows "n+" instead of an exact total.
+    capped: bool,
     current: Option<usize>,
     /// The text `matches` was last computed from — compared against
     /// `input`'s live text each render, same lazy-recompute trigger as
@@ -337,6 +346,7 @@ impl ResultGrid {
         self.find = Some(FindState {
             input,
             matches: Vec::new(),
+            capped: false,
             current: None,
             last_query: String::new(),
             computed_generation: self.view_generation,
@@ -386,14 +396,21 @@ impl ResultGrid {
             (0..self.hidden_cols.len()).filter(|&c| !self.hidden_cols.get(c).copied().unwrap_or(false)).collect();
         let rows = self.view.len();
         let gen = self.view_generation;
-        let matches = if let Some(buf) = self.buffer.clone() {
+        // Capped scan (Task 3 review issue 2): synchronous per-keystroke
+        // work on the UI thread must be bounded for huge/spilled results.
+        let (matches, capped) = if let Some(buf) = self.buffer.clone() {
             let view = &self.view;
             let mut buf = buf.borrow_mut();
-            row_view::find_matches(rows, &visible_cols, &query, &mut |r, c| {
-                buf.cell_text(view.source_row(r), c)
-            })
+            row_view::find_matches_capped(
+                rows,
+                &visible_cols,
+                &query,
+                FIND_MAX_ROWS,
+                FIND_MAX_MATCHES,
+                &mut |r, c| buf.cell_text(view.source_row(r), c),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
         let first = if matches.is_empty() { None } else { Some(0) };
         if let Some(row) = first.map(|ix| matches[ix].0) {
@@ -401,6 +418,7 @@ impl ResultGrid {
         }
         if let Some(f) = &mut self.find {
             f.matches = matches;
+            f.capped = capped;
             f.current = first;
             f.last_query = query;
             f.computed_generation = gen;
@@ -518,7 +536,12 @@ impl ResultGrid {
 
         if let Some(f) = &self.find {
             let count_label = match f.current {
-                Some(ix) => format!("{} z {}", ix + 1, f.matches.len()),
+                Some(ix) => format!(
+                    "{} z {}{}",
+                    ix + 1,
+                    f.matches.len(),
+                    if f.capped { "+" } else { "" }
+                ),
                 None => format!("0 z {}", f.matches.len()),
             };
             row = row
@@ -760,11 +783,6 @@ impl Focusable for ResultGrid {
 
 impl Render for ResultGrid {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Row count/order goes through `view` (G4 Task 2: local sort), not
-        // the buffer's raw row count directly — `row_ix` below is a
-        // DISPLAY index, mapped to the buffer's actual row via
-        // `this.view.source_row` before every read/selection use.
-        let row_count = self.view.len();
         let buffer = self.buffer.clone();
         let widths = self.col_widths.clone();
         let is_resizing = self.resizing.is_some();
@@ -796,6 +814,14 @@ impl Render for ResultGrid {
             }
         }
 
+        // Row count/order goes through `view` (G4 Task 2: local sort), not
+        // the buffer's raw row count directly — `row_ix` below is a DISPLAY
+        // index, mapped via `this.view.source_row` before every read.
+        // CAPTURED ONLY AFTER `toolbar(cx)` ran above: `poll_filters` inside
+        // it can shrink `self.view` mid-render, and a stale larger count fed
+        // to `uniform_list` panics `source_row` out-of-bounds (Task 3 review
+        // issue 1).
+        let row_count = self.view.len();
         root = root.child(self.header(cx)).child(
             uniform_list(
                 "result-rows",

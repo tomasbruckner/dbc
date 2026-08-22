@@ -127,19 +127,40 @@ pub fn find_matches(
     needle: &str,
     cell: &mut dyn FnMut(usize, usize) -> String,
 ) -> Vec<(usize, usize)> {
+    find_matches_capped(rows, cols, needle, usize::MAX, usize::MAX, cell).0
+}
+
+/// Capped variant (Task 3 review issue 2): the scan runs synchronously on
+/// the UI thread per keystroke, so both the scanned row count and the match
+/// count are bounded. Returns `(matches, capped)` — `capped == true` when
+/// the scan stopped early (rows beyond `max_rows` unscanned, or
+/// `max_matches` reached), so the UI can show "1000+" instead of a wrong
+/// exact total.
+pub fn find_matches_capped(
+    rows: usize,
+    cols: &[usize],
+    needle: &str,
+    max_rows: usize,
+    max_matches: usize,
+    cell: &mut dyn FnMut(usize, usize) -> String,
+) -> (Vec<(usize, usize)>, bool) {
     if needle.is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     let needle_lower = needle.to_lowercase();
     let mut out = Vec::new();
-    for r in 0..rows {
+    let scanned_rows = rows.min(max_rows);
+    for r in 0..scanned_rows {
         for &c in cols {
             if cell(r, c).to_lowercase().contains(&needle_lower) {
                 out.push((r, c));
+                if out.len() >= max_matches {
+                    return (out, true);
+                }
             }
         }
     }
-    out
+    (out, scanned_rows < rows)
 }
 
 /// Wrap-around next/prev index into a match list of length `len`. `None`
