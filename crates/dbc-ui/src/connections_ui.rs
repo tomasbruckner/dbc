@@ -1338,8 +1338,16 @@ impl AppView {
                         match result {
                             Ok(Ok(())) => {
                                 view.status = format!("Připojeno ({engine_lbl})");
-                                view.active_connection_id = Some(target_id);
+                                view.active_connection_id = Some(target_id.clone());
                                 view.conn_url = None;
+                                // G2 Task 6: re-fetch the schema tree for the
+                                // newly active connection. Rebuilt from
+                                // `view.config`/`view.vault` rather than
+                                // reusing the (already-consumed) `spec` this
+                                // test_connect dispatched with.
+                                if let Some(spec) = view.active_conn_spec() {
+                                    view.trigger_schema_fetch(spec, cx);
+                                }
                             }
                             Ok(Err(e)) => view.status = format!("error: {e}"),
                             Err(_) => view.status = "error: connect zrušen".into(),

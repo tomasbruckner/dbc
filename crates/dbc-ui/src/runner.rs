@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use dbc_core::arrow::array::RecordBatch;
 use dbc_core::arrow::datatypes::SchemaRef;
-use dbc_core::{CancelToken, Connection, QueryError, CHANNEL_CAPACITY};
+use dbc_core::{CancelToken, Connection, QueryError, SchemaSnapshot, CHANNEL_CAPACITY};
 use dbc_state::ConnectionConfig;
 
 use crate::connect;
@@ -151,6 +151,27 @@ impl QueryRunner {
         let handle = self.handle();
         self.runtime.spawn(async move {
             let result = open_spec(spec, handle).await.map(|_opened| ());
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
+    /// Fetches a `SchemaSnapshot` for the tree panel (G2 Task 6): opens
+    /// `spec` off the UI thread (same `open_spec` dispatch as
+    /// `test_connect`/`connect_and_run`'s connect step), calls
+    /// `Connection::schema()`, then drops the connection/tunnel — this is a
+    /// one-shot fetch, not a held connection.
+    pub fn fetch_schema(
+        &self,
+        spec: ConnectSpec,
+    ) -> tokio::sync::oneshot::Receiver<Result<SchemaSnapshot, QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            let result = match open_spec(spec, handle).await {
+                Ok(mut opened) => opened.conn.schema().await,
+                Err(e) => Err(e),
+            };
             let _ = tx.send(result);
         });
         rx

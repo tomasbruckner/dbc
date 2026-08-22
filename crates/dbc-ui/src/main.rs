@@ -2,6 +2,7 @@ mod connect;
 mod connections_ui;
 mod grid;
 mod runner;
+mod schema_tree;
 mod sql_input;
 mod tabs;
 mod text_model;
@@ -22,10 +23,11 @@ use gpui::{
 use gpui_platform::application;
 use grid::ResultGrid;
 use runner::{ConnectSpec, QueryEvent, QueryRunner};
+use schema_tree::{SchemaTree, TreeEvent};
 use sql_input::SqlInput;
 use tabs::{collapse_title, ResultTab, TabContent, Tabs};
 
-actions!(dbc, [RunQuery, RunQueryUnlimited, CancelQuery]);
+actions!(dbc, [RunQuery, RunQueryUnlimited, CancelQuery, ToggleTree]);
 
 struct AppView {
     tabs: Tabs,
@@ -62,6 +64,15 @@ struct AppView {
     /// on dropdown-open and after config mutations (see
     /// `AppView::refresh_grouped_cache`) rather than on every render frame.
     grouped_cache: connections_ui::GroupedConnections,
+    // --- G2 Task 6: schema tree panel ---
+    /// Loading/error/snapshot state lives on the entity itself, driven by
+    /// direct mutation from `trigger_schema_fetch` (see schema_tree.rs's
+    /// header comment for why this isn't done via `TreeEvent` instead).
+    tree: Entity<SchemaTree>,
+    /// Ctrl+B (`ToggleTree`, app action, binding context `None`). `false`
+    /// means the panel isn't rendered at all (0 px), not just visually
+    /// hidden.
+    tree_visible: bool,
 }
 
 impl AppView {
@@ -277,6 +288,77 @@ impl AppView {
         }
     }
 
+    fn on_toggle_tree(&mut self, _: &ToggleTree, _window: &mut Window, cx: &mut Context<Self>) {
+        self.tree_visible = !self.tree_visible;
+        cx.notify();
+    }
+
+    /// Builds the `ConnectSpec` for the *currently active* connection (saved
+    /// config or CLI-arg URL) — used by the schema tree's initial fetch and
+    /// its `RefreshRequested` handler. Unlike `run_query`'s spec, callers
+    /// here don't need `read_only`/`auto_limit`/`timeout_secs`, so this just
+    /// returns the spec. `None` means there's nothing to fetch a schema for
+    /// (tree shows "Bez připojení").
+    fn active_conn_spec(&self) -> Option<ConnectSpec> {
+        if let Some(id) = self.active_connection_id.clone() {
+            let cfg = self.config.connections.iter().find(|c| c.id == id)?.clone();
+            let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+            Some(ConnectSpec::Config { cfg: Box::new(cfg), secret })
+        } else {
+            self.conn_url.clone().map(ConnectSpec::Url)
+        }
+    }
+
+    /// Dispatches `runner.fetch_schema(spec)` off the UI thread and updates
+    /// `self.tree`'s loading/snapshot/error state as it resolves — same
+    /// "UI thread only ever awaits a channel via `cx.spawn`" shape as
+    /// `run_query`/`switch_to_connection`. Called from the
+    /// `switch_to_connection` success arm, `TreeEvent::RefreshRequested`,
+    /// and once at CLI-arg startup (see `main`).
+    fn trigger_schema_fetch(&mut self, spec: ConnectSpec, cx: &mut Context<Self>) {
+        self.tree.update(cx, |t, cx| t.set_loading(cx));
+        let rx = self.runner.fetch_schema(spec);
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |view, cx| {
+                view.tree.update(cx, |t, cx| match result {
+                    Ok(Ok(snapshot)) => t.set_snapshot(snapshot, cx),
+                    Ok(Err(e)) => t.set_error(e.to_string(), cx),
+                    Err(_) => t.set_error("fetch zrušen".to_string(), cx),
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// `SchemaTree`'s `TreeEvent` subscription (wired in `main`).
+    /// `OpenPreview`/`OpenDdl` are stubbed here — Task 7 wires them to
+    /// actually open a preview/DDL tab; this task just needs the
+    /// subscription seam to exist and be exercised end-to-end.
+    fn on_tree_event(&mut self, _emitter: Entity<SchemaTree>, event: &TreeEvent, cx: &mut Context<Self>) {
+        match event {
+            TreeEvent::OpenPreview { schema, table } => {
+                let qualified = match schema {
+                    Some(s) => format!("{s}.{table}"),
+                    None => table.clone(),
+                };
+                self.status = format!("Náhled {qualified} přijde v T7");
+                cx.notify();
+            }
+            TreeEvent::OpenDdl { title, ddl } => {
+                self.status = format!("DDL {title} ({} znaků) přijde v T7", ddl.len());
+                cx.notify();
+            }
+            TreeEvent::RefreshRequested => {
+                if let Some(spec) = self.active_conn_spec() {
+                    self.trigger_schema_fetch(spec, cx);
+                } else {
+                    self.tree.update(cx, |t, cx| t.clear(cx));
+                }
+            }
+        }
+    }
+
     /// Tab strip between the SQL editor and result content: title +
     /// row-count badge (`Grid` tabs read `buffer.row_count()` fresh at
     /// render time rather than caching it on the tab) + pin toggle + close.
@@ -422,16 +504,14 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut root = div()
-            .relative()
+        // The SQL editor + tab strip + tab content column, unchanged from
+        // pre-Task-6 except that it's now one column in a horizontal row
+        // rather than filling the whole window body.
+        let mut column = div()
             .flex()
             .flex_col()
-            .size_full()
-            .bg(rgb(0x1e1e2e))
-            .on_action(cx.listener(Self::on_run_query))
-            .on_action(cx.listener(Self::on_run_query_unlimited))
-            .on_action(cx.listener(Self::on_cancel_query))
-            .child(self.render_top_bar(cx))
+            .flex_1()
+            .min_w_0()
             .child(
                 // Fixed height of 8 lines (SqlInput's own line_height is
                 // px(20.), see sql_input.rs render()); the input scrolls
@@ -447,16 +527,47 @@ impl Render for AppView {
         // contract #2); with none, `render_tab_content` fills the area with
         // a neutral placeholder instead.
         if self.tabs.iter().next().is_some() {
-            root = root.child(self.render_tab_strip(cx));
+            column = column.child(self.render_tab_strip(cx));
         }
-        root = root.child(self.render_tab_content(cx)).child(
-            div()
-                .h(px(28.))
-                .px_2()
-                .bg(rgb(0x313244))
-                .text_color(rgb(0xa6adc8))
-                .child(self.status.clone()),
-        );
+        column = column.child(self.render_tab_content(cx));
+
+        // G2 Task 6: the schema tree panel sits LEFT of `column`, fixed
+        // 260 px, collapsible via Ctrl+B (`ToggleTree`) — collapsed means
+        // not rendered at all (width 0), not just visually hidden.
+        let mut body = div().flex().flex_row().flex_1().min_h_0();
+        if self.tree_visible {
+            body = body.child(
+                div()
+                    .w(px(260.))
+                    .h_full()
+                    .flex_shrink_0()
+                    .border_r_1()
+                    .border_color(rgb(0x45475a))
+                    .child(self.tree.clone()),
+            );
+        }
+        body = body.child(column);
+
+        let mut root = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(0x1e1e2e))
+            .on_action(cx.listener(Self::on_run_query))
+            .on_action(cx.listener(Self::on_run_query_unlimited))
+            .on_action(cx.listener(Self::on_cancel_query))
+            .on_action(cx.listener(Self::on_toggle_tree))
+            .child(self.render_top_bar(cx))
+            .child(body)
+            .child(
+                div()
+                    .h(px(28.))
+                    .px_2()
+                    .bg(rgb(0x313244))
+                    .text_color(rgb(0xa6adc8))
+                    .child(self.status.clone()),
+            );
 
         if self.dropdown_open && self.modal.is_none() {
             root = root.child(self.render_dropdown_overlay(cx));
@@ -490,51 +601,68 @@ fn main() {
             KeyBinding::new("ctrl-enter", RunQuery, None),
             KeyBinding::new("ctrl-shift-enter", RunQueryUnlimited, None),
             KeyBinding::new("escape", CancelQuery, None),
+            KeyBinding::new("ctrl-b", ToggleTree, None),
         ]);
         sql_input::bind_keys(cx);
         grid::bind_keys(cx);
         connections_ui::bind_keys(cx);
+        schema_tree::bind_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |window, cx| {
-                cx.new(|cx| {
-                    let sql = cx.new(|cx| SqlInput::new(cx, "Type SQL, then Ctrl+Enter…"));
-                    window.focus(&sql.focus_handle(cx), cx);
-                    let grouped_cache = connections_ui::group_connections(&config.connections);
-                    let status = match &config_load_error {
-                        Some(detail) => {
-                            format!("error: config.toml je poškozený – oprav nebo smaž soubor ({detail})")
+        let window_handle = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    cx.new(|cx| {
+                        let sql = cx.new(|cx| SqlInput::new(cx, "Type SQL, then Ctrl+Enter…"));
+                        window.focus(&sql.focus_handle(cx), cx);
+                        let grouped_cache = connections_ui::group_connections(&config.connections);
+                        let status = match &config_load_error {
+                            Some(detail) => {
+                                format!("error: config.toml je poškozený – oprav nebo smaž soubor ({detail})")
+                            }
+                            None => "ready".into(),
+                        };
+                        let tree = cx.new(SchemaTree::new);
+                        cx.subscribe(&tree, AppView::on_tree_event).detach();
+                        AppView {
+                            tabs: Tabs::new(),
+                            status,
+                            runner: QueryRunner::new(),
+                            conn_url,
+                            sql,
+                            cancel: None,
+                            started_at: None,
+                            config,
+                            config_path,
+                            config_load_error,
+                            vault_path,
+                            vault: None,
+                            active_connection_id: None,
+                            switch_generation: 0,
+                            dropdown_open: false,
+                            modal: None,
+                            grouped_cache,
+                            tree,
+                            tree_visible: true,
                         }
-                        None => "ready".into(),
-                    };
-                    AppView {
-                        tabs: Tabs::new(),
-                        status,
-                        runner: QueryRunner::new(),
-                        conn_url,
-                        sql,
-                        cancel: None,
-                        started_at: None,
-                        config,
-                        config_path,
-                        config_load_error,
-                        vault_path,
-                        vault: None,
-                        active_connection_id: None,
-                        switch_generation: 0,
-                        dropdown_open: false,
-                        modal: None,
-                        grouped_cache,
-                    }
-                })
-            },
-        )
-        .unwrap();
+                    })
+                },
+            )
+            .unwrap();
         cx.activate(true);
+
+        // CLI-arg back-compat startup path (brief contract #6): also fires
+        // the initial schema fetch, exactly like a dropdown connection
+        // switch does — `active_conn_spec` reads `conn_url` when no saved
+        // connection is active yet, which is always true this early.
+        let _ = window_handle.update(cx, |view, _window, cx| {
+            if let Some(spec) = view.active_conn_spec() {
+                view.trigger_schema_fetch(spec, cx);
+            }
+        });
     });
 }
