@@ -5,3 +5,6 @@ pub use config::{
 
 mod vault;
 pub use vault::{default_vault_path, Vault};
+
+mod history;
+pub use history::{default_history_path, HistoryDb, HistoryEntry};
