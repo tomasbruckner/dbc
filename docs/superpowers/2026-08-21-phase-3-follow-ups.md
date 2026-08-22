@@ -42,6 +42,11 @@ durable record).
 - Test gap worth closing before MSSQL driver work: a fake-driver test at the
   `runner.rs` seam (spec §7 named it; dbc-core half was consciously skipped,
   the runner half is where it would pay off).
+- G1 Task 8 REQUIREMENT (from Task 6 security review): read-only connections
+  must ALSO be enforced server-side — Postgres: set
+  `default_transaction_read_only=on` (options or `SET` after connect);
+  SQLite: open with `SQLITE_OPEN_READONLY` where possible. Client-side guards
+  are best-effort (e.g. `set_config()`/`nextval()` callable from SELECT).
 
 ## Deferred human verification
 
