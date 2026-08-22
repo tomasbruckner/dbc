@@ -1,4 +1,5 @@
 mod connect;
+mod connections_ui;
 mod grid;
 mod runner;
 mod sql_input;
@@ -6,10 +7,12 @@ mod text_model;
 mod tunnel;
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use dbc_buffer::ResultBuffer;
 use dbc_core::CancelToken;
+use dbc_state::{AppConfig, Vault};
 use gpui::{
     actions, div, prelude::*, px, rgb, size, App, Bounds, Context, Entity, Focusable, KeyBinding,
     Window, WindowBounds, WindowOptions,
@@ -25,14 +28,30 @@ struct AppView {
     grid: Entity<ResultGrid>,
     status: String,
     runner: QueryRunner,
-    conn_url: String,
+    /// Back-compat CLI-arg connection string (phase 0-2 path). `None` when
+    /// the app was started with no argument (Task 7's new startup path) or
+    /// once a saved connection has been switched to.
+    conn_url: Option<String>,
     sql: Entity<SqlInput>,
     cancel: Option<CancelToken>,
     started_at: Option<std::time::Instant>,
+    // --- Task 7: connection manager state ---
+    config: AppConfig,
+    config_path: PathBuf,
+    vault_path: PathBuf,
+    /// Unlocked vault, kept for the session once the user has entered the
+    /// master password once (brief: prompt on first use, not at startup).
+    vault: Option<Vault>,
+    active_connection_id: Option<String>,
+    dropdown_open: bool,
+    modal: Option<connections_ui::ModalState>,
 }
 
 impl AppView {
     fn on_run_query(&mut self, _: &RunQuery, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return; // don't run queries under a modal
+        }
         if self.cancel.is_some() {
             return; // one query at a time in v1
         }
@@ -40,7 +59,19 @@ impl AppView {
         if sql.trim().is_empty() {
             return;
         }
-        let conn = match connect::open(&self.conn_url, &self.runner.handle()) {
+        // Back-compat CLI-arg path only for now — connecting via a saved
+        // ConnectionConfig (`active_connection_id`) is Task 8's seam; see
+        // connections_ui::pending_connect's doc comment.
+        let Some(url) = self.conn_url.clone() else {
+            self.status = if self.active_connection_id.is_some() {
+                "connect flow lands in Task 8".into()
+            } else {
+                "Bez připojení — vyberte připojení nahoře.".into()
+            };
+            cx.notify();
+            return;
+        };
+        let conn = match connect::open(&url, &self.runner.handle()) {
             Ok(c) => c,
             Err(e) => {
                 self.status = format!("error: {e}");
@@ -104,13 +135,15 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let mut root = div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(0x1e1e2e))
             .on_action(cx.listener(Self::on_run_query))
             .on_action(cx.listener(Self::on_cancel_query))
+            .child(self.render_top_bar(cx))
             .child(
                 // Fixed height of 8 lines (SqlInput's own line_height is
                 // px(20.), see sql_input.rs render()); the input scrolls
@@ -129,14 +162,27 @@ impl Render for AppView {
                     .bg(rgb(0x313244))
                     .text_color(rgb(0xa6adc8))
                     .child(self.status.clone()),
-            )
+            );
+
+        if self.dropdown_open && self.modal.is_none() {
+            root = root.child(self.render_dropdown_overlay(cx));
+        }
+        if let Some(overlay) = self.render_modal_overlay(cx) {
+            root = root.child(overlay);
+        }
+        root
     }
 }
 
 fn main() {
-    let conn_url = std::env::args()
-        .nth(1)
-        .expect("usage: dbc-ui <connection-string>");
+    // CLI arg is now optional: back-compat direct-connect path (phase 0-2)
+    // when present, otherwise the app starts with no active connection and
+    // the user picks one from the top-bar switcher (Task 7).
+    let conn_url = std::env::args().nth(1);
+    let config_path = dbc_state::default_config_path();
+    let vault_path = dbc_state::default_vault_path();
+    let config = AppConfig::load(&config_path).unwrap_or_default();
+
     application().run(move |cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("ctrl-enter", RunQuery, None),
@@ -144,6 +190,7 @@ fn main() {
         ]);
         sql_input::bind_keys(cx);
         grid::bind_keys(cx);
+        connections_ui::bind_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         cx.open_window(
@@ -164,6 +211,13 @@ fn main() {
                         sql,
                         cancel: None,
                         started_at: None,
+                        config,
+                        config_path,
+                        vault_path,
+                        vault: None,
+                        active_connection_id: None,
+                        dropdown_open: false,
+                        modal: None,
                     }
                 })
             },
