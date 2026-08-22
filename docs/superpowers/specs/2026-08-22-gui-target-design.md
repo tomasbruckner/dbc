@@ -95,6 +95,9 @@ lands last) and pays the biggest pains first.
 | **G6 Editor pro** | Tree-sitter highlighting; schema autocomplete | Most expensive single feature, functionally least urgent |
 | **G7 DB compare** | Schema diff between two saved connections (SchemaSnapshot-based); data diff via DuckDB over Arrow buffers | Future; own brainstorm when reached |
 | **G8 ER diagram** | FK-graph rendering of a schema in GPUI canvas; export image | Future; own brainstorm when reached |
+| **G9 Sessions monitor** | Active connections and running queries (pg_stat_activity / sp_who2), kill query/session | Read-mostly + one KILL action; may be pulled forward (after G4) since it is useful while debugging. Not applicable to SQLite |
+| **G10 Server admin** | Users and roles (create, password, membership), privileges matrix (GRANT/REVOKE), database/schema DDL with sizes | Pure DDL write paths — lands after G5 establishes the "show SQL → confirm → transaction" pattern; heavily engine-specific (pg roles vs MSSQL logins; SQLite exempt); privileges matrix gets its own design pass |
+| **G11 Backup & restore** | Whole-DB export and restore per engine: Postgres via pg_dump/pg_restore (external binaries orchestrated by the app, streamed progress, format/compression options), MSSQL via BACKUP/RESTORE DATABASE (server-side, writes to the server's disk — path picker must reflect that), SQLite via file copy/VACUUM INTO | Two fundamentally different mechanics behind one UI; requires detecting client tools on the machine; own design pass when reached |
 
 Orthogonal, unscheduled here: MSSQL driver (odbc-api), DuckDB driver, MCP
 server (original phases 3/6 — unchanged).
@@ -113,5 +116,5 @@ server (original phases 3/6 — unchanged).
 ## 4. Out of scope of this spec
 
 Detailed design of G5 (SQL generation rules, conflict handling), G6
-(autocomplete engine), G7 and G8 — each gets its own brainstorm + spec when
+(autocomplete engine), and G7–G11 — each gets its own brainstorm + spec when
 its turn comes. This spec fixes the target UX and the phase boundaries.
