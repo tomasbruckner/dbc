@@ -33,10 +33,16 @@ One window, hybrid layout (user choice "C"):
   (Ctrl+B for tree; history toggle analogous), plus a Ctrl+K command palette.
 - **Connections:** top-bar dropdown listing saved connections; "New
   connection…" opens a full form dialog (name, type, host, database, user,
-  password, "Test connection" button). Passwords ONLY in Windows Credential
-  Manager — never on disk. Connection metadata (no secrets) in a config file
-  in the user profile. Connecting happens off the UI thread (fixes the
-  known block_on freeze follow-up).
+  password, "Test connection" button). Connections can be organised into
+  user-defined folders (tree in both the manager and the dropdown; folder
+  is metadata only, no behaviour). Passwords live in an encrypted vault
+  file: keys derived from a master password via Argon2id, payload encrypted
+  with an AEAD cipher (ChaCha20-Poly1305 or AES-GCM); the master password
+  is prompted once per app start to unlock the vault and is never stored.
+  Plaintext secrets never touch disk; the vault file is portable between
+  machines. Connection metadata (no secrets) in a separate config file in
+  the user profile. Connecting happens off the UI thread (fixes the known
+  block_on freeze follow-up).
 - **Schema tree:** shows the full object catalog per schema — tables, views
   (incl. materialized), functions, procedures, triggers, indexes,
   sequences, constraints. Columns show name, type, nullability, default
@@ -94,7 +100,7 @@ lands last) and pays the biggest pains first.
 
 | Phase | Contents | Notes |
 |---|---|---|
-| **G1 Editor & connections** | Multiline editor (plain); connection manager (form dialog, Credential Manager vault, top-bar switcher); connect off the UI thread; per-connection options: SSH tunnel (host/user/key, app-managed), read-only flag (blocks every write path app-wide: sandbox Apply, admin, script runner), query timeout; auto-LIMIT guard (bare SELECT gets a configurable LIMIT, overridable per run) | Kills the two worst pains from the first human test; includes the block_on-freeze follow-up |
+| **G1 Editor & connections** | Multiline editor (plain); connection manager (form dialog, folders, Argon2id master-password vault, top-bar switcher); connect off the UI thread; per-connection options: SSH tunnel (host/user/key, app-managed), read-only flag (blocks every write path app-wide: sandbox Apply, admin, script runner), query timeout; auto-LIMIT guard (bare SELECT gets a configurable LIMIT, overridable per run) | Kills the two worst pains from the first human test; includes the block_on-freeze follow-up |
 | **G2 Tabs & tree** | Result-tab infrastructure (buffer per tab); schema tree panel with speed search; double-click preview/DDL tabs; Ctrl+B; `SchemaSnapshot` in dbc-core grows from tables+columns to the full object model (views, functions, procedures, triggers, indexes, sequences, constraints, column defaults) with per-driver catalog queries; "Generate DDL" on tables/views (CREATE statement into a read-only tab) | Also the natural home for the spill-off-UI-thread and byte-cap follow-ups (buffer work is touched anyway) |
 | **G3 History & palette** | Persistent history (SQLite), right panel, fulltext, pins, click-to-load; Ctrl+K palette | History and palette share data sources |
 | **G4 Grid+** | Local sort, column filters, cell detail popup, export CSV/TSV/JSON/INSERT; column visibility menu; FK joined columns; Ctrl+F search within the fetched result | Mostly local additions over the buffer; FK joins need FK metadata from G2 and are the meaty half of this phase |
