@@ -195,6 +195,7 @@ impl AppView {
                                     if let Some(token) = view.cancel.take() {
                                         token.cancel();
                                     }
+                                    view.status = "zrušeno (tab zavřen)".into();
                                 } else if let Some(Err(e)) =
                                     buffer.as_ref().map(|buf| buf.borrow_mut().push(b))
                                 {
@@ -366,6 +367,7 @@ impl AppView {
 
                 let mut body = div()
                     .id("tab-text-body")
+                    .font_family("Consolas")
                     .flex()
                     .flex_col()
                     .flex_1()
