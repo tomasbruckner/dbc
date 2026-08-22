@@ -61,6 +61,17 @@ One window, hybrid layout (user choice "C"):
   (contains/=/range); Enter or double-click on a cell opens a read-only
   full-content popup; export of the full result or selection as CSV, JSON,
   or INSERT statements.
+- **Column visibility:** a ☰ menu on the grid header opens a checkbox list
+  of columns; unchecked columns are hidden locally (buffer unchanged,
+  display-only). Per result tab, not persisted.
+- **FK joined columns (user choice "B"):** on a column that is a foreign
+  key, the ☰ menu offers "add columns from <referenced table>" with a
+  checkbox list; selected columns appear inline next to the FK column,
+  visually tinted as joined. Mechanics: for preview tabs the underlying
+  query is rewritten with a LEFT JOIN; for arbitrary user queries the
+  values are fetched locally by key lookup (batched `WHERE pk IN (…)` over
+  the visible window). Detailed design of the lookup path lands in the G4
+  plan.
 - **Grid editing — sandbox with diff (user choice):** edits never touch the
   database directly. Local changes accumulate with diff colouring (yellow
   edited / green new row / red deleted row). "Apply…" opens a dialog showing
@@ -79,7 +90,7 @@ lands last) and pays the biggest pains first.
 | **G1 Editor & connections** | Multiline editor (plain); connection manager (form dialog, Credential Manager vault, top-bar switcher); connect off the UI thread | Kills the two worst pains from the first human test; includes the block_on-freeze follow-up |
 | **G2 Tabs & tree** | Result-tab infrastructure (buffer per tab); schema tree panel with speed search; double-click preview tabs; Ctrl+B | Also the natural home for the spill-off-UI-thread and byte-cap follow-ups (buffer work is touched anyway) |
 | **G3 History & palette** | Persistent history (SQLite), right panel, fulltext, pins, click-to-load; Ctrl+K palette | History and palette share data sources |
-| **G4 Grid+** | Local sort, column filters, cell detail popup, export CSV/JSON/INSERT | Pure additions over the existing buffer |
+| **G4 Grid+** | Local sort, column filters, cell detail popup, export CSV/JSON/INSERT; column visibility menu; FK joined columns | Mostly local additions over the buffer; FK joins need FK metadata from G2 and are the meaty half of this phase |
 | **G5 Sandbox editing** | PK detection, local diff edits, Apply dialog with generated SQL, single transaction | First write path in the app; gets its own design pass before implementation |
 | **G6 Editor pro** | Tree-sitter highlighting; schema autocomplete | Most expensive single feature, functionally least urgent |
 | **G7 DB compare** | Schema diff between two saved connections (SchemaSnapshot-based); data diff via DuckDB over Arrow buffers | Future; own brainstorm when reached |
