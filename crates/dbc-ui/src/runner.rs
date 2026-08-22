@@ -85,26 +85,10 @@ impl QueryRunner {
                 return;
             }
 
-            let blocking_handle = handle.clone();
-            let opened = tokio::task::spawn_blocking(move || match spec {
-                ConnectSpec::Config { cfg, secret } => {
-                    connect::open_config(&cfg, secret, &blocking_handle)
-                }
-                ConnectSpec::Url(url) => connect::open(&url, &blocking_handle)
-                    .map(|conn| connect::OpenConnection { conn, _tunnel: None }),
-            })
-            .await;
-
-            let opened = match opened {
-                Ok(Ok(opened)) => opened,
-                Ok(Err(e)) => {
+            let opened = match open_spec(spec, handle.clone()).await {
+                Ok(opened) => opened,
+                Err(e) => {
                     let _ = tx.send(QueryEvent::Failed(e)).await;
-                    return;
-                }
-                Err(_) => {
-                    let _ = tx
-                        .send(QueryEvent::Failed(QueryError::msg("connect task panicked")))
-                        .await;
                     return;
                 }
             };
@@ -141,6 +125,58 @@ impl QueryRunner {
             }
         });
         rx
+    }
+
+    /// Connects (off the UI thread) using `spec` and immediately drops the
+    /// resulting connection/tunnel — used by the connection-manager's Test
+    /// button and dropdown connection-switch to validate a connection
+    /// without blocking the UI thread (Task 8 review issue #1/#2). Reuses
+    /// the exact `spawn_blocking(open_config(...))` dispatch
+    /// `connect_and_run` uses for its connect step, via the shared
+    /// `open_spec` helper, so both paths get the same `connect_timeout`
+    /// bound and the same "blocking work never runs on a runtime worker
+    /// thread" guarantee.
+    ///
+    /// No `CancelToken` is threaded through here: unlike a query, there is
+    /// no in-flight query step to cancel, and `open_config`'s signature
+    /// (brief-mandated: `cfg, secret, runtime`) doesn't accept one either —
+    /// same limitation `connect_and_run`'s own connect step has (cancel is
+    /// only checked before/after the blocking call, never during it). The
+    /// `connect_timeout` bound is what actually caps how long this can run.
+    pub fn test_connect(
+        &self,
+        spec: ConnectSpec,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            let result = open_spec(spec, handle).await.map(|_opened| ());
+            let _ = tx.send(result);
+        });
+        rx
+    }
+}
+
+/// Dispatches a `ConnectSpec` to the right driver inside `spawn_blocking`
+/// (legal to block there; not on a runtime worker thread) — shared by
+/// `connect_and_run`'s connect step and `test_connect`, so both get the
+/// same `connect_timeout` bound and panic handling.
+async fn open_spec(
+    spec: ConnectSpec,
+    handle: tokio::runtime::Handle,
+) -> Result<connect::OpenConnection, QueryError> {
+    let blocking_handle = handle.clone();
+    let opened = tokio::task::spawn_blocking(move || match spec {
+        ConnectSpec::Config { cfg, secret } => connect::open_config(&cfg, secret, &blocking_handle),
+        ConnectSpec::Url(url) => connect::open(&url, &blocking_handle)
+            .map(|conn| connect::OpenConnection { conn, _tunnel: None }),
+    })
+    .await;
+
+    match opened {
+        Ok(Ok(opened)) => Ok(opened),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(QueryError::msg("connect task panicked")),
     }
 }
 

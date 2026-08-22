@@ -25,9 +25,11 @@
 //      inherent `impl` blocks for the same type to be split across modules
 //      within a crate.
 //   5. Free helper functions: panel renderers for each modal, small style
-//      helpers, engine cycling, id generation, form-field parsing, and the
-//      `pending_connect` SEAM — see its doc comment — which is the single
-//      integration point Task 8 replaces with the real connect flow.
+//      helpers, engine cycling, id generation, form-field parsing, and
+//      `test_connect_spec` — builds the `ConnectSpec` the Test button /
+//      dropdown connection-switch dispatch through `QueryRunner::test_connect`
+//      (off the UI thread; see its doc comment and the Task 8 review fix
+//      round for why the earlier synchronous `pending_connect` was replaced).
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -42,7 +44,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::connect;
+use crate::runner::ConnectSpec;
 use crate::text_model::MultilineBuffer;
 use crate::AppView;
 
@@ -770,6 +772,11 @@ pub struct ConnectionDialogUi {
     pub favourite: bool,
     pub ssh_enabled: bool,
     pub test_result: Option<Result<String, String>>,
+    /// `true` while a Test-button connect dispatched via
+    /// `QueryRunner::test_connect` is in flight (Task 8 review issue #1) —
+    /// drives the "testuji…" status line and makes `on_test_clicked` a
+    /// no-op re-click guard until the result arrives.
+    pub testing: bool,
 }
 
 impl ConnectionDialogUi {
@@ -1087,6 +1094,7 @@ impl AppView {
             favourite,
             ssh_enabled,
             test_result: None,
+            testing: false,
         };
         self.modal = Some(ModalState::ConnectionDialog(ui));
         self.dropdown_open = false;
@@ -1124,20 +1132,69 @@ impl AppView {
         cx.notify();
     }
 
+    /// Dispatches the Test button's connect off the UI thread via
+    /// `QueryRunner::test_connect` (Task 8 review issue #1: this used to
+    /// call `pending_connect` synchronously, freezing the whole window for
+    /// however long an unreachable host's TCP handshake took). Sets
+    /// `testing = true` immediately (drives the "testuji…" status line and
+    /// guards against a second click starting a redundant in-flight test),
+    /// then updates `test_result` once the result comes back over a oneshot
+    /// channel — same "UI thread only ever awaits a channel via `cx.spawn`"
+    /// shape as `run_query`'s `QueryEvent` drain.
     fn on_test_clicked(&mut self, cx: &mut Context<Self>) {
-        let Some(ModalState::ConnectionDialog(ui)) = self.modal.clone() else { return };
-        let data = ui.to_form_data(cx);
+        let Some(ModalState::ConnectionDialog(ui)) = &self.modal else { return };
+        if ui.testing {
+            return;
+        }
+        let ui_snapshot = ui.clone();
+        let data = ui_snapshot.to_form_data(cx);
         let secret = if !data.password.is_empty() {
             Some(data.password.clone())
         } else {
             self.vault.as_ref().and_then(|v| v.get_secret(&data.id))
         };
+        let engine_lbl = engine_label(data.engine);
+        let editing_id = ui_snapshot.editing_id.clone();
         let cfg = data.to_connection_config();
-        let result = pending_connect(&cfg, secret.as_deref(), &self.runner.handle());
-        if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
-            ui.test_result = Some(result);
+
+        match test_connect_spec(cfg, secret) {
+            Err(msg) => {
+                if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
+                    ui.test_result = Some(Err(msg));
+                }
+                cx.notify();
+            }
+            Ok(spec) => {
+                if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
+                    ui.testing = true;
+                    ui.test_result = None;
+                }
+                cx.notify();
+
+                let rx = self.runner.test_connect(spec);
+                cx.spawn(async move |this, cx| {
+                    let result = rx.await;
+                    let _ = this.update(cx, |view, cx| {
+                        // Guard: the dialog may have been closed/reopened
+                        // (a different `editing_id`, or no dialog at all)
+                        // while this was in flight — don't resurrect a
+                        // stale result onto an unrelated/closed dialog.
+                        if let Some(ModalState::ConnectionDialog(ui)) = &mut view.modal {
+                            if ui.editing_id == editing_id {
+                                ui.testing = false;
+                                ui.test_result = Some(match result {
+                                    Ok(Ok(())) => Ok(format!("Připojeno ({engine_lbl})")),
+                                    Ok(Err(e)) => Err(e.to_string()),
+                                    Err(_) => Err("connect zrušen".to_string()),
+                                });
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
         }
-        cx.notify();
     }
 
     fn on_save_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1227,19 +1284,47 @@ impl AppView {
         self.switch_to_connection(&id, cx);
     }
 
+    /// Dispatches the dropdown connection-switch's validating connect off
+    /// the UI thread via `QueryRunner::test_connect` (Task 8 review issue
+    /// #1, same as `on_test_clicked`). Shows the existing "connecting…"
+    /// status synchronously, then flips to the connected/error status and
+    /// (only on success) switches `active_connection_id` once the result
+    /// comes back.
     fn switch_to_connection(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(cfg) = self.config.connections.iter().find(|c| c.id == id).cloned() else { return };
         let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
-        match pending_connect(&cfg, secret.as_deref(), &self.runner.handle()) {
-            Ok(msg) => {
-                self.status = msg;
-                self.active_connection_id = Some(cfg.id.clone());
-                self.conn_url = None;
-            }
-            Err(e) => self.status = format!("error: {e}"),
-        }
+        let engine_lbl = engine_label(cfg.engine);
+        let target_id = cfg.id.clone();
         self.dropdown_open = false;
-        cx.notify();
+
+        match test_connect_spec(cfg, secret) {
+            Err(msg) => {
+                self.status = format!("error: {msg}");
+                cx.notify();
+            }
+            Ok(spec) => {
+                self.status = "connecting…".into();
+                cx.notify();
+
+                let rx = self.runner.test_connect(spec);
+                cx.spawn(async move |this, cx| {
+                    let result = rx.await;
+                    let _ = this.update(cx, |view, cx| {
+                        match result {
+                            Ok(Ok(())) => {
+                                view.status = format!("Připojeno ({engine_lbl})");
+                                view.active_connection_id = Some(target_id);
+                                view.conn_url = None;
+                            }
+                            Ok(Err(e)) => view.status = format!("error: {e}"),
+                            Err(_) => view.status = "error: connect zrušen".into(),
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        }
     }
 
     fn resume_pending(&mut self, pending: PendingAfterUnlock, cx: &mut Context<Self>) {
@@ -1350,34 +1435,25 @@ fn generate_connection_id() -> String {
     format!("conn-{nanos:x}")
 }
 
-/// Validates a connection (Test button / dropdown connection switch) by
-/// actually opening it — tunnel included — and immediately dropping the
-/// result. This runs synchronously on the UI thread (via `runtime.block_on`
-/// inside `connect::open_config`): acceptable here because both call sites
-/// are explicit, deliberate user actions (click Test / pick a connection),
-/// unlike `on_run_query`'s connect, which Task 8 moved off the UI thread
-/// (see `runner::connect_and_run`) specifically because it fires on every
-/// query run. v1 has no persistent connection cache (see `AppView::conn_url`
-/// doc comment), so there is nothing to stash on success — `on_run_query`
-/// opens its own fresh connection per query regardless of what this
-/// validated.
+/// Builds the `ConnectSpec` for a Test/switch validation, short-circuiting
+/// the permanent MSSQL-unsupported case client-side (rather than letting it
+/// fall through to `open_config`'s own MSSQL rejection) so it doesn't need
+/// to bounce through the runner's async plumbing for a case with zero I/O.
+/// This is a permanent behaviour per the brief (the MSSQL driver is a
+/// separate roadmap item), not a placeholder this function is expected to
+/// eventually replace.
 ///
-/// The MSSQL case is called out explicitly (rather than just falling through
-/// to `open_config`'s own MSSQL rejection) because it's a permanent
-/// behaviour per the brief (the driver is a separate roadmap item), not a
-/// placeholder this function is expected to eventually replace.
-fn pending_connect(
-    cfg: &ConnectionConfig,
-    secret: Option<&str>,
-    runtime: &tokio::runtime::Handle,
-) -> Result<String, String> {
+/// Used by both `on_test_clicked` and `switch_to_connection` — Task 8's
+/// review found the synchronous `pending_connect` this replaces froze the
+/// whole window on an unreachable/firewalled host (no bound on the
+/// UI-thread `block_on` call); both call sites now dispatch the returned
+/// spec through `QueryRunner::test_connect`, which runs entirely off the UI
+/// thread and is bounded by `connect::open_config`'s `connect_timeout`.
+fn test_connect_spec(cfg: ConnectionConfig, secret: Option<String>) -> Result<ConnectSpec, String> {
     if cfg.engine == Engine::Mssql {
         return Err("MSSQL driver zatím není k dispozici".into());
     }
-    match connect::open_config(cfg, secret.map(|s| s.to_string()), runtime) {
-        Ok(_opened) => Ok(format!("Připojeno ({})", engine_label(cfg.engine))),
-        Err(e) => Err(e.to_string()),
-    }
+    Ok(ConnectSpec::Config { cfg: Box::new(cfg), secret })
 }
 
 fn field_row(label: &str, field: Entity<TextField>) -> impl IntoElement {
@@ -1429,10 +1505,18 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
 
 fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppView>) -> AnyElement {
     let title = if ui.editing_id.is_some() { "Připojení — úprava" } else { "Připojení — nové" };
-    let test_line = ui.test_result.clone().map(|r| match r {
-        Ok(msg) => (format!("✓ {msg}"), true),
-        Err(e) => (format!("✗ {e}"), false),
-    });
+    // While `testing`, the in-flight-status line takes priority over
+    // whatever the previous `test_result` was (a stale ✓/✗ from an earlier
+    // click shouldn't linger under a fresh "testuji…").
+    let test_line = if ui.testing {
+        Some(("testuji…".to_string(), None))
+    } else {
+        ui.test_result.clone().map(|r| match r {
+            Ok(msg) => (format!("✓ {msg}"), Some(true)),
+            Err(e) => (format!("✗ {e}"), Some(false)),
+        })
+    };
+    let testing = ui.testing;
 
     let mut panel: Div = div()
         .w(px(480.))
@@ -1496,10 +1580,15 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
     }
 
     if let Some((text, ok)) = test_line {
-        let color = if ok { rgb(0xa6e3a1) } else { rgb(0xf38ba8) };
+        let color = match ok {
+            Some(true) => rgb(0xa6e3a1),
+            Some(false) => rgb(0xf38ba8),
+            None => rgb(0xa6adc8),
+        };
         panel = panel.child(div().text_color(color).child(text));
     }
 
+    let test_label = if testing { "Testuji…" } else { "Test" };
     panel = panel.child(
         div()
             .flex()
@@ -1507,7 +1596,7 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("dlg-test", "Test").on_click(cx.listener(|v, _, _, cx| v.on_test_clicked(cx))))
+            .child(styled_button("dlg-test", test_label).on_click(cx.listener(|v, _, _, cx| v.on_test_clicked(cx))))
             .child(styled_button("dlg-save", "Uložit").on_click(cx.listener(|v, _, window, cx| v.on_save_clicked(window, cx))))
             .child(styled_button("dlg-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx)))),
     );

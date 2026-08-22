@@ -1,9 +1,19 @@
+use std::time::Duration;
+
 use dbc_core::{Connection, QueryError};
 use dbc_driver_postgres::PostgresConnection;
 use dbc_driver_sqlite::SqliteConnection;
 use dbc_state::{ConnectionConfig, Engine};
 
 use crate::tunnel::Tunnel;
+
+/// Fallback bound for `tokio_postgres::Config::connect_timeout` when a saved
+/// connection doesn't set `timeout_secs` (that field otherwise doubles as
+/// the query-side watchdog in `runner::connect_and_run`). Keeps the TCP
+/// handshake from hanging for the OS's own default timeout (tens of seconds
+/// to minutes on a black-holed/firewalled host) — see task-8-review.md
+/// issue #1.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
 
 /// Dispatch a connection string to the right driver.
 ///
@@ -65,6 +75,11 @@ pub struct OpenConnection {
 /// and up-to-10s poll loop, plus `runtime.block_on` for the Postgres
 /// handshake) and must be called from a context where blocking is legal —
 /// `spawn_blocking`, not a runtime worker thread. See `runner::connect_and_run`.
+/// The whole sequence is bounded end-to-end: the tunnel step (when present)
+/// caps out at 10s, and the Postgres handshake itself carries a
+/// `connect_timeout` (`cfg.timeout_secs`, or `DEFAULT_CONNECT_TIMEOUT_SECS`
+/// if unset) — an unreachable/firewalled host can no longer hang this
+/// function for the OS's own (much longer, platform-dependent) TCP timeout.
 ///
 /// SECURITY: `secret` (the connection password) is never logged here and
 /// never appears in an error message — Postgres/SQLite driver errors carry
@@ -101,7 +116,10 @@ pub fn open_config(
                 .host(&target_host)
                 .port(target_port)
                 .dbname(&cfg.database)
-                .user(&cfg.user);
+                .user(&cfg.user)
+                .connect_timeout(Duration::from_secs(
+                    cfg.timeout_secs.unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+                ));
             if let Some(pw) = &secret {
                 config.password(pw);
             }
