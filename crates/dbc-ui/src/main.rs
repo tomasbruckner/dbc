@@ -112,8 +112,11 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_run_query))
             .on_action(cx.listener(Self::on_cancel_query))
             .child(
+                // Fixed height of 8 lines (SqlInput's own line_height is
+                // px(20.), see sql_input.rs render()); the input scrolls
+                // internally once the buffer grows past that.
                 div()
-                    .h(px(36.))
+                    .h(px(20. * 8. + 4. * 2.))
                     .px_2()
                     .bg(rgb(0x181825))
                     .child(self.sql.clone()),
