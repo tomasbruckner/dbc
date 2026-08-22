@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 use dbc_buffer::ResultBuffer;
 use dbc_core::{apply_auto_limit, is_read_statement, quote_qualified, CancelToken, QueryError};
-use dbc_state::{AppConfig, HistoryDb, Vault};
+use dbc_state::{AppConfig, HistoryDb, HistoryEntry, Vault};
 use gpui::{
     actions, div, prelude::*, px, rgb, size, AnyElement, App, Bounds, ClipboardItem, Context,
     Entity, Focusable, KeyBinding, ScrollDelta, ScrollWheelEvent, Window, WindowBounds,
@@ -118,10 +118,22 @@ struct AppView {
     /// "not rendered at all when hidden" convention as `tree_visible`.
     history_visible: bool,
     /// Search box for the history panel (unmasked `TextField`, reused from
-    /// connections_ui.rs). Re-queried fresh on every render of the panel —
-    /// see history_panel.rs's module doc comment for why no separate
-    /// dirty-tracking is needed.
+    /// connections_ui.rs). Its text is polled (cheap string compare) at the
+    /// start of every `render_history_panel` call against
+    /// `last_history_query` to detect an edit — see history_panel.rs's
+    /// module doc comment for the full caching strategy.
     history_search: Entity<connections_ui::TextField>,
+    /// Cached result of the last `HistoryDb::search`, recomputed only by
+    /// `AppView::refresh_history_cache` (startup, after a recorded run, star
+    /// toggle, ToggleHistory-on, and search-text change detected in
+    /// `render_history_panel`) rather than on every render frame — same
+    /// precedent as `grouped_cache`. Post-review fix for Task 3 review
+    /// Issue 1 (unindexed full-table sort on every window repaint).
+    history_cache: Vec<HistoryEntry>,
+    /// The search text `history_cache` was last computed from, compared
+    /// against `history_search`'s live text each render to decide whether a
+    /// refresh is needed (see `history_search`'s doc comment).
+    last_history_query: String,
 }
 
 /// Stable identity for a `ConnectSpec`, used only to decide whether two
@@ -262,10 +274,14 @@ impl AppView {
         let mut rx = self.runner.connect_and_run(spec, sql, cancel, timeout_secs);
         cx.spawn(async move |this, cx| {
             let mut buffer: Option<Rc<RefCell<ResultBuffer>>> = None;
-            // Set once a buffer push fails; suppresses further batch
-            // processing for this run while the cancel we just fired
-            // propagates through the driver.
-            let mut errored = false;
+            // Set (to the buffer-push error text) once a buffer push fails;
+            // suppresses further batch processing for this run while the
+            // cancel we just fired propagates through the driver. The
+            // captured text is what actually gets recorded to history when
+            // the run's terminal event (`Finished` or `Failed` — the driver
+            // sends exactly one) eventually arrives — review Issue 2: a
+            // spill failure must still produce a history entry.
+            let mut errored: Option<String> = None;
             // This run's own tab id, set once `Started` opens it. `Batch`
             // events target this tab specifically (by id, not "the active
             // tab") — if the tab was closed mid-stream, the run cancels
@@ -304,7 +320,7 @@ impl AppView {
                                 view.status = format!("running…{limit_suffix}");
                             }
                             QueryEvent::Batch(b) => {
-                                if errored {
+                                if errored.is_some() {
                                     // Already failed and cancelled this run —
                                     // drop any further in-flight batches.
                                 } else if tab_id.is_some_and(|id| view.tabs.iter().all(|t| t.id != id)) {
@@ -319,8 +335,9 @@ impl AppView {
                                 } else if let Some(Err(e)) =
                                     buffer.as_ref().map(|buf| buf.borrow_mut().push(b))
                                 {
-                                    errored = true;
-                                    view.status = format!("error: {e}");
+                                    let err_text = e.to_string();
+                                    view.status = format!("error: {err_text}");
+                                    errored = Some(err_text);
                                     if let Some(token) = view.cancel.take() {
                                         token.cancel();
                                     }
@@ -331,43 +348,83 @@ impl AppView {
                                     view.status = format!("{rows} rows… {secs:.1}s{limit_suffix}");
                                 }
                             }
+                            // The driver sends exactly one terminal event
+                            // per run (`Finished` xor `Failed` —
+                            // `runner::stream_query`), so exactly one of
+                            // these two arms fires, and each records
+                            // history exactly once (review Issue 2): when a
+                            // buffer-push spill error already latched
+                            // (`errored`), record that as the failed entry
+                            // (its text is the real root cause; a queued
+                            // `Finished`'s fake success or `Failed`'s
+                            // redundant "cancelled" text would be wrong)
+                            // and leave the status bar alone — it already
+                            // shows the spill error from the `Batch` arm
+                            // above (bb2dd7c: never clobber it with a stale
+                            // status). Otherwise record the terminal
+                            // event's own outcome and update the status bar
+                            // as before.
                             QueryEvent::Finished { elapsed } => {
-                                // A queued Finished must not clobber a spill
-                                // error with a fake success status.
-                                if !errored {
-                                    let rows =
-                                        buffer.as_ref().map_or(0, |b| b.borrow().row_count());
-                                    view.status =
-                                        format!("{rows} rows in {elapsed:.2?}{limit_suffix}");
-                                    // G3 Task 3: record the run (previews
-                                    // included — they run real SQL too).
-                                    // Fire-and-forget; a write failure never
-                                    // surfaces here.
-                                    view.record_history(
-                                        &sql_for_title,
-                                        &history_conn_name,
-                                        history_started_at,
-                                        Some(elapsed.as_millis() as i64),
-                                        Some(rows as i64),
-                                        None,
-                                    );
+                                match &errored {
+                                    None => {
+                                        let rows =
+                                            buffer.as_ref().map_or(0, |b| b.borrow().row_count());
+                                        view.status =
+                                            format!("{rows} rows in {elapsed:.2?}{limit_suffix}");
+                                        // G3 Task 3: record the run (previews
+                                        // included — they run real SQL too).
+                                        // Fire-and-forget; a write failure never
+                                        // surfaces here.
+                                        view.record_history(
+                                            &sql_for_title,
+                                            &history_conn_name,
+                                            history_started_at,
+                                            Some(elapsed.as_millis() as i64),
+                                            Some(rows as i64),
+                                            None,
+                                            cx,
+                                        );
+                                    }
+                                    Some(err_text) => {
+                                        view.record_history(
+                                            &sql_for_title,
+                                            &history_conn_name,
+                                            history_started_at,
+                                            None,
+                                            None,
+                                            Some(err_text),
+                                            cx,
+                                        );
+                                    }
                                 }
                                 view.cancel = None;
                             }
                             QueryEvent::Failed(e) => {
-                                // Same guard: the push error is the root cause;
-                                // the driver's follow-up "cancelled" is noise.
-                                if !errored {
-                                    view.status = format!("error: {e}");
-                                    let err_text = e.to_string();
-                                    view.record_history(
-                                        &sql_for_title,
-                                        &history_conn_name,
-                                        history_started_at,
-                                        None,
-                                        None,
-                                        Some(&err_text),
-                                    );
+                                match &errored {
+                                    None => {
+                                        view.status = format!("error: {e}");
+                                        let err_text = e.to_string();
+                                        view.record_history(
+                                            &sql_for_title,
+                                            &history_conn_name,
+                                            history_started_at,
+                                            None,
+                                            None,
+                                            Some(&err_text),
+                                            cx,
+                                        );
+                                    }
+                                    Some(err_text) => {
+                                        view.record_history(
+                                            &sql_for_title,
+                                            &history_conn_name,
+                                            history_started_at,
+                                            None,
+                                            None,
+                                            Some(err_text),
+                                            cx,
+                                        );
+                                    }
                                 }
                                 view.cancel = None;
                             }
@@ -425,6 +482,13 @@ impl AppView {
 
     fn on_toggle_history(&mut self, _: &ToggleHistory, _window: &mut Window, cx: &mut Context<Self>) {
         self.history_visible = !self.history_visible;
+        if self.history_visible {
+            // The cache may be stale relative to runs recorded while the
+            // panel was hidden (record_history's own refresh still ran, but
+            // this is cheap insurance and matches the review's explicit
+            // "ToggleHistory-on" trigger list).
+            self.refresh_history_cache(cx);
+        }
         cx.notify();
     }
 
@@ -858,6 +922,8 @@ fn main() {
                             history,
                             history_visible: true,
                             history_search,
+                            history_cache: Vec::new(),
+                            last_history_query: String::new(),
                         }
                     })
                 },
@@ -873,6 +939,10 @@ fn main() {
             if let Some(spec) = view.active_conn_spec() {
                 view.trigger_schema_fetch(spec, cx);
             }
+            // G3 Task 3 review fix: populate `history_cache` once at
+            // startup (history panel defaults to visible) instead of
+            // leaving it empty until the first recorded run/search edit.
+            view.refresh_history_cache(cx);
         });
     });
 }

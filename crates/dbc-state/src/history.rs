@@ -61,7 +61,9 @@ impl HistoryDb {
                 row_count INTEGER,
                 error TEXT,
                 starred INTEGER NOT NULL DEFAULT 0
-            );",
+            );
+            CREATE INDEX IF NOT EXISTS idx_entries_star_time
+                ON entries(starred DESC, started_at DESC);",
         )?;
 
         // Detect FTS5 availability by attempting to create the external-content
@@ -296,5 +298,30 @@ mod tests {
         h.add("select bad", "demo", 1000, None, None, Some("syntax error")).unwrap();
         let r = h.search("", 10).unwrap();
         assert_eq!(r[0].error.as_deref(), Some("syntax error"));
+    }
+
+    /// Review Issue 1: the empty-search hot path sorts by
+    /// `(starred DESC, started_at DESC)` with no index, forcing a full-table
+    /// scan+sort on every call. `idx_entries_star_time` must exist after
+    /// `open`, both freshly and on a pre-existing DB opened again (the
+    /// `CREATE INDEX IF NOT EXISTS` migration must be idempotent).
+    #[test]
+    fn open_creates_the_star_time_index_and_reopen_is_idempotent() {
+        let (d, h) = db();
+        let has_index = |h: &HistoryDb| -> bool {
+            h.conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_entries_star_time'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(has_index(&h));
+        drop(h);
+        let h2 = HistoryDb::open(&d.path().join("h.sqlite")).unwrap();
+        assert!(has_index(&h2));
     }
 }

@@ -7,14 +7,28 @@
 //      `tabs::collapse_title` / `schema_tree::flatten`.
 //   2. `impl AppView` — recording (`record_history`, called from
 //      `run_query_with`'s `Finished`/`Failed` arms in main.rs) and the
-//      panel's render helper. There is deliberately no separate
-//      `Entity<HistoryPanel>`/event-emitter split here (unlike
-//      `SchemaTree`): the panel has no internal state beyond the search
-//      `TextField` it borrows from `AppView`, and `HistoryDb::search` is
-//      cheap enough (local sqlite, brief contract #3) to just re-run on
-//      every render — so "refresh after a recorded run / on search-text
-//      change / on panel open" all fall out for free from GPUI's normal
-//      re-render-on-notify flow, with no dirty-tracking needed.
+//      panel's render helper.
+//
+// Caching (post-review fix — Task 3 review Issue 1): `AppView::history_cache`
+// holds the last-fetched `Vec<HistoryEntry>`, mirroring the
+// `grouped_cache`/`refresh_grouped_cache` precedent in `main.rs` /
+// `connections_ui.rs` — a derived list recomputed only at the handful of
+// events that actually change what should be displayed, not on every GPUI
+// window repaint (`cx.notify()` anywhere in the window re-runs
+// `render_history_panel`, which includes every SQL-editor keystroke and
+// every streamed result batch — see the review for the full call-site
+// list). `refresh_history_cache` is called from: startup once `history` has
+// opened (`main`), `record_history` after a successful `add`, the star
+// toggle's click handler, and `on_toggle_history` when flipping to visible.
+//
+// The search `TextField` (`connections_ui::TextField`) has no on-change
+// hook to drive the refresh from directly — it's a plain get/set-text
+// buffer with no event emission, reused as-is from the connection dialog
+// rather than growing a new capability just for this. So search-text-change
+// is instead detected lazily, inside `render_history_panel` itself: a
+// stored `last_history_query` is compared against the field's current text
+// on every render (a `String` equality check — cheap, unlike the sqlite
+// query) and `refresh_history_cache` only runs when they differ.
 
 use dbc_state::HistoryEntry;
 use gpui::{div, prelude::*, px, rgb, AnyElement, Context, Focusable};
@@ -63,10 +77,13 @@ pub fn format_meta_line(entry: &HistoryEntry) -> (String, bool) {
 impl AppView {
     /// Fire-and-forget history record, called from `run_query_with`'s
     /// `Finished`/`Failed` arms (main.rs) after every recorded run,
-    /// including previews (brief contract #2). A missing/unopenable
-    /// `history` (startup open error — see `main`) or a write failure is
-    /// silently ignored: history is a convenience, never a reason to
-    /// disrupt the run pipeline.
+    /// including previews (brief contract #2), and — post-review — for a
+    /// spill-errored run too (see main.rs's `run_query_with`). A
+    /// missing/unopenable `history` (startup open error — see `main`) or a
+    /// write failure is silently ignored: history is a convenience, never a
+    /// reason to disrupt the run pipeline. Refreshes `history_cache` after a
+    /// successful `add` so the panel reflects the new entry without waiting
+    /// for the next search-text-change poll.
     pub(crate) fn record_history(
         &mut self,
         sql: &str,
@@ -75,10 +92,24 @@ impl AppView {
         duration_ms: Option<i64>,
         row_count: Option<i64>,
         error: Option<&str>,
+        cx: &mut Context<Self>,
     ) {
         if let Some(h) = self.history.as_mut() {
-            let _ = h.add(sql, connection, started_at, duration_ms, row_count, error);
+            if h.add(sql, connection, started_at, duration_ms, row_count, error).is_ok() {
+                self.refresh_history_cache(cx);
+            }
         }
+    }
+
+    /// Recomputes `history_cache` from the search box's current text — the
+    /// module doc comment above explains why this is a separate step rather
+    /// than querying inline in `render_history_panel` on every call. `None`
+    /// `history` (open failed at startup) yields an empty cache.
+    pub(crate) fn refresh_history_cache(&mut self, cx: &mut Context<Self>) {
+        let query = self.history_search.read(cx).text();
+        self.history_cache =
+            self.history.as_ref().and_then(|h| h.search(&query, 100).ok()).unwrap_or_default();
+        self.last_history_query = query;
     }
 
     /// Connection name to record with a run (brief contract #2): the active
@@ -95,17 +126,20 @@ impl AppView {
     }
 
     /// Header "Historie" + search field + newest/starred-first entry list,
-    /// re-querying `history.search` fresh every call — see the module doc
-    /// comment for why that's cheap enough to be the whole refresh
-    /// strategy. `None` `history` (open failed at startup) renders an empty
-    /// list rather than nothing, so the panel's layout doesn't jump around.
+    /// rendered from `history_cache` — see the module doc comment for the
+    /// caching strategy. The one thing this method still does per-call is
+    /// the cheap search-text-vs-`last_history_query` string compare that
+    /// detects a search edit and triggers the (not-cheap) cache refresh.
+    /// `None` `history` (open failed at startup) renders an empty list
+    /// rather than nothing, so the panel's layout doesn't jump around.
     pub(crate) fn render_history_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let query = self.history_search.read(cx).text();
-        let entries: Vec<HistoryEntry> =
-            self.history.as_ref().and_then(|h| h.search(&query, 100).ok()).unwrap_or_default();
+        let current_query = self.history_search.read(cx).text();
+        if current_query != self.last_history_query {
+            self.refresh_history_cache(cx);
+        }
 
         let mut list = div().id("history-list").flex().flex_col().flex_1().overflow_hidden();
-        for entry in &entries {
+        for entry in &self.history_cache {
             let id = entry.id;
             let sql_for_click = entry.sql.clone();
             let line1 = collapse_sql(&entry.sql, SQL_COLLAPSE_MAX_CHARS);
@@ -145,6 +179,11 @@ impl AppView {
                                 if let Some(h) = view.history.as_mut() {
                                     let _ = h.set_starred(id, !starred);
                                 }
+                                // Review Issue 1: the star order (starred
+                                // entries sort first) changed, so the cache
+                                // must be refreshed, not just the window
+                                // re-notified.
+                                view.refresh_history_cache(cx);
                                 cx.notify();
                             })),
                     )
