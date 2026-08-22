@@ -45,6 +45,12 @@ pub struct ResultTab {
     /// preview, "DDL: {name}" for a DDL view.
     pub title: String,
     pub pinned: bool,
+    /// (schema, table) identity for a data-preview tab opened via
+    /// `TreeEvent::OpenPreview` (G2 Task 7) — `None` for every other kind of
+    /// tab (a run from the SQL editor, a DDL text tab, ...). Lets
+    /// `close_by_preview_key` find and replace an existing preview for the
+    /// same table instead of stacking a duplicate (brief contract #1).
+    pub preview_key: Option<String>,
     pub content: TabContent,
 }
 
@@ -126,6 +132,17 @@ impl Tabs {
         }
     }
 
+    /// Closes the currently-open tab whose `preview_key` equals `key`, if
+    /// any (a no-op otherwise) — called by `AppView::run_query_with` right
+    /// before opening a fresh preview tab for the same (schema, table), so
+    /// re-previewing replaces rather than stacks (brief contract #1). Reuses
+    /// `close`'s active-index-repair logic rather than duplicating it.
+    pub fn close_by_preview_key(&mut self, key: &str) {
+        if let Some(id) = self.tabs.iter().find(|t| t.preview_key.as_deref() == Some(key)).map(|t| t.id) {
+            self.close(id);
+        }
+    }
+
     pub fn activate(&mut self, id: u64) {
         if let Some(ix) = self.tabs.iter().position(|t| t.id == id) {
             self.active = Some(ix);
@@ -162,7 +179,23 @@ mod tests {
     use super::*;
 
     fn text_tab(pinned: bool) -> ResultTab {
-        ResultTab { id: 0, title: "t".into(), pinned, content: TabContent::Text { text: String::new(), scroll_lines: 0 } }
+        ResultTab {
+            id: 0,
+            title: "t".into(),
+            pinned,
+            preview_key: None,
+            content: TabContent::Text { text: String::new(), scroll_lines: 0 },
+        }
+    }
+
+    fn preview_tab(key: &str) -> ResultTab {
+        ResultTab {
+            id: 0,
+            title: format!("Náhled: {key}"),
+            pinned: false,
+            preview_key: Some(key.to_string()),
+            content: TabContent::Text { text: String::new(), scroll_lines: 0 },
+        }
     }
 
     #[test]
@@ -269,5 +302,23 @@ mod tests {
         assert_eq!(tabs.active().map(|t| t.pinned), Some(true));
         tabs.toggle_pin(a);
         assert_eq!(tabs.active().map(|t| t.pinned), Some(false));
+    }
+
+    #[test]
+    fn close_by_preview_key_replaces_existing_preview_for_same_key() {
+        let mut tabs = Tabs::new();
+        let a = tabs.open(preview_tab("public.users"));
+        let b = tabs.open(text_tab(false));
+        tabs.close_by_preview_key("public.users");
+        assert!(tabs.iter().all(|t| t.id != a), "old preview tab should have been closed");
+        assert!(tabs.iter().any(|t| t.id == b));
+    }
+
+    #[test]
+    fn close_by_preview_key_is_noop_when_no_matching_tab_is_open() {
+        let mut tabs = Tabs::new();
+        let a = tabs.open(text_tab(false));
+        tabs.close_by_preview_key("nope");
+        assert!(tabs.iter().any(|t| t.id == a));
     }
 }

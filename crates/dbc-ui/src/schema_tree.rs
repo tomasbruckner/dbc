@@ -27,8 +27,8 @@
 use std::collections::{BTreeSet, HashSet};
 
 use dbc_core::{
-    ColumnInfo, RoutineInfo, RoutineKind, SchemaSnapshot, SequenceInfo, TableInfo, TableKind,
-    TriggerInfo,
+    synthesize_create_table, ColumnInfo, RoutineInfo, RoutineKind, SchemaSnapshot, SequenceInfo,
+    TableInfo, TableKind, TriggerInfo,
 };
 use gpui::{
     actions, div, prelude::*, px, rgb, uniform_list, App, ClickEvent, Context, EventEmitter,
@@ -611,6 +611,32 @@ impl SchemaTree {
             .and_then(|t| t.ddl.clone())
     }
 
+    /// The currently-selected table/view's `TableInfo`, if `selected` points
+    /// at one — used both to decide whether the header's "DDL" button is
+    /// enabled and, on click, to build the DDL it opens (`handle_generate_ddl`).
+    fn selected_table(&self) -> Option<&TableInfo> {
+        let NodeId::Table(schema, name) = self.selected.as_ref()? else { return None };
+        self.snapshot
+            .as_ref()?
+            .tables
+            .iter()
+            .find(|t| &t.name == name && &schema_key_string(&t.schema) == schema)
+    }
+
+    /// Task 7 "Generate DDL" affordance (brief contract #3): the tree
+    /// header's "DDL" button, enabled whenever a table/view is selected.
+    /// No DB round-trip — uses the table's own `ddl` if the driver captured
+    /// one (Postgres `pg_get_viewdef`/similar), else synthesizes a
+    /// `CREATE TABLE` from the snapshot's column/constraint metadata
+    /// (`dbc_core::ddl::synthesize_create_table`). Emits the same
+    /// `TreeEvent::OpenDdl` double-click on a routine/trigger already uses,
+    /// so `main.rs` needs no separate handling.
+    fn handle_generate_ddl(&mut self, cx: &mut Context<Self>) {
+        let Some(t) = self.selected_table() else { return };
+        let ddl = t.ddl.clone().unwrap_or_else(|| synthesize_create_table(t));
+        cx.emit(TreeEvent::OpenDdl { title: t.name.clone(), ddl });
+    }
+
     /// Contract #4: double-click table/view -> `OpenPreview`; double-click
     /// routine/trigger -> `OpenDdl` (fallback text when no `ddl`);
     /// otherwise toggle expand.
@@ -693,6 +719,11 @@ impl Render for SchemaTree {
 
         let header_label =
             if self.filter.is_empty() { "Strom schémat".to_string() } else { format!("Strom schémat [{}]", self.filter) };
+        // Task 7 contract #3: enabled only when the current selection is a
+        // table/view (`selected_table`, not merely `self.selected.is_some()`
+        // — e.g. a selected column or routine leaves it disabled).
+        let ddl_enabled = self.selected_table().is_some();
+        let ddl_color = if ddl_enabled { rgb(0xcdd6f4) } else { rgb(0x45475a) };
 
         let header = div()
             .h(px(28.))
@@ -706,13 +737,30 @@ impl Render for SchemaTree {
             .child(div().overflow_hidden().child(header_label))
             .child(
                 div()
-                    .id("tree-refresh")
-                    .cursor_pointer()
-                    .px_1()
-                    .child("⟳")
-                    .on_click(cx.listener(|_this, _: &ClickEvent, _window, cx| {
-                        cx.emit(TreeEvent::RefreshRequested);
-                    })),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(
+                        div()
+                            .id("tree-generate-ddl")
+                            .cursor_pointer()
+                            .px_1()
+                            .text_color(ddl_color)
+                            .child("DDL")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.handle_generate_ddl(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("tree-refresh")
+                            .cursor_pointer()
+                            .px_1()
+                            .child("⟳")
+                            .on_click(cx.listener(|_this, _: &ClickEvent, _window, cx| {
+                                cx.emit(TreeEvent::RefreshRequested);
+                            })),
+                    ),
             );
 
         let mut root = div()

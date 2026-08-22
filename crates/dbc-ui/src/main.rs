@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use dbc_buffer::ResultBuffer;
-use dbc_core::{apply_auto_limit, is_read_statement, CancelToken, QueryError};
+use dbc_core::{apply_auto_limit, is_read_statement, quote_qualified, CancelToken, QueryError};
 use dbc_state::{AppConfig, Vault};
 use gpui::{
     actions, div, prelude::*, px, rgb, size, AnyElement, App, Bounds, ClipboardItem, Context,
@@ -28,6 +28,27 @@ use sql_input::SqlInput;
 use tabs::{collapse_title, ResultTab, TabContent, Tabs};
 
 actions!(dbc, [RunQuery, RunQueryUnlimited, CancelQuery, ToggleTree]);
+
+/// G2 Task 7: SQL builder for `TreeEvent::OpenPreview`. Pure — no GPUI, no
+/// I/O — so quoting can be unit-tested directly. `quote_qualified` (shared
+/// with `synthesize_create_table`'s DDL quoting) is what makes this safe
+/// against a table literally named `we"ird`: the embedded quote is doubled,
+/// not smuggled into the query as SQL syntax.
+fn preview_sql(schema: Option<&str>, table: &str) -> String {
+    format!("SELECT * FROM {} LIMIT 1000", quote_qualified(schema, table))
+}
+
+/// Set by `TreeEvent::OpenPreview` and threaded through `run_query_with` so
+/// a preview runs through the exact same guarded pipeline as an
+/// editor-typed query, without ever touching `self.sql`'s text: `title`
+/// overrides the tab's title (`collapse_title(sql)` is used otherwise), and
+/// `key` is the tab's `preview_key` — matched by `Tabs::close_by_preview_key`
+/// so re-previewing the same (schema, table) replaces rather than stacks
+/// (brief contract #1).
+struct PreviewTarget {
+    title: String,
+    key: String,
+}
 
 struct AppView {
     tabs: Tabs,
@@ -120,14 +141,40 @@ impl AppView {
     /// connecting; (2) auto-limit — rewrites the SQL text, unless bypassed;
     /// (3) timeout — enforced inside `QueryRunner::connect_and_run`, since it
     /// must race the whole connect+query sequence, not just this call.
+    ///
+    /// Reads the SQL straight from the editor and delegates to
+    /// `run_query_with` — the editor-typed-query path, as opposed to a
+    /// preview's `run_query_with` call (see `on_tree_event`'s
+    /// `TreeEvent::OpenPreview` arm), which supplies its own SQL/title and
+    /// never touches `self.sql`.
     fn run_query(&mut self, bypass_auto_limit: bool, cx: &mut Context<Self>) {
+        let sql = self.sql.read(cx).text();
+        if sql.trim().is_empty() {
+            return;
+        }
+        self.run_query_with(sql, None, bypass_auto_limit, cx);
+    }
+
+    /// The actual guarded run pipeline (guard order per the doc comment on
+    /// `run_query`), shared by an editor-typed query (`run_query`, `preview
+    /// == None`) and a schema-tree preview (`TreeEvent::OpenPreview`,
+    /// `preview == Some(..)`). `sql` is whatever the caller wants executed —
+    /// for a preview this is `preview_sql`'s output, never the editor's
+    /// text. `bypass_auto_limit` is still the caller's choice (a preview
+    /// always passes `true` since it already carries its own `LIMIT`).
+    fn run_query_with(
+        &mut self,
+        sql: String,
+        preview: Option<PreviewTarget>,
+        bypass_auto_limit: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.modal.is_some() {
             return; // don't run queries under a modal
         }
         if self.cancel.is_some() {
             return; // one query at a time in v1
         }
-        let sql = self.sql.read(cx).text();
         if sql.trim().is_empty() {
             return;
         }
@@ -184,7 +231,8 @@ impl AppView {
 
         // Captured for the new tab's title (single-line-collapsed SQL, see
         // `tabs::collapse_title`) — the actual SQL text being run, i.e.
-        // post-auto-limit-rewrite.
+        // post-auto-limit-rewrite. Unused when `preview` overrides the title
+        // (still harmless to compute — the collapse is cheap).
         let sql_for_title = sql.clone();
         let mut rx = self.runner.connect_and_run(spec, sql, cancel, timeout_secs);
         cx.spawn(async move |this, cx| {
@@ -208,11 +256,23 @@ impl AppView {
                                 buffer = Some(buf.clone());
                                 let grid = cx.new(ResultGrid::new);
                                 grid.update(cx, |g, _| g.set_buffer(buf.clone()));
-                                let title = collapse_title(&sql_for_title);
+                                let title = preview
+                                    .as_ref()
+                                    .map(|p| p.title.clone())
+                                    .unwrap_or_else(|| collapse_title(&sql_for_title));
+                                // Brief contract #1: re-preview of the same
+                                // (schema, table) replaces its existing
+                                // preview tab rather than stacking a
+                                // duplicate — must happen before `open` so
+                                // the closed tab never overlaps the new one.
+                                if let Some(p) = &preview {
+                                    view.tabs.close_by_preview_key(&p.key);
+                                }
                                 let id = view.tabs.open(ResultTab {
                                     id: 0,
                                     title,
                                     pinned: false,
+                                    preview_key: preview.as_ref().map(|p| p.key.clone()),
                                     content: TabContent::Grid { grid, buffer: buf },
                                 });
                                 tab_id = Some(id);
@@ -387,22 +447,32 @@ impl AppView {
         .detach();
     }
 
-    /// `SchemaTree`'s `TreeEvent` subscription (wired in `main`).
-    /// `OpenPreview`/`OpenDdl` are stubbed here — Task 7 wires them to
-    /// actually open a preview/DDL tab; this task just needs the
-    /// subscription seam to exist and be exercised end-to-end.
+    /// `SchemaTree`'s `TreeEvent` subscription (wired in `main`). G2 Task 7:
+    /// `OpenPreview` builds the SQL via `preview_sql` and runs it through the
+    /// normal guarded pipeline (`run_query_with`, `bypass_auto_limit = true`
+    /// — the SQL already carries its own `LIMIT 1000`) without touching the
+    /// editor's text; `OpenDdl` (double-click on a routine/trigger, or the
+    /// tree header's "DDL" button via `SchemaTree::handle_generate_ddl`)
+    /// just opens a read-only `Text` tab — no DB round-trip either way.
     fn on_tree_event(&mut self, _emitter: Entity<SchemaTree>, event: &TreeEvent, cx: &mut Context<Self>) {
         match event {
             TreeEvent::OpenPreview { schema, table } => {
-                let qualified = match schema {
-                    Some(s) => format!("{s}.{table}"),
-                    None => table.clone(),
+                let sql = preview_sql(schema.as_deref(), table);
+                let preview = PreviewTarget {
+                    title: format!("Náhled: {table}"),
+                    key: format!("{}.{table}", schema.clone().unwrap_or_default()),
                 };
-                self.status = format!("Náhled {qualified} přijde v T7");
-                cx.notify();
+                self.run_query_with(sql, Some(preview), true, cx);
             }
             TreeEvent::OpenDdl { title, ddl } => {
-                self.status = format!("DDL {title} ({} znaků) přijde v T7", ddl.len());
+                self.tabs.open(ResultTab {
+                    id: 0,
+                    title: format!("DDL: {title}"),
+                    pinned: false,
+                    preview_key: None,
+                    content: TabContent::Text { text: ddl.clone(), scroll_lines: 0 },
+                });
+                self.status = format!("DDL otevřeno: {title}");
                 cx.notify();
             }
             TreeEvent::RefreshRequested => {
@@ -725,4 +795,31 @@ fn main() {
             }
         });
     });
+}
+
+#[cfg(test)]
+mod preview_sql_tests {
+    use super::*;
+
+    #[test]
+    fn quotes_schema_and_table_with_limit_1000() {
+        assert_eq!(preview_sql(Some("public"), "orders"), "SELECT * FROM \"public\".\"orders\" LIMIT 1000");
+    }
+
+    #[test]
+    fn omits_schema_qualifier_when_none() {
+        assert_eq!(preview_sql(None, "orders"), "SELECT * FROM \"orders\" LIMIT 1000");
+    }
+
+    /// Brief contract #4: a table literally named `we"ird` must not break
+    /// out of the query or inject anything — `quote_qualified` doubles the
+    /// embedded quote.
+    #[test]
+    fn survives_a_table_name_with_an_embedded_quote() {
+        assert_eq!(preview_sql(None, "we\"ird"), "SELECT * FROM \"we\"\"ird\" LIMIT 1000");
+        assert_eq!(
+            preview_sql(Some("we\"ird"), "t"),
+            "SELECT * FROM \"we\"\"ird\".\"t\" LIMIT 1000"
+        );
+    }
 }
