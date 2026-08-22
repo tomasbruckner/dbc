@@ -3,7 +3,7 @@
 Date: 2026-08-22
 Status: awaiting user review
 Scope: target ("fairly final") UI for the dbc client and its decomposition into
-phases G1–G12. Each phase gets its own implementation plan; G5+ get their own
+phases G1–G14. Each phase gets its own implementation plan; G5+ get their own
 design pass before implementation. This spec supersedes the UI portions of the
 phase 4/5 roadmap sketch in the 2026-08-21 spec; driver phases (MSSQL, DuckDB,
 MCP) are unchanged and orthogonal.
@@ -94,18 +94,20 @@ lands last) and pays the biggest pains first.
 
 | Phase | Contents | Notes |
 |---|---|---|
-| **G1 Editor & connections** | Multiline editor (plain); connection manager (form dialog, Credential Manager vault, top-bar switcher); connect off the UI thread | Kills the two worst pains from the first human test; includes the block_on-freeze follow-up |
-| **G2 Tabs & tree** | Result-tab infrastructure (buffer per tab); schema tree panel with speed search; double-click preview/DDL tabs; Ctrl+B; `SchemaSnapshot` in dbc-core grows from tables+columns to the full object model (views, functions, procedures, triggers, indexes, sequences, constraints, column defaults) with per-driver catalog queries | Also the natural home for the spill-off-UI-thread and byte-cap follow-ups (buffer work is touched anyway) |
+| **G1 Editor & connections** | Multiline editor (plain); connection manager (form dialog, Credential Manager vault, top-bar switcher); connect off the UI thread; per-connection options: SSH tunnel (host/user/key, app-managed), read-only flag (blocks every write path app-wide: sandbox Apply, admin, script runner), query timeout; auto-LIMIT guard (bare SELECT gets a configurable LIMIT, overridable per run) | Kills the two worst pains from the first human test; includes the block_on-freeze follow-up |
+| **G2 Tabs & tree** | Result-tab infrastructure (buffer per tab); schema tree panel with speed search; double-click preview/DDL tabs; Ctrl+B; `SchemaSnapshot` in dbc-core grows from tables+columns to the full object model (views, functions, procedures, triggers, indexes, sequences, constraints, column defaults) with per-driver catalog queries; "Generate DDL" on tables/views (CREATE statement into a read-only tab) | Also the natural home for the spill-off-UI-thread and byte-cap follow-ups (buffer work is touched anyway) |
 | **G3 History & palette** | Persistent history (SQLite), right panel, fulltext, pins, click-to-load; Ctrl+K palette | History and palette share data sources |
-| **G4 Grid+** | Local sort, column filters, cell detail popup, export CSV/TSV/JSON/INSERT; column visibility menu; FK joined columns | Mostly local additions over the buffer; FK joins need FK metadata from G2 and are the meaty half of this phase |
+| **G4 Grid+** | Local sort, column filters, cell detail popup, export CSV/TSV/JSON/INSERT; column visibility menu; FK joined columns; Ctrl+F search within the fetched result | Mostly local additions over the buffer; FK joins need FK metadata from G2 and are the meaty half of this phase |
 | **G5 Sandbox editing** | PK detection, local diff edits, Apply dialog with generated SQL, single transaction | First write path in the app; gets its own design pass before implementation |
-| **G6 Editor pro** | Tree-sitter highlighting; schema autocomplete | Most expensive single feature, functionally least urgent |
+| **G6 Editor pro** | Tree-sitter highlighting; schema autocomplete; parametrized queries (:name placeholders prompt a values dialog before run, last values remembered) | Most expensive single feature, functionally least urgent |
 | **G7 DB compare** | Schema diff between two saved connections (SchemaSnapshot-based); data diff via DuckDB over Arrow buffers | Future; own brainstorm when reached |
 | **G8 ER diagram** | FK-graph rendering of a schema in GPUI canvas; export image | Future; own brainstorm when reached |
-| **G9 Sessions monitor** | Active connections and running queries (pg_stat_activity / sp_who2), kill query/session | Read-mostly + one KILL action; may be pulled forward (after G4) since it is useful while debugging. Not applicable to SQLite |
+| **G9 Server monitor** | Dashboard opening as a special result tab, auto-refresh 5 s (pausable). Tiles: connections (active/idle/max), locks & waiting + today's deadlock count, DB size split data vs WAL/logs, cache hit + uptime + TPS. Sections: running queries (pid, user, application, client, state, duration colour-coded, query text, kill) sorted by duration; blocking chains as a who-waits-on-whom tree with wait times (click pid = query detail); per-table sizes (data + indexes + toast, row estimate, size bar). Postgres via pg_stat_activity/pg_locks/pg_stat_database/pg_total_relation_size; MSSQL via sys.dm_exec_requests, sys.dm_tran_locks, sp_spaceused equivalents; SQLite has no monitor tab. Read-only except kill | Mockup approved 2026-08-22; may be pulled forward (after G4) since it is useful while debugging |
 | **G10 Server admin** | Users and roles (create, password, membership), privileges matrix (GRANT/REVOKE), database/schema DDL with sizes | Pure DDL write paths — lands after G5 establishes the "show SQL → confirm → transaction" pattern; heavily engine-specific (pg roles vs MSSQL logins; SQLite exempt); privileges matrix gets its own design pass |
 | **G11 Backup & restore** | Whole-DB export and restore per engine: Postgres via pg_dump/pg_restore (external binaries orchestrated by the app, streamed progress, format/compression options), MSSQL via BACKUP/RESTORE DATABASE (server-side, writes to the server's disk — path picker must reflect that), SQLite via file copy/VACUUM INTO | Two fundamentally different mechanics behind one UI; requires detecting client tools on the machine; own design pass when reached |
-| **G12 Script runner** | Run an external .sql file (streamed statement-by-statement, never loaded into the editor) or a whole folder (files in name order, per-file progress) against a chosen connection; requires a statement splitter (also unlocks multi-statement SQL in the editor); error policy (stop/continue), transaction scope and progress UI get their own design pass | Future; own brainstorm when reached |
+| **G12 Script runner** | Run an external .sql file (streamed statement-by-statement, never loaded into the editor) or a whole folder (files in name order, per-file progress) against a chosen connection; requires a statement splitter (also unlocks multi-statement SQL in the editor); error policy (stop/continue), transaction scope and progress UI get their own design pass; CSV import into a table (column mapping, batched INSERTs, respects read-only flag) | Future; own brainstorm when reached |
+| **G13 Execution plans** | "Explain" action next to Run: estimated plan and REAL plan (EXPLAIN ANALYZE / MSSQL actual execution plan) rendered as a tree visualization — per node: operation, cost, estimated vs actual rows, timing, buffers; hot nodes highlighted; engine-provided hints (e.g. missing index) surfaced; raw plan text available | Future; own brainstorm when reached |
+| **G14 Polish & extras** | Theme system with light/dark toggle; charts from a result tab (bar/line over selected columns) | Future; lowest priority by agreement |
 
 Orthogonal, unscheduled here: MSSQL driver (odbc-api), DuckDB driver, MCP
 server (original phases 3/6 — unchanged).
@@ -124,5 +126,5 @@ server (original phases 3/6 — unchanged).
 ## 4. Out of scope of this spec
 
 Detailed design of G5 (SQL generation rules, conflict handling), G6
-(autocomplete engine), and G7–G12 — each gets its own brainstorm + spec when
+(autocomplete engine), and G7–G14 — each gets its own brainstorm + spec when
 its turn comes. This spec fixes the target UX and the phase boundaries.
