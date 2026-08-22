@@ -73,6 +73,30 @@ struct AppView {
     /// means the panel isn't rendered at all (0 px), not just visually
     /// hidden.
     tree_visible: bool,
+    /// Bumped on every `trigger_schema_fetch` dispatch; a fetch result only
+    /// applies if the generation still matches (last-dispatched wins — same
+    /// pattern as `switch_generation`). Fixes review Issue 1: without this,
+    /// a slow fetch for a connection the user has since switched away from
+    /// can resolve after a faster fetch for the new connection and silently
+    /// overwrite the tree with the wrong connection's schema.
+    schema_fetch_generation: u64,
+    /// Identity (see `conn_spec_key`) of the connection whose schema is
+    /// currently being fetched/shown in `tree`, so `trigger_schema_fetch`
+    /// can tell `SchemaTree::set_snapshot` whether an incoming snapshot is a
+    /// same-connection refresh (preserve expand/filter/selection) or a
+    /// switch to a different connection (reset them) — review Issue 3.
+    schema_tree_connection_key: Option<String>,
+}
+
+/// Stable identity for a `ConnectSpec`, used only to decide whether two
+/// `trigger_schema_fetch` dispatches target the "same connection" (see
+/// `schema_tree_connection_key`) — not used for anything security-sensitive,
+/// so the secret on `ConnectSpec::Config` is deliberately not part of it.
+fn conn_spec_key(spec: &ConnectSpec) -> String {
+    match spec {
+        ConnectSpec::Config { cfg, .. } => format!("cfg:{}", cfg.id),
+        ConnectSpec::Url(u) => format!("url:{u}"),
+    }
 }
 
 impl AppView {
@@ -315,14 +339,31 @@ impl AppView {
     /// `run_query`/`switch_to_connection`. Called from the
     /// `switch_to_connection` success arm, `TreeEvent::RefreshRequested`,
     /// and once at CLI-arg startup (see `main`).
+    ///
+    /// Guarded by `schema_fetch_generation` (review Issue 1, mirroring
+    /// `switch_generation`): every dispatch bumps the counter and captures
+    /// it, and the `cx.spawn` completion drops its result if the generation
+    /// has since moved on — so a slow fetch for a connection the user has
+    /// already switched away from can never overwrite a newer one
+    /// (last-dispatched wins, not last-resolved).
     fn trigger_schema_fetch(&mut self, spec: ConnectSpec, cx: &mut Context<Self>) {
         self.tree.update(cx, |t, cx| t.set_loading(cx));
+        let key = conn_spec_key(&spec);
+        let same_connection = self.schema_tree_connection_key.as_deref() == Some(key.as_str());
+        self.schema_tree_connection_key = Some(key);
+        self.schema_fetch_generation += 1;
+        let my_generation = self.schema_fetch_generation;
         let rx = self.runner.fetch_schema(spec);
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |view, cx| {
+                // A newer fetch was dispatched meanwhile — this result is
+                // stale, drop it (last-dispatched wins).
+                if view.schema_fetch_generation != my_generation {
+                    return;
+                }
                 view.tree.update(cx, |t, cx| match result {
-                    Ok(Ok(snapshot)) => t.set_snapshot(snapshot, cx),
+                    Ok(Ok(snapshot)) => t.set_snapshot(snapshot, same_connection, cx),
                     Ok(Err(e)) => t.set_error(e.to_string(), cx),
                     Err(_) => t.set_error("fetch zrušen".to_string(), cx),
                 });
@@ -353,6 +394,7 @@ impl AppView {
                 if let Some(spec) = self.active_conn_spec() {
                     self.trigger_schema_fetch(spec, cx);
                 } else {
+                    self.schema_tree_connection_key = None;
                     self.tree.update(cx, |t, cx| t.clear(cx));
                 }
             }
@@ -626,7 +668,8 @@ fn main() {
                             }
                             None => "ready".into(),
                         };
-                        let tree = cx.new(SchemaTree::new);
+                        let editor_focus = sql.focus_handle(cx);
+                        let tree = cx.new(|cx| SchemaTree::new(cx, editor_focus));
                         cx.subscribe(&tree, AppView::on_tree_event).detach();
                         AppView {
                             tabs: Tabs::new(),
@@ -648,6 +691,8 @@ fn main() {
                             grouped_cache,
                             tree,
                             tree_visible: true,
+                            schema_fetch_generation: 0,
+                            schema_tree_connection_key: None,
                         }
                     })
                 },

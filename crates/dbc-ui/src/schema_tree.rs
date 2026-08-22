@@ -394,22 +394,107 @@ pub fn flatten(snapshot: &SchemaSnapshot, expanded: &HashSet<NodeId>, filter: &s
     out
 }
 
+/// Pure, GPUI-free: every `NodeId` that could possibly appear for
+/// `snapshot`, regardless of `expanded`/`filter` (unlike `flatten`, which
+/// only returns the currently-VISIBLE rows). Used by `prune_stale_ids` to
+/// tell which previously-expanded/selected ids still refer to something
+/// real after a same-connection refresh replaces `snapshot` wholesale.
+fn all_node_ids(snapshot: &SchemaSnapshot) -> HashSet<NodeId> {
+    let mut out = HashSet::new();
+
+    let mut schema_key_set: BTreeSet<Option<String>> = BTreeSet::new();
+    for t in &snapshot.tables {
+        schema_key_set.insert(t.schema.clone());
+    }
+    for r in &snapshot.routines {
+        schema_key_set.insert(r.schema.clone());
+    }
+    for tr in &snapshot.triggers {
+        schema_key_set.insert(tr.schema.clone());
+    }
+    for s in &snapshot.sequences {
+        schema_key_set.insert(s.schema.clone());
+    }
+    let schema_keys: Vec<Option<String>> = schema_key_set.into_iter().collect();
+    let single_implicit = schema_keys.iter().all(|k| k.is_none());
+
+    for key in &schema_keys {
+        let schema_name = schema_key_string(key);
+        if !single_implicit {
+            out.insert(NodeId::Schema(schema_name.clone()));
+        }
+
+        for t in snapshot.tables.iter().filter(|t| &t.schema == key) {
+            let section_label = match t.kind {
+                TableKind::Table => "Tabulky",
+                TableKind::View | TableKind::MaterializedView => "Pohledy",
+            };
+            out.insert(NodeId::Section(schema_name.clone(), section_label));
+            out.insert(NodeId::Table(schema_name.clone(), t.name.clone()));
+            for c in &t.columns {
+                out.insert(NodeId::Column(schema_name.clone(), t.name.clone(), c.name.clone()));
+            }
+            if !t.indexes.is_empty() {
+                out.insert(NodeId::Section(schema_name.clone(), "Indexy"));
+            }
+            for idx in &t.indexes {
+                out.insert(NodeId::Index(schema_name.clone(), t.name.clone(), idx.name.clone()));
+            }
+        }
+        for r in snapshot.routines.iter().filter(|r| &r.schema == key) {
+            let section_label = match r.kind {
+                RoutineKind::Function => "Funkce",
+                RoutineKind::Procedure => "Procedury",
+            };
+            out.insert(NodeId::Section(schema_name.clone(), section_label));
+            out.insert(NodeId::Routine(schema_name.clone(), r.name.clone()));
+        }
+        for tr in snapshot.triggers.iter().filter(|tr| &tr.schema == key) {
+            out.insert(NodeId::Section(schema_name.clone(), "Triggery"));
+            out.insert(NodeId::Trigger(schema_name.clone(), tr.name.clone()));
+        }
+        for s in snapshot.sequences.iter().filter(|s| &s.schema == key) {
+            out.insert(NodeId::Section(schema_name.clone(), "Sekvence"));
+            out.insert(NodeId::Sequence(schema_name.clone(), s.name.clone()));
+        }
+    }
+    out
+}
+
+/// Pure, GPUI-free: computes the `expanded`/`selected` state to carry
+/// forward into a same-connection refresh, dropping any id that no longer
+/// exists in `new_snapshot` (e.g. a table dropped since the last fetch).
+/// Extracted out of `SchemaTree::set_snapshot` specifically so it's
+/// unit-testable without a GPUI `Context`.
+fn prune_stale_ids(
+    expanded: &HashSet<NodeId>,
+    selected: &Option<NodeId>,
+    new_snapshot: &SchemaSnapshot,
+) -> (HashSet<NodeId>, Option<NodeId>) {
+    let valid = all_node_ids(new_snapshot);
+    let expanded = expanded.iter().filter(|id| valid.contains(*id)).cloned().collect();
+    let selected = selected.clone().filter(|id| valid.contains(id));
+    (expanded, selected)
+}
+
 // ---------------------------------------------------------------------
 // GPUI entity.
 // ---------------------------------------------------------------------
 
 actions!(schema_tree, [TreeEscape]);
 
-/// Binds the tree's own "escape clears the filter, but only while there IS
-/// a filter" action, scoped to context "SchemaTree" so it takes priority
-/// over the app-level unscoped `escape` -> `CancelQuery` binding (GPUI
-/// prefers a context-scoped binding over an unscoped one when both match —
-/// same precedent as `TextField`'s scoped `backspace` in connections_ui.rs
-/// winning over `SqlInput`'s unscoped one). `on_tree_escape` calls
-/// `cx.propagate()` when the filter was already empty, so the event falls
-/// through to the app-level binding and Esc still cancels a running query /
-/// closes the dropdown as normal while the tree has focus but no active
-/// filter.
+/// Binds the tree's own "escape clears the filter, then blurs to the
+/// editor" action, scoped to context "SchemaTree" so it takes priority over
+/// the app-level unscoped `escape` -> `CancelQuery` binding (GPUI prefers a
+/// context-scoped binding over an unscoped one when both match — same
+/// precedent as `TextField`'s scoped `backspace` in connections_ui.rs
+/// winning over `SqlInput`'s unscoped one). Esc semantics (brief contract
+/// #5, "Esc clears filter first, then collapses focus"): filter non-empty
+/// -> clear it; filter already empty -> blur the tree to the SQL editor
+/// (`on_tree_escape`). Once focus has moved off the tree, `SchemaTree`'s
+/// scoped binding no longer applies, so a further Esc hits the app-level
+/// unscoped `CancelQuery` binding directly and cancels a running query as
+/// normal.
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("escape", TreeEscape, Some("SchemaTree"))]);
 }
@@ -422,10 +507,16 @@ pub struct SchemaTree {
     loading: bool,
     error: Option<String>,
     focus_handle: FocusHandle,
+    /// The SQL editor's focus handle, handed in by `main.rs` at construction
+    /// (it owns both entities) so `on_tree_escape` can blur the tree back to
+    /// the editor directly, without needing a `TreeEvent` round-trip through
+    /// `AppView` (which doesn't have `Window` access in its `cx.subscribe`
+    /// callback) — see `on_tree_escape`.
+    editor_focus: FocusHandle,
 }
 
 impl SchemaTree {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>, editor_focus: FocusHandle) -> Self {
         Self {
             snapshot: None,
             expanded: HashSet::new(),
@@ -434,6 +525,7 @@ impl SchemaTree {
             loading: false,
             error: None,
             focus_handle: cx.focus_handle(),
+            editor_focus,
         }
     }
 
@@ -446,17 +538,33 @@ impl SchemaTree {
         cx.notify();
     }
 
-    /// A fresh snapshot resets expand/filter/selection state — it may
-    /// describe a different connection/database than whatever was
-    /// previously shown, so stale node ids (and a stale filter hiding
-    /// everything) would be actively misleading.
-    pub fn set_snapshot(&mut self, snapshot: SchemaSnapshot, cx: &mut Context<Self>) {
+    /// `same_connection` (passed by the caller, `AppView::trigger_schema_fetch`,
+    /// which knows whether this snapshot is a refresh of the connection
+    /// already shown or a switch to a different one — see
+    /// `conn_spec_key`/`schema_tree_connection_key` in `main.rs`) decides
+    /// what happens to `expanded`/`filter`/`selected`:
+    ///
+    /// - Same connection (e.g. a ⟳ refresh): preserved. `NodeId`'s
+    ///   path-based stability (see the module doc comment) means ids for
+    ///   unchanged objects come back identical, so `prune_stale_ids` only
+    ///   needs to drop the ones that no longer exist (a table/column that
+    ///   was dropped since the last fetch) rather than resetting everything.
+    /// - Different connection: reset entirely, since the new snapshot may
+    ///   describe a completely different database — stale node ids (and a
+    ///   stale filter hiding everything) would be actively misleading.
+    pub fn set_snapshot(&mut self, snapshot: SchemaSnapshot, same_connection: bool, cx: &mut Context<Self>) {
+        if same_connection {
+            let (expanded, selected) = prune_stale_ids(&self.expanded, &self.selected, &snapshot);
+            self.expanded = expanded;
+            self.selected = selected;
+        } else {
+            self.expanded.clear();
+            self.filter.clear();
+            self.selected = None;
+        }
         self.snapshot = Some(snapshot);
         self.loading = false;
         self.error = None;
-        self.expanded.clear();
-        self.filter.clear();
-        self.selected = None;
         cx.notify();
     }
 
@@ -526,15 +634,20 @@ impl SchemaTree {
         cx.notify();
     }
 
-    /// Esc: clears an active filter and consumes the keystroke (default
-    /// action behaviour already stops propagation); with an empty filter,
-    /// propagates so the app-level Esc -> CancelQuery binding still runs.
-    fn on_tree_escape(&mut self, _: &TreeEscape, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Esc: clears an active filter and consumes the keystroke; with an
+    /// empty filter, blurs the tree by moving focus to the SQL editor
+    /// (`editor_focus`, handed in by `main.rs` at construction — see the
+    /// struct doc comment) instead of propagating. This matches the brief's
+    /// "clears filter first, then collapses focus" contract; a further Esc
+    /// after the blur reaches the app-level `CancelQuery` binding normally
+    /// since the tree (and its scoped binding) no longer has focus.
+    fn on_tree_escape(&mut self, _: &TreeEscape, window: &mut Window, cx: &mut Context<Self>) {
         if !self.filter.is_empty() {
             self.filter.clear();
             cx.notify();
         } else {
-            cx.propagate();
+            window.focus(&self.editor_focus, cx);
+            cx.notify();
         }
     }
 
@@ -899,5 +1012,81 @@ mod flatten_tests {
     fn empty_snapshot_flattens_to_no_rows() {
         let snap = SchemaSnapshot::default();
         assert!(flatten(&snap, &HashSet::new(), "").is_empty());
+    }
+
+    // --- review Issue 3: same-connection refresh state preservation ---
+
+    #[test]
+    fn all_node_ids_covers_every_kind_including_indexes_and_multi_schema() {
+        let mut t = table(Some("public"), "users", TableKind::Table, vec![col("id", "INTEGER")]);
+        t.indexes.push(IndexInfo { name: "users_pkey".into(), columns: vec!["id".into()], unique: true });
+        let snap = SchemaSnapshot {
+            tables: vec![t],
+            routines: vec![routine(Some("public"), "f1", RoutineKind::Function)],
+            triggers: vec![trigger(Some("public"), "trg1", "users")],
+            sequences: vec![sequence(Some("public"), "seq1")],
+        };
+        let ids = all_node_ids(&snap);
+        assert!(ids.contains(&NodeId::Schema("public".into())));
+        assert!(ids.contains(&NodeId::Section("public".into(), "Tabulky")));
+        assert!(ids.contains(&NodeId::Table("public".into(), "users".into())));
+        assert!(ids.contains(&NodeId::Column("public".into(), "users".into(), "id".into())));
+        assert!(ids.contains(&NodeId::Section("public".into(), "Indexy")));
+        assert!(ids.contains(&NodeId::Index("public".into(), "users".into(), "users_pkey".into())));
+        assert!(ids.contains(&NodeId::Section("public".into(), "Funkce")));
+        assert!(ids.contains(&NodeId::Routine("public".into(), "f1".into())));
+        assert!(ids.contains(&NodeId::Section("public".into(), "Triggery")));
+        assert!(ids.contains(&NodeId::Trigger("public".into(), "trg1".into())));
+        assert!(ids.contains(&NodeId::Section("public".into(), "Sekvence")));
+        assert!(ids.contains(&NodeId::Sequence("public".into(), "seq1".into())));
+    }
+
+    #[test]
+    fn all_node_ids_omits_schema_node_for_single_implicit_level() {
+        let snap = SchemaSnapshot { tables: vec![table(None, "users", TableKind::Table, vec![])], ..Default::default() };
+        let ids = all_node_ids(&snap);
+        assert!(!ids.iter().any(|id| matches!(id, NodeId::Schema(_))));
+    }
+
+    #[test]
+    fn prune_stale_ids_keeps_valid_and_drops_missing_expanded_and_selected() {
+        let mut expanded = HashSet::new();
+        expanded.insert(NodeId::Section("".into(), "Tabulky"));
+        expanded.insert(NodeId::Table("".into(), "users".into()));
+        expanded.insert(NodeId::Table("".into(), "products".into()));
+        let selected = Some(NodeId::Table("".into(), "products".into()));
+
+        // Refreshed snapshot: "products" table is gone (dropped since the
+        // last fetch), "users" survives (with an extra column, which
+        // doesn't matter for pruning purposes).
+        let new_snap = SchemaSnapshot {
+            tables: vec![table(None, "users", TableKind::Table, vec![col("id", "INTEGER"), col("email", "TEXT")])],
+            ..Default::default()
+        };
+
+        let (pruned_expanded, pruned_selected) = prune_stale_ids(&expanded, &selected, &new_snap);
+        assert!(pruned_expanded.contains(&NodeId::Section("".into(), "Tabulky")));
+        assert!(pruned_expanded.contains(&NodeId::Table("".into(), "users".into())));
+        assert!(!pruned_expanded.contains(&NodeId::Table("".into(), "products".into())));
+        assert_eq!(pruned_expanded.len(), 2);
+        // The selected node ("products") no longer exists in the new
+        // snapshot, so it's cleared rather than pointing at a dead id.
+        assert_eq!(pruned_selected, None);
+    }
+
+    #[test]
+    fn prune_stale_ids_keeps_selected_and_expanded_when_still_present() {
+        let snap = SchemaSnapshot {
+            tables: vec![table(None, "users", TableKind::Table, vec![col("id", "INTEGER")])],
+            ..Default::default()
+        };
+        let mut expanded = HashSet::new();
+        expanded.insert(NodeId::Section("".into(), "Tabulky"));
+        expanded.insert(NodeId::Table("".into(), "users".into()));
+        let selected = Some(NodeId::Table("".into(), "users".into()));
+
+        let (pruned_expanded, pruned_selected) = prune_stale_ids(&expanded, &selected, &snap);
+        assert_eq!(pruned_expanded, expanded);
+        assert_eq!(pruned_selected, selected);
     }
 }
