@@ -349,8 +349,6 @@ impl AppView {
     fn trigger_schema_fetch(&mut self, spec: ConnectSpec, cx: &mut Context<Self>) {
         self.tree.update(cx, |t, cx| t.set_loading(cx));
         let key = conn_spec_key(&spec);
-        let same_connection = self.schema_tree_connection_key.as_deref() == Some(key.as_str());
-        self.schema_tree_connection_key = Some(key);
         self.schema_fetch_generation += 1;
         let my_generation = self.schema_fetch_generation;
         let rx = self.runner.fetch_schema(spec);
@@ -362,11 +360,28 @@ impl AppView {
                 if view.schema_fetch_generation != my_generation {
                     return;
                 }
-                view.tree.update(cx, |t, cx| match result {
-                    Ok(Ok(snapshot)) => t.set_snapshot(snapshot, same_connection, cx),
-                    Ok(Err(e)) => t.set_error(e.to_string(), cx),
-                    Err(_) => t.set_error("fetch zrušen".to_string(), cx),
-                });
+                // `same_connection` is decided at APPLY time against the key
+                // of the snapshot actually shown in the tree — deciding it at
+                // dispatch time let a superseded switch-fetch leave the key
+                // pointing at the new target before any reset ever applied,
+                // so a same-target refresh would "preserve" the previous
+                // connection's expand/filter state (re-review residual race).
+                match result {
+                    Ok(Ok(snapshot)) => {
+                        let same_connection =
+                            view.schema_tree_connection_key.as_deref() == Some(key.as_str());
+                        view.schema_tree_connection_key = Some(key.clone());
+                        view.tree
+                            .update(cx, |t, cx| t.set_snapshot(snapshot, same_connection, cx));
+                    }
+                    Ok(Err(e)) => {
+                        view.tree.update(cx, |t, cx| t.set_error(e.to_string(), cx));
+                    }
+                    Err(_) => {
+                        view.tree
+                            .update(cx, |t, cx| t.set_error("fetch zrušen".to_string(), cx));
+                    }
+                }
             });
         })
         .detach();
