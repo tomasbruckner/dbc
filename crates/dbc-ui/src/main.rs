@@ -546,8 +546,17 @@ impl AppView {
                         let same_connection =
                             view.schema_tree_connection_key.as_deref() == Some(key.as_str());
                         view.schema_tree_connection_key = Some(key.clone());
-                        view.tree
-                            .update(cx, |t, cx| t.set_snapshot(snapshot, same_connection, cx));
+                        // G3 Task 4: (re-)apply the favourite set alongside
+                        // every snapshot — a fresh connection switch needs it
+                        // for its "Oblíbené" section to show anything at all,
+                        // and a same-connection refresh needs it re-applied
+                        // too since `set_snapshot` doesn't touch it.
+                        let favourites = view.config.favourite_objects.clone();
+                        let active_id = view.active_connection_id.clone();
+                        view.tree.update(cx, |t, cx| {
+                            t.set_snapshot(snapshot, same_connection, cx);
+                            t.set_favourites(favourites, active_id, cx);
+                        });
                     }
                     Ok(Err(e)) => {
                         view.tree.update(cx, |t, cx| t.set_error(e.to_string(), cx));
@@ -597,6 +606,25 @@ impl AppView {
                     self.schema_tree_connection_key = None;
                     self.tree.update(cx, |t, cx| t.clear(cx));
                 }
+            }
+            // G3 Task 4: a row's ★/☆ toggle (a table/view/routine/trigger/
+            // sequence in the schema tree proper, or an item already listed
+            // under the "Oblíbené" section) — mirrors
+            // `connections_ui::AppView::toggle_connection_favourite`'s
+            // guarded-save shape for the dropdown's connection stars.
+            TreeEvent::ToggleFavourite(fav) => {
+                if !self.guard_corrupt_config(cx) {
+                    return;
+                }
+                self.config.toggle_favourite(fav.clone());
+                self.status = match self.config.save(&self.config_path) {
+                    Ok(()) => "Uloženo".to_string(),
+                    Err(e) => format!("error saving config: {}", e.message),
+                };
+                let favourites = self.config.favourite_objects.clone();
+                let active_id = self.active_connection_id.clone();
+                self.tree.update(cx, |t, cx| t.set_favourites(favourites, active_id, cx));
+                cx.notify();
             }
         }
     }

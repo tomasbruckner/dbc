@@ -30,6 +30,7 @@ use dbc_core::{
     synthesize_create_table, ColumnInfo, RoutineInfo, RoutineKind, SchemaSnapshot, SequenceInfo,
     TableInfo, TableKind, TriggerInfo,
 };
+use dbc_state::FavouriteObject;
 use gpui::{
     actions, div, prelude::*, px, rgb, uniform_list, App, ClickEvent, Context, EventEmitter,
     FocusHandle, Focusable, KeyBinding, KeyDownEvent, MouseButton, Window,
@@ -62,6 +63,14 @@ pub enum NodeId {
     Sequence(String, String),
     /// (schema, table, index)
     Index(String, String, String),
+    /// The top "Oblíbené" section header (G3 Task 4) — a single, unparameterized
+    /// variant since there's only ever one such section, always rendered at
+    /// depth 0, before any `Schema`/`Section` node.
+    FavouriteSection,
+    /// (kind, schema key string ("" = no schema), name) — one row under
+    /// `FavouriteSection`. `kind` mirrors `FavouriteObject::kind`
+    /// ("table"|"view"|"routine"|"trigger"|"sequence").
+    Favourite(String, String, String),
 }
 
 /// Emitted by `SchemaTree` (`EventEmitter<TreeEvent>`) for the things it
@@ -70,6 +79,11 @@ pub enum TreeEvent {
     OpenPreview { schema: Option<String>, table: String },
     OpenDdl { title: String, ddl: String },
     RefreshRequested,
+    /// G3 Task 4: the row's ★/☆ toggle was clicked (either a table/view/
+    /// routine/trigger/sequence row, or an item already listed under
+    /// `FavouriteSection`) — `main.rs` applies `config.toggle_favourite` +
+    /// a guarded save, then pushes the updated set back via `set_favourites`.
+    ToggleFavourite(FavouriteObject),
 }
 
 /// One visible row: `(id, depth, label, is_expandable)`.
@@ -296,6 +310,42 @@ fn emit_sequence_section(
     }
 }
 
+/// Emits the top "Oblíbené" section (G3 Task 4 brief contract): before any
+/// schema/section, listing favourited objects of the ACTIVE connection only
+/// (cross-schema — `favourites` is `AppConfig::favourite_objects` unfiltered
+/// by kind or schema, just by `connection_id`), labeled `"{schema}.{name}"`
+/// when the favourite has a schema, else just `"{name}"`. Hidden entirely
+/// (no header, no rows) when there are none — either because
+/// `active_connection_id` is `None` (no active connection / CLI-arg URL path
+/// with no id to match against) or because none of `favourites` belong to
+/// it. Unlike the schema/section trees, this section's expand state is not
+/// forced open by an active speed-search filter — favourites are a small,
+/// flat, orthogonal-to-schema list, not something a filter needs to reach
+/// into.
+fn emit_favourites_section(
+    out: &mut Vec<FlatNode>,
+    favourites: &[FavouriteObject],
+    active_connection_id: Option<&str>,
+    expanded: &HashSet<NodeId>,
+) {
+    let Some(conn_id) = active_connection_id else { return };
+    let items: Vec<&FavouriteObject> = favourites.iter().filter(|f| f.connection_id == conn_id).collect();
+    if items.is_empty() {
+        return;
+    }
+    let section_id = NodeId::FavouriteSection;
+    out.push((section_id.clone(), 0, format!("Oblíbené ({})", items.len()), true));
+    if !expanded.contains(&section_id) {
+        return;
+    }
+    for f in items {
+        let schema_key = f.schema.clone().unwrap_or_default();
+        let label = if schema_key.is_empty() { f.name.clone() } else { format!("{}.{}", schema_key, f.name) };
+        let id = NodeId::Favourite(f.kind.clone(), schema_key, f.name.clone());
+        out.push((id, 1, label, false));
+    }
+}
+
 /// Emits all seven sections (fixed order: Tabulky, Pohledy, Funkce,
 /// Procedury, Triggery, Indexy, Sekvence) for one schema, at `depth`.
 fn emit_sections(
@@ -353,10 +403,20 @@ fn emit_sections(
 /// sections render straight at depth 0. Otherwise each distinct schema gets
 /// its own expandable `Schema` node at depth 0, with sections nested one
 /// level deeper once that schema is expanded.
-pub fn flatten(snapshot: &SchemaSnapshot, expanded: &HashSet<NodeId>, filter: &str) -> Vec<FlatNode> {
+pub fn flatten(
+    snapshot: &SchemaSnapshot,
+    expanded: &HashSet<NodeId>,
+    filter: &str,
+    favourites: &[FavouriteObject],
+    active_connection_id: Option<&str>,
+) -> Vec<FlatNode> {
     let mut out = Vec::new();
     let filter_lc = filter.to_lowercase();
     let filter_active = !filter_lc.is_empty();
+
+    // G3 Task 4: the "Oblíbené" section always comes first, ahead of any
+    // schema/section node below.
+    emit_favourites_section(&mut out, favourites, active_connection_id, expanded);
 
     let mut schema_key_set: BTreeSet<Option<String>> = BTreeSet::new();
     for t in &snapshot.tables {
@@ -401,6 +461,10 @@ pub fn flatten(snapshot: &SchemaSnapshot, expanded: &HashSet<NodeId>, filter: &s
 /// real after a same-connection refresh replaces `snapshot` wholesale.
 fn all_node_ids(snapshot: &SchemaSnapshot) -> HashSet<NodeId> {
     let mut out = HashSet::new();
+    // G3 Task 4: always valid, independent of `snapshot` — its favourites
+    // come from config, not the schema fetch — so a same-connection refresh
+    // never drops the section's expand state out from under the user.
+    out.insert(NodeId::FavouriteSection);
 
     let mut schema_key_set: BTreeSet<Option<String>> = BTreeSet::new();
     for t in &snapshot.tables {
@@ -513,6 +577,17 @@ pub struct SchemaTree {
     /// `AppView` (which doesn't have `Window` access in its `cx.subscribe`
     /// callback) — see `on_tree_escape`.
     editor_focus: FocusHandle,
+    /// G3 Task 4: `AppConfig::favourite_objects`, pushed in by `main.rs`
+    /// (`set_favourites`) on every schema-fetch apply and after every ★
+    /// toggle — NOT filtered by connection here; `flatten`/`favourite_object_for`
+    /// do that filtering against `active_connection_id` below.
+    favourites: Vec<FavouriteObject>,
+    /// The active connection's id (`AppView::active_connection_id`), handed
+    /// in alongside `favourites` by `set_favourites` — `None` for the
+    /// CLI-arg URL path (no `ConnectionConfig`/id to match favourites
+    /// against, so the "Oblíbené" section stays hidden) or before any
+    /// connection has been chosen.
+    active_connection_id: Option<String>,
 }
 
 impl SchemaTree {
@@ -526,6 +601,66 @@ impl SchemaTree {
             error: None,
             focus_handle: cx.focus_handle(),
             editor_focus,
+            favourites: Vec::new(),
+            active_connection_id: None,
+        }
+    }
+
+    /// Called by `main.rs` on every schema-fetch apply (`trigger_schema_fetch`)
+    /// and again right after a ★ toggle resolves (`config.toggle_favourite` +
+    /// guarded save) — `flatten`'s "Oblíbené" section and every row's star
+    /// state are recomputed fresh from these two fields on the very next
+    /// render, same as `snapshot`/`expanded`/`filter`.
+    pub fn set_favourites(
+        &mut self,
+        favourites: Vec<FavouriteObject>,
+        active_connection_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.favourites = favourites;
+        self.active_connection_id = active_connection_id;
+        cx.notify();
+    }
+
+    /// The `FavouriteObject` a given row's ★/☆ toggle targets, or `None` for
+    /// rows that don't support favouriting (`Schema`/`Section`/`Column`/
+    /// `Index`) and whenever there's no active connection id to stamp onto a
+    /// new `FavouriteObject` (can't build one — and `is_favourite` would
+    /// never match one from a different connection anyway). For
+    /// `NodeId::Table`, the table/view distinction (`kind: "table"|"view"`)
+    /// is looked up from `self.snapshot` since the node id alone doesn't
+    /// carry it; a table that's since vanished from the snapshot (a rename/
+    /// drop raced with the click) safely yields `None` rather than guessing.
+    fn favourite_object_for(&self, id: &NodeId) -> Option<FavouriteObject> {
+        let connection_id = self.active_connection_id.clone()?;
+        let schema_opt = |s: &str| if s.is_empty() { None } else { Some(s.to_string()) };
+        match id {
+            NodeId::Table(schema, name) => {
+                let kind = self
+                    .snapshot
+                    .as_ref()?
+                    .tables
+                    .iter()
+                    .find(|t| &t.name == name && &schema_key_string(&t.schema) == schema)
+                    .map(|t| match t.kind {
+                        TableKind::Table => "table",
+                        TableKind::View | TableKind::MaterializedView => "view",
+                    })?;
+                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: kind.to_string() })
+            }
+            NodeId::Routine(schema, name) => {
+                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: "routine".into() })
+            }
+            NodeId::Trigger(schema, name) => {
+                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: "trigger".into() })
+            }
+            NodeId::Sequence(schema, name) => {
+                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: "sequence".into() })
+            }
+            NodeId::Favourite(kind, schema, name) => {
+                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: kind.clone() })
+            }
+            _ => None,
         }
     }
 
@@ -655,6 +790,28 @@ impl SchemaTree {
                 let ddl = self.find_trigger_ddl(schema, name).unwrap_or_else(|| DDL_FALLBACK.to_string());
                 cx.emit(TreeEvent::OpenDdl { title: name.clone(), ddl });
             }
+            // G3 Task 4: a favourites-section row uses the same double-click
+            // semantics as its counterpart elsewhere in the tree — table/view
+            // -> OpenPreview, routine/trigger -> OpenDdl. Sequences have no
+            // double-click action anywhere in the tree, so that's a no-op
+            // here too (falls through without emitting).
+            NodeId::Favourite(kind, schema, name) => {
+                let schema_opt = if schema.is_empty() { None } else { Some(schema.clone()) };
+                match kind.as_str() {
+                    "table" | "view" => {
+                        cx.emit(TreeEvent::OpenPreview { schema: schema_opt, table: name.clone() });
+                    }
+                    "routine" => {
+                        let ddl = self.find_routine_ddl(schema, name).unwrap_or_else(|| DDL_FALLBACK.to_string());
+                        cx.emit(TreeEvent::OpenDdl { title: name.clone(), ddl });
+                    }
+                    "trigger" => {
+                        let ddl = self.find_trigger_ddl(schema, name).unwrap_or_else(|| DDL_FALLBACK.to_string());
+                        cx.emit(TreeEvent::OpenDdl { title: name.clone(), ddl });
+                    }
+                    _ => {}
+                }
+            }
             _ => self.toggle_expand(id),
         }
         cx.notify();
@@ -715,7 +872,11 @@ impl Focusable for SchemaTree {
 
 impl Render for SchemaTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = self.snapshot.as_ref().map(|s| flatten(s, &self.expanded, &self.filter)).unwrap_or_default();
+        let rows = self
+            .snapshot
+            .as_ref()
+            .map(|s| flatten(s, &self.expanded, &self.filter, &self.favourites, self.active_connection_id.as_deref()))
+            .unwrap_or_default();
 
         let header_label =
             if self.filter.is_empty() { "Strom schémat".to_string() } else { format!("Strom schémat [{}]", self.filter) };
@@ -807,6 +968,29 @@ impl Render for SchemaTree {
                             let click_id = id.clone();
                             let chevron_id = id.clone();
 
+                            // G3 Task 4: a ★/☆ toggle, right-aligned (pushed
+                            // there by the label's `flex_1()` below), for
+                            // every favouritable row — `favourite_object_for`
+                            // returns `None` for `Schema`/`Section`/`Column`/
+                            // `Index` rows, which get no star at all.
+                            let fav_obj = this.favourite_object_for(&id);
+                            let is_fav = fav_obj.as_ref().is_some_and(|f| this.favourites.contains(f));
+                            let star = fav_obj.map(|f| {
+                                let (glyph, color) =
+                                    if is_fav { ("★", rgb(0xf9e2af)) } else { ("☆", rgb(0x6c7086)) };
+                                div()
+                                    .id(("tree-star", ix))
+                                    .px_1()
+                                    .flex_shrink_0()
+                                    .cursor_pointer()
+                                    .text_color(color)
+                                    .child(glyph)
+                                    .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        cx.emit(TreeEvent::ToggleFavourite(f.clone()));
+                                    }))
+                            });
+
                             let mut row = div()
                                 .id(("tree-row", ix))
                                 .flex()
@@ -834,7 +1018,7 @@ impl Render for SchemaTree {
                                             cx.notify();
                                         })),
                                 )
-                                .child(div().overflow_hidden().child(label))
+                                .child(div().flex_1().overflow_hidden().child(label))
                                 .on_click(cx.listener(move |this, ev: &ClickEvent, _window, cx| {
                                     if ev.click_count() >= 2 {
                                         this.handle_double_click(&click_id, cx);
@@ -843,6 +1027,9 @@ impl Render for SchemaTree {
                                         cx.notify();
                                     }
                                 }));
+                            if let Some(star) = star {
+                                row = row.child(star);
+                            }
                             items.push(row);
                         }
                         items
@@ -895,7 +1082,7 @@ mod flatten_tests {
             tables: vec![table(None, "users", TableKind::Table, vec![col("id", "INTEGER")])],
             ..Default::default()
         };
-        let rows = flatten(&snap, &HashSet::new(), "");
+        let rows = flatten(&snap, &HashSet::new(), "", &[], None);
         // No `NodeId::Schema` row anywhere, and the section sits at depth 0.
         assert!(!rows.iter().any(|(id, ..)| matches!(id, NodeId::Schema(_))));
         assert_eq!(rows[0].0, NodeId::Section("".to_string(), "Tabulky"));
@@ -911,7 +1098,7 @@ mod flatten_tests {
             ],
             ..Default::default()
         };
-        let rows = flatten(&snap, &HashSet::new(), "");
+        let rows = flatten(&snap, &HashSet::new(), "", &[], None);
         // Only the two Schema headers show — nothing is expanded yet.
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], (NodeId::Schema("audit".into()), 0, "audit".into(), true));
@@ -919,7 +1106,7 @@ mod flatten_tests {
 
         let mut expanded = HashSet::new();
         expanded.insert(NodeId::Schema("public".into()));
-        let rows = flatten(&snap, &expanded, "");
+        let rows = flatten(&snap, &expanded, "", &[], None);
         // "public" expanded reveals its Tabulky section nested one level in;
         // "audit" stays collapsed to just its header.
         assert!(rows.iter().any(|(id, depth, ..)| {
@@ -940,7 +1127,7 @@ mod flatten_tests {
             triggers: vec![trigger(None, "trg1", "a")],
             sequences: vec![sequence(None, "seq1")],
         };
-        let rows = flatten(&snap, &HashSet::new(), "");
+        let rows = flatten(&snap, &HashSet::new(), "", &[], None);
         let labels: Vec<&str> = rows.iter().map(|(_, _, label, _)| label.as_str()).collect();
         // Procedury and Indexy are absent (empty); the rest appear in the
         // brief's fixed order, with correct counts.
@@ -956,7 +1143,7 @@ mod flatten_tests {
             ],
             ..Default::default()
         };
-        let rows = flatten(&snap, &HashSet::new(), "");
+        let rows = flatten(&snap, &HashSet::new(), "", &[], None);
         assert_eq!(rows, vec![(NodeId::Section("".into(), "Pohledy"), 0, "Pohledy (2)".into(), true)]);
     }
 
@@ -967,19 +1154,19 @@ mod flatten_tests {
             ..Default::default()
         };
         // Nothing expanded: only the section header.
-        let rows = flatten(&snap, &HashSet::new(), "");
+        let rows = flatten(&snap, &HashSet::new(), "", &[], None);
         assert_eq!(rows.len(), 1);
 
         // Section expanded: table row appears, columns still hidden.
         let mut expanded = HashSet::new();
         expanded.insert(NodeId::Section("".into(), "Tabulky"));
-        let rows = flatten(&snap, &expanded, "");
+        let rows = flatten(&snap, &expanded, "", &[], None);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].0, NodeId::Table("".into(), "users".into()));
 
         // Table also expanded: column row appears too.
         expanded.insert(NodeId::Table("".into(), "users".into()));
-        let rows = flatten(&snap, &expanded, "");
+        let rows = flatten(&snap, &expanded, "", &[], None);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[2].0, NodeId::Column("".into(), "users".into(), "id".into()));
         assert_eq!(rows[2].2, "id: INTEGER");
@@ -1012,7 +1199,7 @@ mod flatten_tests {
         // "products" (no match anywhere in it) is hidden entirely, and
         // "id" (present on both tables, doesn't match) doesn't show either
         // since "users" itself didn't match by name.
-        let rows = flatten(&snap, &HashSet::new(), "EMAIL");
+        let rows = flatten(&snap, &HashSet::new(), "EMAIL", &[], None);
         assert_eq!(
             rows,
             vec![
@@ -1029,7 +1216,7 @@ mod flatten_tests {
             tables: vec![table(None, "users", TableKind::Table, vec![col("id", "INTEGER"), col("email", "TEXT")])],
             ..Default::default()
         };
-        let rows = flatten(&snap, &HashSet::new(), "users");
+        let rows = flatten(&snap, &HashSet::new(), "users", &[], None);
         // The table itself matched by name, so both columns show, not just
         // ones whose own name happens to contain "users".
         let col_labels: Vec<&str> = rows
@@ -1048,7 +1235,7 @@ mod flatten_tests {
 
         let mut expanded = HashSet::new();
         expanded.insert(NodeId::Section("".into(), "Indexy"));
-        let rows = flatten(&snap, &expanded, "");
+        let rows = flatten(&snap, &expanded, "", &[], None);
         assert!(rows.iter().any(|(id, depth, label, _)| {
             *id == NodeId::Index("".into(), "users".into(), "users_pkey".into())
                 && *depth == 1
@@ -1059,7 +1246,7 @@ mod flatten_tests {
     #[test]
     fn empty_snapshot_flattens_to_no_rows() {
         let snap = SchemaSnapshot::default();
-        assert!(flatten(&snap, &HashSet::new(), "").is_empty());
+        assert!(flatten(&snap, &HashSet::new(), "", &[], None).is_empty());
     }
 
     // --- review Issue 3: same-connection refresh state preservation ---
@@ -1136,5 +1323,136 @@ mod flatten_tests {
         let (pruned_expanded, pruned_selected) = prune_stale_ids(&expanded, &selected, &snap);
         assert_eq!(pruned_expanded, expanded);
         assert_eq!(pruned_selected, selected);
+    }
+
+    // --- G3 Task 4: favourites section ---
+
+    fn fav(connection_id: &str, schema: Option<&str>, name: &str, kind: &str) -> FavouriteObject {
+        FavouriteObject {
+            connection_id: connection_id.into(),
+            schema: schema.map(str::to_string),
+            name: name.into(),
+            kind: kind.into(),
+        }
+    }
+
+    #[test]
+    fn favourites_section_hidden_when_no_active_connection() {
+        let snap = SchemaSnapshot {
+            tables: vec![table(None, "users", TableKind::Table, vec![])],
+            ..Default::default()
+        };
+        let favourites = vec![fav("c1", None, "users", "table")];
+        // No active connection id at all (e.g. the CLI-arg URL path) — the
+        // section can't be built (nothing to stamp a new toggle with
+        // either), so it's hidden even though `favourites` is non-empty.
+        let rows = flatten(&snap, &HashSet::new(), "", &favourites, None);
+        assert!(!rows.iter().any(|(id, ..)| matches!(id, NodeId::FavouriteSection)));
+    }
+
+    #[test]
+    fn favourites_section_hidden_when_none_belong_to_active_connection() {
+        let snap = SchemaSnapshot {
+            tables: vec![table(None, "users", TableKind::Table, vec![])],
+            ..Default::default()
+        };
+        let favourites = vec![fav("other-conn", None, "users", "table")];
+        let rows = flatten(&snap, &HashSet::new(), "", &favourites, Some("c1"));
+        assert!(!rows.iter().any(|(id, ..)| matches!(id, NodeId::FavouriteSection)));
+    }
+
+    #[test]
+    fn favourites_section_renders_first_before_schemas() {
+        let snap = SchemaSnapshot {
+            tables: vec![
+                table(Some("public"), "t1", TableKind::Table, vec![]),
+                table(Some("audit"), "t2", TableKind::Table, vec![]),
+            ],
+            ..Default::default()
+        };
+        let favourites = vec![fav("c1", Some("public"), "t1", "table")];
+        let rows = flatten(&snap, &HashSet::new(), "", &favourites, Some("c1"));
+        assert_eq!(rows[0].0, NodeId::FavouriteSection);
+        assert_eq!(rows[0].2, "Oblíbené (1)");
+        // The Schema headers still follow, unaffected.
+        assert!(rows.iter().any(|(id, ..)| *id == NodeId::Schema("audit".into())));
+        assert!(rows.iter().any(|(id, ..)| *id == NodeId::Schema("public".into())));
+    }
+
+    #[test]
+    fn favourites_section_only_shows_active_connection_items_cross_schema() {
+        let snap = SchemaSnapshot::default();
+        let favourites = vec![
+            fav("c1", Some("public"), "t1", "table"),
+            fav("c1", Some("audit"), "f1", "routine"),
+            fav("c2", Some("public"), "other", "table"),
+        ];
+        let mut expanded = HashSet::new();
+        expanded.insert(NodeId::FavouriteSection);
+        let rows = flatten(&snap, &expanded, "", &favourites, Some("c1"));
+        assert_eq!(rows[0], (NodeId::FavouriteSection, 0, "Oblíbené (2)".into(), true));
+        let items: Vec<&NodeId> = rows.iter().skip(1).map(|(id, ..)| id).collect();
+        assert_eq!(
+            items,
+            vec![
+                &NodeId::Favourite("table".into(), "public".into(), "t1".into()),
+                &NodeId::Favourite("routine".into(), "audit".into(), "f1".into()),
+            ]
+        );
+        // "c2"'s favourite never shows, and no dangling reference to it.
+        assert!(!rows.iter().any(|(id, ..)| *id == NodeId::Favourite("table".into(), "public".into(), "other".into())));
+    }
+
+    #[test]
+    fn favourites_section_labels_schema_dot_name_or_bare_name() {
+        let snap = SchemaSnapshot::default();
+        let favourites = vec![fav("c1", Some("public"), "t1", "table"), fav("c1", None, "seq1", "sequence")];
+        let mut expanded = HashSet::new();
+        expanded.insert(NodeId::FavouriteSection);
+        let rows = flatten(&snap, &expanded, "", &favourites, Some("c1"));
+        let labels: Vec<&str> = rows.iter().skip(1).map(|(_, _, l, _)| l.as_str()).collect();
+        assert_eq!(labels, vec!["public.t1", "seq1"]);
+    }
+
+    #[test]
+    fn favourites_section_stays_collapsed_until_expanded() {
+        let snap = SchemaSnapshot::default();
+        let favourites = vec![fav("c1", Some("public"), "t1", "table")];
+        let rows = flatten(&snap, &HashSet::new(), "", &favourites, Some("c1"));
+        // Header only — not expanded, so the item row is hidden.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, NodeId::FavouriteSection);
+    }
+
+    /// The favourites section's `NodeId::Favourite(kind, schema, name)`
+    /// carries whatever `kind` the `FavouriteObject` was stored under —
+    /// this is exactly the data `handle_double_click`'s `NodeId::Favourite`
+    /// arm switches on to decide OpenPreview (table/view) vs OpenDdl
+    /// (routine/trigger) vs no-op (sequence), so asserting it round-trips
+    /// unchanged through `flatten` is what makes that dispatch correct.
+    #[test]
+    fn favourites_section_node_ids_carry_kind_for_double_click_dispatch() {
+        let snap = SchemaSnapshot::default();
+        let favourites = vec![
+            fav("c1", Some("s"), "a_table", "table"),
+            fav("c1", Some("s"), "a_view", "view"),
+            fav("c1", Some("s"), "a_routine", "routine"),
+            fav("c1", Some("s"), "a_trigger", "trigger"),
+            fav("c1", Some("s"), "a_sequence", "sequence"),
+        ];
+        let mut expanded = HashSet::new();
+        expanded.insert(NodeId::FavouriteSection);
+        let rows = flatten(&snap, &expanded, "", &favourites, Some("c1"));
+        let ids: Vec<&NodeId> = rows.iter().skip(1).map(|(id, ..)| id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                &NodeId::Favourite("table".into(), "s".into(), "a_table".into()),
+                &NodeId::Favourite("view".into(), "s".into(), "a_view".into()),
+                &NodeId::Favourite("routine".into(), "s".into(), "a_routine".into()),
+                &NodeId::Favourite("trigger".into(), "s".into(), "a_trigger".into()),
+                &NodeId::Favourite("sequence".into(), "s".into(), "a_sequence".into()),
+            ]
+        );
     }
 }

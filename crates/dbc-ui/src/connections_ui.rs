@@ -1236,13 +1236,22 @@ impl AppView {
         cx.notify();
     }
 
-    fn finish_save(&mut self, data: ConnectionFormData, cx: &mut Context<Self>) {
+    /// final-review must-fix #2's corrupt-config guard, extracted out of
+    /// `finish_save` (G3 Task 4) so every config-mutating save path — the
+    /// connection dialog's save, a tree object's ★ toggle
+    /// (`AppView::on_tree_event`'s `TreeEvent::ToggleFavourite` arm in
+    /// main.rs), and a dropdown connection's ★ toggle
+    /// (`toggle_connection_favourite` below) — shares the exact same
+    /// backup-before-overwrite behaviour: never silently overwrite a
+    /// config.toml that failed to parse at startup. Moves it aside to
+    /// `config.toml.corrupt-bak` first; if that fails (permissions, file
+    /// vanished, etc.), the whole save is aborted (`false`) rather than
+    /// risk clobbering data the user may still want to recover by hand. A
+    /// no-op returning `true` once there's no `config_load_error` left to
+    /// guard against, so callers can call it unconditionally before every
+    /// save.
+    pub(crate) fn guard_corrupt_config(&mut self, cx: &mut Context<Self>) -> bool {
         if self.config_load_error.is_some() {
-            // final-review must-fix #2: never silently overwrite a config
-            // file that failed to parse at startup. Move it aside first;
-            // if that fails (permissions, file vanished, etc.), abort the
-            // whole save rather than risk clobbering data the user may
-            // still want to recover by hand.
             let backup = self.config_path.with_extension("toml.corrupt-bak");
             match std::fs::rename(&self.config_path, &backup) {
                 Ok(()) => self.config_load_error = None,
@@ -1251,9 +1260,16 @@ impl AppView {
                         "error: nelze zálohovat poškozený config.toml ({e}) – uložení zrušeno"
                     );
                     cx.notify();
-                    return;
+                    return false;
                 }
             }
+        }
+        true
+    }
+
+    fn finish_save(&mut self, data: ConnectionFormData, cx: &mut Context<Self>) {
+        if !self.guard_corrupt_config(cx) {
+            return;
         }
         if !data.password.is_empty() {
             let Some(vault) = self.vault.as_mut() else {
@@ -1284,6 +1300,28 @@ impl AppView {
         self.refresh_grouped_cache();
         self.modal = None;
         self.dropdown_open = false;
+        cx.notify();
+    }
+
+    /// G3 Task 4: the dropdown row's ★ toggle (mirrors the tree's object ★
+    /// toggle — see `main.rs`'s `on_tree_event` `ToggleFavourite` arm) —
+    /// flips `ConnectionConfig::favourite`, saves through the same guarded
+    /// path (`guard_corrupt_config`), and refreshes `grouped_cache` so the
+    /// dropdown's favourites-first ordering (G1) picks up the change
+    /// immediately rather than waiting for the next dropdown-open.
+    pub(crate) fn toggle_connection_favourite(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.guard_corrupt_config(cx) {
+            return;
+        }
+        let Some(c) = self.config.connections.iter_mut().find(|c| c.id == id) else {
+            return; // connection vanished meanwhile — nothing to toggle/save
+        };
+        c.favourite = !c.favourite;
+        self.status = match self.config.save(&self.config_path) {
+            Ok(()) => "Uloženo".to_string(),
+            Err(e) => format!("error saving config: {}", e.message),
+        };
+        self.refresh_grouped_cache();
         cx.notify();
     }
 
@@ -1533,8 +1571,11 @@ fn checkbox(id: &'static str, label: &'static str, checked: bool) -> Stateful<Di
 
 fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) -> impl IntoElement {
     let id = c.id.clone();
+    let star_id = c.id.clone();
     let editing = c.clone();
     let label = format!("{}{} — {} {}", "  ".repeat(depth), c.name, engine_label(c.engine), c.host);
+    let (star_glyph, star_color) =
+        if c.favourite { ("★", rgb(0xf9e2af)) } else { ("☆", rgb(0x6c7086)) };
     div()
         .id(SharedString::from(format!("dropdown-item-row-{}", c.id)))
         .flex()
@@ -1550,6 +1591,22 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
                 .child(label)
                 .on_click(cx.listener(move |view, _, window, cx| {
                     view.on_dropdown_item_click(id.clone(), window, cx);
+                })),
+        )
+        .child(
+            // G3 Task 4: ★ toggle, mirroring the ✎ edit affordance's
+            // `cx.stop_propagation()` pattern below — without it, this click
+            // would also bubble to the row's connect handler above.
+            div()
+                .id(SharedString::from(format!("dropdown-item-star-{}", c.id)))
+                .px_1()
+                .cursor_pointer()
+                .text_color(star_color)
+                .hover(|s| s.bg(rgb(0x45475a)))
+                .child(star_glyph)
+                .on_click(cx.listener(move |view, _, _window, cx| {
+                    cx.stop_propagation();
+                    view.toggle_connection_favourite(&star_id, cx);
                 })),
         )
         .child(
