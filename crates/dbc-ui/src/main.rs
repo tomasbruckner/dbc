@@ -1,6 +1,7 @@
 mod connect;
 mod connections_ui;
 mod grid;
+mod history_panel;
 mod runner;
 mod schema_tree;
 mod sql_input;
@@ -14,7 +15,7 @@ use std::rc::Rc;
 
 use dbc_buffer::ResultBuffer;
 use dbc_core::{apply_auto_limit, is_read_statement, quote_qualified, CancelToken, QueryError};
-use dbc_state::{AppConfig, Vault};
+use dbc_state::{AppConfig, HistoryDb, Vault};
 use gpui::{
     actions, div, prelude::*, px, rgb, size, AnyElement, App, Bounds, ClipboardItem, Context,
     Entity, Focusable, KeyBinding, ScrollDelta, ScrollWheelEvent, Window, WindowBounds,
@@ -27,7 +28,7 @@ use schema_tree::{SchemaTree, TreeEvent};
 use sql_input::SqlInput;
 use tabs::{collapse_title, ResultTab, TabContent, Tabs};
 
-actions!(dbc, [RunQuery, RunQueryUnlimited, CancelQuery, ToggleTree]);
+actions!(dbc, [RunQuery, RunQueryUnlimited, CancelQuery, ToggleTree, ToggleHistory]);
 
 /// G2 Task 7: SQL builder for `TreeEvent::OpenPreview`. Pure — no GPUI, no
 /// I/O — so quoting can be unit-tested directly. `quote_qualified` (shared
@@ -107,6 +108,20 @@ struct AppView {
     /// same-connection refresh (preserve expand/filter/selection) or a
     /// switch to a different connection (reset them) — review Issue 3.
     schema_tree_connection_key: Option<String>,
+    // --- G3 Task 3: history panel + query recording ---
+    /// Opened from `default_history_path()` at startup; `None` when the open
+    /// failed (surfaced once in the startup status — see `main`), in which
+    /// case the app stays fully functional, just without recording/search
+    /// (`record_history` and the panel's search both no-op gracefully).
+    history: Option<HistoryDb>,
+    /// Ctrl+H (`ToggleHistory`, app action, binding context `None`) — same
+    /// "not rendered at all when hidden" convention as `tree_visible`.
+    history_visible: bool,
+    /// Search box for the history panel (unmasked `TextField`, reused from
+    /// connections_ui.rs). Re-queried fresh on every render of the panel —
+    /// see history_panel.rs's module doc comment for why no separate
+    /// dirty-tracking is needed.
+    history_search: Entity<connections_ui::TextField>,
 }
 
 /// Stable identity for a `ConnectSpec`, used only to decide whether two
@@ -234,6 +249,16 @@ impl AppView {
         // post-auto-limit-rewrite. Unused when `preview` overrides the title
         // (still harmless to compute — the collapse is cheap).
         let sql_for_title = sql.clone();
+        // G3 Task 3: captured at dispatch (not resolution) for
+        // `record_history` — the unix time the run started, and the active
+        // connection's name (or "cli" for the CLI-arg path), both fixed for
+        // the lifetime of this run regardless of what the user does
+        // meanwhile (e.g. switching connections while this query runs).
+        let history_started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let history_conn_name = self.active_connection_name_for_history();
         let mut rx = self.runner.connect_and_run(spec, sql, cancel, timeout_secs);
         cx.spawn(async move |this, cx| {
             let mut buffer: Option<Rc<RefCell<ResultBuffer>>> = None;
@@ -314,6 +339,18 @@ impl AppView {
                                         buffer.as_ref().map_or(0, |b| b.borrow().row_count());
                                     view.status =
                                         format!("{rows} rows in {elapsed:.2?}{limit_suffix}");
+                                    // G3 Task 3: record the run (previews
+                                    // included — they run real SQL too).
+                                    // Fire-and-forget; a write failure never
+                                    // surfaces here.
+                                    view.record_history(
+                                        &sql_for_title,
+                                        &history_conn_name,
+                                        history_started_at,
+                                        Some(elapsed.as_millis() as i64),
+                                        Some(rows as i64),
+                                        None,
+                                    );
                                 }
                                 view.cancel = None;
                             }
@@ -322,6 +359,15 @@ impl AppView {
                                 // the driver's follow-up "cancelled" is noise.
                                 if !errored {
                                     view.status = format!("error: {e}");
+                                    let err_text = e.to_string();
+                                    view.record_history(
+                                        &sql_for_title,
+                                        &history_conn_name,
+                                        history_started_at,
+                                        None,
+                                        None,
+                                        Some(&err_text),
+                                    );
                                 }
                                 view.cancel = None;
                             }
@@ -374,6 +420,11 @@ impl AppView {
 
     fn on_toggle_tree(&mut self, _: &ToggleTree, _window: &mut Window, cx: &mut Context<Self>) {
         self.tree_visible = !self.tree_visible;
+        cx.notify();
+    }
+
+    fn on_toggle_history(&mut self, _: &ToggleHistory, _window: &mut Window, cx: &mut Context<Self>) {
+        self.history_visible = !self.history_visible;
         cx.notify();
     }
 
@@ -675,6 +726,13 @@ impl Render for AppView {
         }
         body = body.child(column);
 
+        // G3 Task 3: the history panel sits RIGHT of `column`, fixed 280 px,
+        // collapsible via Ctrl+H (`ToggleHistory`) — same collapse-to-0px
+        // convention as the schema tree panel above.
+        if self.history_visible {
+            body = body.child(self.render_history_panel(cx));
+        }
+
         let mut root = div()
             .relative()
             .flex()
@@ -685,6 +743,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_run_query_unlimited))
             .on_action(cx.listener(Self::on_cancel_query))
             .on_action(cx.listener(Self::on_toggle_tree))
+            .on_action(cx.listener(Self::on_toggle_history))
             .child(self.render_top_bar(cx))
             .child(body)
             .child(
@@ -722,6 +781,14 @@ fn main() {
         Ok(cfg) => (cfg, None),
         Err(e) => (AppConfig::default(), Some(e.to_string())),
     };
+    // G3 Task 3: opened once at startup; a failure (e.g. an unwritable
+    // config dir) is surfaced in the status bar below but never blocks the
+    // rest of the app — `record_history`/the panel's search both treat
+    // `history: None` as "no history available" rather than panicking.
+    let (history, history_open_error) = match HistoryDb::open(&dbc_state::default_history_path()) {
+        Ok(h) => (Some(h), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
 
     application().run(move |cx: &mut App| {
         cx.bind_keys([
@@ -729,6 +796,7 @@ fn main() {
             KeyBinding::new("ctrl-shift-enter", RunQueryUnlimited, None),
             KeyBinding::new("escape", CancelQuery, None),
             KeyBinding::new("ctrl-b", ToggleTree, None),
+            KeyBinding::new("ctrl-h", ToggleHistory, None),
         ]);
         sql_input::bind_keys(cx);
         grid::bind_keys(cx);
@@ -751,15 +819,20 @@ fn main() {
                         let sql = cx.new(|cx| SqlInput::new(cx, "Type SQL, then Ctrl+Enter…"));
                         window.focus(&sql.focus_handle(cx), cx);
                         let grouped_cache = connections_ui::group_connections(&config.connections);
-                        let status = match &config_load_error {
-                            Some(detail) => {
+                        // config.toml corruption takes priority (it blocks
+                        // saving/editing connections outright); a history
+                        // open failure is a lesser, non-blocking notice.
+                        let status = match (&config_load_error, &history_open_error) {
+                            (Some(detail), _) => {
                                 format!("error: config.toml je poškozený – oprav nebo smaž soubor ({detail})")
                             }
-                            None => "ready".into(),
+                            (None, Some(detail)) => format!("error: historie nedostupná ({detail})"),
+                            (None, None) => "ready".into(),
                         };
                         let editor_focus = sql.focus_handle(cx);
                         let tree = cx.new(|cx| SchemaTree::new(cx, editor_focus));
                         cx.subscribe(&tree, AppView::on_tree_event).detach();
+                        let history_search = cx.new(|cx| connections_ui::TextField::new(cx, "Hledat…", false));
                         AppView {
                             tabs: Tabs::new(),
                             status,
@@ -782,6 +855,9 @@ fn main() {
                             tree_visible: true,
                             schema_fetch_generation: 0,
                             schema_tree_connection_key: None,
+                            history,
+                            history_visible: true,
+                            history_search,
                         }
                     })
                 },
