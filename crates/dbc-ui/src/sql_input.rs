@@ -14,15 +14,14 @@
 //   reads `buffer.text()` / `buffer.selection()` / `buffer.cursor()`.
 // - `text()` returns the real multiline text (the v1 `\n` -> ' ' hack is
 //   deleted); `set_text()` is new, for future history-load.
-// - `MultilineBuffer` (frozen for this task, in text_model.rs) exposes no
-//   "set cursor/selection to an arbitrary offset" primitive — only
-//   grapheme-stepwise `move_left`/`move_right` and line-stepwise
-//   `move_up`/`move_down`/`move_home`/`move_end`. Mouse clicks/drags and
-//   IME range replacement need arbitrary-offset seeking, so `SqlInput::seek`
-//   synthesizes it by stepping the model's own primitives: vertical move to
-//   the target line, `move_home`, then `move_right` N times (N = grapheme
-//   count from line start to the target byte column). This is O(line count
-//   + line length) per seek, which is fine for a SQL input box.
+// - `MultilineBuffer` exposes `set_cursor`/`select_range` (added in G1 Task 4
+//   fix round 1, per review) for placing the cursor/selection at an
+//   arbitrary absolute byte offset in a single O(n) pass over the buffer.
+//   Mouse clicks/drags and IME range replacement use these via
+//   `SqlInput::seek` (clicks/drags) or directly (IME), instead of the
+//   original stepwise replay of `move_up`/`move_down`/`move_right`, which
+//   was O(line_count) buffer-rescanning calls per seek — quadratic overall
+//   during drag-select across a large pasted buffer.
 // - `previous_boundary`/`next_boundary` (grapheme-boundary scanning for
 //   Left/Right) are deleted — the model does this internally now.
 // - New actions `Up`/`Down`/`SelectUp`/`SelectDown` (vertical movement) and
@@ -30,14 +29,20 @@
 //   the app-level `ctrl-enter` -> RunQuery binding in main.rs is unaffected
 //   — different keystroke, same precedence as today).
 // - Rendering: `TextElement::prepaint` shapes one `ShapedLine` per visible
-//   line (scroll offset tracked in lines, clamped so edits/moves that leave
-//   the visible window pull it back into view), builds a per-line selection
+//   line (scroll offset tracked in lines), builds a per-line selection
 //   background quad (first/middle/last-line spans, extending to indicate
 //   the selection continues onto the next line) and a single cursor quad on
 //   whichever visible line contains the cursor. `paint` stashes the
 //   per-line hit-test data (`CachedLine`: absolute line index + byte start
 //   + `ShapedLine`) back onto the entity for the next click/IME query.
-// - Mouse wheel scrolling added via `on_scroll_wheel`.
+// - Mouse wheel scrolling added via `on_scroll_wheel`. The cursor-follow
+//   clamp that pulls the visible window back to the cursor's line is gated
+//   by `SqlInput::follow_cursor` (set by every edit/keyboard move/click/IME
+//   op, consumed and cleared by the next `prepaint`) so it only fires on
+//   frames where the cursor actually moved — otherwise it would immediately
+//   undo a wheel scroll on the very next `prepaint` (G1 Task 4 review,
+//   issue 1). `on_scroll_wheel` only clamps `scroll_offset_lines` to the
+//   valid `[0, max_scroll]` range and never sets the flag.
 // - `if focus_handle.is_focused(window) && let Some(...)` let-chains from
 //   the example are still written as nested `if`s — this workspace pins
 //   edition 2021, which rejects let-chains.
@@ -52,7 +57,6 @@ use gpui::{
     ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
     UnderlineStyle, Window,
 };
-use unicode_segmentation::*;
 
 use crate::text_model::MultilineBuffer;
 
@@ -214,6 +218,14 @@ pub struct SqlInput {
     buffer: MultilineBuffer,
     marked_range: Option<Range<usize>>,
     scroll_offset_lines: usize,
+    /// Set by every cursor-moving/editing action (insert, backspace,
+    /// delete, move_*, click/drag, `set_text`, paste, IME); consumed and
+    /// cleared by the next `TextElement::prepaint`, which only re-clamps
+    /// the visible window to the cursor's line when this is set. Keeps a
+    /// deliberate mouse-wheel scroll from being immediately undone by the
+    /// cursor-follow clamp on the next unrelated re-render (G1 Task 4
+    /// review, issue 1).
+    follow_cursor: bool,
     last_bounds: Option<Bounds<Pixels>>,
     last_line_height: Option<Pixels>,
     last_visible_line_count: usize,
@@ -229,6 +241,7 @@ impl SqlInput {
             buffer: MultilineBuffer::new(),
             marked_range: None,
             scroll_offset_lines: 0,
+            follow_cursor: true,
             last_bounds: None,
             last_line_height: None,
             last_visible_line_count: 1,
@@ -247,6 +260,7 @@ impl SqlInput {
         self.buffer.set_text(text);
         self.marked_range = None;
         self.scroll_offset_lines = 0;
+        self.follow_cursor = true;
         cx.notify();
     }
 
@@ -257,31 +271,35 @@ impl SqlInput {
     }
 
     /// Moves the model's cursor (and, if `extend`, its selection's active
-    /// end) to an arbitrary absolute byte `target_offset`, using only the
-    /// model's public line/grapheme-stepwise primitives. See file header.
+    /// end) to an arbitrary absolute byte `target_offset`, via
+    /// `MultilineBuffer::set_cursor`/`select_range` — O(n) single-pass
+    /// operations against the buffer's stored text. See file header.
+    ///
+    /// When extending, the anchor (the selection's fixed end) is derived
+    /// from the current cursor/selection rather than tracked separately:
+    /// `buffer.cursor()` always equals whichever end of the (ordered)
+    /// selection is the active one (every mutation that sets a selection
+    /// also moves the cursor to its active end), so the *other* end — or,
+    /// with no active selection, the cursor itself — is the anchor to
+    /// extend from. This correctly preserves the anchor across a drag
+    /// (repeated `seek(_, true)` calls) and across shift-click after either
+    /// a mouse- or keyboard-established selection.
     fn seek(&mut self, target_offset: usize, extend: bool) {
-        let text = self.buffer.text().to_string();
-        let target_offset = target_offset.min(text.len());
-        let (target_line, target_col) = line_col_of(&text, target_offset);
-
-        let max_steps = self.buffer.line_count() + 1;
-        for _ in 0..max_steps {
-            let (cur_line, _) = self.buffer.cursor_position();
-            if cur_line == target_line {
-                break;
-            } else if cur_line < target_line {
-                self.buffer.move_down(extend);
-            } else {
-                self.buffer.move_up(extend);
-            }
-        }
-
-        self.buffer.move_home(extend);
-        let line_text = text.split('\n').nth(target_line).unwrap_or("");
-        let col = target_col.min(line_text.len());
-        let steps = line_text[..col].graphemes(true).count();
-        for _ in 0..steps {
-            self.buffer.move_right(extend);
+        self.follow_cursor = true;
+        if extend {
+            let anchor = match self.buffer.selection() {
+                Some(sel) if !sel.is_empty() => {
+                    if self.buffer.cursor() == sel.start {
+                        sel.end
+                    } else {
+                        sel.start
+                    }
+                }
+                _ => self.buffer.cursor(),
+            };
+            self.buffer.select_range(anchor..target_offset);
+        } else {
+            self.buffer.set_cursor(target_offset);
         }
     }
 
@@ -317,74 +335,88 @@ impl SqlInput {
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.move_left(false);
+        self.follow_cursor = true;
         cx.notify();
     }
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.move_right(false);
+        self.follow_cursor = true;
         cx.notify();
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.move_up(false);
+        self.follow_cursor = true;
         cx.notify();
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.move_down(false);
+        self.follow_cursor = true;
         cx.notify();
     }
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.move_left(true);
+        self.follow_cursor = true;
         cx.notify();
     }
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.move_right(true);
+        self.follow_cursor = true;
         cx.notify();
     }
 
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.move_up(true);
+        self.follow_cursor = true;
         cx.notify();
     }
 
     fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.move_down(true);
+        self.follow_cursor = true;
         cx.notify();
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.select_all();
+        self.follow_cursor = true;
         cx.notify();
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.move_home(false);
+        self.follow_cursor = true;
         cx.notify();
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.move_end(false);
+        self.follow_cursor = true;
         cx.notify();
     }
 
     fn newline(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.insert("\n");
         self.marked_range = None;
+        self.follow_cursor = true;
         cx.notify();
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.backspace();
         self.marked_range = None;
+        self.follow_cursor = true;
         cx.notify();
     }
 
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.delete();
         self.marked_range = None;
+        self.follow_cursor = true;
         cx.notify();
     }
 
@@ -437,6 +469,7 @@ impl SqlInput {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.buffer.insert(&text);
             self.marked_range = None;
+            self.follow_cursor = true;
             cx.notify();
         }
     }
@@ -459,6 +492,7 @@ impl SqlInput {
                 ));
                 self.buffer.delete();
                 self.marked_range = None;
+                self.follow_cursor = true;
                 cx.notify();
             }
         }
@@ -557,10 +591,10 @@ impl EntityInputHandler for SqlInput {
             .or(self.marked_range.clone())
             .unwrap_or_else(|| self.current_selected_range());
 
-        self.seek(range.start, false);
-        self.seek(range.end, true);
+        self.buffer.select_range(range);
         self.buffer.insert(new_text);
         self.marked_range = None;
+        self.follow_cursor = true;
         cx.notify();
     }
 
@@ -578,8 +612,7 @@ impl EntityInputHandler for SqlInput {
             .or(self.marked_range.clone())
             .unwrap_or_else(|| self.current_selected_range());
 
-        self.seek(range.start, false);
-        self.seek(range.end, true);
+        self.buffer.select_range(range.clone());
         self.buffer.insert(new_text);
 
         if !new_text.is_empty() {
@@ -592,10 +625,10 @@ impl EntityInputHandler for SqlInput {
             let new_range = self.range_from_utf16(new_range_utf16);
             let sel_start = range.start + new_range.start;
             let sel_end = range.start + new_range.end;
-            self.seek(sel_start, false);
-            self.seek(sel_end, true);
+            self.buffer.select_range(sel_start..sel_end);
         }
 
+        self.follow_cursor = true;
         cx.notify();
     }
 
@@ -703,6 +736,7 @@ impl Element for TextElement {
         let marked_range = input.marked_range.clone();
         let placeholder = input.placeholder.clone();
         let scroll_offset_lines = input.scroll_offset_lines;
+        let follow_cursor = input.follow_cursor;
 
         let style = window.text_style();
         let font = style.font();
@@ -718,14 +752,25 @@ impl Element for TextElement {
             as usize)
             .max(1);
 
-        // Keep the cursor's line inside the visible window.
+        // Keep the cursor's line inside the visible window, but only on
+        // frames where the cursor actually moved (`follow_cursor`, set by
+        // every edit/keyboard-move/click/IME op and cleared below once
+        // consumed). Otherwise this clamp would immediately undo a
+        // deliberate mouse-wheel scroll on the very next `prepaint` (the
+        // `cx.notify()` `on_scroll_wheel` triggers to paint its own
+        // `scroll_offset_lines` change) — see G1 Task 4 review, issue 1.
         let (cursor_line, _) = line_col_of(&text, cursor);
         let mut scroll = scroll_offset_lines;
-        if cursor_line < scroll {
-            scroll = cursor_line;
-        } else if cursor_line >= scroll + visible_line_count {
-            scroll = cursor_line + 1 - visible_line_count;
+        if follow_cursor {
+            if cursor_line < scroll {
+                scroll = cursor_line;
+            } else if cursor_line >= scroll + visible_line_count {
+                scroll = cursor_line + 1 - visible_line_count;
+            }
         }
+        // Always clamp to the valid range, regardless of `follow_cursor` —
+        // this keeps `on_scroll_wheel`'s own clamped value valid too (e.g.
+        // after the window is resized smaller between frames).
         let max_scroll = line_count.saturating_sub(visible_line_count);
         if scroll > max_scroll {
             scroll = max_scroll;
@@ -735,6 +780,7 @@ impl Element for TextElement {
             input.scroll_offset_lines = scroll;
             input.last_line_height = Some(line_height);
             input.last_visible_line_count = visible_line_count;
+            input.follow_cursor = false;
         });
 
         let end_line = (scroll + visible_line_count).min(line_count);

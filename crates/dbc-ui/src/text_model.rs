@@ -29,6 +29,30 @@ fn snap_to_grapheme_boundary(line: &str, byte_col: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// Like `snap_to_grapheme_boundary`, but snaps two byte offsets (each
+/// already `<= text.len()`) down to their nearest grapheme boundaries in a
+/// single scan over `text`'s grapheme boundaries, instead of two
+/// independent scans. Used by `select_range` so placing a selection at an
+/// arbitrary offset pair stays a single O(n) pass over the buffer rather
+/// than O(n) per endpoint.
+fn snap_two_to_grapheme_boundary(text: &str, a: usize, b: usize) -> (usize, usize) {
+    let mut snapped_a = 0;
+    let mut snapped_b = 0;
+    let boundaries = text
+        .grapheme_indices(true)
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()));
+    for i in boundaries {
+        if i <= a {
+            snapped_a = i;
+        }
+        if i <= b {
+            snapped_b = i;
+        }
+    }
+    (snapped_a, snapped_b)
+}
+
 pub struct MultilineBuffer {
     text: String,
     cursor: usize,
@@ -386,6 +410,46 @@ impl MultilineBuffer {
         offset + clamped_col
     }
 
+    /// Places the cursor at `offset`, clamped to `text.len()` and snapped
+    /// down to the nearest grapheme boundary at or before it. Clears any
+    /// active selection and the goal column. Single O(n) pass over `text`
+    /// (via `snap_to_grapheme_boundary`) — unlike seeking an arbitrary
+    /// offset via repeated `move_up`/`move_down`/`move_right` calls, which
+    /// each independently re-scan the whole buffer (G1 Task 4 review,
+    /// issue 2: O(line_count) such calls per seek).
+    pub fn set_cursor(&mut self, offset: usize) {
+        let clamped = offset.min(self.text.len());
+        self.cursor = snap_to_grapheme_boundary(&self.text, clamped);
+        self.selection = None;
+        self.goal_column = None;
+    }
+
+    /// Sets the selection to `range`, with each end independently clamped
+    /// to `text.len()` and snapped down to the nearest grapheme boundary at
+    /// or before it (both ends resolved in one pass via
+    /// `snap_two_to_grapheme_boundary`). `range.start` becomes the
+    /// selection's anchor and `range.end` its active end (the cursor) —
+    /// matching the anchor/active convention `move_left`/`move_right`/
+    /// `move_up`/`move_down`/... already use internally, so a subsequent
+    /// `move_*(extend_selection: true)` call extends from `range.end` while
+    /// `range.start` stays fixed, exactly as if the selection had been
+    /// built up via repeated extending moves.
+    ///
+    /// `range` is used verbatim, not pre-sorted: passing a "reversed" range
+    /// (`range.start > range.end`) is a deliberate, supported way to select
+    /// backward from an anchor — the anchor sits at `range.start` (here the
+    /// larger offset) and the cursor lands at `range.end` (the smaller
+    /// one). `selection()` always returns an ordered view regardless of
+    /// which direction was used to build the selection.
+    pub fn select_range(&mut self, range: Range<usize>) {
+        let len = self.text.len();
+        let (start, end) =
+            snap_two_to_grapheme_boundary(&self.text, range.start.min(len), range.end.min(len));
+        self.selection = Some(start..end);
+        self.cursor = end;
+        self.goal_column = None;
+    }
+
     #[cfg(test)]
     pub(crate) fn set_cursor_for_test(&mut self, pos: usize) {
         // Clamp to char boundary
@@ -570,5 +634,60 @@ mod tests {
         let mut b3 = MultilineBuffer::new();
         b3.insert("p\r\nq");
         assert_eq!(b3.text(), "p\nq");
+    }
+
+    // --- Fix round 1: set_cursor / select_range ---------------------------
+
+    #[test]
+    fn set_cursor_snaps_mid_grapheme_offset_down() {
+        // "🙂" occupies bytes 0..4; an offset landing inside it (2) must
+        // snap down to 0 (the start of the grapheme), not panic or land
+        // mid-character.
+        let mut b = MultilineBuffer::from_text("\u{1F642}bc");
+        b.set_cursor(2);
+        assert_eq!(b.cursor(), 0);
+        assert_eq!(b.selection(), None);
+    }
+
+    #[test]
+    fn set_cursor_clamps_out_of_bounds_offset() {
+        let mut b = MultilineBuffer::from_text("abc");
+        b.set_cursor(9999);
+        assert_eq!(b.cursor(), 3);
+    }
+
+    #[test]
+    fn select_range_snaps_mid_grapheme_offsets_down() {
+        // Both ends of the range (1 and 3) land inside the same emoji
+        // grapheme (bytes 0..4 of "🙂"); both must snap down to 0.
+        let mut b = MultilineBuffer::from_text("\u{1F642}bc");
+        b.select_range(1..3);
+        assert_eq!(b.selection(), Some(0..0));
+        assert_eq!(b.cursor(), 0);
+    }
+
+    #[test]
+    fn select_range_clamps_out_of_bounds_range() {
+        let mut b = MultilineBuffer::from_text("abc");
+        b.select_range(1..9999);
+        assert_eq!(b.selection(), Some(1..3));
+        assert_eq!(b.cursor(), 3);
+    }
+
+    #[test]
+    fn select_range_reversed_input_selects_backward_from_anchor() {
+        // Documented/chosen behaviour: a "reversed" input range
+        // (range.start > range.end) is a deliberate, supported way to
+        // select backward. The anchor sits at range.start (here the larger
+        // offset, 8) and the cursor lands at range.end (the smaller one,
+        // 2). selection() still returns an ordered view; a subsequent
+        // extend-move continues from the cursor (the active end) while the
+        // anchor stays fixed.
+        let mut b = MultilineBuffer::from_text("hello world");
+        b.select_range(8..2);
+        assert_eq!(b.selection(), Some(2..8), "selection() is always ordered");
+        assert_eq!(b.cursor(), 2, "cursor sits at range.end, the active end");
+        b.move_left(true); // extend further left from the active end
+        assert_eq!(b.selection(), Some(1..8), "anchor (8) stays fixed");
     }
 }
