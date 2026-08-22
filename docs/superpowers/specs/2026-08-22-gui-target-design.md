@@ -37,10 +37,17 @@ One window, hybrid layout (user choice "C"):
   Manager — never on disk. Connection metadata (no secrets) in a config file
   in the user profile. Connecting happens off the UI thread (fixes the
   known block_on freeze follow-up).
-- **Schema tree:** single click selects only; double-click on a table opens
-  a data preview (`SELECT * LIMIT 1000`) as a result tab tagged PREVIEW;
-  typing while the tree has focus starts speed search (DataGrip-style
-  type-to-jump/filter). Columns show name, type, PK/FK markers.
+- **Schema tree:** shows the full object catalog per schema — tables, views
+  (incl. materialized), functions, procedures, triggers, indexes,
+  sequences, constraints. Columns show name, type, nullability, default
+  value, PK/FK markers. Single click selects only; double-click on a
+  table/view opens a data preview (`SELECT * LIMIT 1000`) as a result tab
+  tagged PREVIEW; double-click on a function/procedure/trigger opens its
+  source (DDL) in a read-only text tab (same tab mechanism, text instead
+  of grid). Typing while the tree has focus starts speed search
+  (DataGrip-style type-to-jump/filter) across all object types. Object
+  availability per engine differs (SQLite: no procedures; MSSQL/pg map
+  their own catalogs) — the tree renders what the driver reports.
 - **Editor:** one multiline editor (no editor tabs). Target state includes
   tree-sitter syntax highlighting and schema-driven autocomplete (G6);
   earlier phases ship it plain. Ctrl+Enter runs, Esc cancels (unchanged).
@@ -59,8 +66,8 @@ One window, hybrid layout (user choice "C"):
 - **Grid additions:** click on header sorts locally over the Arrow buffer
   (second click reverses); per-column filter row filters locally
   (contains/=/range); Enter or double-click on a cell opens a read-only
-  full-content popup; export of the full result or selection as CSV, JSON,
-  or INSERT statements.
+  full-content popup; export of the full result or selection as CSV, TSV,
+  JSON, or INSERT statements.
 - **Column visibility:** a ☰ menu on the grid header opens a checkbox list
   of columns; unchecked columns are hidden locally (buffer unchanged,
   display-only). Per result tab, not persisted.
@@ -88,9 +95,9 @@ lands last) and pays the biggest pains first.
 | Phase | Contents | Notes |
 |---|---|---|
 | **G1 Editor & connections** | Multiline editor (plain); connection manager (form dialog, Credential Manager vault, top-bar switcher); connect off the UI thread | Kills the two worst pains from the first human test; includes the block_on-freeze follow-up |
-| **G2 Tabs & tree** | Result-tab infrastructure (buffer per tab); schema tree panel with speed search; double-click preview tabs; Ctrl+B | Also the natural home for the spill-off-UI-thread and byte-cap follow-ups (buffer work is touched anyway) |
+| **G2 Tabs & tree** | Result-tab infrastructure (buffer per tab); schema tree panel with speed search; double-click preview/DDL tabs; Ctrl+B; `SchemaSnapshot` in dbc-core grows from tables+columns to the full object model (views, functions, procedures, triggers, indexes, sequences, constraints, column defaults) with per-driver catalog queries | Also the natural home for the spill-off-UI-thread and byte-cap follow-ups (buffer work is touched anyway) |
 | **G3 History & palette** | Persistent history (SQLite), right panel, fulltext, pins, click-to-load; Ctrl+K palette | History and palette share data sources |
-| **G4 Grid+** | Local sort, column filters, cell detail popup, export CSV/JSON/INSERT; column visibility menu; FK joined columns | Mostly local additions over the buffer; FK joins need FK metadata from G2 and are the meaty half of this phase |
+| **G4 Grid+** | Local sort, column filters, cell detail popup, export CSV/TSV/JSON/INSERT; column visibility menu; FK joined columns | Mostly local additions over the buffer; FK joins need FK metadata from G2 and are the meaty half of this phase |
 | **G5 Sandbox editing** | PK detection, local diff edits, Apply dialog with generated SQL, single transaction | First write path in the app; gets its own design pass before implementation |
 | **G6 Editor pro** | Tree-sitter highlighting; schema autocomplete | Most expensive single feature, functionally least urgent |
 | **G7 DB compare** | Schema diff between two saved connections (SchemaSnapshot-based); data diff via DuckDB over Arrow buffers | Future; own brainstorm when reached |
