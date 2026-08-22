@@ -949,6 +949,14 @@ impl AppView {
                 }
                 cx.notify();
             }))
+            // Version label, right-aligned (spec: Versioning — bumped per
+            // completed phase as part of the merge checklist).
+            .child(
+                div()
+                    .ml_auto()
+                    .text_color(rgb(0x7f849c))
+                    .child(format!("dbc v{}", env!("CARGO_PKG_VERSION"))),
+            )
     }
 
     pub(crate) fn render_dropdown_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {

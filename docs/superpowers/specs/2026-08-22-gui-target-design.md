@@ -129,6 +129,16 @@ lands last) and pays the biggest pains first.
 Orthogonal, unscheduled here: MSSQL driver (odbc-api), DuckDB driver, MCP
 server (original phases 3/6 — unchanged).
 
+### Versioning (added 2026-08-22, user request)
+
+The app is versioned with semver, starting at 0.x: the minor version bumps
+once per completed phase (G1 → 0.1.0, G2 → 0.2.0, …), patch bumps for
+standalone fixes between phases; 1.0.0 when the user declares it daily-driver
+ready. The version lives in `crates/dbc-ui/Cargo.toml` (the binary crate) and
+is read at compile time via `env!("CARGO_PKG_VERSION")` — displayed in the
+top bar's right corner ("dbc v0.2.0") and in the window title. Bumping the
+version is part of each phase's merge checklist.
+
 ## 3. Architecture constraints (carried over, still binding)
 
 - `dbc-core` never sees GPUI; `dbc-ui` never sees concrete driver crates.

@@ -740,6 +740,10 @@ fn main() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some(format!("dbc v{}", env!("CARGO_PKG_VERSION")).into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
                 |window, cx| {
