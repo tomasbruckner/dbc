@@ -2,6 +2,7 @@ mod connect;
 mod grid;
 mod runner;
 mod sql_input;
+mod text_model;
 
 use std::cell::RefCell;
 use std::rc::Rc;
