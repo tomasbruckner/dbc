@@ -1,6 +1,34 @@
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
+/// Replaces "\r\n" with "\n" so that every internal `\n`-based line-splitting
+/// operation (`lines`, `line_count`, `offset_at`, `cursor_position`, ...) can
+/// safely assume LF-only line endings. Applied at every text-entry point
+/// (`from_text`, `set_text`, `insert`), so CRLF input is normalized before it
+/// ever reaches the buffer.
+fn normalize_newlines(s: &str) -> String {
+    if s.contains('\r') {
+        s.replace("\r\n", "\n")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Snaps `byte_col` (clamped to `line.len()`) down to the nearest grapheme
+/// cluster boundary at or before it, so callers (in particular `offset_at`,
+/// which feeds `move_up`/`move_down`'s goal-column tracking) never produce a
+/// cursor position that lands mid-character on a multi-byte line.
+fn snap_to_grapheme_boundary(line: &str, byte_col: usize) -> usize {
+    let clamped = byte_col.min(line.len());
+    let mut boundaries: Vec<usize> = line.grapheme_indices(true).map(|(i, _)| i).collect();
+    boundaries.push(line.len());
+    boundaries
+        .into_iter()
+        .filter(|&b| b <= clamped)
+        .max()
+        .unwrap_or(0)
+}
+
 pub struct MultilineBuffer {
     text: String,
     cursor: usize,
@@ -20,9 +48,11 @@ impl MultilineBuffer {
     }
 
     pub fn from_text(s: &str) -> Self {
+        let text = normalize_newlines(s);
+        let cursor = text.len();
         Self {
-            text: s.to_string(),
-            cursor: s.len(),
+            text,
+            cursor,
             selection: None,
             goal_column: None,
         }
@@ -33,8 +63,8 @@ impl MultilineBuffer {
     }
 
     pub fn set_text(&mut self, s: &str) {
-        self.text = s.to_string();
-        self.cursor = s.len();
+        self.text = normalize_newlines(s);
+        self.cursor = self.text.len();
         self.selection = None;
         self.goal_column = None;
     }
@@ -43,18 +73,25 @@ impl MultilineBuffer {
         self.cursor
     }
 
+    /// Always returns an ordered range (`min..max`), regardless of which
+    /// direction the selection was extended in. Internal storage may be
+    /// anchor/active (unordered); callers must be able to rely on this
+    /// accessor for slicing/rendering.
     pub fn selection(&self) -> Option<Range<usize>> {
-        self.selection.clone()
+        self.selection
+            .clone()
+            .map(|r| r.start.min(r.end)..r.start.max(r.end))
     }
 
     pub fn insert(&mut self, s: &str) {
+        let s = normalize_newlines(s);
         if let Some(sel) = self.selection.take() {
             let start = sel.start.min(sel.end);
             let end = sel.start.max(sel.end);
             self.text.drain(start..end);
             self.cursor = start;
         }
-        self.text.insert_str(self.cursor, s);
+        self.text.insert_str(self.cursor, &s);
         self.cursor += s.len();
         self.goal_column = None;
     }
@@ -105,21 +142,32 @@ impl MultilineBuffer {
     }
 
     pub fn move_left(&mut self, extend_selection: bool) {
+        // Standard editor behaviour: with an active selection and no shift
+        // held, Left collapses the cursor to the selection's left edge
+        // instead of stepping one grapheme from the active end.
+        if !extend_selection {
+            if let Some(sel) = self.selection.take() {
+                self.cursor = sel.start.min(sel.end);
+                self.goal_column = None;
+                return;
+            }
+        }
         if self.cursor > 0 {
             // Find the previous grapheme boundary
             let graphemes: Vec<(usize, &str)> = self.text.grapheme_indices(true).collect();
             for i in (0..graphemes.len()).rev() {
                 if graphemes[i].0 < self.cursor {
+                    let new_pos = graphemes[i].0;
                     if extend_selection {
                         if let Some(sel) = &mut self.selection {
-                            sel.end = graphemes[i].0;
+                            sel.end = new_pos;
                         } else {
-                            self.selection = Some(self.cursor..graphemes[i].0);
+                            self.selection = Some(self.cursor..new_pos);
                         }
                     } else {
                         self.selection = None;
                     }
-                    self.cursor = graphemes[i].0;
+                    self.cursor = new_pos;
                     break;
                 }
             }
@@ -128,33 +176,29 @@ impl MultilineBuffer {
     }
 
     pub fn move_right(&mut self, extend_selection: bool) {
-        // If cursor is past end of text, move backward to last valid position
-        if self.cursor > self.text.len() {
-            // Move backward
-            if self.cursor > 0 {
-                let graphemes: Vec<(usize, &str)> = self.text.grapheme_indices(true).collect();
-                for i in (0..graphemes.len()).rev() {
-                    if graphemes[i].0 < self.cursor {
-                        if extend_selection {
-                            if let Some(sel) = &mut self.selection {
-                                sel.end = graphemes[i].0;
-                            } else {
-                                self.selection = Some(self.cursor..graphemes[i].0);
-                            }
-                        } else {
-                            self.selection = None;
-                        }
-                        self.cursor = graphemes[i].0;
-                        break;
-                    }
-                }
+        // Standard editor behaviour: with an active selection and no shift
+        // held, Right collapses the cursor to the selection's right edge
+        // instead of stepping one grapheme from the active end.
+        if !extend_selection {
+            if let Some(sel) = self.selection.take() {
+                self.cursor = sel.start.max(sel.end);
+                self.goal_column = None;
+                return;
             }
-        } else if self.cursor < self.text.len() {
-            // Move forward normally
+        }
+        // Every code path that sets `self.cursor` keeps it <= text.len();
+        // this should never fire via the public API. Surface the invariant
+        // violation in debug builds instead of silently moving backward.
+        debug_assert!(self.cursor <= self.text.len());
+        if self.cursor < self.text.len() {
             let graphemes: Vec<(usize, &str)> = self.text.grapheme_indices(true).collect();
             for i in 0..graphemes.len() {
-                if graphemes[i].0 == self.cursor && i + 1 < graphemes.len() {
-                    let next_pos = graphemes[i + 1].0;
+                if graphemes[i].0 == self.cursor {
+                    let next_pos = if i + 1 < graphemes.len() {
+                        graphemes[i + 1].0
+                    } else {
+                        self.text.len()
+                    };
                     if extend_selection {
                         if let Some(sel) = &mut self.selection {
                             sel.end = next_pos;
@@ -282,6 +326,7 @@ impl MultilineBuffer {
     pub fn select_all(&mut self) {
         self.selection = Some(0..self.text.len());
         self.cursor = self.text.len();
+        self.goal_column = None;
     }
 
     pub fn line_count(&self) -> usize {
@@ -296,6 +341,9 @@ impl MultilineBuffer {
         self.text.split('\n')
     }
 
+    /// Returns (line index, byte column within line) — the column is a raw
+    /// byte offset into the line, consistent with `offset_at`'s `byte_col`
+    /// parameter (NOT a character count).
     pub fn cursor_position(&self) -> (usize, usize) {
         let mut line = 0;
         let mut col = 0;
@@ -308,13 +356,19 @@ impl MultilineBuffer {
                 line += 1;
                 col = 0;
             } else {
-                col += 1;
+                col += ch.len_utf8();
             }
         }
 
         (line, col)
     }
 
+    /// Converts (line, byte_col) to an absolute byte offset. `line` is
+    /// clamped to the last line, `byte_col` is clamped to the line length,
+    /// and — defensively, since callers such as `move_up`/`move_down` may
+    /// pass in a goal column computed against a *different* line's byte
+    /// layout — snapped down to the nearest grapheme boundary so the result
+    /// always lands on a valid, splittable position.
     pub fn offset_at(&self, line: usize, byte_col: usize) -> usize {
         let lines: Vec<&str> = self.text.split('\n').collect();
 
@@ -328,7 +382,7 @@ impl MultilineBuffer {
         }
 
         let line_text = lines[line];
-        let clamped_col = byte_col.min(line_text.len());
+        let clamped_col = snap_to_grapheme_boundary(line_text, byte_col);
         offset + clamped_col
     }
 
@@ -418,5 +472,103 @@ mod tests {
         assert_eq!(b.selection(), Some(1..6));
         b.delete();
         assert_eq!(b.text(), "ab\nccc");
+    }
+
+    // --- Fix round 1 regression tests -------------------------------------
+
+    #[test]
+    fn multibyte_vertical_move_then_backspace_does_not_panic() {
+        // Reproduction from the review (B1): cursor_position() used to
+        // return a char *count* instead of a byte *column*, so move_down's
+        // goal-column tracking could hand offset_at() a column that split a
+        // multi-byte character on the target line, panicking on backspace.
+        let mut b = MultilineBuffer::from_text("\u{1F642}\u{1F642}x\n\u{0159}\u{1F642}z");
+        b.set_cursor_for_test(9); // end of line 0 ("🙂🙂x" = 4+4+1 = 9 bytes)
+        assert_eq!(b.cursor_position(), (0, 9)); // byte column, not char count (3)
+        b.move_down(false);
+        // Must not panic:
+        b.backspace();
+        // Sanity: text is still valid UTF-8 and shorter than before.
+        assert!(b.text().len() < "\u{1F642}\u{1F642}x\n\u{0159}\u{1F642}z".len());
+    }
+
+    #[test]
+    fn vertical_move_snaps_goal_column_to_char_boundary() {
+        // B1: when the goal column lands strictly *inside* a multi-byte
+        // character on the target line (not just past its end), the cursor
+        // must snap to the nearest grapheme boundary at or before it rather
+        // than landing mid-character.
+        let mut b = MultilineBuffer::from_text("abc\na\u{1F642}bc");
+        b.set_cursor_for_test(3); // end of line 0, byte col 3
+        assert_eq!(b.cursor_position(), (0, 3));
+        b.move_down(false);
+        // Goal col 3 falls inside the emoji (bytes 1..5) on line 1 "a🙂bc";
+        // must snap down to col 1 (right after 'a'), not panic.
+        assert_eq!(b.cursor_position(), (1, 1));
+        b.backspace();
+        assert_eq!(b.text(), "abc\n\u{1F642}bc");
+    }
+
+    #[test]
+    fn selection_is_always_ordered_when_extending_backward() {
+        // B2: selection() must return an ordered range regardless of drag
+        // direction, even though internal storage may be anchor/active.
+        let mut b = MultilineBuffer::from_text("hello world");
+        b.set_cursor_for_test(5);
+        b.move_left(true);
+        b.move_left(true);
+        b.move_left(true);
+        let sel = b.selection().expect("selection should be active");
+        assert!(sel.start <= sel.end, "selection must be ordered: {:?}", sel);
+        assert_eq!(sel, 2..5);
+    }
+
+    #[test]
+    fn move_left_right_collapse_to_selection_edge() {
+        // B3: with extend_selection == false and an active selection,
+        // move_left/move_right must collapse to the selection's left/right
+        // edge, not step one grapheme from the active end.
+        let mut b = MultilineBuffer::from_text("hello world");
+        b.move_home(false);
+        for _ in 0..5 {
+            b.move_right(true);
+        } // select "hello", cursor at active end = 5 (right edge)
+        assert_eq!(b.selection(), Some(0..5));
+
+        let mut left = MultilineBuffer::from_text("hello world");
+        left.move_home(false);
+        for _ in 0..5 {
+            left.move_right(true);
+        }
+        left.move_left(false);
+        assert_eq!(left.cursor(), 0, "move_left should collapse to left edge");
+        assert_eq!(left.selection(), None);
+
+        let mut right = MultilineBuffer::from_text("hello world");
+        right.set_cursor_for_test(5);
+        for _ in 0..5 {
+            right.move_left(true);
+        } // select "hello" by dragging backward, cursor at active end = 0 (left edge)
+        assert_eq!(right.selection(), Some(0..5));
+        right.move_right(false);
+        assert_eq!(right.cursor(), 5, "move_right should collapse to right edge");
+        assert_eq!(right.selection(), None);
+    }
+
+    #[test]
+    fn crlf_input_is_normalized_on_entry() {
+        // Minor: CRLF is normalized to LF at every text-entry point so the
+        // internal '\n'-based line model stays consistent.
+        let b = MultilineBuffer::from_text("a\r\nb\r\nc");
+        assert_eq!(b.text(), "a\nb\nc");
+        assert_eq!(b.line_count(), 3);
+
+        let mut b2 = MultilineBuffer::new();
+        b2.set_text("x\r\ny");
+        assert_eq!(b2.text(), "x\ny");
+
+        let mut b3 = MultilineBuffer::new();
+        b3.insert("p\r\nq");
+        assert_eq!(b3.text(), "p\nq");
     }
 }
