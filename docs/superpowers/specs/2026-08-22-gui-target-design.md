@@ -3,7 +3,7 @@
 Date: 2026-08-22
 Status: awaiting user review
 Scope: target ("fairly final") UI for the dbc client and its decomposition into
-phases G1–G8. Each phase gets its own implementation plan; G5+ get their own
+phases G1–G11. Each phase gets its own implementation plan; G5+ get their own
 design pass before implementation. This spec supersedes the UI portions of the
 phase 4/5 roadmap sketch in the 2026-08-21 spec; driver phases (MSSQL, DuckDB,
 MCP) are unchanged and orthogonal.
