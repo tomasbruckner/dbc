@@ -30,9 +30,9 @@ use dbc_state::{
     ViewPrefsStore,
 };
 use gpui::{
-    actions, div, prelude::*, px, rgb, rgba, size, AnyElement, App, Bounds, ClipboardItem,
-    Context, Entity, Focusable, KeyBinding, ScrollDelta, ScrollWheelEvent, Window, WindowBounds,
-    WindowOptions,
+    actions, div, prelude::*, px, rgb, rgba, size, uniform_list, AnyElement, App, Bounds,
+    ClipboardItem, Context, Entity, Focusable, KeyBinding, ScrollDelta, ScrollWheelEvent, Window,
+    WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use grid::{GridEvent, ResultGrid};
@@ -42,7 +42,10 @@ use schema_tree::{SchemaTree, TreeEvent};
 use sql_input::SqlInput;
 use tabs::{collapse_title, ResultTab, TabContent, Tabs};
 
-actions!(dbc, [RunQuery, RunQueryUnlimited, CancelQuery, ToggleTree, ToggleHistory, OpenPalette]);
+actions!(
+    dbc,
+    [RunQuery, RunQueryUnlimited, CancelQuery, ToggleTree, ToggleHistory, OpenPalette, OpenAutocomplete]
+);
 
 /// G3 Task 5: Ctrl+K command palette state — created on `OpenPalette`,
 /// dropped on close/execute. `items`/`selected` are recomputed from
@@ -57,6 +60,44 @@ struct PaletteState {
     /// The text `items` was last computed from — compared against `input`'s
     /// live text each render to detect an edit.
     last_query: String,
+}
+
+/// G6 T7: autocomplete popup state — `None` when closed. `candidates` is
+/// recomputed lazily (`AppView::refresh_autocomplete`, driven by
+/// `last_ac_text`/`last_ac_cursor`), exactly the `history_search`/
+/// `last_history_query` lazy-diff idiom (history_panel.rs's module doc
+/// comment) design §2 calls out by name.
+struct AutocompleteState {
+    candidates: Vec<autocomplete::Candidate>,
+    selected: usize,
+}
+
+/// Pure: clamps `selected + delta` into `[0, len.saturating_sub(1)]` — no
+/// wraparound (design §2: "Up/Down navigate ... (clamped)"). `len == 0`
+/// always yields `0` (the popup is never rendered with zero candidates —
+/// `refresh_autocomplete`/`on_open_autocomplete` both close it instead — but
+/// this stays total rather than panicking on a hypothetical empty list).
+fn move_selection(selected: usize, len: usize, delta: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let max = (len - 1) as i32;
+    (selected as i32 + delta).clamp(0, max) as usize
+}
+
+/// Pure: given `text`, `cursor`, and the candidate's `text` to insert,
+/// returns the byte range to replace (the identifier prefix ending at
+/// `cursor`, or an empty range at `cursor` if there is none — e.g. a
+/// force-triggered accept with no partial prefix typed) and the final
+/// string. Extracted so T7's `accept_completion` wiring has a pure,
+/// directly-testable core instead of only being exercisable through a live
+/// `SqlInput` (plan T7 step 1).
+fn completion_edit(text: &str, cursor: usize, insert: &str) -> (std::ops::Range<usize>, String) {
+    let ctx = autocomplete::cursor_context(text, cursor);
+    let start = cursor - ctx.prefix.len();
+    let mut new_text = text.to_string();
+    new_text.replace_range(start..cursor, insert);
+    (start..cursor, new_text)
 }
 
 /// G2 Task 7: SQL builder for `TreeEvent::OpenPreview`. Pure — no GPUI, no
@@ -653,6 +694,15 @@ struct AppView {
     /// is pending; see `DiscardConfirmState`'s doc comment for the three
     /// trigger sites.
     discard_confirm: Option<DiscardConfirmState>,
+    // --- G6 Task 7: schema autocomplete popup ---
+    /// `None` when the popup is closed — see `AutocompleteState`'s doc
+    /// comment for the lazy-diff recompute idiom.
+    autocomplete: Option<AutocompleteState>,
+    /// The SQL text `autocomplete` was last computed from — compared
+    /// against `self.sql`'s live text/cursor each render
+    /// (`refresh_autocomplete`) to decide whether a recompute is needed.
+    last_ac_text: String,
+    last_ac_cursor: usize,
 }
 
 /// Stable identity for a `ConnectSpec`, used only to decide whether two
@@ -1717,6 +1767,212 @@ impl AppView {
                 .bg(rgba(0x00000099))
                 .occlude()
                 .child(panel)
+                .into_any_element(),
+        )
+    }
+
+    /// G6 T7: force-trigger (`Ctrl+Space`, global binding, design §2) — opens
+    /// the popup with the FULL candidate set (empty prefix, bypassing
+    /// whatever partial identifier/qualifier the cursor happens to sit in),
+    /// regardless of the typing-trigger gating `refresh_autocomplete` does.
+    /// No-ops while a modal is open, same posture as `on_open_palette`.
+    fn on_open_autocomplete(&mut self, _: &OpenAutocomplete, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        let text = self.sql.read(cx).text();
+        let cursor = self.sql.read(cx).cursor();
+        let suppressed = self.sql.read(cx).cursor_in_suppressed_span();
+        let snapshot = self.tree.read(cx).snapshot();
+        let candidates = autocomplete::candidates(&text, cursor, snapshot, true, suppressed);
+        self.autocomplete =
+            (!candidates.is_empty()).then(|| AutocompleteState { candidates, selected: 0 });
+        // Keep the lazy-diff cache in sync so the SAME render's
+        // `refresh_autocomplete` (which runs before this popup is drawn,
+        // but AFTER this handler since actions dispatch before re-render)
+        // doesn't immediately reconsider — text/cursor are unchanged by a
+        // force-trigger, so this is a no-op compare either way, but staying
+        // explicit here avoids relying on that coincidence.
+        self.last_ac_text = text;
+        self.last_ac_cursor = cursor;
+        cx.notify();
+    }
+
+    /// G6 T7: the typing-trigger lazy-diff recompute (design §2 / plan T7
+    /// grounding — same idiom as `history_search`/`last_history_query`),
+    /// called at the top of every `Render::render`, BEFORE the popup is
+    /// drawn. Also the one place responsible for every "close the popup"
+    /// condition that isn't `Escape`/accept: losing focus, a params (or any
+    /// other) modal opening, the cursor leaving a completable position
+    /// (typing a space/most punctuation, arrow-key/mouse cursor movement
+    /// that isn't popup navigation) — all of these change what
+    /// `self.sql`'s focus/text/cursor look like, which this function reads
+    /// fresh every render.
+    fn refresh_autocomplete(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !self.sql.focus_handle(cx).is_focused(window) || self.modal.is_some() {
+            self.autocomplete = None;
+            return;
+        }
+
+        let text = self.sql.read(cx).text();
+        let cursor = self.sql.read(cx).cursor();
+        if text == self.last_ac_text && cursor == self.last_ac_cursor {
+            return;
+        }
+        self.last_ac_text = text.clone();
+        self.last_ac_cursor = cursor;
+
+        let suppressed = self.sql.read(cx).cursor_in_suppressed_span();
+        let ctx = autocomplete::cursor_context(&text, cursor);
+        if suppressed || (ctx.prefix.is_empty() && ctx.qualifier.is_none()) {
+            self.autocomplete = None;
+            return;
+        }
+
+        let snapshot = self.tree.read(cx).snapshot();
+        let candidates = autocomplete::candidates(&text, cursor, snapshot, false, suppressed);
+        self.autocomplete =
+            (!candidates.is_empty()).then(|| AutocompleteState { candidates, selected: 0 });
+    }
+
+    fn on_ac_up(&mut self, _: &sql_input::Up, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ac) = &mut self.autocomplete else { return };
+        ac.selected = move_selection(ac.selected, ac.candidates.len(), -1);
+        cx.notify();
+    }
+
+    fn on_ac_down(&mut self, _: &sql_input::Down, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ac) = &mut self.autocomplete else { return };
+        ac.selected = move_selection(ac.selected, ac.candidates.len(), 1);
+        cx.notify();
+    }
+
+    /// Shared accept path for both `Newline` (Enter) and `Tab` — see
+    /// `on_ac_confirm`/`on_ac_confirm_tab`. Inserts the selected candidate's
+    /// `text` via `SqlInput::accept_completion`, using `completion_edit`'s
+    /// pure range computation for the prefix length (design §2's "Enter/Tab
+    /// accept").
+    fn accept_selected_completion(&mut self, cx: &mut Context<Self>) {
+        let Some(ac) = &self.autocomplete else { return };
+        let Some(candidate) = ac.candidates.get(ac.selected) else { return };
+        let insert = candidate.text.clone();
+        let text = self.sql.read(cx).text();
+        let cursor = self.sql.read(cx).cursor();
+        let (range, _) = completion_edit(&text, cursor, &insert);
+        let prefix_len = cursor - range.start;
+
+        self.sql.update(cx, |s, cx| s.accept_completion(prefix_len, &insert, cx));
+        self.autocomplete = None;
+        self.sql.update(cx, |s, _| s.set_autocomplete_active(false));
+        // Sync the lazy-diff cache to the post-accept text/cursor so the
+        // very next render's `refresh_autocomplete` doesn't compare against
+        // stale pre-accept values.
+        self.last_ac_text = self.sql.read(cx).text();
+        self.last_ac_cursor = self.sql.read(cx).cursor();
+        cx.notify();
+    }
+
+    fn on_ac_confirm(&mut self, _: &sql_input::Newline, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.autocomplete.is_none() {
+            return;
+        }
+        self.accept_selected_completion(cx);
+    }
+
+    fn on_ac_confirm_tab(&mut self, _: &sql_input::Tab, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.autocomplete.is_none() {
+            return;
+        }
+        self.accept_selected_completion(cx);
+    }
+
+    fn on_ac_escape(&mut self, _: &sql_input::Escape, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.autocomplete.is_none() {
+            return;
+        }
+        self.autocomplete = None;
+        self.sql.update(cx, |s, _| s.set_autocomplete_active(false));
+        cx.notify();
+    }
+
+    /// G6 T7: floating popup, anchored just below the cursor via
+    /// `SqlInput::cursor_screen_bounds()` (design §2). `uniform_list` —
+    /// same mechanism `schema_tree.rs`/`history_panel.rs`/`grid.rs` use for
+    /// their scrollable rows — capped to 8 visible rows (design: "Max 8
+    /// visible rows, scrollable"); `autocomplete::candidates` itself already
+    /// caps the underlying set at 20. `None` (renders nothing) when closed,
+    /// when there's no live cursor position to anchor to (e.g. scrolled out
+    /// of view — `cursor_screen_bounds`'s own documented degradation), or
+    /// while a modal is open (belt and suspenders alongside
+    /// `refresh_autocomplete`'s own guard).
+    fn render_autocomplete_popup(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.modal.is_some() {
+            return None;
+        }
+        let ac = self.autocomplete.as_ref()?;
+        let candidates = ac.candidates.clone();
+        let selected = ac.selected;
+        let bounds = self.sql.read(cx).cursor_screen_bounds()?;
+
+        const ROW_H: gpui::Pixels = px(22.);
+        let visible_rows = candidates.len().min(8);
+
+        let list = uniform_list(
+            "autocomplete-list",
+            candidates.len(),
+            cx.processor(move |_this, range: std::ops::Range<usize>, _window, cx| {
+                let mut items = Vec::with_capacity(range.len());
+                for ix in range {
+                    let c = candidates[ix].clone();
+                    let is_selected = ix == selected;
+                    let bg = if is_selected { rgb(0x45475a) } else { rgb(0x1e1e2e) };
+                    let (kind_label, kind_color) = match c.kind {
+                        autocomplete::CandidateKind::Keyword => ("K", rgb(0x89b4fa)),
+                        autocomplete::CandidateKind::Table => ("T", rgb(0xa6e3a1)),
+                        autocomplete::CandidateKind::Column => ("C", rgb(0xf9e2af)),
+                    };
+                    let label = c.label.clone();
+                    items.push(
+                        div()
+                            .id(("ac-item", ix))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .h(ROW_H)
+                            .px_2()
+                            .cursor_pointer()
+                            .bg(bg)
+                            .text_color(rgb(0xcdd6f4))
+                            .hover(|s| s.bg(rgb(0x313244)))
+                            .child(div().w(px(10.)).text_size(px(11.)).text_color(kind_color).child(kind_label))
+                            .child(div().flex_1().overflow_hidden().child(label))
+                            .on_click(cx.listener(move |view, _, _window, cx| {
+                                if let Some(a) = &mut view.autocomplete {
+                                    a.selected = ix;
+                                }
+                                view.accept_selected_completion(cx);
+                            })),
+                    );
+                }
+                items
+            }),
+        )
+        .h(ROW_H * visible_rows);
+
+        Some(
+            div()
+                .absolute()
+                .left(bounds.left())
+                .top(bounds.top() + bounds.size.height)
+                .w(px(280.))
+                .max_h(ROW_H * 8)
+                .bg(rgb(0x1e1e2e))
+                .border_1()
+                .border_color(rgb(0x45475a))
+                .rounded_md()
+                .occlude()
+                .child(list)
                 .into_any_element(),
         )
     }
@@ -3054,7 +3310,15 @@ impl AppView {
 }
 
 impl Render for AppView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // G6 T7: lazy-diff typing-trigger recompute, BEFORE the popup is
+        // drawn below (design §2 grounding) — then sync the flag T5's
+        // `SqlInput::up`/`down`/`newline` check to decide whether to
+        // consume or propagate (keyboard precedence, plan T7 step 3).
+        self.refresh_autocomplete(window, cx);
+        let ac_active = self.autocomplete.is_some();
+        self.sql.update(cx, |s, _| s.set_autocomplete_active(ac_active));
+
         // The SQL editor + tab strip + tab content column, unchanged from
         // pre-Task-6 except that it's now one column in a horizontal row
         // rather than filling the whole window body.
@@ -3066,11 +3330,21 @@ impl Render for AppView {
             .child(
                 // Fixed height of 8 lines (SqlInput's own line_height is
                 // px(20.), see sql_input.rs render()); the input scrolls
-                // internally once the buffer grows past that.
+                // internally once the buffer grows past that. The
+                // Up/Down/Newline/Escape/Tab handlers below only ever act
+                // when `autocomplete_active` — see each's own doc comment
+                // — so this is a no-op addition to this div's existing
+                // behavior whenever the popup is closed (plan T7 step 3,
+                // keyboard precedence item 3).
                 div()
                     .h(px(20. * 8. + 4. * 2.))
                     .px_2()
                     .bg(rgb(0x181825))
+                    .on_action(cx.listener(Self::on_ac_up))
+                    .on_action(cx.listener(Self::on_ac_down))
+                    .on_action(cx.listener(Self::on_ac_confirm))
+                    .on_action(cx.listener(Self::on_ac_confirm_tab))
+                    .on_action(cx.listener(Self::on_ac_escape))
                     .child(self.sql.clone()),
             );
 
@@ -3118,6 +3392,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_toggle_tree))
             .on_action(cx.listener(Self::on_toggle_history))
             .on_action(cx.listener(Self::on_open_palette))
+            .on_action(cx.listener(Self::on_open_autocomplete))
             .child(self.render_top_bar(cx))
             .child(body);
 
@@ -3149,6 +3424,14 @@ impl Render for AppView {
             root = root.child(overlay);
         }
         if let Some(overlay) = self.render_apply_dialog_overlay(cx) {
+            root = root.child(overlay);
+        }
+        // G6 T7: last, so it paints above every other overlay it could
+        // plausibly coexist with (in practice only while typing in the SQL
+        // editor with nothing else open — `render_autocomplete_popup`/
+        // `refresh_autocomplete` both already close it whenever a modal is
+        // up).
+        if let Some(overlay) = self.render_autocomplete_popup(cx) {
             root = root.child(overlay);
         }
         root
@@ -3203,6 +3486,9 @@ fn main() {
             KeyBinding::new("ctrl-b", ToggleTree, None),
             KeyBinding::new("ctrl-h", ToggleHistory, None),
             KeyBinding::new("ctrl-k", OpenPalette, None),
+            // G6 T7: force-trigger, same "global, context None" precedent
+            // as `RunQuery`/`OpenPalette` above (design §2).
+            KeyBinding::new("ctrl-space", OpenAutocomplete, None),
         ]);
         sql_input::bind_keys(cx);
         grid::bind_keys(cx);
@@ -3278,6 +3564,9 @@ fn main() {
                             param_values,
                             apply_dialog: None,
                             discard_confirm: None,
+                            autocomplete: None,
+                            last_ac_text: String::new(),
+                            last_ac_cursor: 0,
                         }
                     })
                 },
@@ -3792,5 +4081,62 @@ mod query_params_tests {
         // through to the caller.
         let out = build_param_sql("SELECT ':x", &["x".to_string()], &[("1".to_string(), false)]);
         assert!(out.is_err());
+    }
+}
+
+#[cfg(test)]
+mod move_selection_tests {
+    use super::*;
+
+    #[test]
+    fn moves_down_within_bounds() {
+        assert_eq!(move_selection(2, 5, 1), 3);
+    }
+
+    #[test]
+    fn moves_up_within_bounds() {
+        assert_eq!(move_selection(2, 5, -1), 1);
+    }
+
+    #[test]
+    fn clamps_at_the_top_no_wraparound() {
+        assert_eq!(move_selection(0, 5, -1), 0);
+    }
+
+    #[test]
+    fn clamps_at_the_bottom_no_wraparound() {
+        assert_eq!(move_selection(4, 5, 1), 4);
+    }
+
+    #[test]
+    fn empty_list_always_yields_zero() {
+        assert_eq!(move_selection(0, 0, 1), 0);
+        assert_eq!(move_selection(0, 0, -1), 0);
+    }
+}
+
+#[cfg(test)]
+mod completion_edit_tests {
+    use super::*;
+
+    #[test]
+    fn replaces_partial_prefix_with_full_candidate() {
+        let (range, new_text) = completion_edit("SELECT sel", 10, "SELECT");
+        assert_eq!(range, 7..10);
+        assert_eq!(new_text, "SELECT SELECT");
+    }
+
+    #[test]
+    fn force_trigger_with_no_prefix_inserts_at_cursor() {
+        let (range, new_text) = completion_edit("SELECT ", 7, "FROM");
+        assert_eq!(range, 7..7);
+        assert_eq!(new_text, "SELECT FROM");
+    }
+
+    #[test]
+    fn qualified_completion_only_replaces_the_column_part() {
+        let (range, new_text) = completion_edit("SELECT o.tot", 12, "total");
+        assert_eq!(range, 9..12);
+        assert_eq!(new_text, "SELECT o.total");
     }
 }

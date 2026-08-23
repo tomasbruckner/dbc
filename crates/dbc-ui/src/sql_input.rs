@@ -82,6 +82,15 @@ actions!(
         Paste,
         Cut,
         Copy,
+        // G6 T7: new key-context-scoped actions for the autocomplete popup.
+        // Neither is bound to buffer-mutating behavior here — both always
+        // propagate (see `on_escape`/`on_tab`) so `AppView`'s wrapper-div
+        // handlers (bound on the SAME action type, see `main.rs`) can do
+        // popup close/accept when the popup is open, or (for `Escape`) let
+        // the app-level global `"escape" -> CancelQuery` binding still fire
+        // when it's closed.
+        Escape,
+        Tab,
     ]
 );
 
@@ -111,6 +120,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", End, None),
         KeyBinding::new("enter", Newline, None),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, None),
+        // G6 T7: context-scoped so a "SqlInput"-focused Escape/Tab is seen
+        // by `SqlInput::on_escape`/`on_tab` first (bubble phase visits the
+        // focused element before any ancestor) and can choose to propagate
+        // to `AppView`'s wrapper-div handlers or (Escape only) the global
+        // `"escape" -> CancelQuery` binding — same precedence mechanism
+        // `palette.rs`'s own `"Palette"`-scoped Escape binding already
+        // proves (main.rs's `CancelQuery` doc comment).
+        KeyBinding::new("escape", Escape, Some("SqlInput")),
+        KeyBinding::new("tab", Tab, Some("SqlInput")),
     ]);
 }
 
@@ -337,19 +355,42 @@ impl SqlInput {
     }
 
     /// Current cursor byte offset (G6 T5, consumed by T7's autocomplete
-    /// seam — not yet called anywhere in `dbc-ui` until T7 lands, hence the
-    /// `allow` below, same convention as `sql_highlight.rs`/`autocomplete.rs`
-    /// carried for their own pre-T7/T5 gaps).
-    #[allow(dead_code)] // TODO(T7): remove allow once AppView calls this
+    /// seam — `AppView::refresh_autocomplete`'s lazy-diff trigger).
     pub fn cursor(&self) -> usize {
         self.buffer.cursor()
     }
 
+    /// True if `cursor()` currently falls inside a string/comment highlight
+    /// span (T4's `suppresses_completion`) — the autocomplete trigger's
+    /// suppression check (design §2), consumed by `AppView`'s
+    /// `refresh_autocomplete`/`on_open_autocomplete`.
+    pub fn cursor_in_suppressed_span(&self) -> bool {
+        let c = self.buffer.cursor();
+        self.highlights.iter().any(|h| h.suppresses_completion && h.range.contains(&c))
+    }
+
     /// AppView-driven: true while T7's autocomplete popup is open. See the
     /// `autocomplete_active` field doc.
-    #[allow(dead_code)] // TODO(T7): remove allow once AppView calls this
     pub fn set_autocomplete_active(&mut self, active: bool) {
         self.autocomplete_active = active;
+    }
+
+    /// G6 T7: replaces the `prefix_len`-byte identifier prefix immediately
+    /// before the cursor with `text` — the range/text math is
+    /// `AppView::completion_edit`'s pure, unit-tested logic; this is the
+    /// live-buffer surgery that actually applies it (`buffer.select_range`
+    /// + `buffer.insert`, same shape as `newline`/`backspace`), then
+    /// re-kicks highlighting so T5's debounced re-highlight picks up the
+    /// inserted text.
+    pub fn accept_completion(&mut self, prefix_len: usize, text: &str, cx: &mut Context<Self>) {
+        let cursor = self.buffer.cursor();
+        let start = cursor.saturating_sub(prefix_len);
+        self.buffer.select_range(start..cursor);
+        self.buffer.insert(text);
+        self.marked_range = None;
+        self.follow_cursor = true;
+        self.kick_highlight(cx);
+        cx.notify();
     }
 
     /// Screen-space pixel bounds of a single-point caret at the CURRENT
@@ -359,7 +400,6 @@ impl SqlInput {
     /// Mirrors `EntityInputHandler::bounds_for_range`'s existing lookup
     /// logic, specialized to a single point at the live cursor rather than
     /// an arbitrary UTF-16 range.
-    #[allow(dead_code)] // TODO(T7): remove allow once AppView calls this
     pub fn cursor_screen_bounds(&self) -> Option<Bounds<Pixels>> {
         let bounds = self.last_bounds?;
         let line_height = self.last_line_height?;
@@ -578,6 +618,24 @@ impl SqlInput {
         self.follow_cursor = true;
         self.kick_highlight(cx);
         cx.notify();
+    }
+
+    /// G6 T7: always propagates — never consumed here. When the popup is
+    /// open (`autocomplete_active`), `AppView`'s wrapper-div handler (bound
+    /// on this SAME action type) closes it; when it's closed, propagating
+    /// lets `Escape` fall through to the global `"escape" -> CancelQuery`
+    /// binding, preserving today's cancel-a-running-query behavior exactly
+    /// (design §2 / plan T7 step 3, item 4).
+    fn on_escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
+        cx.propagate();
+    }
+
+    /// G6 T7: always propagates — mirrors `on_escape`. When the popup is
+    /// open, `AppView`'s wrapper-div handler accepts the selected
+    /// completion; otherwise this preserves `Tab`'s prior no-op behavior (no
+    /// binding existed anywhere for it before this task).
+    fn on_tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
+        cx.propagate();
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
@@ -1152,6 +1210,8 @@ impl Render for SqlInput {
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
             .on_action(cx.listener(Self::newline))
+            .on_action(cx.listener(Self::on_escape))
+            .on_action(cx.listener(Self::on_tab))
             .on_action(cx.listener(Self::show_character_palette))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))

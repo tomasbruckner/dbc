@@ -13,11 +13,7 @@
 //!
 //! T6 (this file) is a parallel-batch task with no dependency on T7 (the
 //! `AppView` seam that wires `candidates()`/`resolve_aliases()` into the
-//! editor) — until that wiring lands, this module's public surface has no
-//! caller in `dbc-ui` outside its own tests, hence the module-level
-//! `#![allow(dead_code)]` (same convention `sandbox.rs` used to carry for
-//! the same reason; remove this once T7 lands).
-#![allow(dead_code)]
+//! editor) — T7 (`main.rs`) is now that caller.
 
 use dbc_core::SchemaSnapshot;
 use std::collections::{HashMap, HashSet};
