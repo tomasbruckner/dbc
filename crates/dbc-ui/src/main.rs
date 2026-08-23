@@ -9,6 +9,7 @@ mod row_view;
 mod runner;
 mod sandbox;
 mod schema_tree;
+mod sql_highlight;
 mod sql_input;
 mod tabs;
 mod text_model;
