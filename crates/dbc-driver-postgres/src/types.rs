@@ -96,6 +96,39 @@ impl ColBuilder {
     }
 }
 
+/// Decodes a `json`/`jsonb` column's wire bytes to its UTF-8 text.
+/// `json` is "JSON stored as text" (postgres-types' own doc comment on
+/// `Type::JSON`) — its wire bytes ARE the JSON text verbatim. `jsonb`'s
+/// binary wire format additionally carries a leading 1-byte format-version
+/// tag (currently always `1`) before the same UTF-8 JSON text (Postgres
+/// source: `jsonb_send`/`jsonb_recv`, `src/backend/utils/adt/jsonb.c`).
+fn decode_json_bytes(ty: &Type, raw: &[u8]) -> Result<String, Box<dyn StdError + Sync + Send>> {
+    let text_bytes = if *ty == Type::JSONB { raw.get(1..).unwrap_or(&[]) } else { raw };
+    Ok(std::str::from_utf8(text_bytes)?.to_string())
+}
+
+/// `FromSql` wrapper carrying `decode_json_bytes` — `postgres-types`' own
+/// `impl FromSql for String` does NOT accept `Type::JSON`/`Type::JSONB`
+/// (confirmed against `postgres-types-0.2.14/src/lib.rs`: `<&str as
+/// FromSql>::accepts` only allows `VARCHAR`/`TEXT`/`BPCHAR`/`NAME`/
+/// `UNKNOWN`/`citext`/`ltree`/`lquery`/`ltxtquery`), so without this
+/// wrapper `row.try_get::<_, Option<String>>` on a `json`/`jsonb` column
+/// fails `accepts` and falls through to the `AnyValue` placeholder path
+/// below (`"<oid 114>"`/`"<oid 3802>"` instead of the real JSON text) — a
+/// real bug this fixes, discovered while proving G13 T2's docker-gated
+/// live `EXPLAIN (FORMAT JSON)` round trip end to end.
+struct JsonText(String);
+
+impl<'a> FromSql<'a> for JsonText {
+    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn StdError + Sync + Send>> {
+        decode_json_bytes(ty, raw).map(JsonText)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::JSON | Type::JSONB)
+    }
+}
+
 /// Legal Postgres values exist that the target Rust type can't represent —
 /// NUMERIC 'NaN' (`rust_decimal` has no NaN), 'infinity'/'-infinity'
 /// timestamps and dates (chrono has no such value), and dates outside
@@ -136,9 +169,43 @@ fn text_value(row: &Row, i: usize) -> Option<String> {
             Ok(v) => v.map(|v| v.to_string()),
             Err(_) => decode_error(),
         },
+        Type::JSON | Type::JSONB => match row.try_get::<_, Option<JsonText>>(i) {
+            Ok(v) => v.map(|j| j.0),
+            Err(_) => decode_error(),
+        },
         _ => match row.try_get::<_, Option<AnyValue>>(i) {
             Ok(v) => v.map(|_| format!("<oid {}>", t.oid())),
             Err(_) => decode_error(),
         },
+    }
+}
+
+#[cfg(test)]
+mod json_decode_tests {
+    use super::*;
+
+    #[test]
+    fn json_bytes_decode_verbatim_no_prefix() {
+        let raw = br#"{"a":1}"#;
+        assert_eq!(decode_json_bytes(&Type::JSON, raw).unwrap(), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn jsonb_bytes_strip_leading_version_byte() {
+        let mut raw = vec![1u8]; // jsonb wire format-version tag
+        raw.extend_from_slice(br#"{"a":1}"#);
+        assert_eq!(decode_json_bytes(&Type::JSONB, &raw).unwrap(), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn jsonb_bytes_empty_after_stripping_prefix_is_empty_string_not_panic() {
+        let raw = vec![1u8]; // version byte only, no payload
+        assert_eq!(decode_json_bytes(&Type::JSONB, &raw).unwrap(), "");
+    }
+
+    #[test]
+    fn invalid_utf8_is_err_not_panic() {
+        let raw = vec![0xff, 0xfe];
+        assert!(decode_json_bytes(&Type::JSON, &raw).is_err());
     }
 }
