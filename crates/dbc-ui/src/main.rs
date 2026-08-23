@@ -599,6 +599,32 @@ struct DiscardConfirmState {
     action: PendingDiscard,
 }
 
+/// G7 T6: the pending-fetch state `connections_ui::confirm_compare_dialog`
+/// hands to `AppView::on_compare_schema_pair_ready` once `fetch_schema_pair`
+/// resolves. `label_a`/`label_b` are precomputed display labels ("{name}
+/// ({engine})") for the eventual Compare tab title; `conn_a`/`conn_b` +
+/// their secrets are carried through so a failed-leg retry (T7's error
+/// banner) can re-dispatch without re-resolving the vault. `generation`
+/// mirrors `schema_fetch_generation`'s guard shape — a newer dispatch's
+/// result always wins over an older, still-in-flight one.
+///
+/// `#[allow(dead_code)]`: deviation from the plan's literal Step 6 note
+/// (which expected only the stub *function* to need an allow) — with
+/// `on_compare_schema_pair_ready`'s body still a T7-completed stub, every
+/// field here is constructed by `confirm_compare_dialog` but never READ
+/// anywhere yet, which is a per-field dead-code warning, not a per-function
+/// one. Removed once T7's real body reads these fields.
+#[allow(dead_code)] // fields read by T7's real on_compare_schema_pair_ready body
+pub(crate) struct PendingCompare {
+    pub label_a: String,
+    pub label_b: String,
+    pub conn_a: dbc_state::ConnectionConfig,
+    pub secret_a: Option<String>,
+    pub conn_b: dbc_state::ConnectionConfig,
+    pub secret_b: Option<String>,
+    pub generation: u64,
+}
+
 struct AppView {
     tabs: Tabs,
     status: String,
@@ -664,6 +690,11 @@ struct AppView {
     /// can resolve after a faster fetch for the new connection and silently
     /// overwrite the tree with the wrong connection's schema.
     schema_fetch_generation: u64,
+    /// G7 T6: bumped on every `confirm_compare_dialog` dispatch; an
+    /// `on_compare_schema_pair_ready` result only applies if the generation
+    /// still matches — same last-dispatched-wins guard as
+    /// `schema_fetch_generation`/`switch_generation`.
+    compare_fetch_generation: u64,
     /// Identity (see `conn_spec_key`) of the connection whose schema is
     /// currently being fetched/shown in `tree`, so `trigger_schema_fetch`
     /// can tell `SchemaTree::set_snapshot` whether an incoming snapshot is a
@@ -2051,6 +2082,7 @@ impl AppView {
                     }
                 }
                 PaletteAction::OpenMonitor => self.open_monitor_tab(cx),
+                PaletteAction::OpenCompare => self.open_compare_dialog(cx),
             },
         }
         cx.notify();
@@ -3433,6 +3465,24 @@ impl AppView {
         .detach();
     }
 
+    /// G7 T6 stub: `#[allow(dead_code)]` — T7 opens the Compare tab here
+    /// (design §3). Signature matches `confirm_compare_dialog`'s dispatch:
+    /// `pending` carries the resolved connections/secrets/labels;
+    /// `result` is `fetch_schema_pair`'s oneshot outcome (an `Err` is the
+    /// channel closing — the runner task panicked or was dropped, which
+    /// never happens in normal operation, but is still a `Result`, not an
+    /// `unwrap`, same posture `trigger_schema_fetch` takes on its own
+    /// oneshot).
+    #[allow(dead_code)] // body completed by T7
+    pub(crate) fn on_compare_schema_pair_ready(
+        &mut self,
+        _pending: PendingCompare,
+        _result: Result<(Result<SchemaSnapshot, QueryError>, Result<SchemaSnapshot, QueryError>), tokio::sync::oneshot::error::RecvError>,
+        _cx: &mut Context<Self>,
+    ) {
+        // T7 fills this in.
+    }
+
     /// `SchemaTree`'s `TreeEvent` subscription (wired in `main`). G2 Task 7:
     /// `OpenPreview` builds the SQL via `preview_sql` and runs it through the
     /// normal guarded pipeline (`run_query_with`, `bypass_auto_limit = true`
@@ -4219,6 +4269,7 @@ fn main() {
                             tree,
                             tree_visible: true,
                             schema_fetch_generation: 0,
+                            compare_fetch_generation: 0,
                             schema_tree_connection_key: None,
                             history,
                             history_visible: true,
