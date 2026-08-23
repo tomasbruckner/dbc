@@ -17,14 +17,30 @@ pub trait Connection: Send {
     async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError>;
 
     /// Executes a non-returning statement, reporting affected rows. This is
-    /// the app's write path — ONLY the sandbox Apply flow, the
-    /// server-monitor's confirmed kill action (G9: `pg_terminate_backend` /
-    /// `KILL <spid>`, confirm-dialog-gated, refused on read-only
-    /// connections), and the ANALYZE-on-a-write sequence (G13:
-    /// `QueryRunner::run_analyze_write` — a dedicated connection, BEGIN …
-    /// the user's write wrapped in `EXPLAIN ANALYZE` … ROLLBACK, ALWAYS,
-    /// never COMMIT — confirm-dialog-gated, refused on read-only
-    /// connections) may call it.
+    /// the app's write path, governed by a PATTERN, not a single caller:
+    /// every write reaches `execute` only through (a) a confirm modal
+    /// showing the exact SQL that will run, (b) a runner-owned method with
+    /// explicit transaction discipline, and (c) a read-only guard enforced
+    /// at the runner choke point — the SHARED `dbc-ui`'s
+    /// `runner::guard_not_read_only` for every caller below except kill,
+    /// which uses its own equivalent direct read-only check so it can carry
+    /// the design's mandated message text (`MONITOR_READ_ONLY_KILL_MSG`,
+    /// design §0/§9.1's belt-and-braces gate — no server-side enforcement
+    /// exists for kill on either engine).
+    ///
+    /// Sanctioned runner callers: `run_write_transaction` (sandbox Apply);
+    /// the server-monitor's confirmed kill action (G9:
+    /// `pg_terminate_backend` / `KILL <spid>`, confirm-dialog-gated);
+    /// `run_analyze_write` (G13's ANALYZE-on-a-write sequence — its own
+    /// `execute` calls are BEGIN/ROLLBACK transaction control only, over a
+    /// dedicated connection; the user's write itself is dispatched via
+    /// `query()`, wrapped in `EXPLAIN ANALYZE`, and ALWAYS rolled back,
+    /// never committed); `run_script` (G12 script-runner write statements
+    /// plus its own BEGIN/COMMIT/ROLLBACK transaction control);
+    /// `run_csv_import` (G12, batched CSV `INSERT`s plus transaction
+    /// control); and `connect_and_run_many` (G12 editor multi-statement —
+    /// its per-statement read-only rejection is guard (c), via the shared
+    /// guard). No other code may call this method.
     ///
     /// Transactions are per-connection: a caller driving `BEGIN` … `COMMIT`/
     /// `ROLLBACK` MUST issue every statement in that sequence over the SAME
@@ -47,5 +63,10 @@ pub trait Connection: Send {
     /// interleave `query()` calls on this instance. The Apply flow satisfies
     /// this by opening a DEDICATED connection used exclusively for its
     /// BEGIN…COMMIT sequence and dropped immediately after.
+    ///
+    /// The script runner's own read statements are the sanctioned exception:
+    /// they run sequentially, fully drained, over this same dedicated
+    /// connection inside the script's own transaction — the caveat forbids
+    /// UNRELATED interleaving, not a script's own ordered statements.
     async fn execute(&mut self, sql: &str, cancel: CancelToken) -> Result<u64, QueryError>;
 }

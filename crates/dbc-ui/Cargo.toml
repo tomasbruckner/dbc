@@ -1,6 +1,6 @@
 [package]
 name = "dbc-ui"
-version = "0.10.0"
+version.workspace = true
 edition.workspace = true
 
 [dependencies]
@@ -26,6 +26,11 @@ quick-xml = "0.41"
 # with the workspace's existing `derive`-feature pin.
 serde.workspace = true
 serde_json.workspace = true
+# G12 T4: CSV import — streaming, quote-aware parser (design §5 decided
+# against a hand-written RFC-4180 scanner). dbc-ui only; dbc-core stays
+# free of it (csv_import.rs's pure model has no dependency on this crate
+# at all — only the UI-owned parsing/peek pass in main.rs/runner.rs does).
+csv = "1"
 
 [dev-dependencies]
 tempfile.workspace = true
