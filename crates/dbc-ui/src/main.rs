@@ -1,5 +1,5 @@
 mod autocomplete;
-#[allow(dead_code)] // consumed from T3/T4 on
+#[allow(dead_code)] // G11 T4 wired the MSSQL/SQLite SQL builders, the read-only guard, and the process-control types (runner.rs) as real (non-test) consumers; the Postgres arg builders (build_pg_dump_args/build_pg_restore_args/build_psql_args), detect_dump_format, confirm_matches, and display_command_line still await T6's UI dispatch. Narrow/remove this allow once T6 lands.
 mod backup;
 mod compare;
 mod connect;

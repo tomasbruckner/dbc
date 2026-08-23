@@ -20,11 +20,21 @@ pub trait Connection: Send {
     /// the app's write path — ONLY the sandbox Apply flow, the
     /// server-monitor's confirmed kill action (G9: `pg_terminate_backend` /
     /// `KILL <spid>`, confirm-dialog-gated, refused on read-only
-    /// connections), and the ANALYZE-on-a-write sequence (G13:
+    /// connections), the ANALYZE-on-a-write sequence (G13:
     /// `QueryRunner::run_analyze_write` — a dedicated connection, BEGIN …
     /// the user's write wrapped in `EXPLAIN ANALYZE` … ROLLBACK, ALWAYS,
     /// never COMMIT — confirm-dialog-gated, refused on read-only
-    /// connections) may call it.
+    /// connections), and G11's backup/restore methods (`runner.rs`:
+    /// `run_mssql_backup` — `BACKUP DATABASE`, allowed on read-only, the
+    /// ONE documented exception since it only reads the source database;
+    /// `run_mssql_restore` — `SET SINGLE_USER` → `RESTORE DATABASE` → `SET
+    /// MULTI_USER` over one dedicated connection, hard-blocked on
+    /// read-only, no override; `run_sqlite_backup` — `VACUUM INTO`, allowed
+    /// on read-only) may call it. `run_sqlite_restore` is NOT in this list —
+    /// it never calls `execute()` at all, restoring via a plain
+    /// magic-header-checked `fs::copy` instead. Each of the above is a
+    /// named, gated method per this file's own transaction-discipline
+    /// contract below, never raw ad-hoc SQL.
     ///
     /// Transactions are per-connection: a caller driving `BEGIN` … `COMMIT`/
     /// `ROLLBACK` MUST issue every statement in that sequence over the SAME
