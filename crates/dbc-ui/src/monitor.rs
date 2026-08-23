@@ -66,6 +66,30 @@ pub struct BlockingNode {
     pub cycle: bool,
 }
 
+/// Not in the plan's grounding code — found while fixing BLOCKER 1
+/// (fmt_bytes/compute_rate review): `BlockingNode`'s owned `Vec<Self>`
+/// children make it a recursive structure, so the *default* generated
+/// `Drop` glue recurses one stack frame per tree depth when it goes out of
+/// scope — the exact same class of stack overflow the iterative rewrite of
+/// `build_blocking_tree` fixed for construction, just on the way down
+/// instead of the way up (confirmed empirically: the 10k-depth regression
+/// test built fine but then overflowed the stack when the test function's
+/// local `tree` value dropped at end of scope). Drains the tree
+/// iteratively with an explicit stack instead: each popped node has its
+/// own `children` moved out (`Vec::append` leaves the source empty)
+/// *before* it is allowed to drop, so the automatic per-field drop that
+/// still runs after this method body sees an already-empty `Vec` and
+/// recurses at most one level — never proportional to tree depth.
+impl Drop for BlockingNode {
+    fn drop(&mut self) {
+        let mut pending: Vec<BlockingNode> = std::mem::take(&mut self.children);
+        while let Some(mut node) = pending.pop() {
+            pending.append(&mut node.children);
+            // `node` drops here with `children` already empty.
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableSizeRow {
     pub schema: Option<String>,
@@ -114,11 +138,23 @@ fn col_i64(row: &Row, c: usize) -> Option<i64> {
     let v = row.get(c)?.as_deref()?.trim().to_string();
     // Numeric aggregates (sum() over bigint) come back as arbitrary-precision
     // numeric text on Postgres — accept "123" and "123.0" alike (fail-soft).
-    v.parse::<i64>().ok().or_else(|| v.parse::<f64>().ok().map(|f| f as i64))
+    // Deviation from the plan's grounding code (review finding): the f64
+    // fallback must reject non-finite text ("NaN"/"inf"/"-inf") — `f as i64`
+    // is a saturating cast that would otherwise silently produce
+    // i64::MAX/MIN/0, which is exactly the kind of extreme value that made
+    // `compute_rate`'s subtraction overflow in production (see its doc
+    // comment). Rejecting here means that path can no longer feed it.
+    v.parse::<i64>()
+        .ok()
+        .or_else(|| v.parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| f as i64))
 }
 
 fn col_f64(row: &Row, c: usize) -> Option<f64> {
-    row.get(c)?.as_deref()?.trim().parse::<f64>().ok()
+    // Deviation from the plan's grounding code: reject non-finite text
+    // ("NaN"/"inf"/"-inf") rather than passing it through — see col_i64's
+    // comment for why (review finding, advisory (a)).
+    let v = row.get(c)?.as_deref()?.trim().parse::<f64>().ok()?;
+    v.is_finite().then_some(v)
 }
 
 fn cell_i64(rows: &[Row], r: usize, c: usize) -> Option<i64> {
@@ -203,15 +239,38 @@ pub fn parse_tables(rows: &[Row]) -> Vec<TableSizeRow> {
 /// path-tracked, marked `cycle: true` instead of recursing forever; a
 /// pure cycle (no root at all) still renders, rooted at its
 /// first-listed blocker.
+///
+/// Deviation from the plan's grounding code (review finding, BLOCKER 1):
+/// the plan's `build_node` was a plain recursive DFS — one stack frame per
+/// tree depth. A long linear blocking chain (thousands of sessions each
+/// waiting on the previous one — plausible given `MONITOR_ROW_CAP =
+/// 10_000` in runner.rs) overflows the thread stack; on tokio worker
+/// threads (smaller stacks than the test-thread default) this is reachable
+/// in production, not just a pathological test. Rewritten as an explicit-
+/// stack iterative traversal — no recursion, so depth is bounded only by
+/// heap, not by stack. Cycle detection still needs "is this pid already on
+/// the current root-to-node path", so `path` is carried alongside a
+/// `HashSet` mirror for O(1) membership (a `Vec::contains` scan would be
+/// O(depth) per node, i.e. O(n^2) on a linear chain of n edges).
 pub fn build_blocking_tree(edges: &[BlockingEdge]) -> Vec<BlockingNode> {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+    // Precomputed once: blocker_pid -> its outgoing edges (its waiters).
+    // Avoids an O(n) scan of `edges` per node (the plan's grounding code
+    // did `edges.iter().filter(...)` inside every `build_node` call).
+    let mut children_of: HashMap<i64, Vec<&BlockingEdge>> = HashMap::new();
+    let mut waiter_pids: HashSet<i64> = HashSet::new();
+    for e in edges {
+        children_of.entry(e.blocker_pid).or_default().push(e);
+        waiter_pids.insert(e.waiter_pid);
+    }
+
     let mut covered: HashSet<i64> = HashSet::new();
     let mut roots = Vec::new();
     // Pass 1: true roots — blockers that never wait on anyone.
     for e in edges {
-        let is_root = !edges.iter().any(|x| x.waiter_pid == e.blocker_pid);
+        let is_root = !waiter_pids.contains(&e.blocker_pid);
         if is_root && covered.insert(e.blocker_pid) {
-            roots.push(build_node(e.blocker_pid, None, edges, &mut Vec::new(), &mut covered));
+            roots.push(build_tree_iterative(e.blocker_pid, &children_of, &mut covered));
         }
     }
     // Pass 2: pure cycles have NO root (every participant waits on someone)
@@ -220,38 +279,89 @@ pub fn build_blocking_tree(edges: &[BlockingEdge]) -> Vec<BlockingNode> {
     // closure with `cycle: true` instead of recursing forever.
     for e in edges {
         if covered.insert(e.blocker_pid) {
-            roots.push(build_node(e.blocker_pid, None, edges, &mut Vec::new(), &mut covered));
+            roots.push(build_tree_iterative(e.blocker_pid, &children_of, &mut covered));
         }
     }
     roots
 }
 
-fn build_node(
+/// One stack frame of the iterative post-order tree build: the node under
+/// construction plus an index into `children_of[pid]` for the next
+/// not-yet-visited child edge. Deliberately holds no borrowed iterator (and
+/// so no lifetime parameter) — re-looking-up `children_of.get(&pid)` by
+/// value each step is an O(1) hash lookup, simpler than threading borrow
+/// lifetimes through the explicit stack.
+struct BuildFrame {
     pid: i64,
-    via: Option<&BlockingEdge>, // the edge this node was reached through (None for a root)
-    edges: &[BlockingEdge],
-    path: &mut Vec<i64>,
+    query: Option<String>,
+    wait_secs: Option<f64>,
+    next_idx: usize,
+    children: Vec<BlockingNode>,
+}
+
+/// Iterative replacement for the plan's recursive `build_node` (see
+/// `build_blocking_tree`'s doc comment). Same output shape and cycle
+/// semantics: a pid already on the current path becomes a `cycle: true`
+/// leaf instead of being descended into again.
+fn build_tree_iterative(
+    root_pid: i64,
+    children_of: &std::collections::HashMap<i64, Vec<&BlockingEdge>>,
     covered: &mut std::collections::HashSet<i64>,
 ) -> BlockingNode {
-    let query = match via {
-        Some(e) => e.waiter_query.clone(),
-        None => edges.iter().find(|e| e.blocker_pid == pid).and_then(|e| e.blocker_query.clone()),
-    };
-    let wait_secs = via.map(|e| e.wait_secs);
-    if path.contains(&pid) {
-        return BlockingNode { pid, query, wait_secs, children: Vec::new(), cycle: true };
+    use std::collections::HashSet;
+    let root_query = children_of.get(&root_pid).and_then(|v| v.first()).and_then(|e| e.blocker_query.clone());
+
+    // `path_set` alone is enough: membership answers the cycle check, and
+    // popping a frame already knows its own pid to remove — no separate
+    // ordered path vector needed.
+    let mut path_set: HashSet<i64> = HashSet::from([root_pid]);
+    let mut stack: Vec<BuildFrame> =
+        vec![BuildFrame { pid: root_pid, query: root_query, wait_secs: None, next_idx: 0, children: Vec::new() }];
+
+    loop {
+        let pid = stack.last().unwrap().pid;
+        let idx = stack.last().unwrap().next_idx;
+        let edge = children_of.get(&pid).and_then(|v| v.get(idx)).copied();
+        match edge {
+            Some(e) => {
+                stack.last_mut().unwrap().next_idx += 1;
+                covered.insert(e.waiter_pid);
+                if path_set.contains(&e.waiter_pid) {
+                    stack.last_mut().unwrap().children.push(BlockingNode {
+                        pid: e.waiter_pid,
+                        query: e.waiter_query.clone(),
+                        wait_secs: Some(e.wait_secs),
+                        children: Vec::new(),
+                        cycle: true,
+                    });
+                } else {
+                    path_set.insert(e.waiter_pid);
+                    stack.push(BuildFrame {
+                        pid: e.waiter_pid,
+                        query: e.waiter_query.clone(),
+                        wait_secs: Some(e.wait_secs),
+                        next_idx: 0,
+                        children: Vec::new(),
+                    });
+                }
+            }
+            None => {
+                let frame = stack.pop().unwrap();
+                path_set.remove(&frame.pid);
+                let node = BlockingNode {
+                    pid: frame.pid,
+                    query: frame.query,
+                    wait_secs: frame.wait_secs,
+                    children: frame.children,
+                    cycle: false,
+                };
+                match stack.last_mut() {
+                    Some(parent) => parent.children.push(node),
+                    None => return node,
+                }
+            }
+        }
     }
-    path.push(pid);
-    let children = edges
-        .iter()
-        .filter(|e| e.blocker_pid == pid)
-        .map(|e| {
-            covered.insert(e.waiter_pid);
-            build_node(e.waiter_pid, Some(e), edges, path, covered)
-        })
-        .collect();
-    path.pop();
-    BlockingNode { pid, query, wait_secs, children, cycle: false }
 }
 
 /// Client-side delta over a CUMULATIVE counter. `None` on: no previous
@@ -263,14 +373,24 @@ pub fn compute_rate(
     at: std::time::Instant,
 ) -> Option<f64> {
     let (prev_total, prev_at) = prev?;
-    if now_total < prev_total {
+    // Deviation from the plan's grounding code (review finding, BLOCKER 2):
+    // the plan computed `now_total < prev_total` then `(now_total -
+    // prev_total) as f64`, which still panics with "attempt to subtract
+    // with overflow" in debug builds when the subtraction itself overflows
+    // i64's range (e.g. now=i64::MAX, prev=i64::MIN — both individually
+    // valid i64 values, `now >= prev` holds, but the difference doesn't fit
+    // i64). `checked_sub` catches that case; the ordinary counter-reset
+    // case (now < prev, no overflow) is still caught by the `delta < 0`
+    // check below, so both existing semantics are preserved.
+    let delta = now_total.checked_sub(prev_total)?;
+    if delta < 0 {
         return None;
     }
     let elapsed = at.checked_duration_since(prev_at)?.as_secs_f64();
     if elapsed <= 0.0 {
         return None;
     }
-    Some((now_total - prev_total) as f64 / elapsed)
+    Some(delta as f64 / elapsed)
 }
 
 /// 0.0..=1.0 fill fraction for the per-table size bar; `max_in_set <= 0`
@@ -320,6 +440,11 @@ pub fn monitor_available(engine: dbc_state::Engine) -> bool {
 
 /// "1.5 GB" / "512 B" — tile + table-size labels.
 pub fn fmt_bytes(bytes: i64) -> String {
+    // Deviation from the plan's grounding code (review advisory (b)): clamp
+    // negative to 0, same posture as fmt_uptime — a negative byte count is
+    // a nonsensical display value (e.g. a driver quirk), not something to
+    // render as "-5 B".
+    let bytes = bytes.max(0);
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     if bytes < 1024 {
         return format!("{bytes} B");
@@ -394,6 +519,20 @@ mod tests {
         assert_eq!(parse_perf(&rows).xact_total, Some(123_456));
     }
 
+    /// Regression test for review advisory (a): "NaN"/"inf"/"-inf" text
+    /// must degrade to None, not to a saturating-cast extreme (i64::MAX /
+    /// i64::MIN / 0 for col_i64's f64 fallback) — that extreme is exactly
+    /// the kind of value that fed BLOCKER 2's subtraction overflow.
+    #[test]
+    fn non_finite_text_degrades_to_none_not_a_saturated_extreme() {
+        let rows = vec![row(&[Some("NaN"), Some("inf"), Some("-inf")])];
+        // cache_hit_pct (col_f64), uptime_secs (col_i64, unwrap_or(0)), xact_total (col_i64)
+        let tile = parse_perf(&rows);
+        assert_eq!(tile.cache_hit_pct, None);
+        assert_eq!(tile.uptime_secs, 0); // fail-soft default, not a saturated cast
+        assert_eq!(tile.xact_total, None);
+    }
+
     #[test]
     fn parse_running_maps_all_seven_columns_and_defaults_bad_cells() {
         let rows = vec![
@@ -442,6 +581,21 @@ mod tests {
         let t0 = Instant::now();
         let t1 = t0 + Duration::from_secs(5);
         assert_eq!(compute_rate(50, Some((100, t0)), t1), None);
+    }
+
+    /// Regression test for review BLOCKER 2: the plan's grounding code did
+    /// `now_total < prev_total` then `(now_total - prev_total) as f64`,
+    /// which panics with "attempt to subtract with overflow" in debug
+    /// builds when now=i64::MAX and prev=i64::MIN — both are individually
+    /// valid i64 values and `now >= prev` holds, so the `<` guard doesn't
+    /// catch it, but the subtraction itself doesn't fit i64's range.
+    /// `checked_sub` must catch this and return None, same as an ordinary
+    /// counter reset.
+    #[test]
+    fn compute_rate_subtraction_overflow_is_none_not_a_panic() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(5);
+        assert_eq!(compute_rate(i64::MAX, Some((i64::MIN, t0)), t1), None);
     }
 
     // --- build_blocking_tree ---
@@ -504,6 +658,32 @@ mod tests {
     #[test]
     fn no_edges_no_tree() {
         assert_eq!(build_blocking_tree(&[]), Vec::new());
+    }
+
+    /// Regression test for review BLOCKER 1: the plan's grounding code used
+    /// plain recursion for `build_node`, one stack frame per tree depth — a
+    /// long linear blocking chain overflowed the thread stack
+    /// (`STATUS_STACK_OVERFLOW`), and production runs on tokio worker
+    /// threads with smaller stacks than the test-thread default, so this
+    /// was reachable, not just a pathological test. `build_tree_iterative`
+    /// replaced the recursion with an explicit heap-allocated stack; this
+    /// must build a 10,000-edge linear chain (waiter i+1 blocked by i) to
+    /// depth 10,000 without aborting the process.
+    #[test]
+    fn ten_thousand_edge_linear_chain_builds_without_stack_overflow() {
+        let edges: Vec<BlockingEdge> = (0..10_000).map(|i| edge(i + 1, i)).collect();
+        let tree = build_blocking_tree(&edges);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].pid, 0);
+        // Walk the chain down to depth 10,000, confirming no truncation and
+        // no cycle mis-marking anywhere along the way.
+        let mut node = &tree[0];
+        for depth in 0..10_000 {
+            assert!(!node.cycle, "node at depth {depth} incorrectly marked cycle");
+            assert_eq!(node.children.len(), 1, "node at depth {depth} should have exactly one child");
+            node = &node.children[0];
+        }
+        assert_eq!(node.pid, 10_000);
     }
 
     // --- bar_fraction ---
@@ -578,6 +758,13 @@ mod tests {
         assert_eq!(fmt_bytes(512), "512 B");
         assert_eq!(fmt_bytes(1536), "1.5 KB");
         assert_eq!(fmt_bytes(3 * 1024 * 1024), "3.0 MB");
+    }
+
+    #[test]
+    fn fmt_bytes_clamps_negative() {
+        // Review advisory (b): same clamp posture as fmt_uptime — a
+        // negative byte count is nonsensical, never rendered as "-5 B".
+        assert_eq!(fmt_bytes(-5), "0 B");
     }
 
     #[test]
