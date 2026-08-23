@@ -1,0 +1,21 @@
+[package]
+name = "dbc-driver-mssql"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+dbc-core = { path = "../dbc-core" }
+tokio.workspace = true
+async-trait.workspace = true
+# default-features pulls in "prompt" (winit + a platform windowing stack,
+# for the connection-string-completion dialog), which this driver never
+# invokes — we always connect via a fully-specified connection string.
+# "odbc_version_3_80" is re-enabled explicitly since disabling default
+# features drops it too, and it's needed for modern ODBC connection
+# attributes / driver 18 compatibility. "derive" (the odbc-api-derive proc
+# macro crate) is intentionally omitted: nothing in this crate uses its
+# macros.
+odbc-api = { version = "29", default-features = false, features = ["odbc_version_3_80"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
