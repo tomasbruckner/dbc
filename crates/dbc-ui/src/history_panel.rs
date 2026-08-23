@@ -31,8 +31,9 @@
 // query) and `refresh_history_cache` only runs when they differ.
 
 use dbc_state::HistoryEntry;
-use gpui::{div, prelude::*, px, rgb, uniform_list, AnyElement, Context, Focusable};
+use gpui::{div, prelude::*, px, uniform_list, AnyElement, Context, Focusable};
 
+use crate::theme::ActiveTheme;
 use crate::AppView;
 
 /// Right-panel fixed width (brief contract #3), mirroring the schema tree
@@ -164,10 +165,10 @@ impl AppView {
                     let sql_for_click = entry.sql.clone();
                     let line1 = collapse_sql(&entry.sql, SQL_COLLAPSE_MAX_CHARS);
                     let (line2, is_error) = format_meta_line(entry);
-                    let line2_color = if is_error { rgb(0xf38ba8) } else { rgb(0xa6adc8) };
+                    let line2_color = if is_error { cx.theme().danger } else { cx.theme().text_muted };
                     let starred = entry.starred;
                     let star = if starred { "★" } else { "☆" };
-                    let star_color = if starred { rgb(0xf9e2af) } else { rgb(0x6c7086) };
+                    let star_color = if starred { cx.theme().warn } else { cx.theme().text_disabled };
 
                     items.push(
                         div()
@@ -180,7 +181,7 @@ impl AppView {
                             .px_2()
                             .py_1()
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x313244)))
+                            .hover(|s| s.bg(cx.theme().bg_hover))
                             // Brief contract #4: click loads the SQL into
                             // the editor and focuses it, but NEVER runs it.
                             .on_click(cx.listener(move |view, _, window, cx| {
@@ -215,7 +216,7 @@ impl AppView {
                                     .flex_col()
                                     .flex_1()
                                     .min_w_0()
-                                    .child(div().text_color(rgb(0xcdd6f4)).child(line1))
+                                    .child(div().text_color(cx.theme().text_primary).child(line1))
                                     .child(div().text_size(px(11.)).text_color(line2_color).child(line2)),
                             ),
                     );
@@ -233,9 +234,9 @@ impl AppView {
             .flex()
             .flex_col()
             .border_l_1()
-            .border_color(rgb(0x45475a))
-            .bg(rgb(0x181825))
-            .text_color(rgb(0xcdd6f4))
+            .border_color(cx.theme().border)
+            .bg(cx.theme().bg_app)
+            .text_color(cx.theme().text_primary)
             .child(div().px_2().py_1().child("Historie"))
             .child(div().px_2().pb_1().child(self.history_search.clone()))
             .child(list)
