@@ -2061,6 +2061,29 @@ pub(crate) fn kill_confirm_matches(modal: &Option<ModalState>, event_tab_id: u64
     )
 }
 
+/// Applies a FAILED kill's outcome to `modal`, if it's still open for THIS
+/// pid/tab_id (`kill_confirm_matches`) — writes `error` for display AND
+/// resets `dispatched` back to `false`. No-op (leaves `modal` untouched)
+/// when the event doesn't match the currently open dialog.
+///
+/// Review fix (NEW MINOR, follow-up to the MINOR double-dispatch guard):
+/// leaving `dispatched` at `true` here permanently greyed "Ukončit proces"
+/// out after the FIRST failed attempt — the Ok arm is the only other place
+/// that ever clears it, and Ok closes the dialog outright instead, so nobody
+/// ever reset it back to `false` for a genuine retry. `pub(crate)`: called
+/// from `main.rs`'s `on_monitor_view_event`; factored out (same rationale as
+/// `kill_confirm_matches`/`kill_confirm_dispatch_target` above) so the
+/// retry-reset is unit-testable without a GPUI entity/`Context`.
+pub(crate) fn apply_kill_error_to_modal(modal: &mut Option<ModalState>, tab_id: u64, pid: i64, msg: &str) {
+    if !kill_confirm_matches(modal, tab_id, pid) {
+        return;
+    }
+    if let Some(ModalState::KillConfirm { error, dispatched, .. }) = modal {
+        *error = Some(msg.to_string());
+        *dispatched = false;
+    }
+}
+
 /// G9 T5: the kill-confirm dialog panel — same card tokens as every other
 /// modal in this file. Shows the exact SQL that will run (design §6's "show
 /// the exact generated SQL" principle) and, on a failed attempt, the error
@@ -2210,5 +2233,37 @@ mod kill_confirm_tests {
         // RESOLVE side (matches).
         let modal = kill_confirm(1, 100, true);
         assert!(kill_confirm_matches(&modal, 100, 1));
+    }
+
+    // --- apply_kill_error_to_modal (NEW MINOR: retry-after-failure) ---
+
+    #[test]
+    fn matching_err_sets_error_and_resets_dispatched_for_retry() {
+        // Regression for the NEW MINOR finding: before this fix, a genuine
+        // failed kill left `dispatched` at `true` forever, permanently
+        // greying out "Ukončit proces" — no way to retry.
+        let mut modal = kill_confirm(42, 7, true); // in flight
+        apply_kill_error_to_modal(&mut modal, 7, 42, "boom");
+        let Some(ModalState::KillConfirm { error, dispatched, .. }) = &modal else {
+            panic!("dialog must stay open on a matching failed kill");
+        };
+        assert_eq!(error.as_deref(), Some("boom"));
+        assert!(!dispatched, "dispatched must reset so a retry click can dispatch again");
+        // The retry itself must now be dispatchable.
+        assert_eq!(kill_confirm_dispatch_target(&modal), Some((42, 7)));
+    }
+
+    #[test]
+    fn non_matching_err_leaves_modal_untouched() {
+        // Same misattribution class as the MAJOR fix: pid 1's stale error
+        // must not touch pid 2's currently open, still-in-flight dialog.
+        let mut modal = kill_confirm(2, 7, true);
+        apply_kill_error_to_modal(&mut modal, 7, 1, "boom");
+        let Some(ModalState::KillConfirm { pid, error, dispatched, .. }) = &modal else {
+            panic!("unrelated dialog must remain open");
+        };
+        assert_eq!(*pid, 2);
+        assert_eq!(*error, None);
+        assert!(*dispatched, "unrelated dialog's in-flight state must be untouched");
     }
 }

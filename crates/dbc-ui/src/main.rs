@@ -2800,11 +2800,11 @@ impl AppView {
                     }
                     Err(msg) => {
                         if matches_open_dialog {
-                            if let Some(connections_ui::ModalState::KillConfirm { error, .. }) =
-                                &mut self.modal
-                            {
-                                *error = Some(msg.clone()); // dialog stays open
-                            }
+                            // Dialog stays open with the error; NEW MINOR
+                            // review fix: also resets `dispatched` so a
+                            // genuine failure can be retried (see
+                            // `apply_kill_error_to_modal`'s doc comment).
+                            connections_ui::apply_kill_error_to_modal(&mut self.modal, tab_id, *pid, msg);
                         } else {
                             self.status = format!("error: {msg}");
                         }
