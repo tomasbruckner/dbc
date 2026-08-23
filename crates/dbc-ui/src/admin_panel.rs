@@ -192,6 +192,13 @@ impl MembershipEdits {
         self.add.len() + self.remove.len()
     }
 
+    /// Kept for API parity with `sandbox::EditState`'s staging idiom (and
+    /// with this struct's own `change_count`/`clear`/`to_statements`) even
+    /// though `AdminPanel::is_dirty` composes its OWN answer from
+    /// `AdminPanel::change_count` (which folds `staged_role_actions` in
+    /// too) rather than calling this — that keeps the panel's dirtiness a
+    /// single definition (`combined_change_count`) instead of two.
+    #[allow(dead_code)]
     pub fn is_dirty(&self) -> bool {
         self.change_count() > 0
     }
@@ -217,6 +224,18 @@ impl MembershipEdits {
     }
 }
 
+/// Pure, GPUI-free half of `AdminPanel::change_count`'s arithmetic —
+/// `staged_role_actions` (create-role/change-password/drop-role, staged
+/// directly with no local diffing of their own) plus `membership_edits`'s
+/// own count. Extracted so the tab-strip "✕" close guard's dirtiness
+/// contract (`main.rs::AppView::grid_dirty_change_count`'s `Admin` arm —
+/// review finding: that match had NO `Admin` arm at all, so closing a
+/// dirty admin tab silently discarded staged writes) is directly
+/// unit-testable without constructing a GPUI `AdminPanel` entity.
+fn combined_change_count(staged_role_actions: usize, membership_edits: &MembershipEdits) -> usize {
+    staged_role_actions + membership_edits.change_count()
+}
+
 // ---------------------------------------------------------------------
 // 4. GPUI entity.
 // ---------------------------------------------------------------------
@@ -231,10 +250,16 @@ enum RoleFlagKind {
 }
 
 /// Panel-local overlay state — same visual idiom as the grid cell editor
-/// (a floating panel over the tab content, not a full-window modal).
-/// Passwords live in the `TextField`'s own buffer until the confirm
-/// handler reads them ONCE into a `zeroize::Zeroizing<String>` (CURATION
-/// item 4) — never cached anywhere else in this struct.
+/// (a floating panel over the tab content, not a full-window modal). While
+/// the modal is open, the password sits in the `TextField`'s own buffer —
+/// a plain, unprotected `String` buffer, same as every other password
+/// `TextField` in this app (e.g. the vault master-password prompt); this
+/// struct does not harden that pre-existing convention. What CURATION item
+/// 4 actually guarantees is downstream of that: the confirm handler reads
+/// the buffer ONCE into a `zeroize::Zeroizing<String>` and that's the only
+/// form the password takes anywhere else — never cached a second time in
+/// this struct, in `AdminPanel`, or beyond the resulting `WriteStatement`'s
+/// `exec_sql`.
 enum AdminModal {
     NewRole {
         name: Entity<connections_ui::TextField>,
@@ -383,11 +408,23 @@ impl AdminPanel {
     }
 
     fn is_dirty(&self) -> bool {
-        !self.staged_role_actions.is_empty() || self.membership_edits.is_dirty()
+        self.change_count() > 0
     }
 
-    fn change_count(&self) -> usize {
-        self.staged_role_actions.len() + self.membership_edits.change_count()
+    /// The panel's one dirtiness definition — drives BOTH the in-panel
+    /// Apply bar ("{n} změn") / sub-nav discard-confirm prompt AND (via
+    /// `main.rs`'s `AppView::grid_dirty_change_count`/`render_tab_strip`)
+    /// the tab-strip's "✕" close guard and " •" dirty indicator. `pub` so
+    /// `main.rs` can read it without duplicating what "dirty" means for
+    /// this panel a second time. Delegates to `combined_change_count` (the
+    /// free-function, GPUI-free half of this same arithmetic) so the exact
+    /// formula is directly unit-testable without an `AdminPanel` instance —
+    /// this codebase has no established "construct a GPUI entity in a test"
+    /// precedent (see e.g. `admin_open_decision`/`conn_identity_matches` in
+    /// `main.rs`, which keep their pure decisions free of `Context`/`cx`
+    /// too).
+    pub fn change_count(&self) -> usize {
+        combined_change_count(self.staged_role_actions.len(), &self.membership_edits)
     }
 
     fn is_member(&self, role: &str, member: &str, server_role: bool) -> bool {
@@ -623,11 +660,9 @@ impl AdminPanel {
             // a second heading for server-scoped roles.
             detail = detail.child(div().mt_2().text_color(rgb(0xa6adc8)).child("Členem v"));
             let mut member_list = div().flex().flex_col();
-            for r in &roles {
-                if &r.name == sel {
-                    continue;
-                }
+            for (ix, r) in roles.iter().filter(|r| &r.name != sel).enumerate() {
                 member_list = member_list.child(self.render_membership_checkbox(
+                    ix,
                     r.name.clone(),
                     sel.clone(),
                     false,
@@ -642,8 +677,9 @@ impl AdminPanel {
                 if !server_roles.is_empty() {
                     detail = detail.child(div().mt_2().text_color(rgb(0xa6adc8)).child("Členem v (server)"));
                     let mut srv_list = div().flex().flex_col();
-                    for role_name in server_roles {
+                    for (ix, role_name) in server_roles.into_iter().enumerate() {
                         srv_list = srv_list.child(self.render_membership_checkbox(
+                            ix,
                             role_name,
                             sel.clone(),
                             true,
@@ -711,8 +747,16 @@ impl AdminPanel {
             .into_any_element()
     }
 
+    /// `ix` is this row's position within its OWN list (`member_list` or
+    /// `srv_list` in `render_roles_body`) — combined with a per-list
+    /// literal prefix, that's the same collision-safe `(&'static str,
+    /// usize)` id shape `schema_tree.rs`'s `("tree-row", ix)` uses.
+    /// Interpolating `role`/`member` strings directly into the id (the
+    /// prior shape) was collision-prone: role "a-b" + member "c" and role
+    /// "a" + member "b-c" produced the identical id string.
     fn render_membership_checkbox(
         &self,
+        ix: usize,
         role: String,
         member: String,
         server_role: bool,
@@ -724,8 +768,9 @@ impl AdminPanel {
         let mark = if checked { "☑" } else { "☐" };
         let role_for_click = role.clone();
         let member_for_click = member.clone();
+        let id_prefix = if server_role { "admin-membership-srv" } else { "admin-membership-db" };
         div()
-            .id(format!("admin-membership-{role}-{member}-{server_role}"))
+            .id((id_prefix, ix))
             .cursor_pointer()
             .px_1()
             .flex()
@@ -1124,5 +1169,34 @@ mod tests {
 
         e.clear();
         assert!(!e.is_dirty());
+    }
+
+    // Review finding (MAJOR): the tab-strip "✕" close guard
+    // (`main.rs::AppView::grid_dirty_change_count`) had no `TabContent::
+    // Admin` arm at all, so closing a dirty admin tab silently discarded
+    // staged writes — no confirm prompt, no " •" indicator either. Both
+    // sites now read `AdminPanel::change_count`, which is this exact
+    // arithmetic; proven here without a GPUI entity/window (this codebase
+    // has no "construct an entity in a test" precedent — see this
+    // function's own doc comment).
+    #[test]
+    fn admin_dirty_count_is_zero_when_clean_and_reflects_role_actions_and_membership_edits() {
+        let mut edits = MembershipEdits::default();
+        // Zero staged anything -> 0, which `main.rs`'s `(n > 0).then_some(n)`
+        // turns into `None` (no close-confirm prompt, no dirty dot).
+        assert_eq!(combined_change_count(0, &edits), 0);
+
+        // A membership toggle alone must already dirty the tab (a create-
+        // role/drop-role/change-password action isn't the only way to
+        // stage a write here).
+        edits.toggle("readers", "bob", false, false);
+        assert_eq!(combined_change_count(0, &edits), 1);
+
+        // Staged role actions (e.g. one "Nová role…" + one "Smazat roli")
+        // add on top of whatever membership edits are staged.
+        assert_eq!(combined_change_count(2, &edits), 3);
+
+        edits.clear();
+        assert_eq!(combined_change_count(2, &edits), 2, "role actions alone still count once membership is clean");
     }
 }

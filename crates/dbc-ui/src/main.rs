@@ -4452,13 +4452,22 @@ impl AppView {
     // G5 Task 4: dirty-edit discard guard (folded T3 review issue 2).
     // -----------------------------------------------------------------
 
-    /// Row-granular staged-change count for `tab`'s grid, if it has any —
-    /// `None` for a `Text` tab or a clean/non-editable `Grid` tab (both are
-    /// safe to proceed past without a confirm prompt). Shared by the two
-    /// lookup helpers below.
+    /// Row-granular staged-change count for `tab`, if it has any — `None`
+    /// for a `Text`/other non-editable tab or a clean `Grid`/`Admin` tab
+    /// (both are safe to proceed past without a confirm prompt). Shared by
+    /// the two lookup helpers below.
+    ///
+    /// `Admin` reuses `AdminPanel::change_count` verbatim — the SAME
+    /// dirtiness definition that already drives the panel's own Apply bar
+    /// and sub-nav discard-confirm prompt, not a second one invented here
+    /// (review finding: closing a dirty admin tab via "✕" used to silently
+    /// discard staged writes, since this match had no `Admin` arm at all).
     fn grid_dirty_change_count(tab: &ResultTab, cx: &Context<Self>) -> Option<usize> {
-        let TabContent::Grid { grid, .. } = &tab.content else { return None };
-        let n = grid.read(cx).edit_state.change_count();
+        let n = match &tab.content {
+            TabContent::Grid { grid, .. } => grid.read(cx).edit_state.change_count(),
+            TabContent::Admin { view } => view.read(cx).change_count(),
+            _ => return None,
+        };
         (n > 0).then_some(n)
     }
 
@@ -5498,7 +5507,13 @@ impl AppView {
                     TabContent::Diagram { .. } => (0, false),
                     TabContent::Compare { .. } => (0, false),
                     TabContent::ScriptRun { .. } => (0, false),
-                    TabContent::Admin { .. } => (0, false),
+                    // Review finding: this used to hardcode `false`
+                    // regardless of staged admin edits, so a dirty admin
+                    // tab never got the " •" suffix either. Reuses
+                    // `AdminPanel::change_count` — the same dirtiness
+                    // definition `grid_dirty_change_count`'s `Admin` arm
+                    // (the close-tab guard) already reads.
+                    TabContent::Admin { view } => (0, view.read(cx).change_count() > 0),
                 };
                 // G5 Task 3, brief contract #7: dirty (unapplied staged
                 // edits) tabs get a " •" title suffix — the apply bar
