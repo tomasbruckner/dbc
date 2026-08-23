@@ -294,6 +294,250 @@ pub fn analyze_gate(sql: &str, read_only: bool) -> AnalyzeGate {
     }
 }
 
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::reader::Reader;
+use quick_xml::XmlVersion;
+
+/// Defensive cap, independent of anything `quick-xml` enforces itself
+/// (unlike `serde_json`, it has no built-in recursion-limit equivalent) —
+/// converts a pathological/adversarial payload into a clean `Err`, not
+/// unbounded memory growth or a stack issue elsewhere in the pipeline.
+const MAX_XML_DEPTH: usize = 5000;
+
+fn attr_string(e: &BytesStart, name: &str) -> Option<String> {
+    e.attributes()
+        .flatten()
+        .find(|a| a.key.as_ref() == name.as_bytes())
+        .and_then(|a| a.normalized_value(XmlVersion::Implicit1_0).ok().map(|c| c.into_owned()))
+}
+
+fn leaf_node(operation: String, target: Option<String>, est_cost: Option<f64>, est_rows: Option<f64>) -> PlanNode {
+    PlanNode {
+        operation,
+        target,
+        est_cost,
+        est_rows,
+        actual_rows: None,
+        actual_time_ms: None,
+        loops: None,
+        rows_removed_by_filter: None,
+        buffers: None,
+        extra: Vec::new(),
+        children: Vec::new(),
+    }
+}
+
+struct RelOpFrame {
+    node: PlanNode,
+    // Sum(ActualRows) / max(ActualElapsedms) across every
+    // `<RunTimeCountersPerThread>` seen while this frame is open — design
+    // §1b v1 per-thread aggregation.
+    actual_rows_sum: f64,
+    actual_ms_max: f64,
+    has_runtime_counters: bool,
+}
+
+fn new_relop_frame(e: &BytesStart) -> RelOpFrame {
+    let operation = attr_string(e, "PhysicalOp")
+        .or_else(|| attr_string(e, "LogicalOp"))
+        .unwrap_or_else(|| "?".to_string());
+    let est_cost = finite(attr_string(e, "EstimatedTotalSubtreeCost").and_then(|s| s.parse().ok()));
+    let est_rows = finite(attr_string(e, "EstimateRows").and_then(|s| s.parse().ok()));
+    RelOpFrame {
+        node: leaf_node(operation, None, est_cost, est_rows),
+        actual_rows_sum: 0.0,
+        actual_ms_max: 0.0,
+        has_runtime_counters: false,
+    }
+}
+
+/// Finalizes an innermost `<RelOp>` frame's aggregated runtime counters
+/// (ANALYZE only) and attaches it to its parent frame (or sets `root` when
+/// the stack is now empty). Shared by both the `Event::End` (a
+/// `<RelOp>...</RelOp>` pair) and `Event::Empty` (a self-closing
+/// `<RelOp .../>` leaf) closure paths — the self-closing case pushes then
+/// immediately calls this, exactly like a `Start` followed instantly by an
+/// `End`.
+fn close_relop_frame(mut frame: RelOpFrame, stack: &mut Vec<RelOpFrame>, root: &mut Option<PlanNode>, is_analyze: bool) {
+    if is_analyze && frame.has_runtime_counters {
+        frame.node.actual_rows = finite(Some(frame.actual_rows_sum));
+        frame.node.actual_time_ms = finite(Some(frame.actual_ms_max));
+        frame.node.loops = Some(1); // per-thread sums/max are already whole-node totals
+    }
+    match stack.last_mut() {
+        Some(parent) => parent.node.children.push(frame.node),
+        None => *root = Some(frame.node),
+    }
+}
+
+fn apply_object(e: &BytesStart, stack: &mut [RelOpFrame]) {
+    if let Some(top) = stack.last_mut() {
+        if top.node.target.is_none() {
+            top.node.target = attr_string(e, "Table").or_else(|| attr_string(e, "Index"));
+        }
+    }
+}
+
+fn apply_runtime_counters(e: &BytesStart, stack: &mut [RelOpFrame]) {
+    if let Some(top) = stack.last_mut() {
+        let rows = attr_string(e, "ActualRows").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let ms = attr_string(e, "ActualElapsedms").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        top.actual_rows_sum += rows;
+        top.actual_ms_max = top.actual_ms_max.max(ms);
+        top.has_runtime_counters = true;
+    }
+}
+
+/// `(impact, database, schema, table, column names)` — accumulated across a
+/// `<MissingIndexGroup>`'s descendant `<MissingIndex>`/`<Column>` elements,
+/// then flattened into one `PlanHint` when the group closes.
+type PendingHint = (f64, String, String, String, Vec<String>);
+
+fn new_missing_index_group(e: &BytesStart) -> PendingHint {
+    let impact = attr_string(e, "Impact").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    (impact, String::new(), String::new(), String::new(), Vec::new())
+}
+
+fn apply_missing_index(e: &BytesStart, cur_hint: &mut Option<PendingHint>) {
+    if let Some((_, db, schema, table, _)) = cur_hint.as_mut() {
+        *db = attr_string(e, "Database").unwrap_or_default();
+        *schema = attr_string(e, "Schema").unwrap_or_default();
+        *table = attr_string(e, "Table").unwrap_or_default();
+    }
+}
+
+fn apply_column(e: &BytesStart, cur_hint: &mut Option<PendingHint>) {
+    if let Some((_, _, _, _, cols)) = cur_hint.as_mut() {
+        if let Some(name) = attr_string(e, "Name") {
+            cols.push(name);
+        }
+    }
+}
+
+fn close_missing_index_group(cur_hint: &mut Option<PendingHint>, hints: &mut Vec<PlanHint>) {
+    if let Some((impact, db, schema, table, cols)) = cur_hint.take() {
+        let col_list = cols.join(", ");
+        hints.push(PlanHint {
+            message: format!("Chybějící index: dopad {impact:.1}%"),
+            detail: Some(format!(
+                "-- návrh, ověřte před spuštěním:\nCREATE INDEX ix_suggested ON {db}.{schema}.{table} ({col_list});"
+            )),
+        });
+    }
+}
+
+/// **needs-verification** (design §1b/§6/§7): every attribute name and the
+/// result-set delivery mechanics below are best-effort from Microsoft's
+/// published Showplan XML documentation — no live MSSQL server or driver
+/// exists to capture real output against yet (dbc-ui's `connect::open_config`
+/// hard-errors `Engine::Mssql` today). Correct against real captures once
+/// the MSSQL driver phase lands (T7).
+///
+/// Walks the whole document once, iteratively (Global Constraints "Deep
+/// recursive tree hazard" — an explicit `<RelOp>` frame stack over
+/// `quick-xml`'s own already-iterative `Reader`/`Event` token stream, never
+/// a self-calling function), tracking three independent pieces of state as
+/// events arrive: (a) the `<RelOp>` frame stack (builds the tree), (b)
+/// whether we're inside `<Object .../>` (sets the current frame's
+/// `target`), (c) `<MissingIndexGroup>` accumulation (top-level hints,
+/// unrelated to any one `RelOp`, per design §1b — attached to
+/// `PlanResult.top_level_hints`, not any node).
+///
+/// `Event::Start` (opens, awaits a matching `Event::End`) and `Event::Empty`
+/// (self-closing, no matching `Event::End` ever arrives) are handled as two
+/// separate match arms rather than one combined arm — a combined arm cannot
+/// tell "just opened, wait for End" apart from "opened and closed in the
+/// same instant", which would leave `depth`/the `<RelOp>` frame stack
+/// permanently incremented for every self-closing leaf (e.g. a leaf
+/// `<RelOp .../>`, or every `<Object .../>`/`<Column .../>` in the fixtures
+/// below, all of which are self-closing in real Showplan XML output).
+pub fn parse_mssql_xml(is_analyze: bool, raw_text: &str) -> Result<PlanResult, String> {
+    let mut reader = Reader::from_str(raw_text);
+    reader.config_mut().trim_text(true);
+
+    let mut stack: Vec<RelOpFrame> = Vec::new();
+    let mut root: Option<PlanNode> = None;
+    let mut depth: usize = 0;
+
+    let mut hints: Vec<PlanHint> = Vec::new();
+    let mut cur_hint: Option<PendingHint> = None;
+
+    loop {
+        match reader.read_event().map_err(|e| format!("chyba XML plánu: {e}"))? {
+            Event::Eof => break,
+            Event::Start(e) => {
+                depth += 1;
+                if depth > MAX_XML_DEPTH {
+                    return Err(format!("XML plán překročil maximální hloubku {MAX_XML_DEPTH}"));
+                }
+                match e.name().as_ref() {
+                    b"RelOp" => stack.push(new_relop_frame(&e)),
+                    b"Object" => apply_object(&e, &mut stack),
+                    b"RunTimeCountersPerThread" if is_analyze => apply_runtime_counters(&e, &mut stack),
+                    b"MissingIndexGroup" => cur_hint = Some(new_missing_index_group(&e)),
+                    b"MissingIndex" => apply_missing_index(&e, &mut cur_hint),
+                    b"Column" => apply_column(&e, &mut cur_hint),
+                    _ => {}
+                }
+            }
+            // Self-closing (`<Foo ... />`) — never gets a matching
+            // `Event::End`, so it is opened AND closed in this one step
+            // (push-then-immediately-pop-and-attach for `RelOp`,
+            // finalize-immediately for `MissingIndexGroup`), and `depth`'s
+            // increment here is unwound at the end of this arm rather than
+            // left for an `End` event that will never come.
+            Event::Empty(e) => {
+                depth += 1;
+                if depth > MAX_XML_DEPTH {
+                    return Err(format!("XML plán překročil maximální hloubku {MAX_XML_DEPTH}"));
+                }
+                match e.name().as_ref() {
+                    b"RelOp" => {
+                        let frame = new_relop_frame(&e);
+                        close_relop_frame(frame, &mut stack, &mut root, is_analyze);
+                    }
+                    b"Object" => apply_object(&e, &mut stack),
+                    b"RunTimeCountersPerThread" if is_analyze => apply_runtime_counters(&e, &mut stack),
+                    b"MissingIndexGroup" => {
+                        let mut hint = Some(new_missing_index_group(&e));
+                        close_missing_index_group(&mut hint, &mut hints);
+                    }
+                    b"MissingIndex" => apply_missing_index(&e, &mut cur_hint),
+                    b"Column" => apply_column(&e, &mut cur_hint),
+                    _ => {}
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Event::End(e) => {
+                depth = depth.saturating_sub(1);
+                match e.name().as_ref() {
+                    b"RelOp" => {
+                        let frame = stack.pop().ok_or_else(|| "nepárový </RelOp>".to_string())?;
+                        close_relop_frame(frame, &mut stack, &mut root, is_analyze);
+                    }
+                    b"MissingIndexGroup" => close_missing_index_group(&mut cur_hint, &mut hints),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !stack.is_empty() {
+        return Err("neuzavřené <RelOp> elementy (neplatné XML)".to_string());
+    }
+    let root = root.ok_or_else(|| "v XML plánu nebyl nalezen žádný <RelOp>".to_string())?;
+    Ok(PlanResult {
+        root,
+        is_analyze,
+        engine: dbc_state::Engine::Mssql,
+        total_planning_time_ms: None, // MSSQL Showplan XML carries no separate planning-time figure
+        total_execution_time_ms: None, // no single top-level total in STATISTICS XML — per-node only (design §2 fallback)
+        top_level_hints: hints,
+        raw_text: raw_text.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod model_tests {
     use super::*;
@@ -549,5 +793,75 @@ mod analyze_gate_tests {
     fn multi_statement_batch_any_write_anywhere_is_a_write() {
         assert_eq!(analyze_gate("SELECT 1; DROP TABLE t", false), AnalyzeGate::NeedsConfirm);
         assert_eq!(analyze_gate("SELECT 1; SELECT 2", true), AnalyzeGate::Run);
+    }
+}
+
+#[cfg(test)]
+mod mssql_parser_tests {
+    use super::*;
+
+    #[test]
+    fn estimated_nested_loops_tree_shape_and_targets() {
+        let raw = include_str!("../tests/fixtures/mssql_showplan_estimated.xml");
+        let result = parse_mssql_xml(false, raw).expect("parse");
+        assert_eq!(result.root.operation, "Nested Loops");
+        assert_eq!(result.root.est_cost, Some(0.123));
+        assert_eq!(result.root.children.len(), 2);
+        assert_eq!(result.root.children[0].operation, "Index Seek");
+        assert_eq!(result.root.children[0].target.as_deref(), Some("[dbo].[users]"));
+        assert_eq!(result.root.children[1].target.as_deref(), Some("[dbo].[orders]"));
+        assert!(result.top_level_hints.is_empty());
+    }
+
+    #[test]
+    fn analyze_aggregates_runtime_counters_per_thread() {
+        let raw = include_str!("../tests/fixtures/mssql_showplan_analyze.xml");
+        let result = parse_mssql_xml(true, raw).expect("parse");
+        // design §1b v1 aggregation: sum ActualRows, max ActualElapsedms.
+        assert_eq!(result.root.actual_rows, Some(1000.0));
+        assert_eq!(result.root.actual_time_ms, Some(12.0));
+    }
+
+    #[test]
+    fn estimated_mode_never_reads_runtime_counters_even_if_present() {
+        let raw = include_str!("../tests/fixtures/mssql_showplan_analyze.xml");
+        let result = parse_mssql_xml(false, raw).expect("parse");
+        assert_eq!(result.root.actual_rows, None);
+        assert_eq!(result.root.actual_time_ms, None);
+    }
+
+    #[test]
+    fn missing_index_hint_flattens_to_top_level_with_create_index_suggestion() {
+        let raw = include_str!("../tests/fixtures/mssql_showplan_missing_index.xml");
+        let result = parse_mssql_xml(false, raw).expect("parse");
+        assert_eq!(result.top_level_hints.len(), 1);
+        let hint = &result.top_level_hints[0];
+        assert!(hint.message.contains("87.3"));
+        let detail = hint.detail.as_ref().expect("detail present");
+        assert!(detail.contains("CREATE INDEX"));
+        assert!(detail.contains("[orders]"));
+        assert!(detail.contains("[user_id]"));
+        assert!(detail.contains("[amount]"));
+        assert_eq!(result.root.operation, "Table Scan"); // the RelOp tree still parses alongside the hint
+    }
+
+    #[test]
+    fn malformed_xml_is_err_not_panic() {
+        assert!(parse_mssql_xml(false, "not xml at all").is_err());
+        assert!(parse_mssql_xml(false, "<ShowPlanXML></ShowPlanXML>").is_err()); // no RelOp
+        assert!(parse_mssql_xml(false, "<RelOp NodeId=\"0\">").is_err()); // unclosed
+    }
+
+    #[test]
+    fn pathologically_deep_xml_fails_closed_at_max_depth() {
+        let mut deep = String::from("<a>");
+        for _ in 0..(MAX_XML_DEPTH + 10) {
+            deep.push_str("<a>");
+        }
+        for _ in 0..(MAX_XML_DEPTH + 11) {
+            deep.push_str("</a>");
+        }
+        let err = parse_mssql_xml(false, &deep).unwrap_err();
+        assert!(err.contains("hloubku"), "expected the depth-guard message, got: {err}");
     }
 }

@@ -17,6 +17,7 @@ tokio-postgres = "0.7"
 dirs.workspace = true
 tree-sitter = "0.25"
 tree-sitter-sequel = "0.3"
+quick-xml = "0.41"
 
 [dev-dependencies]
 tempfile.workspace = true

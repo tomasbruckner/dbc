@@ -1,0 +1,13 @@
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
+  <BatchSequence><Batch><Statements><StmtSimple>
+    <QueryPlan>
+      <RelOp NodeId="0" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="1000" EstimatedTotalSubtreeCost="4.5">
+        <IndexScan><Object Table="[dbo].[orders]" Index="[PK_orders]" Schema="[dbo]" /></IndexScan>
+        <RunTimeInformation>
+          <RunTimeCountersPerThread Thread="0" ActualRows="600" ActualElapsedms="12" ActualExecutions="1" />
+          <RunTimeCountersPerThread Thread="1" ActualRows="400" ActualElapsedms="9" ActualExecutions="1" />
+        </RunTimeInformation>
+      </RelOp>
+    </QueryPlan>
+  </StmtSimple></Statements></Batch></BatchSequence>
+</ShowPlanXML>
