@@ -29,10 +29,21 @@ enum Item {
 /// This is deliberately conservative: a `SELECT` over an unquoted column or
 /// alias literally named e.g. `update` would also be rejected. That's an
 /// acceptable false positive for a read-only guard -- fail closed.
+/// `INTO` (review round 1 finding #2) closes the `SELECT ... INTO new_tbl
+/// FROM t` bypass -- PostgreSQL's legacy `CREATE TABLE AS` spelling, which
+/// otherwise lexically starts with the allowlisted `SELECT` keyword and
+/// contains no other write keyword. Layer 2 (forced
+/// `default_transaction_read_only=on`) already catches this on Postgres,
+/// but layer 1 (this lexical gate) should too -- defense in depth means
+/// each layer holds on its own, not just in combination. `apply_auto_limit`
+/// already treats a bare `INTO` token as a "has a limiting/target clause,
+/// don't touch it" signal (see its own doc comment), so this doesn't change
+/// that function's behavior at all -- it only widens what this module's
+/// *other* guard, `is_read_statement`, rejects.
 const WRITE_KEYWORDS: &[&str] = &[
     "INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "ALTER", "CREATE", "TRUNCATE", "GRANT",
     "REVOKE", "COPY", "CALL", "DO", "VACUUM", "REINDEX", "ATTACH", "DETACH", "REPLACE", "UPSERT",
-    "EXEC", "EXECUTE",
+    "EXEC", "EXECUTE", "INTO",
 ];
 
 /// Leading keywords that may start a read-only statement.
@@ -400,6 +411,29 @@ mod tests {
     fn explain_analyze_write_fails_closed() {
         // Postgres's EXPLAIN ANALYZE actually executes the statement.
         assert!(!is_read_statement("EXPLAIN ANALYZE UPDATE t SET a=1"));
+    }
+
+    // Review round 1 finding #2: PostgreSQL's legacy `SELECT ... INTO`
+    // spelling of `CREATE TABLE AS` lexically starts with the allowlisted
+    // `SELECT` keyword and (before this fix) contained no other write
+    // keyword -- layer 1 must reject it directly, not rely solely on
+    // dbc-mcp forcing `default_transaction_read_only=on` at the driver
+    // layer to catch it.
+    #[test]
+    fn select_into_is_not_a_read_statement() {
+        assert!(!is_read_statement("SELECT * INTO new_tbl FROM t"));
+        assert!(!is_read_statement("select id into backup_t from t where id > 10"));
+        // Still fails closed inside a WITH/CTE wrapper too.
+        assert!(!is_read_statement("WITH x AS (SELECT 1) SELECT * INTO y FROM x"));
+    }
+
+    #[test]
+    fn select_into_does_not_change_auto_limit_behavior() {
+        // apply_auto_limit already treated a bare INTO token as a
+        // limiting/target clause before this change (skips appending
+        // LIMIT); adding INTO to WRITE_KEYWORDS only affects
+        // is_read_statement, not this function -- verified unchanged here.
+        assert!(!apply_auto_limit("select * into new_tbl from t", 1000).1);
     }
 
     #[test]

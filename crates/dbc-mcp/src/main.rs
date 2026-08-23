@@ -167,13 +167,17 @@ fn run_setup(vault_path: &std::path::Path, remove: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let password = match rpassword::prompt_password("dbc-mcp setup — master password: ") {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("dbc-mcp: failed to read the password: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    // Review round 1 finding #3: wrap the master password in `Zeroizing`
+    // too — it's the setup-side local this finding specifically calls out,
+    // same rationale as `Vault::export_key`'s own `Zeroizing` wrap below.
+    let password: zeroize::Zeroizing<String> =
+        match rpassword::prompt_password("dbc-mcp setup — master password: ") {
+            Ok(p) => zeroize::Zeroizing::new(p),
+            Err(e) => {
+                eprintln!("dbc-mcp: failed to read the password: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     let vault = match Vault::unlock(vault_path, &password) {
         Ok(v) => v,
@@ -182,6 +186,8 @@ fn run_setup(vault_path: &std::path::Path, remove: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Already Zeroizing<[u8; 32]> — see Vault::export_key's doc comment for
+    // exactly what this does and doesn't cover.
     let key = vault.export_key();
 
     let entry = match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
@@ -191,7 +197,7 @@ fn run_setup(vault_path: &std::path::Path, remove: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match entry.set_secret(&key) {
+    match entry.set_secret(key.as_slice()) {
         Ok(()) => {
             eprintln!(
                 "dbc-mcp: vault key stored. Register the server with no secrets in its config, e.g.:\n  claude mcp add dbc -- dbc-mcp"

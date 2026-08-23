@@ -7,6 +7,7 @@ use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::config::StateError;
 
@@ -133,12 +134,29 @@ impl Vault {
     /// Credential Manager via the `keyring` crate. The master password
     /// itself is never exposed by this or any other `Vault` method.
     ///
-    /// Callers should treat the returned bytes as sensitive for as long as
-    /// they're held (zeroize after storing, where practical) — same
-    /// handling discipline as the master password itself gets elsewhere in
-    /// this codebase.
-    pub fn export_key(&self) -> [u8; 32] {
-        self.key.into()
+    /// The returned copy is wrapped in [`Zeroizing`] so it's overwritten
+    /// with zeros the moment the caller drops it (review round 1 finding
+    /// #3: the previous wording here — "zeroize after storing, where
+    /// practical" — overclaimed; nothing actually zeroized anything before
+    /// this). Scope note, stated honestly rather than silently: this only
+    /// covers the copy handed out by *this* call. `Vault`'s own internal
+    /// `key` field is deliberately left as plain `chacha20poly1305::Key`,
+    /// NOT zeroized on `Vault::drop` — doing that would mean either
+    /// wrapping every internal use site or a bigger `chacha20poly1305`
+    /// interop change, out of scope for this pass. The export path and the
+    /// `setup`-side local are what matter for dbc-mcp's threat model, since
+    /// that's the only place the key transiently exists outside the vault
+    /// before landing in an OS credential store.
+    ///
+    /// SECURITY (review round 1 finding #4): this method is intentionally
+    /// `pub` so `dbc-mcp setup` can call it from outside this crate, which
+    /// necessarily widens the exposure surface of a security primitive
+    /// (the vault's derived key) beyond `Vault` itself. Callers must never
+    /// persist the returned key anywhere except an OS-backed credential
+    /// store (Windows Credential Manager / macOS Keychain / Secret
+    /// Service) — never to a plain file, a log line, or a config file.
+    pub fn export_key(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.key.into())
     }
 
     fn persist(&mut self) -> Result<(), StateError> {

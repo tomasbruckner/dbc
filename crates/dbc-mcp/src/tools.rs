@@ -3,7 +3,7 @@
 //! write/`execute` tool (§4 layer 3, mechanically enforced by the
 //! regression test at the bottom of this file).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dbc_core::arrow::datatypes::SchemaRef;
 use dbc_core::{apply_auto_limit, is_read_statement, CancelToken, Connection, QueryError};
@@ -70,6 +70,57 @@ fn query_error_result(e: &QueryError) -> CallToolResult {
         "message": e.message,
         "position": e.position,
     }))
+}
+
+/// Formats the design doc §4 audit-log line. Kept as a pure string
+/// formatter, separate from the `tracing::info!` call site, so the shape
+/// is unit-testable without standing up a subscriber (review round 1
+/// finding #1's stated minimum bar).
+///
+/// Base shape: `tool=<name> connection=<name> rows=<n> duration_ms=<n>`,
+/// with `sql=<text>` appended when `sql` is `Some` (only `run_query` ever
+/// passes one — §4's "SQL text yes" logging policy, matching the GUI's own
+/// `HistoryEntry` policy: SQL yes, connection name yes, never row data,
+/// never a password) and `error=<msg>` appended when `error` is `Some`.
+///
+/// SECURITY: callers must only ever pass the SQL text itself (never row
+/// data) and a `QueryError`'s own message or a short fixed reason string
+/// for `error` — never a secret. No call site in this crate passes a
+/// connection password or vault key into either parameter.
+fn audit_line(
+    tool: &str,
+    connection: &str,
+    sql: Option<&str>,
+    rows: Option<u64>,
+    duration_ms: u64,
+    error: Option<&str>,
+) -> String {
+    let rows = rows.map(|r| r.to_string()).unwrap_or_else(|| "-".to_string());
+    let mut line = format!("tool={tool} connection={connection} rows={rows} duration_ms={duration_ms}");
+    if let Some(sql) = sql {
+        line.push_str(" sql=");
+        line.push_str(sql);
+    }
+    if let Some(e) = error {
+        line.push_str(" error=");
+        line.push_str(e);
+    }
+    line
+}
+
+/// Emits [`audit_line`]'s output as a single `tracing` INFO event (design
+/// doc §4: "every tool call emits one tracing INFO line to stderr").
+/// Called at every return point of every tool method below, success and
+/// error alike, so no tool call ever completes silently.
+fn log_tool_call(
+    tool: &str,
+    connection: &str,
+    sql: Option<&str>,
+    rows: Option<u64>,
+    duration_ms: u64,
+    error: Option<&str>,
+) {
+    tracing::info!("{}", audit_line(tool, connection, sql, rows, duration_ms, error));
 }
 
 fn clamp_row_limit(requested: Option<u32>) -> (u32, bool) {
@@ -154,6 +205,7 @@ impl McpServer {
         &self,
         Parameters(_): Parameters<ListConnectionsParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let start = Instant::now();
         let items: Vec<serde_json::Value> = self
             .config
             .connections
@@ -170,6 +222,16 @@ impl McpServer {
                 })
             })
             .collect();
+        // No single "connection" applies to a list call — "-" per
+        // audit_line's documented placeholder.
+        log_tool_call(
+            "list_connections",
+            "-",
+            None,
+            Some(items.len() as u64),
+            start.elapsed().as_millis() as u64,
+            None,
+        );
         Ok(CallToolResult::structured(json!({ "connections": items })))
     }
 
@@ -180,33 +242,64 @@ impl McpServer {
         &self,
         Parameters(p): Parameters<GetSchemaParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let start = Instant::now();
         let cfg = match self.find_connection(&p.connection_id) {
             Some(c) => c,
             None => {
+                log_tool_call(
+                    "get_schema",
+                    &p.connection_id,
+                    None,
+                    None,
+                    start.elapsed().as_millis() as u64,
+                    Some("unknown connection_id"),
+                );
                 return Err(ErrorData::invalid_params(
                     format!("unknown connection_id: {}", p.connection_id),
                     None,
-                ))
+                ));
             }
         };
         if cfg.ssh.is_some() {
-            return Ok(CallToolResult::structured_error(json!({
-                "error": "SSH-tunneled connections are not available over MCP (v1 non-goal)",
-            })));
+            let msg = "SSH-tunneled connections are not available over MCP (v1 non-goal)";
+            log_tool_call("get_schema", &cfg.name, None, None, start.elapsed().as_millis() as u64, Some(msg));
+            return Ok(CallToolResult::structured_error(json!({ "error": msg })));
         }
 
         let secret = self.vault.get_secret(&cfg.id);
         let mut conn = match open_for_mcp(&cfg, secret).await {
             Ok(c) => c,
-            Err(e) => return Ok(query_error_result(&e)),
+            Err(e) => {
+                log_tool_call(
+                    "get_schema",
+                    &cfg.name,
+                    None,
+                    None,
+                    start.elapsed().as_millis() as u64,
+                    Some(&e.message),
+                );
+                return Ok(query_error_result(&e));
+            }
         };
         let snapshot = match conn.schema().await {
             Ok(s) => s,
-            Err(e) => return Ok(query_error_result(&e)),
+            Err(e) => {
+                log_tool_call(
+                    "get_schema",
+                    &cfg.name,
+                    None,
+                    None,
+                    start.elapsed().as_millis() as u64,
+                    Some(&e.message),
+                );
+                return Ok(query_error_result(&e));
+            }
         };
 
         let include_ddl = p.include_ddl.unwrap_or(false);
         let body = schema_to_json(&snapshot, p.schema.as_deref(), include_ddl);
+        let table_count = body.get("tables").and_then(|t| t.as_array()).map(|a| a.len() as u64);
+        log_tool_call("get_schema", &cfg.name, None, table_count, start.elapsed().as_millis() as u64, None);
         Ok(CallToolResult::structured(body))
     }
 
@@ -217,27 +310,53 @@ impl McpServer {
         &self,
         Parameters(p): Parameters<RunQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let tool_start = Instant::now();
+
         // Gate 1 (§4 layer 1): reject before ever opening a connection.
         if !is_read_statement(&p.sql) {
+            let msg = "only read-only statements are allowed over MCP (SELECT/WITH/EXPLAIN/SHOW/VALUES/PRAGMA-getters); the statement was rejected before any connection was opened";
+            log_tool_call(
+                "run_query",
+                &p.connection_id,
+                Some(&p.sql),
+                None,
+                tool_start.elapsed().as_millis() as u64,
+                Some("write statement rejected"),
+            );
             return Ok(CallToolResult::structured_error(json!({
                 "error": "write statement rejected",
-                "message": "only read-only statements are allowed over MCP (SELECT/WITH/EXPLAIN/SHOW/VALUES/PRAGMA-getters); the statement was rejected before any connection was opened",
+                "message": msg,
             })));
         }
 
         let cfg = match self.find_connection(&p.connection_id) {
             Some(c) => c,
             None => {
+                log_tool_call(
+                    "run_query",
+                    &p.connection_id,
+                    Some(&p.sql),
+                    None,
+                    tool_start.elapsed().as_millis() as u64,
+                    Some("unknown connection_id"),
+                );
                 return Err(ErrorData::invalid_params(
                     format!("unknown connection_id: {}", p.connection_id),
                     None,
-                ))
+                ));
             }
         };
         if cfg.ssh.is_some() {
-            return Ok(CallToolResult::structured_error(json!({
-                "error": "SSH-tunneled connections are not available over MCP (v1 non-goal)",
-            })));
+            let msg = "SSH-tunneled connections are not available over MCP (v1 non-goal)";
+            log_tool_call(
+                "run_query",
+                &cfg.name,
+                Some(&p.sql),
+                None,
+                tool_start.elapsed().as_millis() as u64,
+                Some(msg),
+            );
+            return Ok(CallToolResult::structured_error(json!({ "error": msg })));
         }
 
         let (row_limit, row_limit_clamped) = clamp_row_limit(p.row_limit);
@@ -247,11 +366,21 @@ impl McpServer {
         let secret = self.vault.get_secret(&cfg.id);
         let mut conn = match open_for_mcp(&cfg, secret).await {
             Ok(c) => c,
-            Err(e) => return Ok(query_error_result(&e)),
+            Err(e) => {
+                log_tool_call(
+                    "run_query",
+                    &cfg.name,
+                    Some(&p.sql),
+                    None,
+                    tool_start.elapsed().as_millis() as u64,
+                    Some(&e.message),
+                );
+                return Ok(query_error_result(&e));
+            }
         };
 
         let cancel = CancelToken::new();
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let timeout_dur = Duration::from_secs(timeout_secs as u64);
 
         let drained = match tokio::time::timeout(
@@ -261,15 +390,34 @@ impl McpServer {
         .await
         {
             Ok(Ok(d)) => d,
-            Ok(Err(e)) => return Ok(query_error_result(&e)),
+            Ok(Err(e)) => {
+                log_tool_call(
+                    "run_query",
+                    &cfg.name,
+                    Some(&p.sql),
+                    None,
+                    tool_start.elapsed().as_millis() as u64,
+                    Some(&e.message),
+                );
+                return Ok(query_error_result(&e));
+            }
             Err(_) => {
                 // Protocol-level cancel (§5): fires the same CancelToken the
                 // driver watches, then reports a timeout — v1 is
                 // all-or-nothing, no partial rows on timeout.
                 cancel.cancel();
+                let msg = format!("query exceeded the {timeout_secs}s timeout");
+                log_tool_call(
+                    "run_query",
+                    &cfg.name,
+                    Some(&p.sql),
+                    None,
+                    tool_start.elapsed().as_millis() as u64,
+                    Some(&msg),
+                );
                 return Ok(CallToolResult::structured_error(json!({
                     "error": "timeout",
-                    "message": format!("query exceeded the {timeout_secs}s timeout"),
+                    "message": msg,
                 })));
             }
         };
@@ -285,6 +433,15 @@ impl McpServer {
             obj.insert("row_limit".into(), json!(row_limit));
             obj.insert("row_limit_clamped".into(), json!(row_limit_clamped));
         }
+        let row_count = body.get("row_count").and_then(|v| v.as_u64());
+        log_tool_call(
+            "run_query",
+            &cfg.name,
+            Some(&p.sql),
+            row_count,
+            tool_start.elapsed().as_millis() as u64,
+            None,
+        );
         Ok(CallToolResult::structured(body))
     }
 }
@@ -591,6 +748,45 @@ mod tests {
         let body = result.structured_content.unwrap();
         assert_eq!(body["truncated"], false);
         assert_eq!(body["row_count"], 3);
+    }
+}
+
+// Review round 1 finding #1: audit logging (design doc §4) is a binding
+// requirement, not optional polish. These test the pure formatter directly
+// (the stated minimum bar) plus a smoke test that the `tracing::info!`
+// call site itself compiles and doesn't panic without a subscriber
+// installed — the call sites inside the three tool methods above are what
+// actually satisfies "every tool call".
+#[cfg(test)]
+mod audit_log_tests {
+    use super::*;
+
+    #[test]
+    fn audit_line_matches_the_design_docs_base_shape() {
+        let line = audit_line("list_connections", "-", None, Some(3), 12, None);
+        assert_eq!(line, "tool=list_connections connection=- rows=3 duration_ms=12");
+    }
+
+    #[test]
+    fn audit_line_appends_sql_and_error_when_present() {
+        let line = audit_line("run_query", "prod-db", Some("SELECT 1"), None, 5, Some("syntax error"));
+        assert_eq!(line, "tool=run_query connection=prod-db rows=- duration_ms=5 sql=SELECT 1 error=syntax error");
+    }
+
+    #[test]
+    fn audit_line_never_needs_a_secret_parameter() {
+        // Structural check that the formatter has no way to accidentally
+        // carry a password/key: its only string-shaped inputs are tool
+        // name, connection name, SQL text, and an error message — verified
+        // here by construction rather than by grepping call sites.
+        let line = audit_line("run_query", "c1", Some("SELECT * FROM t"), Some(1), 1, None);
+        assert!(!line.to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn log_tool_call_smoke_test_does_not_panic_without_a_subscriber() {
+        log_tool_call("run_query", "c1", Some("SELECT 1"), Some(2), 3, None);
+        log_tool_call("get_schema", "c1", None, None, 1, Some("boom"));
     }
 }
 
