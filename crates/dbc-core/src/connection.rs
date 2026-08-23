@@ -15,4 +15,14 @@ pub trait Connection: Send {
     /// already-reported failure.
     async fn query(&mut self, sql: &str, cancel: CancelToken) -> Result<QueryStream, QueryError>;
     async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError>;
+
+    /// Executes a non-returning statement, reporting affected rows. This is
+    /// the app's write path — ONLY the sandbox Apply flow may call it.
+    ///
+    /// Transactions are per-connection: a caller driving `BEGIN` … `COMMIT`/
+    /// `ROLLBACK` MUST issue every statement in that sequence over the SAME
+    /// `Connection` instance, sequentially. Implementations must never
+    /// re-open or pool connections underneath `execute` — doing so would
+    /// silently split a transaction across separate server-side sessions.
+    async fn execute(&mut self, sql: &str, cancel: CancelToken) -> Result<u64, QueryError>;
 }

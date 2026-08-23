@@ -12,11 +12,20 @@ use dbc_core::{
 pub struct SqliteConnection {
     path: PathBuf,
     read_only: bool,
+    /// Lazily-opened connection reused across [`Connection::execute`] calls
+    /// so a `BEGIN … COMMIT`/`ROLLBACK` sequence runs over one underlying
+    /// sqlite handle rather than being silently split across separate
+    /// connections (which would drop the in-progress transaction). Taken out
+    /// of the `Option` and moved into `spawn_blocking`, then put back — safe
+    /// because `execute` takes `&mut self`, so there is never concurrent
+    /// access. `query`/`schema` are unaffected and keep opening a fresh
+    /// connection per call, as before.
+    exec_conn: Option<rusqlite::Connection>,
 }
 
 impl SqliteConnection {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into(), read_only: false }
+        Self { path: path.into(), read_only: false, exec_conn: None }
     }
 
     /// Like [`SqliteConnection::new`], but opens the database with
@@ -26,7 +35,7 @@ impl SqliteConnection {
     /// file. See dbc-ui's `connect::open_config`, which selects this
     /// constructor when `ConnectionConfig::read_only` is set.
     pub fn new_with_options(path: impl Into<PathBuf>, read_only: bool) -> Self {
-        Self { path: path.into(), read_only }
+        Self { path: path.into(), read_only, exec_conn: None }
     }
 }
 
@@ -156,6 +165,38 @@ impl Connection for SqliteConnection {
 
         let columns = schema_rx.await.map_err(|_| QueryError::msg("driver task died"))??;
         Ok(QueryStream { columns, batches: rx })
+    }
+
+    /// Executes a non-returning statement over a connection kept open across
+    /// calls (see [`SqliteConnection::exec_conn`]), so `BEGIN … COMMIT`/
+    /// `ROLLBACK` sequences issued via successive `execute` calls run over
+    /// the same sqlite handle. `rusqlite::Connection::execute` returns the
+    /// changed-row count directly for DML (`0` for `BEGIN`/`COMMIT`/DDL), and
+    /// errors on statements that return rows (e.g. `SELECT`) — desired here,
+    /// since this path is for writes only.
+    async fn execute(&mut self, sql: &str, cancel: CancelToken) -> Result<u64, QueryError> {
+        if cancel.is_cancelled() {
+            return Err(QueryError {
+                code: Some("cancelled".into()),
+                message: "query cancelled".into(),
+                position: None,
+            });
+        }
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        let conn = match self.exec_conn.take() {
+            Some(c) => c,
+            None => open_conn(&path, read_only).map_err(q_err)?,
+        };
+        let sql = sql.to_owned();
+        let (result, conn) = tokio::task::spawn_blocking(move || {
+            let result = conn.execute(&sql, []).map(|n| n as u64).map_err(q_err);
+            (result, conn)
+        })
+        .await
+        .map_err(|_| QueryError::msg("driver task died"))?;
+        self.exec_conn = Some(conn);
+        result
     }
 
     async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError> {
@@ -570,5 +611,63 @@ mod tests {
         // If schema() succeeds on a valid db, the happy path is confirmed
         let snap = c.schema().await;
         assert!(snap.is_ok(), "schema() should succeed on valid db");
+    }
+
+    #[tokio::test]
+    async fn execute_reports_affected_rows() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let mut c = SqliteConnection::new(f.path());
+
+        // DDL: 0 affected rows.
+        let n = c
+            .execute("CREATE TABLE t(id INTEGER, name TEXT)", CancelToken::new())
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+
+        // Each INSERT affects exactly 1 row.
+        let n = c
+            .execute("INSERT INTO t(id, name) VALUES (1, 'a')", CancelToken::new())
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let n = c
+            .execute("INSERT INTO t(id, name) VALUES (2, 'b')", CancelToken::new())
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // UPDATE hitting both rows reports 2.
+        let n = c.execute("UPDATE t SET name = 'z'", CancelToken::new()).await.unwrap();
+        assert_eq!(n, 2);
+
+        // DELETE with no matching rows reports 0.
+        let n = c
+            .execute("DELETE FROM t WHERE id = 9999", CancelToken::new())
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn execute_in_transaction_rolls_back() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let mut c = SqliteConnection::new(f.path());
+        c.execute("CREATE TABLE t(id INTEGER, name TEXT)", CancelToken::new()).await.unwrap();
+
+        c.execute("BEGIN", CancelToken::new()).await.unwrap();
+        c.execute("INSERT INTO t(id, name) VALUES (1, 'a')", CancelToken::new()).await.unwrap();
+        c.execute("ROLLBACK", CancelToken::new()).await.unwrap();
+
+        // The insert must not be visible — same underlying connection must
+        // have been used for BEGIN/INSERT/ROLLBACK for the rollback to take
+        // effect; a fresh connection per call would have auto-committed the
+        // INSERT before ROLLBACK ever ran.
+        let mut s = c.query("SELECT id FROM t", CancelToken::new()).await.unwrap();
+        let mut rows = 0usize;
+        while let Some(b) = s.batches.recv().await {
+            rows += b.unwrap().num_rows();
+        }
+        assert_eq!(rows, 0, "row inserted inside the rolled-back transaction must be absent");
     }
 }

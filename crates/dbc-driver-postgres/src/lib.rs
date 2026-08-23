@@ -205,6 +205,21 @@ impl Connection for PostgresConnection {
         Ok(QueryStream { columns: schema, batches: rx })
     }
 
+    /// Executes a non-returning statement over `self.client` (an `Arc`
+    /// shared for the lifetime of this `PostgresConnection`, i.e. one
+    /// backend session), so `BEGIN … COMMIT`/`ROLLBACK` issued via successive
+    /// `execute` calls run within the same server-side transaction.
+    async fn execute(&mut self, sql: &str, cancel: CancelToken) -> Result<u64, QueryError> {
+        if cancel.is_cancelled() {
+            return Err(QueryError {
+                code: Some("cancelled".into()),
+                message: "query cancelled".into(),
+                position: None,
+            });
+        }
+        self.client.execute(sql, &[]).await.map_err(pg_err)
+    }
+
     async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError> {
         let (mut tables, oid_idx, col_idx) = self.fetch_tables().await?;
         self.attach_pks(&mut tables, &col_idx).await?;

@@ -363,3 +363,48 @@ async fn temp_table_from_other_session_does_not_leak_into_schema() {
     // the whole schema() call above.
     drop(temp_client);
 }
+
+/// `Connection::execute` affected-rows reporting, mirroring the sqlite
+/// driver's `execute_reports_affected_rows` unit test.
+#[tokio::test]
+#[ignore]
+async fn execute_reports_affected_rows() {
+    let node = Postgres::default().start().await.unwrap();
+    let mut c = PostgresConnection::connect(&pg_url(&node).await).await.unwrap();
+
+    let n = c.execute("CREATE TABLE t(id integer, name text)", CancelToken::new()).await.unwrap();
+    assert_eq!(n, 0);
+
+    let n = c.execute("INSERT INTO t(id, name) VALUES (1, 'a')", CancelToken::new()).await.unwrap();
+    assert_eq!(n, 1);
+    let n = c.execute("INSERT INTO t(id, name) VALUES (2, 'b')", CancelToken::new()).await.unwrap();
+    assert_eq!(n, 1);
+
+    let n = c.execute("UPDATE t SET name = 'z'", CancelToken::new()).await.unwrap();
+    assert_eq!(n, 2);
+
+    let n = c.execute("DELETE FROM t WHERE id = 9999", CancelToken::new()).await.unwrap();
+    assert_eq!(n, 0);
+}
+
+/// `BEGIN … ROLLBACK` driven through successive `execute` calls over the
+/// SAME `PostgresConnection` must roll back — this is the write-path
+/// contract Task 4's Apply runner depends on.
+#[tokio::test]
+#[ignore]
+async fn execute_in_transaction_rolls_back() {
+    let node = Postgres::default().start().await.unwrap();
+    let mut c = PostgresConnection::connect(&pg_url(&node).await).await.unwrap();
+    c.execute("CREATE TABLE t(id integer, name text)", CancelToken::new()).await.unwrap();
+
+    c.execute("BEGIN", CancelToken::new()).await.unwrap();
+    c.execute("INSERT INTO t(id, name) VALUES (1, 'a')", CancelToken::new()).await.unwrap();
+    c.execute("ROLLBACK", CancelToken::new()).await.unwrap();
+
+    let mut s = c.query("SELECT id FROM t", CancelToken::new()).await.unwrap();
+    let mut rows = 0usize;
+    while let Some(b) = s.batches.recv().await {
+        rows += b.unwrap().num_rows();
+    }
+    assert_eq!(rows, 0, "row inserted inside the rolled-back transaction must be absent");
+}
