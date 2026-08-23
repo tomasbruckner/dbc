@@ -1,11 +1,15 @@
 //! G14 charts — pure data prep + scale math (design §2.2). GPUI-free like
 //! tabs.rs/sandbox.rs; chart_view.rs only paints this module's output.
-// consumed by chart_view.rs (G14 Task 8); allow removed there
-#![allow(dead_code)]
 
 pub const CHART_ROW_HARD_CAP: usize = 500;
 pub const MIN_PX_PER_TICK: f32 = 3.0;
 
+// Variants are threaded through (matched on, stored) by chart_view.rs
+// already, but not yet CONSTRUCTED anywhere reachable outside tests — that
+// happens at the ModalState::ChartPicker call site (G14 Task 11). Targeted
+// allow, not a file-level one — everything else in this module is genuinely
+// used (transitively, via chart_view.rs) as of Task 8.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChartKind {
     Bar,

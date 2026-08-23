@@ -1,5 +1,6 @@
 mod autocomplete;
 mod chart_data;
+mod chart_view;
 mod compare;
 mod connect;
 mod connections_ui;
