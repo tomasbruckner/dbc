@@ -85,6 +85,22 @@ fn move_selection(selected: usize, len: usize, delta: i32) -> usize {
     (selected as i32 + delta).clamp(0, max) as usize
 }
 
+/// Pure decision table for the AppView wrapper-div popup-action handlers
+/// (`on_ac_up`/`on_ac_down`/`on_ac_confirm`/`on_ac_confirm_tab`/
+/// `on_ac_escape`): `true` means the handler should treat the action as its
+/// own (consume it — no `cx.propagate()`); `false` means it must
+/// propagate. Review round 3, BLOCKER: `on_ac_escape` previously returned
+/// early WITHOUT propagating whenever `popup_open` was false, which
+/// silently ate every `Escape` keystroke and made the global
+/// `"escape" -> CancelQuery` binding (one level up the SAME bubble path)
+/// unreachable while the SQL editor had focus — see each handler's own doc
+/// comment for the full grounding. Trivial by construction (`popup_open`
+/// IS the answer), but named and centralized so the contract is explicit
+/// and every handler stays consistent rather than re-deriving it inline.
+fn autocomplete_handles_action(popup_open: bool) -> bool {
+    popup_open
+}
+
 /// Pure: given `text`, `cursor`, and the candidate's `text` to insert,
 /// returns the byte range to replace (the identifier prefix ending at
 /// `cursor`, or an empty range at `cursor` if there is none — e.g. a
@@ -92,6 +108,15 @@ fn move_selection(selected: usize, len: usize, delta: i32) -> usize {
 /// string. Extracted so T7's `accept_completion` wiring has a pure,
 /// directly-testable core instead of only being exercisable through a live
 /// `SqlInput` (plan T7 step 1).
+///
+/// The replaced range is "the identifier prefix ending EXACTLY at `cursor`"
+/// (`autocomplete::cursor_context`'s own contract) — if the cursor sits in
+/// the MIDDLE of a longer identifier (e.g. `usXer` with the cursor after
+/// `us`), only the part BEFORE the cursor is replaced; whatever comes after
+/// the cursor is left untouched, not merged/deduped against the inserted
+/// text. This is intentional (review round 3 NIT): matching most editors'
+/// "complete up to the cursor" model rather than attempting to also
+/// understand/replace a suffix the user hasn't necessarily finished typing.
 fn completion_edit(text: &str, cursor: usize, insert: &str) -> (std::ops::Range<usize>, String) {
     let ctx = autocomplete::cursor_context(text, cursor);
     let start = cursor - ctx.prefix.len();
@@ -1771,6 +1796,28 @@ impl AppView {
         )
     }
 
+    /// G6 T7 (review round 3, MAJOR 1): unconditionally closes the
+    /// autocomplete popup — called from every place the ACTIVE connection's
+    /// identity or schema snapshot changes underneath it
+    /// (`connections_ui::switch_to_connection`'s success arm, AND
+    /// `trigger_schema_fetch`'s successful-snapshot arm below), not just
+    /// from `on_ac_escape`. Without this, `refresh_autocomplete`'s
+    /// text/cursor/focus-based lazy-diff has no signal that the SCHEMA
+    /// changed (the SQL editor's own text/cursor/focus are untouched by a
+    /// connection switch), so a popup opened against the OLD connection's
+    /// schema could survive the switch and, if accepted, insert a
+    /// table/column name from the wrong database. No-op (and no
+    /// `cx.notify()`) when already closed, so call sites don't need their
+    /// own guard.
+    pub(crate) fn close_autocomplete(&mut self, cx: &mut Context<Self>) {
+        if self.autocomplete.is_none() {
+            return;
+        }
+        self.autocomplete = None;
+        self.sql.update(cx, |s, _| s.set_autocomplete_active(false));
+        cx.notify();
+    }
+
     /// G6 T7: force-trigger (`Ctrl+Space`, global binding, design §2) — opens
     /// the popup with the FULL candidate set (empty prefix, bypassing
     /// whatever partial identifier/qualifier the cursor happens to sit in),
@@ -1836,13 +1883,30 @@ impl AppView {
     }
 
     fn on_ac_up(&mut self, _: &sql_input::Up, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ac) = &mut self.autocomplete else { return };
+        // Review round 3, BLOCKER follow-up: every one of these
+        // wrapper-div handlers only runs at all when `SqlInput`'s own
+        // handler propagated (i.e. `autocomplete_active` was true at
+        // dispatch time), but the defensive `self.autocomplete` re-check
+        // below can still fail on a same-frame race (plan T7 step 3, item
+        // 5) — when it does, this handler must `cx.propagate()`, not
+        // silently swallow the keystroke (see `on_ac_escape`'s doc comment
+        // for why this matters most for `Escape`; applied uniformly here
+        // for consistency/hygiene).
+        if !autocomplete_handles_action(self.autocomplete.is_some()) {
+            cx.propagate();
+            return;
+        }
+        let ac = self.autocomplete.as_mut().unwrap();
         ac.selected = move_selection(ac.selected, ac.candidates.len(), -1);
         cx.notify();
     }
 
     fn on_ac_down(&mut self, _: &sql_input::Down, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ac) = &mut self.autocomplete else { return };
+        if !autocomplete_handles_action(self.autocomplete.is_some()) {
+            cx.propagate();
+            return;
+        }
+        let ac = self.autocomplete.as_mut().unwrap();
         ac.selected = move_selection(ac.selected, ac.candidates.len(), 1);
         cx.notify();
     }
@@ -1853,6 +1917,12 @@ impl AppView {
     /// pure range computation for the prefix length (design §2's "Enter/Tab
     /// accept").
     fn accept_selected_completion(&mut self, cx: &mut Context<Self>) {
+        // Callers (`on_ac_confirm`/`on_ac_confirm_tab`) already guard on
+        // `autocomplete_handles_action` before calling this, but `ac`'s
+        // `selected` index could in principle be stale (e.g. a candidate
+        // list that shrank between the last nav and this accept) — the
+        // `.get` below stays defensive rather than assuming it's always
+        // in-bounds.
         let Some(ac) = &self.autocomplete else { return };
         let Some(candidate) = ac.candidates.get(ac.selected) else { return };
         let insert = candidate.text.clone();
@@ -1873,26 +1943,47 @@ impl AppView {
     }
 
     fn on_ac_confirm(&mut self, _: &sql_input::Newline, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.autocomplete.is_none() {
+        if !autocomplete_handles_action(self.autocomplete.is_some()) {
+            cx.propagate();
             return;
         }
         self.accept_selected_completion(cx);
     }
 
+    /// Review round 3, hygiene follow-up to the BLOCKER below: `Tab` is
+    /// unconditionally propagated by `SqlInput::on_tab` regardless of
+    /// `autocomplete_active` (unlike `Up`/`Down`/`Newline`, which `SqlInput`
+    /// itself only propagates while the popup is open), so this handler
+    /// runs on EVERY Tab press with editor focus, not just while the popup
+    /// is open. Currently harmless (no other ancestor binds `Tab`, so a
+    /// swallowed propagate has no observable effect), but propagating here
+    /// keeps that from becoming a silent trap if a `Tab` binding is ever
+    /// added elsewhere.
     fn on_ac_confirm_tab(&mut self, _: &sql_input::Tab, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.autocomplete.is_none() {
+        if !autocomplete_handles_action(self.autocomplete.is_some()) {
+            cx.propagate();
             return;
         }
         self.accept_selected_completion(cx);
     }
 
+    /// Review round 3, BLOCKER: `SqlInput::on_escape` ALWAYS propagates
+    /// (open or closed popup alike — see its own doc comment), specifically
+    /// so `Escape` can reach the global `"escape" -> CancelQuery` binding
+    /// when the popup is closed. This handler sits directly on that bubble
+    /// path (bound on the SAME wrapper div, SAME action type), so it must
+    /// mirror that and propagate too whenever it doesn't actually close a
+    /// popup — the previous version returned early WITHOUT propagating,
+    /// which silently consumed the action and made `CancelQuery`
+    /// unreachable via Escape for as long as the SQL editor had focus (a
+    /// user-visible regression: no way to cancel a running query from the
+    /// keyboard).
     fn on_ac_escape(&mut self, _: &sql_input::Escape, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.autocomplete.is_none() {
+        if !autocomplete_handles_action(self.autocomplete.is_some()) {
+            cx.propagate();
             return;
         }
-        self.autocomplete = None;
-        self.sql.update(cx, |s, _| s.set_autocomplete_active(false));
-        cx.notify();
+        self.close_autocomplete(cx);
     }
 
     /// G6 T7: floating popup, anchored just below the cursor via
@@ -2813,6 +2904,12 @@ impl AppView {
                             t.set_snapshot(snapshot, same_connection, cx);
                             t.set_favourites(favourites, active_id, cx);
                         });
+                        // Review round 3, MAJOR 1: a new snapshot landing
+                        // (connection switch OR a same-connection refresh)
+                        // invalidates whatever candidates an open popup was
+                        // computed from — close it rather than risk an
+                        // accept inserting a stale/wrong-schema name.
+                        view.close_autocomplete(cx);
                     }
                     Ok(Err(e)) => {
                         view.tree.update(cx, |t, cx| t.set_error(e.to_string(), cx));
@@ -4138,5 +4235,50 @@ mod completion_edit_tests {
         let (range, new_text) = completion_edit("SELECT o.tot", 12, "total");
         assert_eq!(range, 9..12);
         assert_eq!(new_text, "SELECT o.total");
+    }
+
+    // --- Review round 3 fixes ---
+
+    /// MAJOR 3: the previous byte-only prefix walk truncated a non-ASCII
+    /// prefix (`čas` -> only `as`), which then corrupted the replace-range
+    /// math — `č` was left in place in the untouched region AND duplicated
+    /// by the inserted candidate (`SELECT ččasovka`). The walk is now
+    /// char-based (`autocomplete::cursor_context`), so the whole `čas`
+    /// prefix is replaced cleanly.
+    #[test]
+    fn non_ascii_prefix_is_replaced_in_full_not_truncated_or_duplicated() {
+        let (range, new_text) = completion_edit("SELECT čas", 11, "časovka");
+        assert_eq!(range, 7..11);
+        assert_eq!(new_text, "SELECT časovka");
+    }
+
+    /// NIT: cursor-mid-word behavior is intentional (see `completion_edit`'s
+    /// doc comment) — only the prefix BEFORE the cursor is replaced; a
+    /// suffix already typed past the cursor (`Xer` here) is left as-is,
+    /// not merged against the inserted candidate.
+    #[test]
+    fn mid_word_cursor_only_replaces_the_prefix_before_the_cursor() {
+        let (range, new_text) = completion_edit("usXer", 2, "users");
+        assert_eq!(range, 0..2);
+        assert_eq!(new_text, "usersXer");
+    }
+}
+
+#[cfg(test)]
+mod autocomplete_handles_action_tests {
+    use super::*;
+
+    #[test]
+    fn consumes_only_while_the_popup_is_open() {
+        assert!(autocomplete_handles_action(true));
+    }
+
+    #[test]
+    fn propagates_when_the_popup_is_closed() {
+        // Review round 3, BLOCKER: this is the exact case `on_ac_escape`
+        // previously got wrong (returned early without propagating),
+        // silently eating Escape and making the global CancelQuery binding
+        // unreachable while the editor had focus.
+        assert!(!autocomplete_handles_action(false));
     }
 }

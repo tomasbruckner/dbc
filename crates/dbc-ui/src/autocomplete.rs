@@ -74,43 +74,65 @@ fn is_alias_stopword(word_upper: &str) -> bool {
 
 const MAX_CANDIDATES: usize = 20;
 
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+/// True if `c` can be part of an identifier prefix/qualifier token, per
+/// `cursor_context`'s Unicode-aware walk (review round 3, MAJOR 3 —
+/// distinct from `is_ident_start`/`is_ident_char` below, which stay
+/// ASCII-only since they're only ever used to recognize ASCII SQL keywords
+/// in `resolve_aliases`' scanner, a narrower job than "is this byte/char
+/// part of whatever identifier the user is typing").
+fn is_ident_char_unicode(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
-/// Walks backward from `cursor` over identifier bytes to find the partial
-/// token under the cursor, and (if that token is preceded by a `.`) the
-/// qualifier token before the dot.
+/// Walks backward from `end` over a contiguous run of `is_ident_char_unicode`
+/// characters, returning the byte offset the run starts at (`end` itself if
+/// the character immediately before it, if any, isn't part of an
+/// identifier). Char-based (not byte-based) so a multi-byte identifier char
+/// (`č`, `užc`, ...) is walked as ONE unit rather than stopping mid-character
+/// — review round 3, MAJOR 3: the previous byte-only `is_ident_byte` walk
+/// silently truncated a non-ASCII prefix (`čas` -> only `as`), which then
+/// corrupted `completion_edit`'s replace-range math (`č` left in place AND
+/// duplicated). This is the ONE shared place both the popup filter
+/// (`candidates`, via this function) and `main.rs`'s `completion_edit`
+/// (via `cursor_context`) derive the prefix range from, so both stay
+/// consistent by construction.
+fn walk_ident_prefix_start(text: &str, end: usize) -> usize {
+    let mut start = end;
+    for (i, c) in text[..end].char_indices().rev() {
+        if !is_ident_char_unicode(c) {
+            break;
+        }
+        start = i;
+    }
+    start
+}
+
+/// Walks backward from `cursor` over identifier characters (Unicode-aware —
+/// see `walk_ident_prefix_start`) to find the partial token under the
+/// cursor, and (if that token is preceded by a `.`) the qualifier token
+/// before the dot.
 pub fn cursor_context(text: &str, cursor: usize) -> CursorContext {
     let mut cursor = cursor.min(text.len());
     // A cursor mid-way through a multi-byte UTF-8 character (e.g. a
     // caller passing a stale/out-of-sync byte offset) would otherwise
     // panic on the `text[..]` slicing below — snap DOWN to the nearest
     // character boundary first, same "floor, don't round" convention as
-    // `text_model.rs`'s grapheme-boundary snapping. Floor (not full
-    // grapheme-cluster awareness) is sufficient here: this function only
-    // ever reasons about ASCII identifier bytes, so once `cursor` itself
-    // sits on a character boundary, every backward step below consumes one
-    // whole ASCII byte at a time and can never re-enter the middle of a
-    // multi-byte sequence (review round 1, finding 4).
+    // `text_model.rs`'s grapheme-boundary snapping (review round 1, finding
+    // 4). Once `cursor` sits on a character boundary, `walk_ident_prefix_start`
+    // below only ever steps back whole characters at a time, so it can
+    // never re-enter the middle of a multi-byte sequence either.
     while cursor > 0 && !text.is_char_boundary(cursor) {
         cursor -= 1;
     }
 
-    let bytes = text.as_bytes();
-
-    let mut start = cursor;
-    while start > 0 && is_ident_byte(bytes[start - 1]) {
-        start -= 1;
-    }
+    let start = walk_ident_prefix_start(text, cursor);
     let prefix = text[start..cursor].to_string();
 
-    let qualifier = if start > 0 && bytes[start - 1] == b'.' {
+    // `.` is always exactly 1 ASCII byte, so `start - 1` is always a valid
+    // boundary immediately preceding `start`.
+    let qualifier = if start > 0 && text.as_bytes()[start - 1] == b'.' {
         let dot = start - 1;
-        let mut qbegin = dot;
-        while qbegin > 0 && is_ident_byte(bytes[qbegin - 1]) {
-            qbegin -= 1;
-        }
+        let qbegin = walk_ident_prefix_start(text, dot);
         if qbegin < dot {
             Some(text[qbegin..dot].to_string())
         } else {
@@ -294,6 +316,25 @@ fn column_candidates(text: &str, qualifier: &str, prefix: &str, snapshot: Option
     rank_and_cap(scored)
 }
 
+/// True if the identifier prefix `cursor_context` would compute at `cursor`
+/// is immediately preceded by an (unclosed, from this local check's point of
+/// view) `"` — review round 3, MAJOR 2: tree-sitter's `suppresses_completion`
+/// mask only covers string/comment captures, NOT double-quoted identifiers,
+/// and `is_ident_char_unicode` doesn't treat `"` as an identifier char
+/// either — so typing inside `SELECT "Us` would otherwise both open the
+/// popup AND (on accept) leave the stray opening quote in place while
+/// inserting an unquoted candidate (`SELECT "Users`, no closing quote — or,
+/// for a force-triggered accept via `completion_edit`, `SELECT "SELECT`).
+/// v1 posture: suppress entirely (never open, so never accept either)
+/// rather than attempting a full quoted-identifier grammar. Pure and
+/// directly unit-tested — the ONE seam `candidates` (both the typing-
+/// trigger and Ctrl+Space paths) checks it through.
+fn prefix_preceded_by_open_quote(text: &str, cursor: usize) -> bool {
+    let ctx = cursor_context(text, cursor);
+    let prefix_start = cursor.min(text.len()).saturating_sub(ctx.prefix.len());
+    prefix_start > 0 && text.as_bytes().get(prefix_start - 1) == Some(&b'"')
+}
+
 /// Ranked candidates (design §2's ranking rules; capped at 20).
 /// `in_suppressed_span` is caller-supplied (T7 wires it from
 /// `SqlInput.highlights`' `suppresses_completion` flags, T4/T5) — this
@@ -306,6 +347,15 @@ pub fn candidates(
     in_suppressed_span: bool,
 ) -> Vec<Candidate> {
     if in_suppressed_span {
+        return Vec::new();
+    }
+
+    // Checked unconditionally (even under `force`, review round 3 MAJOR 2):
+    // a Ctrl+Space accept still goes through `completion_edit`'s REAL
+    // `cursor_context`-derived range, not `force`'s empty-prefix bypass, so
+    // sitting right after an unclosed `"` is just as unsafe to accept into
+    // under force-trigger as under the typing trigger.
+    if prefix_preceded_by_open_quote(text, cursor) {
         return Vec::new();
     }
 
@@ -1131,5 +1181,52 @@ mod tests {
         let cursor = sql.len();
         let cs = candidates(sql, cursor, Some(&snap), false, false);
         assert!(cs.iter().all(|c| c.kind != CandidateKind::Column));
+    }
+
+    // --- Review round 3 fixes ---
+
+    #[test]
+    fn prefix_immediately_after_an_open_double_quote_is_detected() {
+        assert!(prefix_preceded_by_open_quote("SELECT \"Us", 10));
+    }
+
+    #[test]
+    fn prefix_not_after_a_quote_is_not_flagged() {
+        assert!(!prefix_preceded_by_open_quote("SELECT sel", 10));
+    }
+
+    // MAJOR 2: an unclosed double-quoted identifier prefix must suppress
+    // the popup entirely (never open, so never accept either) — accepting
+    // would otherwise leave the stray opening quote in place while
+    // inserting an unquoted, unclosed candidate.
+    #[test]
+    fn unclosed_quoted_identifier_prefix_offers_no_candidates() {
+        let cs = candidates("SELECT \"Us", 10, None, false, false);
+        assert!(cs.is_empty());
+    }
+
+    #[test]
+    fn unclosed_quoted_identifier_prefix_suppresses_even_under_force_trigger() {
+        // Ctrl+Space itself bypasses the typed prefix for RANKING purposes,
+        // but an accept from that force-trigger still goes through
+        // `completion_edit`'s real `cursor_context`-derived range — so this
+        // must be suppressed too, not just the typing-trigger path.
+        let cs = candidates("SELECT \"Us", 10, None, true, false);
+        assert!(cs.is_empty());
+    }
+
+    // MAJOR 3: the identifier-prefix walk must be Unicode-aware (whole
+    // chars, not bytes) — a non-ASCII char immediately before the cursor
+    // must be included in the prefix, not silently dropped.
+    #[test]
+    fn cursor_context_captures_a_non_ascii_prefix_in_full() {
+        let ctx = cursor_context("SELECT čas", 11);
+        assert_eq!(ctx.prefix, "čas");
+    }
+
+    #[test]
+    fn cursor_context_captures_a_mixed_ascii_non_ascii_prefix() {
+        let ctx = cursor_context("SELECT užc", 11);
+        assert_eq!(ctx.prefix, "užc");
     }
 }

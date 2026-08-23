@@ -1411,6 +1411,18 @@ impl AppView {
                                 view.status = format!("Připojeno ({engine_lbl})");
                                 view.active_connection_id = Some(target_id.clone());
                                 view.conn_url = None;
+                                // G6 T7 review round 3, MAJOR 1: close any
+                                // open autocomplete popup RIGHT HERE, at the
+                                // moment the active connection identity
+                                // itself changes — don't wait for the
+                                // (async) schema fetch below to land.
+                                // `trigger_schema_fetch`'s own success arm
+                                // closes it again once the NEW schema
+                                // actually arrives, covering the window in
+                                // between (and same-connection refreshes,
+                                // which don't go through this switch path
+                                // at all).
+                                view.close_autocomplete(cx);
                                 // G2 Task 6: re-fetch the schema tree for the
                                 // newly active connection. Rebuilt from
                                 // `view.config`/`view.vault` rather than
