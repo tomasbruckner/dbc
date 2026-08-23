@@ -15,6 +15,24 @@ pub enum QueryEvent {
     Failed(QueryError),
 }
 
+/// G12 T5: streaming progress events for `QueryRunner::connect_and_run_many`
+/// (the editor's multi-statement unlock) — one connection, N statements,
+/// STOP on first error (design §4: error-policy choice is a
+/// script-runner-only concept, `run_script`'s `ErrorPolicy` doesn't apply
+/// here).
+pub enum MultiQueryEvent {
+    /// `columns: Some` = a row-producing statement (`Batch`es follow before
+    /// its `StatementFinished`); `None` = a non-row statement (a write) —
+    /// no result tab opens for it.
+    StatementStarted { index: usize, total: usize, columns: Option<SchemaRef> },
+    Batch(RecordBatch),
+    /// `affected: Some(n)` for a write; `None` for a read (its rows went to
+    /// the caller's tab via `Batch`, not a count).
+    StatementFinished { index: usize, affected: Option<u64>, elapsed: Duration },
+    StatementFailed { index: usize, error: QueryError },
+    RunFinished,
+}
+
 /// Where to connect from for a `connect_and_run` dispatch: either a saved
 /// [`ConnectionConfig`] (Task 7's connection manager — may carry a secret
 /// and/or an SSH tunnel), or the back-compat CLI-arg connection string.
@@ -54,6 +72,93 @@ pub enum MonitorEvent {
 /// when it independently refuses a Kill.
 pub const MONITOR_READ_ONLY_KILL_MSG: &str =
     "spojení je pouze pro čtení — zabití procesu odmítnuto";
+
+/// G12 T2: transaction discipline for `QueryRunner::run_script` (design §2
+/// matrix). `None` = every statement autocommits individually (no
+/// client-managed transaction at all); `PerFile` = one BEGIN…COMMIT per
+/// file; `WholeRun` = one BEGIN…COMMIT spanning every file in the run.
+/// Wired into `main.rs` by Task 3's script-runner UI
+/// (`AppView::confirm_script_run`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxScope {
+    None,
+    PerFile,
+    WholeRun,
+}
+
+/// G12 T2: what happens to the rest of the run after one statement fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorPolicy {
+    Stop,
+    Continue,
+}
+
+/// G12 T2: `QueryRunner::run_script`'s options — plain data, GPUI-free,
+/// so `drive_script` is unit-testable without a window.
+pub struct ScriptRunOptions {
+    pub tx_scope: TxScope,
+    pub error_policy: ErrorPolicy,
+    pub dialect: dbc_core::Dialect,
+    /// From the connection's existing `cfg.timeout_secs` — bounds EACH
+    /// statement individually (a whole-run timeout would be hostile for a
+    /// long script), via a per-statement child `CancelToken` + tokio
+    /// timeout, same shape `connect_and_run`'s watchdog uses.
+    pub statement_timeout_secs: Option<u64>,
+}
+
+/// G12 T2: streaming progress events for `run_script`, same mpsc/
+/// `CHANNEL_CAPACITY` convention as `QueryEvent`. `StatementStarted` carries
+/// no `stmt_total_in_file` (deviation from the design's grounding text,
+/// documented on `drive_script`) — the runner streams statements as the
+/// splitter completes them and can't know a file's total mid-file; the UI's
+/// own pre-scan has exact per-file totals and renders totals from there.
+/// `sql_preview` (see `sql_preview` below) is the ONLY statement text ever
+/// carried on these events — display-safe, capped, single-line (§3-novela:
+/// no credentials/result data in `ScriptEvent`/logs/errors).
+#[derive(Debug)]
+pub enum ScriptEvent {
+    FileStarted { path: std::path::PathBuf, index: usize, total_files: usize },
+    StatementStarted { stmt_index: usize, sql_preview: String },
+    StatementFinished { stmt_index: usize, affected: Option<u64>, elapsed: Duration },
+    StatementFailed { stmt_index: usize, error: QueryError },
+    FileFinished {
+        path: std::path::PathBuf,
+        statements_run: usize,
+        statements_failed: usize,
+        elapsed: Duration,
+    },
+    RunFinished {
+        files_run: usize,
+        statements_run: usize,
+        statements_failed: usize,
+        elapsed: Duration,
+        aborted: bool,
+    },
+}
+
+/// G12 T7: streaming progress events for `QueryRunner::run_csv_import`
+/// (design §5) — ONE transaction for the whole import, so `BatchFinished`'s
+/// `rows_committed_so_far` is "executed inside the still-open transaction",
+/// not durable, until `Finished` actually lands (nothing is committed on a
+/// `Failed`).
+#[derive(Debug)]
+pub enum CsvImportEvent {
+    BatchStarted { batch_index: usize, rows_in_batch: usize },
+    BatchFinished { batch_index: usize, rows_committed_so_far: u64 },
+    Failed { error: QueryError },
+    Finished { rows_imported: u64, elapsed: Duration },
+}
+
+/// G12 T7: one CSV import job — `main.rs`'s peek/pre-count pass builds this
+/// from the file picker's chosen path, the schema snapshot's `TableInfo`
+/// (`columns`), and the mapping modal's live `ColumnMapping`.
+pub struct CsvImportJob {
+    pub path: std::path::PathBuf,
+    pub schema: Option<String>,
+    pub table: String,
+    pub columns: Vec<crate::csv_import::TargetColumn>,
+    pub mapping: crate::csv_import::ColumnMapping,
+}
 
 /// Owns the tokio runtime. All DB I/O lives here; the UI thread only ever
 /// awaits the event channel from inside `cx.spawn`.
@@ -377,6 +482,116 @@ impl QueryRunner {
         rx
     }
 
+    /// G12 T2: runs a multi-statement `.sql` script (design T2) — a
+    /// SANCTIONED runner-owned write path (§3-novela): transactional
+    /// discipline per `opts.tx_scope`, the SHARED `guard_not_read_only`
+    /// read-only guard enforced per-statement BEFORE any write reaches the
+    /// driver (`dispatch_statement`/`run_script_statement`), and
+    /// `opts.error_policy` honored via `failure_action`. One dedicated
+    /// connection for the WHOLE run (satisfies `Connection::execute`'s
+    /// transaction-per-connection invariant across every tx scope), dropped
+    /// when the spawned future completes. Read-only connections are NOT
+    /// refused up front — a read-only script over a read-only connection is
+    /// legitimate; write statements are rejected per-statement instead
+    /// (CURATION item 1(c)/4(a)). Called by Task 3's script-runner UI
+    /// (`AppView::confirm_script_run`, main.rs).
+    pub fn run_script(
+        &self,
+        spec: ConnectSpec,
+        files: Vec<std::path::PathBuf>,
+        opts: ScriptRunOptions,
+        cancel: CancelToken,
+    ) -> tokio::sync::mpsc::Receiver<ScriptEvent> {
+        let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            if cancel.is_cancelled() {
+                let _ = tx
+                    .send(ScriptEvent::RunFinished {
+                        files_run: 0,
+                        statements_run: 0,
+                        statements_failed: 0,
+                        elapsed: Duration::ZERO,
+                        aborted: true,
+                    })
+                    .await;
+                return;
+            }
+            // Captured BEFORE `spec` moves into `open_spec` below — same
+            // "capture read_only up front" convention `open_monitor` uses.
+            let read_only = spec_is_read_only(&spec);
+            let mut opened = match open_spec(spec, handle).await {
+                Ok(o) => o,
+                Err(e) => {
+                    let _ = tx.send(ScriptEvent::StatementFailed { stmt_index: 0, error: e }).await;
+                    let _ = tx
+                        .send(ScriptEvent::RunFinished {
+                            files_run: 0,
+                            statements_run: 0,
+                            statements_failed: 1,
+                            elapsed: Duration::ZERO,
+                            aborted: true,
+                        })
+                        .await;
+                    return;
+                }
+            };
+            drive_script(&mut *opened.conn, read_only, &files, &opts, cancel, &tx).await;
+            // `opened` (connection + tunnel) drops here unconditionally —
+            // the ultimate rollback backstop, same note as
+            // `run_write_transaction_inner`.
+        });
+        rx
+    }
+
+    /// G12 T5: the editor's multi-statement unlock — one connection, every
+    /// statement in `statements` in order, STOP on the first error (no
+    /// `ErrorPolicy` here, that's `run_script`-only). Per-statement
+    /// read-only rejection via the SHARED `guard_not_read_only` guard
+    /// (CURATION item 1(c)/4(c)) and a per-statement child-token timeout,
+    /// same shape `run_script` uses. `statements` is caller-supplied
+    /// ALREADY split + already auto-limited (see `main.rs`'s
+    /// `dialect_for_engine`/`auto_limit_each`) — this method just dispatches
+    /// them in order.
+    pub fn connect_and_run_many(
+        &self,
+        spec: ConnectSpec,
+        statements: Vec<String>,
+        cancel: CancelToken,
+        timeout_secs: Option<u64>,
+    ) -> tokio::sync::mpsc::Receiver<MultiQueryEvent> {
+        let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            connect_and_run_many_inner(spec, statements, cancel, timeout_secs, handle, tx).await;
+        });
+        rx
+    }
+
+    /// G12 T7: runs a CSV import (design T7) — a SANCTIONED runner-owned
+    /// write path (§3-novela): ONE transaction for the WHOLE import (not
+    /// configurable, unlike `run_script`'s `tx_scope`), streaming batched
+    /// `INSERT`s via `csv_import::generate_insert_batches`. FIRST action,
+    /// before any file or DB touch: the SHARED `guard_not_read_only` guard
+    /// (CURATION items 1(c)/4(b)'s runtime half). Cancellation is checked
+    /// BETWEEN batches only (bounded by the 500-row cap); `timeout_secs`
+    /// bounds each batch statement via the same per-statement child-token
+    /// shape `run_script_statement` uses.
+    pub fn run_csv_import(
+        &self,
+        spec: ConnectSpec,
+        job: CsvImportJob,
+        cancel: CancelToken,
+        timeout_secs: Option<u64>,
+    ) -> tokio::sync::mpsc::Receiver<CsvImportEvent> {
+        let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            run_csv_import_inner(spec, job, cancel, timeout_secs, handle, tx).await;
+        });
+        rx
+    }
+
     /// G7 T5: full `SELECT * FROM {quoted table}` [+ `WHERE {where_clause}`],
     /// drained into a `dbc_buffer::ResultBuffer` — NOT `LIMIT`-bounded (a
     /// diff must see the whole table or explicitly say it didn't). The
@@ -501,6 +716,65 @@ fn spec_is_read_only(spec: &ConnectSpec) -> bool {
         ConnectSpec::Config { cfg, .. } => cfg.read_only,
         ConnectSpec::Url(_) => false,
     }
+}
+
+/// G12 T2: dispatch decision behind `run_script_statement`'s per-statement
+/// read-only matrix — pure so the whole matrix is unit tested without any
+/// connection. Fail-closed inputs (`is_read_statement` returning `false` for
+/// an unterminated/unrecognized construct) are treated as writes, not
+/// reads — same posture `is_read_statement`'s own doc comment mandates, so
+/// an ambiguous statement on a read-only connection is rejected rather than
+/// risked.
+/// Consumed by both `run_script` (Task 1, wired into `main.rs` by Task 3)
+/// and `connect_and_run_many` (Task 2, wired into `main.rs::run_many`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StmtDispatch {
+    RunAsRead,
+    RunAsWrite,
+    RejectReadOnly,
+}
+
+pub fn dispatch_statement(sql: &str, read_only: bool) -> StmtDispatch {
+    if dbc_core::is_read_statement(sql) {
+        StmtDispatch::RunAsRead
+    } else if read_only {
+        StmtDispatch::RejectReadOnly
+    } else {
+        StmtDispatch::RunAsWrite
+    }
+}
+
+/// G12 T2: what to do with the REST of the run after one statement fails —
+/// pure decision behind `drive_script`'s failure handling (design §2
+/// matrix). `(Continue, WholeRun)` is a combination the UI never offers,
+/// but the runner still fails SAFE if it arrives anyway: abort, never
+/// continue inside one open transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureAction {
+    AbortRun,
+    NextStatement,
+    NextFile,
+}
+
+pub fn failure_action(policy: ErrorPolicy, scope: TxScope) -> FailureAction {
+    match (policy, scope) {
+        (ErrorPolicy::Stop, _) => FailureAction::AbortRun,
+        (ErrorPolicy::Continue, TxScope::None) => FailureAction::NextStatement,
+        (ErrorPolicy::Continue, TxScope::PerFile) => FailureAction::NextFile,
+        (ErrorPolicy::Continue, TxScope::WholeRun) => FailureAction::AbortRun,
+    }
+}
+
+/// G12 T2: single-line-collapsed, char-safe cap for `ScriptEvent`
+/// `sql_preview` fields — display-safe, no credentials/result data
+/// (§3-novela: statements shown must be display-safe). Same collapse idiom
+/// as `tabs::collapse_title`/`history_panel::collapse_sql` — reused
+/// directly with a different cap rather than re-implementing the collapse
+/// (same precedent `history_panel::collapse_sql` itself documents against
+/// `tabs::collapse_title`).
+pub const SQL_PREVIEW_CAP: usize = 200;
+pub fn sql_preview(sql: &str) -> String {
+    crate::history_panel::collapse_sql(sql, SQL_PREVIEW_CAP)
 }
 
 /// G5 Task 4: pure decision behind the per-statement affected-rows check in
@@ -746,6 +1020,659 @@ async fn run_analyze_write_inner(
     let cancel = CancelToken::new();
     drive_analyze_write_bounded(&mut *opened.conn, &explain_analyze_sql, cancel, timeout_secs).await
     // `opened` drops here unconditionally — the ultimate backstop, same as run_write_transaction_inner.
+}
+
+/// G12 T2: read-chunk size for streaming `.sql` files into the splitter
+/// (design §2).
+const SCRIPT_READ_CHUNK: usize = 64 * 1024;
+
+/// G12 T2: one statement — dispatch per the read-only matrix, per-statement
+/// child cancel + timeout. `Ok(Some(n))` — `n` is the drained row count for
+/// a read, the affected-row count for a write. CURATION item 1(c): the
+/// SHARED `guard_not_read_only` guard produces the read-only rejection, no
+/// fresh read-only logic here.
+async fn run_script_statement(
+    conn: &mut dyn Connection,
+    sql: &str,
+    read_only: bool,
+    timeout_secs: Option<u64>,
+    run_cancel: &CancelToken,
+) -> Result<Option<u64>, QueryError> {
+    let action = dispatch_statement(sql, read_only);
+    if action == StmtDispatch::RejectReadOnly {
+        return Err(guard_not_read_only(true).unwrap_err());
+    }
+    let stmt_cancel = run_cancel.child_token();
+    let fut = async {
+        match action {
+            StmtDispatch::RunAsRead => {
+                let mut stream = conn.query(sql, stmt_cancel.clone()).await?;
+                let mut rows: u64 = 0;
+                while let Some(item) = stream.batches.recv().await {
+                    rows += item?.num_rows() as u64;
+                }
+                Ok(Some(rows))
+            }
+            StmtDispatch::RunAsWrite => conn.execute(sql, stmt_cancel.clone()).await.map(Some),
+            StmtDispatch::RejectReadOnly => unreachable!("handled above"),
+        }
+    };
+    match timeout_secs {
+        Some(t) => match tokio::time::timeout(Duration::from_secs(t), fut).await {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                // Protocol-level cancel of the in-flight statement ONLY —
+                // the run-level `run_cancel` is untouched, see
+                // `ScriptRunOptions::statement_timeout_secs`'s doc comment.
+                stmt_cancel.cancel();
+                Err(QueryError::msg(format!("[timeout] statement exceeded {t}s")))
+            }
+        },
+        None => fut.await,
+    }
+}
+
+/// G12 T2: streams `path` in `SCRIPT_READ_CHUNK` pieces through a fresh
+/// `StatementSplitter`, returning every completed statement in order
+/// (including the splitter's own EOF flush of a final statement missing its
+/// trailing `;`). Deviation from the plan's literal per-chunk-dispatch
+/// grounding text (documented per this task's "reality/tests win, document
+/// deviations" instruction): the plan describes dispatching each statement
+/// the MOMENT the splitter completes it, interleaved with the file read
+/// loop. That shape requires breaking two different labeled loops (the byte
+/// read loop and the caller's per-file loop) from two different statement
+/// sources (`push`'s Vec and `finish`'s tail) — doable, but only correctly
+/// with a `macro_rules!` capturing the outer loop labels as `:lifetime`
+/// metavariables (plain fn extraction can't `break` a caller's loop, and a
+/// macro's own labels are hygienically distinct from the call site's).
+/// Parsing the WHOLE file into a `Vec<String>` first (still streamed off
+/// disk in bounded chunks — this function never holds more than one
+/// `SCRIPT_READ_CHUNK` buffer plus the splitter's own pending-statement
+/// buffer at a time) and dispatching afterward is behaviorally identical
+/// for every `ScriptEvent` a caller observes (same events, same order) and
+/// is far simpler to keep correct. `drive_script` stays fully iterative
+/// either way (Global Constraints: no stack overflow on a pathological
+/// script — this function loops, never recurses).
+/// Deviation (found while fixing a plain-`cargo build` failure, documented
+/// per this task's "reality/tests win" instruction): `tokio::fs` requires
+/// tokio's `fs` feature, which is enabled only via other crates'
+/// dev-dependencies in this workspace (`dbc-driver-sqlite`/`-postgres`'s
+/// `features = ["full"]` dev-dep) — invisible to `cargo test` (dev-deps
+/// feature-unify into the graph) but a hard compile error on a plain
+/// `cargo build -p dbc-ui`. Rather than growing `dbc-ui`'s real `tokio`
+/// dependency just for this, the whole read+split runs inside ONE
+/// `spawn_blocking` over `std::fs`/`std::io::Read` — the same "blocking
+/// work never runs on a runtime worker thread" dispatch `open_spec` already
+/// uses for the driver connect step.
+async fn read_and_split_file(
+    path: &std::path::Path,
+    dialect: dbc_core::Dialect,
+) -> Result<Vec<String>, QueryError> {
+    let path = path.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<String>, QueryError> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| QueryError::msg(format!("[soubor] {}: {e}", path.display())))?;
+        let mut splitter = dbc_core::StatementSplitter::new(dialect);
+        let mut stmts = Vec::new();
+        let mut chunk = vec![0u8; SCRIPT_READ_CHUNK];
+        loop {
+            let n = file
+                .read(&mut chunk)
+                .map_err(|e| QueryError::msg(format!("[soubor] {}: {e}", path.display())))?;
+            if n == 0 {
+                match splitter.finish() {
+                    Ok(Some(tail)) => stmts.push(tail),
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(QueryError::msg(format!(
+                            "[skript] neúplný SQL konstrukt na konci souboru: {e:?}"
+                        )));
+                    }
+                }
+                return Ok(stmts);
+            }
+            match splitter.push(&chunk[..n]) {
+                Ok(mut more) => stmts.append(&mut more),
+                Err(e) => return Err(QueryError::msg(format!("[soubor] {}: {e:?}", path.display()))),
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(inner) => inner,
+        Err(_) => Err(QueryError::msg("[soubor] čtení souboru selhalo (panic)")),
+    }
+}
+
+/// G12 T2: maps a FILE-LEVEL error (open/read/split/utf8, or a per-file
+/// `BEGIN`/`COMMIT` control-statement failure) to a `FailureAction` — these
+/// can't meaningfully "continue to the next statement" of a broken/unopened
+/// file, so they collapse the full `failure_action` matrix down to just
+/// `Stop -> AbortRun`, `Continue -> NextFile`, regardless of `tx_scope`
+/// (design §2 deviation, documented on `drive_script`).
+fn file_level_action(policy: ErrorPolicy) -> FailureAction {
+    match policy {
+        ErrorPolicy::Stop => FailureAction::AbortRun,
+        ErrorPolicy::Continue => FailureAction::NextFile,
+    }
+}
+
+/// G12 T2: the run driver — `TxScope`-appropriate `BEGIN`/`COMMIT`/
+/// `ROLLBACK`, streaming `ScriptEvent`s over `tx` as it goes, honoring
+/// `opts.error_policy` via `failure_action`/`file_level_action`. Fully
+/// iterative (two nested `for`/`for` loops over files/statements, no
+/// recursion) so a script with many statements can't stack-overflow
+/// (Global Constraints). Kept generic over `&mut dyn Connection` (not
+/// `ConnectSpec`/`open_spec`) so it's directly testable over a temp-file
+/// sqlite connection, same posture as `drive_write_sequence`.
+async fn drive_script(
+    conn: &mut dyn Connection,
+    read_only: bool,
+    files: &[std::path::PathBuf],
+    opts: &ScriptRunOptions,
+    cancel: CancelToken,
+    tx: &tokio::sync::mpsc::Sender<ScriptEvent>,
+) {
+    let run_started = Instant::now();
+    let mut files_run = 0usize;
+    let mut statements_run = 0usize;
+    let mut statements_failed = 0usize;
+    let mut aborted = false;
+    let mut stmt_index = 0usize;
+
+    // Two-tier cancellation discipline (per `connect_and_run`'s doc):
+    // checked once here before anything (including a WholeRun `BEGIN`)
+    // happens, then again before every file and every statement below.
+    if cancel.is_cancelled() {
+        let _ = tx
+            .send(ScriptEvent::RunFinished {
+                files_run,
+                statements_run,
+                statements_failed,
+                elapsed: run_started.elapsed(),
+                aborted: true,
+            })
+            .await;
+        return;
+    }
+
+    if opts.tx_scope == TxScope::WholeRun {
+        if conn.execute("BEGIN", cancel.child_token()).await.is_err() {
+            // A BEGIN failure aborts the run immediately — no tx opened,
+            // nothing to roll back.
+            let _ = tx
+                .send(ScriptEvent::RunFinished {
+                    files_run,
+                    statements_run,
+                    statements_failed,
+                    elapsed: run_started.elapsed(),
+                    aborted: true,
+                })
+                .await;
+            return;
+        }
+    }
+
+    'files: for (index, path) in files.iter().enumerate() {
+        if cancel.is_cancelled() {
+            aborted = true;
+            break 'files;
+        }
+        let _ = tx
+            .send(ScriptEvent::FileStarted { path: path.clone(), index, total_files: files.len() })
+            .await;
+        let file_started = Instant::now();
+        let mut file_stmts_run = 0usize;
+        let mut file_stmts_failed = 0usize;
+        // Set once ANY failure (file-level or per-statement) happens in
+        // this file — routes to the shared rollback/abort handling below
+        // instead of the normal end-of-file `COMMIT`.
+        let mut stop_action: Option<FailureAction> = None;
+
+        if opts.tx_scope == TxScope::PerFile {
+            if let Err(e) = conn.execute("BEGIN", cancel.child_token()).await {
+                let _ = tx.send(ScriptEvent::StatementFailed { stmt_index, error: e }).await;
+                statements_failed += 1;
+                file_stmts_failed += 1;
+                stmt_index += 1;
+                stop_action = Some(file_level_action(opts.error_policy));
+            }
+        }
+
+        if stop_action.is_none() {
+            match read_and_split_file(path, opts.dialect).await {
+                Ok(stmts) => {
+                    for stmt in &stmts {
+                        if cancel.is_cancelled() {
+                            stop_action = Some(FailureAction::AbortRun);
+                            break;
+                        }
+                        let _ = tx
+                            .send(ScriptEvent::StatementStarted {
+                                stmt_index,
+                                sql_preview: sql_preview(stmt),
+                            })
+                            .await;
+                        let t0 = Instant::now();
+                        match run_script_statement(
+                            conn,
+                            stmt,
+                            read_only,
+                            opts.statement_timeout_secs,
+                            &cancel,
+                        )
+                        .await
+                        {
+                            Ok(affected) => {
+                                let _ = tx
+                                    .send(ScriptEvent::StatementFinished {
+                                        stmt_index,
+                                        affected,
+                                        elapsed: t0.elapsed(),
+                                    })
+                                    .await;
+                                statements_run += 1;
+                                file_stmts_run += 1;
+                                stmt_index += 1;
+                            }
+                            Err(e) => {
+                                let _ =
+                                    tx.send(ScriptEvent::StatementFailed { stmt_index, error: e }).await;
+                                statements_failed += 1;
+                                file_stmts_failed += 1;
+                                stmt_index += 1;
+                                let action = failure_action(opts.error_policy, opts.tx_scope);
+                                if action != FailureAction::NextStatement {
+                                    stop_action = Some(action);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(file_err) => {
+                    let _ =
+                        tx.send(ScriptEvent::StatementFailed { stmt_index, error: file_err }).await;
+                    statements_failed += 1;
+                    file_stmts_failed += 1;
+                    stmt_index += 1;
+                    stop_action = Some(file_level_action(opts.error_policy));
+                }
+            }
+        }
+
+        // Clean end of file: commit a per-file tx if nothing failed.
+        if stop_action.is_none() && opts.tx_scope == TxScope::PerFile {
+            if let Err(e) = conn.execute("COMMIT", cancel.child_token()).await {
+                let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                let _ = tx.send(ScriptEvent::StatementFailed { stmt_index, error: e }).await;
+                statements_failed += 1;
+                file_stmts_failed += 1;
+                stmt_index += 1;
+                stop_action = Some(file_level_action(opts.error_policy));
+            }
+        }
+
+        if let Some(action) = stop_action {
+            match action {
+                FailureAction::AbortRun => {
+                    if opts.tx_scope != TxScope::None {
+                        let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                    }
+                    aborted = true;
+                }
+                FailureAction::NextFile => {
+                    if opts.tx_scope == TxScope::PerFile {
+                        let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                    }
+                    // WholeRun: the run-level tx stays open — a broken file
+                    // is skipped, not the whole accumulated run.
+                }
+                FailureAction::NextStatement => unreachable!("stop_action is never NextStatement"),
+            }
+        }
+
+        let _ = tx
+            .send(ScriptEvent::FileFinished {
+                path: path.clone(),
+                statements_run: file_stmts_run,
+                statements_failed: file_stmts_failed,
+                elapsed: file_started.elapsed(),
+            })
+            .await;
+        files_run += 1;
+
+        if aborted {
+            break 'files;
+        }
+    }
+
+    if !aborted && opts.tx_scope == TxScope::WholeRun {
+        if conn.execute("COMMIT", cancel.child_token()).await.is_err() {
+            let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+            aborted = true;
+        }
+    }
+
+    let _ = tx
+        .send(ScriptEvent::RunFinished {
+            files_run,
+            statements_run,
+            statements_failed,
+            elapsed: run_started.elapsed(),
+            aborted,
+        })
+        .await;
+}
+
+/// G12 T5: runs ONE statement of a `connect_and_run_many` batch — dispatch
+/// per the read-only matrix (CURATION item 1(c): the SHARED guard produces
+/// the rejection, no fresh read-only logic here), sending
+/// `MultiQueryEvent::StatementStarted`/`Batch`/`StatementFinished` as it
+/// streams a read, or just `StatementStarted{columns: None}` +
+/// `StatementFinished{affected: Some(n)}` for a write. `Err(())` means this
+/// statement failed — its `StatementFailed` has already been sent, and the
+/// caller stops (design §4: stop on first error, no continue policy here).
+async fn run_one_multi_statement(
+    conn: &mut dyn Connection,
+    index: usize,
+    total: usize,
+    sql: &str,
+    read_only: bool,
+    timeout_secs: Option<u64>,
+    run_cancel: &CancelToken,
+    tx: &tokio::sync::mpsc::Sender<MultiQueryEvent>,
+) -> Result<(), ()> {
+    let action = dispatch_statement(sql, read_only);
+    if action == StmtDispatch::RejectReadOnly {
+        let _ = tx
+            .send(MultiQueryEvent::StatementFailed { index, error: guard_not_read_only(true).unwrap_err() })
+            .await;
+        return Err(());
+    }
+    let stmt_cancel = run_cancel.child_token();
+    let started = Instant::now();
+    let fut = async {
+        match action {
+            StmtDispatch::RunAsRead => {
+                let mut stream = conn.query(sql, stmt_cancel.clone()).await?;
+                let _ = tx
+                    .send(MultiQueryEvent::StatementStarted {
+                        index,
+                        total,
+                        columns: Some(stream.columns.clone()),
+                    })
+                    .await;
+                while let Some(item) = stream.batches.recv().await {
+                    let _ = tx.send(MultiQueryEvent::Batch(item?)).await;
+                }
+                Ok(None)
+            }
+            StmtDispatch::RunAsWrite => {
+                let _ =
+                    tx.send(MultiQueryEvent::StatementStarted { index, total, columns: None }).await;
+                conn.execute(sql, stmt_cancel.clone()).await.map(Some)
+            }
+            StmtDispatch::RejectReadOnly => unreachable!("handled above"),
+        }
+    };
+    let result = match timeout_secs {
+        Some(t) => match tokio::time::timeout(Duration::from_secs(t), fut).await {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                stmt_cancel.cancel();
+                Err(QueryError::msg(format!("[timeout] statement exceeded {t}s")))
+            }
+        },
+        None => fut.await,
+    };
+    match result {
+        Ok(affected) => {
+            let _ = tx
+                .send(MultiQueryEvent::StatementFinished { index, affected, elapsed: started.elapsed() })
+                .await;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = tx.send(MultiQueryEvent::StatementFailed { index, error: e }).await;
+            Err(())
+        }
+    }
+}
+
+/// G12 T5: `QueryRunner::connect_and_run_many`'s async body — one dedicated
+/// connection for the whole batch (same `Connection::execute`
+/// session-sharing rationale every other one-shot in this file follows),
+/// dispatching every statement via `run_one_multi_statement` in order,
+/// stopping at the first failure. Extracted from the `spawn` closure so
+/// it's directly testable — same "`_inner` function, driven under
+/// `#[tokio::test]` with `Handle::current()`" precedent as
+/// `run_write_transaction_inner`.
+async fn connect_and_run_many_inner(
+    spec: ConnectSpec,
+    statements: Vec<String>,
+    cancel: CancelToken,
+    timeout_secs: Option<u64>,
+    handle: tokio::runtime::Handle,
+    tx: tokio::sync::mpsc::Sender<MultiQueryEvent>,
+) {
+    if cancel.is_cancelled() {
+        return;
+    }
+    // Captured BEFORE `spec` moves into `open_spec` — same convention
+    // `run_script`/`open_monitor` use.
+    let read_only = spec_is_read_only(&spec);
+    let mut opened = match open_spec(spec, handle).await {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = tx.send(MultiQueryEvent::StatementFailed { index: 0, error: e }).await;
+            return;
+        }
+    };
+    if cancel.is_cancelled() {
+        return;
+    }
+    let conn = &mut *opened.conn;
+    let total = statements.len();
+    for (index, sql) in statements.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return;
+        }
+        if run_one_multi_statement(conn, index, total, sql, read_only, timeout_secs, &cancel, &tx)
+            .await
+            .is_err()
+        {
+            return; // stop on first error (design §4) — `opened` drops here.
+        }
+    }
+    let _ = tx.send(MultiQueryEvent::RunFinished).await;
+    // `opened` (connection + tunnel) drops here unconditionally.
+}
+
+/// G12 T7: read-chunk producer channel depth — small and bounded (design
+/// §5: the producer never gets more than this many batches ahead of the
+/// driver, so at most `CSV_IMPORT_PRODUCER_DEPTH * CSV_IMPORT_BATCH_SIZE`
+/// rows are ever buffered in memory at once).
+const CSV_IMPORT_PRODUCER_DEPTH: usize = 4;
+
+/// G12 T7: the run driver — SHARED guard first, then BEGIN, then streams
+/// `job.path` through a `spawn_blocking` producer (the `csv` crate's
+/// `Reader` is synchronous; this is the same "blocking work never runs on a
+/// runtime worker thread" dispatch `open_spec`/`read_and_split_file`
+/// already use) that chunks rows into `CSV_IMPORT_BATCH_SIZE`-row pieces
+/// over a bounded channel, executing one `INSERT` per chunk via
+/// `csv_import::generate_insert_batches`. ANY failure (guard refusal, open
+/// error, producer parse/IO error, a chunk's generated statement erroring)
+/// ROLLBACKs and reports zero rows imported — never partial.
+async fn run_csv_import_inner(
+    spec: ConnectSpec,
+    job: CsvImportJob,
+    cancel: CancelToken,
+    timeout_secs: Option<u64>,
+    handle: tokio::runtime::Handle,
+    tx: tokio::sync::mpsc::Sender<CsvImportEvent>,
+) {
+    let started = Instant::now();
+    // CURATION items 1(c)/4(b): the SHARED guard, checked before any file or
+    // DB touch — a read-only spec is refused without ever opening the CSV
+    // file or connecting.
+    if let Err(e) = guard_not_read_only(spec_is_read_only(&spec)) {
+        let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
+        return;
+    }
+    if cancel.is_cancelled() {
+        let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg("cancelled") }).await;
+        return;
+    }
+    let mut opened = match open_spec(spec, handle).await {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
+            return;
+        }
+    };
+    if cancel.is_cancelled() {
+        let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg("cancelled") }).await;
+        return;
+    }
+    let conn = &mut *opened.conn;
+    if let Err(e) = conn.execute("BEGIN", cancel.child_token()).await {
+        let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
+        return;
+    }
+
+    let (chunk_tx, mut chunk_rx) =
+        tokio::sync::mpsc::channel::<Result<Vec<crate::csv_import::CsvRow>, String>>(
+            CSV_IMPORT_PRODUCER_DEPTH,
+        );
+    let producer_path = job.path.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut reader = match csv::Reader::from_path(&producer_path) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = chunk_tx
+                    .blocking_send(Err(format!("[CSV] {}: {e}", producer_path.display())));
+                return;
+            }
+        };
+        let mut chunk: Vec<crate::csv_import::CsvRow> = Vec::with_capacity(crate::csv_import::CSV_IMPORT_BATCH_SIZE);
+        for record in reader.records() {
+            let record = match record {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = chunk_tx
+                        .blocking_send(Err(format!("[CSV] {}: {e}", producer_path.display())));
+                    return;
+                }
+            };
+            let row: crate::csv_import::CsvRow =
+                record.iter().map(crate::csv_field_to_value).collect();
+            chunk.push(row);
+            if chunk.len() >= crate::csv_import::CSV_IMPORT_BATCH_SIZE {
+                if chunk_tx.blocking_send(Ok(std::mem::take(&mut chunk))).is_err() {
+                    return; // driver side hung up (already failed/rolled back)
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = chunk_tx.blocking_send(Ok(chunk));
+        }
+        // `chunk_tx` drops here, closing the channel — the driver loop below
+        // sees `None` and knows the whole file has been read.
+    });
+
+    let mut rows_committed: u64 = 0;
+    let mut batch_index: usize = 0;
+    while let Some(chunk_result) = chunk_rx.recv().await {
+        if cancel.is_cancelled() {
+            let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+            let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg("cancelled") }).await;
+            return;
+        }
+        let rows = match chunk_result {
+            Ok(rows) => rows,
+            Err(msg) => {
+                let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg(msg) }).await;
+                return;
+            }
+        };
+        let _ = tx
+            .send(CsvImportEvent::BatchStarted { batch_index, rows_in_batch: rows.len() })
+            .await;
+        let stmts = crate::csv_import::generate_insert_batches(
+            job.schema.as_deref(),
+            &job.table,
+            &job.columns,
+            &job.mapping,
+            &rows,
+        );
+        let stmt = match stmts {
+            Ok(stmts) => {
+                // NIT: `generate_insert_batches` returns one statement PER
+                // `CSV_IMPORT_BATCH_SIZE`-row slice — `rows` here is always
+                // ≤ `CSV_IMPORT_BATCH_SIZE` (the producer chunks to exactly
+                // that size, see the `spawn_blocking` loop above), so this
+                // ALWAYS has at most one statement; `.next()` below is safe
+                // to take as "the whole batch's statement", never a partial
+                // one silently dropped.
+                debug_assert!(
+                    stmts.len() <= 1,
+                    "generate_insert_batches must return at most one statement for a chunk \
+                     sized to CSV_IMPORT_BATCH_SIZE, got {}",
+                    stmts.len()
+                );
+                stmts.into_iter().next()
+            }
+            Err(msg) => {
+                let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg(msg) }).await;
+                return;
+            }
+        };
+        // Review fix (MINOR): only count `rows` as committed once a
+        // statement for this chunk actually ran — `stmt == None` happens
+        // when `generate_insert_batches` had nothing to insert (every
+        // header skipped, an all-`None` mapping); currently unreachable via
+        // the UI (the mapping modal disables "Spustit import" whenever
+        // `sample_sql` would be `None` for this reason), but the counter
+        // must not silently over-report rows that were never written.
+        if let Some(stmt) = stmt {
+            let stmt_cancel = cancel.child_token();
+            let fut = conn.execute(&stmt, stmt_cancel.clone());
+            let result = match timeout_secs {
+                Some(t) => match tokio::time::timeout(Duration::from_secs(t), fut).await {
+                    Ok(r) => r,
+                    Err(_elapsed) => {
+                        stmt_cancel.cancel();
+                        Err(QueryError::msg(format!("[timeout] statement exceeded {t}s")))
+                    }
+                },
+                None => fut.await,
+            };
+            if let Err(e) = result {
+                let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
+                return;
+            }
+            rows_committed += rows.len() as u64;
+        }
+        batch_index += 1;
+        let _ = tx
+            .send(CsvImportEvent::BatchFinished { batch_index: batch_index - 1, rows_committed_so_far: rows_committed })
+            .await;
+    }
+
+    if let Err(e) = conn.execute("COMMIT", cancel.child_token()).await {
+        let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+        let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
+        return;
+    }
+    let _ = tx
+        .send(CsvImportEvent::Finished { rows_imported: rows_committed, elapsed: started.elapsed() })
+        .await;
+    // `opened` (connection + tunnel) drops here unconditionally.
 }
 
 /// Defensive cap on materialized lookup rows — see `QueryRunner::fetch_lookup`.
@@ -1486,6 +2413,737 @@ mod analyze_write_tests {
         assert!(!err.message.is_empty());
         // Connection must still be usable — ROLLBACK ran despite the error.
         conn.execute("INSERT INTO t VALUES (1)", CancelToken::new()).await.unwrap();
+    }
+}
+
+/// G12 T2: `run_script`'s pure-decision tests plus `drive_script` tests
+/// driven over a real sqlite driver via `crate::connect::open` (temp-file
+/// database — no docker/network dependency), matching
+/// `write_transaction_tests`'s fixtures. `open_sqlite_test_conn`/`read_one`
+/// are duplicated here rather than imported — see
+/// `analyze_write_tests`'s doc comment for why (private items in a sibling
+/// test module aren't visible across module boundaries).
+#[cfg(test)]
+mod script_run_tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_statement_matrix() {
+        assert_eq!(dispatch_statement("SELECT 1", false), StmtDispatch::RunAsRead);
+        assert_eq!(dispatch_statement("SELECT 1", true), StmtDispatch::RunAsRead);
+        assert_eq!(dispatch_statement("UPDATE t SET x = 1", false), StmtDispatch::RunAsWrite);
+        assert_eq!(dispatch_statement("UPDATE t SET x = 1", true), StmtDispatch::RejectReadOnly);
+        // fail-closed inputs are writes, not reads (guards.rs contract):
+        assert_eq!(dispatch_statement("SELECT 1 /* unterminated", true), StmtDispatch::RejectReadOnly);
+    }
+
+    #[test]
+    fn failure_action_full_matrix() {
+        use ErrorPolicy::*;
+        use TxScope::*;
+        assert_eq!(failure_action(Stop, None), FailureAction::AbortRun);
+        assert_eq!(failure_action(Stop, PerFile), FailureAction::AbortRun);
+        assert_eq!(failure_action(Stop, WholeRun), FailureAction::AbortRun);
+        assert_eq!(failure_action(Continue, None), FailureAction::NextStatement);
+        assert_eq!(failure_action(Continue, PerFile), FailureAction::NextFile);
+        // UI forbids the combination; runner fails safe if it arrives anyway:
+        assert_eq!(failure_action(Continue, WholeRun), FailureAction::AbortRun);
+    }
+
+    #[test]
+    fn sql_preview_collapses_and_caps() {
+        assert_eq!(sql_preview("SELECT\n  1"), "SELECT 1");
+        let long = "x".repeat(300);
+        let p = sql_preview(&long);
+        assert_eq!(p.chars().count(), SQL_PREVIEW_CAP + 1);
+        assert!(p.ends_with('…'));
+    }
+
+    /// See `write_transaction_tests::open_sqlite_test_conn`'s doc comment —
+    /// identical shape, duplicated for sibling-module visibility.
+    async fn open_sqlite_test_conn() -> (tempfile::NamedTempFile, Box<dyn Connection>) {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        let conn =
+            crate::connect::open(f.path().to_str().expect("utf8 temp path"), &handle).expect("open sqlite");
+        (f, conn)
+    }
+
+    /// See `write_transaction_tests::read_one`'s doc comment — identical
+    /// shape, duplicated for sibling-module visibility.
+    async fn read_one(conn: &mut dyn Connection, sql: &str) -> Option<String> {
+        let mut stream = conn.query(sql, CancelToken::new()).await.expect("query");
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.expect("batch")).expect("push");
+        }
+        if buf.row_count() == 0 {
+            None
+        } else if buf.cell_is_null(0, 0) {
+            Some("<NULL>".to_string())
+        } else {
+            Some(buf.cell_text(0, 0))
+        }
+    }
+
+    /// ~15-line test helper (per the plan): drives `drive_script` and a
+    /// concurrent receiver-drain via `tokio::join!`, returns the full
+    /// `Vec<ScriptEvent>`. `tx` is moved into the `drive` future and
+    /// explicitly `drop`ped once `drive_script` returns — WITHOUT that, the
+    /// owning `Sender` would still be alive (on `drive_collect`'s own stack)
+    /// after `drive_script` finishes sending, and `collect`'s `rx.recv()`
+    /// loop would hang forever waiting for a channel close that never
+    /// comes (found by running this test: several tests hung indefinitely
+    /// on first run because of exactly this).
+    async fn drive_collect(
+        conn: &mut dyn Connection,
+        read_only: bool,
+        files: &[std::path::PathBuf],
+        opts: &ScriptRunOptions,
+    ) -> Vec<ScriptEvent> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let cancel = CancelToken::new();
+        let drive = async {
+            drive_script(conn, read_only, files, opts, cancel, &tx).await;
+            drop(tx);
+        };
+        let collect = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let (_, events) = tokio::join!(drive, collect);
+        events
+    }
+
+    /// CURATION item 4(a): write statement over a read_only connection is
+    /// rejected CLIENT-SIDE (before the driver — proven by the table staying
+    /// unchanged even though the underlying test connection is writable), with
+    /// the SHARED guard's exact message, and Continue policy keeps running the
+    /// script's read statements.
+    #[tokio::test]
+    async fn script_write_statement_rejected_on_read_only_policy_matrix_honored() {
+        let (_f, mut conn) = open_sqlite_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')", CancelToken::new()).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("01.sql");
+        std::fs::write(&f1, "SELECT * FROM t;\nUPDATE t SET n = 'hacked' WHERE id = 1;\nSELECT 1;").unwrap();
+
+        let opts = ScriptRunOptions {
+            tx_scope: TxScope::None,
+            error_policy: ErrorPolicy::Continue,
+            dialect: dbc_core::Dialect::Sqlite,
+            statement_timeout_secs: None,
+        };
+        let events = drive_collect(&mut *conn, /* read_only */ true, &[f1], &opts).await;
+
+        let guard_msg = guard_not_read_only(true).unwrap_err().message;
+        assert!(events.iter().any(|e| matches!(e,
+            ScriptEvent::StatementFailed { stmt_index: 1, error } if error.message == guard_msg)));
+        // Continue: both SELECTs still ran.
+        let finished: Vec<_> = events.iter().filter(|e| matches!(e, ScriptEvent::StatementFinished { .. })).collect();
+        assert_eq!(finished.len(), 2);
+        assert!(matches!(events.last(), Some(ScriptEvent::RunFinished { statements_run: 2, statements_failed: 1, aborted: false, .. })));
+        // Client-side proof: the write never reached the (writable) driver.
+        assert_eq!(read_one(&mut *conn, "SELECT n FROM t WHERE id = 1").await, Some("a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn per_file_scope_stop_policy_rolls_back_file_and_aborts_run() {
+        let (_f, mut conn) = open_sqlite_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new()).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("01.sql");
+        std::fs::write(&f1, "INSERT INTO t VALUES (1, 'a');\nTHIS IS NOT SQL;").unwrap();
+        let f2 = dir.path().join("02.sql");
+        std::fs::write(&f2, "INSERT INTO t VALUES (2, 'b');").unwrap();
+
+        let opts = ScriptRunOptions {
+            tx_scope: TxScope::PerFile,
+            error_policy: ErrorPolicy::Stop,
+            dialect: dbc_core::Dialect::Sqlite,
+            statement_timeout_secs: None,
+        };
+        let events = drive_collect(&mut *conn, false, &[f1, f2], &opts).await;
+
+        // file 2 never started.
+        assert!(!events.iter().any(|e| matches!(e, ScriptEvent::FileStarted { index: 1, .. })));
+        assert!(matches!(events.last(), Some(ScriptEvent::RunFinished { aborted: true, .. })));
+        // file 1's INSERT rolled back.
+        assert_eq!(read_one(&mut *conn, "SELECT n FROM t WHERE id = 1").await, None);
+    }
+
+    #[tokio::test]
+    async fn per_file_scope_continue_policy_skips_failed_file_commits_next() {
+        let (_f, mut conn) = open_sqlite_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new()).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("01.sql");
+        std::fs::write(&f1, "INSERT INTO t VALUES (1, 'a');\nTHIS IS NOT SQL;").unwrap();
+        let f2 = dir.path().join("02.sql");
+        std::fs::write(&f2, "INSERT INTO t VALUES (2, 'b');").unwrap();
+
+        let opts = ScriptRunOptions {
+            tx_scope: TxScope::PerFile,
+            error_policy: ErrorPolicy::Continue,
+            dialect: dbc_core::Dialect::Sqlite,
+            statement_timeout_secs: None,
+        };
+        let events = drive_collect(&mut *conn, false, &[f1, f2], &opts).await;
+
+        let file_finished: Vec<_> =
+            events.iter().filter(|e| matches!(e, ScriptEvent::FileFinished { .. })).collect();
+        assert_eq!(file_finished.len(), 2);
+        assert!(matches!(events.last(), Some(ScriptEvent::RunFinished { aborted: false, .. })));
+        // file 1's INSERT rolled back; file 2's committed.
+        assert_eq!(read_one(&mut *conn, "SELECT n FROM t WHERE id = 1").await, None);
+        assert_eq!(read_one(&mut *conn, "SELECT n FROM t WHERE id = 2").await, Some("b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn whole_run_scope_rolls_back_everything_on_late_failure() {
+        let (_f, mut conn) = open_sqlite_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new()).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("01.sql");
+        std::fs::write(&f1, "INSERT INTO t VALUES (1, 'a');").unwrap();
+        let f2 = dir.path().join("02.sql");
+        std::fs::write(&f2, "INSERT INTO t VALUES (2, 'b');\nTHIS IS NOT SQL;").unwrap();
+
+        let opts = ScriptRunOptions {
+            tx_scope: TxScope::WholeRun,
+            error_policy: ErrorPolicy::Stop,
+            dialect: dbc_core::Dialect::Sqlite,
+            statement_timeout_secs: None,
+        };
+        let events = drive_collect(&mut *conn, false, &[f1, f2], &opts).await;
+
+        assert!(matches!(events.last(), Some(ScriptEvent::RunFinished { aborted: true, .. })));
+        // NOTHING from file 1 is visible — the whole-run tx rolled back.
+        assert_eq!(read_one(&mut *conn, "SELECT n FROM t WHERE id = 1").await, None);
+        assert_eq!(read_one(&mut *conn, "SELECT n FROM t WHERE id = 2").await, None);
+    }
+
+    #[tokio::test]
+    async fn no_tx_continue_skips_only_failing_statement() {
+        let (_f, mut conn) = open_sqlite_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new()).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("01.sql");
+        std::fs::write(&f1, "INSERT INTO t VALUES (1, 'a');\nTHIS IS NOT SQL;\nINSERT INTO t VALUES (3, 'c');").unwrap();
+
+        let opts = ScriptRunOptions {
+            tx_scope: TxScope::None,
+            error_policy: ErrorPolicy::Continue,
+            dialect: dbc_core::Dialect::Sqlite,
+            statement_timeout_secs: None,
+        };
+        let events = drive_collect(&mut *conn, false, &[f1], &opts).await;
+
+        assert!(matches!(events.last(), Some(ScriptEvent::RunFinished { statements_failed: 1, aborted: false, .. })));
+        assert_eq!(read_one(&mut *conn, "SELECT n FROM t WHERE id = 1").await, Some("a".to_string()));
+        assert_eq!(read_one(&mut *conn, "SELECT n FROM t WHERE id = 3").await, Some("c".to_string()));
+    }
+
+    #[tokio::test]
+    async fn final_statement_without_trailing_semicolon_runs() {
+        let (_f, mut conn) = open_sqlite_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')", CancelToken::new()).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("01.sql");
+        std::fs::write(&f1, "INSERT INTO t VALUES (2, 'b');\nSELECT * FROM t").unwrap();
+
+        let opts = ScriptRunOptions {
+            tx_scope: TxScope::None,
+            error_policy: ErrorPolicy::Stop,
+            dialect: dbc_core::Dialect::Sqlite,
+            statement_timeout_secs: None,
+        };
+        let events = drive_collect(&mut *conn, false, &[f1], &opts).await;
+        assert!(matches!(events.last(), Some(ScriptEvent::RunFinished { statements_run: 2, statements_failed: 0, aborted: false, .. })));
+    }
+
+    #[tokio::test]
+    async fn unterminated_construct_surfaces_as_statement_failure() {
+        let (_f, mut conn) = open_sqlite_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", CancelToken::new()).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("01.sql");
+        std::fs::write(&f1, "SELECT 'unterminated").unwrap();
+
+        let opts = ScriptRunOptions {
+            tx_scope: TxScope::None,
+            error_policy: ErrorPolicy::Stop,
+            dialect: dbc_core::Dialect::Sqlite,
+            statement_timeout_secs: None,
+        };
+        let events = drive_collect(&mut *conn, false, &[f1], &opts).await;
+        assert!(events.iter().any(|e| matches!(e,
+            ScriptEvent::StatementFailed { error, .. } if error.message.starts_with("[skript]"))));
+        assert!(matches!(events.last(), Some(ScriptEvent::RunFinished { aborted: true, .. })));
+    }
+
+    #[tokio::test]
+    async fn precancelled_token_aborts_before_any_statement() {
+        let (_f, mut conn) = open_sqlite_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", CancelToken::new()).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("01.sql");
+        std::fs::write(&f1, "INSERT INTO t VALUES (1);").unwrap();
+
+        let opts = ScriptRunOptions {
+            tx_scope: TxScope::None,
+            error_policy: ErrorPolicy::Stop,
+            dialect: dbc_core::Dialect::Sqlite,
+            statement_timeout_secs: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let files = [f1];
+        // See `drive_collect`'s doc comment: `tx` must be dropped once
+        // `drive_script` returns, or `collect`'s `rx.recv()` hangs forever
+        // waiting for a channel close that never comes.
+        let drive = async {
+            drive_script(&mut *conn, false, &files, &opts, cancel, &tx).await;
+            drop(tx);
+        };
+        let collect = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let (_, events) = tokio::join!(drive, collect);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], ScriptEvent::RunFinished { statements_run: 0, aborted: true, .. }));
+    }
+
+    #[tokio::test]
+    async fn read_statements_report_drained_row_counts() {
+        let (_f, mut conn) = open_sqlite_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", CancelToken::new()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1)", CancelToken::new()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES (2)", CancelToken::new()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES (3)", CancelToken::new()).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("01.sql");
+        std::fs::write(&f1, "SELECT * FROM t;").unwrap();
+
+        let opts = ScriptRunOptions {
+            tx_scope: TxScope::None,
+            error_policy: ErrorPolicy::Stop,
+            dialect: dbc_core::Dialect::Sqlite,
+            statement_timeout_secs: None,
+        };
+        let events = drive_collect(&mut *conn, false, &[f1], &opts).await;
+        assert!(events.iter().any(|e| matches!(e,
+            ScriptEvent::StatementFinished { affected: Some(3), .. })));
+    }
+}
+
+/// G12 T5: `connect_and_run_many`'s integration tests, driven directly over
+/// `connect_and_run_many_inner` with `Handle::current()` — same precedent
+/// as `write_transaction_tests::run_write_transaction_refuses_read_only_connection_without_connecting`.
+/// `tx` is moved into a `tokio::spawn`ed task (owning it, dropping it when
+/// the task returns) rather than borrowed + manually dropped — see
+/// `script_run_tests::drive_collect`'s doc comment for why a borrowed `tx`
+/// that outlives its producing future deadlocks a concurrent drain.
+#[cfg(test)]
+mod run_many_tests {
+    use super::*;
+
+    fn sqlite_cfg(database: String, read_only: bool) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "x".into(),
+            name: "x".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Sqlite,
+            database,
+            host: String::new(),
+            port: None,
+            user: String::new(),
+            read_only,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+        }
+    }
+
+    /// CURATION item 4(c): `SELECT 1; UPDATE …` on a READ-ONLY connection
+    /// runs the SELECT (`Started` with columns + `Finished`), then stops at
+    /// the UPDATE with the SHARED guard's message; nothing after it runs.
+    #[tokio::test]
+    async fn read_only_multi_run_runs_select_then_stops_at_update() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        {
+            // Prepare the fixture via a WRITABLE open first.
+            let mut conn = crate::connect::open(f.path().to_str().expect("utf8 path"), &handle)
+                .expect("open sqlite");
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new())
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'a')", CancelToken::new()).await.unwrap();
+        }
+
+        let cfg = sqlite_cfg(f.path().to_str().unwrap().to_string(), true);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let statements = vec![
+            "SELECT 1".to_string(),
+            "UPDATE t SET n = 'x'".to_string(),
+            "SELECT 2".to_string(),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let task = tokio::spawn(connect_and_run_many_inner(
+            spec,
+            statements,
+            CancelToken::new(),
+            None,
+            handle.clone(),
+            tx,
+        ));
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        task.await.unwrap();
+
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementStarted { index: 0, columns: Some(_), .. })));
+        assert!(events.iter().any(|e| matches!(e, MultiQueryEvent::StatementFinished { index: 0, .. })));
+        let guard_msg = guard_not_read_only(true).unwrap_err().message;
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementFailed { index: 1, error } if error.message == guard_msg)));
+        // Nothing for statement index 2, no RunFinished.
+        assert!(!events.iter().any(|e| matches!(e, MultiQueryEvent::StatementStarted { index: 2, .. })));
+        assert!(!events.iter().any(|e| matches!(e, MultiQueryEvent::RunFinished)));
+
+        // The write never reached the driver — table unchanged.
+        let mut verify = crate::connect::open(f.path().to_str().unwrap(), &handle).expect("reopen");
+        let mut stream =
+            verify.query("SELECT n FROM t WHERE id = 1", CancelToken::new()).await.unwrap();
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.unwrap()).unwrap();
+        }
+        assert_eq!(buf.cell_text(0, 0), "a");
+    }
+
+    #[tokio::test]
+    async fn multi_run_mixed_reads_and_writes_over_writable_connection() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        let cfg = sqlite_cfg(f.path().to_str().unwrap().to_string(), false);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let statements = vec![
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)".to_string(),
+            "INSERT INTO t VALUES (1, 'a')".to_string(),
+            "SELECT * FROM t".to_string(),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let task = tokio::spawn(connect_and_run_many_inner(
+            spec,
+            statements,
+            CancelToken::new(),
+            None,
+            handle,
+            tx,
+        ));
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        task.await.unwrap();
+
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementStarted { index: 0, columns: None, .. })));
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementFinished { index: 0, affected: Some(0), .. })));
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementStarted { index: 1, columns: None, .. })));
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementFinished { index: 1, affected: Some(1), .. })));
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementStarted { index: 2, columns: Some(_), .. })));
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementFinished { index: 2, affected: None, .. })));
+        assert!(matches!(events.last(), Some(MultiQueryEvent::RunFinished)));
+    }
+
+    #[tokio::test]
+    async fn multi_run_stops_on_first_error() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        let cfg = sqlite_cfg(f.path().to_str().unwrap().to_string(), false);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let statements = vec![
+            "CREATE TABLE t(id INTEGER PRIMARY KEY)".to_string(),
+            "UPDATE no_such_table SET x = 1".to_string(),
+            "SELECT 1".to_string(),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let task = tokio::spawn(connect_and_run_many_inner(
+            spec,
+            statements,
+            CancelToken::new(),
+            None,
+            handle,
+            tx,
+        ));
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        task.await.unwrap();
+
+        assert!(events.iter().any(|e| matches!(e, MultiQueryEvent::StatementFailed { index: 1, .. })));
+        // Statement 2 never dispatched — no third StatementStarted.
+        assert!(!events.iter().any(|e| matches!(e, MultiQueryEvent::StatementStarted { index: 2, .. })));
+        assert!(!events.iter().any(|e| matches!(e, MultiQueryEvent::RunFinished)));
+    }
+}
+
+/// G12 T7: `run_csv_import_inner` integration tests over a temp-file sqlite
+/// connection — same `sqlite_cfg`/`ConnectSpec::Config` fixture shape as
+/// `run_many_tests`.
+#[cfg(test)]
+mod csv_import_tests {
+    use super::*;
+    use crate::csv_import::{ColumnMapping, TargetColumn};
+
+    fn sqlite_cfg(database: String, read_only: bool) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "x".into(),
+            name: "x".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Sqlite,
+            database,
+            host: String::new(),
+            port: None,
+            user: String::new(),
+            read_only,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+        }
+    }
+
+    async fn drive_csv_import(spec: ConnectSpec, job: CsvImportJob) -> Vec<CsvImportEvent> {
+        let handle = tokio::runtime::Handle::current();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let task =
+            tokio::spawn(run_csv_import_inner(spec, job, CancelToken::new(), None, handle, tx));
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        task.await.unwrap();
+        events
+    }
+
+    /// CURATION item 4(b), runtime half: a read-only spec is refused by the
+    /// SHARED guard before any file or DB is touched (a nonsense path
+    /// proves it — same pattern as
+    /// `write_transaction_tests::run_write_transaction_refuses_read_only_connection_without_connecting`).
+    #[tokio::test]
+    async fn run_csv_import_refuses_read_only_spec_without_touching_anything() {
+        let cfg = sqlite_cfg("\0invalid".to_string(), true);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let job = CsvImportJob {
+            path: std::path::PathBuf::from("Z:/does/not/exist.csv"),
+            schema: None,
+            table: "t".to_string(),
+            columns: vec![TargetColumn { name: "id".into(), numeric: true }],
+            mapping: ColumnMapping { targets: vec![Some(0)] },
+        };
+        let events = drive_csv_import(spec, job).await;
+        let guard_msg = guard_not_read_only(true).unwrap_err().message;
+        assert!(events.iter().any(|e| matches!(e,
+            CsvImportEvent::Failed { error } if error.message == guard_msg)));
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn csv_import_commits_all_rows_in_one_transaction() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        {
+            let mut conn = crate::connect::open(f.path().to_str().expect("utf8 path"), &handle)
+                .expect("open sqlite");
+            conn.execute("CREATE TABLE t(id INTEGER, name TEXT, note TEXT)", CancelToken::new())
+                .await
+                .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("rows.csv");
+        std::fs::write(&csv_path, "id,name,note\n1,alice,\n2,\"bob, jr\",''\n").unwrap();
+
+        let cfg = sqlite_cfg(f.path().to_str().unwrap().to_string(), false);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let job = CsvImportJob {
+            path: csv_path,
+            schema: None,
+            table: "t".to_string(),
+            columns: vec![
+                TargetColumn { name: "id".into(), numeric: true },
+                TargetColumn { name: "name".into(), numeric: false },
+                TargetColumn { name: "note".into(), numeric: false },
+            ],
+            mapping: ColumnMapping { targets: vec![Some(0), Some(1), Some(2)] },
+        };
+        let events = drive_csv_import(spec, job).await;
+        assert!(matches!(events.last(), Some(CsvImportEvent::Finished { rows_imported: 2, .. })));
+
+        let mut verify = crate::connect::open(f.path().to_str().unwrap(), &handle).expect("reopen");
+        let mut stream = verify.query("SELECT id, name, note FROM t ORDER BY id", CancelToken::new()).await.unwrap();
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.unwrap()).unwrap();
+        }
+        assert_eq!(buf.row_count(), 2);
+        assert_eq!(buf.cell_text(0, 1), "alice");
+        assert!(buf.cell_is_null(0, 2)); // empty field -> NULL
+        assert_eq!(buf.cell_text(1, 1), "bob, jr");
+        assert_eq!(buf.cell_text(1, 2), "''"); // literal two-quote text, not NULL
+    }
+
+    #[tokio::test]
+    async fn csv_import_rolls_back_everything_on_batch_failure() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        {
+            let mut conn = crate::connect::open(f.path().to_str().expect("utf8 path"), &handle)
+                .expect("open sqlite");
+            conn.execute("CREATE TABLE t(id INTEGER, name TEXT NOT NULL)", CancelToken::new())
+                .await
+                .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("rows.csv");
+        // Last row's `name` field is empty -> NULL -> violates NOT NULL.
+        std::fs::write(&csv_path, "id,name\n1,alice\n2,\n").unwrap();
+
+        let cfg = sqlite_cfg(f.path().to_str().unwrap().to_string(), false);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let job = CsvImportJob {
+            path: csv_path,
+            schema: None,
+            table: "t".to_string(),
+            columns: vec![
+                TargetColumn { name: "id".into(), numeric: true },
+                TargetColumn { name: "name".into(), numeric: false },
+            ],
+            mapping: ColumnMapping { targets: vec![Some(0), Some(1)] },
+        };
+        let events = drive_csv_import(spec, job).await;
+        assert!(matches!(events.last(), Some(CsvImportEvent::Failed { .. })));
+
+        let mut verify = crate::connect::open(f.path().to_str().unwrap(), &handle).expect("reopen");
+        let mut stream = verify.query("SELECT COUNT(*) FROM t", CancelToken::new()).await.unwrap();
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.unwrap()).unwrap();
+        }
+        assert_eq!(buf.cell_text(0, 0), "0"); // nothing partial — zero rows.
+    }
+
+    #[tokio::test]
+    async fn csv_import_batches_by_500() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        {
+            let mut conn = crate::connect::open(f.path().to_str().expect("utf8 path"), &handle)
+                .expect("open sqlite");
+            conn.execute("CREATE TABLE t(id INTEGER)", CancelToken::new()).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("rows.csv");
+        let mut content = String::from("id\n");
+        for i in 0..1100 {
+            content.push_str(&format!("{i}\n"));
+        }
+        std::fs::write(&csv_path, content).unwrap();
+
+        let cfg = sqlite_cfg(f.path().to_str().unwrap().to_string(), false);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let job = CsvImportJob {
+            path: csv_path,
+            schema: None,
+            table: "t".to_string(),
+            columns: vec![TargetColumn { name: "id".into(), numeric: true }],
+            mapping: ColumnMapping { targets: vec![Some(0)] },
+        };
+        let events = drive_csv_import(spec, job).await;
+        let started =
+            events.iter().filter(|e| matches!(e, CsvImportEvent::BatchStarted { .. })).count();
+        assert_eq!(started, 3); // 500/500/100
+        assert!(matches!(events.last(), Some(CsvImportEvent::Finished { rows_imported: 1100, .. })));
+    }
+
+    /// Review fix (MINOR): a mapping with zero mapped columns makes
+    /// `generate_insert_batches` return `Ok(vec![])` for every chunk (no
+    /// statement ever executes) — `rows_committed`/`rows_imported` must stay
+    /// 0, not silently count the CSV's row total as if it had been written.
+    /// (Currently unreachable via the UI — the mapping modal disables
+    /// "Spustit import" whenever `sample_sql` would be `None` for this
+    /// reason — this is the runner's own belt-and-braces correctness, same
+    /// posture as `guard_not_read_only`'s "the UI already prevents this, but
+    /// the write path must refuse for itself too".)
+    #[tokio::test]
+    async fn csv_import_zero_mapped_columns_does_not_inflate_rows_committed() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        {
+            let mut conn = crate::connect::open(f.path().to_str().expect("utf8 path"), &handle)
+                .expect("open sqlite");
+            conn.execute("CREATE TABLE t(id INTEGER)", CancelToken::new()).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("rows.csv");
+        std::fs::write(&csv_path, "id\n1\n2\n3\n").unwrap();
+
+        let cfg = sqlite_cfg(f.path().to_str().unwrap().to_string(), false);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let job = CsvImportJob {
+            path: csv_path,
+            schema: None,
+            table: "t".to_string(),
+            columns: vec![TargetColumn { name: "id".into(), numeric: true }],
+            // Every header skipped — no mapped columns at all.
+            mapping: ColumnMapping { targets: vec![None] },
+        };
+        let events = drive_csv_import(spec, job).await;
+        assert!(matches!(events.last(), Some(CsvImportEvent::Finished { rows_imported: 0, .. })));
+        // No BatchFinished ever reports a non-zero running total either.
+        assert!(events.iter().all(|e| !matches!(
+            e,
+            CsvImportEvent::BatchFinished { rows_committed_so_far, .. } if *rows_committed_so_far != 0
+        )));
+
+        let mut verify = crate::connect::open(f.path().to_str().unwrap(), &handle).expect("reopen");
+        let mut stream = verify.query("SELECT COUNT(*) FROM t", CancelToken::new()).await.unwrap();
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.unwrap()).unwrap();
+        }
+        assert_eq!(buf.cell_text(0, 0), "0");
     }
 }
 
