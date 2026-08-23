@@ -8,7 +8,8 @@
 //!
 //! Wrong suggestions are worse than none: every ambiguous case (duplicate
 //! alias bound to two different tables, an unresolvable `FROM (`/`JOIN (`
-//! subquery) degrades to offering nothing rather than guessing.
+//! subquery, a bare table name ambiguous across schemas, a name shadowed by
+//! a CTE) degrades to offering nothing rather than guessing.
 //!
 //! T6 (this file) is a parallel-batch task with no dependency on T7 (the
 //! `AppView` seam that wires `candidates()`/`resolve_aliases()` into the
@@ -56,6 +57,25 @@ pub const KEYWORDS: &[&str] = &[
     "REFERENCES", "DEFAULT", "CHECK", "UNIQUE",
 ];
 
+/// Words that appear immediately after a table reference in a `FROM`/`JOIN`
+/// clause but are NEVER a valid alias there, on top of everything `KEYWORDS`
+/// already covers (a clause boundary like `WHERE`/`GROUP`/`JOIN` itself
+/// already stops alias parsing via that list). These are join-syntax words
+/// too narrow/rare to belong in the general keyword-completion list but that
+/// `resolve_aliases`' "is the next token an alias or a clause keyword?"
+/// check MUST recognize — review round 1, finding 1: `FROM t CROSS JOIN u`
+/// was binding `CROSS` as an alias for `t` (same bug for `USING`) because
+/// the old code only consulted `KEYWORDS`, which doesn't list them.
+const ALIAS_STOPWORDS: &[&str] = &["CROSS", "NATURAL", "USING", "LATERAL"];
+
+/// True if `word_upper` (already uppercased) can never be a table alias —
+/// the union of `KEYWORDS` (general SQL vocabulary, doubles as clause
+/// boundaries) and `ALIAS_STOPWORDS` (join-syntax words with no other
+/// reason to be in the completion keyword list).
+fn is_alias_stopword(word_upper: &str) -> bool {
+    KEYWORDS.iter().any(|k| *k == word_upper) || ALIAS_STOPWORDS.iter().any(|k| *k == word_upper)
+}
+
 const MAX_CANDIDATES: usize = 20;
 
 fn is_ident_byte(b: u8) -> bool {
@@ -66,8 +86,22 @@ fn is_ident_byte(b: u8) -> bool {
 /// token under the cursor, and (if that token is preceded by a `.`) the
 /// qualifier token before the dot.
 pub fn cursor_context(text: &str, cursor: usize) -> CursorContext {
+    let mut cursor = cursor.min(text.len());
+    // A cursor mid-way through a multi-byte UTF-8 character (e.g. a
+    // caller passing a stale/out-of-sync byte offset) would otherwise
+    // panic on the `text[..]` slicing below — snap DOWN to the nearest
+    // character boundary first, same "floor, don't round" convention as
+    // `text_model.rs`'s grapheme-boundary snapping. Floor (not full
+    // grapheme-cluster awareness) is sufficient here: this function only
+    // ever reasons about ASCII identifier bytes, so once `cursor` itself
+    // sits on a character boundary, every backward step below consumes one
+    // whole ASCII byte at a time and can never re-enter the middle of a
+    // multi-byte sequence (review round 1, finding 4).
+    while cursor > 0 && !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+
     let bytes = text.as_bytes();
-    let cursor = cursor.min(bytes.len());
 
     let mut start = cursor;
     while start > 0 && is_ident_byte(bytes[start - 1]) {
@@ -182,8 +216,10 @@ fn keyword_and_table_candidates(prefix: &str, snapshot: Option<&SchemaSnapshot>)
 }
 
 /// Column candidates for a `qualifier.` (alias or bare table name) dot
-/// completion. Empty if there's no snapshot, the alias scan is ambiguous, or
-/// the qualifier doesn't resolve to a known table.
+/// completion. Empty if there's no snapshot, the alias scan is ambiguous,
+/// the qualifier is shadowed by a CTE name, the qualifier doesn't resolve to
+/// a known table, or (for a schema-less/bare reference) the table name is
+/// ambiguous across more than one schema in the snapshot.
 fn column_candidates(text: &str, qualifier: &str, prefix: &str, snapshot: Option<&SchemaSnapshot>) -> Vec<Candidate> {
     let Some(snapshot) = snapshot else {
         return Vec::new();
@@ -192,15 +228,48 @@ fn column_candidates(text: &str, qualifier: &str, prefix: &str, snapshot: Option
         return Vec::new();
     };
     let qualifier_lower = qualifier.to_lowercase();
-    let Some(target_table) = alias_map
+    let Some(target) = alias_map
         .iter()
         .find(|(k, _)| k.to_lowercase() == qualifier_lower)
         .map(|(_, v)| v.clone())
     else {
         return Vec::new();
     };
-    let target_lower = target_table.to_lowercase();
-    let Some(table) = snapshot.tables.iter().find(|t| t.name.to_lowercase() == target_lower) else {
+
+    // CTE shadowing (review round 1, finding 3): `resolve_aliases` is a
+    // schema-blind text scan — it happily self-maps `FROM x` even when `x`
+    // is actually a CTE name, not a real table. A CTE's result shape isn't
+    // modeled by `SchemaSnapshot` at all, so if `target`'s name is ALSO
+    // bound by a `WITH ... AS (...)` in this query, the CTE shadows
+    // whatever same-named real table might exist — offer nothing rather
+    // than that real table's (likely wrong) columns.
+    let masked = mask_strings_and_comments(text);
+    let masked_chars: Vec<char> = masked.chars().collect();
+    if cte_names(&masked_chars).contains(&target.name.to_uppercase()) {
+        return Vec::new();
+    }
+
+    let table = match &target.schema {
+        // Schema-qualified reference (`hr.users u`) — match schema AND name
+        // exactly; never fall back to a different schema's same-named table
+        // (review round 1, finding 2).
+        Some(schema) => snapshot.tables.iter().find(|t| {
+            t.name.eq_ignore_ascii_case(&target.name)
+                && t.schema.as_deref().map(|s| s.eq_ignore_ascii_case(schema)).unwrap_or(false)
+        }),
+        // Bare (schema-less) reference — resolve only if exactly one table
+        // in the snapshot has this name; more than one (across different
+        // schemas) is ambiguous, same "offer nothing" invariant as alias
+        // ambiguity (review round 1, finding 2).
+        None => {
+            let mut matching = snapshot.tables.iter().filter(|t| t.name.eq_ignore_ascii_case(&target.name));
+            match (matching.next(), matching.next()) {
+                (Some(t), None) => Some(t),
+                _ => None,
+            }
+        }
+    };
+    let Some(table) = table else {
         return Vec::new();
     };
 
@@ -253,6 +322,27 @@ pub fn candidates(
 
 // --- Alias resolution ---
 
+/// A resolved `alias -> table` (or bare `table -> table`) binding,
+/// preserving the schema qualifier the user typed, if any. Needed so
+/// `hr.users u` and `public.users u` resolve to DIFFERENT tables when both
+/// schemas are present in the snapshot (review round 1, finding 2 — the
+/// previous schema-blind lookup returned whichever same-named table
+/// happened to come first).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableRef {
+    pub schema: Option<String>,
+    pub name: String,
+}
+
+fn table_ref_eq_ignore_case(a: &TableRef, b: &TableRef) -> bool {
+    a.name.eq_ignore_ascii_case(&b.name)
+        && match (&a.schema, &b.schema) {
+            (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+            (None, None) => true,
+            _ => false,
+        }
+}
+
 fn is_ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
 }
@@ -268,40 +358,48 @@ fn skip_ws(chars: &[char], mut j: usize) -> usize {
     j
 }
 
-/// Reads a (possibly dot-chained, e.g. `schema.table`) identifier starting
-/// at `j`, collapsing to the LAST segment. Returns `None` if `j` isn't at an
-/// identifier start.
-fn read_dotted_word(chars: &[char], j: usize) -> Option<(String, usize)> {
+/// Reads a single (non-dotted) identifier starting at `j`. Returns `None`
+/// if `j` isn't at an identifier start.
+fn read_word(chars: &[char], j: usize) -> Option<(String, usize)> {
     if j >= chars.len() || !is_ident_start(chars[j]) {
         return None;
     }
     let mut k = j;
-    let mut word_start = k;
     while k < chars.len() && is_ident_char(chars[k]) {
         k += 1;
     }
-    let mut word: String = chars[word_start..k].iter().collect();
+    Some((chars[j..k].iter().collect(), k))
+}
+
+/// Reads a possibly dot-chained identifier (`schema.table`) starting at
+/// `j`. Returns `(schema, name, end_index)` — `schema` is the segment
+/// before the LAST dot, if there was one (`schema.table` -> `(Some(
+/// "schema"), "table")`), else `None` (`table` -> `(None, "table")`).
+/// Three-or-more-segment chains (`db.schema.table`) collapse to the last
+/// two segments — v1 doesn't model catalog-level qualification, only
+/// schema.table, consistent with `SchemaSnapshot`'s own shape.
+fn read_qualified_word(chars: &[char], j: usize) -> Option<(Option<String>, String, usize)> {
+    let (mut segment, mut k) = read_word(chars, j)?;
+    let mut prev_segment: Option<String> = None;
     loop {
         if k < chars.len() && chars[k] == '.' && k + 1 < chars.len() && is_ident_start(chars[k + 1]) {
-            k += 1; // consume '.'
-            word_start = k;
-            while k < chars.len() && is_ident_char(chars[k]) {
-                k += 1;
-            }
-            word = chars[word_start..k].iter().collect();
+            let (next_seg, next_k) = read_word(chars, k + 1)?;
+            prev_segment = Some(segment);
+            segment = next_seg;
+            k = next_k;
         } else {
             break;
         }
     }
-    Some((word, k))
+    Some((prev_segment, segment, k))
 }
 
 /// Inserts `key -> value`; returns `false` (conflict) if `key` is already
 /// bound to a DIFFERENT value (case-insensitively) — the caller treats that
 /// as whole-query ambiguity.
-fn insert_alias(map: &mut HashMap<String, String>, key: String, value: String) -> bool {
+fn insert_alias(map: &mut HashMap<String, TableRef>, key: String, value: TableRef) -> bool {
     match map.get(&key) {
-        Some(existing) if !existing.eq_ignore_ascii_case(&value) => false,
+        Some(existing) if !table_ref_eq_ignore_case(existing, &value) => false,
         _ => {
             map.insert(key, value);
             true
@@ -311,10 +409,10 @@ fn insert_alias(map: &mut HashMap<String, String>, key: String, value: String) -
 
 /// Replaces single-quoted strings, double-quoted identifiers, `--` line
 /// comments and `/* */` block comments with spaces (preserving newlines),
-/// so `resolve_aliases`' text scan never mistakes their contents for SQL
-/// syntax. Best-effort: an unterminated construct is masked to end-of-input
-/// rather than failing closed (this scanner's contract has no `None`-for-
-/// parse-error case, only `None`-for-ambiguity).
+/// so `resolve_aliases`'/`cte_names`' text scans never mistake their
+/// contents for SQL syntax. Best-effort: an unterminated construct is
+/// masked to end-of-input rather than failing closed (this scanner's
+/// contract has no `None`-for-parse-error case, only `None`-for-ambiguity).
 fn mask_strings_and_comments(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(chars.len());
@@ -424,16 +522,22 @@ fn mask_strings_and_comments(text: &str) -> String {
 
 /// `FROM <table> [AS] <alias>` / `JOIN <table> [AS] <alias>` text scan (NOT
 /// the tree-sitter tree — decouples this module from tree-sitter-sequel's
-/// node shapes, design §2). Also self-maps each named table to itself
-/// (lowercased lookups elsewhere), so a bare `table.` qualifier resolves
-/// without a separate lookup path. `None` = ambiguous (duplicate alias bound
-/// to two different tables, or an unresolvable `FROM (`/`JOIN (` subquery)
-/// — "offers nothing" rather than a guess.
-pub fn resolve_aliases(text: &str) -> Option<HashMap<String, String>> {
+/// node shapes, design §2). `<table>` may be schema-qualified
+/// (`schema.table`), and the schema is preserved in the returned
+/// `TableRef` (review round 1, finding 2). Also self-maps each named table
+/// to itself (lowercased lookups elsewhere), so a bare `table.` qualifier
+/// resolves without a separate lookup path. The word immediately after a
+/// table reference is treated as an alias UNLESS it's a stopword (`AS` is
+/// handled specially; every other `KEYWORDS`/`ALIAS_STOPWORDS` entry —
+/// including `CROSS`/`NATURAL`/`USING`/`LATERAL`, review round 1 finding 1
+/// — is a clause boundary, not an alias). `None` = ambiguous (duplicate
+/// alias bound to two different tables, or an unresolvable `FROM (`/`JOIN (`
+/// subquery) — "offers nothing" rather than a guess.
+pub fn resolve_aliases(text: &str) -> Option<HashMap<String, TableRef>> {
     let masked = mask_strings_and_comments(text);
     let chars: Vec<char> = masked.chars().collect();
     let len = chars.len();
-    let mut map: HashMap<String, String> = HashMap::new();
+    let mut map: HashMap<String, TableRef> = HashMap::new();
     let mut i = 0usize;
 
     while i < len {
@@ -442,12 +546,10 @@ pub fn resolve_aliases(text: &str) -> Option<HashMap<String, String>> {
             continue;
         }
 
-        let word_start = i;
-        let mut j = i;
-        while j < len && is_ident_char(chars[j]) {
-            j += 1;
-        }
-        let word: String = chars[word_start..j].iter().collect();
+        let Some((word, j)) = read_word(&chars, i) else {
+            i += 1;
+            continue;
+        };
         let upper = word.to_uppercase();
 
         if upper != "FROM" && upper != "JOIN" {
@@ -462,17 +564,18 @@ pub fn resolve_aliases(text: &str) -> Option<HashMap<String, String>> {
             return None;
         }
 
-        let Some((table, after_table)) = read_dotted_word(&chars, after_kw) else {
+        let Some((schema, table, after_table)) = read_qualified_word(&chars, after_kw) else {
             i = after_kw;
             continue;
         };
+        let table_ref = TableRef { schema, name: table.clone() };
 
-        if !insert_alias(&mut map, table.clone(), table.clone()) {
+        if !insert_alias(&mut map, table.clone(), table_ref.clone()) {
             return None;
         }
 
         let after_ws = skip_ws(&chars, after_table);
-        let Some((next_word, after_next)) = read_dotted_word(&chars, after_ws) else {
+        let Some((next_word, after_next)) = read_word(&chars, after_ws) else {
             i = after_table;
             continue;
         };
@@ -480,16 +583,16 @@ pub fn resolve_aliases(text: &str) -> Option<HashMap<String, String>> {
 
         if next_upper == "AS" {
             let after_as_ws = skip_ws(&chars, after_next);
-            if let Some((alias, after_alias)) = read_dotted_word(&chars, after_as_ws) {
-                if !insert_alias(&mut map, alias, table) {
+            if let Some((alias, after_alias)) = read_word(&chars, after_as_ws) {
+                if !insert_alias(&mut map, alias, table_ref) {
                     return None;
                 }
                 i = after_alias;
             } else {
                 i = after_next;
             }
-        } else if !KEYWORDS.iter().any(|k| *k == next_upper) {
-            if !insert_alias(&mut map, next_word, table) {
+        } else if !is_alias_stopword(&next_upper) {
+            if !insert_alias(&mut map, next_word, table_ref) {
                 return None;
             }
             i = after_next;
@@ -499,6 +602,112 @@ pub fn resolve_aliases(text: &str) -> Option<HashMap<String, String>> {
     }
 
     Some(map)
+}
+
+/// Names bound by a `WITH <name> [(cols)] AS (...)` / `, <name> [(cols)] AS
+/// (...)` CTE list (an optional leading `RECURSIVE` is skipped). Used only
+/// to detect column-lookup shadowing (review round 1, finding 3): a
+/// `FROM`/`JOIN` reference to a name that's ALSO a CTE name must never
+/// resolve to a same-named real table's columns, since the actual bound
+/// source is the CTE's (unmodeled) result shape, not the table's. `chars`
+/// must already be string/comment-masked (see `mask_strings_and_comments`).
+fn cte_names(chars: &[char]) -> HashSet<String> {
+    let len = chars.len();
+    let mut names = HashSet::new();
+    let mut i = 0usize;
+
+    while i < len {
+        if !is_ident_start(chars[i]) {
+            i += 1;
+            continue;
+        }
+        let Some((word, j)) = read_word(chars, i) else {
+            i += 1;
+            continue;
+        };
+        if word.eq_ignore_ascii_case("WITH") {
+            i = parse_cte_name_list(chars, skip_ws(chars, j), &mut names);
+        } else {
+            i = j;
+        }
+    }
+
+    names
+}
+
+/// Parses a comma-separated `<name> [(cols)] AS (...)` list starting at `i`
+/// (right after `WITH`), inserting each `<name>` (uppercased) into `names`.
+/// Stops (returning the index it stopped at) at the first entry that
+/// doesn't match the expected shape — degrades gracefully on anything this
+/// lightweight scan doesn't understand, never panics.
+fn parse_cte_name_list(chars: &[char], mut i: usize, names: &mut HashSet<String>) -> usize {
+    let len = chars.len();
+    loop {
+        i = skip_ws(chars, i);
+        let Some((mut word, mut after)) = read_word(chars, i) else {
+            return i;
+        };
+        if word.eq_ignore_ascii_case("RECURSIVE") {
+            i = skip_ws(chars, after);
+            match read_word(chars, i) {
+                Some((w2, a2)) => {
+                    word = w2;
+                    after = a2;
+                }
+                None => return i,
+            }
+        }
+        let name = word;
+        i = skip_ws(chars, after);
+        if i < len && chars[i] == '(' {
+            i = skip_balanced_parens(chars, i);
+            i = skip_ws(chars, i);
+        }
+        let Some((as_word, after_as)) = read_word(chars, i) else {
+            return i;
+        };
+        if !as_word.eq_ignore_ascii_case("AS") {
+            return i;
+        }
+        i = skip_ws(chars, after_as);
+        if i >= len || chars[i] != '(' {
+            return i;
+        }
+        names.insert(name.to_uppercase());
+        i = skip_balanced_parens(chars, i);
+        i = skip_ws(chars, i);
+        if i < len && chars[i] == ',' {
+            i += 1;
+            continue;
+        }
+        return i;
+    }
+}
+
+/// Skips a `(...)` group starting at `i` (which must be `(`), respecting
+/// nesting. Returns the index right after the matching `)`, or the end of
+/// input if unterminated (best-effort, no panic).
+fn skip_balanced_parens(chars: &[char], i: usize) -> usize {
+    let len = chars.len();
+    if i >= len || chars[i] != '(' {
+        return i;
+    }
+    let mut depth = 0i32;
+    let mut k = i;
+    while k < len {
+        match chars[k] {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return k + 1;
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    k
 }
 
 #[cfg(test)]
@@ -540,6 +749,34 @@ mod tests {
                 ],
                 ..Default::default()
             }],
+            ..Default::default()
+        }
+    }
+
+    /// `public.users(id, email)` + `hr.users(ssn, salary)` — same table
+    /// name, two different schemas (review round 1, finding 2 fixtures).
+    fn snapshot_duplicate_table_name_across_schemas() -> SchemaSnapshot {
+        SchemaSnapshot {
+            tables: vec![
+                TableInfo {
+                    schema: Some("public".into()),
+                    name: "users".into(),
+                    columns: vec![
+                        ColumnInfo { name: "id".into(), is_pk: true, ..Default::default() },
+                        ColumnInfo { name: "email".into(), ..Default::default() },
+                    ],
+                    ..Default::default()
+                },
+                TableInfo {
+                    schema: Some("hr".into()),
+                    name: "users".into(),
+                    columns: vec![
+                        ColumnInfo { name: "ssn".into(), ..Default::default() },
+                        ColumnInfo { name: "salary".into(), ..Default::default() },
+                    ],
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         }
     }
@@ -651,5 +888,74 @@ mod tests {
         let ctx = cursor_context("SELECT sel", 10);
         assert_eq!(ctx.prefix, "sel");
         assert_eq!(ctx.qualifier, None);
+    }
+
+    // --- Review round 1 fixes ---
+
+    #[test]
+    fn cross_join_binds_no_alias() {
+        let sql = "SELECT * FROM users CROSS JOIN log WHERE users.";
+        let map = resolve_aliases(sql).expect("not ambiguous");
+        assert!(!map.contains_key("CROSS"));
+        let cursor = sql.len();
+        let cs = candidates(sql, cursor, Some(&snapshot_two_schemas()), false, false);
+        assert!(cs.iter().any(|c| c.kind == CandidateKind::Column && c.text == "id"));
+        assert!(cs.iter().any(|c| c.kind == CandidateKind::Column && c.text == "email"));
+    }
+
+    #[test]
+    fn using_clause_binds_no_alias() {
+        let sql = "SELECT * FROM users JOIN log USING (id) WHERE users.";
+        let map = resolve_aliases(sql).expect("not ambiguous");
+        assert!(!map.contains_key("USING"));
+        let cursor = sql.len();
+        let cs = candidates(sql, cursor, Some(&snapshot_two_schemas()), false, false);
+        assert!(cs.iter().any(|c| c.kind == CandidateKind::Column && c.text == "id"));
+    }
+
+    #[test]
+    fn schema_qualified_alias_gets_that_schemas_columns() {
+        let snap = snapshot_duplicate_table_name_across_schemas();
+        let sql = "SELECT * FROM hr.users u WHERE u.";
+        let cursor = sql.len();
+        let cs = candidates(sql, cursor, Some(&snap), false, false);
+        assert!(cs.iter().any(|c| c.kind == CandidateKind::Column && c.text == "ssn"));
+        assert!(cs.iter().any(|c| c.kind == CandidateKind::Column && c.text == "salary"));
+        assert!(!cs.iter().any(|c| c.kind == CandidateKind::Column && (c.text == "id" || c.text == "email")));
+    }
+
+    #[test]
+    fn bare_name_ambiguous_across_schemas_offers_nothing() {
+        let snap = snapshot_duplicate_table_name_across_schemas();
+        let sql = "SELECT * FROM users u WHERE u.";
+        let cursor = sql.len();
+        let cs = candidates(sql, cursor, Some(&snap), false, false);
+        assert!(cs.iter().all(|c| c.kind != CandidateKind::Column));
+    }
+
+    #[test]
+    fn cte_name_shadowing_real_table_offers_nothing() {
+        // "orders" is both a CTE name AND a real table in the snapshot; the
+        // CTE shadows the real table within this query, so `o.` must offer
+        // nothing rather than the real table's columns.
+        let sql = "WITH orders AS (SELECT 1 AS x) SELECT * FROM orders o WHERE o.";
+        let cursor = sql.len();
+        let cs = candidates(sql, cursor, Some(&snapshot_one_schema()), false, false);
+        assert!(cs.iter().all(|c| c.kind != CandidateKind::Column));
+    }
+
+    #[test]
+    fn mid_multibyte_cursor_does_not_panic() {
+        let text = "SELECT café";
+        // Byte 11 sits mid-way through the 2-byte 'é' (bytes 10-11).
+        let ctx = cursor_context(text, 11);
+        assert!(ctx.prefix.chars().all(|c| c.is_ascii()));
+
+        // 4-byte emoji: 'SELECT ' (7 bytes) + \u{1F600} (bytes 7..11) + 'x'.
+        let text2 = "SELECT \u{1F600}x";
+        let ctx2 = cursor_context(text2, 9); // mid-emoji
+        assert!(ctx2.prefix.chars().all(|c| c.is_ascii()));
+        let ctx3 = cursor_context(text2, 10); // also mid-emoji
+        assert!(ctx3.prefix.chars().all(|c| c.is_ascii()));
     }
 }
