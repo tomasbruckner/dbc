@@ -77,8 +77,38 @@ impl Render for ErDiagramView {
     }
 }
 
+/// Non-finite coordinates (NaN/inf) must never reach GPUI's path/quad
+/// builders: `PathBuilder::move_to`/`line_to`/`curve_to` debug-assert
+/// finiteness (lyon_path's `nan_check`) INSIDE the call, before
+/// `.build()`'s own `Result` gets any chance to catch it. Mirrors
+/// `dbc_core::erd::svg::fmt_coord`'s "clamp to 0.0" posture — a
+/// malformed/adversarial `DiagramLayout` (hand-built, or a future layout
+/// bug) is already a display-only edge case; never letting it panic the
+/// paint pass is the load-bearing part, not the exact fallback value.
+fn fmt_coord(v: f32) -> f32 {
+    if v.is_finite() {
+        v
+    } else {
+        0.0
+    }
+}
+
 fn to_screen(origin: Point<Pixels>, world: (f32, f32), pan: Point<f32>, zoom: f32) -> Point<Pixels> {
-    point(origin.x + px((world.0 + pan.x) * zoom), origin.y + px((world.1 + pan.y) * zoom))
+    let x = fmt_coord((world.0 + pan.x) * zoom);
+    let y = fmt_coord((world.1 + pan.y) * zoom);
+    point(origin.x + px(x), origin.y + px(y))
+}
+
+/// `shape_line` debug-asserts the text contains no `\n`
+/// (`text_system.rs:404`) — a catalog identifier can legally carry an
+/// embedded newline or other C0 control character (SQLite quoted names,
+/// same hostile-input class `dbc_core::erd::svg::escape_xml` already
+/// treats as expected, not exceptional). Every char below 0x20 collapses
+/// to a single space so multi-line/control-char garbage renders as one
+/// (still legible, still same-length) line instead of panicking the
+/// paint pass.
+fn sanitize_for_display(s: &str) -> String {
+    s.chars().map(|c| if (c as u32) < 0x20 { ' ' } else { c }).collect()
 }
 
 fn header_text(t: &TableInfo) -> String {
@@ -120,22 +150,26 @@ fn paint_text_line(
     if text.is_empty() {
         return;
     }
+    // Every control char (including the '\n' shape_line debug-asserts
+    // against) is replaced 1:1 with a space before it ever reaches GPUI's
+    // text system — see `sanitize_for_display`.
+    let sanitized = sanitize_for_display(text);
     let mut font = window.text_style().font();
     if bold {
         font.weight = gpui::FontWeight::BOLD;
     }
     let run = TextRun {
-        len: text.len(),
+        len: sanitized.len(),
         font,
         color: rgb(color).into(),
         background_color: None,
         underline: None,
         strikethrough: None,
     };
-    let shaped = window.text_system().shape_line(text.to_string().into(), font_size, &[run], None);
-    // Defensive: a hostile/unusual identifier (embedded control char, huge
-    // string) must never panic the paint pass — worst case, that one
-    // line is silently skipped, the rest of the diagram still renders.
+    let shaped = window.text_system().shape_line(sanitized.into(), font_size, &[run], None);
+    // Defensive: any remaining shaping failure must never panic the paint
+    // pass — worst case, that one line is silently skipped, the rest of
+    // the diagram still renders.
     let _ = shaped.paint(origin, line_height, gpui::TextAlign::Left, None, window, app);
 }
 
@@ -149,7 +183,7 @@ fn paint_node(
     app: &mut App,
 ) {
     let top_left = to_screen(origin, (n.x, n.y), pan, zoom);
-    let sz = size(px(n.w * zoom), px(n.h * zoom));
+    let sz = size(px(fmt_coord(n.w * zoom)), px(fmt_coord(n.h * zoom)));
     window.paint_quad(
         gpui::fill(Bounds::new(top_left, sz), rgb(NODE_FILL))
             .corner_radii(px(4.))
@@ -214,5 +248,85 @@ fn paint_edge(origin: Point<Pixels>, e: &RoutedEdge, pan: Point<f32>, zoom: f32,
     }
     if let Ok(path) = builder.build() {
         window.paint_path(path, rgb(EDGE_COLOR));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `to_screen`/`fmt_coord` are the single choke point every world
+    // coordinate passes through before becoming a `Point<Pixels>` fed to
+    // `PathBuilder`/`paint_quad` — GPUI's `Window`/`App` can't be
+    // constructed in a plain unit test (no such harness exists anywhere
+    // in this codebase), so these pure helpers are what stand in for
+    // "a `DiagramLayout` with a NaN/inf coordinate paints without panic":
+    // every path a non-finite coordinate could take into GPUI funnels
+    // through one of them.
+
+    #[test]
+    fn fmt_coord_clamps_non_finite_to_zero() {
+        assert_eq!(fmt_coord(f32::NAN), 0.0);
+        assert_eq!(fmt_coord(f32::INFINITY), 0.0);
+        assert_eq!(fmt_coord(f32::NEG_INFINITY), 0.0);
+        assert_eq!(fmt_coord(42.5), 42.5);
+    }
+
+    #[test]
+    fn to_screen_never_produces_non_finite_pixels_from_nan_or_inf_world_coords() {
+        let origin = point(px(0.0), px(0.0));
+        let pan = point(0.0, 0.0);
+        for world in [
+            (f32::NAN, 10.0),
+            (10.0, f32::NAN),
+            (f32::INFINITY, 10.0),
+            (10.0, f32::NEG_INFINITY),
+            (f32::NAN, f32::INFINITY),
+        ] {
+            let p = to_screen(origin, world, pan, 1.0);
+            assert!(f32::from(p.x).is_finite(), "x from world {world:?} must be finite");
+            assert!(f32::from(p.y).is_finite(), "y from world {world:?} must be finite");
+        }
+    }
+
+    #[test]
+    fn to_screen_non_finite_zoom_or_pan_also_clamps() {
+        let origin = point(px(0.0), px(0.0));
+        let p = to_screen(origin, (10.0, 10.0), point(f32::NAN, 0.0), f32::INFINITY);
+        assert!(f32::from(p.x).is_finite());
+        assert!(f32::from(p.y).is_finite());
+    }
+
+    #[test]
+    fn to_screen_finite_input_is_unaffected() {
+        let origin = point(px(5.0), px(5.0));
+        let p = to_screen(origin, (10.0, 20.0), point(1.0, 2.0), 2.0);
+        // (10 + 1) * 2 = 22, (20 + 2) * 2 = 44, offset by origin.
+        assert_eq!(f32::from(p.x), 5.0 + 22.0);
+        assert_eq!(f32::from(p.y), 5.0 + 44.0);
+    }
+
+    #[test]
+    fn sanitize_for_display_replaces_newlines_and_control_chars_with_space() {
+        let s = sanitize_for_display("we\"ird\nname\rwith\ttabs\x01ctrl");
+        assert!(!s.contains('\n'));
+        assert!(!s.contains('\r'));
+        assert!(!s.contains('\t'));
+        assert!(!s.contains('\x01'));
+        assert_eq!(s, "we\"ird name with tabs ctrl");
+    }
+
+    #[test]
+    fn sanitize_for_display_preserves_byte_length_and_normal_text() {
+        let s = "plain_table_name";
+        assert_eq!(sanitize_for_display(s), s);
+        let with_newline = "a\nb";
+        assert_eq!(sanitize_for_display(with_newline).len(), with_newline.len());
+    }
+
+    #[test]
+    fn sanitize_for_display_leaves_non_control_unicode_untouched() {
+        let s = sanitize_for_display("tábulka_ěščř");
+        assert_eq!(s, "tábulka_ěščř");
     }
 }
