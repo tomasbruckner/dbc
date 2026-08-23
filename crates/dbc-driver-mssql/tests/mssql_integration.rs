@@ -64,6 +64,65 @@ async fn query_handles_nulls() {
     assert!(saw_row);
 }
 
+/// Czech diacritics must round-trip exactly through `nvarchar` — the
+/// motivating case for wide (`SQL_C_WCHAR`) binding in `wide.rs`. Narrow
+/// (`SQL_C_CHAR`) binding would transcode this through the process ANSI
+/// codepage and silently corrupt it while still "successfully" decoding as
+/// UTF-8, so this specifically needs a live server + driver to catch a
+/// regression back to narrow binding — a unit test can't observe the
+/// codepage transcoding odbc-api/the driver performs internally.
+#[tokio::test]
+#[ignore]
+async fn query_roundtrips_czech_diacritics() {
+    let mut c = connect();
+    let text = "Příliš žluťoučký kůň úpěl ďábelské ódy";
+    let mut s = c
+        .query(&format!("SELECT N'{text}' AS greeting"), CancelToken::new())
+        .await
+        .unwrap();
+    let mut seen = None;
+    while let Some(b) = s.batches.recv().await {
+        let b = b.unwrap();
+        let col = b.column(0).as_any().downcast_ref::<dbc_core::arrow::array::StringArray>().unwrap();
+        if b.num_rows() > 0 {
+            seen = Some(col.value(0).to_string());
+        }
+    }
+    assert_eq!(seen.as_deref(), Some(text));
+}
+
+/// A value longer than `QUERY_MAX_STR_LEN` (64Ki UTF-16 code units) must
+/// come back as `wide::cell_text`'s explicit truncation marker
+/// (`"<zkráceno: >= N znaků>"`), never a silently shortened string that
+/// reads like ordinary, complete data. `REPLICATE` builds an `nvarchar(max)`
+/// well past the cap.
+#[tokio::test]
+#[ignore]
+async fn query_reports_truncation_marker_for_oversized_nvarchar_max() {
+    let mut c = connect();
+    let mut s = c
+        .query(
+            "SELECT REPLICATE(CAST(N'x' AS nvarchar(max)), 100000) AS big",
+            CancelToken::new(),
+        )
+        .await
+        .unwrap();
+    let mut seen = None;
+    while let Some(b) = s.batches.recv().await {
+        let b = b.unwrap();
+        let col = b.column(0).as_any().downcast_ref::<dbc_core::arrow::array::StringArray>().unwrap();
+        if b.num_rows() > 0 {
+            seen = Some(col.value(0).to_string());
+        }
+    }
+    let seen = seen.expect("expected one row");
+    assert!(
+        seen.starts_with("<zkráceno:"),
+        "expected an explicit truncation marker for a 100000-char value against a 65536 cap, got a string of length {}",
+        seen.len()
+    );
+}
+
 /// A syntactically valid query against a nonexistent table must surface as
 /// a stream `Err`, not a panic or a silently-empty stream.
 #[tokio::test]

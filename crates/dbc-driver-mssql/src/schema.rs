@@ -14,11 +14,14 @@
 //! back through that lookup.
 //!
 //! Every query is run through [`run_query_text`], which executes via
-//! `Connection::execute` and drains the result with a bulk columnar
-//! [`TextRowSet`] block cursor (not row-by-row `next_row`) — catalog result
-//! sets are small, so full materialization into `Vec<Vec<Option<String>>>`
-//! keeps every `attach_*` function a plain, easily-reviewed loop, at the
-//! cost of holding the whole (small) catalog result in memory at once.
+//! `Connection::execute` and drains the result with a bulk columnar, wide
+//! (`SQL_C_WCHAR`) block cursor (see `crate::wide`; not row-by-row
+//! `next_row`, and not narrow `SQL_C_CHAR` — narrow binding transcodes
+//! `nvarchar`/`nchar` text through the process ANSI codepage, corrupting
+//! non-ASCII identifiers/comments/definitions) — catalog result sets are
+//! small, so full materialization into `Vec<Vec<Option<String>>>` keeps
+//! every `attach_*` function a plain, easily-reviewed loop, at the cost of
+//! holding the whole (small) catalog result in memory at once.
 //!
 //! CAVEAT: these queries are written against documented `sys.*` view shapes
 //! but have NOT been run against a live SQL Server instance (no server or
@@ -33,10 +36,10 @@ use dbc_core::{
     ColumnInfo, ConstraintInfo, FkRef, IndexInfo, QueryError, RoutineInfo,
     RoutineKind, SchemaSnapshot, TableInfo, TableKind, TriggerInfo, SequenceInfo,
 };
-use odbc_api::buffers::TextRowSet;
-use odbc_api::{Connection, Cursor, ResultSetMetadata};
+use odbc_api::{Connection, Cursor};
 
 use crate::types::odbc_err;
+use crate::wide;
 
 /// Excludes engine-internal schemas. Interpolated directly (not
 /// parameterized) since it's a fixed literal, same style as the postgres
@@ -70,23 +73,25 @@ fn run_query_text(
         Some(c) => c,
         None => return Ok(Vec::new()),
     };
-    let ncols = cursor.num_result_cols().map_err(odbc_err)? as usize;
-    let mut buffers =
-        TextRowSet::for_cursor(batch_size, &mut cursor, Some(max_str_limit)).map_err(odbc_err)?;
+    let (mut buffers, ncols) = wide::build(&mut cursor, batch_size, max_str_limit)?;
     let mut row_set_cursor = cursor.bind_buffer(&mut buffers).map_err(odbc_err)?;
 
     let mut out = Vec::new();
     while let Some(batch) = row_set_cursor.fetch().map_err(odbc_err)? {
-        for row_index in 0..batch.num_rows() {
-            let mut row = Vec::with_capacity(ncols);
-            for col_index in 0..ncols {
-                let val = match batch.at_as_str(col_index, row_index) {
-                    Ok(v) => v.map(|s| s.to_string()),
-                    Err(_) => Some("<decode error: invalid utf8>".to_string()),
-                };
-                row.push(val);
+        let num_rows = batch.num_rows();
+        // Column-major fetch so each column's `Slice` is built once, not
+        // once per cell.
+        let mut columns: Vec<Vec<Option<String>>> = Vec::with_capacity(ncols);
+        for col_index in 0..ncols {
+            let slice = batch.column(col_index);
+            let mut col = Vec::with_capacity(num_rows);
+            for row_index in 0..num_rows {
+                col.push(wide::cell_text(slice, row_index));
             }
-            out.push(row);
+            columns.push(col);
+        }
+        for row_index in 0..num_rows {
+            out.push(columns.iter().map(|c| c[row_index].clone()).collect());
         }
     }
     Ok(out)
@@ -212,7 +217,12 @@ fn fetch_tables(
 
 /// PKs: `sys.key_constraints` (`type = 'PK'`) joined to `sys.index_columns`
 /// via the constraint's backing unique index, ordered by `key_ordinal` so a
-/// composite PK's column order is preserved.
+/// composite PK's column order is preserved. `is_included_column = 0`
+/// matches `attach_indexes`' predicate — a PK's backing index has no
+/// `INCLUDE`d columns in practice (SQL Server doesn't allow them on a
+/// unique index backing a PK constraint), but filtering defensively keeps
+/// the two queries' column-selection logic consistent rather than relying
+/// on that being true.
 fn attach_pks(
     conn: &Connection<'_>,
     tables: &mut [TableInfo],
@@ -225,7 +235,7 @@ fn attach_pks(
          JOIN sys.schemas s ON s.schema_id = t.schema_id
          JOIN sys.index_columns ic ON ic.object_id = kc.parent_object_id AND ic.index_id = kc.unique_index_id
          JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-         WHERE kc.type = 'PK' AND t.is_ms_shipped = 0 AND {SCHEMA_EXCLUDE}
+         WHERE kc.type = 'PK' AND ic.is_included_column = 0 AND t.is_ms_shipped = 0 AND {SCHEMA_EXCLUDE}
          ORDER BY kc.parent_object_id, ic.key_ordinal"
     );
     let rows = run_query_text(conn, &sql, META_BATCH, META_MAX_STR)?;

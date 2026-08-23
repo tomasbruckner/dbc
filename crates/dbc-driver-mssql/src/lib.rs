@@ -29,6 +29,13 @@
 //! String>>` ([`environment`]), giving every connection a `'static`
 //! borrow without unsafe.
 //!
+//! Result-set text (both `query()`'s rows and `schema()`'s catalog data) is
+//! bound and decoded as UTF-16 (`SQL_C_WCHAR`), not the narrower
+//! `SQL_C_CHAR`/`TextRowSet` convenience type odbc-api ships — see the
+//! `wide` module doc for why narrow binding is actively wrong for non-ASCII
+//! text (it transcodes through the process ANSI codepage) rather than just
+//! a missed optimization.
+//!
 //! # Integration notes (things this crate does NOT fix)
 //!
 //! 1. **Identifier quoting.** `dbc_core::ddl::quote_ident` emits
@@ -86,6 +93,22 @@
 //!    loads the named driver from the system driver registry/registry
 //!    keys). [`config::MssqlConfig::driver`] can target 17 instead of the
 //!    18 default if that's what's installed.
+//! 5. **No read-only connection mode.** [`config::MssqlConfig`] has no
+//!    equivalent of the sqlite driver's `new_with_options(path, read_only:
+//!    true)`, which enforces read-only *server-side*
+//!    (`SQLITE_OPEN_READ_ONLY` — a client-side guard bypass still can't
+//!    mutate the file). SQL Server's ODBC connection string does have a
+//!    comparable knob, `ApplicationIntent=ReadOnly`, but it only routes the
+//!    connection to a readable secondary in an Always On availability
+//!    group — on a standalone instance (the common case, and the only kind
+//!    these ignored integration tests target) it is accepted but does not
+//!    reject writes. So there is no server-enforced read-only mode this
+//!    driver can wire up universally; enforcement for MSSQL will have to be
+//!    app-level only (the existing `is_read_statement` guard in
+//!    `dbc_core::guards`), and that gap must be called out explicitly
+//!    wherever the sqlite driver's read-only connection guarantee is
+//!    currently assumed to generalize across drivers — in particular when
+//!    the dbc-ui read-only gate for this driver is lifted.
 //!
 //! # Cancellation
 //!
@@ -106,6 +129,7 @@
 mod config;
 mod schema;
 mod types;
+mod wide;
 
 use std::sync::{Arc, OnceLock};
 
@@ -116,7 +140,6 @@ use dbc_core::{
     CancelToken, Connection as DbcConnection, QueryError, QueryStream, SchemaSnapshot,
     BATCH_ROWS, CHANNEL_CAPACITY,
 };
-use odbc_api::buffers::TextRowSet;
 use odbc_api::{ConnectionOptions, Cursor, Environment, ResultSetMetadata};
 
 pub use config::{escape_odbc_value, MssqlConfig};
@@ -125,15 +148,12 @@ use types::{cancelled_err, map_row_count, odbc_err};
 
 /// Column buffer size cap for `query()`'s result-set streaming (distinct
 /// from the smaller/larger caps `schema.rs` uses for its own catalog
-/// queries): generous enough for ordinary text/numeric columns; a
-/// `varchar(max)`/`nvarchar(max)`/blob-ish column longer than this is
-/// truncated by the ODBC driver at fetch time — a known limitation, not
-/// currently surfaced as a distinct error (it reads like an ordinary
-/// shorter value). Mirrors the sqlite driver's blob placeholder in spirit
-/// (both drivers choose a bounded, lossy text representation over
-/// unbounded memory use per row) but does not synthesize an explicit
-/// placeholder marker the way sqlite's `<blob N B>` does, since odbc-api
-/// does not report the true untruncated length back to us here.
+/// queries), in UTF-16 code units: generous enough for ordinary
+/// text/numeric columns; a `varchar(max)`/`nvarchar(max)`/blob-ish column
+/// longer than this is reported via `wide::cell_text`'s explicit
+/// truncation marker rather than silently shortened — see `wide.rs`'s
+/// module doc for how that detection works and its known false-positive-
+/// safe imprecision.
 const QUERY_MAX_STR_LEN: usize = 65536;
 
 /// Process-wide ODBC environment. Only one may exist per process (ODBC
@@ -235,14 +255,10 @@ impl DbcConnection for MssqlConnection {
             ));
             let _ = schema_tx.send(Ok(schema.clone()));
 
-            let mut buffers = match TextRowSet::for_cursor(
-                BATCH_ROWS,
-                &mut cursor,
-                Some(QUERY_MAX_STR_LEN),
-            ) {
-                Ok(b) => b,
+            let mut buffers = match wide::build(&mut cursor, BATCH_ROWS, QUERY_MAX_STR_LEN) {
+                Ok((b, _ncols)) => b,
                 Err(e) => {
-                    let _ = tx.blocking_send(Err(odbc_err(e)));
+                    let _ = tx.blocking_send(Err(e));
                     return;
                 }
             };
@@ -265,12 +281,12 @@ impl DbcConnection for MssqlConnection {
                     Ok(Some(batch)) => {
                         let mut builders: Vec<StringBuilder> =
                             (0..ncols).map(|_| StringBuilder::new()).collect();
-                        for row_index in 0..batch.num_rows() {
-                            for (col_index, b) in builders.iter_mut().enumerate() {
-                                match batch.at_as_str(col_index, row_index) {
-                                    Ok(Some(s)) => b.append_value(s),
-                                    Ok(None) => b.append_null(),
-                                    Err(_) => b.append_value("<decode error: invalid utf8>"),
+                        for (col_index, b) in builders.iter_mut().enumerate() {
+                            let slice = batch.column(col_index);
+                            for row_index in 0..batch.num_rows() {
+                                match wide::cell_text(slice, row_index) {
+                                    Some(s) => b.append_value(s),
+                                    None => b.append_null(),
                                 }
                             }
                         }

@@ -12,10 +12,10 @@
 ///
 /// Renders a `Key=Value;...` string per the ODBC keyword/value syntax. Values
 /// are escaped with [`escape_odbc_value`] wherever they might contain
-/// characters significant to that syntax (`;`, `{`, leading/trailing
-/// whitespace), so a password or database name containing those characters
-/// round-trips correctly instead of truncating the string or corrupting a
-/// later key.
+/// characters significant to that syntax — see [`BRACE_TRIGGER_CHARS`] —
+/// or leading/trailing whitespace, so a password or database name
+/// containing those characters round-trips correctly instead of truncating
+/// the string or corrupting a later key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MssqlConfig {
     pub host: String,
@@ -113,19 +113,33 @@ fn push_kv(out: &mut String, key: &str, value: &str) {
     out.push(';');
 }
 
+/// Characters Microsoft's "Connection String Keywords and Data Source
+/// Names" docs list as significant to the ODBC keyword/value syntax (or to
+/// DSN-file parsing, which shares the same escaping rules) and that
+/// therefore force a value to be brace-wrapped: `[ ] { } ( ) , ; ? * = ! @`.
+/// This is deliberately wider than the minimum the driver manager's own
+/// parser strictly requires (`;` and a leading `{` are the only characters
+/// that actually change how the *keyword/value* grammar tokenizes) —
+/// this is the password path, so defensive over-escaping (wrapping a value
+/// that didn't strictly need it) is the safe direction to err in; it is
+/// never wrong to wrap a value in `{...}` that didn't need it, only to fail
+/// to wrap one that did.
+const BRACE_TRIGGER_CHARS: [char; 13] =
+    ['[', ']', '{', '}', '(', ')', ',', ';', '?', '*', '=', '!', '@'];
+
 /// Escapes a single ODBC connection-string value per the keyword/value
 /// syntax (see "Connection String Keywords and Data Source Names" in the
-/// Microsoft ODBC docs): a value containing a `;`, a `{`, leading/trailing
-/// whitespace, or that is empty must be wrapped in `{...}`; any `}` inside
-/// the braces is doubled (`}}`) since the driver manager treats a single
-/// `}` as the closing brace. Values needing no escaping are passed through
-/// unchanged so the common case stays readable.
+/// Microsoft ODBC docs): a value containing any of [`BRACE_TRIGGER_CHARS`],
+/// leading/trailing whitespace, or that is empty must be wrapped in
+/// `{...}`; any `}` inside the braces is doubled (`}}`) since the driver
+/// manager treats a single `}` as the closing brace. Values needing no
+/// escaping are passed through unchanged so the common case stays
+/// readable.
 pub fn escape_odbc_value(value: &str) -> String {
     let needs_braces = value.is_empty()
-        || value.contains(';')
-        || value.contains('{')
         || value.starts_with(' ')
-        || value.ends_with(' ');
+        || value.ends_with(' ')
+        || value.chars().any(|c| BRACE_TRIGGER_CHARS.contains(&c));
     if needs_braces {
         format!("{{{}}}", value.replace('}', "}}"))
     } else {
@@ -141,9 +155,15 @@ mod tests {
     fn renders_default_connection_string() {
         let cfg = MssqlConfig::new("dbhost", 1433, "mydb", "sa", "pw");
         let s = cfg.to_connection_string();
+        // `Server`'s value always contains a `,` (host,port) — which, per
+        // the widened `BRACE_TRIGGER_CHARS` set (finding: widen brace
+        // triggers to Microsoft's documented list, which includes `,`),
+        // now brace-wraps every rendered connection string's `Server` key.
+        // This is still valid, equivalent ODBC syntax; it's just no longer
+        // the bare `tcp:host,port` form.
         assert_eq!(
             s,
-            "Driver=ODBC Driver 18 for SQL Server;Server=tcp:dbhost,1433;Database=mydb;\
+            "Driver=ODBC Driver 18 for SQL Server;Server={tcp:dbhost,1433};Database=mydb;\
              Uid=sa;Pwd=pw;Encrypt=yes;TrustServerCertificate=no;"
         );
     }
@@ -190,8 +210,19 @@ mod tests {
 
     #[test]
     fn escape_doubles_closing_braces_inside_wrapped_value() {
-        assert_eq!(escape_odbc_value("a}b"), "a}b"); // no brace/semicolon/space trigger -> untouched
+        // `}` alone is now a trigger character (finding: widen the trigger
+        // set), so a lone `}` gets wrapped and doubled.
+        assert_eq!(escape_odbc_value("a}b"), "{a}}b}");
         assert_eq!(escape_odbc_value("a;b}c"), "{a;b}}c}");
+    }
+
+    #[test]
+    fn escape_wraps_values_containing_documented_trigger_characters() {
+        for c in ['[', ']', '(', ')', ',', '?', '*', '=', '!', '@'] {
+            let value = format!("a{c}b");
+            let escaped = escape_odbc_value(&value);
+            assert_eq!(escaped, format!("{{a{c}b}}"), "expected {c:?} to trigger brace-wrapping");
+        }
     }
 
     #[test]
