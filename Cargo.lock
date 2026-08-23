@@ -2362,6 +2362,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "tempfile",
+ "testcontainers-modules",
  "tokio",
  "tokio-postgres",
  "tree-sitter",

@@ -26,3 +26,6 @@ async-trait.workspace = true
 # paused/auto-advancing virtual clock (`#[tokio::test(start_paused = true)]`)
 # instead of actually sleeping for real wall-clock seconds.
 tokio = { version = "1", features = ["test-util"] }
+# G9 T7: docker-gated monitor integration tests — same crate+version
+# dbc-driver-postgres's own [dev-dependencies] already pins.
+testcontainers-modules = { version = "0.13", features = ["postgres"] }
