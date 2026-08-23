@@ -39,6 +39,10 @@ pub enum TabContent {
     /// not re-stacked on reopen; see AppView::open_monitor_tab).
     ///
     Monitor { view: Entity<crate::monitor_view::MonitorView> },
+    /// G13: an Explain/Analyze execution-plan tab (`AppView::dispatch_plan_query`/
+    /// `AppView::on_confirm_analyze_write`) — one per run, stacked like a
+    /// normal ad-hoc query tab (no preview-key dedup).
+    Plan { view: Entity<crate::plan::PlanView> },
 }
 
 pub struct ResultTab {

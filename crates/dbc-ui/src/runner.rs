@@ -273,6 +273,28 @@ impl QueryRunner {
         rx
     }
 
+    /// G13 CURATION item 2: the app's THIRD sanctioned write path (after
+    /// G5's Apply flow and G9's kill flow) — a dedicated one-shot
+    /// connection, BEGIN -> the EXPLAIN ANALYZE query -> ROLLBACK, ALWAYS
+    /// (never COMMIT — the whole point is to measure real execution
+    /// without keeping the effects). Belt-and-braces: refuses on
+    /// `spec_is_read_only(&spec)` itself, independent of whatever gate the
+    /// caller already applied (`plan::analyze_gate`).
+    pub fn run_analyze_write(
+        &self,
+        spec: ConnectSpec,
+        explain_analyze_sql: String,
+        timeout_secs: Option<u64>,
+    ) -> tokio::sync::oneshot::Receiver<Result<String, QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            let result = run_analyze_write_inner(spec, explain_analyze_sql, timeout_secs, handle).await;
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
     /// G9 T3: opens ONE dedicated connection held for the monitor tab's
     /// lifetime — no reconnect per tick (design §4). `read_only` and
     /// `engine` are captured once at open time; the background task refuses
@@ -504,6 +526,92 @@ async fn run_write_transaction_inner(
     // `opened` (connection + tunnel) drops here unconditionally, tearing the
     // connection down — the ultimate backstop regardless of how the write
     // sequence above resolved.
+}
+
+/// G13 T6: drains a single-row, single-column TEXT result (pg's `EXPLAIN
+/// (ANALYZE, BUFFERS, FORMAT JSON)` output shape, and MSSQL's
+/// `STATISTICS XML` result set once T7 wires it) via the same
+/// `dbc_buffer::ResultBuffer` drain `fetch_lookup_inner` already uses.
+async fn drain_single_text_cell(
+    conn: &mut dyn Connection,
+    sql: &str,
+    cancel: CancelToken,
+) -> Result<String, QueryError> {
+    let mut stream = conn.query(sql, cancel).await?;
+    let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+    while let Some(item) = stream.batches.recv().await {
+        buf.push(item?).map_err(|e| QueryError::msg(e.to_string()))?;
+    }
+    if buf.row_count() == 0 || buf.cell_is_null(0, 0) {
+        return Err(QueryError::msg("EXPLAIN ANALYZE nevrátil žádný řádek"));
+    }
+    Ok(buf.cell_text(0, 0))
+}
+
+/// G13 T6: BEGIN -> query -> ROLLBACK, ALWAYS (never COMMIT — see
+/// `QueryRunner::run_analyze_write`'s doc comment). Stops nothing early on
+/// the query step's own error; the ROLLBACK still runs either way, same
+/// "tolerate ROLLBACK itself failing" posture `drive_write_sequence`
+/// already documents.
+async fn drive_analyze_write(
+    conn: &mut dyn Connection,
+    explain_analyze_sql: &str,
+    cancel: CancelToken,
+) -> Result<String, QueryError> {
+    if let Err(e) = conn.execute("BEGIN", cancel.clone()).await {
+        let _ = conn.execute("ROLLBACK", cancel.clone()).await;
+        return Err(e);
+    }
+    let plan_result = drain_single_text_cell(conn, explain_analyze_sql, cancel.clone()).await;
+    let _ = conn.execute("ROLLBACK", cancel.clone()).await; // ALWAYS — see doc comment.
+    plan_result
+}
+
+/// G13 T6: same timeout/cancel/bounded-rollback-grace shape as
+/// `drive_write_sequence_bounded` — reuses the SAME `ROLLBACK_GRACE_SECS`
+/// constant so a hung ROLLBACK can never wedge this path any differently
+/// than it can already wedge the Apply flow.
+async fn drive_analyze_write_bounded(
+    conn: &mut dyn Connection,
+    explain_analyze_sql: &str,
+    cancel: CancelToken,
+    timeout_secs: Option<u64>,
+) -> Result<String, QueryError> {
+    match timeout_secs {
+        Some(t) => {
+            let sequence = drive_analyze_write(conn, explain_analyze_sql, cancel.clone());
+            match tokio::time::timeout(Duration::from_secs(t), sequence).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    cancel.cancel();
+                    let rollback = conn.execute("ROLLBACK", CancelToken::new());
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(ROLLBACK_GRACE_SECS), rollback)
+                            .await;
+                    Err(QueryError::msg(format!("[timeout] analýza překročila {t}s")))
+                }
+            }
+        }
+        None => drive_analyze_write(conn, explain_analyze_sql, cancel).await,
+    }
+}
+
+/// G13 T6: `QueryRunner::run_analyze_write`'s async body — belt-and-braces
+/// read-only guard (independent of `plan::analyze_gate`'s own UI-side
+/// refusal), open, drive (bounded). See `run_analyze_write`'s doc comment
+/// for the connection-lifetime rationale and `drive_analyze_write_bounded`
+/// for the timeout/cancel/rollback mechanics.
+async fn run_analyze_write_inner(
+    spec: ConnectSpec,
+    explain_analyze_sql: String,
+    timeout_secs: Option<u64>,
+    handle: tokio::runtime::Handle,
+) -> Result<String, QueryError> {
+    guard_not_read_only(spec_is_read_only(&spec))?; // belt-and-braces — see doc comment.
+    let mut opened = open_spec(spec, handle).await?;
+    let cancel = CancelToken::new();
+    drive_analyze_write_bounded(&mut *opened.conn, &explain_analyze_sql, cancel, timeout_secs).await
+    // `opened` drops here unconditionally — the ultimate backstop, same as run_write_transaction_inner.
 }
 
 /// Defensive cap on materialized lookup rows — see `QueryRunner::fetch_lookup`.
@@ -1035,6 +1143,215 @@ mod write_transaction_tests {
             "the SAME cancel token threaded through every execute() call must be cancelled on \
              timeout — this is what reaches the backend for real on Postgres (part (b) of the fix)"
         );
+    }
+}
+
+/// G13 T6: the analyze-write sequence's REQUIRED read-only-discipline tests
+/// (Global Constraints: `run_analyze_write`'s belt-and-braces refusal is
+/// unit tested directly against a read-only `ConnectSpec` with NO live
+/// connection ever attempted) plus the always-rolls-back tests, mirroring
+/// `write_transaction_tests`'s exact fixtures. `open_sqlite_test_conn`/
+/// `read_one` are duplicated here rather than imported (private items in a
+/// sibling test module aren't visible across module boundaries) — per that
+/// module's own doc-comment precedent for this exact situation.
+#[cfg(test)]
+mod analyze_write_tests {
+    use super::*;
+
+    /// See `write_transaction_tests::open_sqlite_test_conn`'s doc comment —
+    /// identical shape, duplicated for sibling-module visibility.
+    async fn open_sqlite_test_conn() -> (tempfile::NamedTempFile, Box<dyn Connection>) {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        let conn =
+            crate::connect::open(f.path().to_str().expect("utf8 temp path"), &handle).expect("open sqlite");
+        (f, conn)
+    }
+
+    /// Single-row, single-text-column `QueryStream` — simulates the one row
+    /// `drain_single_text_cell` expects (pg/MSSQL's real `EXPLAIN ANALYZE`
+    /// shape), for `TxnMockConnection::query` below.
+    fn single_text_row_stream(col_name: &str, value: &str) -> dbc_core::QueryStream {
+        use dbc_core::arrow::array::{ArrayRef, RecordBatch, StringBuilder};
+        use dbc_core::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+        let schema: SchemaRef = std::sync::Arc::new(Schema::new(vec![Field::new(col_name, DataType::Utf8, true)]));
+        let mut builder = StringBuilder::new();
+        builder.append_value(value);
+        let array: ArrayRef = std::sync::Arc::new(builder.finish());
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).expect("schema matches builder");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let _ = tx.try_send(Ok(batch));
+        dbc_core::QueryStream { columns: schema, batches: rx }
+    }
+
+    /// Minimal mock of a driver where `query()`/`execute()` share ONE
+    /// session (see `Connection::execute`'s doc comment — true of pg/MSSQL,
+    /// NOT of `dbc-driver-sqlite`, see the doc comment on the test below
+    /// that needs this) — tracks whether an in-transaction `INSERT` (routed
+    /// through `query()`, matching `drive_analyze_write`'s own shape) ever
+    /// became durable. `committed` only ever flips to `true` on an actual
+    /// `COMMIT` — `drive_analyze_write` must never issue one.
+    struct TxnMockConnection {
+        in_txn: bool,
+        pending_insert: bool,
+        committed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for TxnMockConnection {
+        async fn query(&mut self, sql: &str, _cancel: CancelToken) -> Result<dbc_core::QueryStream, QueryError> {
+            assert!(self.in_txn, "the write must run inside the BEGIN…ROLLBACK bracket");
+            assert!(sql.starts_with("INSERT"), "unexpected query in this mock: {sql}");
+            self.pending_insert = true;
+            Ok(single_text_row_stream("n", "ghost"))
+        }
+        async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn execute(&mut self, sql: &str, _cancel: CancelToken) -> Result<u64, QueryError> {
+            match sql {
+                "BEGIN" => {
+                    self.in_txn = true;
+                    Ok(0)
+                }
+                "ROLLBACK" => {
+                    self.in_txn = false;
+                    self.pending_insert = false; // discarded — never committed
+                    Ok(0)
+                }
+                "COMMIT" => {
+                    if self.pending_insert {
+                        self.committed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    self.in_txn = false;
+                    Ok(0)
+                }
+                other => Err(QueryError::msg(format!("unexpected statement: {other}"))),
+            }
+        }
+    }
+
+    /// See `write_transaction_tests::read_one`'s doc comment — identical
+    /// shape, duplicated for sibling-module visibility.
+    async fn read_one(conn: &mut dyn Connection, sql: &str) -> Option<String> {
+        let mut stream = conn.query(sql, CancelToken::new()).await.expect("query");
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.expect("batch")).expect("push");
+        }
+        if buf.row_count() == 0 {
+            None
+        } else if buf.cell_is_null(0, 0) {
+            Some("<NULL>".to_string())
+        } else {
+            Some(buf.cell_text(0, 0))
+        }
+    }
+
+    /// REQUIRED (Global Constraints): refuses BEFORE `open_spec` is ever
+    /// called — no connection attempted, no driver reached.
+    #[tokio::test]
+    async fn run_analyze_write_refuses_read_only_connection_without_connecting() {
+        let cfg = dbc_state::ConnectionConfig {
+            id: "x".into(),
+            name: "x".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Sqlite,
+            database: "\0invalid".into(), // never actually opened — guard fires first
+            host: String::new(),
+            port: None,
+            user: String::new(),
+            read_only: true,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+        };
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let handle = tokio::runtime::Handle::current();
+        let err = run_analyze_write_inner(
+            spec,
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT 1".to_string(),
+            None,
+            handle,
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drive_analyze_write_always_rolls_back_on_success() {
+        let (_f, mut conn) = open_sqlite_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')", CancelToken::new()).await.unwrap();
+
+        let out = drive_analyze_write(&mut *conn, "SELECT 'plan-text'", CancelToken::new()).await.unwrap();
+        assert_eq!(out, "plan-text");
+        // Sanity: this connection is still usable afterward (ROLLBACK, not
+        // a leaked open transaction) — a fresh statement succeeds.
+        conn.execute("INSERT INTO t VALUES (2, 'b')", CancelToken::new()).await.unwrap();
+        assert_eq!(read_one(&mut *conn, "SELECT n FROM t WHERE id = 2").await, Some("b".to_string()));
+    }
+
+    /// Deviation from the plan's own grounding code (documented per this
+    /// task's instructions — "reality/tests win"): the plan drove a plain
+    /// `INSERT` (no `RETURNING`) through `drive_analyze_write` over
+    /// `crate::connect::open`'s real sqlite driver, then re-read via a
+    /// SECOND `query()` call on the SAME `Box<dyn Connection>`, expecting
+    /// the earlier `BEGIN`/`ROLLBACK` (issued via `execute()`) to have
+    /// undone it. Two problems, both found by actually running this:
+    /// (1) a bare `INSERT` run through `Connection::query` returns zero
+    /// rows on sqlite, so `drive_analyze_write` (which always goes through
+    /// `drain_single_text_cell`, requiring >=1 row — true of pg/MSSQL's
+    /// real `EXPLAIN ANALYZE`) fails at the "nevrátil žádný řádek" guard
+    /// before reaching the rollback assertion at all. (2)
+    /// `dbc-driver-sqlite`'s `SqliteConnection::query` opens a **brand-new**
+    /// `rusqlite::Connection` on every call (see its doc comment) —
+    /// entirely separate from `execute()`'s persistent `exec_conn` — so a
+    /// `BEGIN` issued via `execute()` is invisible to any `query()` call
+    /// (each of which runs in its own autocommit session): the `INSERT`
+    /// commits immediately, outside any transaction, and the subsequent
+    /// `ROLLBACK` on `exec_conn` has nothing of this test's to undo. This is
+    /// a structural property of the sqlite driver specifically —
+    /// `Connection::execute`'s own doc comment only promises session
+    /// sharing between `query()`/`execute()` for PostgreSQL — so no sqlite
+    /// fixture can validate "the write really gets rolled back" for the
+    /// `BEGIN -> query() -> ROLLBACK` sequence `drive_analyze_write` uses.
+    ///
+    /// Fix: test `drive_analyze_write`'s OWN contract directly (COMMIT is
+    /// NEVER issued, ROLLBACK always is) against a minimal mock `Connection`
+    /// that models a single shared session — same "hand-rolled mock
+    /// `Connection`" precedent as `HangingConnection` above, just modeling
+    /// transactional visibility instead of a hang.
+    #[tokio::test]
+    async fn drive_analyze_write_rolls_back_writes_even_though_it_never_commits() {
+        let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut conn = TxnMockConnection { in_txn: false, pending_insert: false, committed: committed.clone() };
+        let out = drive_analyze_write(
+            &mut conn,
+            "INSERT INTO t VALUES (99, 'ghost') RETURNING n",
+            CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "ghost");
+        assert!(
+            !committed.load(std::sync::atomic::Ordering::SeqCst),
+            "drive_analyze_write must never COMMIT — the write must never durably land"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_analyze_write_still_rolls_back_when_the_query_step_errors() {
+        let (_f, mut conn) = open_sqlite_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", CancelToken::new()).await.unwrap();
+        let err = drive_analyze_write(&mut *conn, "SELECT * FROM no_such_table", CancelToken::new())
+            .await
+            .unwrap_err();
+        assert!(!err.message.is_empty());
+        // Connection must still be usable — ROLLBACK ran despite the error.
+        conn.execute("INSERT INTO t VALUES (1)", CancelToken::new()).await.unwrap();
     }
 }
 
