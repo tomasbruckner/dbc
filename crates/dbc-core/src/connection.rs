@@ -40,7 +40,19 @@ pub trait Connection: Send {
     /// `run_csv_import` (G12, batched CSV `INSERT`s plus transaction
     /// control); and `connect_and_run_many` (G12 editor multi-statement —
     /// its per-statement read-only rejection is guard (c), via the shared
-    /// guard). No other code may call this method.
+    /// guard). G11's backup/restore methods are also sanctioned:
+    /// `run_mssql_backup` (`BACKUP DATABASE`, allowed on read-only — the
+    /// ONE documented exception to guard (c), since it only reads the
+    /// source database); `run_mssql_restore` (`SET SINGLE_USER` → `RESTORE
+    /// DATABASE` → `SET MULTI_USER` over one dedicated connection,
+    /// hard-blocked on read-only, no override — its three statements are
+    /// plain sequential `execute()` calls on the SAME connection, NOT
+    /// wrapped in an explicit transaction, because T-SQL does not allow
+    /// `RESTORE DATABASE` inside one); and `run_sqlite_backup` (`VACUUM
+    /// INTO`, allowed on read-only). `run_sqlite_restore` is NOT in this
+    /// list — it never calls `execute()` at all, restoring via a plain
+    /// magic-header-checked `fs::copy` instead. No other code may call
+    /// this method.
     ///
     /// Transactions are per-connection: a caller driving `BEGIN` … `COMMIT`/
     /// `ROLLBACK` MUST issue every statement in that sequence over the SAME

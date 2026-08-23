@@ -108,6 +108,30 @@ impl AppView {
         }
     }
 
+    /// G11 T7: same shape as `record_history`, but records a `kind` other
+    /// than the implicit `"query"` — the ONLY way a G11 backup/restore run
+    /// shows up in the History panel with its 🗄 badge (see `render_history_panel`'s
+    /// row-building closure below). Called from `main.rs`'s
+    /// `finish_backup_restore`/`record_backup_restore_history` in place of
+    /// `record_history`.
+    pub(crate) fn record_history_with_kind(
+        &mut self,
+        sql: &str,
+        connection: &str,
+        started_at: i64,
+        duration_ms: Option<i64>,
+        row_count: Option<i64>,
+        error: Option<&str>,
+        kind: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(h) = self.history.as_mut() {
+            if h.add_with_kind(sql, connection, started_at, duration_ms, row_count, error, kind).is_ok() {
+                self.refresh_history_cache(cx);
+            }
+        }
+    }
+
     /// Recomputes `history_cache` from the search box's current text — the
     /// module doc comment above explains why this is a separate step rather
     /// than querying inline in `render_history_panel` on every call. `None`
@@ -162,7 +186,14 @@ impl AppView {
                     let entry = &this.history_cache[ix];
                     let id = entry.id;
                     let sql_for_click = entry.sql.clone();
-                    let line1 = collapse_sql(&entry.sql, SQL_COLLAPSE_MAX_CHARS);
+                    // G11 T7: a small badge prefix for non-"query" runs —
+                    // the only rendering change the `kind` column drives;
+                    // `format_meta_line`/`collapse_sql` themselves stay
+                    // unchanged (the badge is decided once, here, at
+                    // render time from `entry.kind`, not a new "meta line"
+                    // variant).
+                    let raw_line1 = collapse_sql(&entry.sql, SQL_COLLAPSE_MAX_CHARS);
+                    let line1 = if entry.kind == "query" { raw_line1 } else { format!("🗄 {raw_line1}") };
                     let (line2, is_error) = format_meta_line(entry);
                     let line2_color = if is_error { rgb(0xf38ba8) } else { rgb(0xa6adc8) };
                     let starred = entry.starred;
@@ -272,6 +303,7 @@ mod format_tests {
             row_count,
             error: error.map(|s| s.to_string()),
             starred: false,
+            kind: "query".into(),
         }
     }
 

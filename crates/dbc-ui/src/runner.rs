@@ -5,6 +5,7 @@ use dbc_core::arrow::datatypes::SchemaRef;
 use dbc_core::{CancelToken, Connection, QueryError, SchemaSnapshot, CHANNEL_CAPACITY};
 use dbc_state::ConnectionConfig;
 
+use crate::backup;
 use crate::connect;
 use crate::monitor;
 
@@ -620,6 +621,164 @@ impl QueryRunner {
         });
         rx
     }
+
+    /// G11 T4: one generic external-tool runner, used for `pg_dump`,
+    /// `pg_restore`, AND `psql` alike — their spawn/stream/redact mechanics
+    /// are identical (design §2/§3 both reduce to "spawn a program with
+    /// PGPASSWORD in its env, stream stderr as log lines"), so one method
+    /// serves all three rather than three near-duplicates. The caller
+    /// (T6) builds `program`/`args` via `backup::resolve_tool_path` +
+    /// `backup::build_pg_dump_args`/`build_pg_restore_args`/`build_psql_args`.
+    ///
+    /// DEVIATION from this plan's original sketch (grounded in T3's actual,
+    /// already-committed `backup::run_and_stream`, which itself deviates
+    /// from ITS OWN plan sample — see that function's doc comment): T3's
+    /// `run_and_stream` spawns the child SYNCHRONOUSLY (a fast syscall, not
+    /// a long block — the actual line-streaming + `wait()` work runs on a
+    /// dedicated, internally-owned `std::thread`) and returns its
+    /// `BackupHandle` immediately, before the first log line even arrives.
+    /// That means this method needs neither the plan's `spawn_blocking`
+    /// wrapper around the spawn step nor its `oneshot`-based handle
+    /// handshake — `run_and_stream` is called directly (synchronous,
+    /// millisecond-scale, matching the same "small enough to call inline
+    /// from the UI-thread-callable method" posture this plan's own T6
+    /// section already accepts for `resolve_tool_path`), and the
+    /// `BackupHandle` it returns is handed straight back to the caller. Only
+    /// the STREAMING side (`std_rx.recv()`, which genuinely blocks for the
+    /// process's whole lifetime) needs to move onto a `spawn_blocking`
+    /// thread — done once, looping internally and forwarding into the
+    /// returned `tokio::sync::mpsc::Sender` via `blocking_send` (the
+    /// sender-side counterpart to a blocking receiver, safe to call outside
+    /// async context — same non-async-code accommodation `tokio::sync::mpsc`
+    /// documents `blocking_send` for). This also means `BackupHandle`'s
+    /// panic-recovery degenerate case (`from_already_gone` in the original
+    /// plan sketch) is unneeded here: there is no `spawn_blocking` task that
+    /// could panic before handing back a handle, so it is not added.
+    pub fn run_external_tool(
+        &self,
+        program: String,
+        args: Vec<String>,
+        password: Option<String>,
+    ) -> (tokio::sync::mpsc::Receiver<backup::BackupEvent>, backup::BackupHandle) {
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (std_tx, std_rx) = std::sync::mpsc::channel::<backup::BackupEvent>();
+
+        let handle = backup::run_and_stream(&program, &args, password.as_deref(), &std_tx);
+
+        // Forwarding loop: blocking std channel -> tokio channel, off any
+        // runtime worker thread (a blocking `std_rx.recv()` must never run
+        // there) — one `spawn_blocking` task, looping internally, rather
+        // than one per message.
+        self.handle().spawn_blocking(move || {
+            while let Ok(ev) = std_rx.recv() {
+                let terminal =
+                    matches!(ev, backup::BackupEvent::Finished | backup::BackupEvent::Failed(_));
+                if tx.blocking_send(ev).is_err() || terminal {
+                    break;
+                }
+            }
+        });
+
+        (rx, handle)
+    }
+
+    /// G11 T4: MSSQL `BACKUP DATABASE` — allowed on read-only (design
+    /// CURATION item 2, `backup::BackupOp::Backup` is exempt). Runs over ONE
+    /// fresh connection (`open_spec`, dropped at the end), same one-shot
+    /// shape `fetch_schema`/`test_connect` already use. Against a saved
+    /// MSSQL connection this fails fast at `open_spec` with the exact,
+    /// already-existing "MSSQL driver zatím není k dispozici" error every
+    /// other MSSQL feature in this app produces today (`connect::open_config`'s
+    /// permanent `Engine::Mssql` arm) — no MSSQL-specific handling is added
+    /// around that error here.
+    pub fn run_mssql_backup(
+        &self,
+        spec: ConnectSpec,
+        database: String,
+        server_path: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            let result = run_mssql_backup_inner(spec, database, server_path, handle).await;
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
+    /// G11 T4: MSSQL restore — `SET SINGLE_USER` -> `RESTORE DATABASE` ->
+    /// `SET MULTI_USER`, all three over the SAME dedicated connection
+    /// (`Connection::execute`'s transaction-per-connection invariant), the
+    /// closing `MULTI_USER` attempted even if `RESTORE` failed (best-effort,
+    /// mirrors `drive_write_sequence`'s own "the ROLLBACK attempt's result
+    /// is discarded" posture). Hard-blocked on read-only, no override
+    /// (`backup::guard_backup_restore_read_only(BackupOp::Restore, ..)` is
+    /// never exempt).
+    pub fn run_mssql_restore(
+        &self,
+        spec: ConnectSpec,
+        database: String,
+        server_path: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            let result = run_mssql_restore_inner(spec, database, server_path, handle).await;
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
+    /// G11 T4: SQLite `VACUUM INTO` via `Connection::execute` — allowed on
+    /// read-only (design CURATION item 2).
+    pub fn run_sqlite_backup(
+        &self,
+        spec: ConnectSpec,
+        dest_path: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            let result = run_sqlite_backup_inner(spec, dest_path, handle).await;
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
+    /// G11 T4: SQLite restore — magic-header check (`backup::sqlite_magic_header_ok`,
+    /// design CURATION item 4) then `fs::copy` — no `Connection`/`ConnectSpec`
+    /// involved at all (a plain file operation, no secret, no network
+    /// round-trip).
+    ///
+    /// SECURITY (G11 T4 review MAJOR 2): unlike the other three backup/
+    /// restore methods, this one has no `ConnectSpec` to read
+    /// `spec_is_read_only` from — the caller (T6) already has `cfg.read_only`
+    /// in hand before ever reaching this method, so it is threaded through
+    /// explicitly as `read_only`. This method self-guards on it as its
+    /// FIRST action (`backup::guard_backup_restore_read_only(BackupOp::Restore,
+    /// read_only)`, same call every other restore/backup method here makes)
+    /// — a write path whose only protection was a not-yet-written UI-layer
+    /// caller would be unsafe by construction. T6's own pre-dispatch check
+    /// is kept too (belt-and-braces, matching this codebase's established
+    /// "each layer holds on its own" posture), but is no longer this
+    /// method's SOLE protection.
+    pub fn run_sqlite_restore(
+        &self,
+        db_path: String,
+        backup_path: String,
+        read_only: bool,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                run_sqlite_restore_inner(&db_path, &backup_path, read_only)
+            })
+            .await
+            .unwrap_or_else(|_| Err(QueryError::msg("restore task panicked")));
+            let _ = tx.send(result);
+        });
+        rx
+    }
 }
 
 /// G7 T5: pure SQL composer + guard, extracted as a standalone function
@@ -1020,6 +1179,188 @@ async fn run_analyze_write_inner(
     let cancel = CancelToken::new();
     drive_analyze_write_bounded(&mut *opened.conn, &explain_analyze_sql, cancel, timeout_secs).await
     // `opened` drops here unconditionally — the ultimate backstop, same as run_write_transaction_inner.
+}
+
+/// G11 T4 review MAJOR 1: joins a possibly-relative `path` onto the current
+/// working directory so `resolve_tool_path`'s configured-path branch always
+/// hands back an absolute path — see that function's SECURITY doc comment.
+/// Deliberately does NOT call `std::fs::canonicalize` (which would resolve
+/// symlinks and, on Windows, prefix the result with `\\?\`, an
+/// extended-length-path form some external tools handle poorly) — a plain
+/// `current_dir().join(path)` is enough to defeat the CWD-relative-lookup
+/// class of planting this guards against, without changing the path's
+/// surface form for an already-absolute input.
+fn absolutize(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        path.to_string()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(p).to_string_lossy().to_string(),
+            Err(_) => path.to_string(),
+        }
+    }
+}
+
+/// G11 T4: resolves an external tool's path per design §1's three-step
+/// order: (1) `configured` if `Some` — validated as an existing FILE HERE,
+/// at use time, not at save time (a stale saved path surfaces as an error,
+/// never silently falls through); (2) PATH via `backup::find_on_path`; (3)
+/// glob `C:\Program Files\PostgreSQL\*\bin\<name>.exe`, highest version wins
+/// (`backup::pick_highest_version_dir` — pure, given the `(path, mtime)`
+/// pairs this function reads from disk via `std::fs::read_dir`, the one
+/// place in this module that touches that directory). Errors are
+/// Czech-language, user-facing strings (never a panic on a missing/
+/// malformed directory).
+///
+/// SECURITY (CWE-427, binary planting — G11 T4 review MAJOR 1): the string
+/// returned here is handed straight to `Command::new` by every caller
+/// (`run_external_tool`), so it MUST be an absolute path in every branch,
+/// never a bare name — a bare name would let Windows' `CreateProcess`
+/// search the application directory and the current working directory
+/// BEFORE PATH, so a planted `pg_dump.exe` sitting in a writable CWD would
+/// run instead of the real tool and receive the real `PGPASSWORD` set on
+/// its (attacker-controlled) child environment. All three steps are
+/// absolute: step 1 is `absolutize`d (defense in depth — a user-typed
+/// configured path is expected to already be absolute, e.g. from a file
+/// picker, but is not assumed to be); step 2 relies on `backup::find_on_path`
+/// itself now returning the fully-resolved path rather than the bare
+/// probed name; step 3's glob join is already absolute (`base` is a fixed
+/// absolute root).
+pub fn resolve_tool_path(configured: Option<&str>, name: &str) -> Result<String, QueryError> {
+    if let Some(path) = configured {
+        return if std::path::Path::new(path).is_file() {
+            Ok(absolutize(path))
+        } else {
+            Err(QueryError::msg(format!(
+                "nakonfigurovaná cesta k {name} neexistuje: {path} — nastavte ji znovu"
+            )))
+        };
+    }
+    if let Some(resolved) = backup::find_on_path(name) {
+        return Ok(resolved);
+    }
+    let exe = format!("{name}.exe");
+    let base = std::path::Path::new(r"C:\Program Files\PostgreSQL");
+    let mut candidates: Vec<(String, std::time::SystemTime)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(base) {
+        for entry in entries.flatten() {
+            let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            if let Some(p) = entry.path().to_str() {
+                candidates.push((p.to_string(), mtime));
+            }
+        }
+    }
+    match backup::pick_highest_version_dir(&candidates) {
+        Some(dir) => {
+            let full = std::path::Path::new(&dir).join("bin").join(&exe);
+            if full.is_file() {
+                Ok(full.to_string_lossy().to_string())
+            } else {
+                Err(QueryError::msg(format!("{name} nenalezen — nastavte cestu ručně")))
+            }
+        }
+        None => Err(QueryError::msg(format!("{name} nenalezen — nastavte cestu ručně"))),
+    }
+}
+
+/// G11 T4: `QueryRunner::run_mssql_backup`'s async body — belt-and-braces
+/// read-only guard (Backup is exempt, design CURATION item 2), open ONE
+/// dedicated connection (`open_spec`, dropped at the end), issue
+/// `backup::build_backup_sql` via `Connection::execute` (sanctioned per this
+/// commit's `connection.rs` doc-comment amendment).
+async fn run_mssql_backup_inner(
+    spec: ConnectSpec,
+    database: String,
+    server_path: String,
+    handle: tokio::runtime::Handle,
+) -> Result<(), QueryError> {
+    backup::guard_backup_restore_read_only(backup::BackupOp::Backup, spec_is_read_only(&spec))
+        .map_err(QueryError::msg)?;
+    let mut opened = open_spec(spec, handle).await?;
+    let sql = backup::build_backup_sql(&database, &server_path);
+    opened.conn.execute(&sql, CancelToken::new()).await?;
+    Ok(())
+}
+
+/// G11 T4: `QueryRunner::run_mssql_restore`'s async body — hard-blocked on
+/// read-only, no override (`BackupOp::Restore` is never exempt). Opens ONE
+/// dedicated connection and issues `SET SINGLE_USER` -> `RESTORE DATABASE`
+/// -> `SET MULTI_USER` over that SAME connection, in order
+/// (`Connection::execute`'s transaction-per-connection invariant). The
+/// closing `SET MULTI_USER` is attempted even if `RESTORE` failed
+/// (best-effort, mirrors `drive_write_sequence`'s own "the ROLLBACK
+/// attempt's result is discarded" posture) — the FIRST failure among the
+/// three statements (i.e. `RESTORE`'s, since `SINGLE_USER` failing returns
+/// immediately via `?` before `RESTORE` is even attempted) is what's
+/// returned to the caller; a subsequent `MULTI_USER` failure never
+/// overrides it.
+async fn run_mssql_restore_inner(
+    spec: ConnectSpec,
+    database: String,
+    server_path: String,
+    handle: tokio::runtime::Handle,
+) -> Result<(), QueryError> {
+    backup::guard_backup_restore_read_only(backup::BackupOp::Restore, spec_is_read_only(&spec))
+        .map_err(QueryError::msg)?;
+    let mut opened = open_spec(spec, handle).await?;
+    let cancel = CancelToken::new();
+
+    opened
+        .conn
+        .execute(&backup::build_single_user_sql(&database, false), cancel.clone())
+        .await?;
+    let restore_result = opened
+        .conn
+        .execute(&backup::build_restore_sql(&database, &server_path), cancel.clone())
+        .await;
+    // Best-effort MULTI_USER regardless of RESTORE's outcome — its own
+    // result never overrides `restore_result` (see doc comment above).
+    let _ = opened
+        .conn
+        .execute(&backup::build_single_user_sql(&database, true), cancel)
+        .await;
+    restore_result.map(|_| ())
+}
+
+/// G11 T4: `QueryRunner::run_sqlite_backup`'s async body — belt-and-braces
+/// read-only guard (Backup is exempt), open ONE dedicated connection, issue
+/// `backup::build_vacuum_into_sql` via `Connection::execute` (sanctioned).
+async fn run_sqlite_backup_inner(
+    spec: ConnectSpec,
+    dest_path: String,
+    handle: tokio::runtime::Handle,
+) -> Result<(), QueryError> {
+    backup::guard_backup_restore_read_only(backup::BackupOp::Backup, spec_is_read_only(&spec))
+        .map_err(QueryError::msg)?;
+    let mut opened = open_spec(spec, handle).await?;
+    opened.conn.execute(&backup::build_vacuum_into_sql(&dest_path), CancelToken::new()).await?;
+    Ok(())
+}
+
+/// G11 T4: `QueryRunner::run_sqlite_restore`'s sync body (run inside
+/// `spawn_blocking` by its caller — plain file I/O, no `Connection`
+/// involved). SECURITY (T4 review MAJOR 2): self-guards on `read_only` as
+/// its FIRST action, before even opening `backup_path` — no I/O is
+/// attempted on a read-only refusal, matching every other backup/restore
+/// method's own "guard before I/O" shape. T6's own pre-dispatch check stays
+/// too (belt-and-braces), but this is no longer the sole protection. Design
+/// CURATION item 4, hard requirement (checked second): reads the first 16
+/// bytes of `backup_path` and refuses (no copy attempted) unless they are
+/// exactly `backup::SQLITE_MAGIC_HEADER`.
+fn run_sqlite_restore_inner(db_path: &str, backup_path: &str, read_only: bool) -> Result<(), QueryError> {
+    backup::guard_backup_restore_read_only(backup::BackupOp::Restore, read_only)
+        .map_err(QueryError::msg)?;
+    let mut header = [0u8; 16];
+    let mut f = std::fs::File::open(backup_path).map_err(|e| QueryError::msg(e.to_string()))?;
+    use std::io::Read;
+    let n = f.read(&mut header).map_err(|e| QueryError::msg(e.to_string()))?;
+    if !backup::sqlite_magic_header_ok(&header[..n]) {
+        return Err(QueryError::msg("soubor není SQLite databáze"));
+    }
+    drop(f);
+    std::fs::copy(backup_path, db_path).map_err(|e| QueryError::msg(e.to_string()))?;
+    Ok(())
 }
 
 /// G12 T2: read-chunk size for streaming `.sql` files into the splitter
@@ -4112,6 +4453,622 @@ mod compare_pg_tests {
             let (_, _, mut buf) = rx2.await.unwrap().expect("clean fetch must succeed");
             assert_eq!(buf.row_count(), 1, "row must be untouched — the injected DELETE never executed");
             assert_eq!(buf.cell_text(0, 0), "1", "the surviving row must still be id=1");
+        });
+    }
+}
+
+#[cfg(test)]
+mod backup_runner_tests {
+    use super::*;
+
+    fn cfg(engine: dbc_state::Engine, read_only: bool) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "x".into(),
+            name: "x".into(),
+            folder: Vec::new(),
+            engine,
+            host: String::new(),
+            port: None,
+            database: String::new(),
+            user: String::new(),
+            read_only,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+        }
+    }
+
+    #[test]
+    fn resolve_tool_path_configured_but_missing_is_a_value_error() {
+        let err = resolve_tool_path(Some(r"D:\definitely\not\real\pg_dump.exe"), "pg_dump").unwrap_err();
+        assert!(err.message.contains("pg_dump"));
+    }
+
+    // SECURITY (CWE-427, binary planting — G11 T4 review MAJOR 1): the
+    // PATH-found branch must return an absolute path, never a bare name —
+    // a bare name handed to `Command::new` lets Windows' `CreateProcess`
+    // search the app dir + CWD (both potentially attacker-writable) before
+    // PATH, and the child receives `PGPASSWORD` on its environment.
+    #[test]
+    fn resolve_tool_path_on_path_returns_an_absolute_path_not_a_bare_name() {
+        // "cmd" is guaranteed on PATH on Windows (same assumption
+        // `backup::process_tests::find_on_path_finds_a_universally_present_binary`
+        // already makes).
+        let resolved = resolve_tool_path(None, "cmd").expect("cmd must resolve via PATH");
+        assert!(
+            std::path::Path::new(&resolved).is_absolute(),
+            "expected an absolute path, got: {resolved}"
+        );
+        assert_ne!(resolved, "cmd", "must not be the bare probed name");
+    }
+
+    // SECURITY (CWE-427, defense in depth): `resolve_tool_path`'s
+    // configured-path branch absolutizes a relative-but-existing path too,
+    // not just the PATH-found branch — tested directly against the
+    // `absolutize` helper (rather than round-tripping through a real
+    // relative file path, which would be fragile here: the repo's CWD and
+    // `tempfile::tempdir()`'s default location are commonly on different
+    // drive letters on Windows, and there's no portable relative path
+    // between two different drives).
+    #[test]
+    fn absolutize_joins_a_relative_path_onto_the_current_directory() {
+        let resolved = absolutize("sub\\dir\\fake_tool.exe");
+        assert!(
+            std::path::Path::new(&resolved).is_absolute(),
+            "expected an absolute path, got: {resolved}"
+        );
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(resolved, cwd.join("sub\\dir\\fake_tool.exe").to_string_lossy());
+    }
+
+    #[test]
+    fn absolutize_passes_an_already_absolute_path_through_unchanged() {
+        assert_eq!(absolutize(r"D:\already\absolute\pg_dump.exe"), r"D:\already\absolute\pg_dump.exe");
+    }
+
+    #[test]
+    fn resolve_tool_path_configured_relative_path_is_absolutized() {
+        // Construct a relative path (relative to the real CWD) that points
+        // at a real file, without changing the process's own CWD (which
+        // would affect every other test running concurrently in this
+        // binary) — write the fixture INTO a subdirectory of the actual
+        // CWD instead.
+        let cwd = std::env::current_dir().unwrap();
+        let rel_dir = format!("g11_t4_review_tmp_{}", std::process::id());
+        let dir = cwd.join(&rel_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("fake_tool.exe");
+        std::fs::write(&file, b"not a real binary, just needs to exist").unwrap();
+
+        let relative = format!("{rel_dir}\\fake_tool.exe");
+        let result = resolve_tool_path(Some(&relative), "fake_tool");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let resolved = result.unwrap();
+        assert!(
+            std::path::Path::new(&resolved).is_absolute(),
+            "expected an absolute path, got: {resolved}"
+        );
+    }
+
+    #[test]
+    fn resolve_tool_path_no_config_and_not_on_path_and_no_glob_hit_is_friendly_error() {
+        // "definitely-not-a-real-tool-xyz" is neither configured, on PATH,
+        // nor under C:\Program Files\PostgreSQL — exercises the full
+        // fallthrough.
+        let err = resolve_tool_path(None, "definitely-not-a-real-tool-xyz").unwrap_err();
+        assert!(err.message.contains("nenalezen"));
+    }
+
+    // --- MSSQL: fails fast at open_spec, exactly like every other MSSQL
+    // feature in this app today (Spec section grounding) — REQUIRED. ---
+    #[tokio::test]
+    async fn run_mssql_backup_against_mssql_engine_fails_with_the_standard_unwired_message() {
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg(dbc_state::Engine::Mssql, false)), secret: None };
+        let handle = tokio::runtime::Handle::current();
+        let err = run_mssql_backup_inner(spec, "db".into(), r"D:\x.bak".into(), handle).await.unwrap_err();
+        assert!(err.message.contains("MSSQL driver zatím není k dispozici"));
+    }
+
+    #[tokio::test]
+    async fn run_mssql_restore_against_mssql_engine_fails_with_the_standard_unwired_message() {
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg(dbc_state::Engine::Mssql, false)), secret: None };
+        let handle = tokio::runtime::Handle::current();
+        let err = run_mssql_restore_inner(spec, "db".into(), r"D:\x.bak".into(), handle).await.unwrap_err();
+        assert!(err.message.contains("MSSQL driver zatím není k dispozici"));
+    }
+
+    // --- read-only gates, REQUIRED, no I/O attempted in the refusing path ---
+    #[tokio::test]
+    async fn mssql_restore_refuses_read_only_without_connecting() {
+        let spec = ConnectSpec::Config {
+            cfg: Box::new(cfg(dbc_state::Engine::Sqlite, true)), // engine irrelevant — guard fires first
+            secret: None,
+        };
+        let handle = tokio::runtime::Handle::current();
+        let err = run_mssql_restore_inner(spec, "db".into(), r"D:\x.bak".into(), handle).await.unwrap_err();
+        assert_eq!(err.message, "připojení je jen pro čtení");
+    }
+
+    #[tokio::test]
+    async fn mssql_backup_allowed_even_when_read_only_reaches_open_spec_not_the_guard() {
+        // read_only=true + Backup must NOT be refused by the guard — the
+        // MSSQL-unwired error proves the guard passed and open_spec was
+        // actually reached.
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg(dbc_state::Engine::Mssql, true)), secret: None };
+        let handle = tokio::runtime::Handle::current();
+        let err = run_mssql_backup_inner(spec, "db".into(), r"D:\x.bak".into(), handle).await.unwrap_err();
+        assert!(err.message.contains("MSSQL driver zatím není k dispozici"), "got: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn sqlite_backup_allowed_on_read_only() {
+        let spec = ConnectSpec::Config {
+            cfg: Box::new({
+                let mut c = cfg(dbc_state::Engine::Sqlite, true);
+                c.database = "\0invalid".into();
+                c
+            }),
+            secret: None,
+        };
+        let handle = tokio::runtime::Handle::current();
+        let err = run_sqlite_backup_inner(spec, r"D:\x.sqlite".into(), handle).await;
+        // Backup is exempt from read-only, so this must NOT be the
+        // read-only message — it must instead fail later (bad path),
+        // proving the guard passed through and open_spec was actually
+        // attempted.
+        assert_ne!(err.unwrap_err().message, "připojení je jen pro čtení");
+    }
+
+    #[tokio::test]
+    async fn mssql_backup_refuses_read_only_when_actually_read_only_is_false_check_control() {
+        // Control for the two "allowed even when read_only" tests above:
+        // Restore on a NON-read-only connection must not be refused by the
+        // guard either — it should reach the same MSSQL-unwired error.
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg(dbc_state::Engine::Mssql, false)), secret: None };
+        let handle = tokio::runtime::Handle::current();
+        let err = run_mssql_restore_inner(spec, "db".into(), r"D:\x.bak".into(), handle).await.unwrap_err();
+        assert!(err.message.contains("MSSQL driver zatím není k dispozici"), "got: {}", err.message);
+    }
+
+    // --- SQLite restore: magic header + real copy, temp files, no docker ---
+    #[test]
+    fn sqlite_restore_refuses_non_sqlite_source_without_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("not_a_db.txt");
+        std::fs::write(&src, b"hello world, not a database").unwrap();
+        let dest = dir.path().join("target.sqlite");
+        std::fs::write(&dest, b"ORIGINAL CONTENT").unwrap();
+
+        let err =
+            run_sqlite_restore_inner(dest.to_str().unwrap(), src.to_str().unwrap(), false).unwrap_err();
+        assert_eq!(err.message, "soubor není SQLite databáze");
+        // Original destination file must be untouched.
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ORIGINAL CONTENT");
+    }
+
+    // SECURITY (G11 T4 review MAJOR 2): `run_sqlite_restore_inner` must
+    // self-guard on `read_only` — a write path whose sole protection was an
+    // unwired future UI-layer caller (T6) is unsafe by construction. The
+    // guard must fire BEFORE the source file is ever opened.
+    #[test]
+    fn sqlite_restore_refuses_read_only_without_touching_source_or_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("backup.sqlite");
+        let mut content = backup::SQLITE_MAGIC_HEADER.to_vec();
+        content.extend_from_slice(b"rest of a fake but header-valid sqlite file");
+        std::fs::write(&src, &content).unwrap();
+        let dest = dir.path().join("live.sqlite");
+        std::fs::write(&dest, b"stale content").unwrap();
+
+        let err =
+            run_sqlite_restore_inner(dest.to_str().unwrap(), src.to_str().unwrap(), true).unwrap_err();
+        assert_eq!(err.message, "připojení je jen pro čtení");
+        // Neither file touched — the guard fires before the magic-header
+        // check ever opens the source.
+        assert_eq!(std::fs::read(&dest).unwrap(), b"stale content");
+        assert_eq!(std::fs::read(&src).unwrap(), content);
+    }
+
+    #[test]
+    fn sqlite_restore_copies_a_valid_sqlite_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("backup.sqlite");
+        let mut content = backup::SQLITE_MAGIC_HEADER.to_vec();
+        content.extend_from_slice(b"rest of a fake but header-valid sqlite file");
+        std::fs::write(&src, &content).unwrap();
+        let dest = dir.path().join("live.sqlite");
+        std::fs::write(&dest, b"stale content").unwrap();
+
+        run_sqlite_restore_inner(dest.to_str().unwrap(), src.to_str().unwrap(), false).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), content);
+    }
+
+    #[test]
+    fn sqlite_restore_missing_source_is_a_value_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("live.sqlite");
+        std::fs::write(&dest, b"stale content").unwrap();
+        let err = run_sqlite_restore_inner(
+            dest.to_str().unwrap(),
+            dir.path().join("does_not_exist.sqlite").to_str().unwrap(),
+            false,
+        )
+        .unwrap_err();
+        assert!(!err.message.is_empty());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"stale content");
+    }
+
+    // --- run_external_tool: end-to-end with a real (non-pg_dump) process,
+    // proving spawn/stream/redact/handle wiring without any Postgres
+    // dependency. ---
+    //
+    // NOTE: like `monitor_pg_tests`/`compare_pg_tests` above, these are
+    // plain, NON-async `#[test]` fns that own a `QueryRunner` on an
+    // ordinary OS thread and drive the body through
+    // `runner.handle().block_on(...)`, NOT `#[tokio::test]` — wrapping in
+    // `#[tokio::test]` runs the body ON a tokio runtime worker thread, and
+    // `QueryRunner::new()` builds its OWN independent multi-thread
+    // `tokio::Runtime`; dropping THAT runtime from inside an async context
+    // (e.g. at the end of a `#[tokio::test]` fn) panics ("Cannot drop a
+    // runtime in a context where blocking is not allowed"). A plain
+    // `#[test]` fn is ordinary sync context, so `runner` drops safely.
+    #[test]
+    fn run_external_tool_streams_and_finishes_with_a_real_process() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let (mut rx, _handle) = runner.run_external_tool(
+                "cmd".to_string(),
+                vec!["/C".to_string(), "echo hello 1>&2".to_string()],
+                None,
+            );
+            let mut saw_log = false;
+            let mut saw_finished = false;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    backup::BackupEvent::Log(l) if l.contains("hello") => saw_log = true,
+                    backup::BackupEvent::Finished => {
+                        saw_finished = true;
+                        break;
+                    }
+                    backup::BackupEvent::Failed(m) => panic!("unexpected failure: {m}"),
+                    _ => {}
+                }
+            }
+            assert!(saw_log && saw_finished);
+        });
+    }
+
+    #[test]
+    fn run_external_tool_missing_binary_is_a_failed_event() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let (mut rx, _handle) =
+                runner.run_external_tool("definitely-not-a-real-binary-xyz".to_string(), vec![], None);
+            let ev = rx.recv().await.unwrap();
+            assert!(matches!(ev, backup::BackupEvent::Failed(_)));
+        });
+    }
+
+    // --- SECURITY: PGPASSWORD reaches the child's env, never argv, and a
+    // spawn/exit failure's surfaced message never contains it. ---
+    #[test]
+    fn run_external_tool_password_reaches_child_env_not_argv() {
+        // `cmd /C echo %PGPASSWORD% 1>&2` — proves the env var is actually
+        // set on the child (the whole point of the env-only mechanism)
+        // while the password itself never appears in the `args` this test
+        // passes in. Redirected to stderr (`1>&2`) because
+        // `backup::run_and_stream` only pipes/streams the child's STDERR
+        // (`stdout(Stdio::null())`) — a plain stdout `echo` would be
+        // silently discarded, same as the sibling
+        // `run_external_tool_streams_and_finishes_with_a_real_process` test
+        // above already redirects its own `echo hello`.
+        //
+        // Uses a moderately special (space + `$`), but NOT cmd-quote-hostile,
+        // password — a value containing an unbalanced `"`/`'` gets mangled by
+        // cmd's OWN percent-expansion-then-reparse of the command line
+        // before `run_and_stream` ever sees it, which would make this test
+        // flaky for reasons unrelated to what it's actually proving. The
+        // shell-hostile-character case (`'`, `"`, `--format=evil`, etc.) is
+        // already covered by `backup.rs`'s own pure `build_pg_dump_args`
+        // `NASTY_PASSWORD` tests, which assert the argv shape directly with
+        // no shell in between.
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            const NASTY_PASSWORD: &str = "hunter2$secret pw";
+            let args = vec!["/C".to_string(), "echo %PGPASSWORD% 1>&2".to_string()];
+            assert!(!args.iter().any(|a| a.contains(NASTY_PASSWORD)));
+            let (mut rx, _handle) =
+                runner.run_external_tool("cmd".to_string(), args, Some(NASTY_PASSWORD.to_string()));
+            let mut saw_env_value = false;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    // The redacted echo of the env var comes back as `***`
+                    // — proving both that the child actually saw the real
+                    // password (echoed it) AND that the log line is
+                    // redacted before ever leaving `run_and_stream`.
+                    backup::BackupEvent::Log(l) if l.contains("***") => saw_env_value = true,
+                    backup::BackupEvent::Finished => break,
+                    backup::BackupEvent::Failed(m) => panic!("unexpected failure: {m}"),
+                    _ => {}
+                }
+            }
+            assert!(saw_env_value, "expected the redacted PGPASSWORD echo in the log");
+        });
+    }
+}
+
+/// G11 T5: docker + a real, locally-installed `pg_dump`/`pg_restore`
+/// required — validates T4's `run_external_tool`/`resolve_tool_path` against
+/// a live `postgres:16.13` container, end to end (tool resolution, real
+/// `ConnectionConfig`-driven arg building, PGPASSWORD-via-env, spawn, log
+/// streaming, redaction) rather than just the pure builders `backup.rs`'s
+/// own unit tests already cover. Same hazard/pattern as
+/// `monitor_pg_tests`/`compare_pg_tests` above (see those modules' doc
+/// comments for the full nested-runtime rationale, not repeated here):
+/// every test is a plain, NON-async `#[test]` driven through
+/// `runner.handle().block_on(...)`, NOT `#[tokio::test]`.
+///
+/// Local `pg_dump`/`pg_restore` install is a real prerequisite, same class
+/// of external requirement docker itself is. Unlike `resolve_tool_path`'s
+/// own unit tests (which expect a hard failure), a MISSING install here is
+/// NOT a test failure — these tests skip gracefully (an `eprintln!` note,
+/// then an early `return`) rather than panicking, since "is PostgreSQL
+/// client tools installed on this machine" is an environment fact, not a
+/// regression this suite should ever fail CI over. Run with:
+///   %USERPROFILE%\.cargo\bin\cargo.exe test -p dbc-ui -- --ignored backup_docker_tests::
+#[cfg(test)]
+mod backup_docker_tests {
+    use super::*;
+    use testcontainers_modules::{
+        postgres::Postgres,
+        testcontainers::{runners::AsyncRunner, ImageExt},
+    };
+
+    async fn pg_url(
+        node: &testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+        db: &str,
+    ) -> String {
+        format!(
+            "postgres://postgres:postgres@127.0.0.1:{}/{db}",
+            node.get_host_port_ipv4(5432).await.unwrap()
+        )
+    }
+
+    /// open_spec (NOT connect::open): see `monitor_pg_tests`'s doc comment.
+    async fn open_pg(url: &str) -> Box<dyn Connection> {
+        let handle = tokio::runtime::Handle::current();
+        open_spec(ConnectSpec::Url(url.to_string()), handle).await.expect("connect").conn
+    }
+
+    async fn create_database(default_db_url: &str, name: &str) {
+        let mut conn = open_pg(default_db_url).await;
+        conn.execute(&format!("CREATE DATABASE {name}"), CancelToken::new()).await.unwrap();
+    }
+
+    fn cfg_for(host: &str, port: u16, database: &str) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "docker-pg".into(),
+            name: "docker-pg".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Postgres,
+            host: host.into(),
+            port: Some(port),
+            database: database.into(),
+            user: "postgres".into(),
+            read_only: false,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+        }
+    }
+
+    /// Skip-gracefully helper (see module doc comment) — `None` means the
+    /// caller should log and return early rather than fail the test.
+    fn try_resolve(name: &str) -> Option<String> {
+        match resolve_tool_path(None, name) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!(
+                    "SKIP backup_docker_tests: {name} not resolvable ({e}) — install PostgreSQL client tools to run this test live"
+                );
+                None
+            }
+        }
+    }
+
+    /// Seed a live source database with known data -> real `pg_dump` (Custom
+    /// format) -> assert the dump file exists, is non-empty, sniffs as
+    /// Custom (PGDMP magic), and contains the seeded table's name in its
+    /// TOC -> real `pg_restore` into a FRESH throwaway database -> assert
+    /// the seeded rows actually roundtripped (queried back through the
+    /// restored database, not just a `Finished` event).
+    #[test]
+    #[ignore]
+    fn real_pg_dump_backup_then_pg_restore_roundtrip() {
+        let Some(pg_dump) = try_resolve("pg_dump") else { return };
+        let Some(pg_restore) = try_resolve("pg_restore") else { return };
+
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let node = Postgres::default().with_tag("16.13").start().await.unwrap();
+            let port = node.get_host_port_ipv4(5432).await.unwrap();
+            let default_url = pg_url(&node, "postgres").await;
+
+            {
+                let mut setup = open_pg(&default_url).await;
+                setup
+                    .execute("CREATE TABLE roundtrip_t (id INT PRIMARY KEY, v TEXT)", CancelToken::new())
+                    .await
+                    .unwrap();
+                setup
+                    .execute(
+                        "INSERT INTO roundtrip_t VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')",
+                        CancelToken::new(),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let cfg = cfg_for("127.0.0.1", port, "postgres");
+            let out_dir = tempfile::tempdir().unwrap();
+            let out_path = out_dir.path().join("roundtrip.backup");
+
+            let opts = backup::PgBackupOptions { format: backup::PgDumpFormat::Custom, compress: 6 };
+            let args = backup::build_pg_dump_args(
+                &cfg,
+                &cfg.host,
+                cfg.port.unwrap(),
+                &opts,
+                out_path.to_str().unwrap(),
+            )
+            .expect("dbname passes validate_pg_dbname");
+
+            let (mut rx, _handle) = runner.run_external_tool(pg_dump, args, Some("postgres".to_string()));
+            let mut finished = false;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    backup::BackupEvent::Finished => {
+                        finished = true;
+                        break;
+                    }
+                    backup::BackupEvent::Failed(m) => panic!("pg_dump failed: {m}"),
+                    backup::BackupEvent::Log(_) => {}
+                }
+            }
+            assert!(finished, "pg_dump did not report Finished");
+            assert!(out_path.is_file(), "dump file must exist");
+            let dumped = std::fs::read(&out_path).unwrap();
+            assert!(!dumped.is_empty(), "dump file must be non-empty");
+            assert_eq!(
+                backup::detect_dump_format(&dumped[..dumped.len().min(64)]),
+                backup::DumpFormat::Custom,
+                "a -Fc dump must sniff as Custom via the PGDMP magic"
+            );
+            // Custom-format archives embed their TOC entry tags (object
+            // names, including table names) as plain readable text —
+            // best-effort proof the real seeded DDL made it into the dump,
+            // not just a magic-header check.
+            let dumped_text = String::from_utf8_lossy(&dumped);
+            assert!(
+                dumped_text.contains("roundtrip_t"),
+                "dump must contain the seeded table's name in its TOC"
+            );
+
+            create_database(&default_url, "roundtrip_target").await;
+            let restore_cfg = cfg_for("127.0.0.1", port, "roundtrip_target");
+            let restore_opts = backup::PgRestoreOptions::default();
+            let restore_args = backup::build_pg_restore_args(
+                &restore_cfg,
+                &restore_cfg.host,
+                restore_cfg.port.unwrap(),
+                &restore_opts,
+                out_path.to_str().unwrap(),
+            )
+            .expect("dbname passes validate_pg_dbname");
+
+            let (mut rx2, _h2) =
+                runner.run_external_tool(pg_restore, restore_args, Some("postgres".to_string()));
+            let mut restored = false;
+            while let Some(ev) = rx2.recv().await {
+                match ev {
+                    backup::BackupEvent::Finished => {
+                        restored = true;
+                        break;
+                    }
+                    backup::BackupEvent::Failed(m) => panic!("pg_restore failed: {m}"),
+                    backup::BackupEvent::Log(_) => {}
+                }
+            }
+            assert!(restored, "pg_restore did not report Finished");
+
+            // Prove the DATA genuinely roundtripped — not just a Finished
+            // event — by querying the restored database back.
+            let target_url = pg_url(&node, "roundtrip_target").await;
+            let mut verify = open_pg(&target_url).await;
+            let mut stream = verify
+                .query("SELECT id, v FROM roundtrip_t ORDER BY id", CancelToken::new())
+                .await
+                .unwrap();
+            let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+            while let Some(item) = stream.batches.recv().await {
+                buf.push(item.unwrap()).unwrap();
+            }
+            assert_eq!(buf.row_count(), 3, "all 3 seeded rows must roundtrip");
+            assert_eq!(buf.cell_text(0, 1), "alpha");
+            assert_eq!(buf.cell_text(1, 1), "beta");
+            assert_eq!(buf.cell_text(2, 1), "gamma");
+        });
+    }
+
+    /// SECURITY REQUIRED (Global Constraints item 3): a deliberately WRONG
+    /// password against a real Postgres container makes `pg_dump` fail via
+    /// its own auth rejection — the resulting `BackupEvent::Failed`/`Log`
+    /// text must never contain the real (wrong-but-still-a-real-string)
+    /// password anywhere. A second, defense-in-depth assertion ties this
+    /// SAME live error text to the redaction mechanism directly: run
+    /// through `backup::redact_secret` (the exact function every
+    /// `run_and_stream` log line/failure message already passes through)
+    /// with the real password appended, proving that had the password
+    /// leaked into pg_dump's own stderr, it would have come back as `***`
+    /// rather than as plaintext.
+    #[test]
+    #[ignore]
+    fn wrong_password_error_never_contains_the_real_password() {
+        let Some(pg_dump) = try_resolve("pg_dump") else { return };
+
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let node = Postgres::default().with_tag("16.13").start().await.unwrap();
+            let port = node.get_host_port_ipv4(5432).await.unwrap();
+            let cfg = cfg_for("127.0.0.1", port, "postgres");
+
+            let out_dir = tempfile::tempdir().unwrap();
+            let out_path = out_dir.path().join("should_not_exist.backup");
+            let opts = backup::PgBackupOptions { format: backup::PgDumpFormat::Custom, compress: 0 };
+            let args = backup::build_pg_dump_args(
+                &cfg,
+                &cfg.host,
+                cfg.port.unwrap(),
+                &opts,
+                out_path.to_str().unwrap(),
+            )
+            .expect("dbname passes validate_pg_dbname");
+
+            const WRONG_PASSWORD: &str = "definitely-the-wrong-password-42";
+            let (mut rx, _handle) =
+                runner.run_external_tool(pg_dump, args, Some(WRONG_PASSWORD.to_string()));
+            let mut failure_text = String::new();
+            let mut saw_finished = false;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    backup::BackupEvent::Failed(m) => {
+                        failure_text = m;
+                        break;
+                    }
+                    backup::BackupEvent::Finished => {
+                        saw_finished = true;
+                        break;
+                    }
+                    backup::BackupEvent::Log(l) => failure_text.push_str(&l),
+                }
+            }
+            assert!(!saw_finished, "expected an auth failure with the wrong password, got Finished");
+            assert!(!failure_text.contains(WRONG_PASSWORD), "leaked password in: {failure_text}");
+            assert!(!out_path.exists(), "no dump file should be produced on an auth failure");
+
+            let synthetic_leak = format!("{failure_text} PGPASSWORD={WRONG_PASSWORD}");
+            let redacted = backup::redact_secret(&synthetic_leak, Some(WRONG_PASSWORD));
+            assert!(redacted.contains("***"), "redaction must substitute the secret with ***");
+            assert!(!redacted.contains(WRONG_PASSWORD), "redacted text must never contain the real secret");
         });
     }
 }

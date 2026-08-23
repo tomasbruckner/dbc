@@ -40,7 +40,8 @@ use gpui::{
     Bounds, ClipboardItem, Context, CursorStyle, Div, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Stateful, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
+    ShapedLine, SharedString, Stateful, Style, TextRun, UTF16Selection, UnderlineStyle,
+    uniform_list, Window,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -981,6 +982,13 @@ pub enum ModalState {
     /// already-closed dialog) but kept for a uniform modal-state shape and
     /// possible future pre-dispatch validation.
     CompareDialog { conn_a: Option<String>, conn_b: Option<String>, error: Option<String> },
+    /// G11 T6 (design §2/§3, §3-novela): backup/restore confirm/progress
+    /// overlay — one panel per `BackupSession::status` transition
+    /// (Confirming [Restore only] -> Running -> terminal), same
+    /// single-modal-at-a-time shape every other arm here already
+    /// establishes. See `crate::backup::BackupSession`'s own doc comment
+    /// for why the session lives in `backup.rs` rather than as fields here.
+    BackupRestore(crate::backup::BackupSession),
     /// G12 T3: script-runner confirm modal (design §3) — opened by
     /// `AppView::start_script_pick` once the file/folder picker resolves and
     /// the pre-scan has counted each file's statements. Confirmed via
@@ -1188,6 +1196,7 @@ impl AppView {
             ModalState::CompareDialog { conn_a, conn_b, error } => {
                 render_compare_dialog_panel(conn_a, conn_b, error, self.grouped_cache.clone(), cx)
             }
+            ModalState::BackupRestore(session) => render_backup_restore_panel(&session, cx),
             ModalState::ScriptRun {
                 files,
                 file_counts,
@@ -1248,6 +1257,15 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Review MINOR B fix: single-modal invariant, same guard every
+        // other dialog opener in this file already applies (see
+        // `on_monitor_view_event`'s `KillRequested` arm) — the G11 T6
+        // teardown-path accounting for `ModalState::BackupRestore`
+        // specifically depends on this invariant actually holding
+        // everywhere, not just at ITS OWN two opener call sites.
+        if self.modal.is_some() {
+            return;
+        }
         let name = cx.new(|cx| TextField::new(cx, "např. Produkce", false));
         let host = cx.new(|cx| TextField::new(cx, "localhost", false));
         let port = cx.new(|cx| TextField::new(cx, "5432", false));
@@ -1313,6 +1331,11 @@ impl AppView {
     }
 
     pub(crate) fn close_modal(&mut self, cx: &mut Context<Self>) {
+        // G11 T6 binding carry-forward: backstop for every path that closes
+        // the modal — cancels a still-`Running` backup/restore's handle
+        // before it can be abandoned. See `cancel_active_backup_if_running`'s
+        // doc comment (main.rs) for the full teardown-path accounting.
+        self.cancel_active_backup_if_running();
         self.modal = None;
         cx.notify();
     }
@@ -1323,6 +1346,12 @@ impl AppView {
     /// dialog can be opened via the palette without the dropdown ever having
     /// been opened this session.
     pub(crate) fn open_compare_dialog(&mut self, cx: &mut Context<Self>) {
+        // Review MINOR B fix: single-modal invariant — see
+        // `open_connection_dialog`'s identical guard for why this matters
+        // beyond just this dialog's own correctness.
+        if self.modal.is_some() {
+            return;
+        }
         self.refresh_grouped_cache();
         self.modal = Some(ModalState::CompareDialog { conn_a: None, conn_b: None, error: None });
         cx.notify();
@@ -1660,6 +1689,11 @@ impl AppView {
     /// `Connection` item (G3 Task 5, main.rs) can route through this exact
     /// switch path — brief contract #4: "no new execution logic".
     pub(crate) fn switch_to_connection(&mut self, id: &str, cx: &mut Context<Self>) {
+        // G11 T6 binding carry-forward: defensive — see
+        // `cancel_active_backup_if_running`'s doc comment (main.rs) for why
+        // this path isn't reachable while a backup/restore modal is open
+        // today, and why the call stays here anyway.
+        self.cancel_active_backup_if_running();
         let Some(cfg) = self.config.connections.iter().find(|c| c.id == id).cloned() else { return };
         let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
         let engine_lbl = engine_label(cfg.engine);
@@ -1947,6 +1981,9 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
     let id = c.id.clone();
     let star_id = c.id.clone();
     let editing = c.clone();
+    let backup_target = c.id.clone();
+    let restore_target = c.id.clone();
+    let restore_read_only = c.read_only;
     let label = format!("{}{} — {} {}", "  ".repeat(depth), c.name, engine_label(c.engine), c.host);
     let (star_glyph, star_color) =
         if c.favourite { ("★", rgb(0xf9e2af)) } else { ("☆", rgb(0x6c7086)) };
@@ -2000,6 +2037,44 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
                 .on_click(cx.listener(move |view, _, window, cx| {
                     cx.stop_propagation();
                     view.open_connection_dialog(Some(editing.clone()), window, cx);
+                })),
+        )
+        .child(
+            // G11 T6: backup affordance — allowed on every connection
+            // (backup is the one documented read-only exemption, design
+            // CURATION item 2), same `cx.stop_propagation()` pattern as ★/✎
+            // above so this click doesn't also bubble to the row's connect
+            // handler.
+            div()
+                .id(SharedString::from(format!("dropdown-item-backup-{}", c.id)))
+                .px_1()
+                .cursor_pointer()
+                .text_color(rgb(0xa6adc8))
+                .hover(|s| s.bg(rgb(0x45475a)))
+                .child("🗄")
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    cx.stop_propagation();
+                    view.open_backup_dialog(backup_target.clone(), window, cx);
+                })),
+        )
+        .child(
+            // G11 T6: restore affordance — dimmed (still clickable; the
+            // click itself surfaces the read-only refusal as a status line,
+            // same "no tooltip component exists in this codebase" posture
+            // this plan's Grounding documents) for a read-only connection.
+            // Restore is NEVER exempt from the read-only gate (design
+            // CURATION item 2) — `open_restore_dialog` enforces this for
+            // real; the dim here is a visual hint only, not the guard.
+            div()
+                .id(SharedString::from(format!("dropdown-item-restore-{}", c.id)))
+                .px_1()
+                .cursor_pointer()
+                .text_color(if restore_read_only { rgb(0x6c7086) } else { rgb(0xa6adc8) })
+                .hover(|s| s.bg(rgb(0x45475a)))
+                .child("♻")
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    cx.stop_propagation();
+                    view.open_restore_dialog(restore_target.clone(), window, cx);
                 })),
         )
 }
@@ -2689,6 +2764,182 @@ fn compare_picker_row(
         .on_click(cx.listener(move |view, _, _, cx| {
             view.select_compare_side(side, id.clone(), cx);
         }))
+}
+
+/// G11 T6: backup/restore confirm/progress panel — one render per
+/// `BackupSession::status`, mirroring `render_kill_confirm_panel`'s
+/// running/error/terminal shape. §3-novela: `session.command_line` (the
+/// redacted command/SQL text — never containing the raw secret, see
+/// `backup::display_command_line`) is always shown so the user sees exactly
+/// what will run/ran before and during dispatch.
+fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut Context<AppView>) -> AnyElement {
+    use crate::backup::{BackupKind, BackupStatus};
+
+    let title = match session.kind {
+        BackupKind::Backup => "Zálohovat databázi",
+        BackupKind::Restore => "Obnovit databázi ze zálohy",
+    };
+    let status = session.status.borrow().clone();
+
+    let mut panel = div()
+        .id("backup-restore-panel")
+        .w(px(560.))
+        .bg(rgb(0x1e1e2e))
+        .border_1()
+        .border_color(rgb(0x45475a))
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(rgb(0xcdd6f4))
+        .child(div().text_size(px(16.)).child(title))
+        .child(format!(
+            "{} — {} ({})",
+            session.connection_name,
+            engine_label(session.engine),
+            session.database
+        ))
+        .child(div().text_color(rgb(0xa6adc8)).child(session.target_path.clone()));
+
+    if !session.command_line.is_empty() {
+        panel = panel.child(
+            div()
+                .id("backup-restore-command-preview")
+                .p_1()
+                .bg(rgb(0x181825))
+                .rounded_md()
+                .text_color(rgb(0xa6adc8))
+                .whitespace_normal()
+                .child(session.command_line.clone()),
+        );
+    }
+
+    match &status {
+        BackupStatus::Confirming => {
+            // Restore only (design §3, GitHub-delete-repo pattern) — Backup
+            // never reaches this state (`open_backup_dialog` starts it
+            // straight in `Running`).
+            if let Some(input) = &session.confirm_input {
+                panel = panel
+                    .child(div().text_color(rgb(0xf9e2af)).child(format!(
+                        "Pro potvrzení napište přesný název databáze: {}",
+                        session.expected_name
+                    )))
+                    .child(field_row("Název databáze", input.clone()));
+            }
+            let typed = session.confirm_input.as_ref().map(|f| f.read(cx).text()).unwrap_or_default();
+            let allowed = crate::backup::confirm_matches(&typed, &session.expected_name);
+            let confirm_button = if allowed {
+                styled_button("backup-restore-confirm", "Obnovit")
+                    .bg(rgb(0x5d2e2e))
+                    .on_click(cx.listener(|v, _, _, cx| v.confirm_restore(cx)))
+                    .into_any_element()
+            } else {
+                div()
+                    .id("backup-restore-confirm")
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(0x313244))
+                    .text_color(rgb(0x6c7086))
+                    .child("Obnovit")
+                    .into_any_element()
+            };
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .justify_end()
+                    .mt_2()
+                    .child(
+                        styled_button("backup-restore-cancel", "Zrušit")
+                            .on_click(cx.listener(|v, _, _, cx| v.cancel_backup_restore(cx))),
+                    )
+                    .child(confirm_button),
+            );
+        }
+        BackupStatus::Running => {
+            let elapsed = session.started_at.elapsed().as_secs();
+            panel = panel.child(div().text_color(rgb(0xf9e2af)).child(format!("probíhá… ({elapsed} s)")));
+
+            let log = session.log.borrow();
+            let log_len = log.lines.len();
+            // Review MINOR 2 fix: `session.log` retains at most
+            // `backup::BACKUP_LOG_CAP` lines (evicted oldest-first at the
+            // push site, `backup::push_backup_log`) — a `pg_dump -v` run
+            // against a huge schema emits one line per object, and cloning
+            // an unbounded Vec every render frame would be O(n²) cumulative
+            // over the run's lifetime. `truncated` tells the user their
+            // scrollback isn't the whole story.
+            if log.truncated {
+                panel = panel.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(0x6c7086))
+                        .child("… (starší řádky zahozeny)"),
+                );
+            }
+            if log_len > 0 {
+                let lines: Vec<String> = log.lines.iter().cloned().collect();
+                let list = uniform_list(
+                    "backup-restore-log",
+                    log_len,
+                    move |range: std::ops::Range<usize>, _window, _cx| {
+                        range.map(|ix| div().text_size(px(11.)).child(lines[ix].clone())).collect::<Vec<_>>()
+                    },
+                )
+                .h(px(160.));
+                panel = panel.child(list);
+            }
+            drop(log);
+
+            // Review MAJOR fix: MSSQL/SQLite have no real cancel hook
+            // (`session.can_cancel() == false` — no OS child process, only
+            // a `tokio` task driving `Connection::execute`/`fs::copy`) —
+            // rendering a clickable "Zrušit" there would let the user
+            // believe a click actually stops the in-flight write, when in
+            // fact nothing would happen but the UI lying about it (see
+            // `backup::should_cancel_on_teardown`'s doc comment for the
+            // full consequence chain). Render it non-interactive instead,
+            // same "dimmed div, no `.on_click`" pattern this file already
+            // uses for a disabled Confirming-state "Obnovit".
+            let cancel_button = if session.can_cancel() {
+                styled_button("backup-restore-cancel-running", "Zrušit")
+                    .on_click(cx.listener(|v, _, _, cx| v.cancel_backup_restore(cx)))
+                    .into_any_element()
+            } else {
+                div()
+                    .id("backup-restore-cancel-running")
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(0x313244))
+                    .text_color(rgb(0x6c7086))
+                    .child("nelze přerušit — čeká se na dokončení")
+                    .into_any_element()
+            };
+            panel = panel.child(div().flex().flex_row().justify_end().mt_2().child(cancel_button));
+        }
+        BackupStatus::Succeeded | BackupStatus::Failed(_) | BackupStatus::Cancelled => {
+            let (line, color) = match &status {
+                BackupStatus::Succeeded => ("hotovo".to_string(), rgb(0xa6e3a1)),
+                BackupStatus::Failed(e) => (format!("error: {e}"), rgb(0xf38ba8)),
+                BackupStatus::Cancelled => ("přerušeno uživatelem".to_string(), rgb(0xf9e2af)),
+                _ => unreachable!(),
+            };
+            panel = panel.child(div().text_color(color).child(line));
+            panel = panel.child(
+                div().flex().flex_row().justify_end().mt_2().child(
+                    styled_button("backup-restore-close", "Zavřít")
+                        .on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))),
+                ),
+            );
+        }
+    }
+
+    panel.into_any_element()
 }
 
 #[cfg(test)]
