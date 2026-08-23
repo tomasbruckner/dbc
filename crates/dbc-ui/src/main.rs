@@ -7,6 +7,7 @@ mod history_panel;
 mod palette;
 mod row_view;
 mod runner;
+mod sandbox;
 mod schema_tree;
 mod sql_input;
 mod tabs;
