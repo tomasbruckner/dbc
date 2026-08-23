@@ -921,6 +921,24 @@ pub enum ModalState {
         bypass_auto_limit: bool,
         error: Option<String>,
     },
+    /// G9: confirmed-admin-action dialog for kill (design §6). Reuses the
+    /// single-modal-at-a-time infrastructure deliberately — `run_query_with`
+    /// already refuses to run while `modal.is_some()`, and the
+    /// dropdown/palette refuse to open a second modal; a kill confirmation
+    /// is exactly the blocking dialog that invariant exists for. `sql` is
+    /// the LITERAL statement that will run (shown in a monospace block —
+    /// same "show the exact generated SQL" principle as the Apply dialog).
+    /// `error` is a failed kill's message: the dialog stays open with it
+    /// (same "error stays in the modal" precedent as Apply's
+    /// rollback-error UX).
+    #[allow(dead_code)] // constructed by T6's on_monitor_view_event; allow removed there
+    KillConfirm {
+        pid: i64,
+        label: String, // "{user} · {application} · běží {n}s"
+        sql: String,
+        tab_id: u64,
+        error: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------
@@ -1043,6 +1061,9 @@ impl AppView {
             }
             ModalState::QueryParams { names, inputs, null_flags, sql_template, error, .. } => {
                 render_query_params_panel(names, inputs, null_flags, sql_template, error, cx)
+            }
+            ModalState::KillConfirm { pid, label, sql, error, .. } => {
+                render_kill_confirm_panel(pid, &label, &sql, &error, cx)
             }
         };
         Some(
@@ -1525,6 +1546,39 @@ impl AppView {
         }
         cx.notify();
     }
+
+    /// G9 T5: "Zrušit" on the kill-confirm dialog — closes it, nothing was
+    /// sent.
+    pub(crate) fn cancel_kill_confirm(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.modal, Some(ModalState::KillConfirm { .. })) {
+            self.modal = None;
+            cx.notify();
+        }
+    }
+
+    /// G9 T5: "Ukončit proces" — dispatches `MonitorCmd::Kill` via the
+    /// tab's `MonitorView`; the dialog STAYS OPEN until
+    /// `MonitorViewEvent::KillFinished` resolves (T6's on_monitor_view_event
+    /// closes it on Ok / fills `error` on Err).
+    pub(crate) fn confirm_kill_confirm(&mut self, cx: &mut Context<Self>) {
+        let Some(ModalState::KillConfirm { pid, tab_id, .. }) = &self.modal else {
+            return;
+        };
+        let (pid, tab_id) = (*pid, *tab_id);
+        let Some(view) = self.monitor_view_for_tab(tab_id) else {
+            // Tab closed under the dialog — nothing to kill against.
+            self.modal = None;
+            self.status = "monitor tab už není otevřený — ukončení zrušeno".into();
+            cx.notify();
+            return;
+        };
+        view.update(cx, |m, cx| m.dispatch_kill(pid, cx));
+        // Deliberately no self.modal = None here: success/failure arrives
+        // as MonitorViewEvent::KillFinished (T6), which closes the dialog
+        // on Ok or writes `error` on Err — the failure-stays-in-dialog UX
+        // (design §6).
+        cx.notify();
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1947,6 +2001,65 @@ fn render_query_params_panel(
             .mt_2()
             .child(styled_button("qp-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.cancel_query_params(cx))))
             .child(styled_button("qp-run", "Spustit").on_click(cx.listener(|v, _, _, cx| v.confirm_query_params(cx)))),
+    );
+    panel.into_any_element()
+}
+
+/// G9 T5: the kill-confirm dialog panel — same card tokens as every other
+/// modal in this file. Shows the exact SQL that will run (design §6's "show
+/// the exact generated SQL" principle) and, on a failed attempt, the error
+/// text below it (dialog stays open).
+fn render_kill_confirm_panel(
+    pid: i64,
+    label: &str,
+    sql: &str,
+    error: &Option<String>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let mut panel: Div = div()
+        .w(px(520.))
+        .bg(rgb(0x1e1e2e))
+        .border_1()
+        .border_color(rgb(0x45475a))
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(rgb(0xcdd6f4))
+        .child(div().text_size(px(16.)).child("Ukončit proces"))
+        .child(format!("Opravdu ukončit proces {pid} ({label})?"))
+        .child(
+            div()
+                .id("kill-sql-preview")
+                .p_1()
+                .bg(rgb(0x181825))
+                .rounded_md()
+                .text_color(rgb(0xa6adc8))
+                .whitespace_normal()
+                .child(sql.to_string()),
+        );
+
+    if let Some(e) = error {
+        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {e}")));
+    }
+
+    panel = panel.child(
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .justify_end()
+            .mt_2()
+            .child(
+                styled_button("kill-cancel", "Zrušit")
+                    .on_click(cx.listener(|v, _, _, cx| v.cancel_kill_confirm(cx))),
+            )
+            .child(
+                styled_button("kill-confirm", "Ukončit proces")
+                    .bg(rgb(0x5d2e2e)) // danger tint — DELETED_ROW_BG family
+                    .on_click(cx.listener(|v, _, _, cx| v.confirm_kill_confirm(cx))),
+            ),
     );
     panel.into_any_element()
 }
