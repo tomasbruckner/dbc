@@ -52,12 +52,13 @@ use std::ops::Range;
 use gpui::{
     actions, div, fill, hsla, point, prelude::*, px, relative, rgba, size, App, Bounds,
     ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
+    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, Hsla, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
     UnderlineStyle, Window,
 };
 
+use crate::sql_highlight::{self, HighlightSpan};
 use crate::text_model::MultilineBuffer;
 
 actions!(
@@ -167,41 +168,106 @@ fn per_line_selection_bounds(
     Some((x0, x1))
 }
 
-/// Builds the (up to 3) `TextRun`s for one line's shaped text: a plain run,
-/// or plain/underlined-marked/plain when `marked_local` (the marked range
-/// clipped to this line, in line-local byte coordinates) is present.
-fn build_runs(run: &TextRun, display_len: usize, marked_local: Option<Range<usize>>) -> Vec<TextRun> {
-    if let Some(mr) = marked_local {
-        let start = mr.start.min(display_len);
-        let end = mr.end.min(display_len);
-        vec![
-            TextRun {
-                len: start,
-                ..run.clone()
-            },
-            TextRun {
-                len: end - start,
-                underline: Some(UnderlineStyle {
-                    color: Some(run.color),
-                    thickness: px(1.0),
-                    wavy: false,
-                }),
-                ..run.clone()
-            },
-            TextRun {
-                len: display_len - end,
-                ..run.clone()
-            },
-        ]
-        .into_iter()
-        .filter(|r| r.len > 0)
+/// Clips a global (whole-buffer) byte range onto a single line's local byte
+/// coordinate space. `line_start`/`line_end` are the line's absolute byte
+/// bounds, EXCLUSIVE of its trailing `\n` (`text.split('\n')`'s per-line
+/// convention, the same one `prepaint`'s line loop and the pre-existing
+/// `marked_range` clipping both already use). Returns `None` when `global`
+/// doesn't overlap `[line_start, line_end)` at all — in particular a span
+/// that starts exactly AT `line_end` (i.e. at the `\n` byte itself, or
+/// entirely on the next line) touches this line not at all, only the next
+/// one, and a span that ends exactly at `line_start` touches only the
+/// previous line. This is the one place responsible for the classic
+/// "off-by-one at the `\n` boundary" bug that multi-line highlight-span
+/// mapping is prone to, so it's covered exhaustively by its own unit tests
+/// below rather than only exercised indirectly through `prepaint`.
+fn clip_to_line(global: &Range<usize>, line_start: usize, line_end: usize) -> Option<Range<usize>> {
+    if global.end <= line_start || global.start >= line_end {
+        return None;
+    }
+    let len = line_end - line_start;
+    let start = global.start.saturating_sub(line_start).min(len);
+    let end = global.end.saturating_sub(line_start).min(len);
+    (end > start).then_some(start..end)
+}
+
+/// Filters a whole buffer's highlight spans down to the ones overlapping a
+/// single line, clipped and translated to that line's local byte
+/// coordinates and paired with their resolved color — exactly the shape
+/// `build_runs`'s `highlight_local` parameter wants. Pure wrapper around
+/// `clip_to_line`, kept separate so `prepaint`'s call site stays a
+/// one-liner.
+fn line_local_highlights(
+    highlights: &[HighlightSpan],
+    line_start: usize,
+    line_end: usize,
+) -> Vec<(Range<usize>, Hsla)> {
+    highlights
+        .iter()
+        .filter_map(|h| clip_to_line(&h.range, line_start, line_end).map(|r| (r, h.color)))
         .collect()
-    } else {
-        vec![TextRun {
+}
+
+/// Builds one `TextRun` per contiguous coloring segment of a line's
+/// `display_len` bytes. `highlight_local` (line-local byte ranges with a
+/// resolved color, already clipped/translated to this line's coordinate
+/// space by the caller, e.g. via `line_local_highlights`) supplies the base
+/// color per segment, falling back to `run.color` where uncovered;
+/// `marked_local` (the IME marked range, same clipping) ORs an underline on
+/// top of whichever segment it overlaps — color and underline are
+/// independent, both apply together where they coincide (a marked IME
+/// composition over a keyword must show both the keyword's color AND the
+/// underline).
+fn build_runs(
+    run: &TextRun,
+    display_len: usize,
+    highlight_local: &[(Range<usize>, Hsla)],
+    marked_local: Option<Range<usize>>,
+) -> Vec<TextRun> {
+    let mut points: Vec<usize> = vec![0, display_len];
+    for (r, _) in highlight_local {
+        points.push(r.start.min(display_len));
+        points.push(r.end.min(display_len));
+    }
+    if let Some(mr) = &marked_local {
+        points.push(mr.start.min(display_len));
+        points.push(mr.end.min(display_len));
+    }
+    points.sort_unstable();
+    points.dedup();
+
+    let mut runs = Vec::with_capacity(points.len().saturating_sub(1));
+    for w in points.windows(2) {
+        let (start, end) = (w[0], w[1]);
+        if start >= end {
+            continue;
+        }
+        let color = highlight_local
+            .iter()
+            .find(|(r, _)| r.start <= start && end <= r.end)
+            .map(|(_, c)| *c)
+            .unwrap_or(run.color);
+        let underline = marked_local.as_ref().and_then(|mr| {
+            (mr.start <= start && end <= mr.end).then(|| UnderlineStyle {
+                color: Some(run.color),
+                thickness: px(1.0),
+                wavy: false,
+            })
+        });
+        runs.push(TextRun {
+            len: end - start,
+            color,
+            underline,
+            ..run.clone()
+        });
+    }
+    if runs.is_empty() {
+        runs.push(TextRun {
             len: display_len,
             ..run.clone()
-        }]
+        });
     }
+    runs
 }
 
 /// Per-line hit-test / IME-query cache, populated by `TextElement::paint`
@@ -231,6 +297,23 @@ pub struct SqlInput {
     last_visible_line_count: usize,
     last_lines: Vec<CachedLine>,
     is_selecting: bool,
+    /// Latest computed highlight spans (G6 T5), painted by `TextElement`'s
+    /// per-line `build_runs` call. Refreshed by `kick_highlight`'s debounced
+    /// background parse; stale until the first debounce elapses after
+    /// `new()`, and intentionally left as the PREVIOUS frame's spans while a
+    /// newer parse is in flight (design §1: "never blank/flash to
+    /// unhighlighted").
+    highlights: Vec<HighlightSpan>,
+    /// Monotonic counter bumped by every mutating call site; a
+    /// `kick_highlight` background task only writes `self.highlights` back
+    /// if its captured generation still matches this field when it
+    /// completes, so a superseded (older) in-flight parse is silently
+    /// dropped rather than clobbering a newer edit's result.
+    highlight_generation: u32,
+    /// AppView-driven (G6 T7): true while the autocomplete popup is open.
+    /// Makes `up`/`down`/`newline` propagate instead of consuming so
+    /// AppView's higher-priority handler can do popup nav/accept.
+    autocomplete_active: bool,
 }
 
 impl SqlInput {
@@ -247,7 +330,83 @@ impl SqlInput {
             last_visible_line_count: 1,
             last_lines: Vec::new(),
             is_selecting: false,
+            highlights: Vec::new(),
+            highlight_generation: 0,
+            autocomplete_active: false,
         }
+    }
+
+    /// Current cursor byte offset (G6 T5, consumed by T7's autocomplete
+    /// seam — not yet called anywhere in `dbc-ui` until T7 lands, hence the
+    /// `allow` below, same convention as `sql_highlight.rs`/`autocomplete.rs`
+    /// carried for their own pre-T7/T5 gaps).
+    #[allow(dead_code)] // TODO(T7): remove allow once AppView calls this
+    pub fn cursor(&self) -> usize {
+        self.buffer.cursor()
+    }
+
+    /// AppView-driven: true while T7's autocomplete popup is open. See the
+    /// `autocomplete_active` field doc.
+    #[allow(dead_code)] // TODO(T7): remove allow once AppView calls this
+    pub fn set_autocomplete_active(&mut self, active: bool) {
+        self.autocomplete_active = active;
+    }
+
+    /// Screen-space pixel bounds of a single-point caret at the CURRENT
+    /// cursor, from last frame's cached line layout. `None` before the
+    /// first paint or if the cursor's line isn't in the cache (e.g. scrolled
+    /// out of view) — callers degrade by not showing a popup that frame.
+    /// Mirrors `EntityInputHandler::bounds_for_range`'s existing lookup
+    /// logic, specialized to a single point at the live cursor rather than
+    /// an arbitrary UTF-16 range.
+    #[allow(dead_code)] // TODO(T7): remove allow once AppView calls this
+    pub fn cursor_screen_bounds(&self) -> Option<Bounds<Pixels>> {
+        let bounds = self.last_bounds?;
+        let line_height = self.last_line_height?;
+        let cursor = self.buffer.cursor();
+        let entry = self
+            .last_lines
+            .iter()
+            .find(|e| cursor >= e.start && cursor <= e.start + e.shaped.len())?;
+        let row = entry.index.checked_sub(self.scroll_offset_lines)?;
+        let local = cursor.saturating_sub(entry.start).min(entry.shaped.len());
+        let x = entry.shaped.x_for_index(local);
+        let top = bounds.top() + line_height * row;
+        Some(Bounds::new(point(bounds.left() + x, top), size(px(1.), line_height)))
+    }
+
+    /// Debounced (60ms) background re-highlight, triggered by every
+    /// mutating call site (design §1: "same call sites" that already set
+    /// `follow_cursor = true`). Coalesces bursts (paste, autocomplete-accept)
+    /// via the monotonic `highlight_generation` counter rather than task
+    /// cancellation: this bumps the generation and captures its own value;
+    /// the spawned task waits out the debounce, computes spans off the UI
+    /// thread, then only writes back if its captured generation still
+    /// matches the (possibly since-bumped-again) entity field — a
+    /// superseded result is silently dropped, never applied out of order.
+    /// `.detach()`ing is safe here specifically because coalescing happens
+    /// on write-back, not by cancelling the stale task (same idiom as
+    /// `main.rs`'s `run_generation`).
+    fn kick_highlight(&mut self, cx: &mut Context<Self>) {
+        self.highlight_generation += 1;
+        let my_generation = self.highlight_generation;
+        let text = self.buffer.text().to_string();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(60))
+                .await;
+            let spans = cx
+                .background_spawn(async move { sql_highlight::highlight(&text) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.highlight_generation == my_generation {
+                    this.highlights = spans;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Real multiline text — no newline-to-space substitution.
@@ -262,6 +421,7 @@ impl SqlInput {
         self.marked_range = None;
         self.scroll_offset_lines = 0;
         self.follow_cursor = true;
+        self.kick_highlight(cx);
         cx.notify();
     }
 
@@ -347,12 +507,20 @@ impl SqlInput {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.autocomplete_active {
+            cx.propagate();
+            return;
+        }
         self.buffer.move_up(false);
         self.follow_cursor = true;
         cx.notify();
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.autocomplete_active {
+            cx.propagate();
+            return;
+        }
         self.buffer.move_down(false);
         self.follow_cursor = true;
         cx.notify();
@@ -401,9 +569,14 @@ impl SqlInput {
     }
 
     fn newline(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
+        if self.autocomplete_active {
+            cx.propagate();
+            return;
+        }
         self.buffer.insert("\n");
         self.marked_range = None;
         self.follow_cursor = true;
+        self.kick_highlight(cx);
         cx.notify();
     }
 
@@ -411,6 +584,7 @@ impl SqlInput {
         self.buffer.backspace();
         self.marked_range = None;
         self.follow_cursor = true;
+        self.kick_highlight(cx);
         cx.notify();
     }
 
@@ -418,6 +592,7 @@ impl SqlInput {
         self.buffer.delete();
         self.marked_range = None;
         self.follow_cursor = true;
+        self.kick_highlight(cx);
         cx.notify();
     }
 
@@ -471,6 +646,7 @@ impl SqlInput {
             self.buffer.insert(&text);
             self.marked_range = None;
             self.follow_cursor = true;
+            self.kick_highlight(cx);
             cx.notify();
         }
     }
@@ -494,6 +670,7 @@ impl SqlInput {
                 self.buffer.delete();
                 self.marked_range = None;
                 self.follow_cursor = true;
+                self.kick_highlight(cx);
                 cx.notify();
             }
         }
@@ -596,6 +773,7 @@ impl EntityInputHandler for SqlInput {
         self.buffer.insert(new_text);
         self.marked_range = None;
         self.follow_cursor = true;
+        self.kick_highlight(cx);
         cx.notify();
     }
 
@@ -630,6 +808,7 @@ impl EntityInputHandler for SqlInput {
         }
 
         self.follow_cursor = true;
+        self.kick_highlight(cx);
         cx.notify();
     }
 
@@ -735,6 +914,7 @@ impl Element for TextElement {
         let selection = input.buffer.selection();
         let cursor = input.buffer.cursor();
         let marked_range = input.marked_range.clone();
+        let highlights = input.highlights.clone();
         let placeholder = input.placeholder.clone();
         let scroll_offset_lines = input.scroll_offset_lines;
         let follow_cursor = input.follow_cursor;
@@ -831,7 +1011,12 @@ impl Element for TextElement {
                         }
                     })
                 };
-                let runs = build_runs(&run, display_len, marked_local);
+                let highlight_local = if is_placeholder {
+                    Vec::new()
+                } else {
+                    line_local_highlights(&highlights, line_start, line_end)
+                };
+                let runs = build_runs(&run, display_len, &highlight_local, marked_local);
 
                 let shaped = window
                     .text_system()
@@ -994,5 +1179,189 @@ impl Render for SqlInput {
 impl Focusable for SqlInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+/// Global-span -> per-line-local-range mapping (`clip_to_line`,
+/// `line_local_highlights`). Pure, GPUI-App-free logic (constructing
+/// `Hsla`/`HighlightSpan` values needs no live `App`/`Window`), so this is
+/// where the "off-by-one at the `\n` boundary" family of bugs is actually
+/// pinned down, rather than only exercised indirectly through GPUI paint
+/// wiring (which isn't unit-testable at all).
+#[cfg(test)]
+mod clip_to_line_tests {
+    use super::*;
+    use gpui::rgb;
+
+    fn c() -> Hsla {
+        rgb(0x89b4fa).into()
+    }
+
+    #[test]
+    fn span_fully_inside_one_line() {
+        // "SELECT 1" is line 0, bytes 0..8.
+        assert_eq!(clip_to_line(&(0..6), 0, 8), Some(0..6));
+    }
+
+    #[test]
+    fn span_starting_exactly_at_line_end_touches_only_the_next_line() {
+        // A span that starts right where the line's own bytes end (i.e. AT
+        // the `\n`, or on the following line) must not bleed onto this
+        // line — the classic off-by-one.
+        assert_eq!(clip_to_line(&(8..12), 0, 8), None);
+    }
+
+    #[test]
+    fn span_ending_exactly_at_line_start_touches_only_the_previous_line() {
+        assert_eq!(clip_to_line(&(0..5), 5, 10), None);
+    }
+
+    #[test]
+    fn span_crossing_a_newline_is_clipped_to_each_side_separately() {
+        // "line1\nline2": line 0 is bytes 0..5, line 1 is bytes 6..11 (the
+        // `\n` at byte 5 belongs to neither line's local text). A span
+        // covering the whole buffer (0..11, e.g. a block comment) must
+        // clip to the full local length on each line, never spilling the
+        // `\n` byte itself into either line's local coordinates.
+        assert_eq!(clip_to_line(&(0..11), 0, 5), Some(0..5));
+        assert_eq!(clip_to_line(&(0..11), 6, 11), Some(0..5));
+    }
+
+    #[test]
+    fn span_exactly_ending_at_the_newline_covers_the_whole_line_and_no_more() {
+        // Span 2..5 on a 5-byte line (line_end == 5, i.e. right at the
+        // `\n`) must clip to 2..5, not spill past the line's own length.
+        assert_eq!(clip_to_line(&(2..5), 0, 5), Some(2..5));
+        assert_eq!(clip_to_line(&(2..6), 0, 5), Some(2..5));
+    }
+
+    #[test]
+    fn multiline_block_comment_spans_three_lines_correctly() {
+        // "/*\nc\n*/" — a block comment opening on line 0, filling line 1
+        // entirely, and closing on line 2. Buffer layout:
+        //   line 0: "/*"   bytes 0..2   (byte 2 is '\n')
+        //   line 1: "c"    bytes 3..4   (byte 4 is '\n')
+        //   line 2: "*/"   bytes 5..7
+        // The whole comment is one span: 0..7.
+        let comment = 0..7;
+        assert_eq!(clip_to_line(&comment, 0, 2), Some(0..2)); // "/*"
+        assert_eq!(clip_to_line(&comment, 3, 4), Some(0..1)); // "c"
+        assert_eq!(clip_to_line(&comment, 5, 7), Some(0..2)); // "*/"
+    }
+
+    #[test]
+    fn empty_line_never_produces_a_non_empty_local_range() {
+        // An empty line has line_start == line_end; any span "overlapping"
+        // it must clip to nothing rather than a zero-width or negative
+        // range.
+        assert_eq!(clip_to_line(&(0..10), 4, 4), None);
+    }
+
+    #[test]
+    fn non_overlapping_span_is_none() {
+        assert_eq!(clip_to_line(&(20..30), 0, 8), None);
+    }
+
+    #[test]
+    fn non_ascii_text_before_a_span_uses_byte_offsets_not_char_offsets() {
+        // "čeština SELECT" — "čeština " is 8 chars but 10 bytes (č and š
+        // are each 2 bytes in UTF-8, the rest 1 byte each). The highlight
+        // span for "SELECT" must be expressed (as tree-sitter always does)
+        // in byte offsets, and `clip_to_line` must not attempt any
+        // char-counting of its own — plain byte arithmetic is correct as
+        // long as the caller's ranges are already valid UTF-8 boundaries.
+        let text = "čeština SELECT";
+        let select_start = text.find("SELECT").unwrap();
+        assert_eq!(text.chars().take_while(|&c| c != 'S').count(), 8); // char count
+        assert_eq!(select_start, 10); // byte offset != char offset
+        let span = select_start..text.len();
+        assert_eq!(clip_to_line(&span, 0, text.len()), Some(select_start..text.len()));
+    }
+
+    #[test]
+    fn line_local_highlights_filters_clips_and_pairs_with_color() {
+        let highlights = vec![
+            HighlightSpan {
+                range: 0..6,
+                color: c(),
+                suppresses_completion: false,
+            },
+            HighlightSpan {
+                range: 20..30, // on a different line entirely
+                color: c(),
+                suppresses_completion: false,
+            },
+        ];
+        let local = line_local_highlights(&highlights, 0, 8);
+        assert_eq!(local, vec![(0..6, c())]);
+    }
+
+    #[test]
+    fn line_local_highlights_empty_line_yields_nothing() {
+        let highlights = vec![HighlightSpan {
+            range: 0..10,
+            color: c(),
+            suppresses_completion: false,
+        }];
+        assert_eq!(line_local_highlights(&highlights, 4, 4), Vec::new());
+    }
+}
+
+#[cfg(test)]
+mod build_runs_tests {
+    use super::*;
+    use gpui::{hsla, rgb};
+
+    fn plain_run() -> TextRun {
+        TextRun {
+            len: 0,
+            font: gpui::Font::default(),
+            color: hsla(0., 0., 1., 1.),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }
+    }
+
+    #[test]
+    fn no_highlights_no_marked_is_a_single_run() {
+        let runs = build_runs(&plain_run(), 10, &[], None);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len, 10);
+    }
+
+    #[test]
+    fn marked_range_only_matches_prior_three_run_shape() {
+        let runs = build_runs(&plain_run(), 10, &[], Some(3..6));
+        assert_eq!(runs.iter().map(|r| r.len).collect::<Vec<_>>(), vec![3, 3, 4]);
+        assert!(runs[0].underline.is_none());
+        assert!(runs[1].underline.is_some());
+        assert!(runs[2].underline.is_none());
+    }
+
+    #[test]
+    fn single_highlight_colors_its_span() {
+        let color: gpui::Hsla = rgb(0xff0000).into();
+        let runs = build_runs(&plain_run(), 10, &[(2..5, color)], None);
+        let lens_and_colors: Vec<(usize, gpui::Hsla)> = runs.iter().map(|r| (r.len, r.color)).collect();
+        assert_eq!(lens_and_colors, vec![(2, plain_run().color), (3, color), (5, plain_run().color)]);
+    }
+
+    #[test]
+    fn highlight_and_marked_overlap_both_apply() {
+        let color: gpui::Hsla = rgb(0x00ff00).into();
+        let runs = build_runs(&plain_run(), 10, &[(2..8, color)], Some(4..6));
+        let overlap = runs.iter().find(|r| r.color == color && r.underline.is_some());
+        assert!(overlap.is_some(), "expected a run with BOTH the highlight color and the underline");
+    }
+
+    #[test]
+    fn adjacent_different_colored_highlights_stay_separate_runs() {
+        let c1: gpui::Hsla = rgb(0xff0000).into();
+        let c2: gpui::Hsla = rgb(0x0000ff).into();
+        let runs = build_runs(&plain_run(), 6, &[(0..3, c1), (3..6, c2)], None);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].color, c1);
+        assert_eq!(runs[1].color, c2);
     }
 }
