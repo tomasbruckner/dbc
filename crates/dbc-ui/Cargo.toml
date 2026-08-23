@@ -18,6 +18,13 @@ dirs.workspace = true
 tree-sitter = "0.25"
 tree-sitter-sequel = "0.3"
 quick-xml = "0.41"
+# Plan's Files list only calls out serde_json, but the grounding code's
+# `#[derive(Deserialize)]` on `PgPlanJson`/`PgExplainRoot` needs the `serde`
+# crate itself as a direct dependency too (edition-2021 extern-crate
+# resolution doesn't pick it up transitively via dbc-state) — adding it here
+# with the workspace's existing `derive`-feature pin.
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -27,3 +34,7 @@ async-trait.workspace = true
 # paused/auto-advancing virtual clock (`#[tokio::test(start_paused = true)]`)
 # instead of actually sleeping for real wall-clock seconds.
 tokio = { version = "1", features = ["test-util"] }
+# G13 T2: docker-gated live-fixture-capture test for the Postgres EXPLAIN
+# JSON parser — same crate+version dbc-driver-postgres's own integration
+# tests already pin, so this introduces no version skew.
+testcontainers-modules = { version = "0.13", features = ["postgres"] }
