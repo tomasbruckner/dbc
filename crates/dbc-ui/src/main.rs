@@ -1,3 +1,4 @@
+mod admin_sql;
 mod autocomplete;
 mod connect;
 mod connections_ui;
