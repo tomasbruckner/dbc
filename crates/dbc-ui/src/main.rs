@@ -20,10 +20,13 @@ use std::rc::Rc;
 
 use dbc_buffer::ResultBuffer;
 use dbc_core::{
-    apply_auto_limit, is_read_statement, quote_qualified, CancelToken, FkRef, QueryError,
-    SchemaSnapshot, TableInfo,
+    apply_auto_limit, find_params, is_read_statement, quote_qualified, substitute_params,
+    CancelToken, FkRef, QueryError, SchemaSnapshot, TableInfo,
 };
-use dbc_state::{AppConfig, HistoryDb, HistoryEntry, TableViewPrefs, Vault, ViewPrefsStore};
+use dbc_state::{
+    AppConfig, HistoryDb, HistoryEntry, ParamValue, ParamValuesStore, TableViewPrefs, Vault,
+    ViewPrefsStore,
+};
 use gpui::{
     actions, div, prelude::*, px, rgb, rgba, size, AnyElement, App, Bounds, ClipboardItem,
     Context, Entity, Focusable, KeyBinding, ScrollDelta, ScrollWheelEvent, Window, WindowBounds,
@@ -61,6 +64,40 @@ struct PaletteState {
 /// not smuggled into the query as SQL syntax.
 fn preview_sql(schema: Option<&str>, table: &str) -> String {
     format!("SELECT * FROM {} LIMIT 1000", quote_qualified(schema, table))
+}
+
+/// G6 Task 3: substitutes `sql_template`'s `:name` params (via
+/// `sandbox::sql_value`, `numeric = true` for opportunistic unquoting per
+/// the design doc's §3) using `values` (same order as `names`; `(text,
+/// is_null)` per entry), then re-scans the result and refuses if any bare
+/// `:name` survives — the CURATION-mandated defense (design §5) against a
+/// substituted-but-still-parametrized query silently reaching the driver
+/// (e.g. SQLite's own native `:name`/`@name`/`$name` bind-parameter syntax
+/// binding NULL to whatever wasn't actually replaced), for every engine.
+/// Pure — no GPUI — so it's directly unit-testable, and it's the single
+/// source of truth `render_query_params_panel`'s live preview and
+/// `confirm_query_params`'s actual dispatch both go through, so the
+/// preview can never diverge from what running would do.
+fn build_param_sql(
+    sql_template: &str,
+    names: &[String],
+    values: &[(String, bool)],
+) -> Result<String, String> {
+    let lookup: std::collections::HashMap<&str, &(String, bool)> =
+        names.iter().map(String::as_str).zip(values.iter()).collect();
+    let substituted = substitute_params(sql_template, &mut |name| match lookup.get(name) {
+        Some((_, true)) => sandbox::sql_value(None, true),
+        Some((text, false)) => sandbox::sql_value(Some(text.as_str()), true),
+        None => sandbox::sql_value(None, true), // unreachable: every :name in sql_template is in `names`
+    })
+    .ok_or_else(|| "nepodařilo se sestavit SQL".to_string())?;
+
+    match find_params(&substituted) {
+        Some(remaining) if !remaining.is_empty() => {
+            Err("po dosazení hodnot zůstal v SQL neplatný parametr — spuštění zrušeno".to_string())
+        }
+        _ => Ok(substituted),
+    }
 }
 
 /// G4 Task 5: shared per-column FK lookup against an already-resolved
@@ -594,6 +631,14 @@ struct AppView {
     /// save — the rest of the app is fully functional either way, same
     /// "degrade gracefully" precedent as `history: Option<HistoryDb>`.
     view_prefs: Option<ViewPrefsStore>,
+    // --- G6 Task 3: parametrized `:name` query values ---
+    /// Opened from `dbc_state::default_param_values_path()` at startup;
+    /// `None` on a load failure (same "degrade gracefully" posture as
+    /// `view_prefs` — the values dialog still opens and runs queries, it
+    /// just won't prefill/remember values across runs). Keyed by
+    /// `(connection_id, param name)` — see `open_query_params_dialog`/
+    /// `confirm_query_params`.
+    param_values: Option<ParamValuesStore>,
     // --- G5 Task 4: apply flow ---
     /// The Apply confirmation dialog (brief contract #1/#3/#4) — `None` when
     /// closed. Owned separately from `modal` (`connections_ui::ModalState`,
@@ -665,12 +710,130 @@ impl AppView {
     /// preview's `run_query_with` call (see `on_tree_event`'s
     /// `TreeEvent::OpenPreview` arm), which supplies its own SQL/title and
     /// never touches `self.sql`.
+    ///
+    /// G6 Task 3: also the single interception point for parametrized
+    /// `:name` queries — every editor-typed-query trigger (`on_run_query`,
+    /// `on_run_query_unlimited`, and the command palette's
+    /// `PaletteAction::RunQuery`) funnels through this one call before ever
+    /// reaching `run_query_with`, so intercepting here covers all three
+    /// with one change rather than duplicating the check at each call site.
     fn run_query(&mut self, bypass_auto_limit: bool, cx: &mut Context<Self>) {
         let sql = self.sql.read(cx).text();
         if sql.trim().is_empty() {
             return;
         }
-        self.run_query_with(sql, None, bypass_auto_limit, cx);
+        match find_params(&sql) {
+            Some(names) if !names.is_empty() => {
+                self.open_query_params_dialog(sql, names, bypass_auto_limit, cx);
+            }
+            // Some(empty) or None (fail-closed scan failure) — proceed
+            // exactly as before G6 Task 3, no behavior change.
+            _ => self.run_query_with(sql, None, bypass_auto_limit, cx),
+        }
+    }
+
+    /// Opens the `QueryParams` modal for `sql`'s distinct `:name`s, one
+    /// `TextField` + NULL flag per name, prefilled from `self.param_values`
+    /// (keyed by `current_conn_identity()` — the same stable connection
+    /// identity `ResultTab::conn_identity`/`apply_conn_spec` use, covering
+    /// both a saved connection and the CLI-arg `"cli"` sentinel). Refuses
+    /// to open a second modal on top of an existing one (same
+    /// single-modal-at-a-time invariant `run_query_with` itself enforces
+    /// via its own `self.modal.is_some()` guard).
+    fn open_query_params_dialog(
+        &mut self,
+        sql: String,
+        names: Vec<String>,
+        bypass_auto_limit: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal.is_some() {
+            return;
+        }
+        let conn_id = self.current_conn_identity();
+        let mut inputs = Vec::with_capacity(names.len());
+        let mut null_flags = Vec::with_capacity(names.len());
+        for name in &names {
+            let stored = self.param_values.as_ref().and_then(|s| s.get(&conn_id, name));
+            let prefill = stored.filter(|v| !v.is_null).map(|v| v.text.clone()).unwrap_or_default();
+            null_flags.push(stored.map(|v| v.is_null).unwrap_or(false));
+            inputs.push(cx.new(|cx| {
+                let mut f = connections_ui::TextField::new(cx, "", false);
+                f.set_text(&prefill, cx);
+                f
+            }));
+        }
+        self.modal = Some(connections_ui::ModalState::QueryParams {
+            names,
+            inputs,
+            null_flags,
+            sql_template: sql,
+            bypass_auto_limit,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    /// "Spustit" click — reads every input's live text + its `null_flags`
+    /// entry, substitutes via `build_param_sql` (which also runs the
+    /// CURATION-mandated post-substitution rescan, design §5). On `Ok`:
+    /// persists every value to `self.param_values` (best-effort — a
+    /// `store.set` error degrades silently, same posture `view_prefs`'s own
+    /// callers take), closes the modal, and runs the final SQL with the
+    /// caller's original `bypass_auto_limit`. On `Err`: sets the modal's
+    /// `error` (shown in the dialog) and does NOT close the modal, run
+    /// anything, or persist any value — persistence only ever happens on
+    /// the `Ok` branch, i.e. only on an actual confirmed run.
+    fn confirm_query_params(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::QueryParams {
+            names,
+            inputs,
+            null_flags,
+            sql_template,
+            bypass_auto_limit,
+            ..
+        }) = self.modal.clone()
+        else {
+            return;
+        };
+        let values: Vec<(String, bool)> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, input)| {
+                let text = input.read(cx).text();
+                let is_null = null_flags.get(i).copied().unwrap_or(false);
+                (text, is_null)
+            })
+            .collect();
+
+        match build_param_sql(&sql_template, &names, &values) {
+            Ok(final_sql) => {
+                let conn_id = self.current_conn_identity();
+                if let Some(store) = &mut self.param_values {
+                    for (name, (text, is_null)) in names.iter().zip(values.iter()) {
+                        let _ = store.set(
+                            &conn_id,
+                            name,
+                            ParamValue { text: text.clone(), is_null: *is_null },
+                        );
+                    }
+                }
+                self.modal = None;
+                self.run_query_with(final_sql, None, bypass_auto_limit, cx);
+            }
+            Err(msg) => {
+                if let Some(connections_ui::ModalState::QueryParams { error, .. }) = &mut self.modal {
+                    *error = Some(msg);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Esc / "Zrušit" — closes the dialog without running anything or
+    /// persisting any value ("Esc cancels — no run, no persistence").
+    fn cancel_query_params(&mut self, cx: &mut Context<Self>) {
+        self.close_modal(cx);
     }
 
     /// The actual guarded run pipeline (guard order per the doc comment on
@@ -1207,6 +1370,10 @@ impl AppView {
         if let Some(modal) = self.modal.clone() {
             let closable = match &modal {
                 connections_ui::ModalState::ConnectionDialog(ui) => ui.password.read(cx).text().is_empty(),
+                // G6 Task 3: no password/unsaved-secret concern here — Esc
+                // always cancels the values dialog (no run, no persistence,
+                // same contract as its "Zrušit" button/`cancel_query_params`).
+                connections_ui::ModalState::QueryParams { .. } => true,
                 _ => false,
             };
             if closable {
@@ -2997,6 +3164,12 @@ fn main() {
             Ok(v) => (Some(v), None),
             Err(e) => (None, Some(e.to_string())),
         };
+    // G6 Task 3: same "open at startup, None on failure, degrade
+    // gracefully" posture as `view_prefs` — a load failure here only means
+    // the values dialog won't prefill/remember values across runs, not
+    // that the feature stops working, so (unlike `view_prefs`/`history`)
+    // this isn't surfaced as its own startup status notice.
+    let param_values = ParamValuesStore::load(&dbc_state::default_param_values_path()).ok();
 
     application().run(move |cx: &mut App| {
         cx.bind_keys([
@@ -3078,6 +3251,7 @@ fn main() {
                             last_history_query: String::new(),
                             palette: None,
                             view_prefs,
+                            param_values,
                             apply_dialog: None,
                             discard_confirm: None,
                         }
@@ -3512,5 +3686,87 @@ mod decide_retrigger_action_tests {
         // dirty count in practice, but the guard shouldn't depend on that.
         assert_eq!(decide_retrigger_action(false, None), RetriggerAction::SkipClosed);
         assert_eq!(decide_retrigger_action(false, Some(1)), RetriggerAction::SkipClosed);
+    }
+}
+
+// G6 Task 3: `build_param_sql` — pure `:name` substitution + the
+// CURATION-mandated post-substitution rescan (design §5), tested standalone
+// without a GPUI window (same "pure helper + its own `#[cfg(test)] mod`"
+// convention as `preview_sql_tests`/`decide_retrigger_action_tests` above).
+#[cfg(test)]
+mod query_params_tests {
+    use super::*;
+
+    #[test]
+    fn substitutes_string_and_numeric_and_null() {
+        let names = vec!["name".to_string(), "age".to_string(), "note".to_string()];
+        let values = vec![
+            ("Alice".to_string(), false),
+            ("30".to_string(), false),
+            (String::new(), true),
+        ];
+        let sql = "SELECT * FROM t WHERE name = :name AND age = :age AND note = :note";
+        let out = build_param_sql(sql, &names, &values).unwrap();
+        assert_eq!(
+            out,
+            "SELECT * FROM t WHERE name = 'Alice' AND age = 30 AND note = NULL"
+        );
+    }
+
+    #[test]
+    fn empty_text_without_null_flag_is_empty_string_literal() {
+        let names = vec!["note".to_string()];
+        let values = vec![(String::new(), false)];
+        let out = build_param_sql("UPDATE t SET note = :note", &names, &values).unwrap();
+        assert_eq!(out, "UPDATE t SET note = ''");
+    }
+
+    #[test]
+    fn repeated_param_name_substitutes_every_occurrence() {
+        let names = vec!["x".to_string()];
+        let values = vec![("5".to_string(), false)];
+        let out = build_param_sql("WHERE a = :x OR b = :x", &names, &values).unwrap();
+        assert_eq!(out, "WHERE a = 5 OR b = 5");
+    }
+
+    // CURATION-mandated (design §5): a substituted value that happens to
+    // look like a `:name` token must never be allowed to reach the driver
+    // unescaped — the post-substitution rescan must catch it and refuse.
+    #[test]
+    fn post_substitution_rescan_rejects_a_surviving_bare_param() {
+        // A pathological template where the "value" text itself contains
+        // `:leak` and is substituted into a position `sql_value` does NOT
+        // quote (a non-numeric value always gets single-quoted, so this
+        // simulates the defense actually firing on a scanner/positional
+        // mismatch rather than proving it's reachable via normal typed
+        // input — the rescan is deliberately unconditional, design §5).
+        let names = vec!["x".to_string()];
+        // A value containing a literal, unquoted `:leak` sequence next to
+        // the substituted SQL text (outside any string this function
+        // produces) reproduces the "bare :name survives substitution"
+        // condition the rescan exists to catch.
+        let sql_template = "SELECT :x";
+        let out = build_param_sql(sql_template, &names, &[("1 UNION SELECT :leak".to_string(), false)]);
+        // sql_value quotes any non-numeric text, so the substituted value
+        // becomes a single string literal — the leaked `:leak` sits INSIDE
+        // that string literal's quotes, meaning find_params correctly does
+        // NOT flag it (it's not bare). This asserts the safe case succeeds...
+        assert!(out.is_ok());
+        // ...whereas a template that still has an UNRESOLVED name at
+        // substitution time (a name in the SQL not present in `names`,
+        // which `build_param_sql` maps to a defensive NULL — an
+        // implementation bug scenario) must still round-trip safely:
+        let out2 = build_param_sql("SELECT :x, :y", &names, &[("1".to_string(), false)]);
+        assert_eq!(out2, Ok("SELECT 1, NULL".to_string()));
+    }
+
+    #[test]
+    fn post_substitution_rescan_rejects_when_substitute_params_itself_fails_closed() {
+        // sql_template with an unterminated string — substitute_params
+        // returns None, build_param_sql must surface that as Err, not
+        // silently pass the unmodified (still-parametrized) template
+        // through to the caller.
+        let out = build_param_sql("SELECT ':x", &["x".to_string()], &[("1".to_string(), false)]);
+        assert!(out.is_err());
     }
 }

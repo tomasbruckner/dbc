@@ -902,6 +902,25 @@ pub enum ModalState {
         error: Option<String>,
         pending: PendingAfterUnlock,
     },
+    /// G6 Task 3: parametrized `:name` query values dialog — one row per
+    /// distinct name (`names`/`inputs`/`null_flags` are parallel, same
+    /// index), opened by `AppView::open_query_params_dialog` from
+    /// `run_query`'s interception. `sql_template` is the ORIGINAL SQL (with
+    /// live `:name` tokens, not yet substituted); `bypass_auto_limit` is
+    /// the caller's original run intent (Ctrl+Enter vs Ctrl+Shift+Enter vs
+    /// palette), carried through so confirming the dialog runs with the
+    /// SAME guard behavior the user originally asked for. `error` is set by
+    /// `confirm_query_params` when `build_param_sql` refuses (design §5's
+    /// mandatory post-substitution rescan) — shown in the dialog, dialog
+    /// stays open, nothing runs, nothing persists.
+    QueryParams {
+        names: Vec<String>,
+        inputs: Vec<Entity<TextField>>,
+        null_flags: Vec<bool>,
+        sql_template: String,
+        bypass_auto_limit: bool,
+        error: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------
@@ -1021,6 +1040,9 @@ impl AppView {
             ModalState::MasterPasswordPrompt { input, error, .. } => render_master_password_panel(input, error, cx),
             ModalState::CreateMasterPassword { input1, input2, error, .. } => {
                 render_create_master_password_panel(input1, input2, error, cx)
+            }
+            ModalState::QueryParams { names, inputs, null_flags, sql_template, error, .. } => {
+                render_query_params_panel(names, inputs, null_flags, sql_template, error, cx)
             }
         };
         Some(
@@ -1476,6 +1498,21 @@ impl AppView {
             Err(e) => self.set_create_master_error(&e.message, cx),
         }
     }
+
+    /// G6 Task 3: the QueryParams dialog's per-row "NULL" checkbox — same
+    /// small-toggle shape as `toggle_read_only`/`toggle_favourite`/
+    /// `toggle_ssh_enabled` above. Does not clear the row's `TextField`
+    /// text (so unchecking NULL restores whatever was typed); the checked
+    /// state alone decides NULL-vs-text at substitution time
+    /// (`build_param_sql` in main.rs).
+    fn toggle_query_param_null(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(ModalState::QueryParams { null_flags, .. }) = &mut self.modal {
+            if let Some(flag) = null_flags.get_mut(ix) {
+                *flag = !*flag;
+            }
+        }
+        cx.notify();
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1796,6 +1833,108 @@ fn render_create_master_password_panel(
             .mt_2()
             .child(styled_button("cmp-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
             .child(styled_button("cmp-submit", "Vytvořit").on_click(cx.listener(|v, _, window, cx| v.on_create_master_password_submit(window, cx)))),
+    );
+    panel.into_any_element()
+}
+
+/// G6 Task 3: one row per distinct `:name` (label + `TextField` + a "NULL"
+/// checkbox, same visual idiom as `grid.rs`'s cell editor's Uložit/NULL/
+/// Zrušit), a live substituted-SQL preview line (recomputed read-only from
+/// the inputs' CURRENT text on every render — cheap at interactive SQL
+/// sizes, same posture the design doc calls for; it does not gate typing),
+/// and an error line when `confirm_query_params` (main.rs) has set one.
+/// `build_param_sql` (main.rs, crate-private but visible here — this
+/// module is a child of the crate root) is the single source of truth for
+/// both the preview and the actual Spustit dispatch, so the preview can
+/// never show a different result than what running would actually do.
+fn render_query_params_panel(
+    names: Vec<String>,
+    inputs: Vec<Entity<TextField>>,
+    null_flags: Vec<bool>,
+    sql_template: String,
+    error: Option<String>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let values: Vec<(String, bool)> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            let text = input.read(cx).text();
+            let is_null = null_flags.get(i).copied().unwrap_or(false);
+            (text, is_null)
+        })
+        .collect();
+    let preview = crate::build_param_sql(&sql_template, &names, &values);
+
+    let mut panel: Div = div()
+        .w(px(480.))
+        .max_h(px(520.))
+        .bg(rgb(0x1e1e2e))
+        .border_1()
+        .border_color(rgb(0x45475a))
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(rgb(0xcdd6f4))
+        .child(div().text_size(px(16.)).child("Hodnoty parametrů"));
+
+    for (i, name) in names.iter().enumerate() {
+        let input = inputs[i].clone();
+        let is_null = null_flags.get(i).copied().unwrap_or(false);
+        let mark = if is_null { "☑" } else { "☐" };
+        panel = panel.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(div().w(px(110.)).text_color(rgb(0xa6adc8)).child(format!(":{name}")))
+                .child(div().flex_1().child(input))
+                .child(
+                    div()
+                        .id(("qp-null", i))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .cursor_pointer()
+                        .child(format!("{mark} NULL"))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.toggle_query_param_null(i, cx);
+                        })),
+                ),
+        );
+    }
+
+    panel = panel.child(
+        div()
+            .id("qp-preview")
+            .p_1()
+            .bg(rgb(0x181825))
+            .rounded_md()
+            .text_color(rgb(0xa6adc8))
+            .whitespace_normal()
+            .child(match &preview {
+                Ok(sql) => sql.clone(),
+                Err(e) => format!("náhled: {e}"),
+            }),
+    );
+
+    if let Some(e) = error {
+        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(e));
+    }
+
+    panel = panel.child(
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .justify_end()
+            .mt_2()
+            .child(styled_button("qp-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.cancel_query_params(cx))))
+            .child(styled_button("qp-run", "Spustit").on_click(cx.listener(|v, _, _, cx| v.confirm_query_params(cx)))),
     );
     panel.into_any_element()
 }
