@@ -931,12 +931,25 @@ pub enum ModalState {
     /// `error` is a failed kill's message: the dialog stays open with it
     /// (same "error stays in the modal" precedent as Apply's
     /// rollback-error UX).
+    ///
+    /// Review fix (MAJOR + MINOR, G9 T6 adversarial review): `pid`+`tab_id`
+    /// are what let `on_monitor_view_event` (main.rs) tell THIS dialog's
+    /// outcome apart from some other tab's/pid's in-flight kill — a
+    /// `KillFinished` event whose `(pid, tab_id)` doesn't match the
+    /// currently open dialog must never mutate it (misattribution: one
+    /// kill's result landing in a DIFFERENT kill's dialog). `dispatched`
+    /// guards the same class of bug on the send side: nothing previously
+    /// stopped a double-click on "Ukončit proces" from dispatching two
+    /// `Kill` commands for the same pid while the first was still in
+    /// flight — `confirm_kill_confirm` sets it on the first click and
+    /// becomes a no-op on any click after.
     KillConfirm {
         pid: i64,
         label: String, // "{user} · {application} · běží {n}s"
         sql: String,
         tab_id: u64,
         error: Option<String>,
+        dispatched: bool,
     },
 }
 
@@ -1061,8 +1074,8 @@ impl AppView {
             ModalState::QueryParams { names, inputs, null_flags, sql_template, error, .. } => {
                 render_query_params_panel(names, inputs, null_flags, sql_template, error, cx)
             }
-            ModalState::KillConfirm { pid, label, sql, error, .. } => {
-                render_kill_confirm_panel(pid, &label, &sql, &error, cx)
+            ModalState::KillConfirm { pid, label, sql, error, dispatched, .. } => {
+                render_kill_confirm_panel(pid, &label, &sql, &error, dispatched, cx)
             }
         };
         Some(
@@ -1559,11 +1572,15 @@ impl AppView {
     /// tab's `MonitorView`; the dialog STAYS OPEN until
     /// `MonitorViewEvent::KillFinished` resolves (T6's on_monitor_view_event
     /// closes it on Ok / fills `error` on Err).
+    ///
+    /// MINOR review fix: a double-click used to `try_send` two `Kill`
+    /// commands for the same pid — `kill_confirm_dispatch_target` (below)
+    /// returns `None` once `dispatched` is already `true`, making a second
+    /// call a no-op.
     pub(crate) fn confirm_kill_confirm(&mut self, cx: &mut Context<Self>) {
-        let Some(ModalState::KillConfirm { pid, tab_id, .. }) = &self.modal else {
+        let Some((pid, tab_id)) = kill_confirm_dispatch_target(&self.modal) else {
             return;
         };
-        let (pid, tab_id) = (*pid, *tab_id);
         let Some(view) = self.monitor_view_for_tab(tab_id) else {
             // Tab closed under the dialog — nothing to kill against.
             self.modal = None;
@@ -1571,6 +1588,11 @@ impl AppView {
             cx.notify();
             return;
         };
+        // Mark in-flight BEFORE dispatching so a rapid double-click can't
+        // slip a second Kill through between this check and the send.
+        if let Some(ModalState::KillConfirm { dispatched, .. }) = &mut self.modal {
+            *dispatched = true;
+        }
         view.update(cx, |m, cx| m.dispatch_kill(pid, cx));
         // Deliberately no self.modal = None here: success/failure arrives
         // as MonitorViewEvent::KillFinished (T6), which closes the dialog
@@ -2004,15 +2026,56 @@ fn render_query_params_panel(
     panel.into_any_element()
 }
 
+/// Pure guard for `AppView::confirm_kill_confirm` (MINOR review fix):
+/// `Some((pid, tab_id))` when an OPEN `KillConfirm` dialog has not yet
+/// dispatched its kill; `None` when there's no `KillConfirm` open at all, OR
+/// one is open but `dispatched` is already `true` (a second click while the
+/// first kill is still in flight must be a no-op — nothing else stopped a
+/// double-click from `try_send`-ing two `Kill` commands for the same pid).
+/// Factored out as a free function, same "pure logic, thin cx-touching
+/// wrapper" split `monitor_view::MonitorView::apply_event` uses, so it's
+/// unit-testable without a GPUI entity/`Context`.
+fn kill_confirm_dispatch_target(modal: &Option<ModalState>) -> Option<(i64, u64)> {
+    match modal {
+        Some(ModalState::KillConfirm { pid, tab_id, dispatched: false, .. }) => Some((*pid, *tab_id)),
+        _ => None,
+    }
+}
+
+/// Pure guard for `AppView::on_monitor_view_event` (MAJOR review fix): does
+/// the resolving `KillFinished` event — from tab `event_tab_id`, for
+/// `event_pid` — belong to the CURRENTLY open `KillConfirm` dialog? A
+/// `false` here means some OTHER kill's outcome arrived (a different pid on
+/// the same tab, or the same/different pid on a different monitor tab, or
+/// the dialog was cancelled/closed already) — the caller must not mutate
+/// `self.modal` in that case, or one kill's result gets misattributed into
+/// an unrelated open dialog (wrong error text, or silently closing a dialog
+/// nobody confirmed). Same testability rationale as
+/// `kill_confirm_dispatch_target` above. `pub(crate)`: called from
+/// `main.rs`'s `on_monitor_view_event`.
+pub(crate) fn kill_confirm_matches(modal: &Option<ModalState>, event_tab_id: u64, event_pid: i64) -> bool {
+    matches!(
+        modal,
+        Some(ModalState::KillConfirm { pid, tab_id, .. })
+            if *pid == event_pid && *tab_id == event_tab_id
+    )
+}
+
 /// G9 T5: the kill-confirm dialog panel — same card tokens as every other
 /// modal in this file. Shows the exact SQL that will run (design §6's "show
 /// the exact generated SQL" principle) and, on a failed attempt, the error
-/// text below it (dialog stays open).
+/// text below it (dialog stays open). `dispatched` (MINOR review fix)
+/// greys out "Ukončit proces" and drops its click handler once a kill is in
+/// flight, so a second click can't fire a second `Kill`; "Zrušit" stays
+/// active throughout — dismissing the dialog while a kill is in flight is
+/// harmless (the eventual `KillFinished` just finds no matching dialog to
+/// update, per `kill_confirm_matches`, and falls back to a status line).
 fn render_kill_confirm_panel(
     pid: i64,
     label: &str,
     sql: &str,
     error: &Option<String>,
+    dispatched: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let mut panel: Div = div()
@@ -2043,6 +2106,23 @@ fn render_kill_confirm_panel(
         panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {e}")));
     }
 
+    let confirm_button = if dispatched {
+        div()
+            .id("kill-confirm")
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0x313244))
+            .text_color(rgb(0x6c7086))
+            .child("Ukončuji…")
+            .into_any_element()
+    } else {
+        styled_button("kill-confirm", "Ukončit proces")
+            .bg(rgb(0x5d2e2e)) // danger tint — DELETED_ROW_BG family
+            .on_click(cx.listener(|v, _, _, cx| v.confirm_kill_confirm(cx)))
+            .into_any_element()
+    };
+
     panel = panel.child(
         div()
             .flex()
@@ -2054,11 +2134,81 @@ fn render_kill_confirm_panel(
                 styled_button("kill-cancel", "Zrušit")
                     .on_click(cx.listener(|v, _, _, cx| v.cancel_kill_confirm(cx))),
             )
-            .child(
-                styled_button("kill-confirm", "Ukončit proces")
-                    .bg(rgb(0x5d2e2e)) // danger tint — DELETED_ROW_BG family
-                    .on_click(cx.listener(|v, _, _, cx| v.confirm_kill_confirm(cx))),
-            ),
+            .child(confirm_button),
     );
     panel.into_any_element()
+}
+
+#[cfg(test)]
+mod kill_confirm_tests {
+    use super::*;
+
+    fn kill_confirm(pid: i64, tab_id: u64, dispatched: bool) -> Option<ModalState> {
+        Some(ModalState::KillConfirm {
+            pid,
+            label: "u · app · běží 5s".into(),
+            sql: format!("SELECT pg_terminate_backend({pid})"),
+            tab_id,
+            error: None,
+            dispatched,
+        })
+    }
+
+    // --- kill_confirm_dispatch_target (MINOR: double-dispatch guard) ---
+
+    #[test]
+    fn dispatch_target_none_when_no_dialog_open() {
+        assert_eq!(kill_confirm_dispatch_target(&None), None);
+    }
+
+    #[test]
+    fn dispatch_target_some_when_not_yet_dispatched() {
+        let modal = kill_confirm(42, 7, false);
+        assert_eq!(kill_confirm_dispatch_target(&modal), Some((42, 7)));
+    }
+
+    #[test]
+    fn dispatch_target_none_once_already_dispatched() {
+        // Regression for the MINOR finding: a second confirm click must be
+        // a no-op while the first kill is still in flight.
+        let modal = kill_confirm(42, 7, true);
+        assert_eq!(kill_confirm_dispatch_target(&modal), None);
+    }
+
+    // --- kill_confirm_matches (MAJOR: misattribution guard) ---
+
+    #[test]
+    fn matches_true_for_same_pid_and_tab() {
+        let modal = kill_confirm(1, 100, false);
+        assert!(kill_confirm_matches(&modal, 100, 1));
+    }
+
+    #[test]
+    fn matches_false_for_different_pid_same_tab() {
+        // The MAJOR repro: pid 1's dialog cancelled, pid 2's dialog open on
+        // the same tab, pid 1's stale KillResult arrives.
+        let modal = kill_confirm(2, 100, false);
+        assert!(!kill_confirm_matches(&modal, 100, 1));
+    }
+
+    #[test]
+    fn matches_false_for_same_pid_different_tab() {
+        // The cross-tab variant: two monitor tabs, same pid coincidentally.
+        let modal = kill_confirm(1, 200, false);
+        assert!(!kill_confirm_matches(&modal, 100, 1));
+    }
+
+    #[test]
+    fn matches_false_when_no_dialog_open() {
+        assert!(!kill_confirm_matches(&None, 100, 1));
+    }
+
+    #[test]
+    fn matches_ignores_dispatched_flag() {
+        // A dispatched-but-still-open matching dialog must still resolve —
+        // `dispatched` only gates the SEND side (dispatch_target), not the
+        // RESOLVE side (matches).
+        let modal = kill_confirm(1, 100, true);
+        assert!(kill_confirm_matches(&modal, 100, 1));
+    }
 }

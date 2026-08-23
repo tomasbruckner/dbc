@@ -2769,13 +2769,26 @@ impl AppView {
                     sql: sql.clone(),
                     tab_id,
                     error: None,
+                    dispatched: false,
                 });
                 cx.notify();
             }
             monitor_view::MonitorViewEvent::KillFinished { pid, result } => {
+                // MAJOR review fix: only touch `self.modal` when it's STILL
+                // the KillConfirm dialog THIS event belongs to (same pid AND
+                // same originating tab) — otherwise a stale/cancelled kill's
+                // outcome can land in an unrelated, currently-open dialog
+                // (same tab, different pid; or a different monitor tab
+                // entirely) and either overwrite its error or silently
+                // close it out from under the user. `tab_id` here is this
+                // handler's own parameter — fixed per-subscription to the
+                // tab whose MonitorView emitted the event (see
+                // `open_monitor_tab`'s `cx.subscribe`), so it IS the
+                // event's true origin, no extra plumbing needed.
+                let matches_open_dialog = connections_ui::kill_confirm_matches(&self.modal, tab_id, *pid);
                 match result {
                     Ok(()) => {
-                        if matches!(&self.modal, Some(connections_ui::ModalState::KillConfirm { .. })) {
+                        if matches_open_dialog {
                             self.modal = None;
                         }
                         // pg reports Ok even when the pid already exited
@@ -2786,9 +2799,12 @@ impl AppView {
                         self.status = format!("proces {pid} ukončen");
                     }
                     Err(msg) => {
-                        if let Some(connections_ui::ModalState::KillConfirm { error, .. }) = &mut self.modal
-                        {
-                            *error = Some(msg.clone()); // dialog stays open
+                        if matches_open_dialog {
+                            if let Some(connections_ui::ModalState::KillConfirm { error, .. }) =
+                                &mut self.modal
+                            {
+                                *error = Some(msg.clone()); // dialog stays open
+                            }
                         } else {
                             self.status = format!("error: {msg}");
                         }
