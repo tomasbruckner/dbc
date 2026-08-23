@@ -1,6 +1,7 @@
 mod autocomplete;
 mod connect;
 mod connections_ui;
+mod csv_import;
 mod export;
 mod fk_join;
 mod grid;
