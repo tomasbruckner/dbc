@@ -346,16 +346,9 @@ impl QueryRunner {
     /// independent — a failure on one side does not cancel or block the
     /// other.
     ///
-    /// `#[allow(dead_code)]`: no caller exists yet in this worktree — G7 T6
-    /// (`connections_ui.rs`'s `CompareDialog` confirm handler) is the first
-    /// call site. The plain `cargo build` (no `#[cfg(test)]`) has no reader
-    /// at all today; `diff_fetch_tests` exercises the underlying logic
-    /// directly (mirroring `fetch_diff_side_inner`'s own reasoning) rather
-    /// than through this method, since spawning a full `QueryRunner` inside
-    /// a `#[tokio::test]` async fn panics on drop (see this module's
-    /// `diff_fetch_tests` doc comments). Remove this allow once T6 wires a
-    /// real call site.
-    #[allow(dead_code)]
+    /// G7 T6 wired the first real call site
+    /// (`connections_ui::AppView::confirm_compare_dialog`) — the
+    /// `#[allow(dead_code)]` this carried through T5 is removed.
     pub fn fetch_schema_pair(
         &self,
         spec_a: ConnectSpec,
@@ -2152,5 +2145,319 @@ mod diff_fetch_tests {
         let (result_a, result_b) = tokio::join!(fetch_a, fetch_b);
         assert!(result_a.is_ok(), "the good side must succeed independently of the bad side: {result_a:?}");
         assert!(result_b.is_err(), "the bad side must fail without being masked by the good side");
+    }
+}
+
+/// G7 T9: docker-based empirical validation of the whole T5 pipeline
+/// (`fetch_schema_pair`, `fetch_diff_side`, `compose_diff_select`'s guard)
+/// against a REAL Postgres 16.13 server. `diff_schema_tests` (dbc-diff, T2)
+/// and `diff_fetch_tests` above already prove the pure logic and the guard
+/// over hand-built fixtures / a writable sqlite connection; this module
+/// proves the same pipeline survives genuine live catalog output — two
+/// actually-different databases, `format_type()` text, real PK/index
+/// metadata — and that the WHERE-box guard holds end-to-end against a real
+/// server, not just a mock or a driver that happens not to support batched
+/// statements. Docker required. Run with:
+///   %USERPROFILE%\.cargo\bin\cargo.exe test -p dbc-ui -- --ignored compare_pg_tests::
+///
+/// Same hazard/pattern as `monitor_pg_tests` above (see that module's doc
+/// comment for the full rationale, not repeated here): every test is a
+/// plain, NON-async `#[test]` driven through `runner.handle().block_on(...)`,
+/// NOT `#[tokio::test]` — `#[tokio::test]` runs the body on a tokio worker
+/// thread, where `open_spec`'s nested `spawn_blocking` -> `block_on` for the
+/// Postgres handshake panics ("Cannot start a runtime from within a
+/// runtime"), and dropping `QueryRunner`'s own `Runtime` at end of scope
+/// panics too if that scope is itself async. `open_spec` is used for every
+/// setup connection (never `connect::open` directly, same reason). The ONE
+/// `QueryRunner` each test constructs is used for BOTH the setup
+/// (`open_pg`, which reuses `open_spec` under `Handle::current()` — the
+/// runtime `block_on` itself is driving) and the actual
+/// `fetch_schema_pair`/`fetch_diff_side` calls under test — a second nested
+/// `QueryRunner::new()` is deliberately never constructed inside the
+/// `block_on` body, since dropping ITS `Runtime` before the outer
+/// `block_on` returns would hit the exact same nested-runtime panic.
+#[cfg(test)]
+mod compare_pg_tests {
+    use super::*;
+    use testcontainers_modules::{
+        postgres::Postgres,
+        testcontainers::{runners::AsyncRunner, ImageExt},
+    };
+
+    async fn pg_url(
+        node: &testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+        db: &str,
+    ) -> String {
+        format!(
+            "postgres://postgres:postgres@127.0.0.1:{}/{db}",
+            node.get_host_port_ipv4(5432).await.unwrap()
+        )
+    }
+
+    /// open_spec (NOT connect::open): see the module doc comment above.
+    async fn open_pg(url: &str) -> Box<dyn Connection> {
+        let handle = tokio::runtime::Handle::current();
+        open_spec(ConnectSpec::Url(url.to_string()), handle).await.expect("connect").conn
+    }
+
+    /// `CREATE DATABASE` can't run inside sqlx-style batching anyway — one
+    /// statement per `execute()` call, autocommit, exactly like every other
+    /// setup statement in this module and in `monitor_pg_tests`.
+    async fn create_database(default_db_url: &str, name: &str) {
+        let mut conn = open_pg(default_db_url).await;
+        conn.execute(&format!("CREATE DATABASE {name}"), CancelToken::new()).await.unwrap();
+    }
+
+    /// Seeds TWO genuinely different live databases inside the same
+    /// container with KNOWN schema deltas: `only_a` exists only on the left
+    /// (must diff as Removed), `only_b` only on the right (Added), and
+    /// `keep` exists on both sides but with a changed column (`note`'s type,
+    /// integer -> bigint) AND an added column (`extra`) — so the shared
+    /// table is Changed for two independent, individually-asserted reasons.
+    /// Runs the REAL `fetch_schema_pair` -> `diff_schema` pipeline over live
+    /// catalog output (not hand-built `SchemaSnapshot` fixtures, unlike
+    /// every T2 test) and asserts the diff matches the seeded deltas
+    /// exactly. Container is torn down automatically when `node` drops at
+    /// the end of this fn (testcontainers' own `ContainerAsync` Drop impl —
+    /// no manual cleanup step needed, same as every other docker test in
+    /// this file).
+    #[test]
+    #[ignore]
+    fn fetch_schema_pair_matches_seeded_deltas_on_live_postgres() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let node = Postgres::default().with_tag("16.13").start().await.unwrap();
+            let default_url = pg_url(&node, "postgres").await;
+            create_database(&default_url, "dba").await;
+            create_database(&default_url, "dbb").await;
+            let url_a = pg_url(&node, "dba").await;
+            let url_b = pg_url(&node, "dbb").await;
+
+            {
+                let mut a = open_pg(&url_a).await;
+                a.execute(
+                    "CREATE TABLE keep (id integer PRIMARY KEY, name text NOT NULL, note integer)",
+                    CancelToken::new(),
+                )
+                .await
+                .unwrap();
+                a.execute("CREATE TABLE only_a (id integer PRIMARY KEY)", CancelToken::new())
+                    .await
+                    .unwrap();
+            }
+            {
+                let mut b = open_pg(&url_b).await;
+                b.execute(
+                    "CREATE TABLE keep (id integer PRIMARY KEY, name text NOT NULL, note bigint, extra text)",
+                    CancelToken::new(),
+                )
+                .await
+                .unwrap();
+                b.execute("CREATE TABLE only_b (id integer PRIMARY KEY)", CancelToken::new())
+                    .await
+                    .unwrap();
+            }
+
+            let rx = runner.fetch_schema_pair(ConnectSpec::Url(url_a), ConnectSpec::Url(url_b));
+            let (result_a, result_b) = rx.await.unwrap();
+            let (snap_a, snap_b) = (result_a.unwrap(), result_b.unwrap());
+
+            let diff = dbc_diff::schema_diff::diff_schema(
+                &snap_a,
+                &snap_b,
+                dbc_diff::schema_diff::CompareMode::SameEngine,
+            );
+
+            let only_a = diff.tables.iter().find(|t| t.name == "only_a").expect("only_a present in diff");
+            assert_eq!(only_a.status, dbc_diff::schema_diff::TableStatus::Removed);
+
+            let only_b = diff.tables.iter().find(|t| t.name == "only_b").expect("only_b present in diff");
+            assert_eq!(only_b.status, dbc_diff::schema_diff::TableStatus::Added);
+
+            let keep = diff.tables.iter().find(|t| t.name == "keep").expect("keep present in diff");
+            assert_eq!(keep.status, dbc_diff::schema_diff::TableStatus::Changed);
+            assert!(
+                keep.columns.iter().any(|c| matches!(c,
+                    dbc_diff::schema_diff::ObjectDiff::Changed { left, fields, .. }
+                        if left.name == "note" && fields.iter().any(|f| f.field == "data_type"))),
+                "note's type change (integer -> bigint) must be detected as Changed: {:?}",
+                keep.columns
+            );
+            assert!(
+                keep.columns.iter().any(|c| matches!(c,
+                    dbc_diff::schema_diff::ObjectDiff::Added(col) if col.name == "extra")),
+                "extra column must be detected as Added: {:?}",
+                keep.columns
+            );
+        });
+    }
+
+    /// Seeds a `rows_t` table with KNOWN row deltas on two live databases —
+    /// id=1 only on the left (Removed), id=4 only on the right (Added),
+    /// id=3's `val` differs on each side (Changed), id=2 is identical
+    /// (Unchanged) — and runs the REAL `fetch_diff_side` (both sides) ->
+    /// `dbc_diff::data_diff::diff_data` pipeline over live query output,
+    /// asserting every row lands in the expected bucket by its actual `id`
+    /// value read back out of the `ResultBuffer`s (not by row-index
+    /// position, which live sequential-scan order doesn't formally
+    /// guarantee).
+    #[test]
+    #[ignore]
+    fn fetch_diff_side_and_diff_data_detect_seeded_row_deltas_on_live_postgres() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let node = Postgres::default().with_tag("16.13").start().await.unwrap();
+            let default_url = pg_url(&node, "postgres").await;
+            create_database(&default_url, "dra").await;
+            create_database(&default_url, "drb").await;
+            let url_a = pg_url(&node, "dra").await;
+            let url_b = pg_url(&node, "drb").await;
+
+            {
+                let mut a = open_pg(&url_a).await;
+                a.execute("CREATE TABLE rows_t (id integer PRIMARY KEY, val text)", CancelToken::new())
+                    .await
+                    .unwrap();
+                a.execute(
+                    "INSERT INTO rows_t VALUES (1, 'only-left'), (2, 'same'), (3, 'left-version')",
+                    CancelToken::new(),
+                )
+                .await
+                .unwrap();
+            }
+            {
+                let mut b = open_pg(&url_b).await;
+                b.execute("CREATE TABLE rows_t (id integer PRIMARY KEY, val text)", CancelToken::new())
+                    .await
+                    .unwrap();
+                b.execute(
+                    "INSERT INTO rows_t VALUES (2, 'same'), (3, 'right-version'), (4, 'only-right')",
+                    CancelToken::new(),
+                )
+                .await
+                .unwrap();
+            }
+
+            let rx_a = runner.fetch_diff_side(ConnectSpec::Url(url_a), None, "rows_t".to_string(), None);
+            let (_, schema_a, mut buf_a) = rx_a.await.unwrap().unwrap();
+            let rx_b = runner.fetch_diff_side(ConnectSpec::Url(url_b), None, "rows_t".to_string(), None);
+            let (_, schema_b, mut buf_b) = rx_b.await.unwrap().unwrap();
+
+            let names_a: Vec<String> = schema_a.fields().iter().map(|f| f.name().to_string()).collect();
+            let names_b: Vec<String> = schema_b.fields().iter().map(|f| f.name().to_string()).collect();
+            let pk_a = vec![names_a.iter().position(|n| n == "id").expect("id column on left")];
+            let pk_b = vec![names_b.iter().position(|n| n == "id").expect("id column on right")];
+
+            let outcome =
+                dbc_diff::data_diff::diff_data(&mut buf_a, &names_a, &pk_a, &mut buf_b, &names_b, &pk_b)
+                    .expect("diff_data must succeed under DIFF_ROW_CAP");
+
+            let removed_ids: Vec<String> = outcome
+                .rows
+                .iter()
+                .filter_map(|r| match r {
+                    dbc_diff::data_diff::RowDiff::Removed { left_row } => {
+                        Some(buf_a.cell_text(*left_row, pk_a[0]))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(removed_ids, vec!["1".to_string()], "id=1 only exists on the left — must be Removed");
+
+            let added_ids: Vec<String> = outcome
+                .rows
+                .iter()
+                .filter_map(|r| match r {
+                    dbc_diff::data_diff::RowDiff::Added { right_row } => {
+                        Some(buf_b.cell_text(*right_row, pk_b[0]))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(added_ids, vec!["4".to_string()], "id=4 only exists on the right — must be Added");
+
+            let changed_ids: Vec<String> = outcome
+                .rows
+                .iter()
+                .filter_map(|r| match r {
+                    dbc_diff::data_diff::RowDiff::Changed { left_row, .. } => {
+                        Some(buf_a.cell_text(*left_row, pk_a[0]))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(changed_ids, vec!["3".to_string()], "id=3's val differs on each side — must be Changed");
+
+            let unchanged_ids: Vec<String> = outcome
+                .rows
+                .iter()
+                .filter_map(|r| match r {
+                    dbc_diff::data_diff::RowDiff::Unchanged { left_row, .. } => {
+                        Some(buf_a.cell_text(*left_row, pk_a[0]))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(unchanged_ids, vec!["2".to_string()], "id=2 is identical on both sides — must be Unchanged");
+
+            let val_idx = outcome
+                .intersection_columns
+                .iter()
+                .position(|c| c == "val")
+                .expect("val is a shared column");
+            let changed_cols_ok = outcome.rows.iter().any(|r| matches!(r,
+                dbc_diff::data_diff::RowDiff::Changed { changed_cols, .. } if changed_cols.contains(&val_idx)));
+            assert!(changed_cols_ok, "the Changed row's changed_cols must point at the val column");
+        });
+    }
+
+    /// End-to-end proof of the CURATION-required WHERE-box guard against a
+    /// REAL server (see `diff_fetch_tests::compose_diff_select_refuses_multi_statement_injection_client_side`
+    /// for the pure-function proof and
+    /// `diff_fetch_tests::fetch_diff_side_end_to_end_refuses_before_touching_the_connection`
+    /// for the sqlite companion): a malicious multi-statement WHERE-box
+    /// payload is refused by `compose_diff_select` before `fetch_diff_side`
+    /// ever opens a connection to the live container, and a follow-up CLEAN
+    /// fetch proves the row count is untouched — the strongest possible
+    /// proof against a real server that "refused client-side" really means
+    /// "never even reached the database", not merely "the database also
+    /// happened to reject it".
+    #[test]
+    #[ignore]
+    fn fetch_diff_side_where_box_guard_holds_against_live_postgres() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let node = Postgres::default().with_tag("16.13").start().await.unwrap();
+            let url = pg_url(&node, "postgres").await;
+            {
+                let mut conn = open_pg(&url).await;
+                conn.execute("CREATE TABLE t (id integer PRIMARY KEY, n text)", CancelToken::new())
+                    .await
+                    .unwrap();
+                conn.execute("INSERT INTO t VALUES (1, 'a')", CancelToken::new()).await.unwrap();
+            }
+
+            let rx = runner.fetch_diff_side(
+                ConnectSpec::Url(url.clone()),
+                None,
+                "t".to_string(),
+                Some("1=1; DELETE FROM t".to_string()),
+            );
+            let result = rx.await.unwrap();
+            assert!(
+                result.is_err(),
+                "a multi-statement WHERE-box payload must be refused before touching the container"
+            );
+
+            // Follow-up: a CLEAN fetch (no WHERE box) proves the row is
+            // still there — the malicious statement never reached Postgres.
+            let rx2 = runner.fetch_diff_side(ConnectSpec::Url(url), None, "t".to_string(), None);
+            let (_, _, mut buf) = rx2.await.unwrap().expect("clean fetch must succeed");
+            assert_eq!(buf.row_count(), 1, "row must be untouched — the injected DELETE never executed");
+            assert_eq!(buf.cell_text(0, 0), "1", "the surviving row must still be id=1");
+        });
     }
 }
