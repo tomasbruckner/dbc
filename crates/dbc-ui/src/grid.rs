@@ -14,9 +14,18 @@ use crate::connections_ui::TextField;
 use crate::export::{self, ExportFormat};
 use crate::fk_join::{self, JoinSpec, VirtualCol};
 use crate::row_view::{self, RowView};
+use crate::sandbox::{self, EditState, Editable};
 
 pub const ROW_HEIGHT: f32 = 24.0;
 pub const DEFAULT_COL_WIDTH: f32 = 160.0;
+/// G5 Task 3: leftmost per-row affordance column on an editable tab — "✕"
+/// (toggle delete) per real row, "␡" (remove) per inserted row. Narrow by
+/// design (brief: "~24 px") since it holds a single glyph, not text.
+const GUTTER_WIDTH: f32 = 24.0;
+/// G5 Task 3 diff tints (brief contract #3, exact values).
+const STAGED_CELL_BG: u32 = 0x6b5d2e;
+const DELETED_ROW_BG: u32 = 0x5d2e2e;
+const INSERTED_ROW_BG: u32 = 0x2e5d3a;
 /// G4 Task 2: above this many rows, a sort click sets `status_note` to
 /// "řadím…" before `rebuild_view` runs. `rebuild` is synchronous today, so
 /// this note is a retroactive "that sort was over a big set" marker rather
@@ -173,6 +182,30 @@ struct CellDetail {
     scroll_lines: usize,
 }
 
+/// G5 Task 3: which cell a `CellEditor` overlay is staging into — a real
+/// row's cell (keyed by SOURCE row, brief contract #6) or one column of a
+/// not-yet-applied inserted row (`sandbox::EditState::inserted_rows`
+/// index).
+#[derive(Clone, Copy)]
+enum EditTarget {
+    Cell { source_row: usize, col: usize },
+    Insert { ins_ix: usize, col: usize },
+}
+
+/// G5 Task 3: the cell-editor overlay a double-click opens on an editable
+/// tab (brief contract #2) — column name + the full ORIGINAL (committed)
+/// text shown for reference, an editable `TextField` prefilled with the
+/// CURRENT display value (staged value if this cell is already staged, else
+/// the original), and Uložit/NULL/Zrušit. `original_text` is fixed at open
+/// time (rendered once); `input`'s live text is read only when Uložit is
+/// clicked.
+struct CellEditor {
+    target: EditTarget,
+    column_name: String,
+    original_text: String,
+    input: Entity<TextField>,
+}
+
 pub struct ResultGrid {
     pub buffer: Option<Rc<RefCell<ResultBuffer>>>,
     pub col_widths: Vec<f32>,
@@ -315,6 +348,29 @@ pub struct ResultGrid {
     /// so the stale response is dropped (last-dispatched wins, not
     /// last-arrived).
     lookup_generation: Vec<u64>,
+    // --- G5 Task 3: grid edit mode (staged diff over `sandbox::EditState`) ---
+    /// `Some` only on a PREVIEW tab that passed every `detect_editable_pk`
+    /// check (brief contract #1) — set once by `main.rs` via
+    /// `set_editable`, right after `set_buffer`/`set_fk_info`. Drives every
+    /// edit affordance below: `None` means no gutter, no cell editor (a
+    /// double-click falls back to the existing read-only `cell_detail`
+    /// popup), no "+ řádek" button, exactly the brief's "PK-less table or
+    /// read-only or ad-hoc" case.
+    pub editable: Option<Editable>,
+    /// Staged, not-yet-applied edits for this tab — the Apply dialog (a
+    /// later task) will turn this into `sandbox::generate_statements`
+    /// input; here it only drives staged/deleted/inserted diff rendering
+    /// and the tab-strip dirty indicator (`main.rs` reads
+    /// `edit_state.is_dirty()`).
+    pub edit_state: EditState,
+    /// Double-click-a-cell editor overlay (brief contract #2); `None` when
+    /// closed. Distinct from `cell_detail` (the non-editable popup) —
+    /// mutually exclusive in practice since a double-click opens exactly
+    /// one of the two depending on `editable`/the clicked column, but kept
+    /// as separate fields rather than one enum since their contents differ
+    /// enough (this one owns a live `TextField`) that a shared type would
+    /// need its own internal `Option` anyway.
+    cell_editor: Option<CellEditor>,
 }
 
 impl ResultGrid {
@@ -350,6 +406,9 @@ impl ResultGrid {
             joined_cols: Vec::new(),
             virtual_cols: Vec::new(),
             lookup_generation: Vec::new(),
+            editable: None,
+            edit_state: EditState::default(),
+            cell_editor: None,
         }
     }
 
@@ -386,6 +445,21 @@ impl ResultGrid {
         self.joined_cols = vec![false; ncols];
         self.virtual_cols = Vec::new();
         self.lookup_generation = vec![0; ncols];
+        self.editable = None;
+        self.edit_state = EditState::default();
+        self.cell_editor = None;
+    }
+
+    /// G5 Task 3 public seam: called by `main.rs` right after `set_buffer`
+    /// (and `set_fk_info`) for a PREVIEW tab that passed `detect_editable_pk`
+    /// — `None` (already `set_buffer`'s default) for every ad-hoc tab or a
+    /// preview that failed one of that function's checks. Doesn't touch
+    /// `edit_state` — a fresh `set_buffer` already reset it, and a re-run of
+    /// the SAME preview (a ☰ toggle, a sort/filter never re-runs SQL at all)
+    /// intentionally starts with a clean slate rather than trying to carry
+    /// staged edits across a brand-new `ResultBuffer`/row set.
+    pub fn set_editable(&mut self, editable: Option<Editable>) {
+        self.editable = editable;
     }
 
     /// Public seam (Task 4): called by `main.rs` right after `set_buffer`
@@ -1065,6 +1139,13 @@ impl ResultGrid {
     /// sits on top), and reports whether it closed anything so the caller
     /// can stop there instead of also cancelling a running query.
     pub fn close_overlay_if_open(&mut self) -> bool {
+        // G5 Task 3: the cell-editor overlay is the same kind of top-layer
+        // popup as `cell_detail` — closes without staging anything (same as
+        // its own "Zrušit" button).
+        if self.cell_editor.is_some() {
+            self.cell_editor = None;
+            return true;
+        }
         if self.cell_detail.is_some() {
             self.cell_detail = None;
             return true;
@@ -1508,6 +1589,22 @@ impl ResultGrid {
                     })),
             );
 
+        // G5 Task 3, brief contract #4: "+ řádek" only on editable tabs.
+        if self.editable.is_some() {
+            row = row.child(
+                div()
+                    .id("add-insert-row")
+                    .cursor_pointer()
+                    .px_2()
+                    .rounded_md()
+                    .bg(rgb(0x313244))
+                    .child("+ řádek")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.add_insert_row(cx);
+                    })),
+            );
+        }
+
         if filtered {
             row = row.child(format!("{shown} / {total} řádků"));
         }
@@ -1566,6 +1663,10 @@ impl ResultGrid {
     /// an entry for them.
     fn filter_row(&self) -> impl IntoElement {
         let mut row = div().flex().flex_row().bg(rgb(0x181825));
+        // G5 Task 3: same gutter-width alignment spacer as `header`.
+        if self.editable.is_some() {
+            row = row.child(div().w(px(GUTTER_WIDTH)).h(px(ROW_HEIGHT)));
+        }
         if self.buffer.is_some() {
             // G4 Task 5: `filter_inputs`/`filter_cache` are kept sized to
             // the EFFECTIVE column count by `sync_virtual_aux` — iterating
@@ -1795,6 +1896,209 @@ impl ResultGrid {
         )
     }
 
+    /// G5 Task 3: "✕" gutter click on a real row — toggles that row's
+    /// delete flag, keyed by SOURCE row (brief contract #6: staged/deleted
+    /// state survives a sort/filter). The gutter cell's own `on_click`
+    /// calls `cx.stop_propagation()` first (brief contract #4) so this
+    /// never also lands on the row's selection click handler underneath.
+    fn toggle_row_delete(&mut self, source_row: usize, cx: &mut Context<Self>) {
+        self.edit_state.toggle_delete(source_row);
+        cx.notify();
+    }
+
+    /// G5 Task 3: "␡" gutter click on an inserted row — removes it
+    /// entirely (`EditState::remove_insert_row`). Unlike a real row's
+    /// delete (a reversible flag — the row still exists in the table until
+    /// Apply runs), an insert row has no underlying identity to preserve,
+    /// so removing it here is the only way to un-stage it.
+    fn remove_insert_row(&mut self, ins_ix: usize, cx: &mut Context<Self>) {
+        self.edit_state.remove_insert_row(ins_ix);
+        cx.notify();
+    }
+
+    /// "+ řádek" toolbar click (editable tabs only, brief contract #4) —
+    /// appends one blank insert row sized to the CURRENT result's column
+    /// count (every column starts untouched, i.e. "(výchozí)" — see
+    /// `sandbox::insert_cell_display`).
+    fn add_insert_row(&mut self, cx: &mut Context<Self>) {
+        let ncols = self.buffer.as_ref().map_or(0, |b| b.borrow().column_count());
+        self.edit_state.add_insert_row(ncols);
+        cx.notify();
+    }
+
+    /// G5 Task 3: opens the cell-editor overlay (brief contract #2) for
+    /// `target`. `column_name`/`original_text` are snapshotted once at open
+    /// time (same "capture at click time" convention `cell_detail` already
+    /// follows) — `original_text` is the ORIGINAL committed value (empty
+    /// string for a real NULL cell, same convention `ResultBuffer::cell_text`
+    /// uses), shown for reference alongside the editable field so staging
+    /// over a value doesn't lose sight of what it used to be (this is what
+    /// lets the editor also cover the old cell-detail "see the full text"
+    /// use case). The `TextField` itself is prefilled with the CURRENT
+    /// display value: this cell's staged text if it's already staged (a
+    /// staged NULL prefills empty — re-clicking "NULL" re-stages it), else
+    /// `original_text`/the insert row's untouched default (also empty).
+    fn open_cell_editor(
+        &mut self,
+        target: EditTarget,
+        column_name: String,
+        original_text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prefill = match target {
+            EditTarget::Cell { source_row, col } => self
+                .edit_state
+                .cells
+                .get(&(source_row, col))
+                .map(|staged| staged.clone().unwrap_or_default())
+                .unwrap_or_else(|| original_text.clone()),
+            EditTarget::Insert { ins_ix, col } => self
+                .edit_state
+                .inserted_rows
+                .get(ins_ix)
+                .and_then(|row| row.get(col))
+                .cloned()
+                .flatten()
+                .flatten()
+                .unwrap_or_default(),
+        };
+        let input = cx.new(|cx| TextField::new(cx, "hodnota…", false));
+        input.update(cx, |f, cx| f.set_text(&prefill, cx));
+        let focus = input.focus_handle(cx);
+        self.cell_editor = Some(CellEditor { target, column_name, original_text, input });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Routes a staged value to the right `EditState` method for `target` —
+    /// shared by "Uložit" (`Some(text)`) and "NULL" (`None`).
+    fn stage_from_editor(&mut self, target: EditTarget, v: Option<String>) {
+        match target {
+            EditTarget::Cell { source_row, col } => self.edit_state.stage_cell(source_row, col, v),
+            EditTarget::Insert { ins_ix, col } => self.edit_state.stage_insert_cell(ins_ix, col, v),
+        }
+    }
+
+    /// "Uložit" click — stages the editor's live `TextField` text (brief
+    /// contract #2), then closes the overlay.
+    fn commit_cell_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(ed) = &self.cell_editor else { return };
+        let text = ed.input.read(cx).text();
+        let target = ed.target;
+        self.stage_from_editor(target, Some(text));
+        self.cell_editor = None;
+        cx.notify();
+    }
+
+    /// "NULL" click — stages a SQL NULL for the editor's target, then
+    /// closes the overlay.
+    fn commit_cell_editor_null(&mut self, cx: &mut Context<Self>) {
+        let Some(ed) = &self.cell_editor else { return };
+        let target = ed.target;
+        self.stage_from_editor(target, None);
+        self.cell_editor = None;
+        cx.notify();
+    }
+
+    /// G5 Task 3: cell-editor overlay (brief contract #2) — same centered-
+    /// modal shape as `render_cell_detail_overlay`, but with an editable
+    /// `TextField` plus Uložit/NULL/Zrušit instead of a read-only scrolled
+    /// body + Kopírovat/Zavřít. The original value is still shown (a plain
+    /// wrapped text block, not scrolled — v1, per the brief's "centered
+    /// modal is acceptable") so this covers the old cell-detail "see the
+    /// full text" use case too.
+    fn render_cell_editor_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ed = self.cell_editor.as_ref()?;
+        let column_name = ed.column_name.clone();
+        let original_text = ed.original_text.clone();
+        let input = ed.input.clone();
+
+        let panel = div()
+            .id("cell-editor-panel")
+            .w(px(480.))
+            .max_h(px(360.))
+            .bg(rgb(0x1e1e2e))
+            .border_1()
+            .border_color(rgb(0x45475a))
+            .rounded_md()
+            .flex()
+            .flex_col()
+            .p_2()
+            .gap_2()
+            .text_color(rgb(0xcdd6f4))
+            .child(div().text_color(rgb(0xf9e2af)).child(column_name))
+            .child(
+                div()
+                    .id("cell-editor-original")
+                    .max_h(px(120.))
+                    .overflow_hidden()
+                    .p_1()
+                    .bg(rgb(0x181825))
+                    .rounded_md()
+                    .text_color(rgb(0xa6adc8))
+                    .whitespace_normal()
+                    .child(if original_text.is_empty() {
+                        "(prázdné/NULL)".to_string()
+                    } else {
+                        original_text
+                    }),
+            )
+            .child(div().w_full().child(input))
+            .child(
+                div().flex().flex_row().justify_end().gap_2().child(
+                    div()
+                        .id("cell-editor-save")
+                        .cursor_pointer()
+                        .bg(rgb(0x313244))
+                        .text_color(rgb(0xcdd6f4))
+                        .px_2()
+                        .rounded_md()
+                        .child("Uložit")
+                        .on_click(cx.listener(|this, _, _, cx| this.commit_cell_editor(cx))),
+                ).child(
+                    div()
+                        .id("cell-editor-null")
+                        .cursor_pointer()
+                        .bg(rgb(0x313244))
+                        .text_color(rgb(0xcdd6f4))
+                        .px_2()
+                        .rounded_md()
+                        .child("NULL")
+                        .on_click(cx.listener(|this, _, _, cx| this.commit_cell_editor_null(cx))),
+                ).child(
+                    div()
+                        .id("cell-editor-cancel")
+                        .cursor_pointer()
+                        .bg(rgb(0x313244))
+                        .text_color(rgb(0xcdd6f4))
+                        .px_2()
+                        .rounded_md()
+                        .child("Zrušit")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cell_editor = None;
+                            cx.notify();
+                        })),
+                ),
+            );
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000099))
+                .occlude()
+                .child(panel)
+                .into_any_element(),
+        )
+    }
+
     /// Skips hidden source columns entirely (brief: "header + cells +
     /// widths skip hidden"). The label area (everything except the 5px
     /// resize-handle strip) is clickable and cycles that column's sort
@@ -1804,6 +2108,12 @@ impl ResultGrid {
     /// also fires a sort toggle.
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut row = div().flex().flex_row().bg(rgb(0x313244)).text_color(rgb(0xf9e2af));
+        // G5 Task 3: blank gutter-width spacer so the header stays aligned
+        // with each row's own leading "✕"/"␡" gutter cell (brief contract
+        // #4) — editable tabs only.
+        if self.editable.is_some() {
+            row = row.child(div().w(px(GUTTER_WIDTH)).h(px(ROW_HEIGHT)));
+        }
         let Some(buf) = &self.buffer else { return row };
         let buf = buf.borrow();
         let ncols = buf.column_count();
@@ -2157,7 +2467,14 @@ impl Render for ResultGrid {
         // it can shrink `self.view` mid-render, and a stale larger count fed
         // to `uniform_list` panics `source_row` out-of-bounds (Task 3 review
         // issue 1).
-        let row_count = self.view.len();
+        let real_row_count = self.view.len();
+        // G5 Task 3, brief contract #3: inserted rows render AFTER every
+        // real row (regardless of sort — `RowView`/`view.source_row` never
+        // sees them at all), so the total `uniform_list` count on an
+        // editable tab is `view.len() + inserted.len()`.
+        let is_editable = self.editable.is_some();
+        let insert_row_count = if is_editable { self.edit_state.inserted_rows.len() } else { 0 };
+        let row_count = real_row_count + insert_row_count;
         root = root.child(self.header(cx)).child(
             uniform_list(
                 "result-rows",
@@ -2172,26 +2489,159 @@ impl Render for ResultGrid {
                         // (`ncols..ncols+virtual_cols.len()`), never
                         // hideable (see `virtual_cols`' doc comment).
                         let effective_ncols = ncols + this.virtual_cols.len();
+                        let editable = this.editable.is_some();
+                        let real_row_count = this.view.len();
                         for row_ix in range {
+                            // G5 Task 3: rows past `real_row_count` are
+                            // staged INSERTs (brief contract #3) — a
+                            // completely separate rendering path (no
+                            // `view`/`source_row`, no selection/find, cells
+                            // read from `edit_state.inserted_rows` instead
+                            // of the buffer).
+                            if editable && row_ix >= real_row_count {
+                                let ins_ix = row_ix - real_row_count;
+                                let mut row = div()
+                                    .id(row_ix)
+                                    .flex()
+                                    .flex_row()
+                                    .h(px(ROW_HEIGHT))
+                                    .bg(rgb(INSERTED_ROW_BG));
+                                row = row.child(
+                                    div()
+                                        .id(("gutter-ins", ins_ix))
+                                        .w(px(GUTTER_WIDTH))
+                                        .h(px(ROW_HEIGHT))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .text_color(rgb(0x6c7086))
+                                        .child("␡")
+                                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                                            cx.stop_propagation();
+                                            this.remove_insert_row(ins_ix, cx);
+                                        })),
+                                );
+                                for col in 0..ncols {
+                                    if this.hidden_cols.get(col).copied().unwrap_or(false) {
+                                        continue;
+                                    }
+                                    let cell_val = this
+                                        .edit_state
+                                        .inserted_rows
+                                        .get(ins_ix)
+                                        .and_then(|r| r.get(col))
+                                        .cloned()
+                                        .unwrap_or(None);
+                                    let text = sandbox::insert_cell_display(&cell_val);
+                                    let column_name = buf
+                                        .schema()
+                                        .fields()
+                                        .get(col)
+                                        .map(|f| f.name().clone())
+                                        .unwrap_or_default();
+                                    let cell = div()
+                                        .id(("cell-ins", ins_ix * 10_000 + col))
+                                        .w(px(widths.get(col).copied().unwrap_or(DEFAULT_COL_WIDTH)))
+                                        .px_2()
+                                        .overflow_hidden()
+                                        .text_color(rgb(0xcdd6f4))
+                                        .bg(rgb(INSERTED_ROW_BG))
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                                                window.focus(&this.focus_handle, cx);
+                                                if e.click_count >= 2 {
+                                                    this.open_cell_editor(
+                                                        EditTarget::Insert { ins_ix, col },
+                                                        column_name.clone(),
+                                                        "(nový řádek)".to_string(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }
+                                            }),
+                                        )
+                                        .child(text);
+                                    row = row.child(cell);
+                                }
+                                items.push(row);
+                                continue;
+                            }
+
                             let source_row = this.view.source_row(row_ix);
+                            let is_deleted =
+                                editable && this.edit_state.deleted_rows.contains(&source_row);
                             let mut row = div()
                                 .id(row_ix)
                                 .flex()
                                 .flex_row()
                                 .h(px(ROW_HEIGHT))
-                                .bg(if row_ix % 2 == 0 { rgb(0x1e1e2e) } else { rgb(0x232334) });
+                                .bg(if is_deleted {
+                                    rgb(DELETED_ROW_BG)
+                                } else if row_ix % 2 == 0 {
+                                    rgb(0x1e1e2e)
+                                } else {
+                                    rgb(0x232334)
+                                });
+                            // G5 Task 3, brief contract #4: "✕" toggles this
+                            // SOURCE row's delete flag; `stop_propagation`
+                            // keeps it from also landing on a cell's own
+                            // mouse-down (selection/double-click) below.
+                            if editable {
+                                row = row.child(
+                                    div()
+                                        .id(("gutter", row_ix))
+                                        .w(px(GUTTER_WIDTH))
+                                        .h(px(ROW_HEIGHT))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .text_color(if is_deleted {
+                                            rgb(0xf38ba8)
+                                        } else {
+                                            rgb(0x6c7086)
+                                        })
+                                        .child("✕")
+                                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                                            cx.stop_propagation();
+                                            if row_ix < this.view.len() {
+                                                let source_row = this.view.source_row(row_ix);
+                                                this.toggle_row_delete(source_row, cx);
+                                            }
+                                        })),
+                                );
+                            }
                             for col in 0..effective_ncols {
                                 if col < ncols && this.hidden_cols.get(col).copied().unwrap_or(false) {
                                     continue;
                                 }
                                 let is_virtual = col >= ncols;
-                                let text = if !is_virtual {
+                                let mut text = if !is_virtual {
                                     buf.cell_text(source_row, col)
                                 } else {
                                     let vcol = &this.virtual_cols[col - ncols];
                                     let fk_val = buf.cell_text(source_row, vcol.src_col);
                                     fk_join::virtual_cell_text(&fk_val, &vcol.map)
                                 };
+                                // G5 Task 3, brief contract #3: a staged
+                                // edit shows the STAGED value/"(NULL)"
+                                // instead of the committed one — keyed by
+                                // SOURCE row+col, never applies to a virtual
+                                // (ad-hoc lookup) column.
+                                let staged_display = if editable && !is_virtual {
+                                    sandbox::staged_cell_display(
+                                        this.edit_state.cells.get(&(source_row, col)),
+                                    )
+                                } else {
+                                    None
+                                };
+                                let is_staged = staged_display.is_some();
+                                if let Some(d) = staged_display {
+                                    text = d;
+                                }
                                 // G4 Task 5: joined (preview) / virtual
                                 // (ad-hoc) columns render tinted (brief: bg
                                 // 0x2a2a3d) — checked before selection/find
@@ -2233,37 +2683,69 @@ impl Render for ResultGrid {
                                                 return;
                                             }
                                             // G4 Task 3: double-click (or
-                                            // more) opens the cell-detail
-                                            // popup instead of touching
-                                            // selection — re-reads the
-                                            // SOURCE row from the CURRENT
-                                            // `view` rather than capturing
-                                            // the render-time `source_row`,
-                                            // in case sort/filter changed
-                                            // between render and click. G4
-                                            // Task 5: a virtual column has no
-                                            // real buffer cell — its detail
-                                            // text is the same
-                                            // `virtual_cell_text` lookup the
-                                            // row rendering above used.
+                                            // more) opens a popup instead of
+                                            // touching selection — re-reads
+                                            // the SOURCE row from the
+                                            // CURRENT `view` rather than
+                                            // capturing the render-time
+                                            // `source_row`, in case sort/
+                                            // filter changed between render
+                                            // and click.
+                                            //
+                                            // G5 Task 3, brief contract #2:
+                                            // on an EDITABLE tab, a real
+                                            // (non-virtual, non-joined)
+                                            // column opens the staging
+                                            // editor instead of the
+                                            // read-only detail popup —
+                                            // joined columns aren't part of
+                                            // the writable table, so they
+                                            // keep the old read-only
+                                            // behaviour.
                                             if e.click_count >= 2 {
                                                 if let Some(buf) = this.buffer.clone() {
                                                     let source_row = this.view.source_row(row_ix);
                                                     let ncols = buf.borrow().column_count();
-                                                    let text = if col < ncols {
-                                                        buf.borrow_mut().cell_text(source_row, col)
-                                                    } else if let Some(vcol) =
-                                                        this.virtual_cols.get(col - ncols).cloned()
-                                                    {
-                                                        let fk_val = buf
-                                                            .borrow_mut()
-                                                            .cell_text(source_row, vcol.src_col);
-                                                        fk_join::virtual_cell_text(&fk_val, &vcol.map)
+                                                    let is_virtual = col >= ncols;
+                                                    let joined = !is_virtual
+                                                        && this
+                                                            .joined_cols
+                                                            .get(col)
+                                                            .copied()
+                                                            .unwrap_or(false);
+                                                    if this.editable.is_some() && !is_virtual && !joined {
+                                                        let column_name = buf
+                                                            .borrow()
+                                                            .schema()
+                                                            .fields()
+                                                            .get(col)
+                                                            .map(|f| f.name().clone())
+                                                            .unwrap_or_default();
+                                                        let original_text =
+                                                            buf.borrow_mut().cell_text(source_row, col);
+                                                        this.open_cell_editor(
+                                                            EditTarget::Cell { source_row, col },
+                                                            column_name,
+                                                            original_text,
+                                                            window,
+                                                            cx,
+                                                        );
                                                     } else {
-                                                        String::new()
-                                                    };
-                                                    this.cell_detail =
-                                                        Some(CellDetail { text, scroll_lines: 0 });
+                                                        let text = if col < ncols {
+                                                            buf.borrow_mut().cell_text(source_row, col)
+                                                        } else if let Some(vcol) =
+                                                            this.virtual_cols.get(col - ncols).cloned()
+                                                        {
+                                                            let fk_val = buf
+                                                                .borrow_mut()
+                                                                .cell_text(source_row, vcol.src_col);
+                                                            fk_join::virtual_cell_text(&fk_val, &vcol.map)
+                                                        } else {
+                                                            String::new()
+                                                        };
+                                                        this.cell_detail =
+                                                            Some(CellDetail { text, scroll_lines: 0 });
+                                                    }
                                                 }
                                                 cx.notify();
                                                 return;
@@ -2283,10 +2765,14 @@ impl Render for ResultGrid {
                                         }),
                                     )
                                     .child(text);
-                                if is_find_match {
+                                if is_deleted {
+                                    cell = cell.bg(rgb(DELETED_ROW_BG));
+                                } else if is_find_match {
                                     cell = cell.bg(rgb(0x585b70));
                                 } else if selected {
                                     cell = cell.bg(rgb(0x45475a));
+                                } else if is_staged {
+                                    cell = cell.bg(rgb(STAGED_CELL_BG));
                                 } else if joined {
                                     cell = cell.bg(rgb(0x2a2a3d));
                                 }
@@ -2351,6 +2837,9 @@ impl Render for ResultGrid {
         }
 
         if let Some(overlay) = self.render_cell_detail_overlay(cx) {
+            root = root.child(overlay);
+        }
+        if let Some(overlay) = self.render_cell_editor_overlay(cx) {
             root = root.child(overlay);
         }
 

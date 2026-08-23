@@ -94,6 +94,77 @@ fn fk_info_from_table(
     (fk_info, ref_cols)
 }
 
+/// G5 Task 3: the PK-mapping/read-only/engine decision behind a PREVIEW
+/// tab's `sandbox::Editable` — pure (no GPUI/`Context`) so it's directly
+/// testable, mirroring `fk_info_from_table`'s split (snapshot lookup stays
+/// in `AppView::editable_for_preview`, the actual decision is a free
+/// function here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EditableDecision {
+    /// RESULT-column indices of the mapped PK columns (never empty).
+    Editable(Vec<usize>),
+    /// `table` was found but none of its PK columns map onto `headers` —
+    /// drives the brief's "tabulka nemá primární klíč — jen pro čtení"
+    /// status notice, independent of the read-only/engine/connection checks
+    /// below (a PK-less table is worth flagging regardless of whether the
+    /// connection could otherwise write to it).
+    NoPrimaryKey,
+    /// Not editable for any other reason (table not found in the snapshot —
+    /// e.g. still loading — no connection-backed config at all, a read-only
+    /// connection, or an MSSQL engine — G5 scope excludes MSSQL, see the
+    /// project memory/brief).
+    NotEditable,
+}
+
+/// G5 Task 3: the CLI-arg back-compat path (`AppView::conn_url`, no saved
+/// `ConnectionConfig`) still gets `detect_editable_pk`'s `conn_meta` facts —
+/// always writable (no read-only concept for a bare connection string) with
+/// the engine inferred from the URL itself, via the SAME postgres-vs-sqlite
+/// dispatch `connect::open` uses to pick a driver (`postgres[ql]://` ->
+/// Postgres, anything else -> a SQLite file path — MSSQL has no CLI-arg URL
+/// form at all in this app, so it never needs a branch here).
+fn engine_from_url(url: &str) -> dbc_state::Engine {
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        dbc_state::Engine::Postgres
+    } else {
+        dbc_state::Engine::Sqlite
+    }
+}
+
+/// `conn_meta`: `Some((read_only, engine))` — for a saved `ConnectionConfig`
+/// (`cfg.read_only`/`cfg.engine`) or the CLI-arg URL path (see
+/// `engine_from_url`); `None` only when `run_query_with` couldn't build a
+/// `ConnectSpec` at all (no active connection AND no CLI-arg URL — that path
+/// returns before ever reaching `Started`, so `None` is effectively
+/// unreachable today, but `detect_editable_pk` still treats it as
+/// not-editable defensively rather than assuming a caller always has one).
+/// `table`: the previewed table's `TableInfo` from the schema snapshot, or
+/// `None` if it isn't in the snapshot (yet) — same "degrade gracefully"
+/// precedent `fk_info_for_table` already sets. `headers`: the CURRENT
+/// result's column names in order (same convention `fk_info_from_table`
+/// uses for `result_cols`).
+fn detect_editable_pk(
+    conn_meta: Option<(bool, dbc_state::Engine)>,
+    table: Option<&TableInfo>,
+    headers: &[String],
+) -> EditableDecision {
+    let Some(t) = table else { return EditableDecision::NotEditable };
+    let pk_cols: Vec<usize> = t
+        .columns
+        .iter()
+        .filter(|c| c.is_pk)
+        .filter_map(|c| headers.iter().position(|h| h == &c.name))
+        .collect();
+    if pk_cols.is_empty() {
+        return EditableDecision::NoPrimaryKey;
+    }
+    let Some((read_only, engine)) = conn_meta else { return EditableDecision::NotEditable };
+    if read_only || engine == dbc_state::Engine::Mssql {
+        return EditableDecision::NotEditable;
+    }
+    EditableDecision::Editable(pk_cols)
+}
+
 /// G4 Task 6: maps SAVED preference names to the CURRENT result's source
 /// column indices by exact name match — a name no longer present (a column
 /// renamed or dropped since the prefs were saved) is silently skipped
@@ -454,17 +525,27 @@ impl AppView {
                 return;
             };
             let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
-            (cfg.read_only, cfg.auto_limit, cfg.timeout_secs, ConnectSpec::Config { cfg: Box::new(cfg), secret })
+            // G5 Task 3: captured before `cfg` moves into `ConnectSpec::Config`
+            // below — `Started`'s `Editable` detection needs both facts (see
+            // `detect_editable_pk`), and `cfg` itself won't survive past this
+            // `if` arm.
+            let conn_meta = Some((cfg.read_only, cfg.engine));
+            (cfg.read_only, cfg.auto_limit, cfg.timeout_secs, conn_meta, ConnectSpec::Config { cfg: Box::new(cfg), secret })
         } else if let Some(url) = self.conn_url.clone() {
-            // CLI-arg back-compat path: no read-only/auto-limit/timeout
-            // config exists for it (no ConnectionConfig backs it).
-            (false, None, None, ConnectSpec::Url(url))
+            // CLI-arg back-compat path: no `ConnectionConfig` exists for
+            // read-only/auto-limit/timeout, but a preview IS still
+            // editable through it (G5 Task 3) — always writable (no
+            // read-only concept for this path) with the engine inferred
+            // from the URL itself via `engine_from_url`, the same
+            // postgres-vs-sqlite dispatch `connect::open` already uses.
+            let conn_meta = Some((false, engine_from_url(&url)));
+            (false, None, None, conn_meta, ConnectSpec::Url(url))
         } else {
             self.status = "Bez připojení — vyberte připojení nahoře.".into();
             cx.notify();
             return;
         };
-        let (read_only, auto_limit, timeout_secs, spec) = spec;
+        let (read_only, auto_limit, timeout_secs, conn_meta, spec) = spec;
 
         // Guard 1: read-only — rejected client-side without connecting.
         // (Server-side enforcement lives in connect::open_config: Postgres
@@ -575,6 +656,31 @@ impl AppView {
                                 } else {
                                     view.fk_info_for_adhoc(&result_cols, cx)
                                 };
+                                // G5 Task 3: editability — PREVIEW tabs only
+                                // (brief contract #1); `no_pk_notice` is
+                                // surfaced as `view.status` further below,
+                                // AFTER the "running…" status this arm
+                                // already sets, so it isn't immediately
+                                // clobbered.
+                                let (editable, no_pk_notice) = if let Some(p) = &preview {
+                                    let numeric_cols: Vec<bool> = buf
+                                        .borrow()
+                                        .schema()
+                                        .fields()
+                                        .iter()
+                                        .map(|f| f.data_type().is_numeric())
+                                        .collect();
+                                    view.editable_for_preview(
+                                        p.schema.as_deref(),
+                                        &p.table,
+                                        &result_cols,
+                                        conn_meta,
+                                        numeric_cols,
+                                        cx,
+                                    )
+                                } else {
+                                    (None, false)
+                                };
                                 let grid = cx.new(ResultGrid::new);
                                 grid.update(cx, |g, cx| {
                                     g.set_buffer(buf.clone(), cx);
@@ -589,6 +695,11 @@ impl AppView {
                                         g.set_preview_context(p.schema.clone(), p.key.clone(), p.title.clone());
                                     }
                                     g.set_fk_info(fk_info, ref_cols);
+                                    // G5 Task 3: `None` on an ad-hoc tab
+                                    // (never editable) or a preview that
+                                    // failed one of `detect_editable_pk`'s
+                                    // checks — `set_editable`'s default.
+                                    g.set_editable(editable);
                                     // G4 Task 5: restores ☰-menu checkmarks
                                     // + join tinting on the FRESH grid
                                     // entity a preview re-run just created
@@ -642,6 +753,18 @@ impl AppView {
                                 });
                                 tab_id = Some(id);
                                 view.status = format!("running…{limit_suffix}");
+                                // G5 Task 3, brief contract #5: a PK-less
+                                // table is flagged regardless of read-only/
+                                // engine — set AFTER the "running…" status
+                                // above so it isn't immediately clobbered by
+                                // it (streamed `Batch`/`Finished` status
+                                // updates will still eventually overwrite
+                                // this, same as every other transient
+                                // status note in this file).
+                                if no_pk_notice {
+                                    view.status =
+                                        "tabulka nemá primární klíč — jen pro čtení".to_string();
+                                }
                             }
                             QueryEvent::Batch(b) => {
                                 if errored.is_some() {
@@ -1220,6 +1343,34 @@ impl AppView {
         fk_info_from_table(snapshot, t, result_cols)
     }
 
+    /// G5 Task 3, PREVIEW tabs only: looks the previewed `(schema, table)`
+    /// up in the CURRENT schema-tree snapshot (same lookup
+    /// `fk_info_for_table` does) and delegates the PK-mapping/read-only/
+    /// engine decision to the pure `detect_editable_pk`. Returns
+    /// `(editable, no_pk_notice)` — `no_pk_notice` is the brief's "table
+    /// found but no PK mapped" case, which `QueryEvent::Started`'s handler
+    /// surfaces as a status notice regardless of `editable` (always `None`
+    /// in that case).
+    fn editable_for_preview(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+        result_cols: &[String],
+        conn_meta: Option<(bool, dbc_state::Engine)>,
+        numeric_cols: Vec<bool>,
+        cx: &Context<Self>,
+    ) -> (Option<sandbox::Editable>, bool) {
+        let Some(snapshot) = self.tree.read(cx).snapshot() else { return (None, false) };
+        let t = snapshot.tables.iter().find(|t| t.schema.as_deref() == schema && t.name == table);
+        match detect_editable_pk(conn_meta, t, result_cols) {
+            EditableDecision::Editable(pk_cols) => {
+                (Some(sandbox::Editable { pk_cols, numeric_cols }), false)
+            }
+            EditableDecision::NoPrimaryKey => (None, true),
+            EditableDecision::NotEditable => (None, false),
+        }
+    }
+
     /// G4 Task 5, AD-HOC tabs (brief contract #2's documented heuristic):
     /// matches EVERY result column name against each snapshot table's
     /// columns — if exactly ONE table contains all of them, its FK data is
@@ -1700,11 +1851,17 @@ impl AppView {
             .tabs
             .iter()
             .map(|t| {
-                let row_count = match &t.content {
-                    TabContent::Grid { buffer, .. } => buffer.borrow().row_count(),
-                    TabContent::Text { .. } => 0,
+                let (row_count, dirty) = match &t.content {
+                    TabContent::Grid { buffer, grid } => {
+                        (buffer.borrow().row_count(), grid.read(cx).edit_state.is_dirty())
+                    }
+                    TabContent::Text { .. } => (0, false),
                 };
-                (t.id, t.title.clone(), t.pinned, row_count)
+                // G5 Task 3, brief contract #7: dirty (unapplied staged
+                // edits) tabs get a " •" title suffix — the apply bar
+                // itself is a later task, but the indicator is wired now.
+                let title = if dirty { format!("{} •", t.title) } else { t.title.clone() };
+                (t.id, title, t.pinned, row_count)
             })
             .collect();
 
@@ -2092,6 +2249,147 @@ mod preview_sql_tests {
             preview_sql(Some("we\"ird"), "t"),
             "SELECT * FROM \"we\"\"ird\".\"t\" LIMIT 1000"
         );
+    }
+}
+
+/// G5 Task 3: `detect_editable_pk` — the PK-mapping/read-only/engine
+/// decision behind a PREVIEW tab's `sandbox::Editable`. Pure/GPUI-free (the
+/// snapshot lookup itself lives in `AppView::editable_for_preview`, which
+/// needs a `Context` and so isn't unit-tested directly — same split
+/// `fk_info_for_table`/`fk_info_from_table` already use).
+#[cfg(test)]
+mod editable_detection_tests {
+    use super::*;
+    use dbc_core::ColumnInfo;
+
+    fn col(name: &str, is_pk: bool) -> ColumnInfo {
+        ColumnInfo { name: name.to_string(), is_pk, ..Default::default() }
+    }
+
+    fn table(columns: Vec<ColumnInfo>) -> TableInfo {
+        TableInfo { name: "t".to_string(), columns, ..Default::default() }
+    }
+
+    fn headers(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn rw_engine(engine: dbc_state::Engine) -> Option<(bool, dbc_state::Engine)> {
+        Some((false, engine))
+    }
+
+    #[test]
+    fn table_not_in_snapshot_is_not_editable() {
+        let h = headers(&["id", "name"]);
+        assert_eq!(
+            detect_editable_pk(rw_engine(dbc_state::Engine::Postgres), None, &h),
+            EditableDecision::NotEditable
+        );
+    }
+
+    #[test]
+    fn table_found_no_pk_column_at_all_is_no_primary_key() {
+        let t = table(vec![col("id", false), col("name", false)]);
+        let h = headers(&["id", "name"]);
+        assert_eq!(
+            detect_editable_pk(rw_engine(dbc_state::Engine::Postgres), Some(&t), &h),
+            EditableDecision::NoPrimaryKey
+        );
+    }
+
+    #[test]
+    fn table_found_pk_column_not_in_result_headers_is_no_primary_key() {
+        // The table HAS a PK, but it isn't among this result's columns (e.g.
+        // a hand-written SELECT that omitted it) — still "no PK mapped".
+        let t = table(vec![col("id", true), col("name", false)]);
+        let h = headers(&["name"]);
+        assert_eq!(
+            detect_editable_pk(rw_engine(dbc_state::Engine::Postgres), Some(&t), &h),
+            EditableDecision::NoPrimaryKey
+        );
+    }
+
+    #[test]
+    fn table_found_pk_mapped_writable_connection_is_editable() {
+        let t = table(vec![col("id", true), col("name", false)]);
+        let h = headers(&["id", "name"]);
+        assert_eq!(
+            detect_editable_pk(rw_engine(dbc_state::Engine::Postgres), Some(&t), &h),
+            EditableDecision::Editable(vec![0])
+        );
+    }
+
+    #[test]
+    fn multi_column_pk_maps_every_pk_column_in_table_order() {
+        let t = table(vec![col("a", true), col("v", false), col("b", true)]);
+        let h = headers(&["a", "v", "b"]);
+        assert_eq!(
+            detect_editable_pk(rw_engine(dbc_state::Engine::Postgres), Some(&t), &h),
+            EditableDecision::Editable(vec![0, 2])
+        );
+    }
+
+    #[test]
+    fn read_only_connection_is_not_editable_even_with_a_mapped_pk() {
+        let t = table(vec![col("id", true)]);
+        let h = headers(&["id"]);
+        assert_eq!(
+            detect_editable_pk(Some((true, dbc_state::Engine::Postgres)), Some(&t), &h),
+            EditableDecision::NotEditable
+        );
+    }
+
+    #[test]
+    fn mssql_engine_is_not_editable_even_with_a_mapped_pk() {
+        let t = table(vec![col("id", true)]);
+        let h = headers(&["id"]);
+        assert_eq!(
+            detect_editable_pk(rw_engine(dbc_state::Engine::Mssql), Some(&t), &h),
+            EditableDecision::NotEditable
+        );
+    }
+
+    #[test]
+    fn sqlite_engine_with_mapped_pk_is_editable() {
+        let t = table(vec![col("id", true)]);
+        let h = headers(&["id"]);
+        assert_eq!(
+            detect_editable_pk(rw_engine(dbc_state::Engine::Sqlite), Some(&t), &h),
+            EditableDecision::Editable(vec![0])
+        );
+    }
+
+    #[test]
+    fn no_conn_meta_at_all_is_not_editable_even_with_a_mapped_pk() {
+        // Defensive-only today (`run_query_with` always builds `Some(..)`
+        // for both the saved-connection and CLI-arg paths — see
+        // `conn_meta`'s doc comment) — `detect_editable_pk` must still fail
+        // closed rather than assume editable when it has no read-only/
+        // engine facts at all.
+        let t = table(vec![col("id", true)]);
+        let h = headers(&["id"]);
+        assert_eq!(detect_editable_pk(None, Some(&t), &h), EditableDecision::NotEditable);
+    }
+}
+
+/// G5 Task 3: `engine_from_url` — the CLI-arg path's postgres-vs-sqlite
+/// dispatch, mirroring `connect::open`'s own (untested-in-isolation, since
+/// it also performs real I/O) prefix check.
+#[cfg(test)]
+mod engine_from_url_tests {
+    use super::*;
+
+    #[test]
+    fn postgres_scheme_prefixes_map_to_postgres() {
+        assert_eq!(engine_from_url("postgres://localhost/db"), dbc_state::Engine::Postgres);
+        assert_eq!(engine_from_url("postgresql://localhost/db"), dbc_state::Engine::Postgres);
+    }
+
+    #[test]
+    fn anything_else_is_treated_as_a_sqlite_file_path() {
+        assert_eq!(engine_from_url("C:/data/app.db"), dbc_state::Engine::Sqlite);
+        assert_eq!(engine_from_url("./relative.sqlite"), dbc_state::Engine::Sqlite);
+        assert_eq!(engine_from_url(":memory:"), dbc_state::Engine::Sqlite);
     }
 }
 

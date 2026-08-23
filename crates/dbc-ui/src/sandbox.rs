@@ -3,14 +3,41 @@
 //! be unit-tested directly (quoting is CRITICAL: this is the app's only
 //! write path).
 //!
-//! Not yet wired to the UI — the Apply dialog and grid edit affordances are
-//! a later G5 task — so the public surface is unused outside `#[cfg(test)]`
-//! for now.
-#![allow(dead_code)]
+//! G5 Task 3 wires `EditState`/`Editable` into `grid.rs` (staging + diff
+//! rendering) — every EditState method that drives staging itself
+//! (`stage_cell`, `toggle_delete`, `add_insert_row`, `stage_insert_cell`,
+//! `remove_insert_row`, `is_dirty`) is exercised by the UI now, so the
+//! module-level `#![allow(dead_code)]` this file used to carry is gone. The
+//! Apply dialog itself (turning a dirty `EditState` into executed
+//! statements) is still a later task — `TableMeta`/`sql_value`/
+//! `generate_statements`/`EditState::{change_count,clear}` stay
+//! individually `#[allow(dead_code)]`'d below until that task wires them
+//! up; each already has full test coverage regardless.
 
 use std::collections::{HashMap, HashSet};
 
 use dbc_core::{quote_ident, quote_qualified};
+
+/// G5 Task 3: editability facts for one PREVIEW tab's grid — computed once
+/// per `Started` event by `main.rs`'s `detect_editable_pk` (mapping the
+/// previewed table's catalog PK onto this result's actual columns) and
+/// handed to `ResultGrid::set_editable`. `None` on a `ResultGrid` means "not
+/// editable" (ad-hoc tab, read-only connection, MSSQL, PK-less table, or no
+/// connection at all) — see `detect_editable_pk`'s doc comment for the full
+/// decision.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Editable {
+    /// RESULT-column indices (same indexing as `ResultBuffer`/`ResultGrid`'s
+    /// own columns, i.e. `EditState::cells`' `col`) that are part of the
+    /// previewed table's primary key. Never empty when `Editable` exists —
+    /// a table with no PK column mapped onto the result is NOT editable.
+    pub pk_cols: Vec<usize>,
+    /// By RESULT-column index — `true` when that column's Arrow type is
+    /// numeric (`DataType::is_numeric`). Feeds `sql_value`'s bare-vs-quoted
+    /// decision once the Apply dialog (a later task) calls
+    /// `generate_statements`.
+    pub numeric_cols: Vec<bool>,
+}
 
 /// Staged, not-yet-applied edits for one editable preview tab.
 #[derive(Default)]
@@ -32,6 +59,7 @@ impl EditState {
 
     /// Row-granular change count: edited (non-deleted) rows + deleted rows +
     /// inserted rows.
+    #[allow(dead_code)] // Apply dialog (Task 4); tested directly meanwhile.
     pub fn change_count(&self) -> usize {
         let edited_rows: HashSet<usize> = self
             .cells
@@ -63,6 +91,23 @@ impl EditState {
         self.inserted_rows[ins_ix][col] = Some(v);
     }
 
+    /// G5 Task 3: removes insert row `ins_ix` entirely (the grid's "␡" per
+    /// inserted-row gutter affordance — brief contract #4). Unlike
+    /// `toggle_delete` (a real row's delete is a flag that can be
+    /// un-toggled, since the row still exists in the underlying table until
+    /// Apply runs), an insert row has no underlying identity to preserve —
+    /// removing it here is the only way to un-stage it, so this just drops
+    /// it from `inserted_rows`. A no-op (rather than a panic) when `ins_ix`
+    /// is out of range, since the grid's click handler captures `ins_ix` at
+    /// render time and a second concurrent removal (unlikely, but not
+    /// impossible with a stale render) shouldn't crash the app.
+    pub fn remove_insert_row(&mut self, ins_ix: usize) {
+        if ins_ix < self.inserted_rows.len() {
+            self.inserted_rows.remove(ins_ix);
+        }
+    }
+
+    #[allow(dead_code)] // Apply dialog (Task 4): clears after a successful apply.
     pub fn clear(&mut self) {
         self.cells.clear();
         self.deleted_rows.clear();
@@ -70,6 +115,7 @@ impl EditState {
     }
 }
 
+#[allow(dead_code)] // Apply dialog (Task 4): `generate_statements`' input.
 pub struct TableMeta<'a> {
     pub schema: Option<&'a str>,
     pub table: &'a str,
@@ -78,9 +124,37 @@ pub struct TableMeta<'a> {
     pub numeric_cols: &'a [bool],
 }
 
+/// G5 Task 3: display text for a staged CELL edit (`EditState::cells`
+/// value), given the cell's staged entry if any. `None` (no entry — cell
+/// isn't staged at all) is passed through as `None` so callers know to fall
+/// back to the ORIGINAL committed text instead; a staged SQL NULL
+/// (`Some(None)`) renders as the literal marker `"(NULL)"` rather than an
+/// indistinguishable-from-untouched empty string; a staged value
+/// (`Some(Some(s))`) renders as `s` itself.
+pub fn staged_cell_display(staged: Option<&Option<String>>) -> Option<String> {
+    staged.map(|v| match v {
+        None => "(NULL)".to_string(),
+        Some(s) => s.clone(),
+    })
+}
+
+/// G5 Task 3: display text for one column of an INSERT row
+/// (`EditState::inserted_rows[i][col]`'s outer-`Option` convention — see
+/// `inserted_rows`' doc comment). Untouched (`None`) shows `"(výchozí)"`
+/// (table default applies at Apply time); staged NULL (`Some(None)`) shows
+/// `"(NULL)"`; a staged value (`Some(Some(s))`) shows `s`.
+pub fn insert_cell_display(cell: &Option<Option<String>>) -> String {
+    match cell {
+        None => "(výchozí)".to_string(),
+        Some(None) => "(NULL)".to_string(),
+        Some(Some(s)) => s.clone(),
+    }
+}
+
 /// Value emitter: staged None -> "NULL"; Some(s) with numeric col AND s
 /// parses (after trimming) strictly as f64/i128 -> bare trimmed s;
 /// otherwise a single-quoted string with `'` doubled.
+#[allow(dead_code)] // Apply dialog (Task 4); tested directly meanwhile.
 pub fn sql_value(v: Option<&str>, numeric: bool) -> String {
     match v {
         None => "NULL".to_string(),
@@ -102,6 +176,7 @@ pub fn sql_value(v: Option<&str>, numeric: bool) -> String {
 }
 
 /// Builds a `pk = original` (or `pk IS NULL`) fragment for one pk column.
+#[allow(dead_code)] // Apply dialog (Task 4); tested directly meanwhile.
 fn pk_where_fragment(meta: &TableMeta, row: usize, pk_col: usize, original: &mut dyn FnMut(usize, usize) -> Option<String>) -> String {
     let ident = quote_ident(&meta.headers[pk_col]);
     match original(row, pk_col) {
@@ -110,6 +185,7 @@ fn pk_where_fragment(meta: &TableMeta, row: usize, pk_col: usize, original: &mut
     }
 }
 
+#[allow(dead_code)] // Apply dialog (Task 4); tested directly meanwhile.
 fn where_clause(meta: &TableMeta, row: usize, original: &mut dyn FnMut(usize, usize) -> Option<String>) -> String {
     meta.pk_cols
         .iter()
@@ -124,6 +200,7 @@ fn where_clause(meta: &TableMeta, row: usize, original: &mut dyn FnMut(usize, us
 /// wins). Every statement pairs with its expected affected-row count (1 for
 /// UPDATE/DELETE; None for INSERT — the driver reports 1 but server
 /// triggers may differ).
+#[allow(dead_code)] // Apply dialog (Task 4); tested directly meanwhile.
 pub fn generate_statements(
     meta: &TableMeta,
     edits: &EditState,
@@ -538,5 +615,66 @@ mod tests {
         let stmts = generate_statements(&m, &edits, &mut |_, _| None);
         assert_eq!(stmts[0].0, "INSERT INTO \"t\" (\"a\", \"b\") VALUES (NULL, NULL)");
         assert_eq!(stmts[0].1, None);
+    }
+
+    // G5 Task 3: `EditState::remove_insert_row` — the grid's per-inserted-row
+    // "␡" gutter affordance.
+    #[test]
+    fn remove_insert_row_drops_the_row_and_shifts_later_indices() {
+        let mut edits = EditState::default();
+        let ix0 = edits.add_insert_row(1);
+        edits.stage_insert_cell(ix0, 0, Some("first".into()));
+        let ix1 = edits.add_insert_row(1);
+        edits.stage_insert_cell(ix1, 0, Some("second".into()));
+        assert_eq!(edits.inserted_rows.len(), 2);
+
+        edits.remove_insert_row(ix0);
+        assert_eq!(edits.inserted_rows.len(), 1);
+        // The former ix1 row (now at index 0) survived with its own data.
+        assert_eq!(edits.inserted_rows[0][0], Some(Some("second".to_string())));
+    }
+
+    #[test]
+    fn remove_insert_row_out_of_range_is_a_noop() {
+        let mut edits = EditState::default();
+        edits.add_insert_row(1);
+        edits.remove_insert_row(5);
+        assert_eq!(edits.inserted_rows.len(), 1);
+    }
+
+    #[test]
+    fn remove_last_insert_row_clears_dirty() {
+        let mut edits = EditState::default();
+        edits.add_insert_row(1);
+        assert!(edits.is_dirty());
+        edits.remove_insert_row(0);
+        assert!(!edits.is_dirty());
+    }
+
+    // G5 Task 3: pure staged-display resolution helpers — the exact text
+    // the grid shows in a staged/inserted cell.
+    #[test]
+    fn staged_cell_display_distinguishes_untouched_null_and_value() {
+        assert_eq!(staged_cell_display(None), None);
+        assert_eq!(staged_cell_display(Some(&None)), Some("(NULL)".to_string()));
+        assert_eq!(
+            staged_cell_display(Some(&Some("x".to_string()))),
+            Some("x".to_string())
+        );
+        // Empty string is a real staged value, distinct from staged NULL.
+        assert_eq!(
+            staged_cell_display(Some(&Some(String::new()))),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn insert_cell_display_distinguishes_default_null_and_value() {
+        assert_eq!(insert_cell_display(&None), "(výchozí)".to_string());
+        assert_eq!(insert_cell_display(&Some(None)), "(NULL)".to_string());
+        assert_eq!(
+            insert_cell_display(&Some(Some("y".to_string()))),
+            "y".to_string()
+        );
     }
 }
