@@ -266,6 +266,34 @@ pub fn parse_sqlite_rows(rows: &[(i64, i64, String)]) -> PlanNode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalyzeGate {
+    /// A read (`SELECT`/`WITH`/etc.) — run immediately, no confirmation,
+    /// on any connection including a read-only one (design §5 case 1).
+    Run,
+    /// A write on a read-only connection — refused outright, status-bar
+    /// only, no modal (design §5 case 2).
+    Blocked,
+    /// A write on a writable connection — show the confirm modal
+    /// (design §5 case 3).
+    NeedsConfirm,
+}
+
+/// §5's three-case dispatch, decided purely from the RAW (pre-`EXPLAIN`-
+/// wrap) editor SQL — the exact same `dbc_core::is_read_statement` call
+/// `run_query_with`'s Guard 1 already makes on the pre-wrap text; "Explain"
+/// (estimated) never calls this at all (§5: always safe, unconditionally,
+/// on every engine).
+pub fn analyze_gate(sql: &str, read_only: bool) -> AnalyzeGate {
+    if dbc_core::is_read_statement(sql) {
+        AnalyzeGate::Run
+    } else if read_only {
+        AnalyzeGate::Blocked
+    } else {
+        AnalyzeGate::NeedsConfirm
+    }
+}
+
 #[cfg(test)]
 mod model_tests {
     use super::*;
@@ -463,5 +491,63 @@ mod model_tests {
         }
         assert_eq!(iterative_depth(&root), depth as usize);
         drop(root); // must not overflow — proves PlanNode's custom Drop works end to end.
+    }
+}
+
+#[cfg(test)]
+mod analyze_gate_tests {
+    use super::*;
+
+    #[test]
+    fn read_statement_always_runs_regardless_of_read_only() {
+        assert_eq!(analyze_gate("SELECT 1", false), AnalyzeGate::Run);
+        assert_eq!(analyze_gate("SELECT 1", true), AnalyzeGate::Run);
+        assert_eq!(analyze_gate("WITH x AS (SELECT 1) SELECT * FROM x", true), AnalyzeGate::Run);
+    }
+
+    #[test]
+    fn write_statement_on_read_only_is_blocked() {
+        assert_eq!(analyze_gate("UPDATE t SET a = 1", true), AnalyzeGate::Blocked);
+        assert_eq!(analyze_gate("DELETE FROM t", true), AnalyzeGate::Blocked);
+        assert_eq!(analyze_gate("INSERT INTO t VALUES (1)", true), AnalyzeGate::Blocked);
+    }
+
+    #[test]
+    fn write_statement_on_writable_needs_confirm() {
+        assert_eq!(analyze_gate("UPDATE t SET a = 1", false), AnalyzeGate::NeedsConfirm);
+        assert_eq!(analyze_gate("INSERT INTO t VALUES (1)", false), AnalyzeGate::NeedsConfirm);
+    }
+
+    /// REQUIRED per CURATION item 3: the same bypass edges `guards.rs`
+    /// already proves for `is_read_statement` must gate the same way here
+    /// — this function is a thin wrapper, not a parallel implementation.
+    #[test]
+    fn cte_and_comment_bypass_edges_fail_closed_to_needs_confirm_or_blocked() {
+        // Data-modifying CTE: lexically starts with WITH/SELECT-shaped but
+        // contains an UPDATE token -> is_read_statement is false -> a write.
+        let cte_write = "WITH x AS (UPDATE t SET a=1 RETURNING *) SELECT * FROM x";
+        assert_eq!(analyze_gate(cte_write, false), AnalyzeGate::NeedsConfirm);
+        assert_eq!(analyze_gate(cte_write, true), AnalyzeGate::Blocked);
+
+        // Nested-block-comment bypass: real leading statement is the UPDATE.
+        let nested_comment = "/* /* */ SELECT 1 */ UPDATE t SET a=1";
+        assert_eq!(analyze_gate(nested_comment, false), AnalyzeGate::NeedsConfirm);
+
+        // EXPLAIN ANALYZE UPDATE ... wrapped by the USER themselves (not by
+        // this feature) still correctly classifies as a write on the
+        // UNWRAPPED text this function receives.
+        assert_eq!(analyze_gate("EXPLAIN ANALYZE UPDATE t SET a=1", false), AnalyzeGate::NeedsConfirm);
+
+        // SELECT ... INTO (legacy CREATE TABLE AS spelling) is a write.
+        assert_eq!(analyze_gate("SELECT * INTO new_tbl FROM t", true), AnalyzeGate::Blocked);
+
+        // Unterminated comment/string fails closed -> not a read -> a write.
+        assert_eq!(analyze_gate("SELECT 1 /* unterminated", true), AnalyzeGate::Blocked);
+    }
+
+    #[test]
+    fn multi_statement_batch_any_write_anywhere_is_a_write() {
+        assert_eq!(analyze_gate("SELECT 1; DROP TABLE t", false), AnalyzeGate::NeedsConfirm);
+        assert_eq!(analyze_gate("SELECT 1; SELECT 2", true), AnalyzeGate::Run);
     }
 }
