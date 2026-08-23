@@ -530,6 +530,37 @@ fn csv_import_dispatch_allowed(captured_identity: &str, current_identity: &str) 
     conn_identity_matches(captured_identity, current_identity)
 }
 
+/// G12 T3 review fix (MAJOR 1): pure decision behind `confirm_script_run`'s
+/// connection-identity guard — same shape/rationale as
+/// `csv_import_dispatch_allowed` above (the script picker + background
+/// pre-scan pass don't block the UI either, so the connection dropdown
+/// stays clickable while `ModalState::ScriptRun` is being built and while
+/// it's open). `captured_identity` is what `start_script_pick` snapshotted
+/// before the picker ever opened; `current_identity` is
+/// `self.current_conn_identity()` evaluated fresh at confirm time.
+fn script_run_dispatch_allowed(captured_identity: &str, current_identity: &str) -> bool {
+    conn_identity_matches(captured_identity, current_identity)
+}
+
+/// G12 T4 review fix (MINOR 5): char budget for `ModalState::CsvImport`'s
+/// DISPLAYED `sample_sql` — a real first-batch `INSERT` can run to
+/// several hundred rows' worth of text. `self.modal` is `.clone()`d every
+/// render frame (an app-wide convention this fix deliberately does NOT
+/// restructure — see the review), so the cap is applied ONCE, wherever
+/// `sample_sql` is computed (`start_csv_import`'s completion closure,
+/// `recompute_csv_sample`), never inside a render function — the STORED
+/// string is already display-ready, not re-truncated per frame.
+const CSV_SAMPLE_SQL_DISPLAY_CAP: usize = 2000;
+
+fn cap_sql_sample(sql: String) -> String {
+    if sql.chars().count() <= CSV_SAMPLE_SQL_DISPLAY_CAP {
+        sql
+    } else {
+        let truncated: String = sql.chars().take(CSV_SAMPLE_SQL_DISPLAY_CAP).collect();
+        format!("{truncated}…")
+    }
+}
+
 /// `conn_meta`: `Some((read_only, engine))` — for a saved `ConnectionConfig`
 /// (`cfg.read_only`/`cfg.engine`) or the CLI-arg URL path (see
 /// `engine_from_url`); `None` only when `run_query_with` couldn't build a
@@ -2052,6 +2083,13 @@ impl AppView {
             return;
         };
         let conn_label = self.current_connection_label();
+        // Review fix (MAJOR 1, same pattern as `start_csv_import`'s
+        // `conn_identity` — see 46f6fc1): captured HERE, before the file
+        // picker + background pre-scan pass — the connection dropdown stays
+        // clickable through both, so `confirm_script_run` must re-verify
+        // this identity against whatever is active AT CONFIRM TIME before
+        // dispatching anything.
+        let conn_identity = self.current_conn_identity();
 
         self.status = "výběr souboru…".to_string();
         cx.notify();
@@ -2132,6 +2170,29 @@ impl AppView {
 
             let _ = this.update(cx, |view, cx| match result {
                 Ok((source_label, files, file_counts)) => {
+                    // Review fix (MINOR 4): a modal the user opened WHILE
+                    // this picker/pre-scan was in flight wins — don't
+                    // clobber it with a stale script-run pick.
+                    if view.modal.is_some() {
+                        view.status =
+                            "výběr skriptu zahozen — je otevřený jiný dialog".to_string();
+                        cx.notify();
+                        return;
+                    }
+                    // Review fix (MAJOR 1), defense in depth (same posture
+                    // as CSV's `start_csv_import`): the picker + pre-scan
+                    // didn't block the connection dropdown — if it already
+                    // changed, don't even open the modal with a stale
+                    // file/folder selection; `confirm_script_run` re-checks
+                    // this same identity again regardless (the actual
+                    // guard), so this is purely a faster/friendlier
+                    // refusal.
+                    if !conn_identity_matches(&conn_identity, &view.current_conn_identity()) {
+                        view.status =
+                            "připojení se během výběru změnilo — spuštění zrušeno".to_string();
+                        cx.notify();
+                        return;
+                    }
                     view.status = String::new();
                     view.modal = Some(connections_ui::ModalState::ScriptRun {
                         files,
@@ -2142,6 +2203,7 @@ impl AppView {
                         conn_label,
                         read_only,
                         timeout_secs,
+                        conn_identity,
                     });
                     cx.notify();
                 }
@@ -2204,11 +2266,34 @@ impl AppView {
             tx_scope,
             error_policy,
             source_label,
+            conn_identity,
             ..
         }) = self.modal.clone()
         else {
             return;
         };
+        // Review fix (MINOR 3): a query started DURING the picker/pre-scan
+        // window can still be streaming — confirming now would start a
+        // second concurrent run and silently orphan the first token
+        // (`self.cancel` clobbered). Refuse and keep the modal open (don't
+        // clear `self.modal`) so the user can retry once the other run
+        // finishes.
+        if self.cancel.is_some() {
+            self.status = "jiný dotaz stále běží — počkejte na dokončení".to_string();
+            cx.notify();
+            return;
+        }
+        // Review fix (MAJOR 1): re-verify the connection identity captured
+        // at `start_script_pick` time against whatever is active NOW — same
+        // pattern as `confirm_csv_import`'s guard (46f6fc1). On mismatch:
+        // close the modal and refuse — no spec is ever resolved,
+        // `self.runner.run_script` is never reached.
+        if !script_run_dispatch_allowed(&conn_identity, &self.current_conn_identity()) {
+            self.modal = None;
+            self.status = "připojení se během výběru změnilo — spuštění zrušeno".to_string();
+            cx.notify();
+            return;
+        }
         let Some((_, timeout_secs, engine, spec)) = self.resolve_spec_for_explain(cx) else {
             self.modal = None;
             return;
@@ -2563,9 +2648,18 @@ impl AppView {
                         &first_rows,
                     );
                     let (sample_sql, error) = match sample_sql {
-                        Ok(stmts) => (stmts.into_iter().next(), None),
+                        Ok(stmts) => (stmts.into_iter().next().map(cap_sql_sample), None),
                         Err(msg) => (None, Some(msg)),
                     };
+                    // Review fix (MINOR 4): a modal the user opened WHILE
+                    // this picker/peek was in flight wins — don't clobber
+                    // it with a stale CSV-import pick.
+                    if view.modal.is_some() {
+                        view.status =
+                            "výběr CSV zahozen — je otevřený jiný dialog".to_string();
+                        cx.notify();
+                        return;
+                    }
                     // Review fix, defense in depth (optional per the
                     // review, cheap here): the picker + this background
                     // pre-count pass didn't block the connection dropdown —
@@ -2648,7 +2742,7 @@ impl AppView {
                 first_rows.as_slice(),
             ) {
                 Ok(stmts) => {
-                    *sample_sql = stmts.into_iter().next();
+                    *sample_sql = stmts.into_iter().next().map(cap_sql_sample);
                     *error = if sample_sql.is_none() {
                         Some("žádný sloupec není namapován".to_string())
                     } else {
@@ -2694,6 +2788,16 @@ impl AppView {
         };
         if error.is_some() {
             return; // "Spustit import" is rendered disabled in this state too.
+        }
+        // Review fix (MINOR 3): same guard as `confirm_script_run` — a
+        // query started DURING the picker/peek window can still be
+        // streaming; confirming now would start a second concurrent run
+        // and silently orphan the first token. Refuse and keep the modal
+        // open.
+        if self.cancel.is_some() {
+            self.status = "jiný dotaz stále běží — počkejte na dokončení".to_string();
+            cx.notify();
+            return;
         }
         if !csv_import_dispatch_allowed(&conn_identity, &self.current_conn_identity()) {
             self.modal = None;
@@ -6147,6 +6251,19 @@ mod script_ui_tests {
         assert!(s.contains("6 OK"));
         assert!(s.contains("1 chyb"));
     }
+
+    /// Review fix (MAJOR 1): the connection-identity guard behind
+    /// `confirm_script_run` — proves the refuse path (identity captured at
+    /// `start_script_pick` time != active identity at confirm time), same
+    /// shape as `csv_ui_tests::csv_import_dispatch_allowed_refuses_on_identity_mismatch`.
+    #[test]
+    fn script_run_dispatch_allowed_refuses_on_identity_mismatch() {
+        assert!(script_run_dispatch_allowed("conn-a", "conn-a"));
+        assert!(!script_run_dispatch_allowed("conn-a", "conn-b"));
+        assert!(script_run_dispatch_allowed(CLI_CONN_IDENTITY, CLI_CONN_IDENTITY));
+        assert!(!script_run_dispatch_allowed(CLI_CONN_IDENTITY, "conn-a"));
+        assert!(!script_run_dispatch_allowed("conn-a", CLI_CONN_IDENTITY));
+    }
 }
 
 /// G12 T4: pure-helper tests behind the CSV import mapping modal —
@@ -6193,6 +6310,19 @@ mod csv_ui_tests {
         assert!(csv_import_dispatch_allowed(CLI_CONN_IDENTITY, CLI_CONN_IDENTITY));
         assert!(!csv_import_dispatch_allowed(CLI_CONN_IDENTITY, "conn-a"));
         assert!(!csv_import_dispatch_allowed("conn-a", CLI_CONN_IDENTITY));
+    }
+
+    /// Review fix (MINOR 5): short text is untouched; long text is
+    /// truncated to the exact char cap plus a trailing ellipsis.
+    #[test]
+    fn cap_sql_sample_leaves_short_text_alone_and_truncates_long_text() {
+        let short = "INSERT INTO t (id) VALUES (1);".to_string();
+        assert_eq!(cap_sql_sample(short.clone()), short);
+
+        let long = "x".repeat(CSV_SAMPLE_SQL_DISPLAY_CAP + 500);
+        let capped = cap_sql_sample(long);
+        assert_eq!(capped.chars().count(), CSV_SAMPLE_SQL_DISPLAY_CAP + 1);
+        assert!(capped.ends_with('…'));
     }
 }
 

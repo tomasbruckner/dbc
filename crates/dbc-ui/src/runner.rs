@@ -1475,7 +1475,22 @@ async fn run_csv_import_inner(
             &rows,
         );
         let stmt = match stmts {
-            Ok(stmts) => stmts.into_iter().next(),
+            Ok(stmts) => {
+                // NIT: `generate_insert_batches` returns one statement PER
+                // `CSV_IMPORT_BATCH_SIZE`-row slice — `rows` here is always
+                // ≤ `CSV_IMPORT_BATCH_SIZE` (the producer chunks to exactly
+                // that size, see the `spawn_blocking` loop above), so this
+                // ALWAYS has at most one statement; `.next()` below is safe
+                // to take as "the whole batch's statement", never a partial
+                // one silently dropped.
+                debug_assert!(
+                    stmts.len() <= 1,
+                    "generate_insert_batches must return at most one statement for a chunk \
+                     sized to CSV_IMPORT_BATCH_SIZE, got {}",
+                    stmts.len()
+                );
+                stmts.into_iter().next()
+            }
             Err(msg) => {
                 let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
                 let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg(msg) }).await;

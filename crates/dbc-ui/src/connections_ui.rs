@@ -995,6 +995,16 @@ pub enum ModalState {
         conn_label: String,
         read_only: bool,
         timeout_secs: Option<u64>,
+        /// Review fix (MAJOR 1, same pattern as `CsvImport.conn_identity`
+        /// below): the STABLE identity (`AppView::current_conn_identity`)
+        /// captured at `start_script_pick` dispatch time, BEFORE the file
+        /// picker + background pre-scan ever ran — both leave the
+        /// connection dropdown clickable. `confirm_script_run` re-verifies
+        /// this against the CURRENTLY active connection before dispatching
+        /// anything; on mismatch it refuses rather than running a stale
+        /// file/folder selection against a different, currently-active
+        /// (writable) database.
+        conn_identity: String,
     },
     /// G12 T4: CSV import mapping modal (design §5) — opened once the file
     /// picker + header/row pre-count pass resolve (`AppView::start_csv_import`).
@@ -1173,6 +1183,7 @@ impl AppView {
                 conn_label,
                 read_only,
                 timeout_secs,
+                ..
             } => render_script_run_confirm_panel(
                 &files,
                 &file_counts,

@@ -149,6 +149,17 @@ pub struct StatementSplitter {
     /// bool), defensively mirroring `guards.rs`'s block-comment nesting fix,
     /// even though SQLite's own trigger grammar disallows nested bodies.
     trigger_depth: u32,
+    /// SQLite, review fix (MAJOR 2): `CASE...END` nesting depth WITHIN a
+    /// trigger body (only tracked while `trigger_depth > 0`) -- a bare
+    /// `END` inside a trigger body can close a `CASE` expression (e.g.
+    /// `SET x = CASE WHEN NEW.x > 0 THEN 1 ELSE 0 END;`) rather than the
+    /// body's own `BEGIN`. `apply_trigger_word` pops THIS counter first on
+    /// `END`, and only decrements `trigger_depth` once it's back at 0 --
+    /// safe because SQL grammar guarantees a `CASE`'s `END` always closes
+    /// before any enclosing `BEGIN`'s `END` (the same "trust well-formed
+    /// nesting" posture the block-comment/trigger-depth counters already
+    /// take, not a real parser). See `apply_trigger_word`'s doc comment.
+    case_depth: u32,
 }
 
 impl StatementSplitter {
@@ -165,6 +176,7 @@ impl StatementSplitter {
             dollar_match_len: 0,
             trigger_lead: TriggerLead::initial(dialect),
             trigger_depth: 0,
+            case_depth: 0,
         }
     }
 
@@ -495,6 +507,7 @@ impl StatementSplitter {
         self.mode = Mode::Normal;
         self.trigger_lead = TriggerLead::initial(self.dialect);
         self.trigger_depth = 0;
+        self.case_depth = 0;
     }
 
     fn finalize_word(&mut self) {
@@ -506,6 +519,19 @@ impl StatementSplitter {
         self.mode = Mode::Normal;
     }
 
+    /// Review fix (MAJOR 2, `TriggerLead::Confirmed` arm): `END` is
+    /// ambiguous inside a trigger body -- it can close either the body's own
+    /// `BEGIN` or a `CASE` expression (`CASE ... END`, no `BEGIN` involved).
+    /// `case_depth` is consulted FIRST: while it's non-zero, an `END` pops
+    /// it (a `CASE` closing) rather than touching `trigger_depth` (the
+    /// body's own nesting) at all. Only once `case_depth` is back at 0 does
+    /// `END` decrement `trigger_depth` -- i.e. it takes exactly as many
+    /// `END`s to close all open `CASE`s as `CASE`s were opened, and only the
+    /// NEXT `END` after that closes the body itself. This is sound (not a
+    /// real parser, same "trust well-formed nesting" posture as the
+    /// existing `trigger_depth`/block-comment counters) because SQL grammar
+    /// never lets a `CASE`'s `END` and its enclosing `BEGIN`'s `END`
+    /// interleave out of order.
     fn apply_trigger_word(&mut self, w: &str) {
         match self.trigger_lead {
             TriggerLead::AwaitingCreate => {
@@ -534,8 +560,14 @@ impl StatementSplitter {
             TriggerLead::Confirmed => {
                 if w == "BEGIN" {
                     self.trigger_depth += 1;
+                } else if w == "CASE" && self.trigger_depth > 0 {
+                    self.case_depth += 1;
                 } else if w == "END" && self.trigger_depth > 0 {
-                    self.trigger_depth -= 1;
+                    if self.case_depth > 0 {
+                        self.case_depth -= 1;
+                    } else {
+                        self.trigger_depth -= 1;
+                    }
                 }
             }
             TriggerLead::NotATrigger => {}
@@ -840,6 +872,67 @@ mod tests {
             s.finish(),
             Err(SplitError::UnterminatedAtEof(UnterminatedKind::TriggerBody))
         );
+    }
+
+    // ---------- Review fix (MAJOR 2): CASE...END inside a trigger body ----------
+
+    /// The reviewer's exact probe: a bare `END` closing a `CASE` expression
+    /// inside a trigger body must NOT be mistaken for the body's own `END`
+    /// -- this used to split into 3 statements (the `CASE`'s `END`
+    /// prematurely closed `trigger_depth`, so the real body `END` fell
+    /// through to a fresh top-level `;`-split).
+    #[test]
+    fn trigger_body_with_case_end_is_not_mistaken_for_the_body_end() {
+        let sql = "CREATE TRIGGER trg AFTER UPDATE ON t BEGIN \
+                   UPDATE t SET x = CASE WHEN NEW.x > 0 THEN 1 ELSE 0 END; END; SELECT 1;";
+        let out = split_sql(sql, Dialect::Sqlite).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out[0].starts_with("CREATE TRIGGER"));
+        assert!(out[0].trim_end().ends_with("END"));
+        assert_eq!(out[1], "SELECT 1");
+    }
+
+    /// Nested `CASE`s inside a trigger body -- `case_depth` must climb past
+    /// 1 and unwind fully (inner `CASE`'s `END`, then outer `CASE`'s `END`)
+    /// before the body's own terminating `END` is reachable again.
+    #[test]
+    fn trigger_body_with_nested_case_end() {
+        let sql = "CREATE TRIGGER trg AFTER UPDATE ON t BEGIN \
+                   UPDATE t SET x = CASE WHEN NEW.x > 0 \
+                   THEN (CASE WHEN NEW.y > 0 THEN 1 ELSE 2 END) ELSE 0 END; \
+                   END; SELECT 1;";
+        let out = split_sql(sql, Dialect::Sqlite).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out[0].starts_with("CREATE TRIGGER"));
+        assert!(out[0].trim_end().ends_with("END"));
+        assert_eq!(out[1], "SELECT 1");
+    }
+
+    /// A `CASE...END` OUTSIDE any trigger body is unaffected -- `case_depth`
+    /// is only ever consulted while `trigger_depth > 0`
+    /// (`TriggerLead::Confirmed` + inside `BEGIN...END`), so a plain
+    /// statement's own `;` still splits exactly as before.
+    #[test]
+    fn case_end_outside_a_trigger_is_unaffected() {
+        let sql = "SELECT CASE WHEN a > 0 THEN 1 ELSE 0 END FROM t; SELECT 2;";
+        let out = split_sql(sql, Dialect::Sqlite).unwrap();
+        assert_eq!(out, vec!["SELECT CASE WHEN a > 0 THEN 1 ELSE 0 END FROM t", "SELECT 2"]);
+    }
+
+    /// Multiple body statements, one of them containing a `CASE...END`,
+    /// each properly `;`-terminated, followed by the real body `END`.
+    #[test]
+    fn trigger_body_with_multiple_statements_including_a_case_then_final_end() {
+        let sql = "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                   UPDATE t SET x = CASE WHEN NEW.x > 0 THEN 1 ELSE 0 END; \
+                   DELETE FROM t WHERE x = 0; \
+                   INSERT INTO log VALUES (CASE WHEN NEW.y IS NULL THEN 0 ELSE NEW.y END); \
+                   END; SELECT 3;";
+        let out = split_sql(sql, Dialect::Sqlite).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out[0].starts_with("CREATE TRIGGER"));
+        assert!(out[0].trim_end().ends_with("END"));
+        assert_eq!(out[1], "SELECT 3");
     }
 
     // ---------- Dialect isolation ----------
