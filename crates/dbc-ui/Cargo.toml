@@ -31,6 +31,10 @@ serde_json.workspace = true
 # free of it (csv_import.rs's pure model has no dependency on this crate
 # at all — only the UI-owned parsing/peek pass in main.rs/runner.rs does).
 csv = "1"
+# G10 T4: masked password modals read into Zeroizing<String> before
+# building admin_sql's mutation builders (design §3/CURATION item 4) —
+# same discipline dbc-state's vault export_key and dbc-mcp already use.
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

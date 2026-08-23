@@ -2383,6 +2383,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-sequel",
  "unicode-segmentation",
+ "zeroize",
 ]
 
 [[package]]

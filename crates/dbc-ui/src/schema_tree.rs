@@ -31,6 +31,8 @@ use dbc_core::{
     TableInfo, TableKind, TriggerInfo,
 };
 use dbc_state::FavouriteObject;
+
+use crate::admin_panel::AdminEntry;
 use gpui::{
     actions, div, prelude::*, px, uniform_list, App, ClickEvent, Context, EventEmitter,
     FocusHandle, Focusable, KeyBinding, KeyDownEvent, MouseButton, Window,
@@ -73,6 +75,12 @@ pub enum NodeId {
     /// `FavouriteSection`. `kind` mirrors `FavouriteObject::kind`
     /// ("table"|"view"|"routine"|"trigger"|"sequence").
     Favourite(String, String, String),
+    /// G10 T4: the "Správa serveru" pinned entry row (design §2 "rendered
+    /// above Favourites, not a real catalog object") — a single,
+    /// unparameterized variant, same shape as `FavouriteSection`. Never
+    /// expandable; a click emits `TreeEvent::OpenAdmin` when the tree's
+    /// `admin_entry` is `Enabled` (see `flatten`/`SchemaTree::render`).
+    AdminRoot,
 }
 
 /// Emitted by `SchemaTree` (`EventEmitter<TreeEvent>`) for the things it
@@ -95,6 +103,11 @@ pub enum TreeEvent {
     /// icon isn't rendered at all in that state — see `read_only`'s doc
     /// comment).
     ImportCsv { schema: Option<String>, table: String },
+    /// G10 T4: the pinned "Správa serveru" row was clicked while `Enabled`
+    /// — `main.rs::open_admin_tab` re-checks `admin_entry_state` itself
+    /// defensively (belt-and-braces with the runner's shared read-only
+    /// guard).
+    OpenAdmin,
 }
 
 /// One visible row: `(id, depth, label, is_expandable)`.
@@ -420,10 +433,20 @@ pub fn flatten(
     filter: &str,
     favourites: &[FavouriteObject],
     active_connection_id: Option<&str>,
+    admin: AdminEntry,
 ) -> Vec<FlatNode> {
     let mut out = Vec::new();
     let filter_lc = filter.to_lowercase();
     let filter_active = !filter_lc.is_empty();
+
+    // G10 T4 (design §2): the pinned "Správa serveru" row, when not
+    // Hidden, renders FIRST — above even "Oblíbené" below. Never
+    // expandable (`false`). Its greyed/disabled `Disabled` rendering lives
+    // in `SchemaTree::render` (this function only decides visibility, not
+    // styling).
+    if admin != AdminEntry::Hidden {
+        out.push((NodeId::AdminRoot, 0, "Správa serveru".to_string(), false));
+    }
 
     // G3 Task 4: the "Oblíbené" section always comes first, ahead of any
     // schema/section node below.
@@ -605,6 +628,12 @@ pub struct SchemaTree {
     /// entry-gate half: hidden entirely, not merely disabled, on a
     /// read-only connection).
     read_only: bool,
+    /// G10 T4: `admin_panel::admin_entry_state`'s result for the ACTIVE
+    /// connection, pushed in by `main.rs` everywhere `set_favourites` is
+    /// already called on a connection switch/schema refresh (`set_admin_entry`).
+    /// Drives both `flatten`'s pinned "Správa serveru" row visibility and
+    /// this row's greyed/disabled rendering.
+    admin_entry: AdminEntry,
 }
 
 impl SchemaTree {
@@ -621,12 +650,19 @@ impl SchemaTree {
             favourites: Vec::new(),
             active_connection_id: None,
             read_only: false,
+            admin_entry: AdminEntry::Hidden,
         }
     }
 
     /// G12 T4: see the `read_only` field's doc comment.
     pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
         self.read_only = read_only;
+        cx.notify();
+    }
+
+    /// G10 T4: see the `admin_entry` field's doc comment.
+    pub fn set_admin_entry(&mut self, admin_entry: AdminEntry, cx: &mut Context<Self>) {
+        self.admin_entry = admin_entry;
         cx.notify();
     }
 
@@ -907,7 +943,16 @@ impl Render for SchemaTree {
         let rows = self
             .snapshot
             .as_ref()
-            .map(|s| flatten(s, &self.expanded, &self.filter, &self.favourites, self.active_connection_id.as_deref()))
+            .map(|s| {
+                flatten(
+                    s,
+                    &self.expanded,
+                    &self.filter,
+                    &self.favourites,
+                    self.active_connection_id.as_deref(),
+                    self.admin_entry,
+                )
+            })
             .unwrap_or_default();
 
         let header_label =
@@ -1084,6 +1129,25 @@ impl Render for SchemaTree {
                                 None
                             };
 
+                            // G10 T4 (design §2): the pinned "Správa serveru"
+                            // row is neither expandable nor selectable like
+                            // an ordinary tree node — greyed + an inline
+                            // "(pouze pro čtení)" hint when `Disabled` (this
+                            // codebase has no tooltip primitive elsewhere to
+                            // reuse — see the module's admin_panel.rs
+                            // sibling doc comment), and its click emits
+                            // `TreeEvent::OpenAdmin` only when `Enabled`.
+                            let is_admin_root = matches!(id, NodeId::AdminRoot);
+                            let admin_disabled =
+                                is_admin_root && this.admin_entry == AdminEntry::Disabled;
+                            let admin_enabled =
+                                is_admin_root && this.admin_entry == AdminEntry::Enabled;
+                            let label = if admin_disabled {
+                                format!("{label} (pouze pro čtení)")
+                            } else {
+                                label
+                            };
+
                             let mut row = div()
                                 .id(("tree-row", ix))
                                 .flex()
@@ -1092,7 +1156,11 @@ impl Render for SchemaTree {
                                 .h(px(22.))
                                 .pl(px(6. + depth as f32 * 14.))
                                 .cursor_pointer()
-                                .text_color(cx.theme().text_primary)
+                                .text_color(if admin_disabled {
+                                    cx.theme().text_disabled
+                                } else {
+                                    cx.theme().text_primary
+                                })
                                 .hover(|s| s.bg(cx.theme().bg_hover));
                             if is_selected {
                                 row = row.bg(cx.theme().bg_selected);
@@ -1107,12 +1175,20 @@ impl Render for SchemaTree {
                                         .child(chevron)
                                         .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                                             cx.stop_propagation();
-                                            this.toggle_expand(&chevron_id);
-                                            cx.notify();
+                                            if !is_admin_root {
+                                                this.toggle_expand(&chevron_id);
+                                                cx.notify();
+                                            }
                                         })),
                                 )
                                 .child(div().flex_1().overflow_hidden().child(label))
                                 .on_click(cx.listener(move |this, ev: &ClickEvent, _window, cx| {
+                                    if is_admin_root {
+                                        if admin_enabled {
+                                            cx.emit(TreeEvent::OpenAdmin);
+                                        }
+                                        return;
+                                    }
                                     if ev.click_count() >= 2 {
                                         this.handle_double_click(&click_id, cx);
                                     } else {
@@ -1181,7 +1257,7 @@ mod flatten_tests {
             tables: vec![table(None, "users", TableKind::Table, vec![col("id", "INTEGER")])],
             ..Default::default()
         };
-        let rows = flatten(&snap, &HashSet::new(), "", &[], None);
+        let rows = flatten(&snap, &HashSet::new(), "", &[], None, AdminEntry::Hidden);
         // No `NodeId::Schema` row anywhere, and the section sits at depth 0.
         assert!(!rows.iter().any(|(id, ..)| matches!(id, NodeId::Schema(_))));
         assert_eq!(rows[0].0, NodeId::Section("".to_string(), "Tabulky"));
@@ -1197,7 +1273,7 @@ mod flatten_tests {
             ],
             ..Default::default()
         };
-        let rows = flatten(&snap, &HashSet::new(), "", &[], None);
+        let rows = flatten(&snap, &HashSet::new(), "", &[], None, AdminEntry::Hidden);
         // Only the two Schema headers show — nothing is expanded yet.
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], (NodeId::Schema("audit".into()), 0, "audit".into(), true));
@@ -1205,7 +1281,7 @@ mod flatten_tests {
 
         let mut expanded = HashSet::new();
         expanded.insert(NodeId::Schema("public".into()));
-        let rows = flatten(&snap, &expanded, "", &[], None);
+        let rows = flatten(&snap, &expanded, "", &[], None, AdminEntry::Hidden);
         // "public" expanded reveals its Tabulky section nested one level in;
         // "audit" stays collapsed to just its header.
         assert!(rows.iter().any(|(id, depth, ..)| {
@@ -1226,7 +1302,7 @@ mod flatten_tests {
             triggers: vec![trigger(None, "trg1", "a")],
             sequences: vec![sequence(None, "seq1")],
         };
-        let rows = flatten(&snap, &HashSet::new(), "", &[], None);
+        let rows = flatten(&snap, &HashSet::new(), "", &[], None, AdminEntry::Hidden);
         let labels: Vec<&str> = rows.iter().map(|(_, _, label, _)| label.as_str()).collect();
         // Procedury and Indexy are absent (empty); the rest appear in the
         // brief's fixed order, with correct counts.
@@ -1242,7 +1318,7 @@ mod flatten_tests {
             ],
             ..Default::default()
         };
-        let rows = flatten(&snap, &HashSet::new(), "", &[], None);
+        let rows = flatten(&snap, &HashSet::new(), "", &[], None, AdminEntry::Hidden);
         assert_eq!(rows, vec![(NodeId::Section("".into(), "Pohledy"), 0, "Pohledy (2)".into(), true)]);
     }
 
@@ -1253,19 +1329,19 @@ mod flatten_tests {
             ..Default::default()
         };
         // Nothing expanded: only the section header.
-        let rows = flatten(&snap, &HashSet::new(), "", &[], None);
+        let rows = flatten(&snap, &HashSet::new(), "", &[], None, AdminEntry::Hidden);
         assert_eq!(rows.len(), 1);
 
         // Section expanded: table row appears, columns still hidden.
         let mut expanded = HashSet::new();
         expanded.insert(NodeId::Section("".into(), "Tabulky"));
-        let rows = flatten(&snap, &expanded, "", &[], None);
+        let rows = flatten(&snap, &expanded, "", &[], None, AdminEntry::Hidden);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].0, NodeId::Table("".into(), "users".into()));
 
         // Table also expanded: column row appears too.
         expanded.insert(NodeId::Table("".into(), "users".into()));
-        let rows = flatten(&snap, &expanded, "", &[], None);
+        let rows = flatten(&snap, &expanded, "", &[], None, AdminEntry::Hidden);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[2].0, NodeId::Column("".into(), "users".into(), "id".into()));
         assert_eq!(rows[2].2, "id: INTEGER");
@@ -1298,7 +1374,7 @@ mod flatten_tests {
         // "products" (no match anywhere in it) is hidden entirely, and
         // "id" (present on both tables, doesn't match) doesn't show either
         // since "users" itself didn't match by name.
-        let rows = flatten(&snap, &HashSet::new(), "EMAIL", &[], None);
+        let rows = flatten(&snap, &HashSet::new(), "EMAIL", &[], None, AdminEntry::Hidden);
         assert_eq!(
             rows,
             vec![
@@ -1315,7 +1391,7 @@ mod flatten_tests {
             tables: vec![table(None, "users", TableKind::Table, vec![col("id", "INTEGER"), col("email", "TEXT")])],
             ..Default::default()
         };
-        let rows = flatten(&snap, &HashSet::new(), "users", &[], None);
+        let rows = flatten(&snap, &HashSet::new(), "users", &[], None, AdminEntry::Hidden);
         // The table itself matched by name, so both columns show, not just
         // ones whose own name happens to contain "users".
         let col_labels: Vec<&str> = rows
@@ -1334,7 +1410,7 @@ mod flatten_tests {
 
         let mut expanded = HashSet::new();
         expanded.insert(NodeId::Section("".into(), "Indexy"));
-        let rows = flatten(&snap, &expanded, "", &[], None);
+        let rows = flatten(&snap, &expanded, "", &[], None, AdminEntry::Hidden);
         assert!(rows.iter().any(|(id, depth, label, _)| {
             *id == NodeId::Index("".into(), "users".into(), "users_pkey".into())
                 && *depth == 1
@@ -1345,7 +1421,7 @@ mod flatten_tests {
     #[test]
     fn empty_snapshot_flattens_to_no_rows() {
         let snap = SchemaSnapshot::default();
-        assert!(flatten(&snap, &HashSet::new(), "", &[], None).is_empty());
+        assert!(flatten(&snap, &HashSet::new(), "", &[], None, AdminEntry::Hidden).is_empty());
     }
 
     // --- review Issue 3: same-connection refresh state preservation ---
@@ -1445,7 +1521,7 @@ mod flatten_tests {
         // No active connection id at all (e.g. the CLI-arg URL path) — the
         // section can't be built (nothing to stamp a new toggle with
         // either), so it's hidden even though `favourites` is non-empty.
-        let rows = flatten(&snap, &HashSet::new(), "", &favourites, None);
+        let rows = flatten(&snap, &HashSet::new(), "", &favourites, None, AdminEntry::Hidden);
         assert!(!rows.iter().any(|(id, ..)| matches!(id, NodeId::FavouriteSection)));
     }
 
@@ -1456,7 +1532,7 @@ mod flatten_tests {
             ..Default::default()
         };
         let favourites = vec![fav("other-conn", None, "users", "table")];
-        let rows = flatten(&snap, &HashSet::new(), "", &favourites, Some("c1"));
+        let rows = flatten(&snap, &HashSet::new(), "", &favourites, Some("c1"), AdminEntry::Hidden);
         assert!(!rows.iter().any(|(id, ..)| matches!(id, NodeId::FavouriteSection)));
     }
 
@@ -1470,7 +1546,7 @@ mod flatten_tests {
             ..Default::default()
         };
         let favourites = vec![fav("c1", Some("public"), "t1", "table")];
-        let rows = flatten(&snap, &HashSet::new(), "", &favourites, Some("c1"));
+        let rows = flatten(&snap, &HashSet::new(), "", &favourites, Some("c1"), AdminEntry::Hidden);
         assert_eq!(rows[0].0, NodeId::FavouriteSection);
         assert_eq!(rows[0].2, "Oblíbené (1)");
         // The Schema headers still follow, unaffected.
@@ -1488,7 +1564,7 @@ mod flatten_tests {
         ];
         let mut expanded = HashSet::new();
         expanded.insert(NodeId::FavouriteSection);
-        let rows = flatten(&snap, &expanded, "", &favourites, Some("c1"));
+        let rows = flatten(&snap, &expanded, "", &favourites, Some("c1"), AdminEntry::Hidden);
         assert_eq!(rows[0], (NodeId::FavouriteSection, 0, "Oblíbené (2)".into(), true));
         let items: Vec<&NodeId> = rows.iter().skip(1).map(|(id, ..)| id).collect();
         assert_eq!(
@@ -1508,7 +1584,7 @@ mod flatten_tests {
         let favourites = vec![fav("c1", Some("public"), "t1", "table"), fav("c1", None, "seq1", "sequence")];
         let mut expanded = HashSet::new();
         expanded.insert(NodeId::FavouriteSection);
-        let rows = flatten(&snap, &expanded, "", &favourites, Some("c1"));
+        let rows = flatten(&snap, &expanded, "", &favourites, Some("c1"), AdminEntry::Hidden);
         let labels: Vec<&str> = rows.iter().skip(1).map(|(_, _, l, _)| l.as_str()).collect();
         assert_eq!(labels, vec!["public.t1", "seq1"]);
     }
@@ -1517,7 +1593,7 @@ mod flatten_tests {
     fn favourites_section_stays_collapsed_until_expanded() {
         let snap = SchemaSnapshot::default();
         let favourites = vec![fav("c1", Some("public"), "t1", "table")];
-        let rows = flatten(&snap, &HashSet::new(), "", &favourites, Some("c1"));
+        let rows = flatten(&snap, &HashSet::new(), "", &favourites, Some("c1"), AdminEntry::Hidden);
         // Header only — not expanded, so the item row is hidden.
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, NodeId::FavouriteSection);
@@ -1541,7 +1617,7 @@ mod flatten_tests {
         ];
         let mut expanded = HashSet::new();
         expanded.insert(NodeId::FavouriteSection);
-        let rows = flatten(&snap, &expanded, "", &favourites, Some("c1"));
+        let rows = flatten(&snap, &expanded, "", &favourites, Some("c1"), AdminEntry::Hidden);
         let ids: Vec<&NodeId> = rows.iter().skip(1).map(|(id, ..)| id).collect();
         assert_eq!(
             ids,
@@ -1553,5 +1629,23 @@ mod flatten_tests {
                 &NodeId::Favourite("sequence".into(), "s".into(), "a_sequence".into()),
             ]
         );
+    }
+
+    // G10 T4: the pinned "Správa serveru" row renders first (even ahead of
+    // "Oblíbené") whenever `AdminEntry` isn't `Hidden`, and never appears
+    // at all when it is.
+    #[test]
+    fn admin_root_renders_first_when_not_hidden_and_never_when_hidden() {
+        let snapshot = SchemaSnapshot::default();
+        let expanded = HashSet::new();
+        let out = flatten(&snapshot, &expanded, "", &[], None, AdminEntry::Enabled);
+        assert_eq!(
+            out.first().map(|(id, depth, label, _)| (id.clone(), *depth, label.clone())),
+            Some((NodeId::AdminRoot, 0, "Správa serveru".to_string()))
+        );
+        let out = flatten(&snapshot, &expanded, "", &[], None, AdminEntry::Disabled);
+        assert!(matches!(out.first(), Some((NodeId::AdminRoot, ..))));
+        let out = flatten(&snapshot, &expanded, "", &[], None, AdminEntry::Hidden);
+        assert!(out.iter().all(|(id, ..)| *id != NodeId::AdminRoot));
     }
 }
