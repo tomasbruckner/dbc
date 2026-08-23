@@ -5,13 +5,13 @@
 //! blocking-chains tree / per-table sizes (design §5).
 
 use gpui::{
-    div, prelude::*, px, rgb, rgba, uniform_list, AnyElement, ClipboardItem, Context, Div,
-    EventEmitter, Rgba, Window,
+    div, prelude::*, px, uniform_list, AnyElement, ClipboardItem, Context, Div, EventEmitter, Hsla, Window,
 };
 
 use crate::monitor;
 use crate::monitor_sql;
 use crate::runner;
+use crate::theme::{ActiveTheme, Theme};
 
 // Duration colour tiers (design §5 — constants live HERE, not monitor.rs).
 pub const DURATION_WARN_SECS: f64 = 1.0;
@@ -34,11 +34,11 @@ pub fn duration_tier(secs: f64) -> Tier {
     }
 }
 
-fn tier_color(t: Tier) -> Rgba {
+fn tier_color(t: Tier, theme: &Theme) -> Hsla {
     match t {
-        Tier::Normal => rgb(0xcdd6f4),
-        Tier::Warn => rgb(0xf9e2af), // design §5's literal warn colour
-        Tier::Crit => rgb(0xf38ba8), // design §5's literal crit colour
+        Tier::Normal => theme.text_primary,
+        Tier::Warn => theme.warn, // design §5's literal warn colour
+        Tier::Crit => theme.danger, // design §5's literal crit colour
     }
 }
 
@@ -235,20 +235,20 @@ impl MonitorView {
     }
 }
 
-/// Base card styling shared by the four tiles (design §5 — `rgb(0x1e1e2e)`
-/// bg / `rgb(0x45475a)` border, matching `connections_ui.rs`'s panels).
-fn card() -> Div {
+/// Base card styling shared by the four tiles (design §5 — `bg_panel`/
+/// `border`, matching `connections_ui.rs`'s panels).
+fn card(theme: &Theme) -> Div {
     div()
         .flex()
         .flex_col()
         .gap_1()
         .p_2()
         .w(px(220.))
-        .bg(rgb(0x1e1e2e))
+        .bg(theme.bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(theme.border)
         .rounded_md()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(theme.text_primary)
 }
 
 fn card_title(label: &str) -> Div {
@@ -320,6 +320,7 @@ fn flatten_blocking_tree(roots: &[monitor::BlockingNode]) -> Vec<BlockingRow> {
 
 impl MonitorView {
     fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
         let pause_icon = if self.paused { "▶" } else { "⏸" };
         let freshness = match self.last_refresh_at {
             Some(t) => format!("aktualizace před {} s", t.elapsed().as_secs()),
@@ -332,7 +333,7 @@ impl MonitorView {
             .justify_end()
             .gap_2()
             .p_2()
-            .text_color(rgb(0xcdd6f4))
+            .text_color(theme.text_primary)
             .child(freshness)
             .child(
                 div()
@@ -356,7 +357,7 @@ impl MonitorView {
             .into_any_element()
     }
 
-    fn render_tiles(&self) -> AnyElement {
+    fn render_tiles(&self, theme: &Theme) -> AnyElement {
         let snap = self.snapshot.as_ref();
 
         let conn_body = match snap.and_then(|s| s.connections.as_ref()) {
@@ -402,15 +403,15 @@ impl MonitorView {
             .flex_wrap()
             .gap_2()
             .p_2()
-            .child(card().child(card_title("Připojení")).child(conn_body))
+            .child(card(theme).child(card_title("Připojení")).child(conn_body))
             .child(
-                card()
+                card(theme)
                     .child(card_title("Zámky"))
                     .child(locks_body)
-                    .child(div().text_color(rgb(0x6c7086)).child("od posledního resetu statistik")),
+                    .child(div().text_color(theme.text_disabled).child("od posledního resetu statistik")),
             )
             .child(
-                card()
+                card(theme)
                     .child(card_title("Velikost DB"))
                     .child(
                         div()
@@ -418,12 +419,12 @@ impl MonitorView {
                             .flex_row()
                             .h(px(8.))
                             .w(px(160.))
-                            .child(div().h(px(8.)).w(px(160. * data_frac)).bg(rgb(0x89b4fa)))
-                            .child(div().h(px(8.)).w(px(160. * wal_frac)).bg(rgb(0xf9e2af))),
+                            .child(div().h(px(8.)).w(px(160. * data_frac)).bg(theme.accent))
+                            .child(div().h(px(8.)).w(px(160. * wal_frac)).bg(theme.warn)),
                     )
                     .child(size_label),
             )
-            .child(card().child(card_title("Výkon")).child(perf_body))
+            .child(card(theme).child(card_title("Výkon")).child(perf_body))
             .into_any_element()
     }
 
@@ -439,13 +440,14 @@ impl MonitorView {
             "monitor-running",
             rows_len,
             cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                let theme = *cx.theme();
                 let mut items = Vec::with_capacity(range.len());
                 let Some(rows) = this.snapshot.as_ref().and_then(|s| s.running.as_ref()) else {
                     return items;
                 };
                 for ix in range {
                     let Some(row) = rows.get(ix) else { continue };
-                    let color = tier_color(duration_tier(row.duration_secs));
+                    let color = tier_color(duration_tier(row.duration_secs), &theme);
                     let query_text = row.query.clone().unwrap_or_default();
                     let detail_text = row.query.clone();
                     let pid = row.pid;
@@ -459,7 +461,7 @@ impl MonitorView {
                         // (plan's explicitly-sanctioned fallback).
                         div()
                             .id(("mon-kill", pid as usize))
-                            .text_color(rgb(0x6c7086))
+                            .text_color(theme.text_disabled)
                             .child("✕ pouze pro čtení")
                             .into_any_element()
                     } else {
@@ -473,7 +475,7 @@ impl MonitorView {
                         div()
                             .id(("mon-kill", pid as usize))
                             .cursor_pointer()
-                            .text_color(rgb(0xf38ba8))
+                            .text_color(theme.danger)
                             .child("✕")
                             .on_click(cx.listener(move |_this, _, _, cx| {
                                 cx.emit(MonitorViewEvent::KillRequested {
@@ -532,6 +534,7 @@ impl MonitorView {
     }
 
     fn render_blocking(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
         let mut body: Vec<AnyElement> = Vec::new();
         match self.snapshot.as_ref().and_then(|s| s.blocking.as_ref()) {
             None => body.push(div().px_2().child("n/a").into_any_element()),
@@ -547,7 +550,7 @@ impl MonitorView {
                     if row.cycle {
                         label.push_str(" (cyklus — možný deadlock)");
                     }
-                    let color = if row.cycle { tier_color(Tier::Crit) } else { rgb(0xcdd6f4) };
+                    let color = if row.cycle { tier_color(Tier::Crit, &theme) } else { theme.text_primary };
                     let detail_text = row.query;
                     let el = div()
                         .id(("mon-block", ix))
@@ -571,7 +574,7 @@ impl MonitorView {
             body.push(
                 div()
                     .px_2()
-                    .text_color(rgb(0xf9e2af))
+                    .text_color(theme.warn)
                     .child("strom blokací je příliš velký — zobrazena je jen jeho část")
                     .into_any_element(),
             );
@@ -585,7 +588,7 @@ impl MonitorView {
             .into_any_element()
     }
 
-    fn render_tables(&self) -> AnyElement {
+    fn render_tables(&self, theme: &Theme) -> AnyElement {
         let mut body: Vec<AnyElement> = Vec::new();
         match self.snapshot.as_ref().and_then(|s| s.tables.as_ref()) {
             None => body.push(div().px_2().child("n/a").into_any_element()),
@@ -613,7 +616,7 @@ impl MonitorView {
                         .child(div().w(px(80.)).child(monitor::fmt_bytes(r.index_bytes)))
                         .child(div().w(px(80.)).child(monitor::fmt_bytes(r.toast_bytes)))
                         .child(div().w(px(110.)).child(format!("~{} řádků", r.row_estimate)))
-                        .child(div().h(px(6.)).w(px(160. * frac)).bg(rgb(0x89b4fa)));
+                        .child(div().h(px(6.)).w(px(160. * frac)).bg(theme.accent));
                     body.push(row_el.into_any_element());
                 }
             }
@@ -639,15 +642,16 @@ impl MonitorView {
     /// button), so this follows the ACTUAL precedent rather than the
     /// prose description.
     fn render_detail_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = *cx.theme();
         let text = self.detail.clone()?;
         let text_for_copy = text.clone();
         let panel = div()
             .id("mon-detail-panel")
             .w(px(560.))
             .max_h(px(420.))
-            .bg(rgb(0x1e1e2e))
+            .bg(theme.bg_panel)
             .border_1()
-            .border_color(rgb(0x45475a))
+            .border_color(theme.border)
             .rounded_md()
             .flex()
             .flex_col()
@@ -658,7 +662,7 @@ impl MonitorView {
                     .flex_1()
                     .overflow_hidden()
                     .p_2()
-                    .text_color(rgb(0xcdd6f4))
+                    .text_color(theme.text_primary)
                     .child(text),
             )
             .child(
@@ -672,8 +676,8 @@ impl MonitorView {
                         div()
                             .id("mon-detail-copy")
                             .cursor_pointer()
-                            .bg(rgb(0x313244))
-                            .text_color(rgb(0xcdd6f4))
+                            .bg(theme.bg_hover)
+                            .text_color(theme.text_primary)
                             .px_2()
                             .rounded_md()
                             .child("Kopírovat")
@@ -685,8 +689,8 @@ impl MonitorView {
                         div()
                             .id("mon-detail-close")
                             .cursor_pointer()
-                            .bg(rgb(0x313244))
-                            .text_color(rgb(0xcdd6f4))
+                            .bg(theme.bg_hover)
+                            .text_color(theme.text_primary)
                             .px_2()
                             .rounded_md()
                             .child("Zavřít")
@@ -707,7 +711,7 @@ impl MonitorView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(0x00000099))
+                .bg(theme.bg_backdrop)
                 .occlude()
                 .child(panel)
                 .into_any_element(),
@@ -717,21 +721,22 @@ impl MonitorView {
 
 impl Render for MonitorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.theme();
         let mut root = div()
             .flex()
             .flex_col()
             .flex_1()
             .size_full()
-            .bg(rgb(0x11111b))
-            .text_color(rgb(0xcdd6f4))
+            .bg(theme.bg_deep)
+            .text_color(theme.text_primary)
             .child(self.render_toolbar(cx))
-            .child(self.render_tiles());
+            .child(self.render_tiles(&theme));
 
         if let Some(err) = self.last_error.clone() {
             root = root.child(
                 div()
                     .p_2()
-                    .text_color(rgb(0xf9e2af))
+                    .text_color(theme.warn)
                     .child(format!(
                         "aktualizace selhala ({err}) · další pokus za {}s",
                         self.interval_secs
@@ -742,7 +747,7 @@ impl Render for MonitorView {
         root = root
             .child(self.render_running(cx))
             .child(self.render_blocking(cx))
-            .child(self.render_tables());
+            .child(self.render_tables(&theme));
 
         if let Some(overlay) = self.render_detail_overlay(cx) {
             root = root.child(overlay);
