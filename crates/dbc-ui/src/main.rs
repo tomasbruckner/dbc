@@ -20,6 +20,7 @@ mod sql_highlight;
 mod sql_input;
 mod tabs;
 mod text_model;
+mod theme;
 mod tunnel;
 
 use std::cell::RefCell;
@@ -4366,6 +4367,11 @@ fn main() {
         connections_ui::bind_keys(cx);
         schema_tree::bind_keys(cx);
         palette::bind_keys(cx);
+
+        // G14 Task 1: theme global — installed before the first window opens so
+        // every render() can read cx.theme(). `config.theme` is Copy; `config`
+        // itself moves into the window closure below untouched.
+        cx.set_global(theme::Theme::from_mode(config.theme));
 
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         let window_handle = cx
