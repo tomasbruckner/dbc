@@ -274,3 +274,431 @@ mod catalog_tests {
         assert!(ms[2].1.contains("sys.dm_db_partition_stats"));
     }
 }
+
+/// Design §0/§3: the widened statement type. `exec_sql` is what runs;
+/// `display_sql` is what the confirm modal shows AND what history stores.
+/// They differ ONLY for password-bearing statements (parallel
+/// construction, never post-hoc replace). Lives here (pure module, no
+/// GPUI) per design §5 T2 "mutation builders + WriteStatement";
+/// runner.rs imports it in T3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteStatement {
+    pub exec_sql: String,
+    pub display_sql: String,
+    pub expected_affected: Option<u64>,
+}
+
+/// G5's sandbox statements: exec == display, always.
+impl From<(String, Option<u64>)> for WriteStatement {
+    fn from((sql, expected_affected): (String, Option<u64>)) -> Self {
+        Self { display_sql: sql.clone(), exec_sql: sql, expected_affected }
+    }
+}
+
+/// The literal shown in display_sql wherever exec_sql carries a password.
+const REDACTED: &str = "'***'";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoleFlags {
+    pub login: bool,
+    pub superuser: bool,
+    pub createdb: bool,
+    pub createrole: bool,
+}
+
+impl RoleFlags {
+    fn render(&self) -> String {
+        let mut out = String::new();
+        if self.login {
+            out.push_str(" LOGIN");
+        }
+        if self.superuser {
+            out.push_str(" SUPERUSER");
+        }
+        if self.createdb {
+            out.push_str(" CREATEDB");
+        }
+        if self.createrole {
+            out.push_str(" CREATEROLE");
+        }
+        out
+    }
+}
+
+/// pg: CREATE ROLE + PASSWORD + flags (1 stmt). MSSQL: CREATE LOGIN +
+/// CREATE USER FOR LOGIN (2 stmts). SQLite: empty (exempt).
+pub fn create_role(engine: Engine, name: &str, password: &str, flags: &RoleFlags) -> Vec<WriteStatement> {
+    let ident = quote_ident_for(engine, name);
+    match engine {
+        Engine::Postgres => {
+            let flags_sql = flags.render();
+            vec![WriteStatement {
+                exec_sql: format!("CREATE ROLE {ident} PASSWORD {}{flags_sql}", sql_string_literal(password)),
+                display_sql: format!("CREATE ROLE {ident} PASSWORD {REDACTED}{flags_sql}"),
+                expected_affected: None,
+            }]
+        }
+        Engine::Mssql => vec![
+            WriteStatement {
+                exec_sql: format!("CREATE LOGIN {ident} WITH PASSWORD = {}", sql_string_literal(password)),
+                display_sql: format!("CREATE LOGIN {ident} WITH PASSWORD = {REDACTED}"),
+                expected_affected: None,
+            },
+            (format!("CREATE USER {ident} FOR LOGIN {ident}"), None).into(),
+        ],
+        Engine::Sqlite => Vec::new(),
+    }
+}
+
+pub fn alter_password(engine: Engine, name: &str, password: &str) -> Vec<WriteStatement> {
+    let ident = quote_ident_for(engine, name);
+    match engine {
+        Engine::Postgres => vec![WriteStatement {
+            exec_sql: format!("ALTER ROLE {ident} PASSWORD {}", sql_string_literal(password)),
+            display_sql: format!("ALTER ROLE {ident} PASSWORD {REDACTED}"),
+            expected_affected: None,
+        }],
+        Engine::Mssql => vec![WriteStatement {
+            exec_sql: format!("ALTER LOGIN {ident} WITH PASSWORD = {}", sql_string_literal(password)),
+            display_sql: format!("ALTER LOGIN {ident} WITH PASSWORD = {REDACTED}"),
+            expected_affected: None,
+        }],
+        Engine::Sqlite => Vec::new(),
+    }
+}
+
+/// pg: DROP ROLE (1). MSSQL: DROP USER + DROP LOGIN (2). SQLite: empty.
+pub fn drop_role(engine: Engine, name: &str) -> Vec<WriteStatement> {
+    let ident = quote_ident_for(engine, name);
+    match engine {
+        Engine::Postgres => vec![(format!("DROP ROLE {ident}"), None).into()],
+        Engine::Mssql => vec![
+            (format!("DROP USER {ident}"), None).into(),
+            (format!("DROP LOGIN {ident}"), None).into(),
+        ],
+        Engine::Sqlite => Vec::new(),
+    }
+}
+
+/// `admin_option` pg-only (ignored on MSSQL); `server_role` MSSQL-only
+/// (which membership list the role came from; ignored on pg).
+pub fn add_membership(engine: Engine, role: &str, member: &str, admin_option: bool, server_role: bool) -> Vec<WriteStatement> {
+    let r = quote_ident_for(engine, role);
+    let m = quote_ident_for(engine, member);
+    match engine {
+        Engine::Postgres => {
+            let opt = if admin_option { " WITH ADMIN OPTION" } else { "" };
+            vec![(format!("GRANT {r} TO {m}{opt}"), None).into()]
+        }
+        Engine::Mssql => {
+            let verb = if server_role { "ALTER SERVER ROLE" } else { "ALTER ROLE" };
+            vec![(format!("{verb} {r} ADD MEMBER {m}"), None).into()]
+        }
+        Engine::Sqlite => Vec::new(),
+    }
+}
+
+pub fn remove_membership(engine: Engine, role: &str, member: &str, server_role: bool) -> Vec<WriteStatement> {
+    let r = quote_ident_for(engine, role);
+    let m = quote_ident_for(engine, member);
+    match engine {
+        Engine::Postgres => vec![(format!("REVOKE {r} FROM {m}"), None).into()],
+        Engine::Mssql => {
+            let verb = if server_role { "ALTER SERVER ROLE" } else { "ALTER ROLE" };
+            vec![(format!("{verb} {r} DROP MEMBER {m}"), None).into()]
+        }
+        Engine::Sqlite => Vec::new(),
+    }
+}
+
+/// Privileges-matrix cell state. Postgres cells are BI-state (Denied is
+/// unrepresentable through cycle_cell and refused by the builders);
+/// MSSQL is TRI-state (design §2 — MSSQL alone has a real DENY).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CellState {
+    NotSet,
+    Granted,
+    Denied,
+}
+
+pub fn cycle_cell(engine: Engine, s: CellState) -> CellState {
+    match (engine, s) {
+        (Engine::Mssql, CellState::NotSet) => CellState::Granted,
+        (Engine::Mssql, CellState::Granted) => CellState::Denied,
+        (Engine::Mssql, CellState::Denied) => CellState::NotSet,
+        (_, CellState::NotSet) => CellState::Granted,
+        (_, _) => CellState::NotSet, // pg/sqlite bi-state; Denied normalizes out
+    }
+}
+
+pub const PG_TABLE_PRIVS: &[&str] = &["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"];
+pub const MSSQL_TABLE_PRIVS: &[&str] = &["SELECT", "INSERT", "UPDATE", "DELETE", "EXECUTE", "REFERENCES"];
+pub const SCHEMA_PRIVS: &[&str] = &["USAGE", "CREATE"];
+pub const PG_DATABASE_PRIVS: &[&str] = &["CONNECT", "CREATE", "TEMP"];
+
+/// Target state alone decides the verb: Granted→GRANT, Denied→DENY
+/// (MSSQL only), NotSet→REVOKE. Err (errors are values, design §6's
+/// DENY-divergence risk): (Postgres, Denied), SQLite, or empty `privs`.
+pub fn object_privilege(
+    engine: Engine,
+    schema: &str,
+    object: &str,
+    privs: &[&str],
+    grantee: &str,
+    target: CellState,
+) -> Result<WriteStatement, String> {
+    if privs.is_empty() {
+        return Err("žádná oprávnění ke změně".to_string());
+    }
+    if engine == Engine::Sqlite {
+        return Err("SQLite nemá serverová oprávnění".to_string());
+    }
+    if engine == Engine::Postgres && target == CellState::Denied {
+        return Err("DENY na PostgreSQL neexistuje".to_string());
+    }
+    let list = privs.join(", ");
+    let obj = quote_qualified_for(engine, schema, object);
+    let g = quote_ident_for(engine, grantee);
+    let sql = match target {
+        CellState::Granted => format!("GRANT {list} ON {obj} TO {g}"),
+        CellState::Denied => format!("DENY {list} ON {obj} TO {g}"),
+        CellState::NotSet => format!("REVOKE {list} ON {obj} FROM {g}"),
+    };
+    Ok((sql, None).into())
+}
+
+/// pg: GRANT USAGE ON SCHEMA "s" TO "g". MSSQL: GRANT … ON SCHEMA::[s] TO [g].
+pub fn schema_privilege(engine: Engine, schema: &str, priv_name: &str, grantee: &str, target: CellState) -> Result<WriteStatement, String> {
+    if engine == Engine::Sqlite {
+        return Err("SQLite nemá serverová oprávnění".to_string());
+    }
+    if engine == Engine::Postgres && target == CellState::Denied {
+        return Err("DENY na PostgreSQL neexistuje".to_string());
+    }
+    let g = quote_ident_for(engine, grantee);
+    let sql = match engine {
+        Engine::Mssql => {
+            let ident = quote_ident_for(engine, schema);
+            match target {
+                CellState::Granted => format!("GRANT {priv_name} ON SCHEMA::{ident} TO {g}"),
+                CellState::Denied => format!("DENY {priv_name} ON SCHEMA::{ident} TO {g}"),
+                CellState::NotSet => format!("REVOKE {priv_name} ON SCHEMA::{ident} FROM {g}"),
+            }
+        }
+        Engine::Postgres => {
+            let ident = quote_ident_for(engine, schema);
+            match target {
+                CellState::Granted => format!("GRANT {priv_name} ON SCHEMA {ident} TO {g}"),
+                CellState::Denied => unreachable!("DENY on Postgres refused above"),
+                CellState::NotSet => format!("REVOKE {priv_name} ON SCHEMA {ident} FROM {g}"),
+            }
+        }
+        Engine::Sqlite => unreachable!("Sqlite refused above"),
+    };
+    Ok((sql, None).into())
+}
+
+/// pg-only (design §2: db-level row is pg only): GRANT CONNECT ON DATABASE "d" TO "g".
+pub fn database_privilege_pg(database: &str, priv_name: &str, grantee: &str, target: CellState) -> Result<WriteStatement, String> {
+    if target == CellState::Denied {
+        return Err("DENY na PostgreSQL neexistuje".to_string());
+    }
+    let ident = quote_ident_for(Engine::Postgres, database);
+    let g = quote_ident_for(Engine::Postgres, grantee);
+    let sql = match target {
+        CellState::Granted => format!("GRANT {priv_name} ON DATABASE {ident} TO {g}"),
+        CellState::NotSet => format!("REVOKE {priv_name} ON DATABASE {ident} FROM {g}"),
+        CellState::Denied => unreachable!("DENY refused above"),
+    };
+    Ok((sql, None).into())
+}
+
+pub fn create_schema(engine: Engine, name: &str) -> Vec<WriteStatement> {
+    let ident = quote_ident_for(engine, name);
+    match engine {
+        Engine::Postgres | Engine::Mssql => vec![(format!("CREATE SCHEMA {ident}"), None).into()],
+        Engine::Sqlite => Vec::new(),
+    }
+}
+
+/// `cascade` is pg-only opt-in (design §2 — the confirm modal adds a red
+/// warning line); T-SQL DROP SCHEMA has no CASCADE clause, the flag is
+/// ignored for MSSQL (the engine refuses a non-empty schema itself).
+pub fn drop_schema(engine: Engine, name: &str, cascade: bool) -> Vec<WriteStatement> {
+    let ident = quote_ident_for(engine, name);
+    match engine {
+        Engine::Postgres => {
+            let suffix = if cascade { " CASCADE" } else { "" };
+            vec![(format!("DROP SCHEMA {ident}{suffix}"), None).into()]
+        }
+        Engine::Mssql => vec![(format!("DROP SCHEMA {ident}"), None).into()],
+        Engine::Sqlite => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+    use dbc_state::Engine;
+
+    #[test]
+    fn from_tuple_is_exec_eq_display() {
+        let ws: WriteStatement = ("UPDATE \"t\" SET \"a\" = 1".to_string(), Some(1)).into();
+        assert_eq!(ws.exec_sql, ws.display_sql);
+        assert_eq!(ws.exec_sql, "UPDATE \"t\" SET \"a\" = 1");
+        assert_eq!(ws.expected_affected, Some(1));
+    }
+
+    // Redaction pairs (CURATION item 3 + design §3): display has '***' and
+    // never any form of the real password; exec has the real, escaped value.
+    #[test]
+    fn create_role_pg_redaction_pair() {
+        let flags = RoleFlags { login: true, createdb: true, ..Default::default() };
+        let stmts = create_role(Engine::Postgres, "app_user", "s3cr'et", &flags);
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(
+            stmts[0].exec_sql,
+            "CREATE ROLE \"app_user\" PASSWORD 's3cr''et' LOGIN CREATEDB"
+        );
+        assert_eq!(
+            stmts[0].display_sql,
+            "CREATE ROLE \"app_user\" PASSWORD '***' LOGIN CREATEDB"
+        );
+        assert!(!stmts[0].display_sql.contains("s3cr"));
+        assert_eq!(stmts[0].expected_affected, None);
+    }
+
+    #[test]
+    fn create_role_mssql_is_login_plus_user() {
+        let stmts = create_role(Engine::Mssql, "app_user", "pw", &RoleFlags::default());
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0].exec_sql, "CREATE LOGIN [app_user] WITH PASSWORD = 'pw'");
+        assert_eq!(stmts[0].display_sql, "CREATE LOGIN [app_user] WITH PASSWORD = '***'");
+        assert_eq!(stmts[1].exec_sql, "CREATE USER [app_user] FOR LOGIN [app_user]");
+        assert_eq!(stmts[1].exec_sql, stmts[1].display_sql);
+    }
+
+    #[test]
+    fn alter_password_both_engines_redacts() {
+        let pg = alter_password(Engine::Postgres, "bob", "tajne");
+        assert_eq!(pg[0].exec_sql, "ALTER ROLE \"bob\" PASSWORD 'tajne'");
+        assert_eq!(pg[0].display_sql, "ALTER ROLE \"bob\" PASSWORD '***'");
+        let ms = alter_password(Engine::Mssql, "bob", "tajne");
+        assert_eq!(ms[0].exec_sql, "ALTER LOGIN [bob] WITH PASSWORD = 'tajne'");
+        assert_eq!(ms[0].display_sql, "ALTER LOGIN [bob] WITH PASSWORD = '***'");
+    }
+
+    #[test]
+    fn drop_role_shapes() {
+        assert_eq!(drop_role(Engine::Postgres, "bob")[0].exec_sql, "DROP ROLE \"bob\"");
+        let ms = drop_role(Engine::Mssql, "bob");
+        assert_eq!(ms[0].exec_sql, "DROP USER [bob]");
+        assert_eq!(ms[1].exec_sql, "DROP LOGIN [bob]");
+    }
+
+    #[test]
+    fn membership_statements() {
+        assert_eq!(
+            add_membership(Engine::Postgres, "readers", "bob", false, false)[0].exec_sql,
+            "GRANT \"readers\" TO \"bob\""
+        );
+        assert_eq!(
+            add_membership(Engine::Postgres, "readers", "bob", true, false)[0].exec_sql,
+            "GRANT \"readers\" TO \"bob\" WITH ADMIN OPTION"
+        );
+        assert_eq!(
+            remove_membership(Engine::Postgres, "readers", "bob", false)[0].exec_sql,
+            "REVOKE \"readers\" FROM \"bob\""
+        );
+        assert_eq!(
+            add_membership(Engine::Mssql, "db_datareader", "bob", false, false)[0].exec_sql,
+            "ALTER ROLE [db_datareader] ADD MEMBER [bob]"
+        );
+        assert_eq!(
+            add_membership(Engine::Mssql, "sysadmin", "bob", false, true)[0].exec_sql,
+            "ALTER SERVER ROLE [sysadmin] ADD MEMBER [bob]"
+        );
+        assert_eq!(
+            remove_membership(Engine::Mssql, "db_datareader", "bob", false)[0].exec_sql,
+            "ALTER ROLE [db_datareader] DROP MEMBER [bob]"
+        );
+    }
+
+    // Engine-aware cycling (design §2/§6's DENY-divergence risk): pg is
+    // bi-state and can NEVER reach Denied; MSSQL is tri-state.
+    #[test]
+    fn cycle_cell_pg_bi_state_mssql_tri_state() {
+        assert_eq!(cycle_cell(Engine::Postgres, CellState::NotSet), CellState::Granted);
+        assert_eq!(cycle_cell(Engine::Postgres, CellState::Granted), CellState::NotSet);
+        // Defensive: a (never-constructible) pg Denied normalizes out.
+        assert_eq!(cycle_cell(Engine::Postgres, CellState::Denied), CellState::NotSet);
+        assert_eq!(cycle_cell(Engine::Mssql, CellState::NotSet), CellState::Granted);
+        assert_eq!(cycle_cell(Engine::Mssql, CellState::Granted), CellState::Denied);
+        assert_eq!(cycle_cell(Engine::Mssql, CellState::Denied), CellState::NotSet);
+    }
+
+    #[test]
+    fn object_privilege_grant_revoke_deny() {
+        assert_eq!(
+            object_privilege(Engine::Postgres, "public", "users", &["SELECT", "INSERT"], "bob", CellState::Granted).unwrap().exec_sql,
+            "GRANT SELECT, INSERT ON \"public\".\"users\" TO \"bob\""
+        );
+        assert_eq!(
+            object_privilege(Engine::Postgres, "public", "users", &["SELECT"], "bob", CellState::NotSet).unwrap().exec_sql,
+            "REVOKE SELECT ON \"public\".\"users\" FROM \"bob\""
+        );
+        assert_eq!(
+            object_privilege(Engine::Mssql, "dbo", "users", &["SELECT"], "bob", CellState::Denied).unwrap().exec_sql,
+            "DENY SELECT ON [dbo].[users] TO [bob]"
+        );
+        assert_eq!(
+            object_privilege(Engine::Mssql, "dbo", "users", &["SELECT"], "bob", CellState::NotSet).unwrap().exec_sql,
+            "REVOKE SELECT ON [dbo].[users] FROM [bob]"
+        );
+        // The errors-are-values backstop: DENY must be impossible on pg.
+        assert!(object_privilege(Engine::Postgres, "public", "users", &["SELECT"], "bob", CellState::Denied).is_err());
+        assert!(object_privilege(Engine::Sqlite, "s", "t", &["SELECT"], "b", CellState::Granted).is_err());
+        assert!(object_privilege(Engine::Postgres, "s", "t", &[], "b", CellState::Granted).is_err());
+    }
+
+    #[test]
+    fn schema_and_database_privileges() {
+        assert_eq!(
+            schema_privilege(Engine::Postgres, "public", "USAGE", "bob", CellState::Granted).unwrap().exec_sql,
+            "GRANT USAGE ON SCHEMA \"public\" TO \"bob\""
+        );
+        assert_eq!(
+            schema_privilege(Engine::Postgres, "public", "USAGE", "bob", CellState::NotSet).unwrap().exec_sql,
+            "REVOKE USAGE ON SCHEMA \"public\" FROM \"bob\""
+        );
+        assert_eq!(
+            schema_privilege(Engine::Mssql, "dbo", "USAGE", "bob", CellState::Granted).unwrap().exec_sql,
+            "GRANT USAGE ON SCHEMA::[dbo] TO [bob]"
+        );
+        assert_eq!(
+            database_privilege_pg("appdb", "CONNECT", "bob", CellState::Granted).unwrap().exec_sql,
+            "GRANT CONNECT ON DATABASE \"appdb\" TO \"bob\""
+        );
+        assert!(database_privilege_pg("appdb", "CONNECT", "bob", CellState::Denied).is_err());
+    }
+
+    #[test]
+    fn schema_ddl_and_cascade_opt_in() {
+        assert_eq!(create_schema(Engine::Postgres, "rep\"orts")[0].exec_sql, "CREATE SCHEMA \"rep\"\"orts\"");
+        assert_eq!(create_schema(Engine::Mssql, "reports")[0].exec_sql, "CREATE SCHEMA [reports]");
+        assert_eq!(drop_schema(Engine::Postgres, "reports", false)[0].exec_sql, "DROP SCHEMA \"reports\"");
+        assert_eq!(drop_schema(Engine::Postgres, "reports", true)[0].exec_sql, "DROP SCHEMA \"reports\" CASCADE");
+        // T-SQL has no DROP SCHEMA … CASCADE — the flag never leaks.
+        assert_eq!(drop_schema(Engine::Mssql, "reports", true)[0].exec_sql, "DROP SCHEMA [reports]");
+    }
+
+    #[test]
+    fn sqlite_mutation_builders_are_empty() {
+        assert!(create_role(Engine::Sqlite, "x", "p", &RoleFlags::default()).is_empty());
+        assert!(alter_password(Engine::Sqlite, "x", "p").is_empty());
+        assert!(drop_role(Engine::Sqlite, "x").is_empty());
+        assert!(add_membership(Engine::Sqlite, "r", "m", false, false).is_empty());
+        assert!(create_schema(Engine::Sqlite, "s").is_empty());
+        assert!(drop_schema(Engine::Sqlite, "s", true).is_empty());
+    }
+}
