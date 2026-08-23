@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use crate::schema::TableInfo;
 
+pub mod layout;
+
 pub const MAX_VISIBLE_COLS: usize = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
