@@ -32,16 +32,18 @@ use dbc_diff::data_diff::{self, RowDiff};
 use dbc_diff::schema_diff::{CompareMode, FieldChange, ObjectDiff, SchemaDiff, TableDiff, TableStatus};
 use dbc_diff::text_diff::{diff_lines, DiffLine, DiffTag};
 use gpui::{
-    div, prelude::*, px, rgb, AnyElement, ClickEvent, Context, Div, EventEmitter, SharedString, Stateful, Window,
+    div, prelude::*, px, AnyElement, ClickEvent, Context, Div, EventEmitter, Hsla, SharedString, Stateful, Window,
 };
 
 use crate::runner::{ConnectSpec, QueryRunner};
+use crate::theme::{ActiveTheme, Theme};
 
-// Mirrors grid.rs's sandbox diff tints (grid.rs:26-28) — same convention,
-// different module (those constants are private to grid.rs).
-const TINT_ADDED: u32 = 0x2e5d3a; // green
-const TINT_REMOVED: u32 = 0x5d2e2e; // red
-const TINT_CHANGED: u32 = 0x6b5d2e; // amber/yellow
+// G14 Task 4: these used to be this file's own TINT_ADDED/TINT_REMOVED/
+// TINT_CHANGED consts (same hex family as grid.rs's G5 sandbox diff consts,
+// grid.rs:26-28) — now `Theme::diff_inserted_bg`/`diff_deleted_bg`/
+// `diff_staged_bg`, the SAME fields grid.rs's sweep maps its consts onto
+// (Sweep Rulebook), so a light-mode compare diff matches a light-mode
+// sandbox diff automatically.
 
 /// Bounds how many individual rows ANY per-frame render loop in this file
 /// ever emits — both the data-diff sections (Added/Removed/Changed row
@@ -174,20 +176,20 @@ fn table_existence_rows(t: &TableDiff) -> (Vec<String>, Vec<String>) {
     (added, removed)
 }
 
-fn tint_for_table_status(status: TableStatus) -> Option<u32> {
+fn tint_for_table_status(status: TableStatus, theme: &Theme) -> Option<Hsla> {
     match status {
-        TableStatus::Added => Some(TINT_ADDED),
-        TableStatus::Removed => Some(TINT_REMOVED),
-        TableStatus::Changed => Some(TINT_CHANGED),
+        TableStatus::Added => Some(theme.diff_inserted_bg),
+        TableStatus::Removed => Some(theme.diff_deleted_bg),
+        TableStatus::Changed => Some(theme.diff_staged_bg),
         TableStatus::Unchanged => None,
     }
 }
 
-fn tint_for_object<T>(o: &ObjectDiff<T>) -> Option<u32> {
+fn tint_for_object<T>(o: &ObjectDiff<T>, theme: &Theme) -> Option<Hsla> {
     match o {
-        ObjectDiff::Added(_) => Some(TINT_ADDED),
-        ObjectDiff::Removed(_) => Some(TINT_REMOVED),
-        ObjectDiff::Changed { .. } => Some(TINT_CHANGED),
+        ObjectDiff::Added(_) => Some(theme.diff_inserted_bg),
+        ObjectDiff::Removed(_) => Some(theme.diff_deleted_bg),
+        ObjectDiff::Changed { .. } => Some(theme.diff_staged_bg),
         ObjectDiff::Unchanged(_) => None,
     }
 }
@@ -546,22 +548,23 @@ impl Render for CompareView {
         // the OUTER render method borrows `self` mutably) — so this reads
         // `&self.state` by reference instead, and every helper down the
         // chain takes `&self`.
+        let theme = *cx.theme();
         let body: AnyElement = match &self.state {
             CompareLoadState::Loading => div()
                 .flex_1()
                 .p_4()
-                .text_color(rgb(0xcdd6f4))
+                .text_color(theme.text_primary)
                 .child("Načítám schéma…")
                 .into_any_element(),
-            CompareLoadState::Error { a, b } => render_error_banner(a, b).into_any_element(),
+            CompareLoadState::Error { a, b } => render_error_banner(a, b, &theme).into_any_element(),
             CompareLoadState::Ready { diff, mode } => self.render_ready(diff, *mode, cx),
         };
-        div().id("compare-view").flex().flex_col().flex_1().bg(rgb(0x1e1e2e)).child(body)
+        div().id("compare-view").flex().flex_col().flex_1().bg(theme.bg_panel).child(body)
     }
 }
 
-fn render_error_banner(a: &Option<QueryError>, b: &Option<QueryError>) -> impl IntoElement {
-    let mut banner = div().flex().flex_col().gap_1().p_4().text_color(rgb(0xf38ba8));
+fn render_error_banner(a: &Option<QueryError>, b: &Option<QueryError>, theme: &Theme) -> impl IntoElement {
+    let mut banner = div().flex().flex_col().gap_1().p_4().text_color(theme.danger);
     if let Some(e) = a {
         banner = banner.child(format!("Databáze A: error: {e}"));
     }
@@ -573,6 +576,7 @@ fn render_error_banner(a: &Option<QueryError>, b: &Option<QueryError>) -> impl I
 
 impl CompareView {
     fn render_ready(&self, diff: &SchemaDiff, mode: CompareMode, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
         let counts = count_table_statuses(&diff.tables);
         let mut root = div().id("compare-root").flex().flex_col().flex_1();
 
@@ -583,8 +587,8 @@ impl CompareView {
                 .items_center()
                 .gap_2()
                 .p_2()
-                .bg(rgb(0x181825))
-                .text_color(rgb(0xcdd6f4))
+                .bg(theme.bg_app)
+                .text_color(theme.text_primary)
                 .child(format!("{} ↔ {}", self.label_a, self.label_b))
                 .child(
                     div()
@@ -594,7 +598,7 @@ impl CompareView {
         );
         if mode == CompareMode::CrossEngine {
             root = root.child(
-                div().p_1().bg(rgb(0x3a3a1e)).text_color(rgb(0xf9e2af)).child(
+                div().p_1().bg(theme.bg_warn_banner).text_color(theme.warn).child(
                     "porovnání mezi různými databázovými systémy: typy a výchozí hodnoty sloupců se neporovnávají",
                 ),
             );
@@ -612,6 +616,7 @@ impl CompareView {
     }
 
     fn render_left_pane(&self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.theme();
         div()
             .id("compare-left")
             .w(px(320.))
@@ -621,8 +626,8 @@ impl CompareView {
             .p_2()
             .overflow_hidden()
             .border_r_1()
-            .border_color(rgb(0x313244))
-            .text_color(rgb(0xcdd6f4))
+            .border_color(theme.bg_hover)
+            .text_color(theme.text_primary)
             .child(self.render_table_section(diff, cx))
             .child(self.render_routine_section(diff, cx))
             .child(self.render_trigger_section(diff, cx))
@@ -630,12 +635,14 @@ impl CompareView {
     }
 
     fn render_table_section(&self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.theme();
         let show_unchanged = self.show_unchanged.tables;
         let unchanged = diff.tables.iter().filter(|t| t.status == TableStatus::Unchanged).count();
         let mut section = div().flex().flex_col().gap_1().child(section_header(
             "Tabulky",
             unchanged,
             show_unchanged,
+            &theme,
             cx.listener(|v, _, _, cx| {
                 v.show_unchanged.tables = !v.show_unchanged.tables;
                 cx.notify();
@@ -653,9 +660,9 @@ impl CompareView {
                 Some(s) => format!("{s}.{}", t.name),
                 None => t.name.clone(),
             };
-            let tint = tint_for_table_status(t.status);
+            let tint = tint_for_table_status(t.status, &theme);
             section = section.child(
-                compare_row(SharedString::from(format!("compare-table-row-{ix}")), label, tint, is_selected)
+                compare_row(SharedString::from(format!("compare-table-row-{ix}")), label, tint, is_selected, &theme)
                     .on_click(cx.listener(move |v, _, _, cx| {
                         v.selection = CompareSelection::Table(ix);
                         v.data_diff = DataDiffState::Idle; // new selection invalidates any prior data diff
@@ -665,19 +672,21 @@ impl CompareView {
         }
         if visible.len() > shown {
             section = section.child(
-                div().text_color(rgb(0x6c7086)).child(format!("… a {} dalších", visible.len() - shown)),
+                div().text_color(theme.text_disabled).child(format!("… a {} dalších", visible.len() - shown)),
             );
         }
         section
     }
 
     fn render_routine_section(&self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.theme();
         let show_unchanged = self.show_unchanged.routines;
         let unchanged = diff.routines.iter().filter(|r| matches!(r, ObjectDiff::Unchanged(_))).count();
         let mut section = div().flex().flex_col().gap_1().child(section_header(
             "Funkce/procedury",
             unchanged,
             show_unchanged,
+            &theme,
             cx.listener(|v, _, _, cx| {
                 v.show_unchanged.routines = !v.show_unchanged.routines;
                 cx.notify();
@@ -696,9 +705,9 @@ impl CompareView {
                 ObjectDiff::Added(x) | ObjectDiff::Removed(x) | ObjectDiff::Unchanged(x) => x.name.clone(),
                 ObjectDiff::Changed { left, .. } => left.name.clone(),
             };
-            let tint = tint_for_object(r);
+            let tint = tint_for_object(r, &theme);
             section = section.child(
-                compare_row(SharedString::from(format!("compare-routine-row-{ix}")), name, tint, is_selected)
+                compare_row(SharedString::from(format!("compare-routine-row-{ix}")), name, tint, is_selected, &theme)
                     .on_click(cx.listener(move |v, _, _, cx| {
                         v.selection = CompareSelection::Routine(ix);
                         cx.notify();
@@ -707,19 +716,21 @@ impl CompareView {
         }
         if visible.len() > shown {
             section = section.child(
-                div().text_color(rgb(0x6c7086)).child(format!("… a {} dalších", visible.len() - shown)),
+                div().text_color(theme.text_disabled).child(format!("… a {} dalších", visible.len() - shown)),
             );
         }
         section
     }
 
     fn render_trigger_section(&self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.theme();
         let show_unchanged = self.show_unchanged.triggers;
         let unchanged = diff.triggers.iter().filter(|t| matches!(t, ObjectDiff::Unchanged(_))).count();
         let mut section = div().flex().flex_col().gap_1().child(section_header(
             "Triggery",
             unchanged,
             show_unchanged,
+            &theme,
             cx.listener(|v, _, _, cx| {
                 v.show_unchanged.triggers = !v.show_unchanged.triggers;
                 cx.notify();
@@ -738,9 +749,9 @@ impl CompareView {
                 ObjectDiff::Added(x) | ObjectDiff::Removed(x) | ObjectDiff::Unchanged(x) => x.name.clone(),
                 ObjectDiff::Changed { left, .. } => left.name.clone(),
             };
-            let tint = tint_for_object(t);
+            let tint = tint_for_object(t, &theme);
             section = section.child(
-                compare_row(SharedString::from(format!("compare-trigger-row-{ix}")), name, tint, is_selected)
+                compare_row(SharedString::from(format!("compare-trigger-row-{ix}")), name, tint, is_selected, &theme)
                     .on_click(cx.listener(move |v, _, _, cx| {
                         v.selection = CompareSelection::Trigger(ix);
                         cx.notify();
@@ -749,7 +760,7 @@ impl CompareView {
         }
         if visible.len() > shown {
             section = section.child(
-                div().text_color(rgb(0x6c7086)).child(format!("… a {} dalších", visible.len() - shown)),
+                div().text_color(theme.text_disabled).child(format!("… a {} dalších", visible.len() - shown)),
             );
         }
         section
@@ -761,12 +772,14 @@ impl CompareView {
     /// `CompareSelection` variant exists for them, matching this task's
     /// Interfaces block).
     fn render_sequence_section(&self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.theme();
         let show_unchanged = self.show_unchanged.sequences;
         let unchanged = diff.sequences.iter().filter(|s| matches!(s, ObjectDiff::Unchanged(_))).count();
         let mut section = div().flex().flex_col().gap_1().child(section_header(
             "Sekvence",
             unchanged,
             show_unchanged,
+            &theme,
             cx.listener(|v, _, _, cx| {
                 v.show_unchanged.sequences = !v.show_unchanged.sequences;
                 cx.notify();
@@ -780,22 +793,23 @@ impl CompareView {
                 ObjectDiff::Added(x) | ObjectDiff::Removed(x) | ObjectDiff::Unchanged(x) => x.name.clone(),
                 ObjectDiff::Changed { left, .. } => left.name.clone(),
             };
-            let tint = tint_for_object(*s);
+            let tint = tint_for_object(*s, &theme);
             let mut row = div().px_1().rounded_md().child(name);
             if let Some(t) = tint {
-                row = row.bg(rgb(t));
+                row = row.bg(t);
             }
             section = section.child(row);
         }
         if visible.len() > shown {
             section = section.child(
-                div().text_color(rgb(0x6c7086)).child(format!("… a {} dalších", visible.len() - shown)),
+                div().text_color(theme.text_disabled).child(format!("… a {} dalších", visible.len() - shown)),
             );
         }
         section
     }
 
     fn render_right_pane(&self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.theme();
         let mut pane = div()
             .id("compare-right")
             .flex()
@@ -804,10 +818,10 @@ impl CompareView {
             .p_2()
             .gap_2()
             .overflow_hidden()
-            .text_color(rgb(0xcdd6f4));
+            .text_color(theme.text_primary);
         match self.selection {
             CompareSelection::None => {
-                pane = pane.child(div().text_color(rgb(0x6c7086)).child("Vyber objekt vlevo."));
+                pane = pane.child(div().text_color(theme.text_disabled).child("Vyber objekt vlevo."));
             }
             CompareSelection::Table(ix) => {
                 if let Some(t) = diff.tables.get(ix).cloned() {
@@ -824,7 +838,7 @@ impl CompareView {
                             (Some(routine_ddl_text(left)), Some(routine_ddl_text(right)))
                         }
                     };
-                    pane = pane.child(render_ddl_or_diff(l.as_deref(), r_.as_deref()));
+                    pane = pane.child(render_ddl_or_diff(l.as_deref(), r_.as_deref(), &theme));
                 }
             }
             CompareSelection::Trigger(ix) => {
@@ -837,7 +851,7 @@ impl CompareView {
                             (Some(trigger_ddl_text(left)), Some(trigger_ddl_text(right)))
                         }
                     };
-                    pane = pane.child(render_ddl_or_diff(l.as_deref(), r.as_deref()));
+                    pane = pane.child(render_ddl_or_diff(l.as_deref(), r.as_deref(), &theme));
                 }
             }
         }
@@ -845,6 +859,7 @@ impl CompareView {
     }
 
     fn render_table_detail(&self, t: &TableDiff, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.theme();
         let title = match &t.schema {
             Some(s) => format!("{s}.{}", t.name),
             None => t.name.clone(),
@@ -854,22 +869,22 @@ impl CompareView {
         match t.status {
             TableStatus::Added => {
                 if let Some(ti) = &t.right {
-                    detail = detail.child(ddl_block(&table_ddl_text(ti)));
+                    detail = detail.child(ddl_block(&table_ddl_text(ti), &theme));
                 }
             }
             TableStatus::Removed => {
                 if let Some(ti) = &t.left {
-                    detail = detail.child(ddl_block(&table_ddl_text(ti)));
+                    detail = detail.child(ddl_block(&table_ddl_text(ti), &theme));
                 }
             }
             TableStatus::Changed | TableStatus::Unchanged => {
                 let (added, removed) = table_existence_rows(t);
                 if !added.is_empty() || !removed.is_empty() {
-                    detail = detail.child(existence_list(&added, &removed));
+                    detail = detail.child(existence_list(&added, &removed, &theme));
                 }
                 let field_rows = table_field_rows(t);
                 if !field_rows.is_empty() {
-                    detail = detail.child(field_change_table(&field_rows));
+                    detail = detail.child(field_change_table(&field_rows, &theme));
                 }
                 if let (Some(l), Some(r)) = (&t.left, &t.right) {
                     let toggle_label = if self.show_ddl_diff { "Skrýt DDL diff" } else { "Zobrazit DDL diff" };
@@ -877,7 +892,7 @@ impl CompareView {
                         div()
                             .id("compare-ddl-diff-toggle")
                             .cursor_pointer()
-                            .text_color(rgb(0x89b4fa))
+                            .text_color(theme.accent)
                             .child(toggle_label)
                             .on_click(cx.listener(|v, _, _, cx| {
                                 v.show_ddl_diff = !v.show_ddl_diff;
@@ -885,7 +900,7 @@ impl CompareView {
                             })),
                     );
                     if self.show_ddl_diff {
-                        detail = detail.child(ddl_diff_block(&table_ddl_diff(l, r)));
+                        detail = detail.child(ddl_diff_block(&table_ddl_diff(l, r), &theme));
                     }
                 }
             }
@@ -897,7 +912,7 @@ impl CompareView {
             detail = detail.child(self.render_data_diff_section(cx));
         } else if matches!(t.status, TableStatus::Changed | TableStatus::Unchanged) {
             detail = detail.child(
-                div().text_color(rgb(0x6c7086)).child("Porovnání dat: tabulka nemá primární klíč na obou stranách"),
+                div().text_color(theme.text_disabled).child("Porovnání dat: tabulka nemá primární klíč na obou stranách"),
             );
         }
 
@@ -905,9 +920,10 @@ impl CompareView {
     }
 
     fn render_data_diff_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.theme();
         let mut section =
-            div().flex().flex_col().gap_2().mt_2().p_2().border_1().border_color(rgb(0x313244)).rounded_md();
-        section = section.child(div().text_color(rgb(0x89b4fa)).child("Porovnání dat"));
+            div().flex().flex_col().gap_2().mt_2().p_2().border_1().border_color(theme.bg_hover).rounded_md();
+        section = section.child(div().text_color(theme.accent).child("Porovnání dat"));
 
         let where_text = self.data_where.clone();
         section = section.child(
@@ -916,38 +932,40 @@ impl CompareView {
                 .flex_row()
                 .gap_2()
                 .items_center()
-                .child(div().text_color(rgb(0x6c7086)).child("WHERE"))
+                .child(div().text_color(theme.text_disabled).child("WHERE"))
                 .child(
                     div()
                         .id("compare-data-where")
                         .flex_1()
                         .px_1()
-                        .bg(rgb(0x181825))
+                        .bg(theme.bg_app)
                         .rounded_md()
-                        .text_color(rgb(0xcdd6f4))
+                        .text_color(theme.text_primary)
                         .child(if where_text.is_empty() { "(bez omezení)".to_string() } else { where_text }),
                 ),
         );
 
-        section = section.child(compare_button("compare-run-data-diff", "Porovnat data").on_click(cx.listener(
-            |_v, _, _, cx| {
-                cx.emit(CompareViewEvent::DataDiffRequested);
-            },
-        )));
+        section = section.child(
+            compare_button("compare-run-data-diff", "Porovnat data", &theme).on_click(cx.listener(
+                |_v, _, _, cx| {
+                    cx.emit(CompareViewEvent::DataDiffRequested);
+                },
+            )),
+        );
 
         match &self.data_diff {
             DataDiffState::Idle => {}
             DataDiffState::Loading => {
-                section = section.child(div().text_color(rgb(0xf9e2af)).child("Načítám data…"));
+                section = section.child(div().text_color(theme.warn).child("Načítám data…"));
             }
             DataDiffState::Error(e) => {
-                section = section.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {e}")));
+                section = section.child(div().text_color(theme.danger).child(format!("error: {e}")));
             }
             DataDiffState::RowCapExceeded { message } => {
-                section = section.child(div().text_color(rgb(0xf38ba8)).child(message.clone()));
+                section = section.child(div().text_color(theme.danger).child(message.clone()));
             }
             DataDiffState::Ready { summary, sql_a, sql_b } => {
-                section = section.child(render_data_diff_outcome(summary, sql_a, sql_b));
+                section = section.child(render_data_diff_outcome(summary, sql_a, sql_b, &theme));
             }
         }
         section
@@ -961,32 +979,38 @@ impl CompareView {
 /// `DISPLAY_ROW_CAP` at construction time; the "… zobrazeno prvních N z M"
 /// footers use `summary`'s own totals, which ARE the full (uncapped)
 /// counts — cheap `usize` fields, not a re-scan of the row list.
-fn render_data_diff_outcome(summary: &DataDiffSummary, sql_a: &str, sql_b: &str) -> impl IntoElement {
+fn render_data_diff_outcome(summary: &DataDiffSummary, sql_a: &str, sql_b: &str, theme: &Theme) -> impl IntoElement {
     let mut block = div().flex().flex_col().gap_2();
-    block = block.child(div().text_color(rgb(0xa6adc8)).child(format!(
+    block = block.child(div().text_color(theme.text_muted).child(format!(
         "{} přidáno, {} odebráno, {} změněno (z {} řádků na levé straně)",
         summary.added, summary.removed, summary.changed, summary.total_left
     )));
-    block = block.child(ddl_block(&format!("A: {sql_a}")));
-    block = block.child(ddl_block(&format!("B: {sql_b}")));
+    block = block.child(ddl_block(&format!("A: {sql_a}"), theme));
+    block = block.child(ddl_block(&format!("B: {sql_b}"), theme));
 
-    block = block.child(row_id_list("Přidané řádky", TINT_ADDED, &summary.added_shown, summary.added));
-    block = block.child(row_id_list("Odebrané řádky", TINT_REMOVED, &summary.removed_shown, summary.removed));
-    block = block.child(render_changed_rows_display(summary));
+    block = block.child(row_id_list("Přidané řádky", theme.diff_inserted_bg, &summary.added_shown, summary.added, theme));
+    block = block.child(row_id_list(
+        "Odebrané řádky",
+        theme.diff_deleted_bg,
+        &summary.removed_shown,
+        summary.removed,
+        theme,
+    ));
+    block = block.child(render_changed_rows_display(summary, theme));
     block
 }
 
 /// `DataDiffSummary::changed_rows_shown`, rendered as a text table with the
-/// changed cells tinted `TINT_CHANGED` — review fix (MAJOR): purely a read
-/// of the precomputed cache, no `build_changed_batch` call here.
-fn render_changed_rows_display(summary: &DataDiffSummary) -> impl IntoElement {
+/// changed cells tinted `theme.diff_staged_bg` — review fix (MAJOR): purely
+/// a read of the precomputed cache, no `build_changed_batch` call here.
+fn render_changed_rows_display(summary: &DataDiffSummary, theme: &Theme) -> impl IntoElement {
     let mut block = div().flex().flex_col().gap_1();
-    block = block.child(div().text_color(rgb(TINT_CHANGED)).child("Změněné řádky"));
+    block = block.child(div().text_color(theme.diff_staged_bg).child("Změněné řádky"));
     if summary.changed_rows_shown.is_empty() {
         return block;
     }
 
-    let mut header = div().flex().flex_row().gap_2().text_color(rgb(0x6c7086));
+    let mut header = div().flex().flex_row().gap_2().text_color(theme.text_disabled);
     for name in &summary.changed_columns {
         header = header.child(div().w(px(160.)).child(name.clone()));
     }
@@ -997,7 +1021,7 @@ fn render_changed_rows_display(summary: &DataDiffSummary) -> impl IntoElement {
         for (col, text) in cells.iter().enumerate() {
             let mut cell = div().w(px(160.)).child(text.clone());
             if summary.changed_tinted.contains(&(row, col)) {
-                cell = cell.bg(rgb(TINT_CHANGED));
+                cell = cell.bg(theme.diff_staged_bg);
             }
             r = r.child(cell);
         }
@@ -1007,7 +1031,7 @@ fn render_changed_rows_display(summary: &DataDiffSummary) -> impl IntoElement {
     if summary.changed > shown {
         block = block.child(
             div()
-                .text_color(rgb(0x6c7086))
+                .text_color(theme.text_disabled)
                 .child(format!("… zobrazeno prvních {shown} z {} změněných řádků", summary.changed)),
         );
     }
@@ -1022,16 +1046,16 @@ fn render_changed_rows_display(summary: &DataDiffSummary) -> impl IntoElement {
 /// above the sections is the source of truth for what each side actually
 /// returned; a user who needs the full row contents can re-run that exact
 /// SQL in a normal query tab.
-fn row_id_list(title: &str, tint: u32, shown_indices: &[usize], total: usize) -> impl IntoElement {
+fn row_id_list(title: &str, tint: Hsla, shown_indices: &[usize], total: usize, theme: &Theme) -> impl IntoElement {
     let mut block = div().flex().flex_col().gap_1();
-    block = block.child(div().text_color(rgb(tint)).child(title.to_string()));
+    block = block.child(div().text_color(tint).child(title.to_string()));
     for &ix in shown_indices {
-        block = block.child(div().text_color(rgb(0xa6adc8)).child(format!("řádek {ix}")));
+        block = block.child(div().text_color(theme.text_muted).child(format!("řádek {ix}")));
     }
     if total > shown_indices.len() {
         block = block.child(
             div()
-                .text_color(rgb(0x6c7086))
+                .text_color(theme.text_disabled)
                 .child(format!("… zobrazeno prvních {} z {total} řádků", shown_indices.len())),
         );
     }
@@ -1042,6 +1066,7 @@ fn section_header(
     label: &str,
     unchanged_count: usize,
     show_unchanged: bool,
+    theme: &Theme,
     on_toggle: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
     let toggle_label = format!("Zobrazit beze změn ({unchanged_count})");
@@ -1050,82 +1075,82 @@ fn section_header(
         .flex_row()
         .items_center()
         .justify_between()
-        .child(div().text_color(rgb(0x89b4fa)).child(label.to_string()))
+        .child(div().text_color(theme.accent).child(label.to_string()))
         .child(
             div()
                 .id(SharedString::from(format!("compare-toggle-{label}")))
                 .cursor_pointer()
-                .text_color(if show_unchanged { rgb(0xa6e3a1) } else { rgb(0x6c7086) })
+                .text_color(if show_unchanged { theme.success } else { theme.text_disabled })
                 .child(toggle_label)
                 .on_click(on_toggle),
         )
 }
 
-fn compare_row(id: SharedString, label: String, tint: Option<u32>, selected: bool) -> Stateful<Div> {
-    let mut row = div().id(id).px_1().cursor_pointer().rounded_md().hover(|s| s.bg(rgb(0x313244))).child(label);
+fn compare_row(id: SharedString, label: String, tint: Option<Hsla>, selected: bool, theme: &Theme) -> Stateful<Div> {
+    let mut row = div().id(id).px_1().cursor_pointer().rounded_md().hover(|s| s.bg(theme.bg_hover)).child(label);
     if let Some(t) = tint {
-        row = row.bg(rgb(t));
+        row = row.bg(t);
     }
     if selected {
-        row = row.text_color(rgb(0xf9e2af));
+        row = row.text_color(theme.warn);
     }
     row
 }
 
-fn compare_button(id: &'static str, label: &'static str) -> Stateful<Div> {
+fn compare_button(id: &'static str, label: &'static str, theme: &Theme) -> Stateful<Div> {
     div()
         .id(id)
         .px_2()
         .py_1()
         .w(px(140.))
-        .bg(rgb(0x313244))
+        .bg(theme.bg_hover)
         .rounded_md()
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(0x45475a)))
+        .hover(|s| s.bg(theme.bg_selected))
         .child(label)
 }
 
-fn ddl_block(text: &str) -> impl IntoElement {
+fn ddl_block(text: &str, theme: &Theme) -> impl IntoElement {
     div()
         .font_family("Consolas")
         .p_1()
-        .bg(rgb(0x181825))
+        .bg(theme.bg_app)
         .rounded_md()
-        .text_color(rgb(0xa6adc8))
+        .text_color(theme.text_muted)
         .whitespace_normal()
         .child(text.to_string())
 }
 
-fn ddl_diff_block(lines: &[DiffLine]) -> impl IntoElement {
-    let mut block = div().flex().flex_col().font_family("Consolas").p_1().bg(rgb(0x181825)).rounded_md();
+fn ddl_diff_block(lines: &[DiffLine], theme: &Theme) -> impl IntoElement {
+    let mut block = div().flex().flex_col().font_family("Consolas").p_1().bg(theme.bg_app).rounded_md();
     for l in lines {
         let (prefix, color) = match l.tag {
-            DiffTag::Equal => ("  ", rgb(0xa6adc8)),
-            DiffTag::Insert => ("+ ", rgb(0xa6e3a1)),
-            DiffTag::Delete => ("- ", rgb(0xf38ba8)),
+            DiffTag::Equal => ("  ", theme.text_muted),
+            DiffTag::Insert => ("+ ", theme.success),
+            DiffTag::Delete => ("- ", theme.danger),
         };
         block = block.child(div().text_color(color).child(format!("{prefix}{}", l.text)));
     }
     block
 }
 
-fn render_ddl_or_diff(left_text: Option<&str>, right_text: Option<&str>) -> AnyElement {
+fn render_ddl_or_diff(left_text: Option<&str>, right_text: Option<&str>, theme: &Theme) -> AnyElement {
     match (left_text, right_text) {
-        (Some(l), Some(r)) => ddl_diff_block(&diff_lines(l, r)).into_any_element(),
-        (Some(l), None) => ddl_block(l).into_any_element(),
-        (None, Some(r)) => ddl_block(r).into_any_element(),
-        (None, None) => div().text_color(rgb(0x6c7086)).child("(bez DDL)").into_any_element(),
+        (Some(l), Some(r)) => ddl_diff_block(&diff_lines(l, r), theme).into_any_element(),
+        (Some(l), None) => ddl_block(l, theme).into_any_element(),
+        (None, Some(r)) => ddl_block(r, theme).into_any_element(),
+        (None, None) => div().text_color(theme.text_disabled).child("(bez DDL)").into_any_element(),
     }
 }
 
-fn field_change_table(rows: &[(String, FieldChange)]) -> impl IntoElement {
+fn field_change_table(rows: &[(String, FieldChange)], theme: &Theme) -> impl IntoElement {
     let mut table = div().flex().flex_col().gap_1();
     table = table.child(
         div()
             .flex()
             .flex_row()
             .gap_2()
-            .text_color(rgb(0x6c7086))
+            .text_color(theme.text_disabled)
             .child(div().w(px(180.)).child("pole"))
             .child(div().w(px(200.)).child("A"))
             .child(div().flex_1().child("B")),
@@ -1137,20 +1162,20 @@ fn field_change_table(rows: &[(String, FieldChange)]) -> impl IntoElement {
                 .flex_row()
                 .gap_2()
                 .child(div().w(px(180.)).child(format!("{ctx}.{}", fc.field)))
-                .child(div().w(px(200.)).bg(rgb(TINT_REMOVED)).child(fc.left.clone()))
-                .child(div().flex_1().bg(rgb(TINT_ADDED)).child(fc.right.clone())),
+                .child(div().w(px(200.)).bg(theme.diff_deleted_bg).child(fc.left.clone()))
+                .child(div().flex_1().bg(theme.diff_inserted_bg).child(fc.right.clone())),
         );
     }
     table
 }
 
-fn existence_list(added: &[String], removed: &[String]) -> impl IntoElement {
+fn existence_list(added: &[String], removed: &[String], theme: &Theme) -> impl IntoElement {
     let mut block = div().flex().flex_col().gap_1();
     for a in added {
-        block = block.child(div().text_color(rgb(0xa6e3a1)).child(format!("+ {a}")));
+        block = block.child(div().text_color(theme.success).child(format!("+ {a}")));
     }
     for r in removed {
-        block = block.child(div().text_color(rgb(0xf38ba8)).child(format!("- {r}")));
+        block = block.child(div().text_color(theme.danger).child(format!("- {r}")));
     }
     block
 }

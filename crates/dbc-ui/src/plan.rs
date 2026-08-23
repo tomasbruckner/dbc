@@ -1363,9 +1363,11 @@ ALTER DATABASE postgres SET min_parallel_table_scan_size = 0;"
 use std::collections::HashSet;
 use std::rc::Rc;
 use gpui::{
-    div, prelude::*, px, rgb, rgba, uniform_list, App, ClickEvent, Context, EventEmitter,
-    FocusHandle, Focusable, Window,
+    div, prelude::*, px, uniform_list, App, ClickEvent, Context, EventEmitter, FocusHandle,
+    Focusable, Window,
 };
+
+use crate::theme::ActiveTheme;
 
 /// Stable pre-order index into `PlanView`'s `index` (`build_index`'s
 /// output) — NOT a path (see the perf deviation note above). Stable for
@@ -1593,6 +1595,7 @@ fn fmt_metric(v: Option<f64>) -> String {
 
 impl Render for PlanView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.theme();
         let badge = if self.result.is_analyze { "Skutečný plán" } else { "Odhadovaný plán" };
         let header = div()
             .h(px(28.))
@@ -1601,8 +1604,8 @@ impl Render for PlanView {
             .flex_row()
             .items_center()
             .justify_between()
-            .bg(rgb(0x181825))
-            .text_color(rgb(0xcdd6f4))
+            .bg(theme.bg_app)
+            .text_color(theme.text_primary)
             .child(format!(
                 "{badge}{}",
                 match (self.result.total_planning_time_ms, self.result.total_execution_time_ms) {
@@ -1629,11 +1632,19 @@ impl Render for PlanView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x1e1e2e))
+            .bg(theme.bg_panel)
             .child(header);
 
         if !self.result.top_level_hints.is_empty() {
-            let mut banner = div().flex().flex_col().bg(rgb(0x2a2a1e)).text_color(rgb(0xf9e2af)).px_2().py_1();
+            // G14 Task 4: this used to be a one-off `rgb(0x2a2a1e)` — now
+            // `theme.bg_warn_banner`, the SAME field compare.rs's
+            // `rgb(0x3a3a1e)` banner maps onto (Sweep Rulebook / grounding
+            // correction 4). The two near-identical dark hexes collapse
+            // into one field: in dark mode this banner now renders
+            // 0x3a3a1e instead of 0x2a2a1e — an imperceptible tint change
+            // on a notice banner, the one deliberate value change in this
+            // whole sweep.
+            let mut banner = div().flex().flex_col().bg(theme.bg_warn_banner).text_color(theme.warn).px_2().py_1();
             for hint in &self.result.top_level_hints {
                 banner = banner.child(div().child(format!("⚠ {}", hint.message)));
             }
@@ -1642,7 +1653,7 @@ impl Render for PlanView {
 
         if self.show_raw {
             root = root.child(
-                div().flex_1().overflow_hidden().p_2().text_color(rgb(0xcdd6f4)).child(self.result.raw_text.clone()),
+                div().flex_1().overflow_hidden().p_2().text_color(theme.text_primary).child(self.result.raw_text.clone()),
             );
             return root;
         }
@@ -1656,6 +1667,7 @@ impl Render for PlanView {
                 "plan-tree-rows",
                 row_count,
                 cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                    let theme = *cx.theme();
                     let mut items = Vec::with_capacity(range.len());
                     for ix in range {
                         // Copy out the small bits of data this row needs
@@ -1692,13 +1704,13 @@ impl Render for PlanView {
                             .items_center()
                             .h(px(22.))
                             .pl(px(6. + depth as f32 * 14.))
-                            .text_color(rgb(0xcdd6f4))
-                            .hover(|s| s.bg(rgb(0x313244)));
+                            .text_color(theme.text_primary)
+                            .hover(|s| s.bg(theme.bg_hover));
                         // Hot-node coloring applies to the ROW background,
                         // not just one column (design §2/§4).
                         match hot_fraction {
-                            Some(f) if f >= 0.30 => row = row.bg(rgb(0xf38ba8)),
-                            Some(f) if f >= 0.10 => row = row.bg(rgb(0xf9e2af)),
+                            Some(f) if f >= 0.30 => row = row.bg(theme.danger),
+                            Some(f) if f >= 0.10 => row = row.bg(theme.warn),
                             _ => {}
                         }
                         row = row
@@ -1745,9 +1757,9 @@ impl Render for PlanView {
                 .id("plan-node-detail-panel")
                 .w(px(560.))
                 .max_h(px(420.))
-                .bg(rgb(0x1e1e2e))
+                .bg(theme.bg_panel)
                 .border_1()
-                .border_color(rgb(0x45475a))
+                .border_color(theme.border)
                 .rounded_md()
                 .flex()
                 .flex_col()
@@ -1759,7 +1771,7 @@ impl Render for PlanView {
                         .flex_1()
                         .overflow_hidden()
                         .p_2()
-                        .text_color(rgb(0xcdd6f4))
+                        .text_color(theme.text_primary)
                         .child(detail.text.clone()),
                 )
                 .child(
@@ -1767,8 +1779,8 @@ impl Render for PlanView {
                         div()
                             .id("plan-node-detail-close")
                             .cursor_pointer()
-                            .bg(rgb(0x313244))
-                            .text_color(rgb(0xcdd6f4))
+                            .bg(theme.bg_hover)
+                            .text_color(theme.text_primary)
                             .px_2()
                             .rounded_md()
                             .child("Zavřít")
@@ -1790,7 +1802,7 @@ impl Render for PlanView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(rgba(0x00000099))
+                    .bg(theme.bg_backdrop)
                     .occlude()
                     .child(panel),
             );

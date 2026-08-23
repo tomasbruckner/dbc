@@ -58,6 +58,14 @@ pub struct FavouriteObject {
     pub kind: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    #[default]
+    Dark,
+    Light,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ToolPaths {
     #[serde(default)]
@@ -78,6 +86,8 @@ pub struct AppConfig {
     pub connections: Vec<ConnectionConfig>,
     #[serde(default)]
     pub favourite_objects: Vec<FavouriteObject>,
+    #[serde(default)]
+    pub theme: ThemeMode,
     /// Global, not per-connection (an installed tool is a machine property,
     /// not a connection property) — design §1.
     #[serde(default)]
@@ -145,6 +155,7 @@ mod tests {
                 favourite: false,
             }],
             favourite_objects: vec![],
+            theme: ThemeMode::Dark,
             tool_paths: ToolPaths::default(),
         }
     }
@@ -231,6 +242,34 @@ user = "postgres"
 "#;
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.favourite_objects, vec![]);
+    }
+
+    #[test]
+    fn old_config_without_theme_loads() {
+        // Same forward-compat posture as old_config_without_favourites_loads:
+        // a pre-G14 config.toml with no `theme` key defaults to Dark.
+        let toml_str = r#"
+[[connections]]
+id = "c1"
+name = "demo"
+engine = "postgres"
+host = "localhost"
+database = "postgres"
+user = "postgres"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.theme, ThemeMode::Dark);
+    }
+
+    #[test]
+    fn theme_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        let mut config = sample();
+        config.theme = ThemeMode::Light;
+        config.save(&p).unwrap();
+        let loaded = AppConfig::load(&p).unwrap();
+        assert_eq!(loaded.theme, ThemeMode::Light);
     }
 
     fn sample_with_tools() -> AppConfig {

@@ -19,7 +19,7 @@
 //! was needed.
 
 use gpui::{
-    canvas, div, point, prelude::*, px, rgb, size, App, Bounds, Context, EventEmitter,
+    canvas, div, point, prelude::*, px, size, App, Bounds, Context, EventEmitter, Hsla,
     PathBuilder, Pixels, Point, ScrollDelta, TextRun, Window,
 };
 
@@ -28,13 +28,7 @@ use dbc_core::erd::{TableKey, MAX_VISIBLE_COLS};
 use dbc_core::TableInfo;
 
 use crate::schema_tree::TreeEvent;
-
-const NODE_FILL: u32 = 0x313244;
-const NODE_BORDER: u32 = 0x45475a;
-const TEXT_COLOR: u32 = 0xcdd6f4;
-const MUTED_COLOR: u32 = 0x6c7086;
-const EDGE_COLOR: u32 = 0x89b4fa;
-const ACCENT_COLOR: u32 = 0xf5c2e7;
+use crate::theme::ActiveTheme;
 
 /// Anchored-zoom clamp bounds (T5 grounding, Constraints: "clamp zoom to a
 /// sane range — no zoom->0 or infinity producing NaN"). `0.2`/`3.0` per the
@@ -181,7 +175,7 @@ impl Render for ErDiagramView {
         let mut canvas_area = div()
             .id("er-diagram-root")
             .flex_1()
-            .bg(rgb(0x1e1e2e))
+            .bg(cx.theme().bg_panel)
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, e: &gpui::MouseDownEvent, _window, cx| {
@@ -281,15 +275,15 @@ impl Render for ErDiagramView {
             .justify_between()
             .px_2()
             .py_1()
-            .bg(rgb(0x181825))
-            .text_color(rgb(0xcdd6f4))
+            .bg(cx.theme().bg_app)
+            .text_color(cx.theme().text_primary)
             .child(format!("ER: {schema_label}"))
             .child(
                 div()
                     .id("er-diagram-export")
                     .cursor_pointer()
-                    .bg(rgb(0x313244))
-                    .text_color(rgb(0xcdd6f4))
+                    .bg(cx.theme().bg_hover)
+                    .text_color(cx.theme().text_primary)
                     .px_2()
                     .rounded_md()
                     .child("Export…")
@@ -302,8 +296,8 @@ impl Render for ErDiagramView {
                 .w_full()
                 .px_2()
                 .py_1()
-                .bg(rgb(0x45475a))
-                .text_color(rgb(0xf9e2af))
+                .bg(cx.theme().bg_selected)
+                .text_color(cx.theme().warn)
                 .child(msg)
         });
 
@@ -311,7 +305,7 @@ impl Render for ErDiagramView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x1e1e2e))
+            .bg(cx.theme().bg_panel)
             .child(header)
             .children(banner)
             .child(canvas_area)
@@ -436,8 +430,9 @@ fn paint_diagram(
     window: &mut Window,
     app: &mut App,
 ) {
+    let theme = *app.theme();
     for e in &layout.edges {
-        paint_edge(bounds.origin, e, pan, zoom, EDGE_COLOR, window);
+        paint_edge(bounds.origin, e, pan, zoom, theme.accent, window);
     }
     for n in &layout.nodes {
         if let Some(t) = tables.iter().find(|t| t.schema == n.key.schema && t.name == n.key.name) {
@@ -450,7 +445,7 @@ fn paint_diagram(
     // z-order trick, no new state beyond `selected` itself.
     if let Some(key) = selected {
         for e in layout.edges.iter().filter(|e| &e.from == key || &e.to == key) {
-            paint_edge(bounds.origin, e, pan, zoom, ACCENT_COLOR, window);
+            paint_edge(bounds.origin, e, pan, zoom, theme.accent_alt, window);
         }
     }
 }
@@ -458,7 +453,7 @@ fn paint_diagram(
 fn paint_text_line(
     origin: Point<Pixels>,
     text: &str,
-    color: u32,
+    color: Hsla,
     bold: bool,
     font_size: Pixels,
     line_height: Pixels,
@@ -479,7 +474,7 @@ fn paint_text_line(
     let run = TextRun {
         len: sanitized.len(),
         font,
-        color: rgb(color).into(),
+        color,
         background_color: None,
         underline: None,
         strikethrough: None,
@@ -501,15 +496,16 @@ fn paint_node(
     window: &mut Window,
     app: &mut App,
 ) {
+    let theme = *app.theme();
     let top_left = to_screen(origin, (n.x, n.y), pan, zoom);
     let sz = size(px(fmt_coord(n.w * zoom)), px(fmt_coord(n.h * zoom)));
     let (border_color, border_w) =
-        if is_selected { (ACCENT_COLOR, px(2.0)) } else { (NODE_BORDER, px(1.0)) };
+        if is_selected { (theme.accent_alt, px(2.0)) } else { (theme.border, px(1.0)) };
     window.paint_quad(
-        gpui::fill(Bounds::new(top_left, sz), rgb(NODE_FILL))
+        gpui::fill(Bounds::new(top_left, sz), theme.bg_hover)
             .corner_radii(px(4.))
             .border_widths(border_w)
-            .border_color(rgb(border_color)),
+            .border_color(border_color),
     );
 
     let rem_size = window.rem_size();
@@ -521,7 +517,7 @@ fn paint_node(
     paint_text_line(
         top_left + point(pad_x, pad_top),
         &header_text(t),
-        TEXT_COLOR,
+        theme.text_primary,
         true,
         header_font_size,
         header_font_size,
@@ -544,7 +540,7 @@ fn paint_node(
         let marker = if c.is_pk { "PK " } else { "FK " };
         let line = format!("{marker}{}: {}", c.name, c.data_type);
         let row_origin = to_screen(origin, (n.x, n.y + row_y), pan, zoom);
-        paint_text_line(row_origin + point(pad_x, px(0.0)), &line, TEXT_COLOR, false, row_font_size, row_font_size, window, app);
+        paint_text_line(row_origin + point(pad_x, px(0.0)), &line, theme.text_primary, false, row_font_size, row_font_size, window, app);
         row_y += ROW_H;
         shown += 1;
     }
@@ -552,11 +548,11 @@ fn paint_node(
     if hidden > 0 {
         let footer = format!("+{hidden} dalších");
         let row_origin = to_screen(origin, (n.x, n.y + row_y), pan, zoom);
-        paint_text_line(row_origin + point(pad_x, px(0.0)), &footer, MUTED_COLOR, false, row_font_size, row_font_size, window, app);
+        paint_text_line(row_origin + point(pad_x, px(0.0)), &footer, theme.text_disabled, false, row_font_size, row_font_size, window, app);
     }
 }
 
-fn paint_edge(origin: Point<Pixels>, e: &RoutedEdge, pan: Point<f32>, zoom: f32, color: u32, window: &mut Window) {
+fn paint_edge(origin: Point<Pixels>, e: &RoutedEdge, pan: Point<f32>, zoom: f32, color: Hsla, window: &mut Window) {
     if e.points.len() < 2 {
         return;
     }
@@ -568,7 +564,7 @@ fn paint_edge(origin: Point<Pixels>, e: &RoutedEdge, pan: Point<f32>, zoom: f32,
         builder.line_to(to_screen(origin, e.points[1], pan, zoom));
     }
     if let Ok(path) = builder.build() {
-        window.paint_path(path, rgb(color));
+        window.paint_path(path, color);
     }
 }
 

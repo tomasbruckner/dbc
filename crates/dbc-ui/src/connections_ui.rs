@@ -34,9 +34,10 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+use dbc_buffer::ResultBuffer;
 use dbc_state::{ConnectionConfig, Engine, SshTunnelConfig, Vault};
 use gpui::{
-    actions, div, fill, hsla, point, prelude::*, px, relative, rgb, rgba, size, App, AnyElement,
+    actions, div, fill, hsla, point, prelude::*, px, relative, size, App, AnyElement,
     Bounds, ClipboardItem, Context, CursorStyle, Div, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
@@ -45,8 +46,10 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::chart_data::ChartKind;
 use crate::runner::ConnectSpec;
 use crate::text_model::MultilineBuffer;
+use crate::theme::{ActiveTheme, Theme};
 use crate::AppView;
 
 // ---------------------------------------------------------------------
@@ -661,7 +664,7 @@ impl Element for FieldElement {
                 (
                     Some(fill(
                         Bounds::from_corners(point(bounds.left() + x0, bounds.top()), point(bounds.left() + x1, bounds.bottom())),
-                        rgba(0x3311ff30),
+                        cx.theme().bg_selection,
                     )),
                     None,
                 )
@@ -1064,6 +1067,30 @@ pub enum ModalState {
         conn_identity: String,
         conn_label: String,
     },
+    /// G14 T10: app settings modal (theme row only, for now). Unit variant —
+    /// all its state (`config.theme`) already lives on `AppView`, same
+    /// "modal only carries display data" posture the other arms follow.
+    /// Opened via the topbar gear or the palette's "Přepnout motiv"
+    /// bypasses this entirely (direct `toggle_theme` dispatch, no modal).
+    Settings,
+    /// G14 T11: bar/line chart axis picker (design §2.1/§2.4) — opened by
+    /// `AppView::open_chart_picker` (grid "Graf" button / palette "Graf z
+    /// výsledku") or reopened editing-in-place by
+    /// `AppView::on_chart_view_event` (a Chart tab's "Upravit…").
+    ChartPicker {
+        source_title: String,
+        buffer: std::rc::Rc<std::cell::RefCell<ResultBuffer>>,
+        /// (column name, is_numeric) per buffer column, display order.
+        columns: Vec<(String, bool)>,
+        kind: ChartKind,
+        x_col: usize,
+        /// One flag per column; only numeric columns are toggleable (design
+        /// §2.1: Y list pre-filtered numeric, X unfiltered).
+        y_selected: Vec<bool>,
+        /// Some(tab_id): re-pick — reconfigure that tab's `ChartView` in
+        /// place instead of opening a new tab.
+        edit_tab: Option<u64>,
+    },
 }
 
 // ---------------------------------------------------------------------
@@ -1100,8 +1127,8 @@ impl AppView {
             .flex()
             .flex_row()
             .items_center()
-            .bg(rgb(0x181825))
-            .text_color(rgb(0xcdd6f4))
+            .bg(cx.theme().bg_app)
+            .text_color(cx.theme().text_primary)
             .cursor_pointer()
             .child(format!("Připojení: {label} ▾"))
             .on_click(cx.listener(|view, _, _, cx| {
@@ -1116,8 +1143,24 @@ impl AppView {
             .child(
                 div()
                     .ml_auto()
-                    .text_color(rgb(0x7f849c))
+                    .text_color(cx.theme().text_faint)
                     .child(format!("dbc v{}", env!("CARGO_PKG_VERSION"))),
+            )
+            // G14 T10: settings gear — same `cx.stop_propagation()` pattern
+            // as `dropdown_item`'s ★/✎ icon buttons so this click doesn't
+            // also bubble to the row's dropdown-toggle handler above.
+            .child(
+                div()
+                    .id("top-bar-settings")
+                    .px_1()
+                    .cursor_pointer()
+                    .text_color(cx.theme().text_muted)
+                    .hover(|s| s.text_color(cx.theme().text_primary))
+                    .child("⚙")
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        cx.stop_propagation();
+                        view.open_settings(cx);
+                    })),
             )
     }
 
@@ -1128,15 +1171,15 @@ impl AppView {
             .top(px(32.))
             .left(px(4.))
             .w(px(340.))
-            .bg(rgb(0x1e1e2e))
+            .bg(cx.theme().bg_panel)
             .border_1()
-            .border_color(rgb(0x45475a))
+            .border_color(cx.theme().border)
             .rounded_md()
             .p_2()
             .flex()
             .flex_col()
             .gap_1()
-            .text_color(rgb(0xcdd6f4))
+            .text_color(cx.theme().text_primary)
             .occlude()
             .on_mouse_down_out(cx.listener(|view, _, _, cx| {
                 view.dropdown_open = false;
@@ -1144,7 +1187,7 @@ impl AppView {
             }));
 
         if !grouped.favourites.is_empty() {
-            panel = panel.child(div().text_color(rgb(0xf9e2af)).child("Oblíbené"));
+            panel = panel.child(div().text_color(cx.theme().warn).child("Oblíbené"));
             for c in &grouped.favourites {
                 panel = panel.child(dropdown_item(c, 1, cx));
             }
@@ -1154,7 +1197,7 @@ impl AppView {
             let depth = folder.path.len();
             panel = panel.child(
                 div()
-                    .text_color(rgb(0x89b4fa))
+                    .text_color(cx.theme().accent)
                     .child(format!("{}{}", "  ".repeat(depth), header)),
             );
             for c in &folder.connections {
@@ -1166,8 +1209,8 @@ impl AppView {
                 .id("dropdown-new")
                 .mt_1()
                 .cursor_pointer()
-                .text_color(rgb(0xa6e3a1))
-                .hover(|s| s.bg(rgb(0x313244)))
+                .text_color(cx.theme().success)
+                .hover(|s| s.bg(cx.theme().bg_hover))
                 .child("Nové spojení…")
                 .on_click(cx.listener(|view, _, window, cx| {
                     view.open_connection_dialog(None, window, cx);
@@ -1233,6 +1276,10 @@ impl AppView {
                 &path, &table, &headers, &columns, &targets, row_count, &sample_sql, &error,
                 &conn_label, cx,
             ),
+            ModalState::Settings => self.render_settings_panel(cx),
+            ModalState::ChartPicker { source_title, columns, kind, x_col, y_selected, edit_tab, .. } => {
+                render_chart_picker_panel(source_title, columns, kind, x_col, y_selected, edit_tab, cx)
+            }
         };
         Some(
             div()
@@ -1244,11 +1291,69 @@ impl AppView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(0x00000099))
+                .bg(cx.theme().bg_backdrop)
                 .occlude()
                 .child(panel)
                 .into_any_element(),
         )
+    }
+
+    /// G14 T10: theme row only, for now (design's minimal `ModalState::Settings`
+    /// scope) — the two radios call `set_theme` directly, so the switch is
+    /// visible immediately while the modal stays open (design §1.5: "the
+    /// user sees the live switch"); "Zavřít" (or Esc — see
+    /// `AppView::on_cancel_query`'s closable match) is the only way out.
+    fn render_settings_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mode = self.config.theme;
+        let radio = |id: &'static str,
+                     label: &'static str,
+                     m: dbc_state::ThemeMode,
+                     current: dbc_state::ThemeMode,
+                     cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .bg(if m == current { cx.theme().bg_selected } else { cx.theme().bg_hover })
+                .child(if m == current { "●" } else { "○" })
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_theme(m, cx)))
+        };
+        div()
+            .id("settings-panel")
+            .w(px(360.))
+            .bg(cx.theme().bg_panel)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded_md()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .text_color(cx.theme().text_primary)
+            .child(div().text_size(px(16.)).child("Nastavení"))
+            .child(div().text_color(cx.theme().text_muted).child("Motiv"))
+            .child(radio("settings-theme-dark", "Tmavý", dbc_state::ThemeMode::Dark, mode, cx))
+            .child(radio("settings-theme-light", "Světlý", dbc_state::ThemeMode::Light, mode, cx))
+            .child(
+                div()
+                    .id("settings-close")
+                    .mt_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(cx.theme().bg_hover)
+                    .cursor_pointer()
+                    .child("Zavřít")
+                    .on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))),
+            )
+            .into_any_element()
     }
 
     pub(crate) fn open_connection_dialog(
@@ -1340,6 +1445,17 @@ impl AppView {
         cx.notify();
     }
 
+    /// G14 T10: topbar gear entry point. Same single-modal invariant every
+    /// other opener in this file applies (see `open_connection_dialog`'s
+    /// identical guard) — a no-op while any other modal is already open.
+    pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        self.modal = Some(ModalState::Settings);
+        cx.notify();
+    }
+
     /// G7 T6: opens the connection-pair picker. Reuses `self.grouped_cache`
     /// (the SAME folder/favourite grouping the top-bar dropdown shows) —
     /// refreshed here rather than trusting whatever it last held, since the
@@ -1366,6 +1482,34 @@ impl AppView {
             match side {
                 CompareSide::A => *conn_a = Some(id),
                 CompareSide::B => *conn_b = Some(id),
+            }
+        }
+        cx.notify();
+    }
+
+    /// G14 T11: the picker's kind toggle ("Sloupcový"/"Čárový") — same
+    /// in-place-mutate-open-modal idiom as `select_compare_side`.
+    pub(crate) fn set_chart_kind(&mut self, kind: ChartKind, cx: &mut Context<Self>) {
+        if let Some(ModalState::ChartPicker { kind: k, .. }) = &mut self.modal {
+            *k = kind;
+        }
+        cx.notify();
+    }
+
+    /// G14 T11: the picker's X-column radio.
+    pub(crate) fn set_chart_x_col(&mut self, col: usize, cx: &mut Context<Self>) {
+        if let Some(ModalState::ChartPicker { x_col, .. }) = &mut self.modal {
+            *x_col = col;
+        }
+        cx.notify();
+    }
+
+    /// G14 T11: a Y-column checkbox toggle (numeric columns only — the
+    /// panel only ever renders a checkbox for a numeric `col`).
+    pub(crate) fn toggle_chart_y_col(&mut self, col: usize, cx: &mut Context<Self>) {
+        if let Some(ModalState::ChartPicker { y_selected, .. }) = &mut self.modal {
+            if let Some(flag) = y_selected.get_mut(col) {
+                *flag = !*flag;
             }
         }
         cx.notify();
@@ -1943,25 +2087,25 @@ fn test_connect_spec(cfg: ConnectionConfig, secret: Option<String>) -> Result<Co
     Ok(ConnectSpec::Config { cfg: Box::new(cfg), secret })
 }
 
-fn field_row(label: &str, field: Entity<TextField>) -> impl IntoElement {
+fn field_row(label: &str, field: Entity<TextField>, theme: Theme) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap_2()
-        .child(div().w(px(130.)).text_color(rgb(0xa6adc8)).child(label.to_string()))
+        .child(div().w(px(130.)).text_color(theme.text_muted).child(label.to_string()))
         .child(div().flex_1().child(field))
 }
 
-fn styled_button(id: &'static str, label: &'static str) -> Stateful<Div> {
+fn styled_button(id: &'static str, label: &'static str, theme: Theme) -> Stateful<Div> {
     div()
         .id(id)
         .px_3()
         .py_1()
-        .bg(rgb(0x313244))
+        .bg(theme.bg_hover)
         .rounded_md()
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(0x45475a)))
+        .hover(move |s| s.bg(theme.bg_selected))
         .child(label)
 }
 
@@ -1986,14 +2130,14 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
     let restore_read_only = c.read_only;
     let label = format!("{}{} — {} {}", "  ".repeat(depth), c.name, engine_label(c.engine), c.host);
     let (star_glyph, star_color) =
-        if c.favourite { ("★", rgb(0xf9e2af)) } else { ("☆", rgb(0x6c7086)) };
+        if c.favourite { ("★", cx.theme().warn) } else { ("☆", cx.theme().text_disabled) };
     div()
         .id(SharedString::from(format!("dropdown-item-row-{}", c.id)))
         .flex()
         .flex_row()
         .items_center()
         .justify_between()
-        .hover(|s| s.bg(rgb(0x313244)))
+        .hover(|s| s.bg(cx.theme().bg_hover))
         .child(
             div()
                 .id(SharedString::from(format!("dropdown-item-{}", c.id)))
@@ -2013,7 +2157,7 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
                 .px_1()
                 .cursor_pointer()
                 .text_color(star_color)
-                .hover(|s| s.bg(rgb(0x45475a)))
+                .hover(|s| s.bg(cx.theme().bg_selected))
                 .child(star_glyph)
                 .on_click(cx.listener(move |view, _, _window, cx| {
                     cx.stop_propagation();
@@ -2031,8 +2175,8 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
                 .id(SharedString::from(format!("dropdown-item-edit-{}", c.id)))
                 .px_1()
                 .cursor_pointer()
-                .text_color(rgb(0xa6adc8))
-                .hover(|s| s.bg(rgb(0x45475a)))
+                .text_color(cx.theme().text_muted)
+                .hover(|s| s.bg(cx.theme().bg_selected))
                 .child("✎")
                 .on_click(cx.listener(move |view, _, window, cx| {
                     cx.stop_propagation();
@@ -2049,8 +2193,8 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
                 .id(SharedString::from(format!("dropdown-item-backup-{}", c.id)))
                 .px_1()
                 .cursor_pointer()
-                .text_color(rgb(0xa6adc8))
-                .hover(|s| s.bg(rgb(0x45475a)))
+                .text_color(cx.theme().text_muted)
+                .hover(|s| s.bg(cx.theme().bg_selected))
                 .child("🗄")
                 .on_click(cx.listener(move |view, _, window, cx| {
                     cx.stop_propagation();
@@ -2069,8 +2213,8 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
                 .id(SharedString::from(format!("dropdown-item-restore-{}", c.id)))
                 .px_1()
                 .cursor_pointer()
-                .text_color(if restore_read_only { rgb(0x6c7086) } else { rgb(0xa6adc8) })
-                .hover(|s| s.bg(rgb(0x45475a)))
+                .text_color(if restore_read_only { cx.theme().text_disabled } else { cx.theme().text_muted })
+                .hover(|s| s.bg(cx.theme().bg_selected))
                 .child("♻")
                 .on_click(cx.listener(move |view, _, window, cx| {
                     cx.stop_propagation();
@@ -2096,44 +2240,44 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
 
     let mut panel: Div = div()
         .w(px(480.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child(title))
-        .child(field_row("Název", ui.name.clone()))
+        .child(field_row("Název", ui.name.clone(), *cx.theme()))
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(div().w(px(130.)).text_color(rgb(0xa6adc8)).child("Engine"))
+                .child(div().w(px(130.)).text_color(cx.theme().text_muted).child("Engine"))
                 .child(
                     div()
                         .id("engine-cycle")
                         .px_2()
                         .py_1()
-                        .bg(rgb(0x313244))
+                        .bg(cx.theme().bg_hover)
                         .rounded_md()
                         .cursor_pointer()
                         .child(engine_label(ui.engine))
                         .on_click(cx.listener(|view, _, _, cx| view.cycle_engine(cx))),
                 ),
         )
-        .child(field_row("Host", ui.host.clone()))
-        .child(field_row("Port", ui.port.clone()))
-        .child(field_row("Databáze", ui.database.clone()))
-        .child(field_row("Uživatel", ui.user.clone()))
-        .child(field_row("Heslo", ui.password.clone()))
-        .child(field_row("Složka", ui.folder.clone()))
-        .child(field_row("Timeout (s)", ui.timeout_secs.clone()))
-        .child(field_row("Auto-limit řádků", ui.auto_limit.clone()))
+        .child(field_row("Host", ui.host.clone(), *cx.theme()))
+        .child(field_row("Port", ui.port.clone(), *cx.theme()))
+        .child(field_row("Databáze", ui.database.clone(), *cx.theme()))
+        .child(field_row("Uživatel", ui.user.clone(), *cx.theme()))
+        .child(field_row("Heslo", ui.password.clone(), *cx.theme()))
+        .child(field_row("Složka", ui.folder.clone(), *cx.theme()))
+        .child(field_row("Timeout (s)", ui.timeout_secs.clone(), *cx.theme()))
+        .child(field_row("Auto-limit řádků", ui.auto_limit.clone(), *cx.theme()))
         .child(
             div()
                 .flex()
@@ -2149,17 +2293,17 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
 
     if ui.ssh_enabled {
         panel = panel
-            .child(field_row("SSH host", ui.ssh_host.clone()))
-            .child(field_row("SSH port", ui.ssh_port.clone()))
-            .child(field_row("SSH uživatel", ui.ssh_user.clone()))
-            .child(field_row("SSH klíč (cesta)", ui.ssh_key_path.clone()));
+            .child(field_row("SSH host", ui.ssh_host.clone(), *cx.theme()))
+            .child(field_row("SSH port", ui.ssh_port.clone(), *cx.theme()))
+            .child(field_row("SSH uživatel", ui.ssh_user.clone(), *cx.theme()))
+            .child(field_row("SSH klíč (cesta)", ui.ssh_key_path.clone(), *cx.theme()));
     }
 
     if let Some((text, ok)) = test_line {
         let color = match ok {
-            Some(true) => rgb(0xa6e3a1),
-            Some(false) => rgb(0xf38ba8),
-            None => rgb(0xa6adc8),
+            Some(true) => cx.theme().success,
+            Some(false) => cx.theme().danger,
+            None => cx.theme().text_muted,
         };
         panel = panel.child(div().text_color(color).child(text));
     }
@@ -2172,9 +2316,9 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("dlg-test", test_label).on_click(cx.listener(|v, _, _, cx| v.on_test_clicked(cx))))
-            .child(styled_button("dlg-save", "Uložit").on_click(cx.listener(|v, _, window, cx| v.on_save_clicked(window, cx))))
-            .child(styled_button("dlg-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx)))),
+            .child(styled_button("dlg-test", test_label, *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.on_test_clicked(cx))))
+            .child(styled_button("dlg-save", "Uložit", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_save_clicked(window, cx))))
+            .child(styled_button("dlg-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx)))),
     );
 
     panel.into_any_element()
@@ -2183,19 +2327,19 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
 fn render_master_password_panel(input: Entity<TextField>, error: Option<String>, cx: &mut Context<AppView>) -> AnyElement {
     let mut panel: Div = div()
         .w(px(360.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Master heslo"))
-        .child(field_row("Heslo", input));
+        .child(field_row("Heslo", input, *cx.theme()));
     if let Some(e) = error {
-        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(e));
+        panel = panel.child(div().text_color(cx.theme().danger).child(e));
     }
     panel = panel.child(
         div()
@@ -2204,8 +2348,8 @@ fn render_master_password_panel(input: Entity<TextField>, error: Option<String>,
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("mpp-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
-            .child(styled_button("mpp-submit", "Odemknout").on_click(cx.listener(|v, _, _, cx| v.on_master_password_submit(cx)))),
+            .child(styled_button("mpp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+            .child(styled_button("mpp-submit", "Odemknout", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.on_master_password_submit(cx)))),
     );
     panel.into_any_element()
 }
@@ -2218,20 +2362,20 @@ fn render_create_master_password_panel(
 ) -> AnyElement {
     let mut panel: Div = div()
         .w(px(360.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Vytvořit master heslo"))
-        .child(field_row("Nové heslo", input1))
-        .child(field_row("Zopakujte heslo", input2));
+        .child(field_row("Nové heslo", input1, *cx.theme()))
+        .child(field_row("Zopakujte heslo", input2, *cx.theme()));
     if let Some(e) = error {
-        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(e));
+        panel = panel.child(div().text_color(cx.theme().danger).child(e));
     }
     panel = panel.child(
         div()
@@ -2240,8 +2384,8 @@ fn render_create_master_password_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("cmp-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
-            .child(styled_button("cmp-submit", "Vytvořit").on_click(cx.listener(|v, _, window, cx| v.on_create_master_password_submit(window, cx)))),
+            .child(styled_button("cmp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+            .child(styled_button("cmp-submit", "Vytvořit", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_create_master_password_submit(window, cx)))),
     );
     panel.into_any_element()
 }
@@ -2278,15 +2422,15 @@ fn render_query_params_panel(
     let mut panel: Div = div()
         .w(px(480.))
         .max_h(px(520.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Hodnoty parametrů"));
 
     for (i, name) in names.iter().enumerate() {
@@ -2299,7 +2443,7 @@ fn render_query_params_panel(
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(div().w(px(110.)).text_color(rgb(0xa6adc8)).child(format!(":{name}")))
+                .child(div().w(px(110.)).text_color(cx.theme().text_muted).child(format!(":{name}")))
                 .child(div().flex_1().child(input))
                 .child(
                     div()
@@ -2321,9 +2465,9 @@ fn render_query_params_panel(
         div()
             .id("qp-preview")
             .p_1()
-            .bg(rgb(0x181825))
+            .bg(cx.theme().bg_app)
             .rounded_md()
-            .text_color(rgb(0xa6adc8))
+            .text_color(cx.theme().text_muted)
             .whitespace_normal()
             .child(match &preview {
                 Ok(sql) => sql.clone(),
@@ -2332,7 +2476,7 @@ fn render_query_params_panel(
     );
 
     if let Some(e) = error {
-        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(e));
+        panel = panel.child(div().text_color(cx.theme().danger).child(e));
     }
 
     panel = panel.child(
@@ -2342,8 +2486,8 @@ fn render_query_params_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("qp-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.cancel_query_params(cx))))
-            .child(styled_button("qp-run", "Spustit").on_click(cx.listener(|v, _, _, cx| v.confirm_query_params(cx)))),
+            .child(styled_button("qp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.cancel_query_params(cx))))
+            .child(styled_button("qp-run", "Spustit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.confirm_query_params(cx)))),
     );
     panel.into_any_element()
 }
@@ -2448,30 +2592,30 @@ fn render_kill_confirm_panel(
 ) -> AnyElement {
     let mut panel: Div = div()
         .w(px(520.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Ukončit proces"))
         .child(format!("Opravdu ukončit proces {pid} ({label})?"))
         .child(
             div()
                 .id("kill-sql-preview")
                 .p_1()
-                .bg(rgb(0x181825))
+                .bg(cx.theme().bg_app)
                 .rounded_md()
-                .text_color(rgb(0xa6adc8))
+                .text_color(cx.theme().text_muted)
                 .whitespace_normal()
                 .child(sql.to_string()),
         );
 
     if let Some(e) = error {
-        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {e}")));
+        panel = panel.child(div().text_color(cx.theme().danger).child(format!("error: {e}")));
     }
 
     let confirm_button = if dispatched {
@@ -2480,13 +2624,13 @@ fn render_kill_confirm_panel(
             .px_3()
             .py_1()
             .rounded_md()
-            .bg(rgb(0x313244))
-            .text_color(rgb(0x6c7086))
+            .bg(cx.theme().bg_hover)
+            .text_color(cx.theme().text_disabled)
             .child("Ukončuji…")
             .into_any_element()
     } else {
-        styled_button("kill-confirm", "Ukončit proces")
-            .bg(rgb(0x5d2e2e)) // danger tint — DELETED_ROW_BG family
+        styled_button("kill-confirm", "Ukončit proces", *cx.theme())
+            .bg(cx.theme().diff_deleted_bg) // danger tint — DELETED_ROW_BG family
             .on_click(cx.listener(|v, _, _, cx| v.confirm_kill_confirm(cx)))
             .into_any_element()
     };
@@ -2499,7 +2643,7 @@ fn render_kill_confirm_panel(
             .justify_end()
             .mt_2()
             .child(
-                styled_button("kill-cancel", "Zrušit")
+                styled_button("kill-cancel", "Zrušit", *cx.theme())
                     .on_click(cx.listener(|v, _, _, cx| v.cancel_kill_confirm(cx))),
             )
             .child(confirm_button),
@@ -2533,17 +2677,17 @@ fn render_analyze_write_confirm_panel(
     let mut panel = div()
         .id("analyze-write-confirm")
         .w(px(520.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Analyzovat (EXPLAIN ANALYZE)"))
-        .child(div().text_color(rgb(0xf9e2af)).child(
+        .child(div().text_color(cx.theme().warn).child(
             "Toto SQL bude SKUTEČNĚ PROVEDENO, aby bylo možné změřit skutečný plán, a poté vráceno \
              zpět (ROLLBACK). Vedlejší efekty MIMO transakci (např. hodnoty sekvencí/IDENTITY, \
              volání externích funkcí) NEBUDOU vráceny zpět.",
@@ -2552,18 +2696,18 @@ fn render_analyze_write_confirm_panel(
             div()
                 .id("analyze-write-sql-preview")
                 .p_1()
-                .bg(rgb(0x181825))
+                .bg(cx.theme().bg_app)
                 .rounded_md()
-                .text_color(rgb(0xa6adc8))
+                .text_color(cx.theme().text_muted)
                 .whitespace_normal()
                 .child(sql),
         );
 
     if running {
-        panel = panel.child(div().text_color(rgb(0xf9e2af)).child("analyzuji (BEGIN…ROLLBACK)…"));
+        panel = panel.child(div().text_color(cx.theme().warn).child("analyzuji (BEGIN…ROLLBACK)…"));
     }
     if let Some(err) = error {
-        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {err}")));
+        panel = panel.child(div().text_color(cx.theme().danger).child(format!("error: {err}")));
     }
 
     panel = panel.child(
@@ -2582,8 +2726,8 @@ fn render_analyze_write_confirm_panel(
                             cx.notify();
                         }))
                     })
-                    .bg(rgb(0x313244))
-                    .text_color(if running { rgb(0x6c7086) } else { rgb(0xcdd6f4) })
+                    .bg(cx.theme().bg_hover)
+                    .text_color(if running { cx.theme().text_disabled } else { cx.theme().text_primary })
                     .px_3()
                     .py_1()
                     .rounded_md()
@@ -2598,8 +2742,8 @@ fn render_analyze_write_confirm_panel(
                         }))
                     })
                     // danger tint — DELETED_ROW_BG family, matches kill-confirm — dimmed while running.
-                    .bg(if running { rgb(0x313244) } else { rgb(0x5d2e2e) })
-                    .text_color(if running { rgb(0x6c7086) } else { rgb(0xcdd6f4) })
+                    .bg(if running { cx.theme().bg_hover } else { cx.theme().diff_deleted_bg })
+                    .text_color(if running { cx.theme().text_disabled } else { cx.theme().text_primary })
                     .px_3()
                     .py_1()
                     .rounded_md()
@@ -2633,15 +2777,15 @@ fn render_compare_dialog_panel(
     let mut panel = div()
         .id("compare-dialog")
         .w(px(680.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Porovnat databáze…"))
         .child(
             div()
@@ -2667,11 +2811,11 @@ fn render_compare_dialog_panel(
         );
 
     if let Some(e) = &error {
-        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {e}")));
+        panel = panel.child(div().text_color(cx.theme().danger).child(format!("error: {e}")));
     }
 
     let confirm_button = if both_picked {
-        styled_button("compare-confirm", "Spustit porovnání")
+        styled_button("compare-confirm", "Spustit porovnání", *cx.theme())
             .on_click(cx.listener(|v, _, _, cx| v.confirm_compare_dialog(cx)))
             .into_any_element()
     } else {
@@ -2680,8 +2824,8 @@ fn render_compare_dialog_panel(
             .px_3()
             .py_1()
             .rounded_md()
-            .bg(rgb(0x313244))
-            .text_color(rgb(0x6c7086))
+            .bg(cx.theme().bg_hover)
+            .text_color(cx.theme().text_disabled)
             .child("Spustit porovnání")
             .into_any_element()
     };
@@ -2693,7 +2837,7 @@ fn render_compare_dialog_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("compare-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| {
+            .child(styled_button("compare-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| {
                 v.modal = None;
                 cx.notify();
             })))
@@ -2720,24 +2864,24 @@ fn render_compare_picker_column(
         .h(px(240.))
         .overflow_hidden()
         .border_1()
-        .border_color(rgb(0x313244))
+        .border_color(cx.theme().bg_hover)
         .rounded_md();
 
     if !grouped.favourites.is_empty() {
-        list = list.child(div().text_color(rgb(0xf9e2af)).child("Oblíbené"));
+        list = list.child(div().text_color(cx.theme().warn).child("Oblíbené"));
         for c in &grouped.favourites {
             list = list.child(compare_picker_row(c, side, selected, cx));
         }
     }
     for folder in &grouped.folders {
         let header = if folder.path.is_empty() { "Bez složky".to_string() } else { folder.path.join("/") };
-        list = list.child(div().text_color(rgb(0x6c7086)).child(header));
+        list = list.child(div().text_color(cx.theme().text_disabled).child(header));
         for c in &folder.connections {
             list = list.child(compare_picker_row(c, side, selected, cx));
         }
     }
 
-    div().flex().flex_col().flex_1().gap_1().child(div().text_color(rgb(0x89b4fa)).child(label)).child(list)
+    div().flex().flex_col().flex_1().gap_1().child(div().text_color(cx.theme().accent).child(label)).child(list)
 }
 
 fn compare_picker_row(
@@ -2758,8 +2902,8 @@ fn compare_picker_row(
         .px_1()
         .cursor_pointer()
         .rounded_md()
-        .when(is_selected, |d| d.bg(rgb(0x313244)).text_color(rgb(0xa6e3a1)))
-        .hover(|s| s.bg(rgb(0x313244)))
+        .when(is_selected, |d| d.bg(cx.theme().bg_hover).text_color(cx.theme().success))
+        .hover(|s| s.bg(cx.theme().bg_hover))
         .child(label)
         .on_click(cx.listener(move |view, _, _, cx| {
             view.select_compare_side(side, id.clone(), cx);
@@ -2784,15 +2928,15 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
     let mut panel = div()
         .id("backup-restore-panel")
         .w(px(560.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child(title))
         .child(format!(
             "{} — {} ({})",
@@ -2800,16 +2944,16 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
             engine_label(session.engine),
             session.database
         ))
-        .child(div().text_color(rgb(0xa6adc8)).child(session.target_path.clone()));
+        .child(div().text_color(cx.theme().text_muted).child(session.target_path.clone()));
 
     if !session.command_line.is_empty() {
         panel = panel.child(
             div()
                 .id("backup-restore-command-preview")
                 .p_1()
-                .bg(rgb(0x181825))
+                .bg(cx.theme().bg_app)
                 .rounded_md()
-                .text_color(rgb(0xa6adc8))
+                .text_color(cx.theme().text_muted)
                 .whitespace_normal()
                 .child(session.command_line.clone()),
         );
@@ -2822,17 +2966,17 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
             // straight in `Running`).
             if let Some(input) = &session.confirm_input {
                 panel = panel
-                    .child(div().text_color(rgb(0xf9e2af)).child(format!(
+                    .child(div().text_color(cx.theme().warn).child(format!(
                         "Pro potvrzení napište přesný název databáze: {}",
                         session.expected_name
                     )))
-                    .child(field_row("Název databáze", input.clone()));
+                    .child(field_row("Název databáze", input.clone(), *cx.theme()));
             }
             let typed = session.confirm_input.as_ref().map(|f| f.read(cx).text()).unwrap_or_default();
             let allowed = crate::backup::confirm_matches(&typed, &session.expected_name);
             let confirm_button = if allowed {
-                styled_button("backup-restore-confirm", "Obnovit")
-                    .bg(rgb(0x5d2e2e))
+                styled_button("backup-restore-confirm", "Obnovit", *cx.theme())
+                    .bg(cx.theme().diff_deleted_bg)
                     .on_click(cx.listener(|v, _, _, cx| v.confirm_restore(cx)))
                     .into_any_element()
             } else {
@@ -2841,8 +2985,8 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(0x313244))
-                    .text_color(rgb(0x6c7086))
+                    .bg(cx.theme().bg_hover)
+                    .text_color(cx.theme().text_disabled)
                     .child("Obnovit")
                     .into_any_element()
             };
@@ -2854,7 +2998,7 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
                     .justify_end()
                     .mt_2()
                     .child(
-                        styled_button("backup-restore-cancel", "Zrušit")
+                        styled_button("backup-restore-cancel", "Zrušit", *cx.theme())
                             .on_click(cx.listener(|v, _, _, cx| v.cancel_backup_restore(cx))),
                     )
                     .child(confirm_button),
@@ -2862,7 +3006,7 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
         }
         BackupStatus::Running => {
             let elapsed = session.started_at.elapsed().as_secs();
-            panel = panel.child(div().text_color(rgb(0xf9e2af)).child(format!("probíhá… ({elapsed} s)")));
+            panel = panel.child(div().text_color(cx.theme().warn).child(format!("probíhá… ({elapsed} s)")));
 
             let log = session.log.borrow();
             let log_len = log.lines.len();
@@ -2877,7 +3021,7 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
                 panel = panel.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(0x6c7086))
+                        .text_color(cx.theme().text_disabled)
                         .child("… (starší řádky zahozeny)"),
                 );
             }
@@ -2906,7 +3050,7 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
             // same "dimmed div, no `.on_click`" pattern this file already
             // uses for a disabled Confirming-state "Obnovit".
             let cancel_button = if session.can_cancel() {
-                styled_button("backup-restore-cancel-running", "Zrušit")
+                styled_button("backup-restore-cancel-running", "Zrušit", *cx.theme())
                     .on_click(cx.listener(|v, _, _, cx| v.cancel_backup_restore(cx)))
                     .into_any_element()
             } else {
@@ -2915,8 +3059,8 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(0x313244))
-                    .text_color(rgb(0x6c7086))
+                    .bg(cx.theme().bg_hover)
+                    .text_color(cx.theme().text_disabled)
                     .child("nelze přerušit — čeká se na dokončení")
                     .into_any_element()
             };
@@ -2924,15 +3068,15 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
         }
         BackupStatus::Succeeded | BackupStatus::Failed(_) | BackupStatus::Cancelled => {
             let (line, color) = match &status {
-                BackupStatus::Succeeded => ("hotovo".to_string(), rgb(0xa6e3a1)),
-                BackupStatus::Failed(e) => (format!("error: {e}"), rgb(0xf38ba8)),
-                BackupStatus::Cancelled => ("přerušeno uživatelem".to_string(), rgb(0xf9e2af)),
+                BackupStatus::Succeeded => ("hotovo".to_string(), cx.theme().success),
+                BackupStatus::Failed(e) => (format!("error: {e}"), cx.theme().danger),
+                BackupStatus::Cancelled => ("přerušeno uživatelem".to_string(), cx.theme().warn),
                 _ => unreachable!(),
             };
             panel = panel.child(div().text_color(color).child(line));
             panel = panel.child(
                 div().flex().flex_row().justify_end().mt_2().child(
-                    styled_button("backup-restore-close", "Zavřít")
+                    styled_button("backup-restore-close", "Zavřít", *cx.theme())
                         .on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))),
                 ),
             );
@@ -3005,13 +3149,13 @@ fn render_script_run_confirm_panel(
     for (path, count) in files.iter().zip(file_counts.iter()) {
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string());
         file_list = file_list.child(
-            div().text_color(rgb(0xa6adc8)).child(format!("{name} — {count} příkazů")),
+            div().text_color(cx.theme().text_muted).child(format!("{name} — {count} příkazů")),
         );
     }
 
-    let mut conn_line = div().flex().flex_row().gap_2().text_color(rgb(0xa6adc8)).child(conn_label.to_string());
+    let mut conn_line = div().flex().flex_row().gap_2().text_color(cx.theme().text_muted).child(conn_label.to_string());
     if read_only {
-        conn_line = conn_line.child(div().text_color(rgb(0xf9e2af)).child("jen pro čtení"));
+        conn_line = conn_line.child(div().text_color(cx.theme().warn).child("jen pro čtení"));
     }
 
     let tx_option = |id: &'static str, label: &'static str, value: TxScope, current: TxScope| {
@@ -3019,13 +3163,13 @@ fn render_script_run_confirm_panel(
         let selected = value == current;
         let base = div().id(id).px_2().py_1().rounded_md().child(label);
         if !valid {
-            base.text_color(rgb(0x45475a))
+            base.text_color(cx.theme().border)
         } else if selected {
-            base.cursor_pointer().bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4)).on_click(cx.listener(move |v, _, _, cx| {
+            base.cursor_pointer().bg(cx.theme().bg_selected).text_color(cx.theme().text_primary).on_click(cx.listener(move |v, _, _, cx| {
                 v.set_script_tx_scope(value, cx);
             }))
         } else {
-            base.cursor_pointer().bg(rgb(0x313244)).text_color(rgb(0xa6adc8)).on_click(cx.listener(move |v, _, _, cx| {
+            base.cursor_pointer().bg(cx.theme().bg_hover).text_color(cx.theme().text_muted).on_click(cx.listener(move |v, _, _, cx| {
                 v.set_script_tx_scope(value, cx);
             }))
         }
@@ -3035,13 +3179,13 @@ fn render_script_run_confirm_panel(
         let selected = value == current;
         let base = div().id(id).px_2().py_1().rounded_md().child(label);
         if !valid {
-            base.text_color(rgb(0x45475a))
+            base.text_color(cx.theme().border)
         } else if selected {
-            base.cursor_pointer().bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4)).on_click(cx.listener(move |v, _, _, cx| {
+            base.cursor_pointer().bg(cx.theme().bg_selected).text_color(cx.theme().text_primary).on_click(cx.listener(move |v, _, _, cx| {
                 v.set_script_error_policy(value, cx);
             }))
         } else {
-            base.cursor_pointer().bg(rgb(0x313244)).text_color(rgb(0xa6adc8)).on_click(cx.listener(move |v, _, _, cx| {
+            base.cursor_pointer().bg(cx.theme().bg_hover).text_color(cx.theme().text_muted).on_click(cx.listener(move |v, _, _, cx| {
                 v.set_script_error_policy(value, cx);
             }))
         }
@@ -3055,25 +3199,25 @@ fn render_script_run_confirm_panel(
     let panel = div()
         .id("script-run-confirm")
         .w(px(560.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child(format!("Spustit skript: {source_label}")))
         .child(conn_line)
         .child(file_list)
-        .child(div().text_color(rgb(0xa6adc8)).child(format!("celkem: {total} příkazů")))
+        .child(div().text_color(cx.theme().text_muted).child(format!("celkem: {total} příkazů")))
         .child(
             div()
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(div().text_color(rgb(0xa6adc8)).child("Transakce"))
+                .child(div().text_color(cx.theme().text_muted).child("Transakce"))
                 .child(
                     div()
                         .flex()
@@ -3089,7 +3233,7 @@ fn render_script_run_confirm_panel(
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(div().text_color(rgb(0xa6adc8)).child("Při chybě"))
+                .child(div().text_color(cx.theme().text_muted).child("Při chybě"))
                 .child(
                     div()
                         .flex()
@@ -3099,7 +3243,7 @@ fn render_script_run_confirm_panel(
                         .child(policy_option("script-err-continue", "pokračovat", ErrorPolicy::Continue, error_policy)),
                 ),
         )
-        .child(div().text_color(rgb(0xa6adc8)).child(timeout_line))
+        .child(div().text_color(cx.theme().text_muted).child(timeout_line))
         .child(
             div()
                 .flex()
@@ -3107,9 +3251,9 @@ fn render_script_run_confirm_panel(
                 .gap_2()
                 .justify_end()
                 .mt_2()
-                .child(styled_button("script-run-cancel-modal", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+                .child(styled_button("script-run-cancel-modal", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
                 .child(
-                    styled_button("script-run-confirm-btn", "Spustit")
+                    styled_button("script-run-confirm-btn", "Spustit", *cx.theme())
                         .on_click(cx.listener(|v, _, _, cx| v.confirm_script_run(cx))),
                 ),
         );
@@ -3156,13 +3300,13 @@ fn render_csv_import_panel(
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(div().w(px(160.)).text_color(rgb(0xa6adc8)).child(header.clone()))
+                .child(div().w(px(160.)).text_color(cx.theme().text_muted).child(header.clone()))
                 .child(
                     div()
                         .id(("csv-target-cycle", ix))
                         .px_2()
                         .py_1()
-                        .bg(rgb(0x313244))
+                        .bg(cx.theme().bg_hover)
                         .rounded_md()
                         .cursor_pointer()
                         .child(format!("→ {target_label}"))
@@ -3174,26 +3318,26 @@ fn render_csv_import_panel(
     let mut panel = div()
         .id("csv-import-modal")
         .w(px(600.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child(format!("Import CSV do {table}")))
-        .child(div().text_color(rgb(0xa6adc8)).child(format!("připojení: {conn_label}")))
-        .child(div().text_color(rgb(0xa6adc8)).child(path.display().to_string()))
+        .child(div().text_color(cx.theme().text_muted).child(format!("připojení: {conn_label}")))
+        .child(div().text_color(cx.theme().text_muted).child(path.display().to_string()))
         .child(mapping_rows)
-        .child(div().text_color(rgb(0xa6adc8)).child(format!(
+        .child(div().text_color(cx.theme().text_muted).child(format!(
             "{row_count} řádků · dávka: {} řádků",
             crate::csv_import::CSV_IMPORT_BATCH_SIZE
         )))
         .child(
             div()
-                .text_color(rgb(0xa6adc8))
+                .text_color(cx.theme().text_muted)
                 .child("prázdné pole → NULL; hlavičkový řádek je povinný"),
         );
 
@@ -3204,21 +3348,21 @@ fn render_csv_import_panel(
                 .max_h(px(140.))
                 .overflow_hidden()
                 .p_1()
-                .bg(rgb(0x181825))
+                .bg(cx.theme().bg_app)
                 .rounded_md()
-                .text_color(rgb(0xa6adc8))
+                .text_color(cx.theme().text_muted)
                 .font_family("Consolas")
                 .whitespace_normal()
                 .child(sql.clone()),
         );
     }
     if let Some(e) = error {
-        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {e}")));
+        panel = panel.child(div().text_color(cx.theme().danger).child(format!("error: {e}")));
     }
 
     let can_run = error.is_none() && sample_sql.is_some();
     let confirm_btn = if can_run {
-        styled_button("csv-import-confirm-btn", "Spustit import")
+        styled_button("csv-import-confirm-btn", "Spustit import", *cx.theme())
             .on_click(cx.listener(|v, _, _, cx| v.confirm_csv_import(cx)))
             .into_any_element()
     } else {
@@ -3227,8 +3371,8 @@ fn render_csv_import_panel(
             .px_3()
             .py_1()
             .rounded_md()
-            .bg(rgb(0x313244))
-            .text_color(rgb(0x6c7086))
+            .bg(cx.theme().bg_hover)
+            .text_color(cx.theme().text_disabled)
             .child("Spustit import")
             .into_any_element()
     };
@@ -3240,9 +3384,127 @@ fn render_csv_import_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("csv-import-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+            .child(styled_button("csv-import-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
             .child(confirm_btn),
     );
+    panel.into_any_element()
+}
+
+/// G14 T11 (design §2.1/§2.4): bar/line axis picker — same panel skeleton
+/// as `render_settings_panel`. `columns` is the FULL column list (display
+/// order); the X list shows every column (radio, `x_col` index), the Y list
+/// shows ONLY `numeric == true` columns (checkboxes, `y_selected[i]`) — the
+/// real bound on series count (`chart_view::MAX_SERIES` is only a belt).
+/// Heading/footer label switch on `edit_tab.is_some()` (re-pick vs. create).
+fn render_chart_picker_panel(
+    source_title: String,
+    columns: Vec<(String, bool)>,
+    kind: ChartKind,
+    x_col: usize,
+    y_selected: Vec<bool>,
+    edit_tab: Option<u64>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let theme = *cx.theme();
+    let is_edit = edit_tab.is_some();
+    let numeric_count = columns.iter().filter(|(_, numeric)| *numeric).count();
+
+    let kind_button = |id: &'static str, label: &'static str, this_kind: ChartKind, cx: &mut Context<AppView>| {
+        div()
+            .id(id)
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .bg(if this_kind == kind { cx.theme().bg_selected } else { cx.theme().bg_hover })
+            .child(label)
+            .on_click(cx.listener(move |v, _, _, cx| v.set_chart_kind(this_kind, cx)))
+    };
+
+    let mut panel = div()
+        .id("chart-picker-panel")
+        .w(px(460.))
+        .max_h(px(560.))
+        .bg(theme.bg_panel)
+        .border_1()
+        .border_color(theme.border)
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(theme.text_primary)
+        .child(div().text_size(px(16.)).child(format!("Graf: {source_title}")))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(kind_button("chart-picker-kind-bar", "Sloupcový", ChartKind::Bar, cx))
+                .child(kind_button("chart-picker-kind-line", "Čárový", ChartKind::Line, cx)),
+        )
+        .child(div().text_color(theme.text_muted).child("Osa X"));
+
+    let mut x_list = div().id("chart-picker-x-list").flex().flex_col().gap_1().max_h(px(120.)).overflow_hidden();
+    for (i, (name, _numeric)) in columns.iter().enumerate() {
+        let selected = i == x_col;
+        x_list = x_list.child(
+            div()
+                .id(SharedString::from(format!("chart-picker-x-{i}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .cursor_pointer()
+                .bg(if selected { theme.bg_selected } else { theme.bg_hover })
+                .child(if selected { "●" } else { "○" })
+                .child(name.clone())
+                .on_click(cx.listener(move |v, _, _, cx| v.set_chart_x_col(i, cx))),
+        );
+    }
+    panel = panel.child(x_list).child(div().text_color(theme.text_muted).child("Osa Y (číselné sloupce)"));
+
+    if numeric_count == 0 {
+        panel = panel.child(div().text_color(theme.danger).child("výsledek nemá žádný číselný sloupec"));
+    }
+    let mut y_list = div().id("chart-picker-y-list").flex().flex_col().gap_1().max_h(px(160.)).overflow_hidden();
+    for (i, (name, numeric)) in columns.iter().enumerate() {
+        if !*numeric {
+            continue;
+        }
+        let checked = y_selected.get(i).copied().unwrap_or(false);
+        let mark = if checked { "☑" } else { "☐" };
+        y_list = y_list.child(
+            div()
+                .id(SharedString::from(format!("chart-picker-y-{i}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .cursor_pointer()
+                .child(format!("{mark} {name}"))
+                .on_click(cx.listener(move |v, _, _, cx| v.toggle_chart_y_col(i, cx))),
+        );
+    }
+    panel = panel.child(y_list);
+
+    panel = panel.child(
+        div()
+            .flex()
+            .flex_row()
+            .justify_end()
+            .gap_2()
+            .mt_2()
+            .child(
+                styled_button("chart-picker-cancel", "Zrušit", theme)
+                    .on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))),
+            )
+            .child(
+                styled_button("chart-picker-confirm", if is_edit { "Použít" } else { "Vytvořit graf" }, theme)
+                    .on_click(cx.listener(|v, _, _, cx| v.confirm_chart_picker(cx))),
+            ),
+    );
+
     panel.into_any_element()
 }
 
