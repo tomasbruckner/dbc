@@ -1,3 +1,5 @@
+mod admin_panel;
+mod admin_sql;
 mod autocomplete;
 mod backup;
 mod compare;
@@ -818,39 +820,62 @@ struct LookupRequest {
     generation: u64,
 }
 
-/// G5 Task 4: state for the Apply confirmation dialog — created by
-/// `on_open_apply_dialog` (the apply bar's "Aplikovat"), from the ACTIVE
-/// tab's `ResultGrid::editable`/`edit_state` at the moment it's clicked.
-/// `statements`/`sql_text` are captured ONCE here rather than recomputed
-/// live: the dialog must show (and, on confirm, execute) the EXACT SQL the
-/// user reviewed, even if the underlying grid's staged edits somehow changed
-/// in the gap before "Potvrdit a spustit" (not currently possible — the
-/// dialog's own `.occlude()` blocks every click that could restage a cell —
-/// but capturing once is also just the simpler, more obviously-correct
-/// shape).
+/// G10 T4: which staged-edit owner this dialog applies for — drives the
+/// success-arm cleanup only; the confirm/dispatch/error mechanics below are
+/// IDENTICAL for both (the whole point of the shared write path — §3-novela:
+/// one confirm modal, one `run_write_transaction`, one shared read-only
+/// guard, regardless of which caller staged the statements).
+#[derive(Clone)]
+enum ApplyTarget {
+    SandboxTab {
+        /// Which tab's grid to clear/re-preview on success — looked up by id
+        /// (not a held `Entity<ResultGrid>`) so a tab closed while the write
+        /// is in flight (not reachable today, since the dialog's overlay
+        /// occludes the tab strip, but checked defensively anyway) is simply
+        /// not found rather than updating a dangling reference.
+        tab_id: u64,
+        /// `ResultGrid::preview_identity()`'s shape, captured at dialog-open
+        /// time — lets a successful Apply re-run the SAME preview (brief:
+        /// "re-run the preview, existing pipeline") without re-reading grid
+        /// state after `clear_edits` has already run.
+        preview_identity: (Option<String>, String),
+    },
+    Admin {
+        panel: Entity<admin_panel::AdminPanel>,
+    },
+}
+
+/// G5 Task 4 (G10 T4: generalized for the admin Apply flow too): state for
+/// the Apply confirmation dialog — created by `on_open_apply_dialog` (the
+/// apply bar's "Aplikovat") or `open_admin_apply_dialog` (the admin panel's
+/// own "Aplikovat"). `statements`/`sql_text` are captured ONCE here rather
+/// than recomputed live: the dialog must show (and, on confirm, execute) the
+/// EXACT SQL the user reviewed, even if the underlying staged edits somehow
+/// changed in the gap before "Potvrdit a spustit" (not currently possible —
+/// the dialog's own `.occlude()` blocks every click that could restage
+/// anything — but capturing once is also just the simpler, more
+/// obviously-correct shape).
 struct ApplyDialogState {
-    /// Which tab's grid to clear/re-preview on success — looked up by id
-    /// (not a held `Entity<ResultGrid>`) so a tab closed while the write is
-    /// in flight (not reachable today, since the dialog's overlay occludes
-    /// the tab strip, but checked defensively anyway) is simply not found
-    /// rather than updating a dangling reference.
-    tab_id: u64,
-    /// `sandbox::generate_statements`' output verbatim — fed straight to
-    /// `QueryRunner::run_write_transaction` on confirm.
-    statements: Vec<(String, Option<u64>)>,
-    /// `statements`' SQL text joined by newline (brief contract #3) — shown
-    /// in the dialog AND recorded as the eventual history entry's `sql`.
+    target: ApplyTarget,
+    /// G10 T3/T4: `admin_sql::WriteStatement` — `display_sql` is the ONLY
+    /// string this struct's `sql_text` (and hence the dialog/history) is
+    /// ever built from; `exec_sql` is used exactly once, by
+    /// `run_write_transaction` on confirm, and is never read anywhere in
+    /// this file (CURATION item 3's redaction discipline, structural here).
+    statements: Vec<admin_sql::WriteStatement>,
+    /// `statements`' `display_sql`s joined by newline (brief contract #3) —
+    /// shown in the dialog AND recorded as the eventual history entry's
+    /// `sql`. '***'-redacted wherever a statement carries a password.
     sql_text: String,
-    /// `ResultGrid::preview_identity()`'s shape, captured at dialog-open
-    /// time — lets a successful Apply re-run the SAME preview (brief:
-    /// "re-run the preview, existing pipeline") without re-reading grid
-    /// state after `clear_edits` has already run.
-    preview_identity: (Option<String>, String),
-    /// G5 Task 4 review fix (BLOCKER 1): the tab's `ResultTab::conn_identity`
-    /// at dialog-open time — `on_confirm_apply` re-checks this against
-    /// `AppView::current_conn_identity()` before dispatching (belt-and-
-    /// braces alongside `on_open_apply_dialog`'s own check and the
-    /// apply-bar's disabled button: the dialog's `.occlude()` should make a
+    /// G10 T6 (databases sub-view): a red warning line above the buttons —
+    /// the CASCADE-drop confirmation. `None` everywhere else.
+    warning: Option<String>,
+    /// G5 Task 4 review fix (BLOCKER 1): the identity (`ResultTab::
+    /// conn_identity` for a sandbox tab, `AdminPanel::conn_identity()` for
+    /// admin) at dialog-open time — `on_confirm_apply` re-checks this
+    /// against `AppView::current_conn_identity()` before dispatching
+    /// (belt-and-braces alongside the opener's own check and the apply
+    /// bar's disabled button: the dialog's `.occlude()` should make a
     /// connection switch impossible while it's open, but this is the
     /// backstop if that assumption is ever wrong).
     conn_identity: String,
@@ -868,7 +893,10 @@ struct ApplyDialogState {
     /// `render_apply_dialog_overlay` can `.track_focus` the panel with the
     /// SAME handle — without this, focus stays on the SQL editor
     /// underneath, and a stray Enter/keystroke while the dialog is open
-    /// would land there instead of being inert.
+    /// would land there instead of being inert. `open_admin_apply_dialog`
+    /// (a subscribe callback with no `Window` access — see its own doc
+    /// comment) still constructs one but doesn't call `window.focus` itself,
+    /// same posture `on_monitor_view_event`'s `KillRequested` already sets.
     focus_handle: gpui::FocusHandle,
 }
 
@@ -1105,6 +1133,33 @@ const CLI_CONN_IDENTITY: &str = "cli";
 /// intent is documented once instead of three times.
 fn conn_identity_matches(tab_identity: &str, current: &str) -> bool {
     tab_identity == current
+}
+
+/// G10 T4: what `open_admin_tab` should do given the current tab set — pure
+/// (over `&Tabs`, GPUI-free plain data) so the singleton-per-connection
+/// dedup/replace decision is directly testable. Same connection → activate
+/// (re-focus, staged edits preserved — design §2 "re-focuses the existing
+/// tab"); different connection → replace (stale staged admin edits must
+/// never survive a connection switch — the same rationale as G5's
+/// BLOCKER-1 `conn_identity` guard, see `tabs.rs::ResultTab::conn_identity`'s
+/// doc comment); no admin tab open at all → open fresh.
+#[derive(Debug, PartialEq, Eq)]
+enum AdminOpenDecision {
+    Activate(u64),
+    Replace(u64),
+    OpenFresh,
+}
+
+fn admin_open_decision(tabs: &Tabs, current_identity: &str) -> AdminOpenDecision {
+    match tabs
+        .iter()
+        .find(|t| t.preview_key.as_deref() == Some(admin_panel::ADMIN_PREVIEW_KEY))
+        .map(|t| (t.id, t.conn_identity == current_identity))
+    {
+        Some((id, true)) => AdminOpenDecision::Activate(id),
+        Some((id, false)) => AdminOpenDecision::Replace(id),
+        None => AdminOpenDecision::OpenFresh,
+    }
 }
 
 impl AppView {
@@ -1685,6 +1740,7 @@ impl AppView {
                                             TabContent::Diagram { .. } => None,
                                             TabContent::Compare { .. } => None,
                                             TabContent::ScriptRun { .. } => None,
+                                            TabContent::Admin { .. } => None,
                                         }
                                     })
                                 });
@@ -3527,12 +3583,14 @@ impl AppView {
             .collect();
 
         let monitor_available = self.active_engine().is_some_and(monitor::monitor_available);
+        let admin_entry = admin_panel::admin_entry_state(self.active_engine(), self.active_read_only());
         palette::rank_items(
             query,
             &tables,
             &history,
             &connections,
             monitor_available,
+            admin_entry,
             30,
             self.active_connection_id.is_some(),
         )
@@ -3589,7 +3647,10 @@ impl AppView {
                         self.trigger_schema_fetch(spec, cx);
                     } else {
                         self.schema_tree_connection_key = None;
-                        self.tree.update(cx, |t, cx| t.clear(cx));
+                        self.tree.update(cx, |t, cx| {
+                            t.clear(cx);
+                            t.set_admin_entry(admin_panel::AdminEntry::Hidden, cx);
+                        });
                     }
                 }
                 PaletteAction::OpenMonitor => self.open_monitor_tab(cx),
@@ -3618,6 +3679,7 @@ impl AppView {
                 }
                 PaletteAction::RunSqlFile => self.start_script_pick(false, cx),
                 PaletteAction::RunSqlFolder => self.start_script_pick(true, cx),
+                PaletteAction::OpenServerAdmin => self.open_admin_tab(cx),
             },
         }
         cx.notify();
@@ -4417,13 +4479,22 @@ impl AppView {
     // G5 Task 4: dirty-edit discard guard (folded T3 review issue 2).
     // -----------------------------------------------------------------
 
-    /// Row-granular staged-change count for `tab`'s grid, if it has any —
-    /// `None` for a `Text` tab or a clean/non-editable `Grid` tab (both are
-    /// safe to proceed past without a confirm prompt). Shared by the two
-    /// lookup helpers below.
+    /// Row-granular staged-change count for `tab`, if it has any — `None`
+    /// for a `Text`/other non-editable tab or a clean `Grid`/`Admin` tab
+    /// (both are safe to proceed past without a confirm prompt). Shared by
+    /// the two lookup helpers below.
+    ///
+    /// `Admin` reuses `AdminPanel::change_count` verbatim — the SAME
+    /// dirtiness definition that already drives the panel's own Apply bar
+    /// and sub-nav discard-confirm prompt, not a second one invented here
+    /// (review finding: closing a dirty admin tab via "✕" used to silently
+    /// discard staged writes, since this match had no `Admin` arm at all).
     fn grid_dirty_change_count(tab: &ResultTab, cx: &Context<Self>) -> Option<usize> {
-        let TabContent::Grid { grid, .. } = &tab.content else { return None };
-        let n = grid.read(cx).edit_state.change_count();
+        let n = match &tab.content {
+            TabContent::Grid { grid, .. } => grid.read(cx).edit_state.change_count(),
+            TabContent::Admin { view } => view.read(cx).change_count(),
+            _ => return None,
+        };
         (n > 0).then_some(n)
     }
 
@@ -4574,6 +4645,143 @@ impl AppView {
             return self.config.connections.iter().find(|c| &c.id == id).is_some_and(|c| c.read_only);
         }
         false
+    }
+
+    // -----------------------------------------------------------------
+    // G10 T4: "Správa serveru" admin tab — open/singleton-dedup, catalog
+    // fetch, panel-event dispatch (design §2/§5).
+    // -----------------------------------------------------------------
+
+    /// Tree row click (`TreeEvent::OpenAdmin`), palette action
+    /// (`PaletteAction::OpenServerAdmin`) — both funnel through here.
+    /// Re-checks `admin_entry_state` itself (belt-and-braces with the
+    /// runner's shared `guard_not_read_only`, and with the tree/palette's
+    /// own gating that should already prevent reaching this with a
+    /// Hidden/Disabled entry) before doing anything. Singleton-per-
+    /// connection dedup via `admin_open_decision` (pure, unit-tested): same
+    /// connection → re-focus the existing tab (staged edits preserved);
+    /// different connection → close the stale tab first (its staged admin
+    /// edits must never survive a connection switch) and open fresh.
+    fn open_admin_tab(&mut self, cx: &mut Context<Self>) {
+        let engine = self.active_engine();
+        let read_only = self.active_read_only();
+        if admin_panel::admin_entry_state(engine, read_only) != admin_panel::AdminEntry::Enabled {
+            self.status = "správa serveru není pro toto připojení dostupná".to_string();
+            cx.notify();
+            return;
+        }
+        let engine = engine.expect("Enabled implies an engine");
+        let identity = self.current_conn_identity();
+        match admin_open_decision(&self.tabs, &identity) {
+            AdminOpenDecision::Activate(id) => {
+                self.tabs.activate(id);
+                cx.notify();
+            }
+            AdminOpenDecision::Replace(id) => {
+                self.tabs.close(id);
+                self.open_fresh_admin_tab(engine, identity, cx);
+            }
+            AdminOpenDecision::OpenFresh => {
+                self.open_fresh_admin_tab(engine, identity, cx);
+            }
+        }
+    }
+
+    /// The "open a brand-new admin tab" half of `open_admin_tab`, shared by
+    /// its `Replace`/`OpenFresh` arms — subscribes to the new panel's
+    /// `AdminEvent`s and kicks off its first catalog fetch (Roles, the
+    /// sub-view every panel opens on).
+    fn open_fresh_admin_tab(&mut self, engine: dbc_state::Engine, identity: String, cx: &mut Context<Self>) {
+        let panel = cx.new(|cx| admin_panel::AdminPanel::new(engine, identity.clone(), cx));
+        cx.subscribe(&panel, Self::on_admin_event).detach();
+        self.tabs.open(ResultTab {
+            id: 0,
+            title: "Správa serveru".to_string(),
+            pinned: false,
+            preview_key: Some(admin_panel::ADMIN_PREVIEW_KEY.to_string()),
+            conn_identity: identity,
+            content: TabContent::Admin { view: panel.clone() },
+        });
+        // G10 T5: seeds the Privileges sub-view's schema selector from
+        // whatever's already in the tree's SchemaSnapshot — same source
+        // `trigger_schema_fetch`'s own success arm re-pushes on every
+        // subsequent refresh (see its `set_schemas` call there).
+        let schemas = self.tree.read(cx).snapshot().map(admin_panel::distinct_schemas).unwrap_or_default();
+        panel.update(cx, |p, cx| p.set_schemas(schemas, cx));
+        self.fetch_admin_catalog_into(panel, admin_sql::roles_catalog(engine), cx);
+        cx.notify();
+    }
+
+    /// `AdminPanel` → `AppView` (the panel doesn't own the runner or the
+    /// confirm dialog — same "view emits, AppView owns the I/O" shape
+    /// `CompareView`/`MonitorView` already use).
+    fn on_admin_event(
+        &mut self,
+        panel: Entity<admin_panel::AdminPanel>,
+        event: &admin_panel::AdminEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            admin_panel::AdminEvent::FetchCatalog { queries } => {
+                self.fetch_admin_catalog_into(panel, queries.clone(), cx);
+            }
+            admin_panel::AdminEvent::RequestApply { statements, warning } => {
+                self.open_admin_apply_dialog(panel, statements.clone(), warning.clone(), cx);
+            }
+        }
+    }
+
+    /// Dispatches `runner.fetch_admin_catalog(spec, queries)` off the UI
+    /// thread and routes the result into `panel` — same one-shot
+    /// "dispatch, `cx.spawn`, update the entity when it resolves" shape
+    /// `trigger_schema_fetch`/`fetch_lookup` already use. No read-only
+    /// guard here (design: catalog reads are never gated) and no
+    /// generation counter (unlike schema fetches, a stale admin-catalog
+    /// result landing after a newer one is a non-issue: the same sub-view's
+    /// re-fetch just overwrites the same parsed fields, and switching
+    /// sub-views clears staged state first via `switch_sub_view`).
+    ///
+    /// Review finding M2: `apply_conn_spec()` alone always resolves against
+    /// the CURRENTLY active connection — with no check against `panel`'s
+    /// OWN stamped identity, opening the admin tab for connection A, then
+    /// switching to B, then clicking a sub-nav tab (which re-emits
+    /// `FetchCatalog` — see `switch_sub_view`) would fetch B's catalog and
+    /// render it inside a panel still labeled/stamped A. Writes were always
+    /// safe (`open_admin_apply_dialog` already re-checks `conn_identity`
+    /// before dispatching `run_write_transaction`); this closes the
+    /// display-only gap using the SAME `conn_identity_matches` predicate
+    /// (already unit-tested in `conn_identity_matches_tests`) the write
+    /// path uses — no new decision logic to test separately.
+    fn fetch_admin_catalog_into(
+        &mut self,
+        panel: Entity<admin_panel::AdminPanel>,
+        queries: Vec<(&'static str, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        let panel_conn_identity = panel.read(cx).conn_identity().to_string();
+        let current_identity = self.current_conn_identity();
+        if !conn_identity_matches(&panel_conn_identity, &current_identity) {
+            let from = self.conn_name_for_identity(&panel_conn_identity);
+            panel.update(cx, |p, cx| {
+                p.set_error(&format!("data pocházejí z jiného připojení ({from}) — přepni se zpět"), cx)
+            });
+            return;
+        }
+        let Some((spec, _timeout)) = self.apply_conn_spec() else {
+            panel.update(cx, |p, cx| p.set_error("Bez připojení — vyberte připojení nahoře.", cx));
+            return;
+        };
+        panel.update(cx, |p, cx| p.set_loading(cx));
+        let rx = self.runner.fetch_admin_catalog(spec, queries);
+        cx.spawn(async move |_this, cx| {
+            let result = rx.await;
+            let _ = panel.update(cx, |p, cx| match result {
+                Ok(Ok(rows)) => p.apply_catalog(rows, cx),
+                Ok(Err(e)) => p.set_error(&e.to_string(), cx),
+                Err(_) => p.set_error("dotaz zrušen", cx),
+            });
+        })
+        .detach();
     }
 
     /// Opens (or re-activates) the monitor tab for the active connection.
@@ -4858,6 +5066,10 @@ impl AppView {
             TabContent::Diagram { .. } => return,
             TabContent::Compare { .. } => return,
             TabContent::ScriptRun { .. } => return,
+            // G10 T4: admin Apply goes through `open_admin_apply_dialog`
+            // (the panel's own "Aplikovat" click emits `AdminEvent::
+            // RequestApply`), not this generic sandbox-grid path.
+            TabContent::Admin { .. } => return,
         };
         let current_identity = self.current_conn_identity();
         if !conn_identity_matches(&tab_conn_identity, &current_identity) {
@@ -4894,13 +5106,18 @@ impl AppView {
         if statements.is_empty() {
             return;
         }
-        let sql_text = statements.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("\n");
+        // G10 T3/T4: sandbox tuples convert via the blanket `From` impl —
+        // exec_sql == display_sql for these, so this is a no-op
+        // behaviourally, just the type the shared write path now takes.
+        let statements: Vec<admin_sql::WriteStatement> =
+            statements.into_iter().map(admin_sql::WriteStatement::from).collect();
+        let sql_text = statements.iter().map(|s| s.display_sql.as_str()).collect::<Vec<_>>().join("\n");
         let focus_handle = cx.focus_handle();
         self.apply_dialog = Some(ApplyDialogState {
-            tab_id,
+            target: ApplyTarget::SandboxTab { tab_id, preview_identity },
             statements,
             sql_text,
-            preview_identity,
+            warning: None,
             conn_identity: tab_conn_identity,
             running: false,
             error: None,
@@ -4931,8 +5148,7 @@ impl AppView {
         }
         let statements = ad.statements.clone();
         let sql_text = ad.sql_text.clone();
-        let tab_id = ad.tab_id;
-        let preview_identity = ad.preview_identity.clone();
+        let target = ad.target.clone();
         let dialog_conn_identity = ad.conn_identity.clone();
         let n_statements = statements.len();
 
@@ -4967,53 +5183,76 @@ impl AppView {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let started = std::time::Instant::now();
+        // §3-novela's single choke point: `run_write_transaction` already
+        // takes `Vec<admin_sql::WriteStatement>` (T3) — both callers'
+        // statements were built as such at dialog-open time (T4), so this
+        // is the one and only dispatch, unchanged in shape whether `target`
+        // is a sandbox tab or the admin panel.
         let rx = self.runner.run_write_transaction(spec, statements, timeout_secs);
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |view, cx| {
                 match result {
                     Ok(Ok(total)) => {
-                        // Brief contract #3, in order: close modal, clear
-                        // edit_state, status, re-run the preview, record ONE
-                        // history entry.
+                        // Brief contract #3, in order: close modal, run the
+                        // target-specific success cleanup, status, record
+                        // ONE history entry (display_sql only, per CURATION
+                        // items 3/4 — `sql_text` is already '***'-redacted
+                        // where it matters, built once at dialog-open time).
                         view.apply_dialog = None;
-                        if let Some(tab) = view.tabs.iter().find(|t| t.id == tab_id) {
-                            if let TabContent::Grid { grid, .. } = &tab.content {
-                                grid.clone().update(cx, |g, cx| g.clear_edits(cx));
+                        match target {
+                            ApplyTarget::SandboxTab { tab_id, preview_identity } => {
+                                if let Some(tab) = view.tabs.iter().find(|t| t.id == tab_id) {
+                                    if let TabContent::Grid { grid, .. } = &tab.content {
+                                        grid.clone().update(cx, |g, cx| g.clear_edits(cx));
+                                    }
+                                }
+                                view.status = format!("aplikováno ({n_statements} příkazů)");
+                                // Re-run the preview via the EXISTING
+                                // pipeline (brief: "preserves joins via
+                                // from_join_change=false machinery" —
+                                // `apply_view_prefs_to_grid`'s saved-fk-join
+                                // auto-retrigger picks the active joins back
+                                // up from this table's persisted view prefs
+                                // once this run's own `Started` lands,
+                                // exactly like a plain preview re-open
+                                // does). This immediately overwrites
+                                // `view.status` above with its own
+                                // "connecting…" / progress text — expected:
+                                // the "aplikováno (…)" status is a transient
+                                // confirmation, the refreshed preview's own
+                                // status (ending in "N rows in …") takes
+                                // over next, same as every other status
+                                // transition in this file.
+                                let (schema, table) = preview_identity;
+                                let sql = preview_sql(schema.as_deref(), &table);
+                                let key = format!("{}.{table}", schema.clone().unwrap_or_default());
+                                let title = format!("Náhled: {table}");
+                                let preview = PreviewTarget {
+                                    title,
+                                    key,
+                                    table,
+                                    schema,
+                                    joins: Vec::new(),
+                                    from_join_change: false,
+                                };
+                                view.run_query_with(sql, Some(preview), true, cx);
+                            }
+                            ApplyTarget::Admin { panel } => {
+                                // G10 T4: clears the panel's staged sets and
+                                // re-requests the active sub-view's catalog
+                                // — the admin equivalent of "re-run the
+                                // preview".
+                                panel.clone().update(cx, |p, cx| p.on_apply_success(cx));
+                                view.status = format!("aplikováno ({n_statements} příkazů)");
                             }
                         }
-                        view.status = format!("aplikováno ({n_statements} příkazů)");
-                        // Re-run the preview via the EXISTING pipeline
-                        // (brief: "preserves joins via from_join_change=false
-                        // machinery" — `apply_view_prefs_to_grid`'s saved-
-                        // fk-join retrigger picks the active joins back up
-                        // from this table's persisted view prefs once this
-                        // run's own `Started` lands, exactly like a plain
-                        // preview re-open does). This immediately overwrites
-                        // `view.status` above with its own "connecting…" /
-                        // progress text — expected: the "aplikováno (…)"
-                        // status is a transient confirmation, the refreshed
-                        // preview's own status (ending in "N rows in …")
-                        // takes over next, same as every other status
-                        // transition in this file.
-                        let (schema, table) = preview_identity;
-                        let sql = preview_sql(schema.as_deref(), &table);
-                        let key = format!("{}.{table}", schema.clone().unwrap_or_default());
-                        let title = format!("Náhled: {table}");
-                        let preview = PreviewTarget {
-                            title,
-                            key,
-                            table,
-                            schema,
-                            joins: Vec::new(),
-                            from_join_change: false,
-                        };
-                        view.run_query_with(sql, Some(preview), true, cx);
                         // Record ONE history entry for the write itself
-                        // (brief contract #3's final step) — the re-run's
-                        // own SELECT gets its OWN separate history entry
-                        // once ITS `Finished`/`Failed` lands, same as any
-                        // other preview.
+                        // (brief contract #3's final step) — the sandbox
+                        // re-run's own SELECT gets its OWN separate history
+                        // entry once ITS `Finished`/`Failed` lands, same as
+                        // any other preview; the admin path has no re-run at
+                        // all, just this one entry.
                         view.record_history(
                             &sql_text,
                             &history_conn_name,
@@ -5041,6 +5280,52 @@ impl AppView {
             });
         })
         .detach();
+    }
+
+    /// G10 T4: the admin panel's own "Aplikovat" (`AdminEvent::RequestApply`)
+    /// — opens the SAME generalized Apply confirm dialog `on_open_apply_dialog`
+    /// does (§3-novela: one confirm modal for both callers), just built from
+    /// the panel's already-staged `Vec<admin_sql::WriteStatement>` instead of
+    /// `sandbox::generate_statements`' tuples. Called from a `cx.subscribe`
+    /// callback (`on_admin_event`), which — unlike a click listener — has no
+    /// `Window` access, so (like `on_monitor_view_event`'s `KillRequested`)
+    /// this does NOT `window.focus` the dialog; the overlay still renders
+    /// and is fully clickable, just without an explicit keyboard-focus
+    /// hand-off.
+    fn open_admin_apply_dialog(
+        &mut self,
+        panel: Entity<admin_panel::AdminPanel>,
+        statements: Vec<admin_sql::WriteStatement>,
+        warning: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal.is_some() || self.discard_confirm.is_some() || self.apply_dialog.is_some() {
+            return;
+        }
+        if statements.is_empty() {
+            return;
+        }
+        let panel_conn_identity = panel.read(cx).conn_identity().to_string();
+        let current_identity = self.current_conn_identity();
+        if !conn_identity_matches(&panel_conn_identity, &current_identity) {
+            let from = self.conn_name_for_identity(&panel_conn_identity);
+            self.status = format!("změny pocházejí z jiného připojení ({from}) — přepni se zpět");
+            cx.notify();
+            return;
+        }
+        let sql_text = statements.iter().map(|s| s.display_sql.as_str()).collect::<Vec<_>>().join("\n");
+        let focus_handle = cx.focus_handle();
+        self.apply_dialog = Some(ApplyDialogState {
+            target: ApplyTarget::Admin { panel },
+            statements,
+            sql_text,
+            warning,
+            conn_identity: panel_conn_identity,
+            running: false,
+            error: None,
+            focus_handle,
+        });
+        cx.notify();
     }
 
     /// Dispatches `runner.fetch_schema(spec)` off the UI thread and updates
@@ -5089,11 +5374,43 @@ impl AppView {
                         let favourites = view.config.favourite_objects.clone();
                         let active_id = view.active_connection_id.clone();
                         let read_only = view.active_read_only();
+                        // G10 T4: recomputed alongside every snapshot apply,
+                        // same posture as favourites/read_only above — the
+                        // tree's pinned "Správa serveru" row visibility must
+                        // never lag a connection switch.
+                        let admin_entry = admin_panel::admin_entry_state(view.active_engine(), read_only);
+                        // G10 T5: the Privileges sub-view's schema selector,
+                        // computed BEFORE `snapshot` moves into
+                        // `set_snapshot` below — pushed into whichever admin
+                        // tab is currently open (there is at most one, the
+                        // singleton-per-connection invariant), same
+                        // "refreshes alongside every snapshot" posture as
+                        // favourites/read_only/admin_entry.
+                        let schemas_for_admin = admin_panel::distinct_schemas(&snapshot);
                         view.tree.update(cx, |t, cx| {
                             t.set_snapshot(snapshot, same_connection, cx);
                             t.set_favourites(favourites, active_id, cx);
                             t.set_read_only(read_only, cx);
+                            t.set_admin_entry(admin_entry, cx);
                         });
+                        // Review finding M2: only push into an admin panel
+                        // whose OWN stamped identity still matches the
+                        // CURRENTLY active connection — a stale admin tab
+                        // left open from a since-abandoned connection (the
+                        // singleton-per-connection invariant only replaces
+                        // it on the NEXT `open_admin_tab` call, not
+                        // automatically on every switch) must never have
+                        // another connection's schema list silently pushed
+                        // into it.
+                        if let Some(panel) = view.tabs.iter().find_map(|t| match &t.content {
+                            TabContent::Admin { view } => Some(view.clone()),
+                            _ => None,
+                        }) {
+                            let current_identity = view.current_conn_identity();
+                            if conn_identity_matches(panel.read(cx).conn_identity(), &current_identity) {
+                                panel.update(cx, |p, cx| p.set_schemas(schemas_for_admin, cx));
+                            }
+                        }
                         // Review round 3, MAJOR 1: a new snapshot landing
                         // (connection switch OR a same-connection refresh)
                         // invalidates whatever candidates an open popup was
@@ -5212,7 +5529,10 @@ impl AppView {
                     self.trigger_schema_fetch(spec, cx);
                 } else {
                     self.schema_tree_connection_key = None;
-                    self.tree.update(cx, |t, cx| t.clear(cx));
+                    self.tree.update(cx, |t, cx| {
+                        t.clear(cx);
+                        t.set_admin_entry(admin_panel::AdminEntry::Hidden, cx);
+                    });
                 }
             }
             // G3 Task 4: a row's ★/☆ toggle (a table/view/routine/trigger/
@@ -5240,6 +5560,9 @@ impl AppView {
             TreeEvent::ImportCsv { schema, table } => {
                 self.start_csv_import(schema.clone(), table.clone(), cx);
             }
+            TreeEvent::OpenAdmin => {
+                self.open_admin_tab(cx);
+            }
         }
     }
 
@@ -5264,6 +5587,13 @@ impl AppView {
                     TabContent::Diagram { .. } => (0, false),
                     TabContent::Compare { .. } => (0, false),
                     TabContent::ScriptRun { .. } => (0, false),
+                    // Review finding: this used to hardcode `false`
+                    // regardless of staged admin edits, so a dirty admin
+                    // tab never got the " •" suffix either. Reuses
+                    // `AdminPanel::change_count` — the same dirtiness
+                    // definition `grid_dirty_change_count`'s `Admin` arm
+                    // (the close-tab guard) already reads.
+                    TabContent::Admin { view } => (0, view.read(cx).change_count() > 0),
                 };
                 // G5 Task 3, brief contract #7: dirty (unapplied staged
                 // edits) tabs get a " •" title suffix — the apply bar
@@ -5434,6 +5764,7 @@ impl AppView {
             // either avoids `self` or touches only a named field like
             // `self.status`, never an opaque method call).
             TabContent::ScriptRun { state } => render_script_run_tab(state.clone(), cx),
+            TabContent::Admin { view } => view.clone().into_any_element(),
         }
     }
 
@@ -5604,8 +5935,13 @@ impl AppView {
         let ad = self.apply_dialog.as_ref()?;
         let running = ad.running;
         let error = ad.error.clone();
+        let warning = ad.warning.clone();
         let focus_handle = ad.focus_handle.clone();
-        let lines: Vec<String> = ad.statements.iter().map(|(s, _)| s.clone()).collect();
+        // G10 T3/T4 (CURATION items 3/4): display_sql ONLY — the confirm
+        // modal is the ONE place a user ever sees this SQL, and it must
+        // never be exec_sql (the real password on a password-bearing
+        // statement).
+        let lines: Vec<String> = ad.statements.iter().map(|s| s.display_sql.clone()).collect();
 
         let mut body = div()
             .id("apply-dialog-body")
@@ -5643,6 +5979,11 @@ impl AppView {
             .child(format!("Aplikovat {} příkazů", lines.len()))
             .child(body);
 
+        // G10 T6: the CASCADE-drop red warning line, above the buttons —
+        // `None` for every non-T6 caller.
+        if let Some(w) = &warning {
+            panel = panel.child(div().text_color(rgb(0xf38ba8)).child(w.clone()));
+        }
         if running {
             panel = panel.child(div().text_color(rgb(0xf9e2af)).child("aplikuji…"));
         }
@@ -7741,6 +8082,33 @@ mod conn_identity_matches_tests {
         // versa) is also a mismatch — never conflate the two.
         assert!(!conn_identity_matches("conn-a", CLI_CONN_IDENTITY));
         assert!(!conn_identity_matches(CLI_CONN_IDENTITY, "conn-a"));
+    }
+}
+
+// G10 T4: `admin_open_decision` — the pure decision behind `open_admin_tab`'s
+// singleton-per-connection dedup/replace.
+#[cfg(test)]
+mod admin_open_tests {
+    use super::*;
+
+    fn admin_tab(identity: &str) -> ResultTab {
+        ResultTab {
+            id: 0,
+            title: "Správa serveru".into(),
+            pinned: false,
+            preview_key: Some(admin_panel::ADMIN_PREVIEW_KEY.to_string()),
+            conn_identity: identity.to_string(),
+            content: TabContent::Text { text: String::new(), scroll_lines: 0 },
+        }
+    }
+
+    #[test]
+    fn admin_tab_is_singleton_per_connection() {
+        let mut tabs = Tabs::new();
+        assert_eq!(admin_open_decision(&tabs, "conn-a"), AdminOpenDecision::OpenFresh);
+        let id = tabs.open(admin_tab("conn-a"));
+        assert_eq!(admin_open_decision(&tabs, "conn-a"), AdminOpenDecision::Activate(id));
+        assert_eq!(admin_open_decision(&tabs, "conn-b"), AdminOpenDecision::Replace(id));
     }
 }
 

@@ -124,6 +124,13 @@ pub enum PaletteAction {
     /// G12 T3: same flow, folder mode — non-recursive `*.sql` listing
     /// (`AppView::start_script_pick(true, ..)`).
     RunSqlFolder,
+    /// G10 T4: opens (or re-focuses) the "Správa serveru" admin tab
+    /// (`AppView::open_admin_tab`) — only ever offered when
+    /// `admin_panel::admin_entry_state` is `Enabled` (see `fixed_actions`;
+    /// `Hidden`/`Disabled` both simply omit the row — a palette has no
+    /// disabled-row idiom, the schema-tree row is where `Disabled` is
+    /// explained).
+    OpenServerAdmin,
 }
 
 /// One table/view from the current schema snapshot, plus whether it's
@@ -163,7 +170,11 @@ const FAVOURITE_BONUS: i64 = 1000;
 /// active" (design's own words) — an inactive/no-connection state hides
 /// them entirely rather than showing them disabled (no disabled-row
 /// rendering precedent exists anywhere in this file — see T6's Grounding).
-pub fn fixed_actions(monitor_available: bool, connection_active: bool) -> Vec<(String, PaletteAction)> {
+pub fn fixed_actions(
+    monitor_available: bool,
+    admin: crate::admin_panel::AdminEntry,
+    connection_active: bool,
+) -> Vec<(String, PaletteAction)> {
     let mut actions = vec![
         ("Spustit dotaz".to_string(), PaletteAction::RunQuery),
         ("Přepnout strom".to_string(), PaletteAction::ToggleTree),
@@ -177,6 +188,11 @@ pub fn fixed_actions(monitor_available: bool, connection_active: bool) -> Vec<(S
     ];
     if monitor_available {
         actions.push(("Monitor serveru".to_string(), PaletteAction::OpenMonitor));
+    }
+    // G10 T4 (design §2, resolved design ambiguity 4): Hidden AND Disabled
+    // both omit the row — only Enabled shows it.
+    if admin == crate::admin_panel::AdminEntry::Enabled {
+        actions.push(("Správa serveru".to_string(), PaletteAction::OpenServerAdmin));
     }
     if connection_active {
         actions.push(("Zálohovat databázi…".to_string(), PaletteAction::BackupDatabase));
@@ -213,6 +229,7 @@ pub fn rank_items(
     history: &[HistorySource],
     connections: &[ConnectionSource],
     monitor_available: bool,
+    admin: crate::admin_panel::AdminEntry,
     cap: usize,
     connection_active: bool,
 ) -> Vec<PaletteItem> {
@@ -230,7 +247,7 @@ pub fn rank_items(
         for c in connections {
             out.push(PaletteItem::Connection { id: c.id.clone(), name: c.name.clone() });
         }
-        for (label, action) in fixed_actions(monitor_available, connection_active) {
+        for (label, action) in fixed_actions(monitor_available, admin, connection_active) {
             out.push(PaletteItem::Action { label, action });
         }
 
@@ -261,7 +278,7 @@ pub fn rank_items(
             scored.push((score, PaletteItem::Connection { id: c.id.clone(), name: c.name.clone() }));
         }
     }
-    for (label, action) in fixed_actions(monitor_available, connection_active) {
+    for (label, action) in fixed_actions(monitor_available, admin, connection_active) {
         if let Some(score) = fuzzy_score(query, &label) {
             scored.push((score, PaletteItem::Action { label, action }));
         }
@@ -387,6 +404,7 @@ mod fuzzy_score_tests {
 #[cfg(test)]
 mod rank_items_tests {
     use super::*;
+    use crate::admin_panel::AdminEntry;
 
     fn table(schema: Option<&str>, name: &str, favourite: bool) -> TableSource {
         TableSource { schema: schema.map(str::to_string), name: name.to_string(), favourite }
@@ -407,7 +425,7 @@ mod rank_items_tests {
         let history = vec![history(1, "select 1"), history(2, "select 2")];
         let connections = vec![conn("c1", "prod", false)];
 
-        let items = rank_items("", &tables, &history, &connections, false, 30, false);
+        let items = rank_items("", &tables, &history, &connections, false, AdminEntry::Hidden, 30, false);
 
         // Favourites (alphabetical) first, then history (as given), then
         // connections, then the fixed actions (5 base + ER diagram +
@@ -435,14 +453,14 @@ mod rank_items_tests {
         // query (brief contract #3 lists favourites/history/connections/
         // actions — not the whole unfiltered table list).
         let tables: Vec<TableSource> = (0..50).map(|i| table(None, &format!("t{i}"), true)).collect();
-        let items = rank_items("", &tables, &[], &[], false, 30, false);
+        let items = rank_items("", &tables, &[], &[], false, AdminEntry::Hidden, 30, false);
         assert_eq!(items.len(), 30);
     }
 
     #[test]
     fn non_matching_query_drops_items_that_dont_subsequence_match() {
         let tables = vec![table(None, "orders", false)];
-        let items = rank_items("zzz", &tables, &[], &[], false, 30, false);
+        let items = rank_items("zzz", &tables, &[], &[], false, AdminEntry::Hidden, 30, false);
         assert!(items.is_empty());
     }
 
@@ -458,7 +476,7 @@ mod rank_items_tests {
             fuzzy_score("orders", &table_search_text(&tables[1])),
             "test setup must produce a genuine base-score tie"
         );
-        let items = rank_items("orders", &tables, &[], &[], false, 30, false);
+        let items = rank_items("orders", &tables, &[], &[], false, AdminEntry::Hidden, 30, false);
         assert_eq!(
             items[0],
             PaletteItem::Table { schema: Some("bbbbb".into()), name: "orders".into() }
@@ -481,37 +499,54 @@ mod rank_items_tests {
         weak_match.push_str(&"z".repeat(30)); // long target: length penalty on top
 
         let tables = vec![table(None, &weak_match, true), table(None, "orders", false)];
-        let items = rank_items("orders", &tables, &[], &[], false, 30, false);
+        let items = rank_items("orders", &tables, &[], &[], false, AdminEntry::Hidden, 30, false);
         assert_eq!(items[0], PaletteItem::Table { schema: None, name: "orders".into() });
     }
 
     #[test]
     fn monitor_entry_present_only_when_available() {
-        let items = rank_items("", &[], &[], &[], true, 30, false);
+        let items = rank_items("", &[], &[], &[], true, AdminEntry::Hidden, 30, false);
         assert!(items
             .iter()
             .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::OpenMonitor, .. })));
-        let items = rank_items("", &[], &[], &[], false, 30, false);
+        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false);
         assert!(items
             .iter()
             .all(|i| !matches!(i, PaletteItem::Action { action: PaletteAction::OpenMonitor, .. })));
     }
 
+    // G10 T4 (design ambiguity 4): the admin action row appears ONLY when
+    // Enabled — Hidden AND Disabled both omit it, since the palette has no
+    // disabled-row idiom (the schema-tree row explains the disabled state).
+    #[test]
+    fn admin_entry_present_only_when_enabled() {
+        let items = rank_items("", &[], &[], &[], false, AdminEntry::Enabled, 30, false);
+        assert!(items
+            .iter()
+            .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::OpenServerAdmin, .. })));
+        for admin in [AdminEntry::Hidden, AdminEntry::Disabled] {
+            let items = rank_items("", &[], &[], &[], false, admin, 30, false);
+            assert!(items
+                .iter()
+                .all(|i| !matches!(i, PaletteItem::Action { action: PaletteAction::OpenServerAdmin, .. })));
+        }
+    }
+
     #[test]
     fn results_are_capped_at_30() {
         let tables: Vec<TableSource> = (0..50).map(|i| table(None, &format!("orders_{i}"), false)).collect();
-        let items = rank_items("orders", &tables, &[], &[], false, 30, false);
+        let items = rank_items("orders", &tables, &[], &[], false, AdminEntry::Hidden, 30, false);
         assert_eq!(items.len(), 30);
     }
 
     // --- G11 T6: backup/restore actions gated on connection_active ---
     #[test]
     fn backup_restore_actions_hidden_without_active_connection() {
-        let actions = fixed_actions(false, false);
+        let actions = fixed_actions(false, AdminEntry::Hidden, false);
         assert!(!actions.iter().any(|(_, a)| matches!(a, PaletteAction::BackupDatabase)));
         assert!(!actions.iter().any(|(_, a)| matches!(a, PaletteAction::RestoreDatabase)));
 
-        let items = rank_items("", &[], &[], &[], false, 30, false);
+        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false);
         assert!(items
             .iter()
             .all(|i| !matches!(i, PaletteItem::Action { action: PaletteAction::BackupDatabase, .. })
@@ -520,11 +555,11 @@ mod rank_items_tests {
 
     #[test]
     fn backup_restore_actions_present_and_last_when_connection_active() {
-        let actions = fixed_actions(false, true);
+        let actions = fixed_actions(false, AdminEntry::Hidden, true);
         assert_eq!(actions.last().unwrap().1, PaletteAction::RestoreDatabase);
         assert_eq!(actions[actions.len() - 2].1, PaletteAction::BackupDatabase);
 
-        let items = rank_items("", &[], &[], &[], false, 30, true);
+        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, true);
         assert!(items
             .iter()
             .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::BackupDatabase, .. })));

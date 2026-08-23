@@ -2360,7 +2360,7 @@ dependencies = [
 
 [[package]]
 name = "dbc-ui"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "csv",
@@ -2383,6 +2383,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-sequel",
  "unicode-segmentation",
+ "zeroize",
 ]
 
 [[package]]
