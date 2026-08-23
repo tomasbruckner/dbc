@@ -13,6 +13,23 @@
 //! Fail-closed: an unterminated string/quoted-ident/comment makes both
 //! [`find_params`] and [`substitute_params`] return `None`, same contract as
 //! `guards::tokenize`.
+//!
+//! **Beyond `guards::tokenize`: PostgreSQL dollar-quoted strings
+//! (`$tag$ ... $tag$`, tag optional).** `guards::tokenize` documents not
+//! recognizing these as a known, accepted limitation -- because for its two
+//! callers (`is_read_statement`/`apply_auto_limit`) an unrecognized
+//! dollar-quote body only ever fails *safe* (a write keyword inside the body
+//! false-positives as a bare top-level token and gets rejected; a limiting
+//! keyword inside the body false-positives and suppresses an optimization).
+//! For this module the same gap fails *unsafe*: a `:name`-shaped token
+//! inside a dollar-quoted function/procedure body (e.g.
+//! `CREATE FUNCTION ... AS $$ ... :bonus ... $$`) would be misdetected as a
+//! live parameter, the values dialog would open uninvited, and substitution
+//! would splice a literal into the middle of the function body -- corrupting
+//! it. So this scanner, unlike `tokenize`, DOES track dollar-quoted spans as
+//! a fifth "in a construct" state: their entire content (including anything
+//! that looks like a string/comment/`:name`) is opaque literal text, and an
+//! unterminated one fails closed exactly like the other four constructs.
 
 /// One event produced while scanning `sql`: either a run of literal text to
 /// copy verbatim, or a recognized `:name` parameter occurrence.
@@ -23,17 +40,23 @@ enum ScanEvent<'a> {
 
 /// Shared scanner: walks `sql` once, tracking the same four "in a construct"
 /// states as `guards::tokenize` (single-quoted string, double-quoted
-/// identifier, line comment, nested block comment via a depth counter), and
-/// invokes `on_event` for each literal run / recognized param in order.
+/// identifier, line comment, nested block comment via a depth counter) plus
+/// a fifth, dollar-quoted-string state this module adds beyond `tokenize`
+/// (see module doc), and invokes `on_event` for each literal run /
+/// recognized param in order.
 ///
-/// Outside all four states: a `:` immediately followed by
+/// Outside all five states: a `:` immediately followed by
 /// `[A-Za-z_][A-Za-z0-9_]*` is a parameter (name = the identifier); a `:`
 /// immediately followed by `:` is an inert 2-char `::` token; a `:`
 /// immediately followed by `=` is an inert 2-char `:=` token; any other bare
-/// `:` is not special and is just ordinary text.
+/// `:` is not special and is just ordinary text. A `$` opens a dollar-quoted
+/// span only if followed by a valid PostgreSQL tag shape (empty, or
+/// `[A-Za-z_][A-Za-z0-9_]*`) and then another `$`; otherwise (e.g. `$1`
+/// positional params, `a$b` identifiers) it's an ordinary character.
 ///
 /// Returns `false` if the input ends inside an open construct (unterminated
-/// string/quoted-ident/comment) -- callers must treat that as fail-closed.
+/// string/quoted-ident/comment/dollar-quote) -- callers must treat that as
+/// fail-closed.
 fn scan<'a>(sql: &'a str, mut on_event: impl FnMut(ScanEvent<'a>)) -> bool {
     let bytes = sql.as_bytes();
     let len = bytes.len();
@@ -46,6 +69,11 @@ fn scan<'a>(sql: &'a str, mut on_event: impl FnMut(ScanEvent<'a>)) -> bool {
     let mut in_double_ident = false;
     let mut in_line_comment = false;
     let mut block_comment_depth: u32 = 0;
+    // `Some(tag)` while inside a dollar-quoted span opened with that tag
+    // (empty `Vec` for the untagged `$$...$$` form). Only the exact `$tag$`
+    // closer ends it -- a different tag's opener/closer sequence inside is
+    // just content (PostgreSQL dollar-quotes don't nest).
+    let mut dollar_tag: Option<Vec<u8>> = None;
 
     macro_rules! flush_literal {
         ($end:expr) => {
@@ -57,6 +85,22 @@ fn scan<'a>(sql: &'a str, mut on_event: impl FnMut(ScanEvent<'a>)) -> bool {
 
     while i < len {
         let c = bytes[i];
+
+        if let Some(tag) = &dollar_tag {
+            if c == b'$' {
+                let tag_len = tag.len();
+                if i + 1 + tag_len + 1 <= len
+                    && &bytes[i + 1..i + 1 + tag_len] == tag.as_slice()
+                    && bytes[i + 1 + tag_len] == b'$'
+                {
+                    i += 1 + tag_len + 1;
+                    dollar_tag = None;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
 
         if in_single_string {
             if c == b'\'' {
@@ -129,6 +173,32 @@ fn scan<'a>(sql: &'a str, mut on_event: impl FnMut(ScanEvent<'a>)) -> bool {
             continue;
         }
 
+        if c == b'$' {
+            // Try to parse a dollar-quote opener: `$` + tag + `$`, where
+            // tag is empty or `[A-Za-z_][A-Za-z0-9_]*`. Anything else
+            // (`$1` positional param, `a$b` identifier char, a lone `$`) is
+            // an ordinary character -- do not enter the dollar-quote state.
+            let mut j = i + 1;
+            let tag_start = j;
+            if j < len {
+                let first = bytes[j];
+                if first.is_ascii_alphabetic() || first == b'_' {
+                    j += 1;
+                    while j < len && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                        j += 1;
+                    }
+                }
+            }
+            if j < len && bytes[j] == b'$' {
+                dollar_tag = Some(bytes[tag_start..j].to_vec());
+                i = j + 1;
+                continue;
+            }
+            // Not a valid opener shape -- ordinary `$`.
+            i += 1;
+            continue;
+        }
+
         if c == b':' {
             // `::` -- inert 2-char cast token.
             if i + 1 < len && bytes[i + 1] == b':' {
@@ -167,7 +237,11 @@ fn scan<'a>(sql: &'a str, mut on_event: impl FnMut(ScanEvent<'a>)) -> bool {
 
     flush_literal!(len);
 
-    !(in_single_string || in_double_ident || in_line_comment || block_comment_depth > 0)
+    !(in_single_string
+        || in_double_ident
+        || in_line_comment
+        || block_comment_depth > 0
+        || dollar_tag.is_some())
 }
 
 /// Distinct `:name` parameter names in `sql`, in first-occurrence order,
@@ -346,5 +420,67 @@ mod tests {
     fn substitute_fails_closed_on_unterminated_construct() {
         let out = substitute_params("SELECT ':id", &mut |_| "5".to_string());
         assert_eq!(out, None);
+    }
+
+    // --- dollar-quoted strings (review round 1: fail-unsafe gap) ---
+
+    #[test]
+    fn ignores_param_inside_untagged_dollar_quote() {
+        assert_eq!(find_params("$$ :a $$"), Some(vec![]));
+    }
+
+    #[test]
+    fn ignores_param_inside_tagged_dollar_quote() {
+        assert_eq!(find_params("$tag$ :a $tag$"), Some(vec![]));
+    }
+
+    #[test]
+    fn finds_param_after_dollar_quote_closes() {
+        assert_eq!(
+            find_params("$$ :a $$ :b"),
+            Some(vec!["b".to_string()])
+        );
+    }
+
+    #[test]
+    fn unterminated_dollar_quote_fails_closed() {
+        assert_eq!(find_params("$$ :a"), None);
+    }
+
+    #[test]
+    fn positional_param_does_not_open_dollar_quote() {
+        assert_eq!(find_params("$1 + :a"), Some(vec!["a".to_string()]));
+    }
+
+    #[test]
+    fn dollar_as_identifier_char_does_not_open_dollar_quote() {
+        assert_eq!(find_params("a$b + :c"), Some(vec!["c".to_string()]));
+    }
+
+    #[test]
+    fn substitute_leaves_dollar_quoted_span_byte_identical() {
+        let out = substitute_params("$$ :a $$ :b", &mut |name| {
+            assert_eq!(name, "b");
+            "5".to_string()
+        });
+        assert_eq!(out, Some("$$ :a $$ 5".to_string()));
+    }
+
+    #[test]
+    fn mismatched_inner_tag_is_just_content_only_matching_outer_closer_ends_it() {
+        // No nesting semantics -- `$inner$` occurrences are opaque content;
+        // only the exact `$outer$` closer ends the span, so `:x` (inside)
+        // is never detected and `:y` (after) is the only live param.
+        assert_eq!(
+            find_params("$outer$ $inner$ :x $inner$ $outer$ :y"),
+            Some(vec!["y".to_string()])
+        );
+    }
+
+    #[test]
+    fn empty_tag_body_containing_a_tagged_looking_sequence_is_still_unterminated() {
+        // `$tag$` inside a `$$...$$` body is just content, not a closer for
+        // the untagged form -- the span never closes, so this fails closed.
+        assert_eq!(find_params("$$ :a $tag$"), None);
     }
 }
