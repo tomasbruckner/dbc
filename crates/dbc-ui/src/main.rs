@@ -5,6 +5,8 @@ mod export;
 mod fk_join;
 mod grid;
 mod history_panel;
+#[allow(dead_code)] // consumed from T3 on; allow removed in T6
+mod monitor;
 mod palette;
 mod row_view;
 mod runner;
