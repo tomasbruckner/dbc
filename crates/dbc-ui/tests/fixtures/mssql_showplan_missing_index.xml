@@ -1,0 +1,21 @@
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
+  <BatchSequence><Batch><Statements><StmtSimple>
+    <QueryPlan>
+      <MissingIndexes>
+        <MissingIndexGroup Impact="87.3">
+          <MissingIndex Database="[app]" Schema="[dbo]" Table="[orders]">
+            <ColumnGroup Usage="EQUALITY">
+              <Column Name="[user_id]" ColumnId="2" />
+            </ColumnGroup>
+            <ColumnGroup Usage="INCLUDE">
+              <Column Name="[amount]" ColumnId="3" />
+            </ColumnGroup>
+          </MissingIndex>
+        </MissingIndexGroup>
+      </MissingIndexes>
+      <RelOp NodeId="0" PhysicalOp="Table Scan" LogicalOp="Table Scan" EstimateRows="50000" EstimatedTotalSubtreeCost="120.0">
+        <TableScan><Object Table="[dbo].[orders]" Schema="[dbo]" /></TableScan>
+      </RelOp>
+    </QueryPlan>
+  </StmtSimple></Statements></Batch></BatchSequence>
+</ShowPlanXML>

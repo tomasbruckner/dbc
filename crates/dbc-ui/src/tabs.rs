@@ -34,6 +34,15 @@ pub enum TabContent {
     /// — the schema browser that will is a later task.
     #[allow(dead_code)]
     Text { text: String, scroll_lines: usize },
+    /// G9: server-monitor dashboard tab (one per connection at a time —
+    /// keyed via `preview_key = "monitor:{conn_identity}"`, activated
+    /// not re-stacked on reopen; see AppView::open_monitor_tab).
+    ///
+    Monitor { view: Entity<crate::monitor_view::MonitorView> },
+    /// G13: an Explain/Analyze execution-plan tab (`AppView::dispatch_plan_query`/
+    /// `AppView::on_confirm_analyze_write`) — one per run, stacked like a
+    /// normal ad-hoc query tab (no preview-key dedup).
+    Plan { view: Entity<crate::plan::PlanView> },
 }
 
 pub struct ResultTab {
