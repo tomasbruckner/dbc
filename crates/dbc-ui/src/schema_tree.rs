@@ -32,9 +32,11 @@ use dbc_core::{
 };
 use dbc_state::FavouriteObject;
 use gpui::{
-    actions, div, prelude::*, px, rgb, uniform_list, App, ClickEvent, Context, EventEmitter,
+    actions, div, prelude::*, px, uniform_list, App, ClickEvent, Context, EventEmitter,
     FocusHandle, Focusable, KeyBinding, KeyDownEvent, MouseButton, Window,
 };
+
+use crate::theme::ActiveTheme;
 
 /// Shown in place of a routine/trigger's DDL when the driver didn't provide
 /// one (`RoutineInfo::ddl`/`TriggerInfo::ddl` is `None`).
@@ -895,7 +897,7 @@ impl Render for SchemaTree {
         // table/view (`selected_table`, not merely `self.selected.is_some()`
         // — e.g. a selected column or routine leaves it disabled).
         let ddl_enabled = self.selected_table().is_some();
-        let ddl_color = if ddl_enabled { rgb(0xcdd6f4) } else { rgb(0x45475a) };
+        let ddl_color = if ddl_enabled { cx.theme().text_primary } else { cx.theme().border };
 
         let header = div()
             .h(px(28.))
@@ -904,8 +906,8 @@ impl Render for SchemaTree {
             .flex_row()
             .items_center()
             .justify_between()
-            .bg(rgb(0x181825))
-            .text_color(rgb(0xcdd6f4))
+            .bg(cx.theme().bg_app)
+            .text_color(cx.theme().text_primary)
             .child(div().overflow_hidden().child(header_label))
             .child(
                 div()
@@ -942,7 +944,7 @@ impl Render for SchemaTree {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x1e1e2e))
+            .bg(cx.theme().bg_panel)
             .on_action(cx.listener(Self::on_tree_escape))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(
@@ -954,11 +956,11 @@ impl Render for SchemaTree {
             .child(header);
 
         if self.loading {
-            root = root.child(div().px_2().py_1().text_color(rgb(0xa6adc8)).child("Načítám…"));
+            root = root.child(div().px_2().py_1().text_color(cx.theme().text_muted).child("Načítám…"));
         } else if let Some(err) = &self.error {
-            root = root.child(div().px_2().py_1().text_color(rgb(0xf38ba8)).child(format!("error: {err}")));
+            root = root.child(div().px_2().py_1().text_color(cx.theme().danger).child(format!("error: {err}")));
         } else if self.snapshot.is_none() {
-            root = root.child(div().px_2().py_1().text_color(rgb(0x6c7086)).child("Bez připojení"));
+            root = root.child(div().px_2().py_1().text_color(cx.theme().text_disabled).child("Bez připojení"));
         } else {
             root = root.child(
                 uniform_list(
@@ -987,8 +989,11 @@ impl Render for SchemaTree {
                             let fav_obj = this.favourite_object_for(&id);
                             let is_fav = fav_obj.as_ref().is_some_and(|f| this.favourites.contains(f));
                             let star = fav_obj.map(|f| {
-                                let (glyph, color) =
-                                    if is_fav { ("★", rgb(0xf9e2af)) } else { ("☆", rgb(0x6c7086)) };
+                                let (glyph, color) = if is_fav {
+                                    ("★", cx.theme().warn)
+                                } else {
+                                    ("☆", cx.theme().text_disabled)
+                                };
                                 div()
                                     .id(("tree-star", ix))
                                     .px_1()
@@ -1014,7 +1019,7 @@ impl Render for SchemaTree {
                                         .px_1()
                                         .flex_shrink_0()
                                         .cursor_pointer()
-                                        .text_color(rgb(0x89b4fa))
+                                        .text_color(cx.theme().accent)
                                         .child("⊞")
                                         .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
                                             cx.stop_propagation();
@@ -1035,10 +1040,10 @@ impl Render for SchemaTree {
                                 .h(px(22.))
                                 .pl(px(6. + depth as f32 * 14.))
                                 .cursor_pointer()
-                                .text_color(rgb(0xcdd6f4))
-                                .hover(|s| s.bg(rgb(0x313244)));
+                                .text_color(cx.theme().text_primary)
+                                .hover(|s| s.bg(cx.theme().bg_hover));
                             if is_selected {
-                                row = row.bg(rgb(0x45475a));
+                                row = row.bg(cx.theme().bg_selected);
                             }
                             row = row
                                 .child(
