@@ -112,6 +112,12 @@ pub struct MonitorSnapshot {
     pub perf: Option<PerfTile>,
     pub running: Option<Vec<RunningQueryRow>>,
     pub blocking: Option<Vec<BlockingNode>>,
+    /// Review-mandated (BLOCKER 2): `true` when `build_blocking_tree` hit
+    /// `MONITOR_TREE_NODE_CAP` and stopped materializing further nodes —
+    /// the rendered tree is a PREFIX of the real one, not the whole thing.
+    /// `false` whenever `blocking` is `None` (that query failed — a
+    /// different degrade, not a truncation).
+    pub blocking_truncated: bool,
     pub tables: Option<Vec<TableSizeRow>>,
     pub fetched_at: std::time::Instant,
 }
@@ -234,11 +240,38 @@ pub fn parse_tables(rows: &[Row]) -> Vec<TableSizeRow> {
         .collect()
 }
 
+/// Hard cap on MATERIALIZED tree nodes — independent of, and NOT covered
+/// by, `MONITOR_ROW_CAP` (runner.rs), which only bounds the number of
+/// EDGES/rows the driver returns. Review-mandated fix (BLOCKER 2):
+/// `build_blocking_tree`'s blocker-as-parent shape duplicates a waiter's
+/// entire subtree once per DISTINCT blocker it's reachable from (no
+/// sharing) — an ordinary fan-in "diamond ladder" (a handful of pids per
+/// layer, each layer blocked by the whole previous layer) blows this up
+/// combinatorially even though the edge count stays tiny and well within
+/// `MONITOR_ROW_CAP` (empirically: 30 pids / 56 edges arranged as a
+/// 15-layer diamond ladder materializes 65,534 nodes). Enforced inside
+/// `build_tree_iterative` — when hit, expansion stops (fail-soft, the
+/// caller gets a truncated-but-valid forest) and `TreeBudget::truncated`
+/// is set so `MonitorSnapshot::blocking_truncated` can surface it.
+pub const MONITOR_TREE_NODE_CAP: usize = 20_000;
+
+/// Shared expansion budget threaded through every root's build (BLOCKER 2)
+/// — a single cap across the WHOLE forest, not per-root, since an
+/// adversarial/pathological set of edges could otherwise spend the cap
+/// `roots.len()` times over.
+struct TreeBudget {
+    remaining: usize,
+    truncated: bool,
+}
+
 /// Blocker-as-parent tree; roots = blockers that never appear as a
 /// waiter. Cycle-safe: a wait-for cycle IS a live deadlock-in-progress —
 /// path-tracked, marked `cycle: true` instead of recursing forever; a
 /// pure cycle (no root at all) still renders, rooted at its
-/// first-listed blocker.
+/// first-listed blocker. Returns `(forest, truncated)` — `truncated` is
+/// `true` iff `MONITOR_TREE_NODE_CAP` was hit and some subtree(s) were cut
+/// short (BLOCKER 2, review-mandated; see `MONITOR_TREE_NODE_CAP`'s doc
+/// comment).
 ///
 /// Deviation from the plan's grounding code (review finding, BLOCKER 1):
 /// the plan's `build_node` was a plain recursive DFS — one stack frame per
@@ -252,7 +285,7 @@ pub fn parse_tables(rows: &[Row]) -> Vec<TableSizeRow> {
 /// the current root-to-node path", so `path` is carried alongside a
 /// `HashSet` mirror for O(1) membership (a `Vec::contains` scan would be
 /// O(depth) per node, i.e. O(n^2) on a linear chain of n edges).
-pub fn build_blocking_tree(edges: &[BlockingEdge]) -> Vec<BlockingNode> {
+pub fn build_blocking_tree(edges: &[BlockingEdge]) -> (Vec<BlockingNode>, bool) {
     use std::collections::{HashMap, HashSet};
     // Precomputed once: blocker_pid -> its outgoing edges (its waiters).
     // Avoids an O(n) scan of `edges` per node (the plan's grounding code
@@ -266,11 +299,17 @@ pub fn build_blocking_tree(edges: &[BlockingEdge]) -> Vec<BlockingNode> {
 
     let mut covered: HashSet<i64> = HashSet::new();
     let mut roots = Vec::new();
+    let mut budget = TreeBudget { remaining: MONITOR_TREE_NODE_CAP, truncated: false };
     // Pass 1: true roots — blockers that never wait on anyone.
     for e in edges {
         let is_root = !waiter_pids.contains(&e.blocker_pid);
-        if is_root && covered.insert(e.blocker_pid) {
-            roots.push(build_tree_iterative(e.blocker_pid, &children_of, &mut covered));
+        if is_root && !covered.contains(&e.blocker_pid) {
+            if budget.remaining == 0 {
+                budget.truncated = true;
+                break;
+            }
+            covered.insert(e.blocker_pid);
+            roots.push(build_tree_iterative(e.blocker_pid, &children_of, &mut covered, &mut budget));
         }
     }
     // Pass 2: pure cycles have NO root (every participant waits on someone)
@@ -278,11 +317,16 @@ pub fn build_blocking_tree(edges: &[BlockingEdge]) -> Vec<BlockingNode> {
     // per still-uncovered blocker; the path check below marks the loop
     // closure with `cycle: true` instead of recursing forever.
     for e in edges {
-        if covered.insert(e.blocker_pid) {
-            roots.push(build_tree_iterative(e.blocker_pid, &children_of, &mut covered));
+        if !covered.contains(&e.blocker_pid) {
+            if budget.remaining == 0 {
+                budget.truncated = true;
+                break;
+            }
+            covered.insert(e.blocker_pid);
+            roots.push(build_tree_iterative(e.blocker_pid, &children_of, &mut covered, &mut budget));
         }
     }
-    roots
+    (roots, budget.truncated)
 }
 
 /// One stack frame of the iterative post-order tree build: the node under
@@ -302,14 +346,27 @@ struct BuildFrame {
 /// Iterative replacement for the plan's recursive `build_node` (see
 /// `build_blocking_tree`'s doc comment). Same output shape and cycle
 /// semantics: a pid already on the current path becomes a `cycle: true`
-/// leaf instead of being descended into again.
+/// leaf instead of being descended into again. `budget` (BLOCKER 2):
+/// consumed one unit per MATERIALIZED node (the root here included); once
+/// exhausted, every further edge in this build — root's own children AND
+/// any still-open ancestor frame's remaining children, since the check
+/// runs on every loop iteration regardless of which frame is on top — is
+/// treated as absent, so the walk unwinds and closes out whatever was
+/// already built rather than expanding further.
 fn build_tree_iterative(
     root_pid: i64,
     children_of: &std::collections::HashMap<i64, Vec<&BlockingEdge>>,
     covered: &mut std::collections::HashSet<i64>,
+    budget: &mut TreeBudget,
 ) -> BlockingNode {
     use std::collections::HashSet;
     let root_query = children_of.get(&root_pid).and_then(|v| v.first()).and_then(|e| e.blocker_query.clone());
+
+    if budget.remaining == 0 {
+        budget.truncated = true;
+        return BlockingNode { pid: root_pid, query: root_query, wait_secs: None, children: Vec::new(), cycle: false };
+    }
+    budget.remaining -= 1; // the root node itself counts against the cap.
 
     // `path_set` alone is enough: membership answers the cycle check, and
     // popping a frame already knows its own pid to remove — no separate
@@ -321,10 +378,17 @@ fn build_tree_iterative(
     loop {
         let pid = stack.last().unwrap().pid;
         let idx = stack.last().unwrap().next_idx;
-        let edge = children_of.get(&pid).and_then(|v| v.get(idx)).copied();
+        let real_edge = children_of.get(&pid).and_then(|v| v.get(idx)).copied();
+        let edge = if budget.remaining == 0 { None } else { real_edge };
+        if real_edge.is_some() && edge.is_none() {
+            // There WAS a next edge to expand but the cap forced an early
+            // stop — a genuine truncation, not just "ran out of children".
+            budget.truncated = true;
+        }
         match edge {
             Some(e) => {
                 stack.last_mut().unwrap().next_idx += 1;
+                budget.remaining -= 1;
                 covered.insert(e.waiter_pid);
                 if path_set.contains(&e.waiter_pid) {
                     stack.last_mut().unwrap().children.push(BlockingNode {
@@ -415,6 +479,17 @@ pub fn assemble_snapshot(r: RefreshResults, fetched_at: std::time::Instant) -> R
     if !any_ok {
         return Err(first_err.unwrap_or_else(|| "prázdná odpověď monitoru".to_string()));
     }
+    // BLOCKER 2 fix: `build_blocking_tree` now returns `(forest, truncated)`
+    // — split out here so `MonitorSnapshot::blocking_truncated` can carry
+    // the flag (`false` when the query itself failed; that's a different,
+    // already-represented degrade via `blocking: None`).
+    let (blocking, blocking_truncated) = match r.blocking {
+        Ok(rows) => {
+            let (tree, truncated) = build_blocking_tree(&parse_blocking_edges(&rows));
+            (Some(tree), truncated)
+        }
+        Err(_) => (None, false),
+    };
     Ok(MonitorSnapshot {
         connections: r.connections.ok().map(|rows| parse_connections(&rows)),
         locks: r.locks.ok().map(|rows| parse_locks(&rows)),
@@ -424,7 +499,8 @@ pub fn assemble_snapshot(r: RefreshResults, fetched_at: std::time::Instant) -> R
         },
         perf: r.perf.ok().map(|rows| parse_perf(&rows)),
         running: r.running.ok().map(|rows| parse_running(&rows)),
-        blocking: r.blocking.ok().map(|rows| build_blocking_tree(&parse_blocking_edges(&rows))),
+        blocking,
+        blocking_truncated,
         tables: r.tables.ok().map(|rows| parse_tables(&rows)),
         fetched_at,
     })
@@ -614,7 +690,8 @@ mod tests {
     fn linear_chain_nests_waiters_under_blockers() {
         // 30 waits on 20, 20 waits on 10 -> one root (10) with 20 under it
         // and 30 under 20.
-        let tree = build_blocking_tree(&[edge(20, 10), edge(30, 20)]);
+        let (tree, truncated) = build_blocking_tree(&[edge(20, 10), edge(30, 20)]);
+        assert!(!truncated);
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].pid, 10);
         assert_eq!(tree[0].wait_secs, None); // a root isn't waiting
@@ -627,7 +704,8 @@ mod tests {
 
     #[test]
     fn two_independent_blockers_are_two_roots() {
-        let tree = build_blocking_tree(&[edge(2, 1), edge(4, 3)]);
+        let (tree, truncated) = build_blocking_tree(&[edge(2, 1), edge(4, 3)]);
+        assert!(!truncated);
         let root_pids: Vec<i64> = tree.iter().map(|n| n.pid).collect();
         assert_eq!(root_pids, vec![1, 3]);
     }
@@ -637,7 +715,8 @@ mod tests {
         // 1 waits on 2, 2 waits on 1 — a live deadlock-in-progress. No true
         // root; pass 2 roots it at the first-listed blocker and the loop
         // closure is a `cycle: true` leaf.
-        let tree = build_blocking_tree(&[edge(1, 2), edge(2, 1)]);
+        let (tree, truncated) = build_blocking_tree(&[edge(1, 2), edge(2, 1)]);
+        assert!(!truncated);
         assert_eq!(tree.len(), 1);
         fn find_cycle(n: &BlockingNode) -> bool {
             n.cycle || n.children.iter().any(find_cycle)
@@ -649,7 +728,8 @@ mod tests {
     fn self_referential_edge_defensive_case() {
         // The pg query excludes blocking.pid = blocked.pid, but the builder
         // must survive a self-edge anyway (defensive, design §1).
-        let tree = build_blocking_tree(&[edge(5, 5)]);
+        let (tree, truncated) = build_blocking_tree(&[edge(5, 5)]);
+        assert!(!truncated);
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].pid, 5);
         assert!(tree[0].children.iter().all(|c| c.cycle));
@@ -657,7 +737,7 @@ mod tests {
 
     #[test]
     fn no_edges_no_tree() {
-        assert_eq!(build_blocking_tree(&[]), Vec::new());
+        assert_eq!(build_blocking_tree(&[]), (Vec::new(), false));
     }
 
     /// Regression test for review BLOCKER 1: the plan's grounding code used
@@ -672,7 +752,10 @@ mod tests {
     #[test]
     fn ten_thousand_edge_linear_chain_builds_without_stack_overflow() {
         let edges: Vec<BlockingEdge> = (0..10_000).map(|i| edge(i + 1, i)).collect();
-        let tree = build_blocking_tree(&edges);
+        let (tree, truncated) = build_blocking_tree(&edges);
+        // 10,001 nodes total — under MONITOR_TREE_NODE_CAP (20_000), so this
+        // must NOT be reported as truncated.
+        assert!(!truncated);
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].pid, 0);
         // Walk the chain down to depth 10,000, confirming no truncation and
@@ -684,6 +767,66 @@ mod tests {
             node = &node.children[0];
         }
         assert_eq!(node.pid, 10_000);
+    }
+
+    /// Iterative node counter for test assertions — never recurses over a
+    /// `BlockingNode` tree (same stack-safety posture as
+    /// `build_tree_iterative`/`flatten_blocking_tree`), even though these
+    /// diamond-shaped test trees are shallow (bounded by `LAYERS`) so a
+    /// naive recursive counter would also be safe here.
+    fn count_nodes_iterative(roots: &[BlockingNode]) -> usize {
+        let mut count = 0usize;
+        let mut stack: Vec<&BlockingNode> = roots.iter().collect();
+        while let Some(node) = stack.pop() {
+            count += 1;
+            stack.extend(node.children.iter());
+        }
+        count
+    }
+
+    /// Regression test for review BLOCKER 2: the blocker-as-parent tree
+    /// shape has NO subtree sharing — a waiter reachable via two different
+    /// blockers gets its whole subtree materialized once PER blocker. An
+    /// ordinary fan-in "diamond ladder" (each layer's pids are blocked by
+    /// EVERY pid in the layer below) blows this up combinatorially even
+    /// though the edge/pid count stays tiny: 15 layers x 2 pids/layer = 30
+    /// pids, 56 edges, but ~65,534 materialized nodes with no cap —
+    /// `MONITOR_TREE_NODE_CAP` must hold this to <= 20,000 and report
+    /// `truncated`.
+    #[test]
+    fn diamond_ladder_fan_in_stays_within_the_node_cap_and_reports_truncated() {
+        const LAYERS: i64 = 15;
+        const PER_LAYER: i64 = 2;
+        let mut edges = Vec::new();
+        for layer in 1..LAYERS {
+            for w in 0..PER_LAYER {
+                let waiter = layer * PER_LAYER + w;
+                for b in 0..PER_LAYER {
+                    let blocker = (layer - 1) * PER_LAYER + b;
+                    edges.push(edge(waiter, blocker));
+                }
+            }
+        }
+        assert_eq!(edges.len(), 56, "sanity: 14 non-root layers x 2 waiters x 2 blockers");
+
+        let (tree, truncated) = build_blocking_tree(&edges);
+        assert!(truncated, "the diamond ladder must exceed MONITOR_TREE_NODE_CAP and report truncation");
+
+        let total = count_nodes_iterative(&tree);
+        assert!(total <= MONITOR_TREE_NODE_CAP, "materialized {total} nodes, cap is {MONITOR_TREE_NODE_CAP}");
+    }
+
+    /// BLOCKER 2 companion case: an ordinary small tree (far under the cap)
+    /// must build EXACTLY as before — untruncated, identical shape to the
+    /// pre-cap behaviour.
+    #[test]
+    fn normal_small_graph_is_unaffected_by_the_node_cap() {
+        let (tree, truncated) = build_blocking_tree(&[edge(20, 10), edge(30, 20)]);
+        assert!(!truncated);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].pid, 10);
+        assert_eq!(tree[0].children[0].pid, 20);
+        assert_eq!(tree[0].children[0].children[0].pid, 30);
     }
 
     // --- bar_fraction ---

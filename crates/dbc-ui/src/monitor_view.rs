@@ -170,12 +170,26 @@ impl MonitorView {
     }
 
     fn on_event(&mut self, ev: runner::MonitorEvent, cx: &mut Context<Self>) {
+        if let Some(event) = self.apply_event(ev) {
+            cx.emit(event);
+        }
+        cx.notify();
+    }
+
+    /// Pure state transition for an incoming `MonitorEvent` — deliberately
+    /// takes no `Context`; the only GPUI-flavoured bits (`cx.notify()` /
+    /// `cx.emit()`) live in the thin `on_event` wrapper above. Factored out
+    /// so the MAJOR review-mandated invariant below is unit-testable
+    /// directly against a hand-built `MonitorView` (no entity/`cx.spawn`
+    /// needed — `dispatch_refresh` itself never touches `cx` either).
+    /// Returns the `MonitorViewEvent` to emit, if any.
+    fn apply_event(&mut self, ev: runner::MonitorEvent) -> Option<MonitorViewEvent> {
         match ev {
             runner::MonitorEvent::Data { generation, mut snapshot } => {
                 // Last-dispatched-wins, same convention as
                 // AppView::switch_generation / schema_fetch_generation.
                 if generation != self.refresh_generation {
-                    return;
+                    return None;
                 }
                 self.awaiting = false;
                 self.interval_secs = 5; // any Data resets backoff (design §4)
@@ -188,31 +202,34 @@ impl MonitorView {
                 }
                 self.snapshot = Some(snapshot);
                 self.last_refresh_at = Some(std::time::Instant::now());
-                cx.notify();
+                None
             }
             runner::MonitorEvent::Error { generation, message } => {
                 if generation != self.refresh_generation {
-                    return;
+                    return None;
                 }
                 self.awaiting = false;
                 self.interval_secs = (self.interval_secs * 2).min(60); // 5→10→20→40→60
                 self.last_error = Some(message);
-                cx.notify();
+                None
             }
             runner::MonitorEvent::KillResult { pid, result, .. } => {
                 // NOT generation-gated: a kill outcome is never superseded
                 // by refresh generations (design §4 gates Data/Error only).
                 let outcome = result.map(|_affected| ()).map_err(|e| e.message);
-                if outcome.is_ok() {
-                    // Immediate out-of-cycle refresh so the list reflects
-                    // the kill without waiting up to 5s (design §6). Note
-                    // pg returns Ok even for "pid already gone" (function
-                    // result false, not an error) — the refresh is what
-                    // shows the truth either way.
-                    self.dispatch_refresh();
-                }
-                cx.emit(MonitorViewEvent::KillFinished { pid, result: outcome });
-                cx.notify();
+                // MAJOR review fix: ALWAYS dispatch a fresh refresh here —
+                // ok AND err alike. `monitor_loop` cancels any in-flight
+                // refresh before servicing a Kill (design §4's
+                // `tokio::select!`) and sends NO terminal Data/Error for
+                // that cancelled generation, so the generation this Kill
+                // interrupted is stale regardless of whether the kill
+                // itself succeeded. Gating this on `outcome.is_ok()` left
+                // `awaiting` stuck `true` forever after a FAILED kill that
+                // raced an in-flight refresh — auto-refresh silently dead
+                // for the rest of the tab's life, since nothing else ever
+                // clears `awaiting`.
+                self.dispatch_refresh();
+                Some(MonitorViewEvent::KillFinished { pid, result: outcome })
             }
         }
     }
@@ -251,6 +268,54 @@ fn truncate_query(s: &str) -> String {
     } else {
         head
     }
+}
+
+/// One flattened row of the blocking-chain tree, ready for rendering —
+/// pure data, no GPUI. Built by `flatten_blocking_tree`. Deliberately
+/// flat (no nested `Vec<Self>`), so `#[derive(Debug)]` here is safe to
+/// print/compare even for a large tree — unlike `monitor::BlockingNode`,
+/// where the analogous derive recurses per depth (never `{:?}`-format a
+/// `BlockingNode` tree directly; use this instead for test assertions).
+#[derive(Debug, Clone, PartialEq)]
+struct BlockingRow {
+    depth: usize,
+    pid: i64,
+    wait_secs: Option<f64>,
+    query: Option<String>,
+    cycle: bool,
+}
+
+/// BLOCKER 1 review fix: explicit-stack pre-order flatten of the blocking
+/// forest — no recursion, so depth is bounded by heap, not by the UI
+/// thread's stack (mirrors `monitor.rs::build_tree_iterative`'s fix for
+/// the same class of bug: the original `push_blocking_rows` recursed one
+/// stack frame per tree depth and a chain deep enough — reachable given
+/// `MONITOR_ROW_CAP = 10_000` in runner.rs — crashed with
+/// `STATUS_STACK_OVERFLOW`, taking the whole app down, not just this tab).
+/// Extracted as a pure function (no `Context`) so it's unit-testable
+/// directly, per the same "pure logic + thin render consumption" split
+/// used throughout this module. NEVER clones a `BlockingNode` — only
+/// `node.query: Option<String>` per visited node is cloned into the row
+/// (same constraint `build_blocking_tree`'s own `Drop` rewrite exists
+/// for).
+fn flatten_blocking_tree(roots: &[monitor::BlockingNode]) -> Vec<BlockingRow> {
+    let mut out = Vec::new();
+    // Push in reverse so popping visits children in original left-to-right
+    // order (matches the old recursive walk's visible ordering).
+    let mut stack: Vec<(usize, &monitor::BlockingNode)> = roots.iter().rev().map(|n| (0usize, n)).collect();
+    while let Some((depth, node)) = stack.pop() {
+        out.push(BlockingRow {
+            depth,
+            pid: node.pid,
+            wait_secs: node.wait_secs,
+            query: node.query.clone(),
+            cycle: node.cycle,
+        });
+        for child in node.children.iter().rev() {
+            stack.push((depth + 1, child));
+        }
+    }
+    out
 }
 
 impl MonitorView {
@@ -466,42 +531,6 @@ impl MonitorView {
             .into_any_element()
     }
 
-    /// Flat recursion into a `Vec` — chain counts are small, no
-    /// `uniform_list` needed (design §5). Reads fields off `node` by
-    /// reference; NEVER clones a `BlockingNode` (its `Vec<Self>` children
-    /// make a clone a deep-tree stack-overflow risk, same class the
-    /// iterative `build_blocking_tree`/`Drop` rewrite fixed — T1 review).
-    fn push_blocking_rows(
-        node: &monitor::BlockingNode,
-        depth: usize,
-        out: &mut Vec<AnyElement>,
-        cx: &mut Context<Self>,
-    ) {
-        let wait = node.wait_secs.map(|w| format!("{w:.1}")).unwrap_or_else(|| "–".into());
-        let query_text = node.query.clone().unwrap_or_default();
-        let mut label = format!("{} · wait {}s · {}", node.pid, wait, truncate_query(&query_text));
-        if node.cycle {
-            label.push_str(" (cyklus — možný deadlock)");
-        }
-        let color = if node.cycle { tier_color(Tier::Crit) } else { rgb(0xcdd6f4) };
-        let detail_text = node.query.clone();
-        let ix = out.len();
-        let row = div()
-            .id(("mon-block", ix))
-            .pl(px(16. * depth as f32))
-            .cursor_pointer()
-            .text_color(color)
-            .child(label)
-            .on_click(cx.listener(move |view, _, _, cx| {
-                view.detail = detail_text.clone();
-                cx.notify();
-            }));
-        out.push(row.into_any_element());
-        for child in &node.children {
-            Self::push_blocking_rows(child, depth + 1, out, cx);
-        }
-    }
-
     fn render_blocking(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut body: Vec<AnyElement> = Vec::new();
         match self.snapshot.as_ref().and_then(|s| s.blocking.as_ref()) {
@@ -510,10 +539,42 @@ impl MonitorView {
                 body.push(div().px_2().child("žádné blokace").into_any_element())
             }
             Some(roots) => {
-                for root in roots {
-                    Self::push_blocking_rows(root, 0, &mut body, cx);
+                for (ix, row) in flatten_blocking_tree(roots).into_iter().enumerate() {
+                    let wait = row.wait_secs.map(|w| format!("{w:.1}")).unwrap_or_else(|| "–".into());
+                    let query_text = row.query.clone().unwrap_or_default();
+                    let mut label =
+                        format!("{} · wait {}s · {}", row.pid, wait, truncate_query(&query_text));
+                    if row.cycle {
+                        label.push_str(" (cyklus — možný deadlock)");
+                    }
+                    let color = if row.cycle { tier_color(Tier::Crit) } else { rgb(0xcdd6f4) };
+                    let detail_text = row.query;
+                    let el = div()
+                        .id(("mon-block", ix))
+                        .pl(px(16. * row.depth as f32))
+                        .cursor_pointer()
+                        .text_color(color)
+                        .child(label)
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.detail = detail_text.clone();
+                            cx.notify();
+                        }));
+                    body.push(el.into_any_element());
                 }
             }
+        }
+        if self.snapshot.as_ref().is_some_and(|s| s.blocking_truncated) {
+            // BLOCKER 2 review fix: `build_blocking_tree` hit
+            // `monitor::MONITOR_TREE_NODE_CAP` and stopped expanding —
+            // surface it the same way as the refresh error/backoff line,
+            // never silently.
+            body.push(
+                div()
+                    .px_2()
+                    .text_color(rgb(0xf9e2af))
+                    .child("strom blokací je příliš velký — zobrazena je jen jeho část")
+                    .into_any_element(),
+            );
         }
         div()
             .flex()
@@ -716,5 +777,72 @@ mod tests {
             seen.push(interval);
         }
         assert_eq!(seen, vec![10, 20, 40, 60, 60, 60]);
+    }
+
+    /// Regression test for review BLOCKER 1: the original `push_blocking_
+    /// rows` recursed one stack frame per tree depth — a chain deep enough
+    /// (reachable given `MONITOR_ROW_CAP = 10_000` edges in runner.rs)
+    /// overflowed the UI thread's stack (`STATUS_STACK_OVERFLOW`, i.e. the
+    /// whole app crashes, not just this tab). `flatten_blocking_tree` must
+    /// walk a 10,000-deep chain via an explicit heap stack instead.
+    #[test]
+    fn flatten_blocking_tree_handles_a_10k_deep_chain_without_stack_overflow() {
+        let edges: Vec<monitor::BlockingEdge> = (0..10_000)
+            .map(|i| monitor::BlockingEdge {
+                waiter_pid: i + 1,
+                blocker_pid: i,
+                wait_secs: 1.0,
+                waiter_query: None,
+                blocker_query: None,
+            })
+            .collect();
+        let (tree, truncated) = monitor::build_blocking_tree(&edges);
+        assert!(!truncated);
+
+        let rows = flatten_blocking_tree(&tree);
+        assert_eq!(rows.len(), 10_001);
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[0].pid, 0);
+        assert_eq!(rows[10_000].depth, 10_000);
+        assert_eq!(rows[10_000].pid, 10_000);
+    }
+
+    /// Regression test for review MAJOR finding: `apply_event`'s
+    /// `KillResult` arm must dispatch a fresh refresh regardless of the
+    /// kill's own outcome — before the fix, a FAILED kill left `awaiting`
+    /// stuck `true` forever whenever it raced an in-flight refresh (the
+    /// cancelled refresh's generation never gets a terminal Data/Error —
+    /// see `runner::monitor_loop`'s `tokio::select!` — so nothing else
+    /// would ever clear it, silently killing auto-refresh for the rest of
+    /// the tab's life). Constructs a `MonitorView` directly (no `cx.spawn`/
+    /// entity needed — `apply_event` and `dispatch_refresh` never touch
+    /// `Context`) with `awaiting: true`, simulating exactly that race.
+    #[test]
+    fn kill_result_always_dispatches_a_fresh_refresh_ok_and_err_alike() {
+        for result in [Ok(1u64), Err(dbc_core::QueryError::msg("boom"))] {
+            let is_err = result.is_err();
+            let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
+            let mut view = MonitorView {
+                cmd_tx,
+                read_only: false,
+                engine: dbc_state::Engine::Postgres,
+                paused: false,
+                awaiting: true, // a refresh was in flight when the Kill fired
+                refresh_generation: 5,
+                interval_secs: 5,
+                snapshot: None,
+                prev_xact: None,
+                last_error: None,
+                last_refresh_at: None,
+                detail: None,
+            };
+            view.apply_event(runner::MonitorEvent::KillResult { generation: 5, pid: 42, result });
+            assert_eq!(view.refresh_generation, 6, "a fresh generation must be dispatched (err = {is_err})");
+            assert!(view.awaiting, "err = {is_err}");
+            match cmd_rx.try_recv() {
+                Ok(runner::MonitorCmd::Refresh { generation: 6 }) => {}
+                other => panic!("expected a fresh Refresh{{generation: 6}}, got {other:?} (err = {is_err})"),
+            }
+        }
     }
 }
