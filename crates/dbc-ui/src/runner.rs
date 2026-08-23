@@ -537,23 +537,34 @@ impl QueryRunner {
     /// G11 T4: SQLite restore — magic-header check (`backup::sqlite_magic_header_ok`,
     /// design CURATION item 4) then `fs::copy` — no `Connection`/`ConnectSpec`
     /// involved at all (a plain file operation, no secret, no network
-    /// round-trip). Its read-only gate is enforced by the CALLER (T6, which
-    /// already has `cfg.read_only` in hand before ever reaching this method)
-    /// — the ONE of the four T4 methods whose gate isn't inline here, per
-    /// this plan's own grounding for why `run_sqlite_restore` takes no
-    /// `ConnectSpec` at all.
+    /// round-trip).
+    ///
+    /// SECURITY (G11 T4 review MAJOR 2): unlike the other three backup/
+    /// restore methods, this one has no `ConnectSpec` to read
+    /// `spec_is_read_only` from — the caller (T6) already has `cfg.read_only`
+    /// in hand before ever reaching this method, so it is threaded through
+    /// explicitly as `read_only`. This method self-guards on it as its
+    /// FIRST action (`backup::guard_backup_restore_read_only(BackupOp::Restore,
+    /// read_only)`, same call every other restore/backup method here makes)
+    /// — a write path whose only protection was a not-yet-written UI-layer
+    /// caller would be unsafe by construction. T6's own pre-dispatch check
+    /// is kept too (belt-and-braces, matching this codebase's established
+    /// "each layer holds on its own" posture), but is no longer this
+    /// method's SOLE protection.
     #[allow(dead_code)] // G11 T6 wires the first real call site (restore dialog dispatch for a SQLite connection). Remove once landed.
     pub fn run_sqlite_restore(
         &self,
         db_path: String,
         backup_path: String,
+        read_only: bool,
     ) -> tokio::sync::oneshot::Receiver<Result<(), QueryError>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.runtime.spawn(async move {
-            let result =
-                tokio::task::spawn_blocking(move || run_sqlite_restore_inner(&db_path, &backup_path))
-                    .await
-                    .unwrap_or_else(|_| Err(QueryError::msg("restore task panicked")));
+            let result = tokio::task::spawn_blocking(move || {
+                run_sqlite_restore_inner(&db_path, &backup_path, read_only)
+            })
+            .await
+            .unwrap_or_else(|_| Err(QueryError::msg("restore task panicked")));
             let _ = tx.send(result);
         });
         rx
@@ -901,6 +912,27 @@ async fn run_analyze_write_inner(
     // `opened` drops here unconditionally — the ultimate backstop, same as run_write_transaction_inner.
 }
 
+/// G11 T4 review MAJOR 1: joins a possibly-relative `path` onto the current
+/// working directory so `resolve_tool_path`'s configured-path branch always
+/// hands back an absolute path — see that function's SECURITY doc comment.
+/// Deliberately does NOT call `std::fs::canonicalize` (which would resolve
+/// symlinks and, on Windows, prefix the result with `\\?\`, an
+/// extended-length-path form some external tools handle poorly) — a plain
+/// `current_dir().join(path)` is enough to defeat the CWD-relative-lookup
+/// class of planting this guards against, without changing the path's
+/// surface form for an already-absolute input.
+fn absolutize(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        path.to_string()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(p).to_string_lossy().to_string(),
+            Err(_) => path.to_string(),
+        }
+    }
+}
+
 /// G11 T4: resolves an external tool's path per design §1's three-step
 /// order: (1) `configured` if `Some` — validated as an existing FILE HERE,
 /// at use time, not at save time (a stale saved path surfaces as an error,
@@ -908,23 +940,37 @@ async fn run_analyze_write_inner(
 /// glob `C:\Program Files\PostgreSQL\*\bin\<name>.exe`, highest version wins
 /// (`backup::pick_highest_version_dir` — pure, given the `(path, mtime)`
 /// pairs this function reads from disk via `std::fs::read_dir`, the one
-/// place in this module that touches that directory). Returns the literal
-/// program string to hand to `Command::new` — either a bare name (PATH
-/// case, step 2) or a full path (steps 1/3). Errors are Czech-language,
-/// user-facing strings (never a panic on a missing/malformed directory).
+/// place in this module that touches that directory). Errors are
+/// Czech-language, user-facing strings (never a panic on a missing/
+/// malformed directory).
+///
+/// SECURITY (CWE-427, binary planting — G11 T4 review MAJOR 1): the string
+/// returned here is handed straight to `Command::new` by every caller
+/// (`run_external_tool`), so it MUST be an absolute path in every branch,
+/// never a bare name — a bare name would let Windows' `CreateProcess`
+/// search the application directory and the current working directory
+/// BEFORE PATH, so a planted `pg_dump.exe` sitting in a writable CWD would
+/// run instead of the real tool and receive the real `PGPASSWORD` set on
+/// its (attacker-controlled) child environment. All three steps are
+/// absolute: step 1 is `absolutize`d (defense in depth — a user-typed
+/// configured path is expected to already be absolute, e.g. from a file
+/// picker, but is not assumed to be); step 2 relies on `backup::find_on_path`
+/// itself now returning the fully-resolved path rather than the bare
+/// probed name; step 3's glob join is already absolute (`base` is a fixed
+/// absolute root).
 #[allow(dead_code)] // G11 T5's docker tests and T6's dispatch are the first real callers. Remove once either lands.
 pub fn resolve_tool_path(configured: Option<&str>, name: &str) -> Result<String, QueryError> {
     if let Some(path) = configured {
         return if std::path::Path::new(path).is_file() {
-            Ok(path.to_string())
+            Ok(absolutize(path))
         } else {
             Err(QueryError::msg(format!(
                 "nakonfigurovaná cesta k {name} neexistuje: {path} — nastavte ji znovu"
             )))
         };
     }
-    if backup::find_on_path(name) {
-        return Ok(name.to_string());
+    if let Some(resolved) = backup::find_on_path(name) {
+        return Ok(resolved);
     }
     let exe = format!("{name}.exe");
     let base = std::path::Path::new(r"C:\Program Files\PostgreSQL");
@@ -1026,13 +1072,17 @@ async fn run_sqlite_backup_inner(
 
 /// G11 T4: `QueryRunner::run_sqlite_restore`'s sync body (run inside
 /// `spawn_blocking` by its caller — plain file I/O, no `Connection`
-/// involved). Design CURATION item 4, hard requirement: reads the first 16
+/// involved). SECURITY (T4 review MAJOR 2): self-guards on `read_only` as
+/// its FIRST action, before even opening `backup_path` — no I/O is
+/// attempted on a read-only refusal, matching every other backup/restore
+/// method's own "guard before I/O" shape. T6's own pre-dispatch check stays
+/// too (belt-and-braces), but this is no longer the sole protection. Design
+/// CURATION item 4, hard requirement (checked second): reads the first 16
 /// bytes of `backup_path` and refuses (no copy attempted) unless they are
-/// exactly `backup::SQLITE_MAGIC_HEADER`. Deliberately does NOT call
-/// `backup::guard_backup_restore_read_only` itself — see
-/// `QueryRunner::run_sqlite_restore`'s doc comment for why that gate lives
-/// one level up, in the caller (T6).
-fn run_sqlite_restore_inner(db_path: &str, backup_path: &str) -> Result<(), QueryError> {
+/// exactly `backup::SQLITE_MAGIC_HEADER`.
+fn run_sqlite_restore_inner(db_path: &str, backup_path: &str, read_only: bool) -> Result<(), QueryError> {
+    backup::guard_backup_restore_read_only(backup::BackupOp::Restore, read_only)
+        .map_err(QueryError::msg)?;
     let mut header = [0u8; 16];
     let mut f = std::fs::File::open(backup_path).map_err(|e| QueryError::msg(e.to_string()))?;
     use std::io::Read;
@@ -2783,6 +2833,74 @@ mod backup_runner_tests {
         assert!(err.message.contains("pg_dump"));
     }
 
+    // SECURITY (CWE-427, binary planting — G11 T4 review MAJOR 1): the
+    // PATH-found branch must return an absolute path, never a bare name —
+    // a bare name handed to `Command::new` lets Windows' `CreateProcess`
+    // search the app dir + CWD (both potentially attacker-writable) before
+    // PATH, and the child receives `PGPASSWORD` on its environment.
+    #[test]
+    fn resolve_tool_path_on_path_returns_an_absolute_path_not_a_bare_name() {
+        // "cmd" is guaranteed on PATH on Windows (same assumption
+        // `backup::process_tests::find_on_path_finds_a_universally_present_binary`
+        // already makes).
+        let resolved = resolve_tool_path(None, "cmd").expect("cmd must resolve via PATH");
+        assert!(
+            std::path::Path::new(&resolved).is_absolute(),
+            "expected an absolute path, got: {resolved}"
+        );
+        assert_ne!(resolved, "cmd", "must not be the bare probed name");
+    }
+
+    // SECURITY (CWE-427, defense in depth): `resolve_tool_path`'s
+    // configured-path branch absolutizes a relative-but-existing path too,
+    // not just the PATH-found branch — tested directly against the
+    // `absolutize` helper (rather than round-tripping through a real
+    // relative file path, which would be fragile here: the repo's CWD and
+    // `tempfile::tempdir()`'s default location are commonly on different
+    // drive letters on Windows, and there's no portable relative path
+    // between two different drives).
+    #[test]
+    fn absolutize_joins_a_relative_path_onto_the_current_directory() {
+        let resolved = absolutize("sub\\dir\\fake_tool.exe");
+        assert!(
+            std::path::Path::new(&resolved).is_absolute(),
+            "expected an absolute path, got: {resolved}"
+        );
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(resolved, cwd.join("sub\\dir\\fake_tool.exe").to_string_lossy());
+    }
+
+    #[test]
+    fn absolutize_passes_an_already_absolute_path_through_unchanged() {
+        assert_eq!(absolutize(r"D:\already\absolute\pg_dump.exe"), r"D:\already\absolute\pg_dump.exe");
+    }
+
+    #[test]
+    fn resolve_tool_path_configured_relative_path_is_absolutized() {
+        // Construct a relative path (relative to the real CWD) that points
+        // at a real file, without changing the process's own CWD (which
+        // would affect every other test running concurrently in this
+        // binary) — write the fixture INTO a subdirectory of the actual
+        // CWD instead.
+        let cwd = std::env::current_dir().unwrap();
+        let rel_dir = format!("g11_t4_review_tmp_{}", std::process::id());
+        let dir = cwd.join(&rel_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("fake_tool.exe");
+        std::fs::write(&file, b"not a real binary, just needs to exist").unwrap();
+
+        let relative = format!("{rel_dir}\\fake_tool.exe");
+        let result = resolve_tool_path(Some(&relative), "fake_tool");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let resolved = result.unwrap();
+        assert!(
+            std::path::Path::new(&resolved).is_absolute(),
+            "expected an absolute path, got: {resolved}"
+        );
+    }
+
     #[test]
     fn resolve_tool_path_no_config_and_not_on_path_and_no_glob_hit_is_friendly_error() {
         // "definitely-not-a-real-tool-xyz" is neither configured, on PATH,
@@ -2834,7 +2952,7 @@ mod backup_runner_tests {
     }
 
     #[tokio::test]
-    async fn sqlite_backup_refuses_read_only_without_connecting() {
+    async fn sqlite_backup_allowed_on_read_only() {
         let spec = ConnectSpec::Config {
             cfg: Box::new({
                 let mut c = cfg(dbc_state::Engine::Sqlite, true);
@@ -2872,10 +2990,34 @@ mod backup_runner_tests {
         let dest = dir.path().join("target.sqlite");
         std::fs::write(&dest, b"ORIGINAL CONTENT").unwrap();
 
-        let err = run_sqlite_restore_inner(dest.to_str().unwrap(), src.to_str().unwrap()).unwrap_err();
+        let err =
+            run_sqlite_restore_inner(dest.to_str().unwrap(), src.to_str().unwrap(), false).unwrap_err();
         assert_eq!(err.message, "soubor není SQLite databáze");
         // Original destination file must be untouched.
         assert_eq!(std::fs::read(&dest).unwrap(), b"ORIGINAL CONTENT");
+    }
+
+    // SECURITY (G11 T4 review MAJOR 2): `run_sqlite_restore_inner` must
+    // self-guard on `read_only` — a write path whose sole protection was an
+    // unwired future UI-layer caller (T6) is unsafe by construction. The
+    // guard must fire BEFORE the source file is ever opened.
+    #[test]
+    fn sqlite_restore_refuses_read_only_without_touching_source_or_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("backup.sqlite");
+        let mut content = backup::SQLITE_MAGIC_HEADER.to_vec();
+        content.extend_from_slice(b"rest of a fake but header-valid sqlite file");
+        std::fs::write(&src, &content).unwrap();
+        let dest = dir.path().join("live.sqlite");
+        std::fs::write(&dest, b"stale content").unwrap();
+
+        let err =
+            run_sqlite_restore_inner(dest.to_str().unwrap(), src.to_str().unwrap(), true).unwrap_err();
+        assert_eq!(err.message, "připojení je jen pro čtení");
+        // Neither file touched — the guard fires before the magic-header
+        // check ever opens the source.
+        assert_eq!(std::fs::read(&dest).unwrap(), b"stale content");
+        assert_eq!(std::fs::read(&src).unwrap(), content);
     }
 
     #[test]
@@ -2888,7 +3030,7 @@ mod backup_runner_tests {
         let dest = dir.path().join("live.sqlite");
         std::fs::write(&dest, b"stale content").unwrap();
 
-        run_sqlite_restore_inner(dest.to_str().unwrap(), src.to_str().unwrap()).unwrap();
+        run_sqlite_restore_inner(dest.to_str().unwrap(), src.to_str().unwrap(), false).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), content);
     }
 
@@ -2900,6 +3042,7 @@ mod backup_runner_tests {
         let err = run_sqlite_restore_inner(
             dest.to_str().unwrap(),
             dir.path().join("does_not_exist.sqlite").to_str().unwrap(),
+            false,
         )
         .unwrap_err();
         assert!(!err.message.is_empty());

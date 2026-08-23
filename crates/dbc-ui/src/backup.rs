@@ -859,12 +859,37 @@ pub fn run_and_stream(
 
 /// Same PATH-probe shape as `tunnel.rs::ssh_binary` (`Command::new("where")`
 /// on Windows), generalized to any program name — design §1.
-pub fn find_on_path(name: &str) -> bool {
+///
+/// SECURITY (CWE-427, binary planting — G11 T4 review MAJOR 1): returns the
+/// FULLY RESOLVED path, never a bare name. `where`/`which` print the
+/// resolved absolute path to stdout; this function reads and returns the
+/// FIRST line (their own "first match wins" precedence — the same one the
+/// shell's own command lookup uses when more than one PATH entry matches).
+/// Handing back a bare name here would be unsafe: callers (`resolve_tool_path`,
+/// `runner.rs`) pass this string straight to `Command::new`, and on Windows
+/// `CreateProcess` searches the application directory and the CURRENT
+/// WORKING DIRECTORY *before* PATH — a planted `pg_dump.exe` sitting in a
+/// writable CWD would run instead of the real tool, and since `PGPASSWORD`
+/// is set on that spawned child's environment, the planted binary would
+/// receive the real database password. Returning the fully-resolved path
+/// bypasses that CWD/app-dir search order entirely (`CreateProcess` uses a
+/// path containing a directory separator as-is, never re-searching it).
+pub fn find_on_path(name: &str) -> Option<String> {
     #[cfg(windows)]
     let probe = Command::new("where").arg(name).output();
     #[cfg(not(windows))]
     let probe = Command::new("which").arg(name).output();
-    matches!(probe, Ok(o) if o.status.success())
+    let output = probe.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first = stdout.lines().next()?.trim();
+    if first.is_empty() {
+        None
+    } else {
+        Some(first.to_string())
+    }
 }
 
 /// Given already-discovered `(version_dir_path, mtime)` pairs (design §1:
@@ -1011,12 +1036,21 @@ mod process_tests {
         // `cmd.exe` (Windows) is always on PATH in this repo's CI/dev
         // environment (the tool this test itself just spawned above).
         #[cfg(windows)]
-        assert!(find_on_path("cmd"));
+        {
+            let resolved = find_on_path("cmd").expect("cmd must be on PATH");
+            // SECURITY (CWE-427, T4 review MAJOR 1): must be the fully
+            // resolved path, never a bare name — see `find_on_path`'s doc
+            // comment.
+            assert!(
+                std::path::Path::new(&resolved).is_absolute(),
+                "expected an absolute path, got: {resolved}"
+            );
+        }
     }
 
     #[test]
     fn find_on_path_missing_binary_is_false() {
-        assert!(!find_on_path("definitely-not-a-real-binary-xyz"));
+        assert!(find_on_path("definitely-not-a-real-binary-xyz").is_none());
     }
 
     fn t(secs: u64) -> SystemTime {

@@ -33,8 +33,13 @@ pub trait Connection: Send {
     /// on read-only) may call it. `run_sqlite_restore` is NOT in this list —
     /// it never calls `execute()` at all, restoring via a plain
     /// magic-header-checked `fs::copy` instead. Each of the above is a
-    /// named, gated method per this file's own transaction-discipline
-    /// contract below, never raw ad-hoc SQL.
+    /// named, gated method issuing its own fixed, non-ad-hoc statement(s)
+    /// over one dedicated connection, sequentially — NOT necessarily a
+    /// BEGIN…COMMIT transaction in the sense the paragraph below describes:
+    /// `run_mssql_restore`'s three statements (`SET SINGLE_USER` → `RESTORE
+    /// DATABASE` → `SET MULTI_USER`) are plain sequential `execute()` calls
+    /// on the SAME connection, not wrapped in an explicit transaction —
+    /// T-SQL does not allow `RESTORE DATABASE` inside one.
     ///
     /// Transactions are per-connection: a caller driving `BEGIN` … `COMMIT`/
     /// `ROLLBACK` MUST issue every statement in that sequence over the SAME
