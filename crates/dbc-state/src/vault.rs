@@ -7,6 +7,7 @@ use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::config::StateError;
 
@@ -94,6 +95,70 @@ impl Vault {
         Ok(Vault { path: path.to_path_buf(), key, salt, secrets })
     }
 
+    /// Curated unlock path (dbc-mcp): opens the vault with an
+    /// already-derived 32-byte key instead of a master password, skipping
+    /// the Argon2id derivation step entirely. The key is expected to have
+    /// come from a prior [`Vault::export_key`] call (persisted at rest by
+    /// the caller, e.g. in the OS credential store) — this function itself
+    /// never derives, stores, or otherwise handles a password.
+    ///
+    /// Additive: does not change `unlock`'s signature or behavior. Fails
+    /// closed exactly like `unlock` on a corrupt envelope, bad salt/nonce,
+    /// or a key that doesn't decrypt the ciphertext (wrong key or tampered
+    /// file) — the two paths share every check except how the key is
+    /// obtained.
+    pub fn unlock_with_key(path: &Path, key: &[u8; 32]) -> Result<Vault, StateError> {
+        let env: Envelope = serde_json::from_str(&std::fs::read_to_string(path)?)
+            .map_err(|_| err("vault unlock failed: corrupt envelope"))?;
+        let salt: [u8; 16] = B64.decode(&env.salt)
+            .ok().and_then(|v| v.try_into().ok())
+            .ok_or_else(|| err("vault unlock failed: bad salt"))?;
+        let key = Key::from(*key);
+        let nonce_bytes = B64.decode(&env.nonce).map_err(|_| err("vault unlock failed: bad nonce"))?;
+        let ct = B64.decode(&env.ciphertext).map_err(|_| err("vault unlock failed: bad ciphertext"))?;
+        let nonce_arr: [u8; 12] = nonce_bytes.as_slice().try_into()
+            .map_err(|_| err("vault unlock failed: bad nonce"))?;
+        let cipher = ChaCha20Poly1305::new(&key);
+        let nonce = Nonce::from(nonce_arr);
+        let plain = cipher
+            .decrypt(&nonce, ct.as_ref())
+            .map_err(|_| err("vault unlock failed: wrong key or tampered file"))?;
+        let secrets: BTreeMap<String, String> =
+            serde_json::from_slice(&plain).map_err(|_| err("vault unlock failed: bad payload"))?;
+        Ok(Vault { path: path.to_path_buf(), key, salt, secrets })
+    }
+
+    /// Exports the raw 32-byte vault key derived at unlock time, for a
+    /// caller (dbc-mcp's `setup` subcommand) to persist somewhere it can
+    /// later feed back into [`Vault::unlock_with_key`] — e.g. the Windows
+    /// Credential Manager via the `keyring` crate. The master password
+    /// itself is never exposed by this or any other `Vault` method.
+    ///
+    /// The returned copy is wrapped in [`Zeroizing`] so it's overwritten
+    /// with zeros the moment the caller drops it (review round 1 finding
+    /// #3: the previous wording here — "zeroize after storing, where
+    /// practical" — overclaimed; nothing actually zeroized anything before
+    /// this). Scope note, stated honestly rather than silently: this only
+    /// covers the copy handed out by *this* call. `Vault`'s own internal
+    /// `key` field is deliberately left as plain `chacha20poly1305::Key`,
+    /// NOT zeroized on `Vault::drop` — doing that would mean either
+    /// wrapping every internal use site or a bigger `chacha20poly1305`
+    /// interop change, out of scope for this pass. The export path and the
+    /// `setup`-side local are what matter for dbc-mcp's threat model, since
+    /// that's the only place the key transiently exists outside the vault
+    /// before landing in an OS credential store.
+    ///
+    /// SECURITY (review round 1 finding #4): this method is intentionally
+    /// `pub` so `dbc-mcp setup` can call it from outside this crate, which
+    /// necessarily widens the exposure surface of a security primitive
+    /// (the vault's derived key) beyond `Vault` itself. Callers must never
+    /// persist the returned key anywhere except an OS-backed credential
+    /// store (Windows Credential Manager / macOS Keychain / Secret
+    /// Service) — never to a plain file, a log line, or a config file.
+    pub fn export_key(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.key.into())
+    }
+
     fn persist(&mut self) -> Result<(), StateError> {
         let cipher = ChaCha20Poly1305::new(&self.key);
         let mut nonce_arr = [0u8; 12];
@@ -178,6 +243,38 @@ mod tests {
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes));
         std::fs::write(&p, serde_json::to_string(&env).unwrap()).unwrap();
         assert!(Vault::unlock(&p, "pw").is_err());
+    }
+
+    #[test]
+    fn unlock_with_key_roundtrips_after_password_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("vault.bin");
+        let mut v = Vault::create(&p, "correct horse").unwrap();
+        v.set_secret("c1", "tajne-heslo").unwrap();
+        let key = v.export_key();
+        drop(v);
+
+        // Curated path: open with the exported key, no password involved.
+        let v2 = Vault::unlock_with_key(&p, &key).unwrap();
+        assert_eq!(v2.get_secret("c1").as_deref(), Some("tajne-heslo"));
+
+        // Locking (dropping) and reopening with the same key still works.
+        drop(v2);
+        let v3 = Vault::unlock_with_key(&p, &key).unwrap();
+        assert_eq!(v3.get_secret("c1").as_deref(), Some("tajne-heslo"));
+    }
+
+    #[test]
+    fn unlock_with_key_wrong_key_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("vault.bin");
+        let v = Vault::create(&p, "correct horse").unwrap();
+        let mut wrong_key = v.export_key();
+        wrong_key[0] ^= 0xFF; // flip a bit: definitely the wrong key
+        drop(v);
+
+        let err = Vault::unlock_with_key(&p, &wrong_key).unwrap_err();
+        assert!(err.message.contains("unlock"), "got: {}", err.message);
     }
 
     #[test]

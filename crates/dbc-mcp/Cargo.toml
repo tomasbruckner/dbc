@@ -1,0 +1,33 @@
+[package]
+name = "dbc-mcp"
+version = "0.1.0"
+edition.workspace = true
+description = "MCP server exposing dbc's saved connections to LLM tools, read-only."
+
+[[bin]]
+name = "dbc-mcp"
+path = "src/main.rs"
+
+[dependencies]
+dbc-core = { path = "../dbc-core" }
+dbc-buffer = { path = "../dbc-buffer" }
+dbc-state = { path = "../dbc-state" }
+dbc-driver-sqlite = { path = "../dbc-driver-sqlite" }
+dbc-driver-postgres = { path = "../dbc-driver-postgres" }
+rmcp = { version = "3.1.4", features = ["transport-io"] }
+tokio = { workspace = true, features = ["io-std"] }
+tokio-postgres = "0.7"
+serde.workspace = true
+serde_json.workspace = true
+schemars = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+dirs.workspace = true
+keyring = "4"
+rpassword = "7"
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite.workspace = true
+async-trait.workspace = true
