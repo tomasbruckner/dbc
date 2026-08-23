@@ -87,9 +87,12 @@ pub fn sql_value(v: Option<&str>, numeric: bool) -> String {
         Some(s) => {
             if numeric {
                 let trimmed = s.trim();
-                if !trimmed.is_empty()
-                    && (trimmed.parse::<i128>().is_ok() || trimmed.parse::<f64>().is_ok())
-                {
+                // f64 accepts "NaN"/"inf"/"infinity", which are NOT valid
+                // SQL numeral tokens — only finite parses emit bare (Task 2
+                // review issue 1); everything else falls through to the
+                // quoted let-the-server-decide path.
+                let finite_float = trimmed.parse::<f64>().map(|f| f.is_finite()).unwrap_or(false);
+                if !trimmed.is_empty() && (trimmed.parse::<i128>().is_ok() || finite_float) {
                     return trimmed.to_string();
                 }
             }
@@ -126,6 +129,13 @@ pub fn generate_statements(
     edits: &EditState,
     original: &mut dyn FnMut(usize, usize) -> Option<String>,
 ) -> Vec<(String, Option<u64>)> {
+    // Brief invariant: editable tables always have a detected PK. An empty
+    // slice would emit `WHERE ` (fails as a syntax error, not a mass
+    // update, but must never be constructed) — Task 2 review issue 3.
+    debug_assert!(
+        !meta.pk_cols.is_empty(),
+        "generate_statements requires a non-empty pk_cols"
+    );
     let mut out = Vec::new();
     let table = quote_qualified(meta.schema, meta.table);
 
@@ -463,5 +473,70 @@ mod tests {
         edits.toggle_delete(3);
         assert!(!edits.deleted_rows.contains(&3));
         assert!(!edits.is_dirty());
+    }
+
+    // Task 2 review issue 1: f64 parses "NaN"/"inf"/"infinity" but they are
+    // not SQL numerals — they must fall through to the quoted path.
+    #[test]
+    fn non_finite_floats_are_quoted_not_bare() {
+        assert_eq!(sql_value(Some("NaN"), true), "'NaN'");
+        assert_eq!(sql_value(Some("inf"), true), "'inf'");
+        assert_eq!(sql_value(Some("-inf"), true), "'-inf'");
+        assert_eq!(sql_value(Some("infinity"), true), "'infinity'");
+        // Finite scientific notation stays bare (review issue 2: intended).
+        assert_eq!(sql_value(Some("1e5"), true), "1e5");
+    }
+
+    // Task 2 review required addition: multi-column PK — every pk column
+    // ANDed into the WHERE, in pk_cols order.
+    #[test]
+    fn multi_column_pk_where_is_anded() {
+        let h = headers(&["a", "b", "v"]);
+        let m = meta(None, "t", &h, &[0, 1], &[true, false, false]);
+        let mut edits = EditState::default();
+        edits.stage_cell(0, 2, Some("x".into()));
+        let mut original = |row: usize, col: usize| -> Option<String> {
+            match (row, col) {
+                (0, 0) => Some("7".into()),
+                (0, 1) => Some("k".into()),
+                _ => None,
+            }
+        };
+        let stmts = generate_statements(&m, &edits, &mut original);
+        assert_eq!(
+            stmts[0].0,
+            "UPDATE \"t\" SET \"v\" = 'x' WHERE \"a\" = 7 AND \"b\" = 'k'"
+        );
+    }
+
+    // Task 2 review required addition: editing the PK column itself — the
+    // WHERE must use the ORIGINAL value, the SET the staged one.
+    #[test]
+    fn editing_pk_column_uses_original_in_where() {
+        let h = headers(&["id"]);
+        let m = meta(None, "t", &h, &[0], &[true]);
+        let mut edits = EditState::default();
+        edits.stage_cell(0, 0, Some("2".into()));
+        let mut original = |row: usize, col: usize| -> Option<String> {
+            if row == 0 && col == 0 { Some("1".into()) } else { None }
+        };
+        let stmts = generate_statements(&m, &edits, &mut original);
+        assert_eq!(stmts[0].0, "UPDATE \"t\" SET \"id\" = 2 WHERE \"id\" = 1");
+    }
+
+    // Task 2 review required addition: an insert row with every cell
+    // explicitly staged NULL must emit VALUES (NULL, ...), never DEFAULT
+    // VALUES (which would take table defaults instead of NULLs).
+    #[test]
+    fn insert_all_explicit_nulls_emits_values_not_defaults() {
+        let h = headers(&["a", "b"]);
+        let m = meta(None, "t", &h, &[0], &[false, false]);
+        let mut edits = EditState::default();
+        let ix = edits.add_insert_row(2);
+        edits.stage_insert_cell(ix, 0, None);
+        edits.stage_insert_cell(ix, 1, None);
+        let stmts = generate_statements(&m, &edits, &mut |_, _| None);
+        assert_eq!(stmts[0].0, "INSERT INTO \"t\" (\"a\", \"b\") VALUES (NULL, NULL)");
+        assert_eq!(stmts[0].1, None);
     }
 }
