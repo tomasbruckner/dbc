@@ -1521,7 +1521,12 @@ impl AppView {
                 cx.notify();
             }
             plan::AnalyzeGate::NeedsConfirm => {
-                self.modal = Some(connections_ui::ModalState::AnalyzeWriteConfirm { sql, engine });
+                self.modal = Some(connections_ui::ModalState::AnalyzeWriteConfirm {
+                    sql,
+                    engine,
+                    running: false,
+                    error: None,
+                });
                 cx.notify();
             }
         }
@@ -1654,25 +1659,53 @@ impl AppView {
     /// dedicated-connection BEGIN…ROLLBACK sequence), called from the
     /// `ModalState::AnalyzeWriteConfirm` dialog's "Analyzovat" button
     /// (connections_ui.rs).
+    ///
+    /// Review fix (MAJOR, adversarial review of commit 0bab655): the first
+    /// version of this method used `self.cancel = Some(CancelToken::new())`
+    /// as a busy-guard, but that token was never threaded into
+    /// `QueryRunner::run_analyze_write` (which builds its own internal
+    /// token in `run_analyze_write_inner`) — Escape while "analyzuji
+    /// plán…" showed would clear `self.cancel`, print a false
+    /// "cancelling…" status, and re-enable every other busy-guard that
+    /// checks `self.cancel.is_none()`, letting a second query/Explain/
+    /// Analyze dispatch start while the original BEGIN…EXPLAIN ANALYZE…
+    /// ROLLBACK was still running server-side (which would then land its
+    /// result and silently clobber whatever the second dispatch had just
+    /// shown). Fixed by mirroring `on_confirm_apply`'s pattern instead
+    /// (`ApplyDialogState::running`): `self.modal` stays `Some(..)` —
+    /// mutated in place, never `.take()`n — for the WHOLE duration of the
+    /// analyze (not just cleared and re-substituted by a cancel token), so
+    /// the SAME `self.modal.is_some()` checks `run_query`/`run_query_with`/
+    /// `run_explain` already use to refuse a second dispatch cover this
+    /// path for free, and (per `on_cancel_query`'s `closable` match, which
+    /// only allow-lists `ConnectionDialog`/`QueryParams` — every other
+    /// modal, `AnalyzeWriteConfirm` included, falls into its `_ => false`
+    /// arm) Escape is now a structural no-op against this dialog, exactly
+    /// like it already was against `KillConfirm`. `self.cancel`/
+    /// `self.run_generation` are never touched by this method — same as
+    /// `on_confirm_apply`.
     fn on_confirm_analyze_write(
         &mut self,
         engine: dbc_state::Engine,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(connections_ui::ModalState::AnalyzeWriteConfirm { sql, .. }) = self.modal.take() else {
-            return;
-        };
+        // Pure guard (unit-tested directly, connections_ui.rs): `None` for
+        // no modal, a DIFFERENT modal, or a re-click while `running` is
+        // already `true` — see its doc comment for why this is the actual
+        // mechanism (not `self.cancel`) that makes a second dispatch a
+        // structural no-op.
+        let Some(sql) = connections_ui::analyze_write_dispatch_sql(&self.modal) else { return };
+
         let Some((_, timeout_secs, _, spec)) = self.resolve_spec_for_explain(cx) else { return };
         let Some(explain_sql) = plan::explain_analyze_sql(engine, &sql) else { return };
 
-        // Blocks a second run while this awaits; cleared below regardless
-        // of outcome (Ok/Err/cancelled), same "always clear on the tail
-        // update" shape `run_query_with`'s own spawn uses.
-        self.cancel = Some(CancelToken::new());
-        self.run_generation += 1;
-        let my_generation = self.run_generation;
-        self.status = "analyzuji plán (BEGIN…ROLLBACK)…".to_string();
+        if let Some(connections_ui::ModalState::AnalyzeWriteConfirm { running, error, .. }) =
+            &mut self.modal
+        {
+            *running = true;
+            *error = None;
+        }
         cx.notify();
 
         let sql_title = format!("Plán: {}", collapse_title(&sql));
@@ -1681,13 +1714,13 @@ impl AppView {
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, move |view, cx| {
-                if view.run_generation != my_generation {
-                    return;
-                }
-                view.cancel = None;
                 match result {
                     Ok(Ok(raw_text)) => match plan::parse_plan(engine, true, &raw_text) {
                         Ok(parsed) => {
+                            // Brief-mirroring `on_confirm_apply`'s success
+                            // shape: close the dialog, open the result tab,
+                            // global status takes over from here.
+                            view.modal = None;
                             let parsed = Rc::new(parsed);
                             let view_entity = cx.new(|cx| plan::PlanView::new(parsed, cx));
                             view.tabs.open(ResultTab {
@@ -1700,10 +1733,40 @@ impl AppView {
                             });
                             view.status = "hotovo (změny vráceny zpět)".to_string();
                         }
-                        Err(e) => view.status = format!("error parsování plánu: {e}"),
+                        Err(e) => {
+                            if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
+                                running,
+                                error,
+                                ..
+                            }) = &mut view.modal
+                            {
+                                *running = false;
+                                *error = Some(format!("error parsování plánu: {e}"));
+                            }
+                        }
                     },
-                    Ok(Err(e)) => view.status = format!("error: {e}"),
-                    Err(_canceled) => view.status = "error: analýza zrušena".to_string(),
+                    Ok(Err(e)) => {
+                        if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
+                            running,
+                            error,
+                            ..
+                        }) = &mut view.modal
+                        {
+                            *running = false;
+                            *error = Some(e.to_string());
+                        }
+                    }
+                    Err(_canceled) => {
+                        if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
+                            running,
+                            error,
+                            ..
+                        }) = &mut view.modal
+                        {
+                            *running = false;
+                            *error = Some("analýza zrušena".to_string());
+                        }
+                    }
                 }
                 cx.notify();
             });

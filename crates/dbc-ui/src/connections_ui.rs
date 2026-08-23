@@ -957,7 +957,19 @@ pub enum ModalState {
     /// verbatim so the user sees exactly what will actually run (and be
     /// rolled back). `engine` is needed at confirm time to rebuild the
     /// wrapped `EXPLAIN ANALYZE` SQL via `plan::explain_analyze_sql`.
-    AnalyzeWriteConfirm { sql: String, engine: Engine },
+    ///
+    /// Review fix (MAJOR, adversarial review of commit 0bab655): `running`/
+    /// `error` mirror `ApplyDialogState`'s exact shape — `self.modal` stays
+    /// `Some(AnalyzeWriteConfirm { running: true, .. })` (mutated in place,
+    /// never cleared) for the WHOLE duration of the analyze, so the
+    /// existing `self.modal.is_some()` busy-guards elsewhere refuse a
+    /// second dispatch, and Escape (which only allow-lists
+    /// `ConnectionDialog`/`QueryParams` as closable — see
+    /// `AppView::on_cancel_query`) is a structural no-op against it rather
+    /// than the previous version's `self.cancel`-based guard, which was
+    /// never actually wired to `QueryRunner::run_analyze_write` and so
+    /// could be defeated by Escape mid-flight.
+    AnalyzeWriteConfirm { sql: String, engine: Engine, running: bool, error: Option<String> },
 }
 
 // ---------------------------------------------------------------------
@@ -1084,8 +1096,8 @@ impl AppView {
             ModalState::KillConfirm { pid, label, sql, error, dispatched, .. } => {
                 render_kill_confirm_panel(pid, &label, &sql, &error, dispatched, cx)
             }
-            ModalState::AnalyzeWriteConfirm { sql, engine } => {
-                render_analyze_write_confirm_panel(&sql, engine, cx)
+            ModalState::AnalyzeWriteConfirm { sql, engine, running, error } => {
+                render_analyze_write_confirm_panel(&sql, engine, running, &error, cx)
             }
         };
         Some(
@@ -2052,6 +2064,29 @@ fn kill_confirm_dispatch_target(modal: &Option<ModalState>) -> Option<(i64, u64)
     }
 }
 
+/// Pure guard for `AppView::on_confirm_analyze_write` (MAJOR review fix on
+/// commit 0bab655): `Some(sql)` when an OPEN `AnalyzeWriteConfirm` dialog
+/// isn't already running; `None` when there's no `AnalyzeWriteConfirm` open
+/// at all, OR one is open but `running` is already `true`. This is what
+/// makes the busy-guard for the analyze-write sequence structural rather
+/// than the earlier (buggy) `self.cancel`-token approach: `self.modal`
+/// stays `Some(AnalyzeWriteConfirm { running: true, .. })` — mutated in
+/// place, never cleared — for the whole duration of the analyze, so (a) a
+/// second "Analyzovat" click routes through this SAME guard and is a
+/// no-op, exactly like `kill_confirm_dispatch_target` above, and (b) Esc
+/// can't defeat it either — `on_cancel_query`'s `closable` match only
+/// allow-lists `ConnectionDialog`/`QueryParams`, so `AnalyzeWriteConfirm`
+/// (like `KillConfirm`) falls into its `_ => false` arm and Esc is
+/// structurally inert against it, whether or not the analyze is running.
+/// Same "pure logic, thin cx-touching wrapper" testability rationale as
+/// `kill_confirm_dispatch_target`.
+pub(crate) fn analyze_write_dispatch_sql(modal: &Option<ModalState>) -> Option<String> {
+    match modal {
+        Some(ModalState::AnalyzeWriteConfirm { sql, running: false, .. }) => Some(sql.clone()),
+        _ => None,
+    }
+}
+
 /// Pure guard for `AppView::on_monitor_view_event` (MAJOR review fix): does
 /// the resolving `KillFinished` event — from tab `event_tab_id`, for
 /// `event_pid` — belong to the CURRENTLY open `KillConfirm` dialog? A
@@ -2181,13 +2216,21 @@ fn render_kill_confirm_panel(
 /// Confirming dispatches `AppView::on_confirm_analyze_write` (main.rs),
 /// which resolves the spec, rebuilds the wrapped `EXPLAIN ANALYZE` SQL, and
 /// calls `QueryRunner::run_analyze_write`.
+/// `running`/`error` mirror `render_apply_dialog_overlay`'s exact shape
+/// (`AppView::render_apply_dialog_overlay`, main.rs): both buttons disabled
+/// (no `cursor_pointer`/`on_click`) while `running`, an "analyzuji…" note
+/// shown while in flight, and any `error` from a failed/cancelled run shown
+/// beneath it — the dialog stays open on error so a retry ("Analyzovat"
+/// again) or an explicit "Zrušit" are both still available, same as Apply.
 fn render_analyze_write_confirm_panel(
     sql: &str,
     engine: Engine,
+    running: bool,
+    error: &Option<String>,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let sql = sql.to_string();
-    div()
+    let mut panel = div()
         .id("analyze-write-confirm")
         .w(px(520.))
         .bg(rgb(0x1e1e2e))
@@ -2214,30 +2257,56 @@ fn render_analyze_write_confirm_panel(
                 .text_color(rgb(0xa6adc8))
                 .whitespace_normal()
                 .child(sql),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap_2()
-                .justify_end()
-                .mt_2()
-                .child(
-                    styled_button("analyze-write-cancel", "Zrušit")
-                        .on_click(cx.listener(|v, _, _, cx| {
+        );
+
+    if running {
+        panel = panel.child(div().text_color(rgb(0xf9e2af)).child("analyzuji (BEGIN…ROLLBACK)…"));
+    }
+    if let Some(err) = error {
+        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {err}")));
+    }
+
+    panel = panel.child(
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .justify_end()
+            .mt_2()
+            .child(
+                div()
+                    .id("analyze-write-cancel")
+                    .when(!running, |d| {
+                        d.cursor_pointer().on_click(cx.listener(|v, _, _, cx| {
                             v.modal = None;
                             cx.notify();
-                        })),
-                )
-                .child(
-                    styled_button("analyze-write-confirm-btn", "Analyzovat")
-                        .bg(rgb(0x5d2e2e)) // danger tint — DELETED_ROW_BG family, matches kill-confirm
-                        .on_click(cx.listener(move |v, _, window, cx| {
+                        }))
+                    })
+                    .bg(rgb(0x313244))
+                    .text_color(if running { rgb(0x6c7086) } else { rgb(0xcdd6f4) })
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .child("Zrušit"),
+            )
+            .child(
+                div()
+                    .id("analyze-write-confirm-btn")
+                    .when(!running, |d| {
+                        d.cursor_pointer().on_click(cx.listener(move |v, _, window, cx| {
                             v.on_confirm_analyze_write(engine, window, cx);
-                        })),
-                ),
-        )
-        .into_any_element()
+                        }))
+                    })
+                    // danger tint — DELETED_ROW_BG family, matches kill-confirm — dimmed while running.
+                    .bg(if running { rgb(0x313244) } else { rgb(0x5d2e2e) })
+                    .text_color(if running { rgb(0x6c7086) } else { rgb(0xcdd6f4) })
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .child(if running { "Analyzuji…" } else { "Analyzovat" }),
+            ),
+    );
+    panel.into_any_element()
 }
 
 #[cfg(test)]
@@ -2343,5 +2412,59 @@ mod kill_confirm_tests {
         assert_eq!(*pid, 2);
         assert_eq!(*error, None);
         assert!(*dispatched, "unrelated dialog's in-flight state must be untouched");
+    }
+}
+
+/// G13 T6 MAJOR review fix (adversarial review of commit 0bab655): pins
+/// `analyze_write_dispatch_sql`'s busy-guard — the mechanism that replaced
+/// the earlier `self.cancel`-token approach, which could be defeated by
+/// Escape (see that function's doc comment for the full story).
+#[cfg(test)]
+mod analyze_write_confirm_tests {
+    use super::*;
+
+    fn analyze_confirm(sql: &str, running: bool) -> Option<ModalState> {
+        Some(ModalState::AnalyzeWriteConfirm {
+            sql: sql.to_string(),
+            engine: Engine::Postgres,
+            running,
+            error: None,
+        })
+    }
+
+    #[test]
+    fn dispatch_sql_none_when_no_dialog_open() {
+        assert_eq!(analyze_write_dispatch_sql(&None), None);
+    }
+
+    #[test]
+    fn dispatch_sql_none_for_an_unrelated_modal() {
+        let modal = Some(ModalState::QueryParams {
+            names: Vec::new(),
+            inputs: Vec::new(),
+            null_flags: Vec::new(),
+            sql_template: "SELECT 1".into(),
+            bypass_auto_limit: false,
+            error: None,
+        });
+        assert_eq!(analyze_write_dispatch_sql(&modal), None);
+    }
+
+    #[test]
+    fn dispatch_sql_some_when_not_yet_running() {
+        let modal = analyze_confirm("UPDATE t SET x = 1", false);
+        assert_eq!(analyze_write_dispatch_sql(&modal), Some("UPDATE t SET x = 1".to_string()));
+    }
+
+    #[test]
+    fn dispatch_sql_none_once_already_running() {
+        // The core regression pin for the MAJOR fix: a second confirm
+        // click (or, before the fix, a false Escape-triggered re-enable
+        // via the old `self.cancel`-based guard) must be a no-op while the
+        // first analyze is still in flight — `self.modal` stays `Some(..)`
+        // with `running: true` for the whole duration, so this guard alone
+        // is what makes a second dispatch impossible now.
+        let modal = analyze_confirm("UPDATE t SET x = 1", true);
+        assert_eq!(analyze_write_dispatch_sql(&modal), None);
     }
 }
