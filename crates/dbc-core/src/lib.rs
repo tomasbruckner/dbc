@@ -6,6 +6,7 @@ mod error;
 mod guards;
 mod params;
 mod schema;
+mod split;
 mod stream;
 
 pub use cancel::CancelToken;
@@ -18,6 +19,7 @@ pub use schema::{
     ColumnInfo, ConstraintInfo, FkRef, IndexInfo, RoutineInfo, RoutineKind, SchemaSnapshot,
     SequenceInfo, TableInfo, TableKind, TriggerInfo,
 };
+pub use split::{split_sql, Dialect, SplitError, StatementSplitter, UnterminatedKind};
 pub use stream::{QueryStream, BATCH_LATENCY, BATCH_ROWS, CHANNEL_CAPACITY};
 
 // Re-export so drivers/UI use one arrow version.

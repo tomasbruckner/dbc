@@ -118,6 +118,12 @@ pub enum PaletteAction {
     /// reduction, see this plan's T6 Grounding: no disabled-row rendering
     /// precedent exists in this file today).
     RestoreDatabase,
+    /// G12 T3: opens the file-picker + pre-scan + confirm-modal flow for a
+    /// single `.sql` script (`AppView::start_script_pick(false, ..)`).
+    RunSqlFile,
+    /// G12 T3: same flow, folder mode — non-recursive `*.sql` listing
+    /// (`AppView::start_script_pick(true, ..)`).
+    RunSqlFolder,
 }
 
 /// One table/view from the current schema snapshot, plus whether it's
@@ -166,6 +172,8 @@ pub fn fixed_actions(monitor_available: bool, connection_active: bool) -> Vec<(S
         ("Obnovit schéma".to_string(), PaletteAction::RefreshSchema),
         ("ER diagram".to_string(), PaletteAction::ShowErDiagram),
         ("Porovnat databáze…".to_string(), PaletteAction::OpenCompare),
+        ("Spustit SQL soubor…".to_string(), PaletteAction::RunSqlFile),
+        ("Spustit SQL složku…".to_string(), PaletteAction::RunSqlFolder),
     ];
     if monitor_available {
         actions.push(("Monitor serveru".to_string(), PaletteAction::OpenMonitor));
@@ -402,8 +410,9 @@ mod rank_items_tests {
         let items = rank_items("", &tables, &history, &connections, false, 30, false);
 
         // Favourites (alphabetical) first, then history (as given), then
-        // connections, then the fixed actions (5 base + G7 T6's
-        // "Porovnat databáze…" = 6, monitor_available=false here).
+        // connections, then the fixed actions (5 base + ER diagram +
+        // G7's compare + G12's two script actions = 9,
+        // monitor_available=false here).
         assert_eq!(
             items[0],
             PaletteItem::Table { schema: None, name: "aaa_fav".into() }
@@ -413,10 +422,11 @@ mod rank_items_tests {
         assert_eq!(items[3], PaletteItem::HistoryEntry { id: 2, sql: "select 2".into() });
         assert_eq!(items[4], PaletteItem::Connection { id: "c1".into(), name: "prod".into() });
         assert!(matches!(items[5], PaletteItem::Action { .. }));
-        // base actions + G8's "ER diagram" (ShowErDiagram) + G7's "Porovnat
-        // databáze…" (OpenCompare) — both unconditional, unlike OpenMonitor
-        // which is engine-gated.
-        assert_eq!(items.len(), 2 + 2 + 1 + 7);
+        // 5 base actions + G8 T6's "ER diagram" (`ShowErDiagram`) + G7's
+        // "Porovnat databáze…" (`OpenCompare`) + G12 T3's "Spustit SQL
+        // soubor…"/"Spustit SQL složku…" — all unconditional, unlike
+        // `OpenMonitor` which is engine-gated (monitor_available=false here).
+        assert_eq!(items.len(), 2 + 2 + 1 + 9);
     }
 
     #[test]

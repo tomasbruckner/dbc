@@ -989,6 +989,81 @@ pub enum ModalState {
     /// establishes. See `crate::backup::BackupSession`'s own doc comment
     /// for why the session lives in `backup.rs` rather than as fields here.
     BackupRestore(crate::backup::BackupSession),
+    /// G12 T3: script-runner confirm modal (design §3) — opened by
+    /// `AppView::start_script_pick` once the file/folder picker resolves and
+    /// the pre-scan has counted each file's statements. Confirmed via
+    /// `AppView::confirm_script_run`, which RE-RESOLVES the connection spec
+    /// fresh at confirm time (same `resolve_spec_for_explain` precedent
+    /// `AnalyzeWriteConfirm` uses above) rather than storing one here — this
+    /// modal only carries display data plus the user's tx-scope/error-policy
+    /// choice; `conn_label`/`read_only`/`timeout_secs` are a snapshot taken
+    /// at pick time purely for the confirm dialog's own display (the "jen
+    /// pro čtení" badge + timeout line), not re-validated against a possible
+    /// connection switch in between — the modal occludes the top bar, so a
+    /// switch can't happen while it's open.
+    ScriptRun {
+        /// (path, pre-scanned statement count) per file, run order.
+        files: Vec<std::path::PathBuf>,
+        file_counts: Vec<usize>,
+        tx_scope: crate::runner::TxScope,
+        error_policy: crate::runner::ErrorPolicy,
+        /// "{filename}" for a single file, or "{foldername}/ ({n} souborů)"
+        /// for a folder run — drives the modal heading AND the progress
+        /// tab's title.
+        source_label: String,
+        conn_label: String,
+        read_only: bool,
+        timeout_secs: Option<u64>,
+        /// Review fix (MAJOR 1, same pattern as `CsvImport.conn_identity`
+        /// below): the STABLE identity (`AppView::current_conn_identity`)
+        /// captured at `start_script_pick` dispatch time, BEFORE the file
+        /// picker + background pre-scan ever ran — both leave the
+        /// connection dropdown clickable. `confirm_script_run` re-verifies
+        /// this against the CURRENTLY active connection before dispatching
+        /// anything; on mismatch it refuses rather than running a stale
+        /// file/folder selection against a different, currently-active
+        /// (writable) database.
+        conn_identity: String,
+    },
+    /// G12 T4: CSV import mapping modal (design §5) — opened once the file
+    /// picker + header/row pre-count pass resolve (`AppView::start_csv_import`).
+    /// `targets` is the live mapping being edited
+    /// (`AppView::cycle_csv_target`); `sample_sql` is recomputed on every
+    /// mapping change (`AppView::recompute_csv_sample`) from the REAL first
+    /// batch, never a synthetic example — an `Err` from
+    /// `csv_import::generate_insert_batches` (duplicate target) fills
+    /// `error` and disables "Spustit import". Same "re-resolve the spec
+    /// fresh at confirm time" posture as `ScriptRun` above — this modal only
+    /// carries display/editing data.
+    ///
+    /// Review fix (BLOCKER): `schema`/`table`/`columns` are a snapshot of
+    /// the connection ACTIVE at `start_csv_import` time — the file picker +
+    /// background pre-count pass do NOT block the UI, so the connection
+    /// dropdown stays clickable while this modal is being built (before it
+    /// even opens) and while it's open. `conn_identity` is the SAME stable
+    /// identity value `ResultTab::conn_identity`/`current_conn_identity`
+    /// use, captured at `start_csv_import` dispatch time — `confirm_csv_import`
+    /// re-checks it against the CURRENT active connection before building
+    /// anything, refusing on mismatch (same "connection changed out from
+    /// under staged state" guard `on_open_apply_dialog`/`on_confirm_apply`
+    /// already enforce for the Apply flow, main.rs). `conn_label` is
+    /// `current_connection_label()`'s snapshot, shown in the modal so the
+    /// target connection is visible (same convention `ScriptRun`'s
+    /// `conn_label` sets above).
+    CsvImport {
+        path: std::path::PathBuf,
+        schema: Option<String>,
+        table: String,
+        headers: Vec<String>,
+        columns: Vec<crate::csv_import::TargetColumn>,
+        targets: Vec<Option<usize>>,
+        row_count: usize,
+        first_rows: Vec<crate::csv_import::CsvRow>,
+        sample_sql: Option<String>,
+        error: Option<String>,
+        conn_identity: String,
+        conn_label: String,
+    },
 }
 
 // ---------------------------------------------------------------------
@@ -1122,6 +1197,42 @@ impl AppView {
                 render_compare_dialog_panel(conn_a, conn_b, error, self.grouped_cache.clone(), cx)
             }
             ModalState::BackupRestore(session) => render_backup_restore_panel(&session, cx),
+            ModalState::ScriptRun {
+                files,
+                file_counts,
+                tx_scope,
+                error_policy,
+                source_label,
+                conn_label,
+                read_only,
+                timeout_secs,
+                ..
+            } => render_script_run_confirm_panel(
+                &files,
+                &file_counts,
+                tx_scope,
+                error_policy,
+                &source_label,
+                &conn_label,
+                read_only,
+                timeout_secs,
+                cx,
+            ),
+            ModalState::CsvImport {
+                path,
+                table,
+                headers,
+                columns,
+                targets,
+                row_count,
+                sample_sql,
+                error,
+                conn_label,
+                ..
+            } => render_csv_import_panel(
+                &path, &table, &headers, &columns, &targets, row_count, &sample_sql, &error,
+                &conn_label, cx,
+            ),
         };
         Some(
             div()
@@ -2850,6 +2961,274 @@ mod compare_dialog_tests {
         };
         assert!(a.is_some() && b.is_some());
     }
+}
+
+/// G12 T3: `ModalState::ScriptRun`'s confirm panel — file list (with the
+/// pre-scanned per-file statement counts), the connection's name + a "jen
+/// pro čtení" badge when read-only, the tx-scope/error-policy radios (a
+/// click on a combination `script_options_valid` forbids is a no-op, dimmed
+/// rather than hidden — `AppView::set_script_tx_scope`/
+/// `set_script_error_policy` enforce the same rule server-side of the
+/// click), the fixed per-statement timeout (read from config, not
+/// editable), and "Spustit"/"Zrušit".
+#[allow(clippy::too_many_arguments)]
+fn render_script_run_confirm_panel(
+    files: &[std::path::PathBuf],
+    file_counts: &[usize],
+    tx_scope: crate::runner::TxScope,
+    error_policy: crate::runner::ErrorPolicy,
+    source_label: &str,
+    conn_label: &str,
+    read_only: bool,
+    timeout_secs: Option<u64>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    use crate::runner::{ErrorPolicy, TxScope};
+
+    let total: usize = file_counts.iter().sum();
+    let mut file_list = div().flex().flex_col().gap_1().max_h(px(160.)).overflow_hidden();
+    for (path, count) in files.iter().zip(file_counts.iter()) {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string());
+        file_list = file_list.child(
+            div().text_color(rgb(0xa6adc8)).child(format!("{name} — {count} příkazů")),
+        );
+    }
+
+    let mut conn_line = div().flex().flex_row().gap_2().text_color(rgb(0xa6adc8)).child(conn_label.to_string());
+    if read_only {
+        conn_line = conn_line.child(div().text_color(rgb(0xf9e2af)).child("jen pro čtení"));
+    }
+
+    let tx_option = |id: &'static str, label: &'static str, value: TxScope, current: TxScope| {
+        let valid = crate::script_options_valid(value, error_policy);
+        let selected = value == current;
+        let base = div().id(id).px_2().py_1().rounded_md().child(label);
+        if !valid {
+            base.text_color(rgb(0x45475a))
+        } else if selected {
+            base.cursor_pointer().bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4)).on_click(cx.listener(move |v, _, _, cx| {
+                v.set_script_tx_scope(value, cx);
+            }))
+        } else {
+            base.cursor_pointer().bg(rgb(0x313244)).text_color(rgb(0xa6adc8)).on_click(cx.listener(move |v, _, _, cx| {
+                v.set_script_tx_scope(value, cx);
+            }))
+        }
+    };
+    let policy_option = |id: &'static str, label: &'static str, value: ErrorPolicy, current: ErrorPolicy| {
+        let valid = crate::script_options_valid(tx_scope, value);
+        let selected = value == current;
+        let base = div().id(id).px_2().py_1().rounded_md().child(label);
+        if !valid {
+            base.text_color(rgb(0x45475a))
+        } else if selected {
+            base.cursor_pointer().bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4)).on_click(cx.listener(move |v, _, _, cx| {
+                v.set_script_error_policy(value, cx);
+            }))
+        } else {
+            base.cursor_pointer().bg(rgb(0x313244)).text_color(rgb(0xa6adc8)).on_click(cx.listener(move |v, _, _, cx| {
+                v.set_script_error_policy(value, cx);
+            }))
+        }
+    };
+
+    let timeout_line = match timeout_secs {
+        Some(t) => format!("timeout na příkaz: {t}s"),
+        None => "bez timeoutu".to_string(),
+    };
+
+    let panel = div()
+        .id("script-run-confirm")
+        .w(px(560.))
+        .bg(rgb(0x1e1e2e))
+        .border_1()
+        .border_color(rgb(0x45475a))
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(rgb(0xcdd6f4))
+        .child(div().text_size(px(16.)).child(format!("Spustit skript: {source_label}")))
+        .child(conn_line)
+        .child(file_list)
+        .child(div().text_color(rgb(0xa6adc8)).child(format!("celkem: {total} příkazů")))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_color(rgb(0xa6adc8)).child("Transakce"))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(tx_option("script-tx-none", "žádná transakce", TxScope::None, tx_scope))
+                        .child(tx_option("script-tx-perfile", "transakce na soubor", TxScope::PerFile, tx_scope))
+                        .child(tx_option("script-tx-whole", "jedna transakce na celý běh", TxScope::WholeRun, tx_scope)),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_color(rgb(0xa6adc8)).child("Při chybě"))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(policy_option("script-err-stop", "zastavit", ErrorPolicy::Stop, error_policy))
+                        .child(policy_option("script-err-continue", "pokračovat", ErrorPolicy::Continue, error_policy)),
+                ),
+        )
+        .child(div().text_color(rgb(0xa6adc8)).child(timeout_line))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .justify_end()
+                .mt_2()
+                .child(styled_button("script-run-cancel-modal", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+                .child(
+                    styled_button("script-run-confirm-btn", "Spustit")
+                        .on_click(cx.listener(|v, _, _, cx| v.confirm_script_run(cx))),
+                ),
+        );
+    panel.into_any_element()
+}
+
+/// G12 T4: `ModalState::CsvImport`'s mapping panel — file path, target
+/// table, per-header mapping row (a lightweight cycle-button through
+/// "(přeskočit)" -> each target column, same idiom as the grid's "Export ▾"
+/// menu rather than a real dropdown — `AppView::cycle_csv_target`), exact
+/// row count, the fixed batch size, and the REAL first batch's `INSERT`
+/// verbatim (recomputed on every mapping change by
+/// `AppView::recompute_csv_sample`) in a scrollable monospace box. A
+/// duplicate-target `error` disables "Spustit import". `conn_label` (review
+/// fix, BLOCKER) is shown so the target connection is visible before
+/// confirming — same convention `render_script_run_confirm_panel`'s
+/// `conn_label` sets; `confirm_csv_import` re-verifies the STABLE identity
+/// (not the label) is unchanged before dispatching.
+#[allow(clippy::too_many_arguments)]
+fn render_csv_import_panel(
+    path: &std::path::Path,
+    table: &str,
+    headers: &[String],
+    columns: &[crate::csv_import::TargetColumn],
+    targets: &[Option<usize>],
+    row_count: usize,
+    sample_sql: &Option<String>,
+    error: &Option<String>,
+    conn_label: &str,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let mut mapping_rows = div().flex().flex_col().gap_1().max_h(px(220.)).overflow_hidden();
+    for (ix, header) in headers.iter().enumerate() {
+        let target_label = targets
+            .get(ix)
+            .copied()
+            .flatten()
+            .and_then(|t| columns.get(t))
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "(přeskočit)".to_string());
+        mapping_rows = mapping_rows.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(div().w(px(160.)).text_color(rgb(0xa6adc8)).child(header.clone()))
+                .child(
+                    div()
+                        .id(("csv-target-cycle", ix))
+                        .px_2()
+                        .py_1()
+                        .bg(rgb(0x313244))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .child(format!("→ {target_label}"))
+                        .on_click(cx.listener(move |v, _, _, cx| v.cycle_csv_target(ix, cx))),
+                ),
+        );
+    }
+
+    let mut panel = div()
+        .id("csv-import-modal")
+        .w(px(600.))
+        .bg(rgb(0x1e1e2e))
+        .border_1()
+        .border_color(rgb(0x45475a))
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(rgb(0xcdd6f4))
+        .child(div().text_size(px(16.)).child(format!("Import CSV do {table}")))
+        .child(div().text_color(rgb(0xa6adc8)).child(format!("připojení: {conn_label}")))
+        .child(div().text_color(rgb(0xa6adc8)).child(path.display().to_string()))
+        .child(mapping_rows)
+        .child(div().text_color(rgb(0xa6adc8)).child(format!(
+            "{row_count} řádků · dávka: {} řádků",
+            crate::csv_import::CSV_IMPORT_BATCH_SIZE
+        )))
+        .child(
+            div()
+                .text_color(rgb(0xa6adc8))
+                .child("prázdné pole → NULL; hlavičkový řádek je povinný"),
+        );
+
+    if let Some(sql) = sample_sql {
+        panel = panel.child(
+            div()
+                .id("csv-sample-sql")
+                .max_h(px(140.))
+                .overflow_hidden()
+                .p_1()
+                .bg(rgb(0x181825))
+                .rounded_md()
+                .text_color(rgb(0xa6adc8))
+                .font_family("Consolas")
+                .whitespace_normal()
+                .child(sql.clone()),
+        );
+    }
+    if let Some(e) = error {
+        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {e}")));
+    }
+
+    let can_run = error.is_none() && sample_sql.is_some();
+    let confirm_btn = if can_run {
+        styled_button("csv-import-confirm-btn", "Spustit import")
+            .on_click(cx.listener(|v, _, _, cx| v.confirm_csv_import(cx)))
+            .into_any_element()
+    } else {
+        div()
+            .id("csv-import-confirm-btn")
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0x313244))
+            .text_color(rgb(0x6c7086))
+            .child("Spustit import")
+            .into_any_element()
+    };
+
+    panel = panel.child(
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .justify_end()
+            .mt_2()
+            .child(styled_button("csv-import-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+            .child(confirm_btn),
+    );
+    panel.into_any_element()
 }
 
 #[cfg(test)]
