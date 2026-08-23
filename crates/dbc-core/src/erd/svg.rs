@@ -24,6 +24,12 @@ pub fn escape_xml(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
+            // C0 control chars are illegal in XML 1.0 even as numeric
+            // character references (only #x9/#xA/#xD are permitted) — a NUL
+            // in an identifier would make the document unparseable. Drop
+            // them rather than emit spec-invalid output.
+            '\t' | '\n' | '\r' => out.push(c),
+            c if (c as u32) < 0x20 => {}
             _ => out.push(c),
         }
     }
@@ -142,6 +148,14 @@ mod tests {
     fn escape_xml_covers_all_five_characters() {
         assert_eq!(escape_xml("a<b>c&d\"e'f"), "a&lt;b&gt;c&amp;d&quot;e&apos;f");
         assert_eq!(escape_xml("plain"), "plain");
+    }
+
+    #[test]
+    fn escape_xml_drops_illegal_c0_controls_but_keeps_tab_lf_cr() {
+        // NUL and other C0 controls are unrepresentable in XML 1.0 — dropped.
+        assert_eq!(escape_xml("evil\u{0}name\u{1}\u{b}"), "evilname");
+        // The three XML-legal whitespace controls survive.
+        assert_eq!(escape_xml("a\tb\nc\rd"), "a\tb\nc\rd");
     }
 
     // REQUIRED test (Global Constraints, CURATION-binding): a table named
