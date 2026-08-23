@@ -42,9 +42,9 @@ use dbc_state::{
     ViewPrefsStore,
 };
 use gpui::{
-    actions, div, prelude::*, px, rgb, rgba, size, uniform_list, AnyElement, App, Bounds,
-    ClipboardItem, Context, Entity, Focusable, KeyBinding, PathPromptOptions, ScrollDelta,
-    ScrollWheelEvent, Window, WindowBounds, WindowOptions,
+    actions, div, prelude::*, px, size, uniform_list, AnyElement, App, Bounds, ClipboardItem,
+    Context, Entity, Focusable, KeyBinding, PathPromptOptions, ScrollDelta, ScrollWheelEvent,
+    Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use grid::{GridEvent, ResultGrid};
@@ -59,6 +59,7 @@ use tabs::{
     collapse_title, ResultTab, ScriptFileRow, ScriptFileStatus, ScriptRunOutcome, ScriptRunState,
     TabContent, Tabs,
 };
+use theme::ActiveTheme;
 
 actions!(
     dbc,
@@ -399,11 +400,16 @@ fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<Ap
     let files_total = s.files.len();
     let elapsed = s.elapsed.unwrap_or_else(|| s.started_at.elapsed());
     let running = matches!(s.outcome, ScriptRunOutcome::Running);
+    let theme = *cx.theme();
     let (outcome_label, outcome_color) = match s.outcome {
-        ScriptRunOutcome::Running => ("běží…", rgb(0xf9e2af)),
-        ScriptRunOutcome::Done => ("Hotovo", rgb(0xa6e3a1)),
-        ScriptRunOutcome::Failed => ("Selhalo", rgb(0xf38ba8)),
-        ScriptRunOutcome::Cancelled => ("Zrušeno", rgb(0x9399b2)),
+        ScriptRunOutcome::Running => ("běží…", theme.warn),
+        ScriptRunOutcome::Done => ("Hotovo", theme.success),
+        ScriptRunOutcome::Failed => ("Selhalo", theme.danger),
+        // G14 T9: no Rulebook-listed field for this exact hex (0x9399b2,
+        // Catppuccin overlay2) — nearest role match is the general
+        // secondary/de-emphasized text field, kept distinct from
+        // warn/success/danger used by the other three arms above.
+        ScriptRunOutcome::Cancelled => ("Zrušeno", theme.text_muted),
     };
 
     let mut header = div()
@@ -412,8 +418,8 @@ fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<Ap
         .items_center()
         .gap_3()
         .p_2()
-        .bg(rgb(0x181825))
-        .text_color(rgb(0xcdd6f4))
+        .bg(theme.bg_app)
+        .text_color(theme.text_primary)
         .child(format!("{files_done}/{files_total} souborů"))
         .child(format!("{}/{} příkazů", s.statements_run, s.total_statements));
     if let Some((done, total)) = s.progress_rows {
@@ -429,7 +435,7 @@ fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<Ap
                 .cursor_pointer()
                 .px_2()
                 .py_1()
-                .bg(rgb(0x5d2e2e))
+                .bg(theme.diff_deleted_bg)
                 .rounded_md()
                 .child("Zrušit")
                 .on_click(cx.listener(|view, _, _, cx| {
@@ -442,7 +448,7 @@ fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<Ap
         );
     }
 
-    let mut file_list = div().flex().flex_col().gap_1().p_2().text_color(rgb(0xa6adc8));
+    let mut file_list = div().flex().flex_col().gap_1().p_2().text_color(theme.text_muted);
     for f in &s.files {
         let glyph = match f.status {
             ScriptFileStatus::Pending => "·",
@@ -471,7 +477,7 @@ fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<Ap
         .flex_1()
         .overflow_hidden()
         .p_2()
-        .text_color(rgb(0x9399b2));
+        .text_color(theme.text_muted);
     for line in s.log.iter() {
         log_body = log_body.child(div().child(line.clone()));
     }
@@ -480,7 +486,7 @@ fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<Ap
         .flex()
         .flex_col()
         .flex_1()
-        .bg(rgb(0x1e1e2e))
+        .bg(theme.bg_panel)
         .child(header)
         .child(file_list)
         .child(log_body)
@@ -3646,11 +3652,12 @@ impl AppView {
         let selected = p.selected;
         let input = p.input.clone();
 
+        let theme = *cx.theme();
         let mut list = div().id("palette-list").flex().flex_col().flex_1().overflow_hidden();
         for (ix, item) in items.into_iter().enumerate() {
             let label = palette::display_label(&item);
             let is_selected = ix == selected;
-            let bg = if is_selected { rgb(0x45475a) } else { rgb(0x1e1e2e) };
+            let bg = if is_selected { theme.bg_selected } else { theme.bg_panel };
             list = list.child(
                 div()
                     .id(("palette-item", ix))
@@ -3658,8 +3665,8 @@ impl AppView {
                     .py_1()
                     .cursor_pointer()
                     .bg(bg)
-                    .text_color(rgb(0xcdd6f4))
-                    .hover(|s| s.bg(rgb(0x313244)))
+                    .text_color(theme.text_primary)
+                    .hover(|s| s.bg(theme.bg_hover))
                     .child(label)
                     .on_click(cx.listener(move |view, _, window, cx| {
                         view.execute_palette_item(item.clone(), window, cx);
@@ -3672,9 +3679,9 @@ impl AppView {
             .key_context("Palette")
             .w(px(560.))
             .max_h(px(420.))
-            .bg(rgb(0x1e1e2e))
+            .bg(theme.bg_panel)
             .border_1()
-            .border_color(rgb(0x45475a))
+            .border_color(theme.border)
             .rounded_md()
             .flex()
             .flex_col()
@@ -3682,7 +3689,7 @@ impl AppView {
             .on_action(cx.listener(Self::on_palette_down))
             .on_action(cx.listener(Self::on_palette_confirm))
             .on_action(cx.listener(Self::on_palette_close))
-            .child(div().px_2().py_2().border_b_1().border_color(rgb(0x45475a)).child(input))
+            .child(div().px_2().py_2().border_b_1().border_color(theme.border).child(input))
             .child(list);
 
         Some(
@@ -3695,7 +3702,7 @@ impl AppView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(0x00000099))
+                .bg(theme.bg_backdrop)
                 .occlude()
                 .child(panel)
                 .into_any_element(),
@@ -3910,6 +3917,7 @@ impl AppView {
         let candidates = ac.candidates.clone();
         let selected = ac.selected;
         let bounds = self.sql.read(cx).cursor_screen_bounds()?;
+        let theme = *cx.theme();
 
         const ROW_H: gpui::Pixels = px(22.);
         let visible_rows = candidates.len().min(8);
@@ -3918,15 +3926,16 @@ impl AppView {
             "autocomplete-list",
             candidates.len(),
             cx.processor(move |_this, range: std::ops::Range<usize>, _window, cx| {
+                let theme = *cx.theme();
                 let mut items = Vec::with_capacity(range.len());
                 for ix in range {
                     let c = candidates[ix].clone();
                     let is_selected = ix == selected;
-                    let bg = if is_selected { rgb(0x45475a) } else { rgb(0x1e1e2e) };
+                    let bg = if is_selected { theme.bg_selected } else { theme.bg_panel };
                     let (kind_label, kind_color) = match c.kind {
-                        autocomplete::CandidateKind::Keyword => ("K", rgb(0x89b4fa)),
-                        autocomplete::CandidateKind::Table => ("T", rgb(0xa6e3a1)),
-                        autocomplete::CandidateKind::Column => ("C", rgb(0xf9e2af)),
+                        autocomplete::CandidateKind::Keyword => ("K", theme.accent),
+                        autocomplete::CandidateKind::Table => ("T", theme.success),
+                        autocomplete::CandidateKind::Column => ("C", theme.warn),
                     };
                     let label = c.label.clone();
                     items.push(
@@ -3940,8 +3949,8 @@ impl AppView {
                             .px_2()
                             .cursor_pointer()
                             .bg(bg)
-                            .text_color(rgb(0xcdd6f4))
-                            .hover(|s| s.bg(rgb(0x313244)))
+                            .text_color(theme.text_primary)
+                            .hover(|s| s.bg(theme.bg_hover))
                             .child(div().w(px(10.)).text_size(px(11.)).text_color(kind_color).child(kind_label))
                             .child(div().flex_1().overflow_hidden().child(label))
                             .on_click(cx.listener(move |view, _, _window, cx| {
@@ -3964,9 +3973,9 @@ impl AppView {
                 .top(bounds.top() + bounds.size.height)
                 .w(px(280.))
                 .max_h(ROW_H * 8)
-                .bg(rgb(0x1e1e2e))
+                .bg(theme.bg_panel)
                 .border_1()
-                .border_color(rgb(0x45475a))
+                .border_color(theme.border)
                 .rounded_md()
                 .occlude()
                 .child(list)
@@ -5252,6 +5261,7 @@ impl AppView {
     /// Click activates. Active tab bg 0x313244, inactive 0x181825. Only
     /// called when there's at least one open tab (see `Render::render`).
     fn render_tab_strip(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.theme();
         let active_id = self.tabs.active().map(|t| t.id);
         let rows: Vec<(u64, String, bool, usize)> = self
             .tabs
@@ -5276,11 +5286,11 @@ impl AppView {
             })
             .collect();
 
-        let mut strip = div().id("tab-strip").flex().flex_row().h(px(28.)).bg(rgb(0x181825));
+        let mut strip = div().id("tab-strip").flex().flex_row().h(px(28.)).bg(theme.bg_app);
         for (id, title, pinned, row_count) in rows {
             let is_active = Some(id) == active_id;
-            let bg = if is_active { rgb(0x313244) } else { rgb(0x181825) };
-            let pin_color = if pinned { rgb(0xf9e2af) } else { rgb(0x6c7086) };
+            let bg = if is_active { theme.bg_hover } else { theme.bg_app };
+            let pin_color = if pinned { theme.warn } else { theme.text_disabled };
             strip = strip.child(
                 div()
                     .id(("tab", id as usize))
@@ -5291,7 +5301,7 @@ impl AppView {
                     .px_2()
                     .h_full()
                     .bg(bg)
-                    .text_color(rgb(0xcdd6f4))
+                    .text_color(theme.text_primary)
                     .cursor_pointer()
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.tabs.activate(id);
@@ -5345,8 +5355,9 @@ impl AppView {
     /// "Kopírovat" button that copies the whole text to the clipboard. With
     /// no tabs open at all, renders a neutral placeholder.
     fn render_tab_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
         let Some(active) = self.tabs.active() else {
-            return div().flex_1().bg(rgb(0x1e1e2e)).into_any_element();
+            return div().flex_1().bg(theme.bg_panel).into_any_element();
         };
 
         match &active.content {
@@ -5374,7 +5385,7 @@ impl AppView {
                     .flex_1()
                     .overflow_hidden()
                     .p_2()
-                    .text_color(rgb(0xcdd6f4))
+                    .text_color(theme.text_primary)
                     .on_scroll_wheel(cx.listener(|view, e: &ScrollWheelEvent, _, cx| {
                         let delta_lines = match e.delta {
                             ScrollDelta::Lines(p) => p.y,
@@ -5398,14 +5409,14 @@ impl AppView {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .bg(rgb(0x1e1e2e))
+                    .bg(theme.bg_panel)
                     .child(
                         div().flex().flex_row().justify_end().p_1().child(
                             div()
                                 .id("tab-copy")
                                 .cursor_pointer()
-                                .bg(rgb(0x313244))
-                                .text_color(rgb(0xcdd6f4))
+                                .bg(theme.bg_hover)
+                                .text_color(theme.text_primary)
                                 .px_2()
                                 .rounded_md()
                                 .child("Kopírovat")
@@ -5471,6 +5482,7 @@ impl AppView {
         let identity_ok =
             conn_identity_matches(&active.conn_identity, &self.current_conn_identity());
         let grid_for_discard = grid.clone();
+        let theme = *cx.theme();
         Some(
             div()
                 .id("apply-bar")
@@ -5480,8 +5492,8 @@ impl AppView {
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .bg(rgb(0x3a3a1e))
-                .text_color(rgb(0xf9e2af))
+                .bg(theme.bg_warn_banner)
+                .text_color(theme.warn)
                 .child(format!("{n} změn"))
                 .child(
                     div()
@@ -5494,14 +5506,14 @@ impl AppView {
                         })
                         .px_2()
                         .rounded_md()
-                        .bg(rgb(0x45475a))
-                        .text_color(if identity_ok { rgb(0xa6e3a1) } else { rgb(0x6c7086) })
+                        .bg(theme.bg_selected)
+                        .text_color(if identity_ok { theme.success } else { theme.text_disabled })
                         .child("Aplikovat"),
                 )
                 .when(!identity_ok, |d| {
                     d.child(
                         div()
-                            .text_color(rgb(0x6c7086))
+                            .text_color(theme.text_disabled)
                             .child("(jiné připojení — přepni se zpět)"),
                     )
                 })
@@ -5511,8 +5523,8 @@ impl AppView {
                         .cursor_pointer()
                         .px_2()
                         .rounded_md()
-                        .bg(rgb(0x45475a))
-                        .text_color(rgb(0xf38ba8))
+                        .bg(theme.bg_selected)
+                        .text_color(theme.danger)
                         .child("Zahodit")
                         .on_click(cx.listener(move |_, _, _, cx| {
                             grid_for_discard.update(cx, |g, cx| g.clear_edits(cx));
@@ -5531,19 +5543,20 @@ impl AppView {
     fn render_discard_confirm_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let dc = self.discard_confirm.as_ref()?;
         let n = dc.change_count;
+        let theme = *cx.theme();
 
         let panel = div()
             .id("discard-confirm-panel")
             .w(px(420.))
-            .bg(rgb(0x1e1e2e))
+            .bg(theme.bg_panel)
             .border_1()
-            .border_color(rgb(0x45475a))
+            .border_color(theme.border)
             .rounded_md()
             .flex()
             .flex_col()
             .p_2()
             .gap_2()
-            .text_color(rgb(0xcdd6f4))
+            .text_color(theme.text_primary)
             .child(format!("Neuložené změny ({n}) — zahodit?"))
             .child(
                 div()
@@ -5555,8 +5568,8 @@ impl AppView {
                         div()
                             .id("discard-confirm-yes")
                             .cursor_pointer()
-                            .bg(rgb(0x313244))
-                            .text_color(rgb(0xf38ba8))
+                            .bg(theme.bg_hover)
+                            .text_color(theme.danger)
                             .px_2()
                             .rounded_md()
                             .child("Zahodit")
@@ -5566,8 +5579,8 @@ impl AppView {
                         div()
                             .id("discard-confirm-no")
                             .cursor_pointer()
-                            .bg(rgb(0x313244))
-                            .text_color(rgb(0xcdd6f4))
+                            .bg(theme.bg_hover)
+                            .text_color(theme.text_primary)
                             .px_2()
                             .rounded_md()
                             .child("Zrušit")
@@ -5585,7 +5598,7 @@ impl AppView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(0x00000099))
+                .bg(theme.bg_backdrop)
                 .occlude()
                 .child(panel)
                 .into_any_element(),
@@ -5609,6 +5622,7 @@ impl AppView {
         let error = ad.error.clone();
         let focus_handle = ad.focus_handle.clone();
         let lines: Vec<String> = ad.statements.iter().map(|(s, _)| s.clone()).collect();
+        let theme = *cx.theme();
 
         let mut body = div()
             .id("apply-dialog-body")
@@ -5618,9 +5632,9 @@ impl AppView {
             .max_h(px(280.))
             .overflow_hidden()
             .p_2()
-            .bg(rgb(0x181825))
+            .bg(theme.bg_app)
             .rounded_md()
-            .text_color(rgb(0xcdd6f4));
+            .text_color(theme.text_primary);
         for line in &lines {
             body = body.child(div().whitespace_normal().child(line.clone()));
         }
@@ -5634,23 +5648,23 @@ impl AppView {
             .track_focus(&focus_handle)
             .w(px(640.))
             .max_h(px(480.))
-            .bg(rgb(0x1e1e2e))
+            .bg(theme.bg_panel)
             .border_1()
-            .border_color(rgb(0x45475a))
+            .border_color(theme.border)
             .rounded_md()
             .flex()
             .flex_col()
             .p_2()
             .gap_2()
-            .text_color(rgb(0xcdd6f4))
+            .text_color(theme.text_primary)
             .child(format!("Aplikovat {} příkazů", lines.len()))
             .child(body);
 
         if running {
-            panel = panel.child(div().text_color(rgb(0xf9e2af)).child("aplikuji…"));
+            panel = panel.child(div().text_color(theme.warn).child("aplikuji…"));
         }
         if let Some(err) = &error {
-            panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {err}")));
+            panel = panel.child(div().text_color(theme.danger).child(format!("error: {err}")));
         }
 
         panel = panel.child(
@@ -5666,8 +5680,8 @@ impl AppView {
                             d.cursor_pointer()
                                 .on_click(cx.listener(|view, _, _, cx| view.on_confirm_apply(cx)))
                         })
-                        .bg(rgb(0x313244))
-                        .text_color(if running { rgb(0x6c7086) } else { rgb(0xa6e3a1) })
+                        .bg(theme.bg_hover)
+                        .text_color(if running { theme.text_disabled } else { theme.success })
                         .px_2()
                         .rounded_md()
                         .child("Potvrdit a spustit"),
@@ -5681,8 +5695,8 @@ impl AppView {
                                 cx.notify();
                             }))
                         })
-                        .bg(rgb(0x313244))
-                        .text_color(if running { rgb(0x6c7086) } else { rgb(0xcdd6f4) })
+                        .bg(theme.bg_hover)
+                        .text_color(if running { theme.text_disabled } else { theme.text_primary })
                         .px_2()
                         .rounded_md()
                         .child("Zrušit"),
@@ -5699,7 +5713,7 @@ impl AppView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(0x00000099))
+                .bg(theme.bg_backdrop)
                 .occlude()
                 .child(panel)
                 .into_any_element(),
@@ -6634,6 +6648,7 @@ impl Render for AppView {
         self.refresh_autocomplete(window, cx);
         let ac_active = self.autocomplete.is_some();
         self.sql.update(cx, |s, _| s.set_autocomplete_active(ac_active));
+        let theme = *cx.theme();
 
         // The SQL editor + tab strip + tab content column, unchanged from
         // pre-Task-6 except that it's now one column in a horizontal row
@@ -6655,7 +6670,7 @@ impl Render for AppView {
                 div()
                     .h(px(20. * 8. + 4. * 2.))
                     .px_2()
-                    .bg(rgb(0x181825))
+                    .bg(theme.bg_app)
                     .on_action(cx.listener(Self::on_ac_up))
                     .on_action(cx.listener(Self::on_ac_down))
                     .on_action(cx.listener(Self::on_ac_confirm))
@@ -6683,7 +6698,7 @@ impl Render for AppView {
                     .h_full()
                     .flex_shrink_0()
                     .border_r_1()
-                    .border_color(rgb(0x45475a))
+                    .border_color(theme.border)
                     .child(self.tree.clone()),
             );
         }
@@ -6701,7 +6716,7 @@ impl Render for AppView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x1e1e2e))
+            .bg(theme.bg_panel)
             .on_action(cx.listener(Self::on_run_query))
             .on_action(cx.listener(Self::on_run_query_unlimited))
             .on_action(cx.listener(Self::on_cancel_query))
@@ -6726,15 +6741,15 @@ impl Render for AppView {
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .bg(rgb(0x313244))
-                .text_color(rgb(0xa6adc8))
+                .bg(theme.bg_hover)
+                .text_color(theme.text_muted)
                 .child({
                     // G13 T6: "Vysvětlit" (estimated EXPLAIN) — always safe
                     // on any engine/connection (design §5), so the only
                     // gating here is "one run at a time" + "there's SQL to
                     // run", same as the RunQuery keybinding's own guard.
                     let enabled = self.cancel.is_none() && !self.sql.read(cx).text().trim().is_empty();
-                    let color = if enabled { rgb(0xcdd6f4) } else { rgb(0x45475a) };
+                    let color = if enabled { theme.text_primary } else { theme.border };
                     div()
                         .id("btn-explain")
                         .cursor_pointer()
@@ -6756,7 +6771,7 @@ impl Render for AppView {
                     if !visible {
                         div().into_any_element()
                     } else {
-                        let color = if enabled { rgb(0xcdd6f4) } else { rgb(0x45475a) };
+                        let color = if enabled { theme.text_primary } else { theme.border };
                         div()
                             .id("btn-analyze")
                             .cursor_pointer()
@@ -6780,7 +6795,7 @@ impl Render for AppView {
                     // buttons" toolbar — reusing it avoids growing a new
                     // toolbar row for two buttons).
                     let enabled = self.cancel.is_none() && self.modal.is_none();
-                    let color = if enabled { rgb(0xcdd6f4) } else { rgb(0x45475a) };
+                    let color = if enabled { theme.text_primary } else { theme.border };
                     div()
                         .id("btn-run-sql-file")
                         .cursor_pointer()
@@ -6794,7 +6809,7 @@ impl Render for AppView {
                 })
                 .child({
                     let enabled = self.cancel.is_none() && self.modal.is_none();
-                    let color = if enabled { rgb(0xcdd6f4) } else { rgb(0x45475a) };
+                    let color = if enabled { theme.text_primary } else { theme.border };
                     div()
                         .id("btn-run-sql-folder")
                         .cursor_pointer()
