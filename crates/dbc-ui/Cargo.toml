@@ -15,3 +15,6 @@ unicode-segmentation = "1"
 tokio.workspace = true
 tokio-postgres = "0.7"
 dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

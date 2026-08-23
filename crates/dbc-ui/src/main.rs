@@ -347,6 +347,82 @@ struct LookupRequest {
     generation: u64,
 }
 
+/// G5 Task 4: state for the Apply confirmation dialog — created by
+/// `on_open_apply_dialog` (the apply bar's "Aplikovat"), from the ACTIVE
+/// tab's `ResultGrid::editable`/`edit_state` at the moment it's clicked.
+/// `statements`/`sql_text` are captured ONCE here rather than recomputed
+/// live: the dialog must show (and, on confirm, execute) the EXACT SQL the
+/// user reviewed, even if the underlying grid's staged edits somehow changed
+/// in the gap before "Potvrdit a spustit" (not currently possible — the
+/// dialog's own `.occlude()` blocks every click that could restage a cell —
+/// but capturing once is also just the simpler, more obviously-correct
+/// shape).
+struct ApplyDialogState {
+    /// Which tab's grid to clear/re-preview on success — looked up by id
+    /// (not a held `Entity<ResultGrid>`) so a tab closed while the write is
+    /// in flight (not reachable today, since the dialog's overlay occludes
+    /// the tab strip, but checked defensively anyway) is simply not found
+    /// rather than updating a dangling reference.
+    tab_id: u64,
+    /// `sandbox::generate_statements`' output verbatim — fed straight to
+    /// `QueryRunner::run_write_transaction` on confirm.
+    statements: Vec<(String, Option<u64>)>,
+    /// `statements`' SQL text joined by newline (brief contract #3) — shown
+    /// in the dialog AND recorded as the eventual history entry's `sql`.
+    sql_text: String,
+    /// `ResultGrid::preview_identity()`'s shape, captured at dialog-open
+    /// time — lets a successful Apply re-run the SAME preview (brief:
+    /// "re-run the preview, existing pipeline") without re-reading grid
+    /// state after `clear_edits` has already run.
+    preview_identity: (Option<String>, String),
+    /// True while `run_write_transaction` is in flight (brief contract #3:
+    /// "aplikuji…", buttons disabled).
+    running: bool,
+    /// Set on failure — the dialog STAYS open showing this (brief contract
+    /// #4: edits stay staged); cleared on a fresh "Potvrdit a spustit"
+    /// retry.
+    error: Option<String>,
+}
+
+/// G5 Task 4 (folded T3 review issue 2 — dirty guard): the action
+/// `discard_confirm` performs on "Zahodit", or undoes (where applicable) on
+/// "Zrušit" — see `DiscardConfirmState`'s doc comment for the three sites
+/// that construct one instead of proceeding directly.
+enum PendingDiscard {
+    /// Close tab `id` outright (`Tabs::close`) — the tab strip's "✕".
+    CloseTab { id: u64 },
+    /// Run `sql` as `preview` through the normal `run_query_with` pipeline
+    /// on "Zahodit" — used both for "re-open the same preview from the
+    /// tree/palette" and for a ☰ join-toggle re-run. `revert` is `Some((grid,
+    /// col, ref_col))` only for the join-toggle case: `ResultGrid::
+    /// toggle_fk_column` already flipped `fk_checked` (and `cx.notify()`'d)
+    /// before emitting the event that led here, so "Zrušit" must undo
+    /// exactly that flip via `revert_fk_toggle` — the same one-off-flip
+    /// reasoning `on_grid_event`'s pre-existing busy-guard revert already
+    /// documents — or the checkbox is left showing a lie about what's
+    /// actually joined.
+    RunPreview {
+        sql: String,
+        preview: Box<PreviewTarget>,
+        revert: Option<(Entity<ResultGrid>, usize, String)>,
+    },
+}
+
+/// G5 Task 4 (folded T3 review issue 2): confirm prompt for an action that
+/// would otherwise silently drop a dirty preview tab's staged edits — the
+/// three sites: `on_grid_event`'s `GridEvent::RerunPreviewJoins` arm (a ☰
+/// toggle re-runs the SAME tab's preview, replacing its grid entity and
+/// hence its `EditState`), `TreeEvent::OpenPreview`/`PaletteItem::Table`
+/// (re-opening the same (schema, table) closes the existing tab via
+/// `Tabs::close_by_preview_key` before opening the fresh one), and the tab
+/// strip's "✕" (`Tabs::close`). "Zrušit" aborts the action outright — no
+/// query runs, no tab closes — via `on_discard_confirm_no`.
+struct DiscardConfirmState {
+    /// Row-granular staged-change count (brief: "Neuložené změny ({n})").
+    change_count: usize,
+    action: PendingDiscard,
+}
+
 struct AppView {
     tabs: Tabs,
     status: String,
@@ -456,6 +532,18 @@ struct AppView {
     /// save — the rest of the app is fully functional either way, same
     /// "degrade gracefully" precedent as `history: Option<HistoryDb>`.
     view_prefs: Option<ViewPrefsStore>,
+    // --- G5 Task 4: apply flow ---
+    /// The Apply confirmation dialog (brief contract #1/#3/#4) — `None` when
+    /// closed. Owned separately from `modal` (`connections_ui::ModalState`,
+    /// a different concern/lifecycle) but mutually exclusive with it in
+    /// practice; see `ApplyDialogState`'s doc comment.
+    apply_dialog: Option<ApplyDialogState>,
+    /// G5 Task 4 (folded T3 review issue 2 — dirty guard): a pending
+    /// confirm-discard prompt, shown before any action that would silently
+    /// drop a dirty preview tab's staged edits. `None` when no such prompt
+    /// is pending; see `DiscardConfirmState`'s doc comment for the three
+    /// trigger sites.
+    discard_confirm: Option<DiscardConfirmState>,
 }
 
 /// Stable identity for a `ConnectSpec`, used only to decide whether two
@@ -518,8 +606,13 @@ impl AppView {
         bypass_auto_limit: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.modal.is_some() {
-            return; // don't run queries under a modal
+        // G5 Task 4: also refuse under the Apply dialog / discard-confirm
+        // prompt — both are `.occlude()`d overlays like `modal`, but a
+        // GLOBAL keybinding (Ctrl+Enter) isn't blocked by occlusion the way
+        // a click is, so this guard is the actual mechanism that stops a
+        // stray Ctrl+Enter from starting a new run while either is up.
+        if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
+            return; // don't run queries under a modal/dialog/confirm prompt
         }
         if self.cancel.is_some() {
             return; // one query at a time in v1
@@ -1015,6 +1108,28 @@ impl AppView {
             }
             return;
         }
+        // G5 Task 4: Esc on the discard-confirm prompt is exactly "Zrušit"
+        // — abort the pending action (reverting a speculative ☰-toggle flip
+        // when there is one), never "Zahodit" (Esc must never be the thing
+        // that destroys staged edits).
+        if self.discard_confirm.is_some() {
+            self.on_discard_confirm_no(cx);
+            return;
+        }
+        // G5 Task 4: Esc on the Apply dialog closes it (edits stay staged,
+        // same as its own "Zrušit" button) — but ONLY while not `running`:
+        // a write already in flight has no cancellation support in v1
+        // (`Connection::execute`'s "no mid-statement interrupt" design
+        // note), so Esc here would just detach the UI from a result it
+        // still needs to react to deterministically, not actually stop
+        // anything server-side.
+        if let Some(ad) = &self.apply_dialog {
+            if !ad.running {
+                self.apply_dialog = None;
+                cx.notify();
+            }
+            return;
+        }
         // G4 Task 3: Esc closes an open cell-detail popup / find bar on the
         // active tab's grid before falling through to query-cancel — same
         // "no scoped-binding shortcut, the check here IS the mechanism"
@@ -1061,7 +1176,11 @@ impl AppView {
     /// connection dropdown if it happened to be open, so the two overlays
     /// never stack. Sources are assembled fresh on every open (contract #2).
     fn on_open_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal.is_some() || self.palette.is_some() {
+        if self.modal.is_some()
+            || self.palette.is_some()
+            || self.apply_dialog.is_some()
+            || self.discard_confirm.is_some()
+        {
             return;
         }
         self.dropdown_open = false;
@@ -1178,16 +1297,7 @@ impl AppView {
         match item {
             PaletteItem::Table { schema, name } => {
                 // Exactly `on_tree_event`'s `TreeEvent::OpenPreview` arm.
-                let sql = preview_sql(schema.as_deref(), &name);
-                let preview = PreviewTarget {
-                    title: format!("Náhled: {name}"),
-                    key: format!("{}.{name}", schema.clone().unwrap_or_default()),
-                    table: name.clone(),
-                    schema,
-                    joins: Vec::new(),
-                    from_join_change: false,
-                };
-                self.run_query_with(sql, Some(preview), true, cx);
+                self.open_table_preview(schema, name, cx);
             }
             PaletteItem::HistoryEntry { sql, .. } => {
                 // Exactly the history panel's row click: load into the
@@ -1704,6 +1814,25 @@ impl AppView {
                     // rather than reading `joins.is_empty()` as "plain open".
                     from_join_change: true,
                 };
+                // G5 Task 4 (folded T3 review issue 2 — dirty guard): this
+                // re-run REPLACES `emitter`'s grid entity (see `GridEvent`'s
+                // doc comment) — its `EditState` would be silently dropped.
+                // `toggle_fk_column` already flipped `fk_checked` before
+                // emitting, so a "Zrušit" here must undo exactly that flip,
+                // same as the busy-guard revert two lines above.
+                let dirty_n = emitter.read(cx).edit_state.change_count();
+                if dirty_n > 0 {
+                    self.discard_confirm = Some(DiscardConfirmState {
+                        change_count: dirty_n,
+                        action: PendingDiscard::RunPreview {
+                            sql,
+                            preview: Box::new(preview),
+                            revert: Some((emitter.clone(), *col, ref_col.clone())),
+                        },
+                    });
+                    cx.notify();
+                    return;
+                }
                 self.run_query_with(sql, Some(preview), true, cx);
             }
             GridEvent::RunLookup { sql, ref_table, wanted_cols, src_col, generation } => {
@@ -1723,6 +1852,287 @@ impl AppView {
                 self.save_view_prefs_for_grid(&emitter, cx);
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // G5 Task 4: dirty-edit discard guard (folded T3 review issue 2).
+    // -----------------------------------------------------------------
+
+    /// Row-granular staged-change count for `tab`'s grid, if it has any —
+    /// `None` for a `Text` tab or a clean/non-editable `Grid` tab (both are
+    /// safe to proceed past without a confirm prompt). Shared by the two
+    /// lookup helpers below.
+    fn grid_dirty_change_count(tab: &ResultTab, cx: &Context<Self>) -> Option<usize> {
+        let TabContent::Grid { grid, .. } = &tab.content else { return None };
+        let n = grid.read(cx).edit_state.change_count();
+        (n > 0).then_some(n)
+    }
+
+    /// Tab-strip "✕" guard: `Some(n)` when closing tab `id` would drop `n`
+    /// staged changes.
+    fn dirty_change_count_for_tab_id(&self, id: u64, cx: &Context<Self>) -> Option<usize> {
+        self.tabs.iter().find(|t| t.id == id).and_then(|t| Self::grid_dirty_change_count(t, cx))
+    }
+
+    /// Re-open-same-preview guard (`TreeEvent::OpenPreview`/
+    /// `PaletteItem::Table`): `Some(n)` when a tab with this `preview_key` is
+    /// ALREADY open and dirty — `run_query_with` would otherwise close it
+    /// via `Tabs::close_by_preview_key` right before opening the fresh one.
+    fn dirty_change_count_for_preview_key(&self, key: &str, cx: &Context<Self>) -> Option<usize> {
+        self.tabs
+            .iter()
+            .find(|t| t.preview_key.as_deref() == Some(key))
+            .and_then(|t| Self::grid_dirty_change_count(t, cx))
+    }
+
+    /// Shared by `TreeEvent::OpenPreview` and `PaletteItem::Table` (both
+    /// open exactly the same kind of preview tab) — dirty-guards (folded T3
+    /// review issue 2) before dispatching: `run_query_with` would otherwise
+    /// silently close an EXISTING dirty tab for the same (schema, table) via
+    /// `Tabs::close_by_preview_key` right before opening the fresh one.
+    fn open_table_preview(&mut self, schema: Option<String>, table: String, cx: &mut Context<Self>) {
+        let sql = preview_sql(schema.as_deref(), &table);
+        let key = format!("{}.{table}", schema.clone().unwrap_or_default());
+        let preview = PreviewTarget {
+            title: format!("Náhled: {table}"),
+            key: key.clone(),
+            table,
+            schema,
+            joins: Vec::new(),
+            from_join_change: false,
+        };
+        if let Some(n) = self.dirty_change_count_for_preview_key(&key, cx) {
+            self.discard_confirm = Some(DiscardConfirmState {
+                change_count: n,
+                action: PendingDiscard::RunPreview { sql, preview: Box::new(preview), revert: None },
+            });
+            cx.notify();
+            return;
+        }
+        self.run_query_with(sql, Some(preview), true, cx);
+    }
+
+    /// "Zahodit" on the discard-confirm prompt — performs the action that
+    /// was withheld pending confirmation. The dropped tab's/grid's
+    /// `EditState` is not explicitly cleared here: `CloseTab` removes the
+    /// whole tab (and its grid entity) outright, and `RunPreview` replaces
+    /// the grid entity via the normal `Started` pipeline (`set_buffer`
+    /// resets `edit_state` on the FRESH entity) — there is nothing left to
+    /// clear on the old one either way.
+    fn on_discard_confirm_yes(&mut self, cx: &mut Context<Self>) {
+        let Some(dc) = self.discard_confirm.take() else { return };
+        match dc.action {
+            PendingDiscard::CloseTab { id } => {
+                self.tabs.close(id);
+            }
+            PendingDiscard::RunPreview { sql, preview, .. } => {
+                self.run_query_with(sql, Some(*preview), true, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// "Zrušit" on the discard-confirm prompt (also Esc, see
+    /// `on_cancel_query`) — aborts the pending action outright: no tab
+    /// closes, no query runs. For a `RunPreview` originating from a ☰
+    /// toggle, also undoes the checkbox flip `toggle_fk_column` already
+    /// applied before emitting `RerunPreviewJoins` (see `PendingDiscard::
+    /// RunPreview`'s doc comment) so the ☰ menu doesn't keep showing a join
+    /// that was never actually re-run.
+    fn on_discard_confirm_no(&mut self, cx: &mut Context<Self>) {
+        let Some(dc) = self.discard_confirm.take() else { return };
+        if let PendingDiscard::RunPreview { revert: Some((grid, col, ref_col)), .. } = dc.action {
+            grid.update(cx, |g, cx| g.revert_fk_toggle(col, &ref_col, cx));
+        }
+        cx.notify();
+    }
+
+    // -----------------------------------------------------------------
+    // G5 Task 4: Apply flow (sandbox edits -> generated SQL -> one tx).
+    // -----------------------------------------------------------------
+
+    /// Builds the `ConnectSpec` + `timeout_secs` for `run_write_transaction`
+    /// — the SAME lookup `run_query_with` performs for its own spec (active
+    /// saved connection with its vault secret, or the CLI-arg URL, else
+    /// `None`) — brief contract #5's "secret handling identical to
+    /// `run_query_with`". Doesn't re-check `read_only` itself: a read-only
+    /// connection never produces an `Editable` grid in the first place
+    /// (`detect_editable_pk`), so the apply bar/dialog can't even be reached
+    /// through one — `run_write_transaction` hard-refuses again regardless
+    /// (belt-and-braces, brief contract #5).
+    fn apply_conn_spec(&self) -> Option<(ConnectSpec, Option<u64>)> {
+        if let Some(id) = self.active_connection_id.clone() {
+            let cfg = self.config.connections.iter().find(|c| c.id == id)?.clone();
+            let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+            let timeout_secs = cfg.timeout_secs;
+            Some((ConnectSpec::Config { cfg: Box::new(cfg), secret }, timeout_secs))
+        } else {
+            self.conn_url.clone().map(|url| (ConnectSpec::Url(url), None))
+        }
+    }
+
+    /// Apply bar's "Aplikovat" (brief contract #1) — builds the exact
+    /// `sandbox::generate_statements` output for the ACTIVE tab's staged
+    /// edits and opens the confirmation dialog. A no-op when there's no
+    /// active tab, it isn't a `Grid` tab, it isn't `editable`, or (shouldn't
+    /// happen — the apply bar only renders when dirty, but checked
+    /// defensively) it generates zero statements.
+    fn on_open_apply_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.modal.is_some() || self.discard_confirm.is_some() || self.apply_dialog.is_some() {
+            return;
+        }
+        let Some(active) = self.tabs.active() else { return };
+        let (tab_id, grid) = match &active.content {
+            TabContent::Grid { grid, .. } => (active.id, grid.clone()),
+            TabContent::Text { .. } => return,
+        };
+        let (statements, preview_identity) = {
+            let g = grid.read(cx);
+            let Some(editable) = g.editable.clone() else { return };
+            let Some(buf_rc) = g.buffer.clone() else { return };
+            let headers = g.column_names();
+            let table = g.table_name.clone();
+            let preview_identity =
+                g.preview_identity().unwrap_or_else(|| (None, table.clone()));
+            let meta = sandbox::TableMeta {
+                schema: preview_identity.0.as_deref(),
+                table: &table,
+                headers: &headers,
+                pk_cols: &editable.pk_cols,
+                numeric_cols: &editable.numeric_cols,
+            };
+            let mut original = |row: usize, col: usize| -> Option<String> {
+                let mut b = buf_rc.borrow_mut();
+                if b.cell_is_null(row, col) { None } else { Some(b.cell_text(row, col)) }
+            };
+            let statements = sandbox::generate_statements(&meta, &g.edit_state, &mut original);
+            (statements, preview_identity)
+        };
+        if statements.is_empty() {
+            return;
+        }
+        let sql_text = statements.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("\n");
+        self.apply_dialog = Some(ApplyDialogState {
+            tab_id,
+            statements,
+            sql_text,
+            preview_identity,
+            running: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    /// Apply dialog's "Potvrdit a spustit" (brief contract #2/#3/#4) —
+    /// dispatches `runner.run_write_transaction` over the dialog's captured
+    /// `statements` and reacts to the outcome. Re-clickable after a failure
+    /// (brief contract #4: the dialog stays open showing the error) — a
+    /// retry just re-dispatches the same statements.
+    fn on_confirm_apply(&mut self, cx: &mut Context<Self>) {
+        let Some(ad) = &self.apply_dialog else { return };
+        if ad.running {
+            return;
+        }
+        let statements = ad.statements.clone();
+        let sql_text = ad.sql_text.clone();
+        let tab_id = ad.tab_id;
+        let preview_identity = ad.preview_identity.clone();
+        let n_statements = statements.len();
+
+        let Some((spec, timeout_secs)) = self.apply_conn_spec() else {
+            if let Some(ad) = &mut self.apply_dialog {
+                ad.error = Some("Bez připojení — vyberte připojení nahoře.".to_string());
+            }
+            cx.notify();
+            return;
+        };
+
+        if let Some(ad) = &mut self.apply_dialog {
+            ad.running = true;
+            ad.error = None;
+        }
+        cx.notify();
+
+        let history_conn_name = self.active_connection_name_for_history();
+        let history_started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let started = std::time::Instant::now();
+        let rx = self.runner.run_write_transaction(spec, statements, timeout_secs);
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(Ok(total)) => {
+                        // Brief contract #3, in order: close modal, clear
+                        // edit_state, status, re-run the preview, record ONE
+                        // history entry.
+                        view.apply_dialog = None;
+                        if let Some(tab) = view.tabs.iter().find(|t| t.id == tab_id) {
+                            if let TabContent::Grid { grid, .. } = &tab.content {
+                                grid.clone().update(cx, |g, cx| g.clear_edits(cx));
+                            }
+                        }
+                        view.status = format!("aplikováno ({n_statements} příkazů)");
+                        // Re-run the preview via the EXISTING pipeline
+                        // (brief: "preserves joins via from_join_change=false
+                        // machinery" — `apply_view_prefs_to_grid`'s saved-
+                        // fk-join retrigger picks the active joins back up
+                        // from this table's persisted view prefs once this
+                        // run's own `Started` lands, exactly like a plain
+                        // preview re-open does). This immediately overwrites
+                        // `view.status` above with its own "connecting…" /
+                        // progress text — expected: the "aplikováno (…)"
+                        // status is a transient confirmation, the refreshed
+                        // preview's own status (ending in "N rows in …")
+                        // takes over next, same as every other status
+                        // transition in this file.
+                        let (schema, table) = preview_identity;
+                        let sql = preview_sql(schema.as_deref(), &table);
+                        let key = format!("{}.{table}", schema.clone().unwrap_or_default());
+                        let title = format!("Náhled: {table}");
+                        let preview = PreviewTarget {
+                            title,
+                            key,
+                            table,
+                            schema,
+                            joins: Vec::new(),
+                            from_join_change: false,
+                        };
+                        view.run_query_with(sql, Some(preview), true, cx);
+                        // Record ONE history entry for the write itself
+                        // (brief contract #3's final step) — the re-run's
+                        // own SELECT gets its OWN separate history entry
+                        // once ITS `Finished`/`Failed` lands, same as any
+                        // other preview.
+                        view.record_history(
+                            &sql_text,
+                            &history_conn_name,
+                            history_started_at,
+                            Some(started.elapsed().as_millis() as i64),
+                            Some(total as i64),
+                            None,
+                            cx,
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        if let Some(ad) = &mut view.apply_dialog {
+                            ad.running = false;
+                            ad.error = Some(e.to_string());
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(ad) = &mut view.apply_dialog {
+                            ad.running = false;
+                            ad.error = Some("apply zrušeno".to_string());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Dispatches `runner.fetch_schema(spec)` off the UI thread and updates
@@ -1798,16 +2208,7 @@ impl AppView {
     fn on_tree_event(&mut self, _emitter: Entity<SchemaTree>, event: &TreeEvent, cx: &mut Context<Self>) {
         match event {
             TreeEvent::OpenPreview { schema, table } => {
-                let sql = preview_sql(schema.as_deref(), table);
-                let preview = PreviewTarget {
-                    title: format!("Náhled: {table}"),
-                    key: format!("{}.{table}", schema.clone().unwrap_or_default()),
-                    table: table.clone(),
-                    schema: schema.clone(),
-                    joins: Vec::new(),
-                    from_join_change: false,
-                };
-                self.run_query_with(sql, Some(preview), true, cx);
+                self.open_table_preview(schema.clone(), table.clone(), cx);
             }
             TreeEvent::OpenDdl { title, ddl } => {
                 self.tabs.open(ResultTab {
@@ -1918,6 +2319,17 @@ impl AppView {
                             .child("✕")
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 cx.stop_propagation();
+                                // G5 Task 4 (folded T3 review issue 2 —
+                                // dirty guard): closing a dirty tab would
+                                // silently drop its staged edits.
+                                if let Some(n) = view.dirty_change_count_for_tab_id(id, cx) {
+                                    view.discard_confirm = Some(DiscardConfirmState {
+                                        change_count: n,
+                                        action: PendingDiscard::CloseTab { id },
+                                    });
+                                    cx.notify();
+                                    return;
+                                }
                                 view.tabs.close(id);
                                 cx.notify();
                             })),
@@ -2007,6 +2419,235 @@ impl AppView {
             }
         }
     }
+
+    /// G5 Task 4, brief contract #1: apply bar above the status bar
+    /// ("{n} změn · Aplikovat · Zahodit") — `None` (renders nothing) unless
+    /// the ACTIVE tab is a `Grid` tab with staged edits.
+    fn render_apply_bar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let active = self.tabs.active()?;
+        let TabContent::Grid { grid, .. } = &active.content else { return None };
+        let n = grid.read(cx).edit_state.change_count();
+        if n == 0 {
+            return None;
+        }
+        let grid_for_discard = grid.clone();
+        Some(
+            div()
+                .id("apply-bar")
+                .h(px(28.))
+                .px_2()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .bg(rgb(0x3a3a1e))
+                .text_color(rgb(0xf9e2af))
+                .child(format!("{n} změn"))
+                .child(
+                    div()
+                        .id("apply-bar-apply")
+                        .cursor_pointer()
+                        .px_2()
+                        .rounded_md()
+                        .bg(rgb(0x45475a))
+                        .text_color(rgb(0xa6e3a1))
+                        .child("Aplikovat")
+                        .on_click(cx.listener(|view, _, _, cx| view.on_open_apply_dialog(cx))),
+                )
+                .child(
+                    div()
+                        .id("apply-bar-discard")
+                        .cursor_pointer()
+                        .px_2()
+                        .rounded_md()
+                        .bg(rgb(0x45475a))
+                        .text_color(rgb(0xf38ba8))
+                        .child("Zahodit")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            grid_for_discard.update(cx, |g, cx| g.clear_edits(cx));
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// G5 Task 4 (folded T3 review issue 2): the "Neuložené změny ({n}) —
+    /// zahodit?" confirm prompt — same centered-overlay `.occlude()`
+    /// convention as every other modal in this file (`render_modal_overlay`,
+    /// `render_palette_overlay`). No text input, so no `window.focus` call
+    /// is needed here (unlike those two) — Esc/click are the only ways to
+    /// answer it, and Esc is wired in `on_cancel_query`.
+    fn render_discard_confirm_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let dc = self.discard_confirm.as_ref()?;
+        let n = dc.change_count;
+
+        let panel = div()
+            .id("discard-confirm-panel")
+            .w(px(420.))
+            .bg(rgb(0x1e1e2e))
+            .border_1()
+            .border_color(rgb(0x45475a))
+            .rounded_md()
+            .flex()
+            .flex_col()
+            .p_2()
+            .gap_2()
+            .text_color(rgb(0xcdd6f4))
+            .child(format!("Neuložené změny ({n}) — zahodit?"))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("discard-confirm-yes")
+                            .cursor_pointer()
+                            .bg(rgb(0x313244))
+                            .text_color(rgb(0xf38ba8))
+                            .px_2()
+                            .rounded_md()
+                            .child("Zahodit")
+                            .on_click(cx.listener(|view, _, _, cx| view.on_discard_confirm_yes(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("discard-confirm-no")
+                            .cursor_pointer()
+                            .bg(rgb(0x313244))
+                            .text_color(rgb(0xcdd6f4))
+                            .px_2()
+                            .rounded_md()
+                            .child("Zrušit")
+                            .on_click(cx.listener(|view, _, _, cx| view.on_discard_confirm_no(cx))),
+                    ),
+            );
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000099))
+                .occlude()
+                .child(panel)
+                .into_any_element(),
+        )
+    }
+
+    /// G5 Task 4, brief contract #1/#3/#4: the Apply confirmation dialog —
+    /// same centered-overlay `.occlude()` shape as every other modal, body
+    /// reuses the `TabContent::Text`/cell-detail "plain wrapped monospace
+    /// lines" pattern (brief: "monospace, scrollable — reuse Text-tab body
+    /// pattern"; a `max_h` + `overflow_hidden` block stands in for real
+    /// scroll handling, same simplification `render_cell_detail_overlay`
+    /// already made for v1). While `running`, "aplikuji…" shows and both
+    /// buttons are visually disabled (no `cursor_pointer`/`on_click`) via
+    /// `.when(!running, ..)`; a set `error` stays visible alongside
+    /// re-enabled buttons so the user can retry or back out (brief contract
+    /// #4: edits stay staged either way).
+    fn render_apply_dialog_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ad = self.apply_dialog.as_ref()?;
+        let running = ad.running;
+        let error = ad.error.clone();
+        let lines: Vec<String> = ad.statements.iter().map(|(s, _)| s.clone()).collect();
+
+        let mut body = div()
+            .id("apply-dialog-body")
+            .font_family("Consolas")
+            .flex()
+            .flex_col()
+            .max_h(px(280.))
+            .overflow_hidden()
+            .p_2()
+            .bg(rgb(0x181825))
+            .rounded_md()
+            .text_color(rgb(0xcdd6f4));
+        for line in &lines {
+            body = body.child(div().whitespace_normal().child(line.clone()));
+        }
+
+        let mut panel = div()
+            .id("apply-dialog-panel")
+            .w(px(640.))
+            .max_h(px(480.))
+            .bg(rgb(0x1e1e2e))
+            .border_1()
+            .border_color(rgb(0x45475a))
+            .rounded_md()
+            .flex()
+            .flex_col()
+            .p_2()
+            .gap_2()
+            .text_color(rgb(0xcdd6f4))
+            .child(format!("Aplikovat {} příkazů", lines.len()))
+            .child(body);
+
+        if running {
+            panel = panel.child(div().text_color(rgb(0xf9e2af)).child("aplikuji…"));
+        }
+        if let Some(err) = &error {
+            panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {err}")));
+        }
+
+        panel = panel.child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap_2()
+                .child(
+                    div()
+                        .id("apply-dialog-confirm")
+                        .when(!running, |d| {
+                            d.cursor_pointer()
+                                .on_click(cx.listener(|view, _, _, cx| view.on_confirm_apply(cx)))
+                        })
+                        .bg(rgb(0x313244))
+                        .text_color(if running { rgb(0x6c7086) } else { rgb(0xa6e3a1) })
+                        .px_2()
+                        .rounded_md()
+                        .child("Potvrdit a spustit"),
+                )
+                .child(
+                    div()
+                        .id("apply-dialog-cancel")
+                        .when(!running, |d| {
+                            d.cursor_pointer().on_click(cx.listener(|view, _, _, cx| {
+                                view.apply_dialog = None;
+                                cx.notify();
+                            }))
+                        })
+                        .bg(rgb(0x313244))
+                        .text_color(if running { rgb(0x6c7086) } else { rgb(0xcdd6f4) })
+                        .px_2()
+                        .rounded_md()
+                        .child("Zrušit"),
+                ),
+        );
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000099))
+                .occlude()
+                .child(panel)
+                .into_any_element(),
+        )
+    }
 }
 
 impl Render for AppView {
@@ -2075,15 +2716,22 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_toggle_history))
             .on_action(cx.listener(Self::on_open_palette))
             .child(self.render_top_bar(cx))
-            .child(body)
-            .child(
-                div()
-                    .h(px(28.))
-                    .px_2()
-                    .bg(rgb(0x313244))
-                    .text_color(rgb(0xa6adc8))
-                    .child(self.status.clone()),
-            );
+            .child(body);
+
+        // G5 Task 4, brief contract #1: apply bar sits directly above the
+        // status bar (spec mockup: "apply bar (when dirty) / status bar"),
+        // rendered only when the ACTIVE tab's grid is dirty.
+        if let Some(bar) = self.render_apply_bar(cx) {
+            root = root.child(bar);
+        }
+        root = root.child(
+            div()
+                .h(px(28.))
+                .px_2()
+                .bg(rgb(0x313244))
+                .text_color(rgb(0xa6adc8))
+                .child(self.status.clone()),
+        );
 
         if self.dropdown_open && self.modal.is_none() {
             root = root.child(self.render_dropdown_overlay(cx));
@@ -2092,6 +2740,12 @@ impl Render for AppView {
             root = root.child(overlay);
         }
         if let Some(overlay) = self.render_palette_overlay(cx) {
+            root = root.child(overlay);
+        }
+        if let Some(overlay) = self.render_discard_confirm_overlay(cx) {
+            root = root.child(overlay);
+        }
+        if let Some(overlay) = self.render_apply_dialog_overlay(cx) {
             root = root.child(overlay);
         }
         root
@@ -2212,6 +2866,8 @@ fn main() {
                             last_history_query: String::new(),
                             palette: None,
                             view_prefs,
+                            apply_dialog: None,
+                            discard_confirm: None,
                         }
                     })
                 },

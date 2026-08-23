@@ -203,6 +203,21 @@ struct CellEditor {
     target: EditTarget,
     column_name: String,
     original_text: String,
+    /// G5 Task 4 (folded T3 review issue 4 — NULL cue): true when, AT OPEN
+    /// TIME, `target`'s CURRENT staged state (not the ORIGINAL committed
+    /// value `original_text` holds) is an explicit staged SQL NULL —
+    /// `Some(None)` in `EditState::cells`/`inserted_rows` terms. Distinct
+    /// from "untouched" (nothing staged, `original_text` is what shows) and
+    /// from a staged EMPTY STRING (`Some(Some(String::new()))`) — both of
+    /// those prefill the `TextField` with an indistinguishable-looking
+    /// empty box, same as a staged NULL does (`open_cell_editor`'s prefill
+    /// is `""` in all three cases). Without this cue, reopening a
+    /// NULL-staged cell and clicking "Uložit" without retyping anything
+    /// silently restages `''` instead of leaving the NULL alone — surfaced
+    /// as an "aktuálně: (NULL)" line in `render_cell_editor_overlay` (the
+    /// least invasive fix: it doesn't change what "Uložit" does, it just
+    /// makes the already-staged NULL visible before the user acts).
+    currently_staged_null: bool,
     input: Entity<TextField>,
 }
 
@@ -1926,6 +1941,20 @@ impl ResultGrid {
         cx.notify();
     }
 
+    /// G5 Task 4: "Zahodit" on the apply bar, and the terminal step of a
+    /// successful Apply (`main.rs::on_confirm_apply`) — drops every staged
+    /// cell/delete/insert. Deliberately does NOT touch `cell_editor`/
+    /// `find`/`cell_detail` or any other overlay state; a caller that also
+    /// wants those closed (none currently do — "Zahodit" only appears on the
+    /// apply bar, which isn't reachable while an overlay is open since
+    /// double-clicking a cell for the editor and clicking "Zahodit" in the
+    /// toolbar-adjacent bar are mutually exclusive click targets) can close
+    /// them separately.
+    pub fn clear_edits(&mut self, cx: &mut Context<Self>) {
+        self.edit_state.clear();
+        cx.notify();
+    }
+
     /// G5 Task 3: opens the cell-editor overlay (brief contract #2) for
     /// `target`. `column_name`/`original_text` are snapshotted once at open
     /// time (same "capture at click time" convention `cell_detail` already
@@ -1963,10 +1992,22 @@ impl ResultGrid {
                 .flatten()
                 .unwrap_or_default(),
         };
+        // G5 Task 4 (folded T3 review issue 4): see `CellEditor::
+        // currently_staged_null`'s doc comment.
+        let currently_staged_null = match target {
+            EditTarget::Cell { source_row, col } => {
+                matches!(self.edit_state.cells.get(&(source_row, col)), Some(None))
+            }
+            EditTarget::Insert { ins_ix, col } => matches!(
+                self.edit_state.inserted_rows.get(ins_ix).and_then(|row| row.get(col)),
+                Some(Some(None))
+            ),
+        };
         let input = cx.new(|cx| TextField::new(cx, "hodnota…", false));
         input.update(cx, |f, cx| f.set_text(&prefill, cx));
         let focus = input.focus_handle(cx);
-        self.cell_editor = Some(CellEditor { target, column_name, original_text, input });
+        self.cell_editor =
+            Some(CellEditor { target, column_name, original_text, currently_staged_null, input });
         window.focus(&focus, cx);
         cx.notify();
     }
@@ -2012,6 +2053,7 @@ impl ResultGrid {
         let ed = self.cell_editor.as_ref()?;
         let column_name = ed.column_name.clone();
         let original_text = ed.original_text.clone();
+        let currently_staged_null = ed.currently_staged_null;
         let input = ed.input.clone();
 
         let panel = div()
@@ -2044,6 +2086,16 @@ impl ResultGrid {
                         original_text
                     }),
             )
+            // G5 Task 4 (folded T3 review issue 4): only shown when the
+            // CURRENT staged state (as opposed to the original block above)
+            // is an explicit NULL — see `CellEditor::currently_staged_null`.
+            .when(currently_staged_null, |d| {
+                d.child(
+                    div()
+                        .text_color(rgb(0xf38ba8))
+                        .child("aktuálně: (NULL) — prázdné Uložit přepíše na '', ne NULL"),
+                )
+            })
             .child(div().w_full().child(input))
             .child(
                 div().flex().flex_row().justify_end().gap_2().child(

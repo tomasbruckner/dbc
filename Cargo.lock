@@ -2057,6 +2057,7 @@ dependencies = [
  "dirs",
  "gpui",
  "gpui_platform",
+ "tempfile",
  "tokio",
  "tokio-postgres",
  "unicode-segmentation",

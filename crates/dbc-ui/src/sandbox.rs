@@ -7,12 +7,17 @@
 //! rendering) — every EditState method that drives staging itself
 //! (`stage_cell`, `toggle_delete`, `add_insert_row`, `stage_insert_cell`,
 //! `remove_insert_row`, `is_dirty`) is exercised by the UI now, so the
-//! module-level `#![allow(dead_code)]` this file used to carry is gone. The
-//! Apply dialog itself (turning a dirty `EditState` into executed
-//! statements) is still a later task — `TableMeta`/`sql_value`/
-//! `generate_statements`/`EditState::{change_count,clear}` stay
-//! individually `#[allow(dead_code)]`'d below until that task wires them
-//! up; each already has full test coverage regardless.
+//! module-level `#![allow(dead_code)]` this file used to carry is gone.
+//!
+//! G5 Task 4 wires the rest: `main.rs::on_open_apply_dialog` builds a
+//! `TableMeta` from the active tab's `ResultGrid::editable`/`column_names`/
+//! `table_name`/`preview_identity` and calls `generate_statements` (reading
+//! `original` straight off the grid's `ResultBuffer`) to populate the Apply
+//! dialog; `EditState::clear` runs on a successful apply
+//! (`ResultGrid::clear_edits`); `change_count` drives both the apply bar's
+//! "{n} změn" label and the dirty-guard confirm prompt's count. Every item
+//! here now has a real UI caller, in addition to its existing full test
+//! coverage.
 
 use std::collections::{HashMap, HashSet};
 
@@ -59,7 +64,6 @@ impl EditState {
 
     /// Row-granular change count: edited (non-deleted) rows + deleted rows +
     /// inserted rows.
-    #[allow(dead_code)] // Apply dialog (Task 4); tested directly meanwhile.
     pub fn change_count(&self) -> usize {
         let edited_rows: HashSet<usize> = self
             .cells
@@ -119,7 +123,7 @@ impl EditState {
         }
     }
 
-    #[allow(dead_code)] // Apply dialog (Task 4): clears after a successful apply.
+    /// Called by `ResultGrid::clear_edits` after a successful Apply.
     pub fn clear(&mut self) {
         self.cells.clear();
         self.deleted_rows.clear();
@@ -127,7 +131,9 @@ impl EditState {
     }
 }
 
-#[allow(dead_code)] // Apply dialog (Task 4): `generate_statements`' input.
+/// Built by `main.rs::on_open_apply_dialog` from the active tab's
+/// `ResultGrid` state (`Editable`/`column_names`/`table_name`/
+/// `preview_identity`) and fed to `generate_statements`.
 pub struct TableMeta<'a> {
     pub schema: Option<&'a str>,
     pub table: &'a str,
@@ -166,7 +172,6 @@ pub fn insert_cell_display(cell: &Option<Option<String>>) -> String {
 /// Value emitter: staged None -> "NULL"; Some(s) with numeric col AND s
 /// parses (after trimming) strictly as f64/i128 -> bare trimmed s;
 /// otherwise a single-quoted string with `'` doubled.
-#[allow(dead_code)] // Apply dialog (Task 4); tested directly meanwhile.
 pub fn sql_value(v: Option<&str>, numeric: bool) -> String {
     match v {
         None => "NULL".to_string(),
@@ -188,7 +193,6 @@ pub fn sql_value(v: Option<&str>, numeric: bool) -> String {
 }
 
 /// Builds a `pk = original` (or `pk IS NULL`) fragment for one pk column.
-#[allow(dead_code)] // Apply dialog (Task 4); tested directly meanwhile.
 fn pk_where_fragment(meta: &TableMeta, row: usize, pk_col: usize, original: &mut dyn FnMut(usize, usize) -> Option<String>) -> String {
     let ident = quote_ident(&meta.headers[pk_col]);
     match original(row, pk_col) {
@@ -197,7 +201,6 @@ fn pk_where_fragment(meta: &TableMeta, row: usize, pk_col: usize, original: &mut
     }
 }
 
-#[allow(dead_code)] // Apply dialog (Task 4); tested directly meanwhile.
 fn where_clause(meta: &TableMeta, row: usize, original: &mut dyn FnMut(usize, usize) -> Option<String>) -> String {
     meta.pk_cols
         .iter()
@@ -212,7 +215,6 @@ fn where_clause(meta: &TableMeta, row: usize, original: &mut dyn FnMut(usize, us
 /// wins). Every statement pairs with its expected affected-row count (1 for
 /// UPDATE/DELETE; None for INSERT — the driver reports 1 but server
 /// triggers may differ).
-#[allow(dead_code)] // Apply dialog (Task 4); tested directly meanwhile.
 pub fn generate_statements(
     meta: &TableMeta,
     edits: &EditState,
