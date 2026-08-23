@@ -921,6 +921,66 @@ pub enum ModalState {
         bypass_auto_limit: bool,
         error: Option<String>,
     },
+    /// G9: confirmed-admin-action dialog for kill (design §6). Reuses the
+    /// single-modal-at-a-time infrastructure deliberately — `run_query_with`
+    /// already refuses to run while `modal.is_some()`, and the
+    /// dropdown/palette refuse to open a second modal; a kill confirmation
+    /// is exactly the blocking dialog that invariant exists for. `sql` is
+    /// the LITERAL statement that will run (shown in a monospace block —
+    /// same "show the exact generated SQL" principle as the Apply dialog).
+    /// `error` is a failed kill's message: the dialog stays open with it
+    /// (same "error stays in the modal" precedent as Apply's
+    /// rollback-error UX).
+    ///
+    /// Review fix (MAJOR + MINOR, G9 T6 adversarial review): `pid`+`tab_id`
+    /// are what let `on_monitor_view_event` (main.rs) tell THIS dialog's
+    /// outcome apart from some other tab's/pid's in-flight kill — a
+    /// `KillFinished` event whose `(pid, tab_id)` doesn't match the
+    /// currently open dialog must never mutate it (misattribution: one
+    /// kill's result landing in a DIFFERENT kill's dialog). `dispatched`
+    /// guards the same class of bug on the send side: nothing previously
+    /// stopped a double-click on "Ukončit proces" from dispatching two
+    /// `Kill` commands for the same pid while the first was still in
+    /// flight — `confirm_kill_confirm` sets it on the first click and
+    /// becomes a no-op on any click after.
+    KillConfirm {
+        pid: i64,
+        label: String, // "{user} · {application} · běží {n}s"
+        sql: String,
+        tab_id: u64,
+        error: Option<String>,
+        dispatched: bool,
+    },
+    /// G13 T6 (design §5 case 3 / §3-novela): confirm dialog for
+    /// "Analyzovat" on a write statement over a WRITABLE connection — `sql`
+    /// is the ORIGINAL (pre-`EXPLAIN ANALYZE`-wrap) editor text, shown
+    /// verbatim so the user sees exactly what will actually run (and be
+    /// rolled back). `engine` is needed at confirm time to rebuild the
+    /// wrapped `EXPLAIN ANALYZE` SQL via `plan::explain_analyze_sql`.
+    ///
+    /// Review fix (MAJOR, adversarial review of commit 0bab655): `running`/
+    /// `error` mirror `ApplyDialogState`'s exact shape — `self.modal` stays
+    /// `Some(AnalyzeWriteConfirm { running: true, .. })` (mutated in place,
+    /// never cleared) for the WHOLE duration of the analyze, so the
+    /// existing `self.modal.is_some()` busy-guards elsewhere refuse a
+    /// second dispatch, and Escape (which only allow-lists
+    /// `ConnectionDialog`/`QueryParams` as closable — see
+    /// `AppView::on_cancel_query`) is a structural no-op against it rather
+    /// than the previous version's `self.cancel`-based guard, which was
+    /// never actually wired to `QueryRunner::run_analyze_write` and so
+    /// could be defeated by Escape mid-flight.
+    AnalyzeWriteConfirm { sql: String, engine: Engine, running: bool, error: Option<String> },
+    /// G7 T6: two-connection picker for the schema/data compare feature
+    /// (design §3). `conn_a`/`conn_b` are `ConnectionConfig.id` values (or
+    /// `None` while unpicked); "Spustit porovnání" (`confirm_compare_dialog`)
+    /// is disabled until both are `Some`. The SAME connection on both sides
+    /// is explicitly ALLOWED (design §3) — yields an all-Unchanged result,
+    /// useful as a smoke test — so there is no equality guard here. `error`
+    /// is currently unused by any handler (schema-pair fetch failures are
+    /// surfaced on the resulting `CompareView` tab, T7, not back into this
+    /// already-closed dialog) but kept for a uniform modal-state shape and
+    /// possible future pre-dispatch validation.
+    CompareDialog { conn_a: Option<String>, conn_b: Option<String>, error: Option<String> },
 }
 
 // ---------------------------------------------------------------------
@@ -1044,6 +1104,15 @@ impl AppView {
             ModalState::QueryParams { names, inputs, null_flags, sql_template, error, .. } => {
                 render_query_params_panel(names, inputs, null_flags, sql_template, error, cx)
             }
+            ModalState::KillConfirm { pid, label, sql, error, dispatched, .. } => {
+                render_kill_confirm_panel(pid, &label, &sql, &error, dispatched, cx)
+            }
+            ModalState::AnalyzeWriteConfirm { sql, engine, running, error } => {
+                render_analyze_write_confirm_panel(&sql, engine, running, &error, cx)
+            }
+            ModalState::CompareDialog { conn_a, conn_b, error } => {
+                render_compare_dialog_panel(conn_a, conn_b, error, self.grouped_cache.clone(), cx)
+            }
         };
         Some(
             div()
@@ -1134,6 +1203,106 @@ impl AppView {
 
     pub(crate) fn close_modal(&mut self, cx: &mut Context<Self>) {
         self.modal = None;
+        cx.notify();
+    }
+
+    /// G7 T6: opens the connection-pair picker. Reuses `self.grouped_cache`
+    /// (the SAME folder/favourite grouping the top-bar dropdown shows) —
+    /// refreshed here rather than trusting whatever it last held, since the
+    /// dialog can be opened via the palette without the dropdown ever having
+    /// been opened this session.
+    pub(crate) fn open_compare_dialog(&mut self, cx: &mut Context<Self>) {
+        self.refresh_grouped_cache();
+        self.modal = Some(ModalState::CompareDialog { conn_a: None, conn_b: None, error: None });
+        cx.notify();
+    }
+
+    /// A picker-row click on side `side` — updates `conn_a`/`conn_b` on the
+    /// open `CompareDialog`, a no-op if some other modal is open by the time
+    /// this fires (defensive; the dialog's own overlay occludes clicks
+    /// elsewhere while open).
+    pub(crate) fn select_compare_side(&mut self, side: CompareSide, id: String, cx: &mut Context<Self>) {
+        if let Some(ModalState::CompareDialog { conn_a, conn_b, .. }) = &mut self.modal {
+            match side {
+                CompareSide::A => *conn_a = Some(id),
+                CompareSide::B => *conn_b = Some(id),
+            }
+        }
+        cx.notify();
+    }
+
+    /// "Spustit porovnání" — resolves both picked `ConnectionConfig`s +
+    /// their vault secrets (EXACT `run_query_with`'s
+    /// `self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id))` pattern, no
+    /// new vault API/unlock step), closes the dialog immediately (design §3:
+    /// "the modal itself closes as soon as the request is dispatched"), and
+    /// dispatches `QueryRunner::fetch_schema_pair` — fire-and-forget with a
+    /// generation guard, mirroring `AppView::trigger_schema_fetch`'s exact
+    /// shape. `on_compare_schema_pair_ready` (T7 fills in the real body)
+    /// picks the result up and opens the Compare tab.
+    pub(crate) fn confirm_compare_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(ModalState::CompareDialog { conn_a, conn_b, .. }) = self.modal.clone() else {
+            return;
+        };
+        let (Some(id_a), Some(id_b)) = (conn_a, conn_b) else { return };
+        let Some(cfg_a) = self.config.connections.iter().find(|c| c.id == id_a).cloned() else {
+            return;
+        };
+        let Some(cfg_b) = self.config.connections.iter().find(|c| c.id == id_b).cloned() else {
+            return;
+        };
+        let secret_a = self.vault.as_ref().and_then(|v| v.get_secret(&cfg_a.id));
+        let secret_b = self.vault.as_ref().and_then(|v| v.get_secret(&cfg_b.id));
+
+        self.modal = None; // design §3: closes as soon as the request is dispatched
+        self.compare_fetch_generation += 1;
+        let my_generation = self.compare_fetch_generation;
+        let label_a = format!("{} ({})", cfg_a.name, engine_label(cfg_a.engine));
+        let label_b = format!("{} ({})", cfg_b.name, engine_label(cfg_b.engine));
+        let spec_a = ConnectSpec::Config { cfg: Box::new(cfg_a.clone()), secret: secret_a.clone() };
+        let spec_b = ConnectSpec::Config { cfg: Box::new(cfg_b.clone()), secret: secret_b.clone() };
+        let rx = self.runner.fetch_schema_pair(spec_a, spec_b);
+
+        // design §3: the Compare tab opens IMMEDIATELY (`CompareLoadState::
+        // Loading`, "Načítám schéma…") — `on_compare_schema_pair_ready`
+        // (main.rs) updates this SAME entity in place once the fetch
+        // resolves, rather than a second entity/tab being created then.
+        let view = cx.new(|_| crate::compare::CompareView {
+            label_a: label_a.clone(),
+            label_b: label_b.clone(),
+            conn_a: cfg_a,
+            secret_a,
+            conn_b: cfg_b,
+            secret_b,
+            state: crate::compare::CompareLoadState::Loading,
+            selection: crate::compare::CompareSelection::None,
+            show_unchanged: crate::compare::ShowUnchanged::default(),
+            show_ddl_diff: false,
+            data_where: String::new(),
+            data_diff: crate::compare::DataDiffState::Idle,
+            data_diff_generation: 0,
+        });
+        cx.subscribe(&view, AppView::on_compare_view_event).detach();
+        self.tabs.open(crate::tabs::ResultTab {
+            id: 0,
+            title: crate::tabs::collapse_title(&format!("Porovnání: {label_a} ↔ {label_b}")),
+            pinned: false,
+            preview_key: None,
+            conn_identity: self.current_conn_identity(),
+            content: crate::tabs::TabContent::Compare { view: view.clone() },
+        });
+        let pending = crate::PendingCompare { view, generation: my_generation };
+
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |view, cx| {
+                if view.compare_fetch_generation != pending.generation {
+                    return;
+                }
+                view.on_compare_schema_pair_ready(pending, result, cx);
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1523,6 +1692,48 @@ impl AppView {
                 *flag = !*flag;
             }
         }
+        cx.notify();
+    }
+
+    /// G9 T5: "Zrušit" on the kill-confirm dialog — closes it, nothing was
+    /// sent.
+    pub(crate) fn cancel_kill_confirm(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.modal, Some(ModalState::KillConfirm { .. })) {
+            self.modal = None;
+            cx.notify();
+        }
+    }
+
+    /// G9 T5: "Ukončit proces" — dispatches `MonitorCmd::Kill` via the
+    /// tab's `MonitorView`; the dialog STAYS OPEN until
+    /// `MonitorViewEvent::KillFinished` resolves (T6's on_monitor_view_event
+    /// closes it on Ok / fills `error` on Err).
+    ///
+    /// MINOR review fix: a double-click used to `try_send` two `Kill`
+    /// commands for the same pid — `kill_confirm_dispatch_target` (below)
+    /// returns `None` once `dispatched` is already `true`, making a second
+    /// call a no-op.
+    pub(crate) fn confirm_kill_confirm(&mut self, cx: &mut Context<Self>) {
+        let Some((pid, tab_id)) = kill_confirm_dispatch_target(&self.modal) else {
+            return;
+        };
+        let Some(view) = self.monitor_view_for_tab(tab_id) else {
+            // Tab closed under the dialog — nothing to kill against.
+            self.modal = None;
+            self.status = "monitor tab už není otevřený — ukončení zrušeno".into();
+            cx.notify();
+            return;
+        };
+        // Mark in-flight BEFORE dispatching so a rapid double-click can't
+        // slip a second Kill through between this check and the send.
+        if let Some(ModalState::KillConfirm { dispatched, .. }) = &mut self.modal {
+            *dispatched = true;
+        }
+        view.update(cx, |m, cx| m.dispatch_kill(pid, cx));
+        // Deliberately no self.modal = None here: success/failure arrives
+        // as MonitorViewEvent::KillFinished (T6), which closes the dialog
+        // on Ok or writes `error` on Err — the failure-stays-in-dialog UX
+        // (design §6).
         cx.notify();
     }
 }
@@ -1949,4 +2160,618 @@ fn render_query_params_panel(
             .child(styled_button("qp-run", "Spustit").on_click(cx.listener(|v, _, _, cx| v.confirm_query_params(cx)))),
     );
     panel.into_any_element()
+}
+
+/// Pure guard for `AppView::confirm_kill_confirm` (MINOR review fix):
+/// `Some((pid, tab_id))` when an OPEN `KillConfirm` dialog has not yet
+/// dispatched its kill; `None` when there's no `KillConfirm` open at all, OR
+/// one is open but `dispatched` is already `true` (a second click while the
+/// first kill is still in flight must be a no-op — nothing else stopped a
+/// double-click from `try_send`-ing two `Kill` commands for the same pid).
+/// Factored out as a free function, same "pure logic, thin cx-touching
+/// wrapper" split `monitor_view::MonitorView::apply_event` uses, so it's
+/// unit-testable without a GPUI entity/`Context`.
+fn kill_confirm_dispatch_target(modal: &Option<ModalState>) -> Option<(i64, u64)> {
+    match modal {
+        Some(ModalState::KillConfirm { pid, tab_id, dispatched: false, .. }) => Some((*pid, *tab_id)),
+        _ => None,
+    }
+}
+
+/// Pure guard for `AppView::on_confirm_analyze_write` (MAJOR review fix on
+/// commit 0bab655): `Some(sql)` when an OPEN `AnalyzeWriteConfirm` dialog
+/// isn't already running; `None` when there's no `AnalyzeWriteConfirm` open
+/// at all, OR one is open but `running` is already `true`. This is what
+/// makes the busy-guard for the analyze-write sequence structural rather
+/// than the earlier (buggy) `self.cancel`-token approach: `self.modal`
+/// stays `Some(AnalyzeWriteConfirm { running: true, .. })` — mutated in
+/// place, never cleared — for the whole duration of the analyze, so (a) a
+/// second "Analyzovat" click routes through this SAME guard and is a
+/// no-op, exactly like `kill_confirm_dispatch_target` above, and (b) Esc
+/// can't defeat it either — `on_cancel_query`'s `closable` match only
+/// allow-lists `ConnectionDialog`/`QueryParams`, so `AnalyzeWriteConfirm`
+/// (like `KillConfirm`) falls into its `_ => false` arm and Esc is
+/// structurally inert against it, whether or not the analyze is running.
+/// Same "pure logic, thin cx-touching wrapper" testability rationale as
+/// `kill_confirm_dispatch_target`.
+pub(crate) fn analyze_write_dispatch_sql(modal: &Option<ModalState>) -> Option<String> {
+    match modal {
+        Some(ModalState::AnalyzeWriteConfirm { sql, running: false, .. }) => Some(sql.clone()),
+        _ => None,
+    }
+}
+
+/// Pure guard for `AppView::on_monitor_view_event` (MAJOR review fix): does
+/// the resolving `KillFinished` event — from tab `event_tab_id`, for
+/// `event_pid` — belong to the CURRENTLY open `KillConfirm` dialog? A
+/// `false` here means some OTHER kill's outcome arrived (a different pid on
+/// the same tab, or the same/different pid on a different monitor tab, or
+/// the dialog was cancelled/closed already) — the caller must not mutate
+/// `self.modal` in that case, or one kill's result gets misattributed into
+/// an unrelated open dialog (wrong error text, or silently closing a dialog
+/// nobody confirmed). Same testability rationale as
+/// `kill_confirm_dispatch_target` above. `pub(crate)`: called from
+/// `main.rs`'s `on_monitor_view_event`.
+pub(crate) fn kill_confirm_matches(modal: &Option<ModalState>, event_tab_id: u64, event_pid: i64) -> bool {
+    matches!(
+        modal,
+        Some(ModalState::KillConfirm { pid, tab_id, .. })
+            if *pid == event_pid && *tab_id == event_tab_id
+    )
+}
+
+/// Applies a FAILED kill's outcome to `modal`, if it's still open for THIS
+/// pid/tab_id (`kill_confirm_matches`) — writes `error` for display AND
+/// resets `dispatched` back to `false`. No-op (leaves `modal` untouched)
+/// when the event doesn't match the currently open dialog.
+///
+/// Review fix (NEW MINOR, follow-up to the MINOR double-dispatch guard):
+/// leaving `dispatched` at `true` here permanently greyed "Ukončit proces"
+/// out after the FIRST failed attempt — the Ok arm is the only other place
+/// that ever clears it, and Ok closes the dialog outright instead, so nobody
+/// ever reset it back to `false` for a genuine retry. `pub(crate)`: called
+/// from `main.rs`'s `on_monitor_view_event`; factored out (same rationale as
+/// `kill_confirm_matches`/`kill_confirm_dispatch_target` above) so the
+/// retry-reset is unit-testable without a GPUI entity/`Context`.
+pub(crate) fn apply_kill_error_to_modal(modal: &mut Option<ModalState>, tab_id: u64, pid: i64, msg: &str) {
+    if !kill_confirm_matches(modal, tab_id, pid) {
+        return;
+    }
+    if let Some(ModalState::KillConfirm { error, dispatched, .. }) = modal {
+        *error = Some(msg.to_string());
+        *dispatched = false;
+    }
+}
+
+/// G9 T5: the kill-confirm dialog panel — same card tokens as every other
+/// modal in this file. Shows the exact SQL that will run (design §6's "show
+/// the exact generated SQL" principle) and, on a failed attempt, the error
+/// text below it (dialog stays open). `dispatched` (MINOR review fix)
+/// greys out "Ukončit proces" and drops its click handler once a kill is in
+/// flight, so a second click can't fire a second `Kill`; "Zrušit" stays
+/// active throughout — dismissing the dialog while a kill is in flight is
+/// harmless (the eventual `KillFinished` just finds no matching dialog to
+/// update, per `kill_confirm_matches`, and falls back to a status line).
+fn render_kill_confirm_panel(
+    pid: i64,
+    label: &str,
+    sql: &str,
+    error: &Option<String>,
+    dispatched: bool,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let mut panel: Div = div()
+        .w(px(520.))
+        .bg(rgb(0x1e1e2e))
+        .border_1()
+        .border_color(rgb(0x45475a))
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(rgb(0xcdd6f4))
+        .child(div().text_size(px(16.)).child("Ukončit proces"))
+        .child(format!("Opravdu ukončit proces {pid} ({label})?"))
+        .child(
+            div()
+                .id("kill-sql-preview")
+                .p_1()
+                .bg(rgb(0x181825))
+                .rounded_md()
+                .text_color(rgb(0xa6adc8))
+                .whitespace_normal()
+                .child(sql.to_string()),
+        );
+
+    if let Some(e) = error {
+        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {e}")));
+    }
+
+    let confirm_button = if dispatched {
+        div()
+            .id("kill-confirm")
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0x313244))
+            .text_color(rgb(0x6c7086))
+            .child("Ukončuji…")
+            .into_any_element()
+    } else {
+        styled_button("kill-confirm", "Ukončit proces")
+            .bg(rgb(0x5d2e2e)) // danger tint — DELETED_ROW_BG family
+            .on_click(cx.listener(|v, _, _, cx| v.confirm_kill_confirm(cx)))
+            .into_any_element()
+    };
+
+    panel = panel.child(
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .justify_end()
+            .mt_2()
+            .child(
+                styled_button("kill-cancel", "Zrušit")
+                    .on_click(cx.listener(|v, _, _, cx| v.cancel_kill_confirm(cx))),
+            )
+            .child(confirm_button),
+    );
+    panel.into_any_element()
+}
+
+/// G13 T6 (design §5 case 3 / §3-novela): confirm dialog for "Analyzovat"
+/// on a write over a writable connection. Shows the LITERAL SQL that will
+/// actually run — same "show the exact generated SQL" principle as the
+/// Apply dialog and the kill-confirm panel above — plus an explicit warning
+/// that side effects OUTSIDE the wrapping transaction (sequence/IDENTITY
+/// advances, external function calls) are not undone by the ROLLBACK.
+/// Confirming dispatches `AppView::on_confirm_analyze_write` (main.rs),
+/// which resolves the spec, rebuilds the wrapped `EXPLAIN ANALYZE` SQL, and
+/// calls `QueryRunner::run_analyze_write`.
+/// `running`/`error` mirror `render_apply_dialog_overlay`'s exact shape
+/// (`AppView::render_apply_dialog_overlay`, main.rs): both buttons disabled
+/// (no `cursor_pointer`/`on_click`) while `running`, an "analyzuji…" note
+/// shown while in flight, and any `error` from a failed/cancelled run shown
+/// beneath it — the dialog stays open on error so a retry ("Analyzovat"
+/// again) or an explicit "Zrušit" are both still available, same as Apply.
+fn render_analyze_write_confirm_panel(
+    sql: &str,
+    engine: Engine,
+    running: bool,
+    error: &Option<String>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let sql = sql.to_string();
+    let mut panel = div()
+        .id("analyze-write-confirm")
+        .w(px(520.))
+        .bg(rgb(0x1e1e2e))
+        .border_1()
+        .border_color(rgb(0x45475a))
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(rgb(0xcdd6f4))
+        .child(div().text_size(px(16.)).child("Analyzovat (EXPLAIN ANALYZE)"))
+        .child(div().text_color(rgb(0xf9e2af)).child(
+            "Toto SQL bude SKUTEČNĚ PROVEDENO, aby bylo možné změřit skutečný plán, a poté vráceno \
+             zpět (ROLLBACK). Vedlejší efekty MIMO transakci (např. hodnoty sekvencí/IDENTITY, \
+             volání externích funkcí) NEBUDOU vráceny zpět.",
+        ))
+        .child(
+            div()
+                .id("analyze-write-sql-preview")
+                .p_1()
+                .bg(rgb(0x181825))
+                .rounded_md()
+                .text_color(rgb(0xa6adc8))
+                .whitespace_normal()
+                .child(sql),
+        );
+
+    if running {
+        panel = panel.child(div().text_color(rgb(0xf9e2af)).child("analyzuji (BEGIN…ROLLBACK)…"));
+    }
+    if let Some(err) = error {
+        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {err}")));
+    }
+
+    panel = panel.child(
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .justify_end()
+            .mt_2()
+            .child(
+                div()
+                    .id("analyze-write-cancel")
+                    .when(!running, |d| {
+                        d.cursor_pointer().on_click(cx.listener(|v, _, _, cx| {
+                            v.modal = None;
+                            cx.notify();
+                        }))
+                    })
+                    .bg(rgb(0x313244))
+                    .text_color(if running { rgb(0x6c7086) } else { rgb(0xcdd6f4) })
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .child("Zrušit"),
+            )
+            .child(
+                div()
+                    .id("analyze-write-confirm-btn")
+                    .when(!running, |d| {
+                        d.cursor_pointer().on_click(cx.listener(move |v, _, window, cx| {
+                            v.on_confirm_analyze_write(engine, window, cx);
+                        }))
+                    })
+                    // danger tint — DELETED_ROW_BG family, matches kill-confirm — dimmed while running.
+                    .bg(if running { rgb(0x313244) } else { rgb(0x5d2e2e) })
+                    .text_color(if running { rgb(0x6c7086) } else { rgb(0xcdd6f4) })
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .child(if running { "Analyzuji…" } else { "Analyzovat" }),
+            ),
+    );
+    panel.into_any_element()
+}
+
+/// G7 T6: which column of the `CompareDialog` picker a row click targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompareSide {
+    A,
+    B,
+}
+
+/// Render contract (design §3): heading, two labeled columns ("Databáze A" /
+/// "Databáze B") each a list of `grouped`'s rows (folder/favourite sections
+/// — the SAME grouping data the top-bar dropdown shows), a single-select
+/// click handler per row, an `error` line (if any) below both columns, and
+/// "Spustit porovnání" disabled until both `conn_a`/`conn_b` are `Some`
+/// (same connection on both sides explicitly allowed — no equality guard).
+fn render_compare_dialog_panel(
+    conn_a: Option<String>,
+    conn_b: Option<String>,
+    error: Option<String>,
+    grouped: GroupedConnections,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let both_picked = conn_a.is_some() && conn_b.is_some();
+    let mut panel = div()
+        .id("compare-dialog")
+        .w(px(680.))
+        .bg(rgb(0x1e1e2e))
+        .border_1()
+        .border_color(rgb(0x45475a))
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(rgb(0xcdd6f4))
+        .child(div().text_size(px(16.)).child("Porovnat databáze…"))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_3()
+                .child(render_compare_picker_column(
+                    "compare-col-a",
+                    "Databáze A",
+                    CompareSide::A,
+                    &conn_a,
+                    &grouped,
+                    cx,
+                ))
+                .child(render_compare_picker_column(
+                    "compare-col-b",
+                    "Databáze B",
+                    CompareSide::B,
+                    &conn_b,
+                    &grouped,
+                    cx,
+                )),
+        );
+
+    if let Some(e) = &error {
+        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {e}")));
+    }
+
+    let confirm_button = if both_picked {
+        styled_button("compare-confirm", "Spustit porovnání")
+            .on_click(cx.listener(|v, _, _, cx| v.confirm_compare_dialog(cx)))
+            .into_any_element()
+    } else {
+        div()
+            .id("compare-confirm")
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0x313244))
+            .text_color(rgb(0x6c7086))
+            .child("Spustit porovnání")
+            .into_any_element()
+    };
+
+    panel = panel.child(
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .justify_end()
+            .mt_2()
+            .child(styled_button("compare-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| {
+                v.modal = None;
+                cx.notify();
+            })))
+            .child(confirm_button),
+    );
+    panel.into_any_element()
+}
+
+fn render_compare_picker_column(
+    id: &'static str,
+    label: &'static str,
+    side: CompareSide,
+    selected: &Option<String>,
+    grouped: &GroupedConnections,
+    cx: &mut Context<AppView>,
+) -> impl IntoElement {
+    let mut list = div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .flex_1()
+        .gap_1()
+        .p_1()
+        .h(px(240.))
+        .overflow_hidden()
+        .border_1()
+        .border_color(rgb(0x313244))
+        .rounded_md();
+
+    if !grouped.favourites.is_empty() {
+        list = list.child(div().text_color(rgb(0xf9e2af)).child("Oblíbené"));
+        for c in &grouped.favourites {
+            list = list.child(compare_picker_row(c, side, selected, cx));
+        }
+    }
+    for folder in &grouped.folders {
+        let header = if folder.path.is_empty() { "Bez složky".to_string() } else { folder.path.join("/") };
+        list = list.child(div().text_color(rgb(0x6c7086)).child(header));
+        for c in &folder.connections {
+            list = list.child(compare_picker_row(c, side, selected, cx));
+        }
+    }
+
+    div().flex().flex_col().flex_1().gap_1().child(div().text_color(rgb(0x89b4fa)).child(label)).child(list)
+}
+
+fn compare_picker_row(
+    c: &ConnectionConfig,
+    side: CompareSide,
+    selected: &Option<String>,
+    cx: &mut Context<AppView>,
+) -> impl IntoElement {
+    let id = c.id.clone();
+    let is_selected = selected.as_deref() == Some(c.id.as_str());
+    let side_tag = match side {
+        CompareSide::A => "a",
+        CompareSide::B => "b",
+    };
+    let label = format!("{} — {} {}", c.name, engine_label(c.engine), c.host);
+    div()
+        .id(SharedString::from(format!("compare-row-{side_tag}-{}", c.id)))
+        .px_1()
+        .cursor_pointer()
+        .rounded_md()
+        .when(is_selected, |d| d.bg(rgb(0x313244)).text_color(rgb(0xa6e3a1)))
+        .hover(|s| s.bg(rgb(0x313244)))
+        .child(label)
+        .on_click(cx.listener(move |view, _, _, cx| {
+            view.select_compare_side(side, id.clone(), cx);
+        }))
+}
+
+#[cfg(test)]
+mod compare_dialog_tests {
+    use super::*;
+
+    #[test]
+    fn compare_dialog_starts_with_both_sides_unpicked() {
+        let modal = ModalState::CompareDialog { conn_a: None, conn_b: None, error: None };
+        assert!(matches!(modal, ModalState::CompareDialog { conn_a: None, conn_b: None, .. }));
+    }
+
+    #[test]
+    fn confirm_is_a_noop_until_both_sides_are_picked() {
+        // Pure precondition check mirrored from `confirm_compare_dialog`'s
+        // early-return guard — proven directly on the enum shape rather than
+        // through a full `AppView`/window harness, same precedent as
+        // `Tabs`' own plain-data tests (tabs.rs's module doc comment).
+        let one_picked = ModalState::CompareDialog { conn_a: Some("x".into()), conn_b: None, error: None };
+        let (a, b) = match one_picked {
+            ModalState::CompareDialog { conn_a, conn_b, .. } => (conn_a, conn_b),
+            _ => unreachable!(),
+        };
+        assert!(!(a.is_some() && b.is_some()));
+    }
+
+    #[test]
+    fn same_connection_on_both_sides_is_a_valid_pick() {
+        // design §3: explicitly allowed, not a validation error.
+        let both_same = ModalState::CompareDialog { conn_a: Some("x".into()), conn_b: Some("x".into()), error: None };
+        let (a, b) = match both_same {
+            ModalState::CompareDialog { conn_a, conn_b, .. } => (conn_a, conn_b),
+            _ => unreachable!(),
+        };
+        assert!(a.is_some() && b.is_some());
+    }
+}
+
+#[cfg(test)]
+mod kill_confirm_tests {
+    use super::*;
+
+    fn kill_confirm(pid: i64, tab_id: u64, dispatched: bool) -> Option<ModalState> {
+        Some(ModalState::KillConfirm {
+            pid,
+            label: "u · app · běží 5s".into(),
+            sql: format!("SELECT pg_terminate_backend({pid})"),
+            tab_id,
+            error: None,
+            dispatched,
+        })
+    }
+
+    // --- kill_confirm_dispatch_target (MINOR: double-dispatch guard) ---
+
+    #[test]
+    fn dispatch_target_none_when_no_dialog_open() {
+        assert_eq!(kill_confirm_dispatch_target(&None), None);
+    }
+
+    #[test]
+    fn dispatch_target_some_when_not_yet_dispatched() {
+        let modal = kill_confirm(42, 7, false);
+        assert_eq!(kill_confirm_dispatch_target(&modal), Some((42, 7)));
+    }
+
+    #[test]
+    fn dispatch_target_none_once_already_dispatched() {
+        // Regression for the MINOR finding: a second confirm click must be
+        // a no-op while the first kill is still in flight.
+        let modal = kill_confirm(42, 7, true);
+        assert_eq!(kill_confirm_dispatch_target(&modal), None);
+    }
+
+    // --- kill_confirm_matches (MAJOR: misattribution guard) ---
+
+    #[test]
+    fn matches_true_for_same_pid_and_tab() {
+        let modal = kill_confirm(1, 100, false);
+        assert!(kill_confirm_matches(&modal, 100, 1));
+    }
+
+    #[test]
+    fn matches_false_for_different_pid_same_tab() {
+        // The MAJOR repro: pid 1's dialog cancelled, pid 2's dialog open on
+        // the same tab, pid 1's stale KillResult arrives.
+        let modal = kill_confirm(2, 100, false);
+        assert!(!kill_confirm_matches(&modal, 100, 1));
+    }
+
+    #[test]
+    fn matches_false_for_same_pid_different_tab() {
+        // The cross-tab variant: two monitor tabs, same pid coincidentally.
+        let modal = kill_confirm(1, 200, false);
+        assert!(!kill_confirm_matches(&modal, 100, 1));
+    }
+
+    #[test]
+    fn matches_false_when_no_dialog_open() {
+        assert!(!kill_confirm_matches(&None, 100, 1));
+    }
+
+    #[test]
+    fn matches_ignores_dispatched_flag() {
+        // A dispatched-but-still-open matching dialog must still resolve —
+        // `dispatched` only gates the SEND side (dispatch_target), not the
+        // RESOLVE side (matches).
+        let modal = kill_confirm(1, 100, true);
+        assert!(kill_confirm_matches(&modal, 100, 1));
+    }
+
+    // --- apply_kill_error_to_modal (NEW MINOR: retry-after-failure) ---
+
+    #[test]
+    fn matching_err_sets_error_and_resets_dispatched_for_retry() {
+        // Regression for the NEW MINOR finding: before this fix, a genuine
+        // failed kill left `dispatched` at `true` forever, permanently
+        // greying out "Ukončit proces" — no way to retry.
+        let mut modal = kill_confirm(42, 7, true); // in flight
+        apply_kill_error_to_modal(&mut modal, 7, 42, "boom");
+        let Some(ModalState::KillConfirm { error, dispatched, .. }) = &modal else {
+            panic!("dialog must stay open on a matching failed kill");
+        };
+        assert_eq!(error.as_deref(), Some("boom"));
+        assert!(!dispatched, "dispatched must reset so a retry click can dispatch again");
+        // The retry itself must now be dispatchable.
+        assert_eq!(kill_confirm_dispatch_target(&modal), Some((42, 7)));
+    }
+
+    #[test]
+    fn non_matching_err_leaves_modal_untouched() {
+        // Same misattribution class as the MAJOR fix: pid 1's stale error
+        // must not touch pid 2's currently open, still-in-flight dialog.
+        let mut modal = kill_confirm(2, 7, true);
+        apply_kill_error_to_modal(&mut modal, 7, 1, "boom");
+        let Some(ModalState::KillConfirm { pid, error, dispatched, .. }) = &modal else {
+            panic!("unrelated dialog must remain open");
+        };
+        assert_eq!(*pid, 2);
+        assert_eq!(*error, None);
+        assert!(*dispatched, "unrelated dialog's in-flight state must be untouched");
+    }
+}
+
+/// G13 T6 MAJOR review fix (adversarial review of commit 0bab655): pins
+/// `analyze_write_dispatch_sql`'s busy-guard — the mechanism that replaced
+/// the earlier `self.cancel`-token approach, which could be defeated by
+/// Escape (see that function's doc comment for the full story).
+#[cfg(test)]
+mod analyze_write_confirm_tests {
+    use super::*;
+
+    fn analyze_confirm(sql: &str, running: bool) -> Option<ModalState> {
+        Some(ModalState::AnalyzeWriteConfirm {
+            sql: sql.to_string(),
+            engine: Engine::Postgres,
+            running,
+            error: None,
+        })
+    }
+
+    #[test]
+    fn dispatch_sql_none_when_no_dialog_open() {
+        assert_eq!(analyze_write_dispatch_sql(&None), None);
+    }
+
+    #[test]
+    fn dispatch_sql_none_for_an_unrelated_modal() {
+        let modal = Some(ModalState::QueryParams {
+            names: Vec::new(),
+            inputs: Vec::new(),
+            null_flags: Vec::new(),
+            sql_template: "SELECT 1".into(),
+            bypass_auto_limit: false,
+            error: None,
+        });
+        assert_eq!(analyze_write_dispatch_sql(&modal), None);
+    }
+
+    #[test]
+    fn dispatch_sql_some_when_not_yet_running() {
+        let modal = analyze_confirm("UPDATE t SET x = 1", false);
+        assert_eq!(analyze_write_dispatch_sql(&modal), Some("UPDATE t SET x = 1".to_string()));
+    }
+
+    #[test]
+    fn dispatch_sql_none_once_already_running() {
+        // The core regression pin for the MAJOR fix: a second confirm
+        // click (or, before the fix, a false Escape-triggered re-enable
+        // via the old `self.cancel`-based guard) must be a no-op while the
+        // first analyze is still in flight — `self.modal` stays `Some(..)`
+        // with `running: true` for the whole duration, so this guard alone
+        // is what makes a second dispatch impossible now.
+        let modal = analyze_confirm("UPDATE t SET x = 1", true);
+        assert_eq!(analyze_write_dispatch_sql(&modal), None);
+    }
 }

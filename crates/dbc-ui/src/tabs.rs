@@ -34,6 +34,26 @@ pub enum TabContent {
     /// — the schema browser that will is a later task.
     #[allow(dead_code)]
     Text { text: String, scroll_lines: usize },
+    /// G9: server-monitor dashboard tab (one per connection at a time —
+    /// keyed via `preview_key = "monitor:{conn_identity}"`, activated
+    /// not re-stacked on reopen; see AppView::open_monitor_tab).
+    ///
+    Monitor { view: Entity<crate::monitor_view::MonitorView> },
+    /// G13: an Explain/Analyze execution-plan tab (`AppView::dispatch_plan_query`/
+    /// `AppView::on_confirm_analyze_write`) — one per run, stacked like a
+    /// normal ad-hoc query tab (no preview-key dedup).
+    Plan { view: Entity<crate::plan::PlanView> },
+    /// G8 T6: ER diagram tab — one per `open_er_diagram` call (schema-tree
+    /// icon or the "ER diagram" palette action), titled `"ER: {schema}"`.
+    /// Read-only, never editable — see `crate::er_diagram_view::ErDiagramView`.
+    Diagram { view: Entity<crate::er_diagram_view::ErDiagramView> },
+    /// G7: schema/data compare tab — a typed `Entity` handle, same shape as
+    /// `Grid`'s (tabs.rs stays GPUI-free beyond this type name, per the
+    /// file's own module doc comment). Opened by
+    /// `AppView::on_compare_schema_pair_ready`, stacked like an ad-hoc query
+    /// tab (no preview-key dedup — repeated compares of the same pair just
+    /// open more tabs, matching `Plan`'s own precedent).
+    Compare { view: Entity<crate::compare::CompareView> },
 }
 
 pub struct ResultTab {

@@ -1,12 +1,18 @@
 mod admin_sql;
 mod autocomplete;
+mod compare;
 mod connect;
 mod connections_ui;
+mod er_diagram_view;
 mod export;
 mod fk_join;
 mod grid;
 mod history_panel;
+mod monitor;
+mod monitor_sql;
+mod monitor_view;
 mod palette;
+mod plan;
 mod row_view;
 mod runner;
 mod sandbox;
@@ -596,6 +602,21 @@ struct DiscardConfirmState {
     action: PendingDiscard,
 }
 
+/// G7 T7: the pending-fetch state `connections_ui::confirm_compare_dialog`
+/// hands to `AppView::on_compare_schema_pair_ready` once `fetch_schema_pair`
+/// resolves. The Compare tab (and its `CompareView` entity, in
+/// `CompareLoadState::Loading`) is opened immediately at dispatch time —
+/// `view` is that SAME entity, updated in place once the fetch resolves
+/// (rather than a second entity being constructed here), so the tab
+/// actually shows "Načítám schéma…" for the duration of the fetch instead
+/// of only appearing once it's already done. `generation` mirrors
+/// `schema_fetch_generation`'s guard shape — a newer dispatch's result
+/// always wins over an older, still-in-flight one.
+pub(crate) struct PendingCompare {
+    pub view: Entity<compare::CompareView>,
+    pub generation: u64,
+}
+
 struct AppView {
     tabs: Tabs,
     status: String,
@@ -661,6 +682,11 @@ struct AppView {
     /// can resolve after a faster fetch for the new connection and silently
     /// overwrite the tree with the wrong connection's schema.
     schema_fetch_generation: u64,
+    /// G7 T6: bumped on every `confirm_compare_dialog` dispatch; an
+    /// `on_compare_schema_pair_ready` result only applies if the generation
+    /// still matches — same last-dispatched-wins guard as
+    /// `schema_fetch_generation`/`switch_generation`.
+    compare_fetch_generation: u64,
     /// Identity (see `conn_spec_key`) of the connection whose schema is
     /// currently being fetched/shown in `tree`, so `trigger_schema_fetch`
     /// can tell `SchemaTree::set_snapshot` whether an incoming snapshot is a
@@ -1300,6 +1326,10 @@ impl AppView {
                                                 grid.update(cx, |g, _| g.on_stream_finished())
                                             }
                                             TabContent::Text { .. } => None,
+                                            TabContent::Monitor { .. } => None,
+                                            TabContent::Plan { .. } => None,
+                                            TabContent::Diagram { .. } => None,
+                                            TabContent::Compare { .. } => None,
                                         }
                                     })
                                 });
@@ -1439,6 +1469,329 @@ impl AppView {
                 // it. See `run_generation`'s doc comment.
                 if view.run_generation == my_generation {
                     view.cancel = None;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // -----------------------------------------------------------------
+    // G13 T6: "Vysvětlit"/"Analyzovat" status-bar buttons — dispatch,
+    // three-case write gate (design §5), and the resulting `TabContent::Plan`
+    // tab. See `plan.rs`'s module doc comment / the design's §3-novela
+    // note for the ANALYZE-on-a-write sequence's write-path status.
+    // -----------------------------------------------------------------
+
+    /// Shared spec-resolution slice of `run_query_with`'s own block, factored
+    /// out for `run_explain`/`on_confirm_analyze_write` to reuse without
+    /// duplicating the connection-lookup/CLI-url branching. Returns `None`
+    /// (status already set) on no active connection.
+    fn resolve_spec_for_explain(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(bool, Option<u64>, dbc_state::Engine, ConnectSpec)> {
+        if let Some(id) = self.active_connection_id.clone() {
+            let Some(cfg) = self.config.connections.iter().find(|c| c.id == id).cloned() else {
+                self.status = "connection no longer exists".into();
+                cx.notify();
+                return None;
+            };
+            let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+            let (read_only, timeout_secs, engine) = (cfg.read_only, cfg.timeout_secs, cfg.engine);
+            Some((read_only, timeout_secs, engine, ConnectSpec::Config { cfg: Box::new(cfg), secret }))
+        } else if let Some(url) = self.conn_url.clone() {
+            Some((false, None, engine_from_url(&url), ConnectSpec::Url(url)))
+        } else {
+            self.status = "Bez připojení — vyberte připojení nahoře.".into();
+            cx.notify();
+            None
+        }
+    }
+
+    /// Dispatch for both buttons: `is_analyze == false` is §5's ALWAYS-safe
+    /// estimated path (no gate, ever, on any engine/connection); `true`
+    /// routes through `plan::analyze_gate`'s three-case dispatch (Run /
+    /// Blocked / NeedsConfirm) decided from the RAW pre-wrap SQL, mirroring
+    /// `run_query_with`'s Guard 1 read-only check.
+    fn run_explain(&mut self, is_analyze: bool, cx: &mut Context<Self>) {
+        if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
+            return;
+        }
+        if self.cancel.is_some() {
+            return;
+        }
+        let sql = self.sql.read(cx).text().to_string();
+        if sql.trim().is_empty() {
+            return;
+        }
+
+        let Some((read_only, timeout_secs, engine, spec)) = self.resolve_spec_for_explain(cx) else {
+            return; // resolve_spec_for_explain already set self.status on failure
+        };
+
+        if !is_analyze {
+            // §5: Explain is ALWAYS safe — no gate, dispatch immediately.
+            self.dispatch_plan_query(spec, plan::explain_sql(engine, &sql), engine, false, timeout_secs, cx);
+            return;
+        }
+
+        match plan::analyze_gate(&sql, read_only) {
+            plan::AnalyzeGate::Run => {
+                let Some(explain_sql) = plan::explain_analyze_sql(engine, &sql) else { return }; // SQLite: button hidden, unreachable
+                self.dispatch_plan_query(spec, explain_sql, engine, true, timeout_secs, cx);
+            }
+            plan::AnalyzeGate::Blocked => {
+                self.status = "error: připojení je jen pro čtení".to_string();
+                cx.notify();
+            }
+            plan::AnalyzeGate::NeedsConfirm => {
+                self.modal = Some(connections_ui::ModalState::AnalyzeWriteConfirm {
+                    sql,
+                    engine,
+                    running: false,
+                    error: None,
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    /// The estimated-path AND the read-case-of-Analyze path both go through
+    /// the NORMAL `connect_and_run` (no write gating needed for either —
+    /// design §5: a plain read, or `EXPLAIN` itself, never writes) —
+    /// draining exactly like an ad-hoc tab but capturing text/rows into a
+    /// `plan::PlanResult` instead of opening a live grid.
+    fn dispatch_plan_query(
+        &mut self,
+        spec: ConnectSpec,
+        wrapped_sql: String,
+        engine: dbc_state::Engine,
+        is_analyze: bool,
+        timeout_secs: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        let cancel = CancelToken::new();
+        self.cancel = Some(cancel.clone());
+        self.run_generation += 1;
+        let my_generation = self.run_generation;
+        self.status = if is_analyze { "analyzuji plán…".to_string() } else { "vysvětluji plán…".to_string() };
+        cx.notify();
+
+        let sql_title = format!("Plán: {}", collapse_title(&wrapped_sql));
+        let conn_identity = self.current_conn_identity();
+        let mut rx = self.runner.connect_and_run(spec, wrapped_sql, cancel, timeout_secs);
+        cx.spawn(async move |this, cx| {
+            let mut buffer: Option<ResultBuffer> = None;
+            let mut failed: Option<QueryError> = None;
+            while let Some(ev) = rx.recv().await {
+                let stop = this
+                    .update(cx, |_view, _cx| match ev {
+                        QueryEvent::Started { columns } => {
+                            buffer = Some(ResultBuffer::new(columns));
+                            false
+                        }
+                        QueryEvent::Batch(b) => {
+                            if let Some(buf) = buffer.as_mut() {
+                                if let Err(e) = buf.push(b) {
+                                    failed = Some(QueryError::msg(e.to_string()));
+                                }
+                            }
+                            false
+                        }
+                        QueryEvent::Finished { .. } => true,
+                        QueryEvent::Failed(e) => {
+                            failed = Some(e);
+                            true
+                        }
+                    })
+                    .unwrap_or(true);
+                if stop {
+                    break;
+                }
+            }
+
+            let _ = this.update(cx, move |view, cx| {
+                if view.run_generation != my_generation {
+                    return; // a newer run superseded this one — don't clobber its state
+                }
+                view.cancel = None;
+                if let Some(e) = failed {
+                    view.status = format!("error: {e}");
+                    cx.notify();
+                    return;
+                }
+                let Some(mut buf) = buffer else {
+                    view.status = "prázdná odpověď EXPLAIN".to_string();
+                    cx.notify();
+                    return;
+                };
+
+                let parsed = if engine == dbc_state::Engine::Sqlite {
+                    let mut rows: Vec<(i64, i64, String)> = Vec::new();
+                    let mut raw_lines: Vec<String> = Vec::new();
+                    for r in 0..buf.row_count() {
+                        let id = buf.cell_text(r, 0).parse().unwrap_or(0);
+                        let parent = buf.cell_text(r, 1).parse().unwrap_or(0);
+                        let detail = buf.cell_text(r, 3); // columns: id, parent, notused, detail
+                        raw_lines.push(format!("{id}\t{parent}\t{detail}"));
+                        rows.push((id, parent, detail));
+                    }
+                    Ok(plan::PlanResult {
+                        root: plan::parse_sqlite_rows(&rows),
+                        is_analyze,
+                        engine,
+                        total_planning_time_ms: None,
+                        total_execution_time_ms: None,
+                        top_level_hints: Vec::new(),
+                        raw_text: raw_lines.join("\n"),
+                    })
+                } else {
+                    let raw_text = if buf.row_count() == 0 || buf.cell_is_null(0, 0) {
+                        Err("EXPLAIN nevrátil žádný řádek".to_string())
+                    } else {
+                        Ok(buf.cell_text(0, 0))
+                    };
+                    raw_text.and_then(|t| plan::parse_plan(engine, is_analyze, &t))
+                };
+
+                match parsed {
+                    Ok(result) => {
+                        let result = Rc::new(result);
+                        let view_entity = cx.new(|cx| plan::PlanView::new(result, cx));
+                        let tab = ResultTab {
+                            id: 0,
+                            title: sql_title,
+                            pinned: false,
+                            preview_key: None,
+                            conn_identity,
+                            content: TabContent::Plan { view: view_entity },
+                        };
+                        view.tabs.open(tab);
+                        view.status = "hotovo".to_string();
+                    }
+                    Err(e) => {
+                        view.status = format!("error parsování plánu: {e}");
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Dispatches `QueryRunner::run_analyze_write` (the runner-owned,
+    /// dedicated-connection BEGIN…ROLLBACK sequence), called from the
+    /// `ModalState::AnalyzeWriteConfirm` dialog's "Analyzovat" button
+    /// (connections_ui.rs).
+    ///
+    /// Review fix (MAJOR, adversarial review of commit 0bab655): the first
+    /// version of this method used `self.cancel = Some(CancelToken::new())`
+    /// as a busy-guard, but that token was never threaded into
+    /// `QueryRunner::run_analyze_write` (which builds its own internal
+    /// token in `run_analyze_write_inner`) — Escape while "analyzuji
+    /// plán…" showed would clear `self.cancel`, print a false
+    /// "cancelling…" status, and re-enable every other busy-guard that
+    /// checks `self.cancel.is_none()`, letting a second query/Explain/
+    /// Analyze dispatch start while the original BEGIN…EXPLAIN ANALYZE…
+    /// ROLLBACK was still running server-side (which would then land its
+    /// result and silently clobber whatever the second dispatch had just
+    /// shown). Fixed by mirroring `on_confirm_apply`'s pattern instead
+    /// (`ApplyDialogState::running`): `self.modal` stays `Some(..)` —
+    /// mutated in place, never `.take()`n — for the WHOLE duration of the
+    /// analyze (not just cleared and re-substituted by a cancel token), so
+    /// the SAME `self.modal.is_some()` checks `run_query`/`run_query_with`/
+    /// `run_explain` already use to refuse a second dispatch cover this
+    /// path for free, and (per `on_cancel_query`'s `closable` match, which
+    /// only allow-lists `ConnectionDialog`/`QueryParams` — every other
+    /// modal, `AnalyzeWriteConfirm` included, falls into its `_ => false`
+    /// arm) Escape is now a structural no-op against this dialog, exactly
+    /// like it already was against `KillConfirm`. `self.cancel`/
+    /// `self.run_generation` are never touched by this method — same as
+    /// `on_confirm_apply`.
+    fn on_confirm_analyze_write(
+        &mut self,
+        engine: dbc_state::Engine,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Pure guard (unit-tested directly, connections_ui.rs): `None` for
+        // no modal, a DIFFERENT modal, or a re-click while `running` is
+        // already `true` — see its doc comment for why this is the actual
+        // mechanism (not `self.cancel`) that makes a second dispatch a
+        // structural no-op.
+        let Some(sql) = connections_ui::analyze_write_dispatch_sql(&self.modal) else { return };
+
+        let Some((_, timeout_secs, _, spec)) = self.resolve_spec_for_explain(cx) else { return };
+        let Some(explain_sql) = plan::explain_analyze_sql(engine, &sql) else { return };
+
+        if let Some(connections_ui::ModalState::AnalyzeWriteConfirm { running, error, .. }) =
+            &mut self.modal
+        {
+            *running = true;
+            *error = None;
+        }
+        cx.notify();
+
+        let sql_title = format!("Plán: {}", collapse_title(&sql));
+        let conn_identity = self.current_conn_identity();
+        let rx = self.runner.run_analyze_write(spec, explain_sql, timeout_secs);
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, move |view, cx| {
+                match result {
+                    Ok(Ok(raw_text)) => match plan::parse_plan(engine, true, &raw_text) {
+                        Ok(parsed) => {
+                            // Brief-mirroring `on_confirm_apply`'s success
+                            // shape: close the dialog, open the result tab,
+                            // global status takes over from here.
+                            view.modal = None;
+                            let parsed = Rc::new(parsed);
+                            let view_entity = cx.new(|cx| plan::PlanView::new(parsed, cx));
+                            view.tabs.open(ResultTab {
+                                id: 0,
+                                title: sql_title,
+                                pinned: false,
+                                preview_key: None,
+                                conn_identity,
+                                content: TabContent::Plan { view: view_entity },
+                            });
+                            view.status = "hotovo (změny vráceny zpět)".to_string();
+                        }
+                        Err(e) => {
+                            if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
+                                running,
+                                error,
+                                ..
+                            }) = &mut view.modal
+                            {
+                                *running = false;
+                                *error = Some(format!("error parsování plánu: {e}"));
+                            }
+                        }
+                    },
+                    Ok(Err(e)) => {
+                        if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
+                            running,
+                            error,
+                            ..
+                        }) = &mut view.modal
+                        {
+                            *running = false;
+                            *error = Some(e.to_string());
+                        }
+                    }
+                    Err(_canceled) => {
+                        if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
+                            running,
+                            error,
+                            ..
+                        }) = &mut view.modal
+                        {
+                            *running = false;
+                            *error = Some("analýza zrušena".to_string());
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -1664,7 +2017,8 @@ impl AppView {
             .map(|c| palette::ConnectionSource { id: c.id.clone(), name: c.name.clone(), favourite: c.favourite })
             .collect();
 
-        palette::rank_items(query, &tables, &history, &connections, 30)
+        let monitor_available = self.active_engine().is_some_and(monitor::monitor_available);
+        palette::rank_items(query, &tables, &history, &connections, monitor_available, 30)
     }
 
     /// Brief contract #4: execution routes through EXISTING paths only —
@@ -1721,6 +2075,20 @@ impl AppView {
                         self.tree.update(cx, |t, cx| t.clear(cx));
                     }
                 }
+                PaletteAction::OpenMonitor => self.open_monitor_tab(cx),
+                PaletteAction::ShowErDiagram => {
+                    let target = self.resolve_er_diagram_schema(cx);
+                    match target {
+                        Some(schema) => self.open_er_diagram(schema, cx),
+                        None => {
+                            self.status =
+                                "Vyberte schéma ve stromu (klikněte na ikonu vedle schématu)"
+                                    .to_string();
+                            cx.notify();
+                        }
+                    }
+                }
+                PaletteAction::OpenCompare => self.open_compare_dialog(cx),
             },
         }
         cx.notify();
@@ -2639,6 +3007,261 @@ impl AppView {
             .unwrap_or_else(|| identity.to_string())
     }
 
+    // -----------------------------------------------------------------
+    // G9 T6: server-monitor tab — open action, timer loop, kill-dialog
+    // bridge (design §4/§6/§7).
+    // -----------------------------------------------------------------
+
+    /// The ACTIVE connection's engine: saved config's `cfg.engine`, or
+    /// `engine_from_url` for the CLI-arg back-compat path, `None` with no
+    /// active connection at all (design §7's three-way gating input).
+    fn active_engine(&self) -> Option<dbc_state::Engine> {
+        if let Some(id) = &self.active_connection_id {
+            return self.config.connections.iter().find(|c| &c.id == id).map(|c| c.engine);
+        }
+        self.conn_url.as_deref().map(engine_from_url)
+    }
+
+    /// Opens (or re-activates) the monitor tab for the active connection.
+    /// `preview_key = "monitor:{conn_identity}"` gives one-monitor-per-
+    /// connection: unlike table previews (`close_by_preview_key` replaces),
+    /// reopening just ACTIVATES the existing tab (design §5).
+    fn open_monitor_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.active_engine() else {
+            self.status = "Bez připojení — vyberte připojení nahoře.".into();
+            cx.notify();
+            return;
+        };
+        if !monitor::monitor_available(engine) {
+            // The palette already hides the entry (build_palette_items);
+            // this is the belt for any other entry point.
+            self.status = "monitor serveru není pro tento engine k dispozici".into();
+            cx.notify();
+            return;
+        }
+        let key = format!("monitor:{}", self.current_conn_identity());
+        let existing_id =
+            self.tabs.iter().find(|t| t.preview_key.as_deref() == Some(key.as_str())).map(|t| t.id);
+        if let Some(id) = existing_id {
+            self.tabs.activate(id);
+            cx.notify();
+            return;
+        }
+        let Some(spec) = self.active_conn_spec() else {
+            self.status = "Bez připojení — vyberte připojení nahoře.".into();
+            cx.notify();
+            return;
+        };
+        // Same read-only resolution runner::spec_is_read_only applies:
+        // config flag, or always-writable for the CLI-arg URL path.
+        let read_only = match &spec {
+            ConnectSpec::Config { cfg, .. } => cfg.read_only,
+            ConnectSpec::Url(_) => false,
+        };
+        let (cmd_tx, event_rx) = self.runner.open_monitor(spec, read_only, engine);
+        let view = cx.new(|cx| monitor_view::MonitorView::new(cx, cmd_tx, event_rx, read_only, engine));
+        let title = collapse_title(&format!("Monitor: {}", self.current_connection_label()));
+        let conn_identity = self.current_conn_identity();
+        let tab_id = self.tabs.open(ResultTab {
+            id: 0,
+            title,
+            pinned: false,
+            preview_key: Some(key),
+            conn_identity,
+            content: TabContent::Monitor { view: view.clone() },
+        });
+        cx.subscribe(&view, move |this, _emitter, event, cx| {
+            this.on_monitor_view_event(tab_id, event, cx);
+        })
+        .detach();
+        self.spawn_monitor_timer(tab_id, cx);
+        cx.notify();
+    }
+
+    // -----------------------------------------------------------------
+    // G8 T6/T7: ER diagram tab — schema-tree icon + palette entry points,
+    // large-schema truncation (design §3).
+    // -----------------------------------------------------------------
+
+    /// design §3 CURATION: the entry action always operates on ONE schema.
+    /// `schema` is `None` for an engine/snapshot with no schema concept
+    /// (SQLite) — matches every other `Option<String>` schema field in this
+    /// codebase (strict, no "public" guessing).
+    fn open_er_diagram(&mut self, schema: Option<String>, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.tree.read(cx).snapshot() else {
+            self.status = "Nejprve načtěte schéma".to_string();
+            cx.notify();
+            return;
+        };
+        let scoped: Vec<TableInfo> =
+            snapshot.tables.iter().filter(|t| t.schema == schema).cloned().collect();
+        let (scoped, hidden) = er_diagram_view::cap_tables(scoped, er_diagram_view::DIAGRAM_TABLE_CAP);
+        let truncated_notice = hidden.map(|hidden| {
+            format!(
+                "Schéma má {} tabulek — zobrazeno prvních {} podle názvu; použijte filtr.",
+                hidden + er_diagram_view::DIAGRAM_TABLE_CAP,
+                er_diagram_view::DIAGRAM_TABLE_CAP
+            )
+        });
+        let label = schema.clone().unwrap_or_else(|| "(bez schématu)".to_string());
+        let graph = dbc_core::erd::build_graph(&scoped);
+        let layout = dbc_core::erd::layout::compute_layout(&graph);
+        let view = cx.new(|_cx| {
+            let mut v = er_diagram_view::ErDiagramView::new(layout, scoped, label.clone());
+            v.truncated_notice = truncated_notice;
+            v
+        });
+        cx.subscribe(&view, Self::on_er_diagram_event).detach();
+        self.tabs.open(ResultTab {
+            id: 0,
+            title: format!("ER: {label}"),
+            pinned: false,
+            preview_key: None,
+            conn_identity: self.current_conn_identity(),
+            content: TabContent::Diagram { view },
+        });
+        self.status = "ER diagram otevřen".to_string();
+        cx.notify();
+    }
+
+    /// `ErDiagramView` reuses `TreeEvent` verbatim (only ever emits
+    /// `OpenDdl`) — this handler mirrors `on_tree_event`'s `OpenDdl` arm
+    /// exactly rather than duplicating tab-open logic a third time.
+    fn on_er_diagram_event(
+        &mut self,
+        _emitter: Entity<er_diagram_view::ErDiagramView>,
+        event: &TreeEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if let TreeEvent::OpenDdl { title, ddl } = event {
+            self.tabs.open(ResultTab {
+                id: 0,
+                title: format!("DDL: {title}"),
+                pinned: false,
+                preview_key: None,
+                conn_identity: self.current_conn_identity(),
+                content: TabContent::Text { text: ddl.clone(), scroll_lines: 0 },
+            });
+            self.status = format!("DDL otevřeno: {title}");
+            cx.notify();
+        }
+    }
+
+    /// `PaletteAction::ShowErDiagram`'s zero-argument -> one-schema
+    /// resolution: exactly one distinct schema in the snapshot wins
+    /// outright; otherwise `None` (caller shows the Czech refusal status
+    /// text pointing at the schema-tree icon, the primary entry point).
+    fn resolve_er_diagram_schema(&self, cx: &Context<Self>) -> Option<Option<String>> {
+        let snapshot = self.tree.read(cx).snapshot()?;
+        let mut schemas: Vec<Option<String>> = snapshot.tables.iter().map(|t| t.schema.clone()).collect();
+        schemas.sort();
+        schemas.dedup();
+        if schemas.len() == 1 {
+            return schemas.into_iter().next();
+        }
+        None
+    }
+
+    /// One timer loop per open monitor tab (design §4), on the SAME
+    /// `cx.background_executor().timer` primitive `grid.rs`'s export
+    /// chunking uses. Hidden-tab gating is automatic: a tick only reaches
+    /// `tick_if_idle` when this tab is the active one; pause/awaiting are
+    /// checked inside `MonitorView`. The loop BREAKS (never a forever-no-op)
+    /// when the tab or the `AppView` is gone.
+    fn spawn_monitor_timer(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                // Re-read the CURRENT interval each lap — backoff can
+                // change it between ticks. None = tab closed.
+                let interval = match this.update(cx, |view, cx| {
+                    view.monitor_view_for_tab(tab_id).map(|m| m.read(cx).interval_secs())
+                }) {
+                    Ok(Some(secs)) => secs,
+                    Ok(None) | Err(_) => break,
+                };
+                cx.background_executor().timer(std::time::Duration::from_secs(interval)).await;
+                let tick = this.update(cx, |view, cx| {
+                    let visible = view.tabs.active().is_some_and(|t| t.id == tab_id);
+                    if visible {
+                        if let Some(m) = view.monitor_view_for_tab(tab_id) {
+                            m.update(cx, |m, cx| m.tick_if_idle(cx));
+                        }
+                    }
+                });
+                if tick.is_err() {
+                    break; // AppView released
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// `MonitorView` -> `AppView` event bridge (subscription wired in
+    /// `open_monitor_tab`). `KillRequested` opens the confirm dialog;
+    /// `KillFinished` resolves it (design §6's success/failure UX).
+    fn on_monitor_view_event(
+        &mut self,
+        tab_id: u64,
+        event: &monitor_view::MonitorViewEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            monitor_view::MonitorViewEvent::KillRequested { pid, label, sql } => {
+                if self.modal.is_some() {
+                    return; // single-modal invariant, same as every dialog opener
+                }
+                self.modal = Some(connections_ui::ModalState::KillConfirm {
+                    pid: *pid,
+                    label: label.clone(),
+                    sql: sql.clone(),
+                    tab_id,
+                    error: None,
+                    dispatched: false,
+                });
+                cx.notify();
+            }
+            monitor_view::MonitorViewEvent::KillFinished { pid, result } => {
+                // MAJOR review fix: only touch `self.modal` when it's STILL
+                // the KillConfirm dialog THIS event belongs to (same pid AND
+                // same originating tab) — otherwise a stale/cancelled kill's
+                // outcome can land in an unrelated, currently-open dialog
+                // (same tab, different pid; or a different monitor tab
+                // entirely) and either overwrite its error or silently
+                // close it out from under the user. `tab_id` here is this
+                // handler's own parameter — fixed per-subscription to the
+                // tab whose MonitorView emitted the event (see
+                // `open_monitor_tab`'s `cx.subscribe`), so it IS the
+                // event's true origin, no extra plumbing needed.
+                let matches_open_dialog = connections_ui::kill_confirm_matches(&self.modal, tab_id, *pid);
+                match result {
+                    Ok(()) => {
+                        if matches_open_dialog {
+                            self.modal = None;
+                        }
+                        // pg reports Ok even when the pid already exited
+                        // (the function returns false, not an error) — the
+                        // out-of-cycle refresh MonitorView already
+                        // dispatched shows the truth momentarily (design
+                        // §6).
+                        self.status = format!("proces {pid} ukončen");
+                    }
+                    Err(msg) => {
+                        if matches_open_dialog {
+                            // Dialog stays open with the error; NEW MINOR
+                            // review fix: also resets `dispatched` so a
+                            // genuine failure can be retried (see
+                            // `apply_kill_error_to_modal`'s doc comment).
+                            connections_ui::apply_kill_error_to_modal(&mut self.modal, tab_id, *pid, msg);
+                        } else {
+                            self.status = format!("error: {msg}");
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+    }
+
     fn apply_conn_spec(&self) -> Option<(ConnectSpec, Option<u64>)> {
         if let Some(id) = self.active_connection_id.clone() {
             let cfg = self.config.connections.iter().find(|c| c.id == id)?.clone();
@@ -2676,6 +3299,10 @@ impl AppView {
         let (tab_id, tab_conn_identity, grid) = match &active.content {
             TabContent::Grid { grid, .. } => (active.id, active.conn_identity.clone(), grid.clone()),
             TabContent::Text { .. } => return,
+            TabContent::Monitor { .. } => return,
+            TabContent::Plan { .. } => return,
+            TabContent::Diagram { .. } => return,
+            TabContent::Compare { .. } => return,
         };
         let current_identity = self.current_conn_identity();
         if !conn_identity_matches(&tab_conn_identity, &current_identity) {
@@ -2930,6 +3557,73 @@ impl AppView {
         .detach();
     }
 
+    /// G7 T7: computes `mode` from the two connections' engines, runs
+    /// `dbc_diff::schema_diff::diff_schema`, and updates the ALREADY-OPEN
+    /// Compare tab's `CompareView` entity (`pending.view`, created and
+    /// opened by `connections_ui::confirm_compare_dialog` in
+    /// `CompareLoadState::Loading` at dispatch time — design §3) in place.
+    /// `result`'s `Err` case (the oneshot channel closing — the runner task
+    /// panicked/dropped, which never happens in normal operation, but is
+    /// still a `Result`, not an `unwrap`, same posture `trigger_schema_fetch`
+    /// takes on its own oneshot) surfaces as a `CompareLoadState::Error` on
+    /// BOTH legs rather than leaving the tab stuck on "Načítám schéma…".
+    pub(crate) fn on_compare_schema_pair_ready(
+        &mut self,
+        pending: PendingCompare,
+        result: Result<(Result<SchemaSnapshot, QueryError>, Result<SchemaSnapshot, QueryError>), tokio::sync::oneshot::error::RecvError>,
+        cx: &mut Context<Self>,
+    ) {
+        let (result_a, result_b) = result.unwrap_or_else(|_| {
+            let cancelled = || Err(QueryError::msg("fetch zrušen".to_string()));
+            (cancelled(), cancelled())
+        });
+        let (engine_a, engine_b) = pending.view.read(cx).engines();
+        let mode = if engine_a == engine_b {
+            dbc_diff::schema_diff::CompareMode::SameEngine
+        } else {
+            dbc_diff::schema_diff::CompareMode::CrossEngine
+        };
+        let state = match (result_a, result_b) {
+            (Ok(snap_a), Ok(snap_b)) => {
+                let diff = dbc_diff::schema_diff::diff_schema(&snap_a, &snap_b, mode);
+                compare::CompareLoadState::Ready { diff, mode }
+            }
+            (a, b) => compare::CompareLoadState::Error { a: a.err(), b: b.err() },
+        };
+        pending.view.update(cx, |v, cx| {
+            v.state = state;
+            cx.notify();
+        });
+        self.status = "Porovnání schématu dokončeno".to_string();
+        cx.notify();
+    }
+
+    /// G7 T8: `CompareView`'s `CompareViewEvent` subscription (wired by
+    /// `connections_ui::confirm_compare_dialog` at tab-open time) —
+    /// `CompareView` doesn't own a `QueryRunner` (no tab-content entity in
+    /// this codebase does, see `MonitorView`'s `KillRequested` for the same
+    /// shape), so the actual `fetch_diff_side` dispatch for "Porovnat data"
+    /// happens here, reading the CURRENT diff/selection straight off the
+    /// entity before calling back into `CompareView::start_data_diff`
+    /// (which owns the generation guard and the `cx.spawn` completion).
+    pub(crate) fn on_compare_view_event(
+        &mut self,
+        view: Entity<compare::CompareView>,
+        event: &compare::CompareViewEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            compare::CompareViewEvent::DataDiffRequested => {
+                let runner = &self.runner;
+                view.update(cx, |v, cx| {
+                    if let compare::CompareLoadState::Ready { diff, .. } = v.state.clone() {
+                        v.start_data_diff(&diff, runner, cx);
+                    }
+                });
+            }
+        }
+    }
+
     /// `SchemaTree`'s `TreeEvent` subscription (wired in `main`). G2 Task 7:
     /// `OpenPreview` builds the SQL via `preview_sql` and runs it through the
     /// normal guarded pipeline (`run_query_with`, `bypass_auto_limit = true`
@@ -2983,6 +3677,9 @@ impl AppView {
                 self.tree.update(cx, |t, cx| t.set_favourites(favourites, active_id, cx));
                 cx.notify();
             }
+            TreeEvent::OpenErDiagram { schema } => {
+                self.open_er_diagram(schema.clone(), cx);
+            }
         }
     }
 
@@ -3002,6 +3699,10 @@ impl AppView {
                         (buffer.borrow().row_count(), grid.read(cx).edit_state.is_dirty())
                     }
                     TabContent::Text { .. } => (0, false),
+                    TabContent::Monitor { .. } => (0, false),
+                    TabContent::Plan { .. } => (0, false),
+                    TabContent::Diagram { .. } => (0, false),
+                    TabContent::Compare { .. } => (0, false),
                 };
                 // G5 Task 3, brief contract #7: dirty (unapplied staged
                 // edits) tabs get a " •" title suffix — the apply bar
@@ -3152,7 +3853,29 @@ impl AppView {
                     .child(body)
                     .into_any_element()
             }
+            TabContent::Monitor { view } => view.clone().into_any_element(),
+            TabContent::Plan { view } => view.clone().into_any_element(),
+            TabContent::Diagram { view } => {
+                // G8 T6: mirrors `ResultGrid`'s `status_note` idiom above —
+                // taken once so the export flow's status text surfaces in
+                // `AppView::status` exactly once, not stuck forever.
+                if let Some(note) = view.update(cx, |v, _| v.status_note.take()) {
+                    self.status = note;
+                }
+                view.clone().into_any_element()
+            }
+            TabContent::Compare { view } => view.clone().into_any_element(),
         }
+    }
+
+    /// The `MonitorView` entity behind an open Monitor tab, by tab id —
+    /// used by the kill-confirm dialog (T5) and the per-tab timer loop
+    /// (T6).
+    fn monitor_view_for_tab(&self, tab_id: u64) -> Option<Entity<monitor_view::MonitorView>> {
+        self.tabs.iter().find(|t| t.id == tab_id).and_then(|t| match &t.content {
+            TabContent::Monitor { view } => Some(view.clone()),
+            _ => None,
+        })
     }
 
     /// G5 Task 4, brief contract #1: apply bar above the status bar
@@ -3509,9 +4232,55 @@ impl Render for AppView {
             div()
                 .h(px(28.))
                 .px_2()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
                 .bg(rgb(0x313244))
                 .text_color(rgb(0xa6adc8))
-                .child(self.status.clone()),
+                .child({
+                    // G13 T6: "Vysvětlit" (estimated EXPLAIN) — always safe
+                    // on any engine/connection (design §5), so the only
+                    // gating here is "one run at a time" + "there's SQL to
+                    // run", same as the RunQuery keybinding's own guard.
+                    let enabled = self.cancel.is_none() && !self.sql.read(cx).text().trim().is_empty();
+                    let color = if enabled { rgb(0xcdd6f4) } else { rgb(0x45475a) };
+                    div()
+                        .id("btn-explain")
+                        .cursor_pointer()
+                        .text_color(color)
+                        .child("Vysvětlit")
+                        .on_click(cx.listener(move |view, _, _window, cx| {
+                            if enabled {
+                                view.run_explain(false, cx);
+                            }
+                        }))
+                })
+                .child({
+                    // G13 T6: "Analyzovat" (EXPLAIN ANALYZE) — hidden
+                    // entirely for SQLite (design §1c/§4: no such mode at
+                    // all, not merely disabled) via `plan::analyze_button_visible`.
+                    let engine = self.active_engine();
+                    let visible = engine.map(plan::analyze_button_visible).unwrap_or(true);
+                    let enabled = visible && self.cancel.is_none() && !self.sql.read(cx).text().trim().is_empty();
+                    if !visible {
+                        div().into_any_element()
+                    } else {
+                        let color = if enabled { rgb(0xcdd6f4) } else { rgb(0x45475a) };
+                        div()
+                            .id("btn-analyze")
+                            .cursor_pointer()
+                            .text_color(color)
+                            .child("Analyzovat")
+                            .on_click(cx.listener(move |view, _, _window, cx| {
+                                if enabled {
+                                    view.run_explain(true, cx);
+                                }
+                            }))
+                            .into_any_element()
+                    }
+                })
+                .child(div().flex_1().child(self.status.clone())),
         );
 
         if self.dropdown_open && self.modal.is_none() {
@@ -3656,6 +4425,7 @@ fn main() {
                             tree,
                             tree_visible: true,
                             schema_fetch_generation: 0,
+                            compare_fetch_generation: 0,
                             schema_tree_connection_key: None,
                             history,
                             history_visible: true,
