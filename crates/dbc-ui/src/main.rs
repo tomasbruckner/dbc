@@ -510,6 +510,26 @@ fn default_csv_mapping(
     csv_import::ColumnMapping { targets }
 }
 
+/// G12 T4 review fix (BLOCKER): pure decision behind `confirm_csv_import`'s
+/// connection-identity guard — the file picker + background pre-count pass
+/// in `start_csv_import` don't block the UI, so the connection dropdown
+/// stays clickable while `ModalState::CsvImport` is being built and while
+/// it's open. `captured_identity` is the identity `start_csv_import`
+/// snapshotted at dispatch time (before the picker ever opened);
+/// `current_identity` is `self.current_conn_identity()` evaluated fresh at
+/// confirm time. `false` means "the active connection changed under this
+/// import" — `confirm_csv_import` refuses (closes the modal, sets a status
+/// message) BEFORE resolving a spec or building a `CsvImportJob`, so a
+/// stale `(schema, table, columns)` snapshot can never be dispatched
+/// against a different, currently-active (writable) database. Just
+/// `conn_identity_matches` under a task-specific name — pulled out as its
+/// own named predicate (not an inline call) so this guard has a direct
+/// unit test without needing a full GPUI window (`confirm_csv_import`
+/// itself can't be driven headlessly).
+fn csv_import_dispatch_allowed(captured_identity: &str, current_identity: &str) -> bool {
+    conn_identity_matches(captured_identity, current_identity)
+}
+
 /// `conn_meta`: `Some((read_only, engine))` — for a saved `ConnectionConfig`
 /// (`cfg.read_only`/`cfg.engine`) or the CLI-arg URL path (see
 /// `engine_from_url`); `None` only when `run_query_with` couldn't build a
@@ -2453,6 +2473,16 @@ impl AppView {
             })
             .collect();
 
+        // Review fix (BLOCKER): captured HERE, before the (non-blocking)
+        // file picker + background pre-count pass — the connection dropdown
+        // stays clickable through both, so `confirm_csv_import` must
+        // re-verify this identity against whatever is active AT CONFIRM
+        // TIME before dispatching anything (see `ModalState::CsvImport`'s
+        // doc comment). `conn_identity` is the STABLE value the guard
+        // actually compares; `conn_label` is display-only.
+        let conn_identity = self.current_conn_identity();
+        let conn_label = self.current_connection_label();
+
         self.status = "výběr CSV souboru…".to_string();
         cx.notify();
         let dialog = cx.prompt_for_paths(PathPromptOptions {
@@ -2536,6 +2566,20 @@ impl AppView {
                         Ok(stmts) => (stmts.into_iter().next(), None),
                         Err(msg) => (None, Some(msg)),
                     };
+                    // Review fix, defense in depth (optional per the
+                    // review, cheap here): the picker + this background
+                    // pre-count pass didn't block the connection dropdown —
+                    // if it already changed, don't even open the modal with
+                    // stale schema/columns; `confirm_csv_import` re-checks
+                    // this same identity again regardless (the actual
+                    // BLOCKER fix), so this is purely a faster/friendlier
+                    // refusal, not the enforcement point.
+                    if !conn_identity_matches(&conn_identity, &view.current_conn_identity()) {
+                        view.status =
+                            "připojení se během importu změnilo — import zrušen".to_string();
+                        cx.notify();
+                        return;
+                    }
                     view.status = String::new();
                     view.modal = Some(connections_ui::ModalState::CsvImport {
                         path: picked,
@@ -2548,6 +2592,8 @@ impl AppView {
                         first_rows,
                         sample_sql,
                         error,
+                        conn_identity,
+                        conn_label,
                     });
                     cx.notify();
                 }
@@ -2621,6 +2667,16 @@ impl AppView {
     /// „Spustit import“ — closes the modal, opens the `TabContent::ScriptRun`
     /// progress tab (`progress_rows: Some((0, row_count))`), and drains
     /// `runner::run_csv_import`'s event stream.
+    ///
+    /// Review fix (BLOCKER): the FIRST thing this does, before resolving a
+    /// fresh spec or touching `columns`/`schema`/`table` at all, is
+    /// re-verify the connection identity captured at `start_csv_import`
+    /// time against whatever is active NOW — see `csv_import_dispatch_allowed`
+    /// and `ModalState::CsvImport`'s doc comment for why this is needed
+    /// (the picker + pre-count pass don't block the connection dropdown).
+    /// On mismatch: close the modal and refuse — no `CsvImportJob` is ever
+    /// built, `resolve_spec_for_explain`/`self.runner.run_csv_import` are
+    /// never reached.
     fn confirm_csv_import(&mut self, cx: &mut Context<Self>) {
         let Some(connections_ui::ModalState::CsvImport {
             path,
@@ -2630,6 +2686,7 @@ impl AppView {
             targets,
             row_count,
             error,
+            conn_identity,
             ..
         }) = self.modal.clone()
         else {
@@ -2637,6 +2694,12 @@ impl AppView {
         };
         if error.is_some() {
             return; // "Spustit import" is rendered disabled in this state too.
+        }
+        if !csv_import_dispatch_allowed(&conn_identity, &self.current_conn_identity()) {
+            self.modal = None;
+            self.status = "připojení se během importu změnilo — import zrušen".to_string();
+            cx.notify();
+            return;
         }
         let Some((_, timeout_secs, _, spec)) = self.resolve_spec_for_explain(cx) else {
             self.modal = None;
@@ -6108,6 +6171,28 @@ mod csv_ui_tests {
         assert_eq!(csv_field_to_value(""), None);
         assert_eq!(csv_field_to_value("0"), Some("0".to_string()));
         assert_eq!(csv_field_to_value(" "), Some(" ".to_string()));
+    }
+
+    /// Review fix (BLOCKER): the connection-identity guard behind
+    /// `confirm_csv_import` — proves the refuse path (captured identity at
+    /// `start_csv_import` time != active identity at confirm time) is a
+    /// pure, directly-testable decision, mirroring the shape of
+    /// `runner::csv_import_tests::run_csv_import_refuses_read_only_spec_without_touching_anything`:
+    /// there, the SHARED read-only guard fires before any file/DB touch;
+    /// here, `csv_import_dispatch_allowed` returning `false` is exactly
+    /// what stops `confirm_csv_import` from ever building a `CsvImportJob`
+    /// or calling `resolve_spec_for_explain`/`self.runner.run_csv_import`
+    /// (see the call site in `confirm_csv_import`, main.rs).
+    #[test]
+    fn csv_import_dispatch_allowed_refuses_on_identity_mismatch() {
+        assert!(csv_import_dispatch_allowed("conn-a", "conn-a"));
+        assert!(!csv_import_dispatch_allowed("conn-a", "conn-b"));
+        // CLI-arg back-compat path: same sentinel on both sides is a match,
+        // a switch away from it (to a saved connection, or vice versa) is
+        // caught same as any other identity change.
+        assert!(csv_import_dispatch_allowed(CLI_CONN_IDENTITY, CLI_CONN_IDENTITY));
+        assert!(!csv_import_dispatch_allowed(CLI_CONN_IDENTITY, "conn-a"));
+        assert!(!csv_import_dispatch_allowed("conn-a", CLI_CONN_IDENTITY));
     }
 }
 

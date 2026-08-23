@@ -1006,6 +1006,21 @@ pub enum ModalState {
     /// `error` and disables "Spustit import". Same "re-resolve the spec
     /// fresh at confirm time" posture as `ScriptRun` above — this modal only
     /// carries display/editing data.
+    ///
+    /// Review fix (BLOCKER): `schema`/`table`/`columns` are a snapshot of
+    /// the connection ACTIVE at `start_csv_import` time — the file picker +
+    /// background pre-count pass do NOT block the UI, so the connection
+    /// dropdown stays clickable while this modal is being built (before it
+    /// even opens) and while it's open. `conn_identity` is the SAME stable
+    /// identity value `ResultTab::conn_identity`/`current_conn_identity`
+    /// use, captured at `start_csv_import` dispatch time — `confirm_csv_import`
+    /// re-checks it against the CURRENT active connection before building
+    /// anything, refusing on mismatch (same "connection changed out from
+    /// under staged state" guard `on_open_apply_dialog`/`on_confirm_apply`
+    /// already enforce for the Apply flow, main.rs). `conn_label` is
+    /// `current_connection_label()`'s snapshot, shown in the modal so the
+    /// target connection is visible (same convention `ScriptRun`'s
+    /// `conn_label` sets above).
     CsvImport {
         path: std::path::PathBuf,
         schema: Option<String>,
@@ -1017,6 +1032,8 @@ pub enum ModalState {
         first_rows: Vec<crate::csv_import::CsvRow>,
         sample_sql: Option<String>,
         error: Option<String>,
+        conn_identity: String,
+        conn_label: String,
     },
 }
 
@@ -1176,9 +1193,11 @@ impl AppView {
                 row_count,
                 sample_sql,
                 error,
+                conn_label,
                 ..
             } => render_csv_import_panel(
-                &path, &table, &headers, &columns, &targets, row_count, &sample_sql, &error, cx,
+                &path, &table, &headers, &columns, &targets, row_count, &sample_sql, &error,
+                &conn_label, cx,
             ),
         };
         Some(
@@ -2535,7 +2554,11 @@ fn render_script_run_confirm_panel(
 /// row count, the fixed batch size, and the REAL first batch's `INSERT`
 /// verbatim (recomputed on every mapping change by
 /// `AppView::recompute_csv_sample`) in a scrollable monospace box. A
-/// duplicate-target `error` disables "Spustit import".
+/// duplicate-target `error` disables "Spustit import". `conn_label` (review
+/// fix, BLOCKER) is shown so the target connection is visible before
+/// confirming — same convention `render_script_run_confirm_panel`'s
+/// `conn_label` sets; `confirm_csv_import` re-verifies the STABLE identity
+/// (not the label) is unchanged before dispatching.
 #[allow(clippy::too_many_arguments)]
 fn render_csv_import_panel(
     path: &std::path::Path,
@@ -2546,6 +2569,7 @@ fn render_csv_import_panel(
     row_count: usize,
     sample_sql: &Option<String>,
     error: &Option<String>,
+    conn_label: &str,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let mut mapping_rows = div().flex().flex_col().gap_1().max_h(px(220.)).overflow_hidden();
@@ -2591,6 +2615,7 @@ fn render_csv_import_panel(
         .gap_2()
         .text_color(rgb(0xcdd6f4))
         .child(div().text_size(px(16.)).child(format!("Import CSV do {table}")))
+        .child(div().text_color(rgb(0xa6adc8)).child(format!("připojení: {conn_label}")))
         .child(div().text_color(rgb(0xa6adc8)).child(path.display().to_string()))
         .child(mapping_rows)
         .child(div().text_color(rgb(0xa6adc8)).child(format!(

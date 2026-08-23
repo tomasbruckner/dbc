@@ -1482,6 +1482,13 @@ async fn run_csv_import_inner(
                 return;
             }
         };
+        // Review fix (MINOR): only count `rows` as committed once a
+        // statement for this chunk actually ran — `stmt == None` happens
+        // when `generate_insert_batches` had nothing to insert (every
+        // header skipped, an all-`None` mapping); currently unreachable via
+        // the UI (the mapping modal disables "Spustit import" whenever
+        // `sample_sql` would be `None` for this reason), but the counter
+        // must not silently over-report rows that were never written.
         if let Some(stmt) = stmt {
             let stmt_cancel = cancel.child_token();
             let fut = conn.execute(&stmt, stmt_cancel.clone());
@@ -1500,8 +1507,8 @@ async fn run_csv_import_inner(
                 let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
                 return;
             }
+            rows_committed += rows.len() as u64;
         }
-        rows_committed += rows.len() as u64;
         batch_index += 1;
         let _ = tx
             .send(CsvImportEvent::BatchFinished { batch_index: batch_index - 1, rows_committed_so_far: rows_committed })
@@ -2939,6 +2946,55 @@ mod csv_import_tests {
             events.iter().filter(|e| matches!(e, CsvImportEvent::BatchStarted { .. })).count();
         assert_eq!(started, 3); // 500/500/100
         assert!(matches!(events.last(), Some(CsvImportEvent::Finished { rows_imported: 1100, .. })));
+    }
+
+    /// Review fix (MINOR): a mapping with zero mapped columns makes
+    /// `generate_insert_batches` return `Ok(vec![])` for every chunk (no
+    /// statement ever executes) — `rows_committed`/`rows_imported` must stay
+    /// 0, not silently count the CSV's row total as if it had been written.
+    /// (Currently unreachable via the UI — the mapping modal disables
+    /// "Spustit import" whenever `sample_sql` would be `None` for this
+    /// reason — this is the runner's own belt-and-braces correctness, same
+    /// posture as `guard_not_read_only`'s "the UI already prevents this, but
+    /// the write path must refuse for itself too".)
+    #[tokio::test]
+    async fn csv_import_zero_mapped_columns_does_not_inflate_rows_committed() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        {
+            let mut conn = crate::connect::open(f.path().to_str().expect("utf8 path"), &handle)
+                .expect("open sqlite");
+            conn.execute("CREATE TABLE t(id INTEGER)", CancelToken::new()).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("rows.csv");
+        std::fs::write(&csv_path, "id\n1\n2\n3\n").unwrap();
+
+        let cfg = sqlite_cfg(f.path().to_str().unwrap().to_string(), false);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let job = CsvImportJob {
+            path: csv_path,
+            schema: None,
+            table: "t".to_string(),
+            columns: vec![TargetColumn { name: "id".into(), numeric: true }],
+            // Every header skipped — no mapped columns at all.
+            mapping: ColumnMapping { targets: vec![None] },
+        };
+        let events = drive_csv_import(spec, job).await;
+        assert!(matches!(events.last(), Some(CsvImportEvent::Finished { rows_imported: 0, .. })));
+        // No BatchFinished ever reports a non-zero running total either.
+        assert!(events.iter().all(|e| !matches!(
+            e,
+            CsvImportEvent::BatchFinished { rows_committed_so_far, .. } if *rows_committed_so_far != 0
+        )));
+
+        let mut verify = crate::connect::open(f.path().to_str().unwrap(), &handle).expect("reopen");
+        let mut stream = verify.query("SELECT COUNT(*) FROM t", CancelToken::new()).await.unwrap();
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.unwrap()).unwrap();
+        }
+        assert_eq!(buf.cell_text(0, 0), "0");
     }
 }
 
