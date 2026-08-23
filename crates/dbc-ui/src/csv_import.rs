@@ -19,6 +19,8 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashSet;
+
 use crate::sandbox::sql_value;
 use dbc_core::{quote_ident, quote_qualified};
 
@@ -38,6 +40,19 @@ pub const CSV_IMPORT_BATCH_SIZE: usize = 500;
 /// guard in this codebase: an empty/unrecognized type name -> `false`
 /// (quoted as text) -- always syntactically safe, worst case an
 /// unnecessary quote the server coerces away (G12 design doc, §5).
+///
+/// Known false POSITIVES exist (e.g. `point`, `int4range`, `integer[]` all
+/// contain "int") and are intentionally left uncaught -- they're harmless
+/// by construction, not a gap: `numeric=true` only ever *offers* bare
+/// emission, it doesn't force it. `sandbox::sql_value`'s own parse gate
+/// (`i128`/finite-`f64` parse of the trimmed value) still runs downstream,
+/// so a non-numeric value in a false-positive-classified column simply
+/// falls through to the quoted branch same as any other unparseable
+/// string -- the safety net is `sql_value`'s parse gate, not the accuracy
+/// of this classifier. There are no false NEGATIVES for the type names
+/// actually listed above, which is the direction that would matter (an
+/// actually-numeric value getting needlessly quoted is always safe; the
+/// server coerces it back).
 pub fn is_numeric_type_name(data_type: &str) -> bool {
     const NUMERIC_FRAGMENTS: &[&str] =
         &["int", "serial", "numeric", "decimal", "real", "double", "float"];
@@ -101,28 +116,53 @@ pub type CsvRow = Vec<Option<String>>;
 
 /// Generates the batched `INSERT INTO {table} ({cols}) VALUES (...), ...;`
 /// statements for one CSV import, `CSV_IMPORT_BATCH_SIZE` rows per
-/// statement (last batch may be smaller). Column list and per-row value
-/// order both follow `ColumnMapping::mapped_pairs`'s CSV-header order.
-/// Value emission is `sandbox::sql_value` UNCHANGED, `numeric` sourced from
-/// each mapped `TargetColumn`. A CSV row shorter than the header row (a
+/// statement (last batch may be smaller). Each returned `String` is one
+/// complete, independently-dispatchable statement -- the trailing `;` is
+/// intentional (unlike `sandbox::generate_statements`'s bare statements,
+/// which are fed to a driver call that supplies its own terminator): a CSV
+/// import batch is meant to be handed straight to `Connection::execute()`
+/// as a standalone string, one call per batch, so it carries its own
+/// terminator rather than relying on a caller to add one.
+///
+/// Column list and per-row value order both follow
+/// `ColumnMapping::mapped_pairs`'s CSV-header order. Value emission is
+/// `sandbox::sql_value` UNCHANGED, `numeric` sourced from each mapped
+/// `TargetColumn`. A CSV row shorter than the header row (a
 /// ragged/malformed line) is treated fail-closed as NULL for any missing
 /// trailing field rather than panicking -- consistent with every other
 /// guard in this codebase preferring a safe fallback over a crash.
 ///
-/// Returns an empty `Vec` (no statements) when `mapping` has no mapped
+/// Returns `Ok(vec![])` (no statements) when `mapping` has no mapped
 /// columns at all -- a CSV import with every header skipped has nothing to
 /// insert into and is a UI-level misconfiguration, not something this pure
 /// model should paper over with a `DEFAULT VALUES` guess.
+///
+/// Returns `Err` when two (or more) CSV headers map onto the SAME target
+/// column -- defense in depth against a mapping-UI bug (T7 hasn't landed
+/// yet; this must not rely on a future UI never allowing it): an
+/// unguarded duplicate would generate a syntactically valid but
+/// always-failing `INSERT INTO t (id, id) VALUES (1, 2)` (the driver
+/// rejects "column specified more than once" on every batch, rolling back
+/// the whole import) -- caught here, before any SQL is built, with a
+/// message identifying the offending column.
 pub fn generate_insert_batches(
     schema: Option<&str>,
     table: &str,
     columns: &[TargetColumn],
     mapping: &ColumnMapping,
     rows: &[CsvRow],
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let pairs = mapping.mapped_pairs();
     if pairs.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
+    }
+
+    let mut seen_targets = HashSet::new();
+    for &(_, target_ix) in &pairs {
+        if !seen_targets.insert(target_ix) {
+            let name = columns.get(target_ix).map(|c| c.name.as_str()).unwrap_or("?");
+            return Err(format!("sloupec {name} je namapován vícekrát"));
+        }
     }
 
     let table_sql = quote_qualified(schema, table);
@@ -132,7 +172,8 @@ pub fn generate_insert_batches(
         .collect::<Vec<_>>()
         .join(", ");
 
-    rows.chunks(CSV_IMPORT_BATCH_SIZE)
+    let statements = rows
+        .chunks(CSV_IMPORT_BATCH_SIZE)
         .map(|batch| {
             let values_sql = batch
                 .iter()
@@ -151,7 +192,8 @@ pub fn generate_insert_batches(
                 .join(", ");
             format!("INSERT INTO {table_sql} ({cols_sql}) VALUES {values_sql};")
         })
-        .collect()
+        .collect();
+    Ok(statements)
 }
 
 #[cfg(test)]
@@ -208,7 +250,7 @@ mod tests {
         let mapping = ColumnMapping { targets: vec![Some(0), Some(1)] };
         let rows: Vec<CsvRow> = vec![vec![Some("1".into()), Some("Alice".into())]];
 
-        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows);
+        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows).unwrap();
         assert_eq!(stmts.len(), 1);
         assert_eq!(stmts[0], "INSERT INTO \"t\" (\"id\", \"name\") VALUES (1, 'Alice');");
     }
@@ -218,7 +260,7 @@ mod tests {
         let columns = vec![TargetColumn { name: "id".into(), numeric: true }];
         let mapping = ColumnMapping { targets: vec![None] };
         let rows: Vec<CsvRow> = vec![vec![Some("1".into())]];
-        assert!(generate_insert_batches(None, "t", &columns, &mapping, &rows).is_empty());
+        assert!(generate_insert_batches(None, "t", &columns, &mapping, &rows).unwrap().is_empty());
     }
 
     // -- NULL vs. empty string ----------------------------------------------
@@ -233,12 +275,12 @@ mod tests {
 
         // Unquoted empty CSV field -> SQL NULL.
         let rows_null: Vec<CsvRow> = vec![vec![Some("1".into()), None]];
-        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows_null);
+        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows_null).unwrap();
         assert_eq!(stmts[0], "INSERT INTO \"t\" (\"id\", \"note\") VALUES (1, NULL);");
 
         // Quoted-empty CSV field -> SQL empty string, distinct from NULL.
         let rows_empty: Vec<CsvRow> = vec![vec![Some("1".into()), Some(String::new())]];
-        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows_empty);
+        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows_empty).unwrap();
         assert_eq!(stmts[0], "INSERT INTO \"t\" (\"id\", \"note\") VALUES (1, '');");
     }
 
@@ -258,7 +300,7 @@ mod tests {
             vec![Some("abc".into()), Some("42".into())],
         ];
 
-        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows);
+        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows).unwrap();
         assert_eq!(stmts.len(), 1);
         assert_eq!(
             stmts[0],
@@ -277,7 +319,7 @@ mod tests {
         let columns = vec![TargetColumn { name: "n".into(), numeric: true }];
         let mapping = ColumnMapping { targets: vec![Some(0)] };
         let rows = one_col_rows(499);
-        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows);
+        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows).unwrap();
         assert_eq!(stmts.len(), 1);
     }
 
@@ -286,7 +328,7 @@ mod tests {
         let columns = vec![TargetColumn { name: "n".into(), numeric: true }];
         let mapping = ColumnMapping { targets: vec![Some(0)] };
         let rows = one_col_rows(500);
-        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows);
+        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows).unwrap();
         assert_eq!(stmts.len(), 1);
     }
 
@@ -295,7 +337,7 @@ mod tests {
         let columns = vec![TargetColumn { name: "n".into(), numeric: true }];
         let mapping = ColumnMapping { targets: vec![Some(0)] };
         let rows = one_col_rows(501);
-        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows);
+        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows).unwrap();
         assert_eq!(stmts.len(), 2);
         // First batch holds 500 rows, second holds the 1 remainder.
         assert_eq!(stmts[0].matches("), (").count() + 1, 500);
@@ -311,7 +353,7 @@ mod tests {
         let rows: Vec<CsvRow> = vec![vec![Some("v".into())]];
 
         let stmts =
-            generate_insert_batches(Some("pu\"blic"), "ta\"ble", &columns, &mapping, &rows);
+            generate_insert_batches(Some("pu\"blic"), "ta\"ble", &columns, &mapping, &rows).unwrap();
         assert_eq!(
             stmts[0],
             "INSERT INTO \"pu\"\"blic\".\"ta\"\"ble\" (\"na\"\"me\") VALUES ('v');"
@@ -334,7 +376,7 @@ mod tests {
             vec![Some("3".into()), None, Some("x".into())],
         ];
 
-        let stmts = generate_insert_batches(Some("public"), "people", &columns, &mapping, &rows);
+        let stmts = generate_insert_batches(Some("public"), "people", &columns, &mapping, &rows).unwrap();
         assert_eq!(stmts.len(), 1);
         assert_eq!(
             stmts[0],
@@ -352,7 +394,26 @@ mod tests {
         // Row is missing the second field entirely (ragged CSV line).
         let rows: Vec<CsvRow> = vec![vec![Some("1".into())]];
 
-        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows);
+        let stmts = generate_insert_batches(None, "t", &columns, &mapping, &rows).unwrap();
         assert_eq!(stmts[0], "INSERT INTO \"t\" (\"id\", \"name\") VALUES (1, NULL);");
+    }
+
+    // -- duplicate target-column mapping (defense in depth) -----------------
+
+    #[test]
+    fn duplicate_target_mapping_is_an_error_no_sql_generated() {
+        // Two CSV headers both mapped onto target column 0 ("id") -- a
+        // mapping-UI bug this model must reject on its own, not rely on T7
+        // to prevent, since an unguarded duplicate would otherwise emit a
+        // guaranteed-to-fail `INSERT INTO t (id, id) VALUES (...)`.
+        let columns = vec![
+            TargetColumn { name: "id".into(), numeric: true },
+            TargetColumn { name: "name".into(), numeric: false },
+        ];
+        let mapping = ColumnMapping { targets: vec![Some(0), Some(0)] };
+        let rows: Vec<CsvRow> = vec![vec![Some("1".into()), Some("2".into())]];
+
+        let result = generate_insert_batches(None, "t", &columns, &mapping, &rows);
+        assert_eq!(result, Err("sloupec id je namapován vícekrát".to_string()));
     }
 }
