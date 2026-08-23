@@ -7,6 +7,7 @@
 //! the affected sub-tree, never a crash.
 
 use std::ops::Range;
+use std::sync::OnceLock;
 
 use tree_sitter::StreamingIterator;
 
@@ -89,61 +90,92 @@ fn color_for_capture(name: &str) -> Option<(u8, gpui::Hsla)> {
     }
 }
 
+/// Compiled once and reused for the process lifetime. `Query::new` against
+/// this vendored, fixed source takes ~35ms — recompiling it on every
+/// `highlight()` call (as this module originally did) made every keystroke
+/// pay that cost, versus ~0.07ms for the actual parse. `Language` is cached
+/// alongside it since `Parser::set_language` needs a `&Language` per call
+/// too.
+///
+/// `Option`, not the bare tuple: `Query::new` can in principle fail (a
+/// malformed query source), and even though `HIGHLIGHTS_SCM` is a vendored
+/// compile-time constant that compiles today, defensively keeping this
+/// fallible (rather than `.expect`-ing inside the `OnceLock` initializer,
+/// which would poison every future call with the same panic) keeps
+/// `highlight()` total: a hypothetical future edit to `HIGHLIGHTS_SCM` that
+/// breaks compilation degrades to "no highlighting", never a panic.
+static QUERY: OnceLock<Option<(tree_sitter::Language, tree_sitter::Query)>> = OnceLock::new();
+
+fn cached_query() -> Option<(&'static tree_sitter::Language, &'static tree_sitter::Query)> {
+    QUERY
+        .get_or_init(|| {
+            let language: tree_sitter::Language = tree_sitter_sequel::LANGUAGE.into();
+            match tree_sitter::Query::new(&language, HIGHLIGHTS_SCM) {
+                Ok(query) => Some((language, query)),
+                Err(_) => None,
+            }
+        })
+        .as_ref()
+        .map(|(language, query)| (language, query))
+}
+
 /// Full-buffer parse + highlights query. Infallible in this codebase's
 /// usage: `tree_sitter::Parser::parse` only returns `None` on an explicit
 /// cancellation flag this code never sets, so every call returns real
 /// (possibly empty, possibly partially-degraded) spans — never panics, even
-/// on T-SQL-only syntax or an unterminated comment.
+/// on T-SQL-only syntax or an unterminated comment. If the cached query
+/// failed to compile (defensive only — see `cached_query`), this returns
+/// empty spans rather than panicking.
 pub fn highlight(text: &str) -> Vec<HighlightSpan> {
+    let Some((language, query)) = cached_query() else {
+        return Vec::new();
+    };
+
     let mut parser = tree_sitter::Parser::new();
-    let language: tree_sitter::Language = tree_sitter_sequel::LANGUAGE.into();
     parser
-        .set_language(&language)
+        .set_language(language)
         .expect("grammar embedded at compile time, cannot fail at runtime");
     let Some(tree) = parser.parse(text, None) else {
         return Vec::new(); // cancellation only, never hit here
     };
-    let query = tree_sitter::Query::new(&language, HIGHLIGHTS_SCM)
-        .expect("vendored query must compile");
 
-    // (range, priority, color) — Vec, not HashMap: buffer sizes are small
-    // (interactive SQL) and preserving a stable order simplifies testing;
-    // O(n) linear scan per capture is fine at this scale.
-    let mut spans: Vec<(Range<usize>, u8, gpui::Hsla)> = Vec::new();
-    let mut string_or_comment: std::collections::HashSet<Range<usize>> =
-        std::collections::HashSet::new();
+    // (range, priority, capture name, color) — Vec, not HashMap: buffer
+    // sizes are small (interactive SQL) and preserving a stable order
+    // simplifies testing; O(n) linear scan per capture is fine at this
+    // scale. The capture name is kept (not just derived color/priority) so
+    // `suppresses_completion` can be derived from the FINAL winning
+    // capture per range after priority resolution, rather than from the
+    // raw pre-resolution `@string`/`@comment` captures — a numeric literal
+    // wins `@number` over `@string` by priority, and must not be marked as
+    // suppressing completion just because it was also captured by the
+    // unconditional `@string` pattern along the way.
+    let mut spans: Vec<(Range<usize>, u8, &'static str, gpui::Hsla)> = Vec::new();
 
     let mut cursor = tree_sitter::QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+    let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
     while let Some(m) = matches.next() {
         for cap in m.captures {
             let name = query.capture_names()[cap.index as usize];
             let range = cap.node.byte_range();
-            if name == "string" || name == "comment" {
-                string_or_comment.insert(range.clone());
-            }
             let Some((priority, color)) = color_for_capture(name) else {
                 continue;
             };
-            if let Some(existing) = spans.iter_mut().find(|(r, _, _)| *r == range) {
+            if let Some(existing) = spans.iter_mut().find(|(r, _, _, _)| *r == range) {
                 if priority >= existing.1 {
-                    *existing = (range, priority, color);
+                    *existing = (range, priority, name, color);
                 }
             } else {
-                spans.push((range, priority, color));
+                spans.push((range, priority, name, color));
             }
         }
     }
 
     spans
         .into_iter()
-        .map(|(range, _, color)| {
-            let suppresses = string_or_comment.contains(&range);
-            HighlightSpan {
-                range,
-                color,
-                suppresses_completion: suppresses,
-            }
+        .map(|(range, _, name, color)| HighlightSpan {
+            range,
+            color,
+            suppresses_completion: matches!(name, "string" | "comment"),
         })
         .collect()
 }
@@ -219,5 +251,25 @@ mod tests {
     #[test]
     fn empty_text_returns_no_spans_without_panicking() {
         assert_eq!(highlight(""), Vec::new());
+    }
+
+    #[test]
+    fn repeated_highlight_calls_use_the_cached_query_and_agree() {
+        // Exercises the `OnceLock`-cached path: the first call initializes
+        // the cache, the second reuses it. Both must produce identical
+        // spans — caching must be purely a performance change, never an
+        // observable one.
+        let sql = "SELECT 42, 'x' FROM t WHERE t.id = 1 -- note";
+        let first = highlight(sql);
+        let second = highlight(sql);
+        assert_eq!(first, second);
+        assert!(!first.is_empty());
+    }
+
+    #[test]
+    fn numeric_literal_does_not_suppress_completion() {
+        let spans = highlight("SELECT 42");
+        let number_span = spans.iter().find(|s| s.range.contains(&7)).unwrap();
+        assert!(!number_span.suppresses_completion);
     }
 }
