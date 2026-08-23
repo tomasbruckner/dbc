@@ -161,9 +161,6 @@ impl Theme {
 /// `cx.theme()` everywhere a `Context` is in scope (it derefs to `App`);
 /// `app.theme()` inside `Element::paint`/`canvas` closures which receive
 /// `&mut App` directly. Mirrors GPUI's own ReadGlobal blanket-impl pattern.
-// removed in G14 Task 2..9 (this allow becomes unnecessary once the sweep
-// tasks start calling `cx.theme()`/`app.theme()` at render call sites).
-#[allow(dead_code)]
 pub trait ActiveTheme {
     fn theme(&self) -> &Theme;
 }

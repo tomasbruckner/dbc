@@ -36,7 +36,7 @@ use std::ops::Range;
 
 use dbc_state::{ConnectionConfig, Engine, SshTunnelConfig, Vault};
 use gpui::{
-    actions, div, fill, hsla, point, prelude::*, px, relative, rgb, rgba, size, App, AnyElement,
+    actions, div, fill, hsla, point, prelude::*, px, relative, size, App, AnyElement,
     Bounds, ClipboardItem, Context, CursorStyle, Div, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
@@ -46,6 +46,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::runner::ConnectSpec;
 use crate::text_model::MultilineBuffer;
+use crate::theme::{ActiveTheme, Theme};
 use crate::AppView;
 
 // ---------------------------------------------------------------------
@@ -660,7 +661,7 @@ impl Element for FieldElement {
                 (
                     Some(fill(
                         Bounds::from_corners(point(bounds.left() + x0, bounds.top()), point(bounds.left() + x1, bounds.bottom())),
-                        rgba(0x3311ff30),
+                        cx.theme().bg_selection,
                     )),
                     None,
                 )
@@ -1017,8 +1018,8 @@ impl AppView {
             .flex()
             .flex_row()
             .items_center()
-            .bg(rgb(0x181825))
-            .text_color(rgb(0xcdd6f4))
+            .bg(cx.theme().bg_app)
+            .text_color(cx.theme().text_primary)
             .cursor_pointer()
             .child(format!("Připojení: {label} ▾"))
             .on_click(cx.listener(|view, _, _, cx| {
@@ -1033,7 +1034,7 @@ impl AppView {
             .child(
                 div()
                     .ml_auto()
-                    .text_color(rgb(0x7f849c))
+                    .text_color(cx.theme().text_faint)
                     .child(format!("dbc v{}", env!("CARGO_PKG_VERSION"))),
             )
     }
@@ -1045,15 +1046,15 @@ impl AppView {
             .top(px(32.))
             .left(px(4.))
             .w(px(340.))
-            .bg(rgb(0x1e1e2e))
+            .bg(cx.theme().bg_panel)
             .border_1()
-            .border_color(rgb(0x45475a))
+            .border_color(cx.theme().border)
             .rounded_md()
             .p_2()
             .flex()
             .flex_col()
             .gap_1()
-            .text_color(rgb(0xcdd6f4))
+            .text_color(cx.theme().text_primary)
             .occlude()
             .on_mouse_down_out(cx.listener(|view, _, _, cx| {
                 view.dropdown_open = false;
@@ -1061,7 +1062,7 @@ impl AppView {
             }));
 
         if !grouped.favourites.is_empty() {
-            panel = panel.child(div().text_color(rgb(0xf9e2af)).child("Oblíbené"));
+            panel = panel.child(div().text_color(cx.theme().warn).child("Oblíbené"));
             for c in &grouped.favourites {
                 panel = panel.child(dropdown_item(c, 1, cx));
             }
@@ -1071,7 +1072,7 @@ impl AppView {
             let depth = folder.path.len();
             panel = panel.child(
                 div()
-                    .text_color(rgb(0x89b4fa))
+                    .text_color(cx.theme().accent)
                     .child(format!("{}{}", "  ".repeat(depth), header)),
             );
             for c in &folder.connections {
@@ -1083,8 +1084,8 @@ impl AppView {
                 .id("dropdown-new")
                 .mt_1()
                 .cursor_pointer()
-                .text_color(rgb(0xa6e3a1))
-                .hover(|s| s.bg(rgb(0x313244)))
+                .text_color(cx.theme().success)
+                .hover(|s| s.bg(cx.theme().bg_hover))
                 .child("Nové spojení…")
                 .on_click(cx.listener(|view, _, window, cx| {
                     view.open_connection_dialog(None, window, cx);
@@ -1124,7 +1125,7 @@ impl AppView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(0x00000099))
+                .bg(cx.theme().bg_backdrop)
                 .occlude()
                 .child(panel)
                 .into_any_element(),
@@ -1798,25 +1799,25 @@ fn test_connect_spec(cfg: ConnectionConfig, secret: Option<String>) -> Result<Co
     Ok(ConnectSpec::Config { cfg: Box::new(cfg), secret })
 }
 
-fn field_row(label: &str, field: Entity<TextField>) -> impl IntoElement {
+fn field_row(label: &str, field: Entity<TextField>, theme: Theme) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap_2()
-        .child(div().w(px(130.)).text_color(rgb(0xa6adc8)).child(label.to_string()))
+        .child(div().w(px(130.)).text_color(theme.text_muted).child(label.to_string()))
         .child(div().flex_1().child(field))
 }
 
-fn styled_button(id: &'static str, label: &'static str) -> Stateful<Div> {
+fn styled_button(id: &'static str, label: &'static str, theme: Theme) -> Stateful<Div> {
     div()
         .id(id)
         .px_3()
         .py_1()
-        .bg(rgb(0x313244))
+        .bg(theme.bg_hover)
         .rounded_md()
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(0x45475a)))
+        .hover(move |s| s.bg(theme.bg_selected))
         .child(label)
 }
 
@@ -1838,14 +1839,14 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
     let editing = c.clone();
     let label = format!("{}{} — {} {}", "  ".repeat(depth), c.name, engine_label(c.engine), c.host);
     let (star_glyph, star_color) =
-        if c.favourite { ("★", rgb(0xf9e2af)) } else { ("☆", rgb(0x6c7086)) };
+        if c.favourite { ("★", cx.theme().warn) } else { ("☆", cx.theme().text_disabled) };
     div()
         .id(SharedString::from(format!("dropdown-item-row-{}", c.id)))
         .flex()
         .flex_row()
         .items_center()
         .justify_between()
-        .hover(|s| s.bg(rgb(0x313244)))
+        .hover(|s| s.bg(cx.theme().bg_hover))
         .child(
             div()
                 .id(SharedString::from(format!("dropdown-item-{}", c.id)))
@@ -1865,7 +1866,7 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
                 .px_1()
                 .cursor_pointer()
                 .text_color(star_color)
-                .hover(|s| s.bg(rgb(0x45475a)))
+                .hover(|s| s.bg(cx.theme().bg_selected))
                 .child(star_glyph)
                 .on_click(cx.listener(move |view, _, _window, cx| {
                     cx.stop_propagation();
@@ -1883,8 +1884,8 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
                 .id(SharedString::from(format!("dropdown-item-edit-{}", c.id)))
                 .px_1()
                 .cursor_pointer()
-                .text_color(rgb(0xa6adc8))
-                .hover(|s| s.bg(rgb(0x45475a)))
+                .text_color(cx.theme().text_muted)
+                .hover(|s| s.bg(cx.theme().bg_selected))
                 .child("✎")
                 .on_click(cx.listener(move |view, _, window, cx| {
                     cx.stop_propagation();
@@ -1910,44 +1911,44 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
 
     let mut panel: Div = div()
         .w(px(480.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child(title))
-        .child(field_row("Název", ui.name.clone()))
+        .child(field_row("Název", ui.name.clone(), *cx.theme()))
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(div().w(px(130.)).text_color(rgb(0xa6adc8)).child("Engine"))
+                .child(div().w(px(130.)).text_color(cx.theme().text_muted).child("Engine"))
                 .child(
                     div()
                         .id("engine-cycle")
                         .px_2()
                         .py_1()
-                        .bg(rgb(0x313244))
+                        .bg(cx.theme().bg_hover)
                         .rounded_md()
                         .cursor_pointer()
                         .child(engine_label(ui.engine))
                         .on_click(cx.listener(|view, _, _, cx| view.cycle_engine(cx))),
                 ),
         )
-        .child(field_row("Host", ui.host.clone()))
-        .child(field_row("Port", ui.port.clone()))
-        .child(field_row("Databáze", ui.database.clone()))
-        .child(field_row("Uživatel", ui.user.clone()))
-        .child(field_row("Heslo", ui.password.clone()))
-        .child(field_row("Složka", ui.folder.clone()))
-        .child(field_row("Timeout (s)", ui.timeout_secs.clone()))
-        .child(field_row("Auto-limit řádků", ui.auto_limit.clone()))
+        .child(field_row("Host", ui.host.clone(), *cx.theme()))
+        .child(field_row("Port", ui.port.clone(), *cx.theme()))
+        .child(field_row("Databáze", ui.database.clone(), *cx.theme()))
+        .child(field_row("Uživatel", ui.user.clone(), *cx.theme()))
+        .child(field_row("Heslo", ui.password.clone(), *cx.theme()))
+        .child(field_row("Složka", ui.folder.clone(), *cx.theme()))
+        .child(field_row("Timeout (s)", ui.timeout_secs.clone(), *cx.theme()))
+        .child(field_row("Auto-limit řádků", ui.auto_limit.clone(), *cx.theme()))
         .child(
             div()
                 .flex()
@@ -1963,17 +1964,17 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
 
     if ui.ssh_enabled {
         panel = panel
-            .child(field_row("SSH host", ui.ssh_host.clone()))
-            .child(field_row("SSH port", ui.ssh_port.clone()))
-            .child(field_row("SSH uživatel", ui.ssh_user.clone()))
-            .child(field_row("SSH klíč (cesta)", ui.ssh_key_path.clone()));
+            .child(field_row("SSH host", ui.ssh_host.clone(), *cx.theme()))
+            .child(field_row("SSH port", ui.ssh_port.clone(), *cx.theme()))
+            .child(field_row("SSH uživatel", ui.ssh_user.clone(), *cx.theme()))
+            .child(field_row("SSH klíč (cesta)", ui.ssh_key_path.clone(), *cx.theme()));
     }
 
     if let Some((text, ok)) = test_line {
         let color = match ok {
-            Some(true) => rgb(0xa6e3a1),
-            Some(false) => rgb(0xf38ba8),
-            None => rgb(0xa6adc8),
+            Some(true) => cx.theme().success,
+            Some(false) => cx.theme().danger,
+            None => cx.theme().text_muted,
         };
         panel = panel.child(div().text_color(color).child(text));
     }
@@ -1986,9 +1987,9 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("dlg-test", test_label).on_click(cx.listener(|v, _, _, cx| v.on_test_clicked(cx))))
-            .child(styled_button("dlg-save", "Uložit").on_click(cx.listener(|v, _, window, cx| v.on_save_clicked(window, cx))))
-            .child(styled_button("dlg-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx)))),
+            .child(styled_button("dlg-test", test_label, *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.on_test_clicked(cx))))
+            .child(styled_button("dlg-save", "Uložit", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_save_clicked(window, cx))))
+            .child(styled_button("dlg-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx)))),
     );
 
     panel.into_any_element()
@@ -1997,19 +1998,19 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
 fn render_master_password_panel(input: Entity<TextField>, error: Option<String>, cx: &mut Context<AppView>) -> AnyElement {
     let mut panel: Div = div()
         .w(px(360.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Master heslo"))
-        .child(field_row("Heslo", input));
+        .child(field_row("Heslo", input, *cx.theme()));
     if let Some(e) = error {
-        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(e));
+        panel = panel.child(div().text_color(cx.theme().danger).child(e));
     }
     panel = panel.child(
         div()
@@ -2018,8 +2019,8 @@ fn render_master_password_panel(input: Entity<TextField>, error: Option<String>,
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("mpp-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
-            .child(styled_button("mpp-submit", "Odemknout").on_click(cx.listener(|v, _, _, cx| v.on_master_password_submit(cx)))),
+            .child(styled_button("mpp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+            .child(styled_button("mpp-submit", "Odemknout", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.on_master_password_submit(cx)))),
     );
     panel.into_any_element()
 }
@@ -2032,20 +2033,20 @@ fn render_create_master_password_panel(
 ) -> AnyElement {
     let mut panel: Div = div()
         .w(px(360.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Vytvořit master heslo"))
-        .child(field_row("Nové heslo", input1))
-        .child(field_row("Zopakujte heslo", input2));
+        .child(field_row("Nové heslo", input1, *cx.theme()))
+        .child(field_row("Zopakujte heslo", input2, *cx.theme()));
     if let Some(e) = error {
-        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(e));
+        panel = panel.child(div().text_color(cx.theme().danger).child(e));
     }
     panel = panel.child(
         div()
@@ -2054,8 +2055,8 @@ fn render_create_master_password_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("cmp-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
-            .child(styled_button("cmp-submit", "Vytvořit").on_click(cx.listener(|v, _, window, cx| v.on_create_master_password_submit(window, cx)))),
+            .child(styled_button("cmp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+            .child(styled_button("cmp-submit", "Vytvořit", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_create_master_password_submit(window, cx)))),
     );
     panel.into_any_element()
 }
@@ -2092,15 +2093,15 @@ fn render_query_params_panel(
     let mut panel: Div = div()
         .w(px(480.))
         .max_h(px(520.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Hodnoty parametrů"));
 
     for (i, name) in names.iter().enumerate() {
@@ -2113,7 +2114,7 @@ fn render_query_params_panel(
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(div().w(px(110.)).text_color(rgb(0xa6adc8)).child(format!(":{name}")))
+                .child(div().w(px(110.)).text_color(cx.theme().text_muted).child(format!(":{name}")))
                 .child(div().flex_1().child(input))
                 .child(
                     div()
@@ -2135,9 +2136,9 @@ fn render_query_params_panel(
         div()
             .id("qp-preview")
             .p_1()
-            .bg(rgb(0x181825))
+            .bg(cx.theme().bg_app)
             .rounded_md()
-            .text_color(rgb(0xa6adc8))
+            .text_color(cx.theme().text_muted)
             .whitespace_normal()
             .child(match &preview {
                 Ok(sql) => sql.clone(),
@@ -2146,7 +2147,7 @@ fn render_query_params_panel(
     );
 
     if let Some(e) = error {
-        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(e));
+        panel = panel.child(div().text_color(cx.theme().danger).child(e));
     }
 
     panel = panel.child(
@@ -2156,8 +2157,8 @@ fn render_query_params_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("qp-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.cancel_query_params(cx))))
-            .child(styled_button("qp-run", "Spustit").on_click(cx.listener(|v, _, _, cx| v.confirm_query_params(cx)))),
+            .child(styled_button("qp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.cancel_query_params(cx))))
+            .child(styled_button("qp-run", "Spustit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.confirm_query_params(cx)))),
     );
     panel.into_any_element()
 }
@@ -2262,30 +2263,30 @@ fn render_kill_confirm_panel(
 ) -> AnyElement {
     let mut panel: Div = div()
         .w(px(520.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Ukončit proces"))
         .child(format!("Opravdu ukončit proces {pid} ({label})?"))
         .child(
             div()
                 .id("kill-sql-preview")
                 .p_1()
-                .bg(rgb(0x181825))
+                .bg(cx.theme().bg_app)
                 .rounded_md()
-                .text_color(rgb(0xa6adc8))
+                .text_color(cx.theme().text_muted)
                 .whitespace_normal()
                 .child(sql.to_string()),
         );
 
     if let Some(e) = error {
-        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {e}")));
+        panel = panel.child(div().text_color(cx.theme().danger).child(format!("error: {e}")));
     }
 
     let confirm_button = if dispatched {
@@ -2294,13 +2295,13 @@ fn render_kill_confirm_panel(
             .px_3()
             .py_1()
             .rounded_md()
-            .bg(rgb(0x313244))
-            .text_color(rgb(0x6c7086))
+            .bg(cx.theme().bg_hover)
+            .text_color(cx.theme().text_disabled)
             .child("Ukončuji…")
             .into_any_element()
     } else {
-        styled_button("kill-confirm", "Ukončit proces")
-            .bg(rgb(0x5d2e2e)) // danger tint — DELETED_ROW_BG family
+        styled_button("kill-confirm", "Ukončit proces", *cx.theme())
+            .bg(cx.theme().diff_deleted_bg) // danger tint — DELETED_ROW_BG family
             .on_click(cx.listener(|v, _, _, cx| v.confirm_kill_confirm(cx)))
             .into_any_element()
     };
@@ -2313,7 +2314,7 @@ fn render_kill_confirm_panel(
             .justify_end()
             .mt_2()
             .child(
-                styled_button("kill-cancel", "Zrušit")
+                styled_button("kill-cancel", "Zrušit", *cx.theme())
                     .on_click(cx.listener(|v, _, _, cx| v.cancel_kill_confirm(cx))),
             )
             .child(confirm_button),
@@ -2347,17 +2348,17 @@ fn render_analyze_write_confirm_panel(
     let mut panel = div()
         .id("analyze-write-confirm")
         .w(px(520.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Analyzovat (EXPLAIN ANALYZE)"))
-        .child(div().text_color(rgb(0xf9e2af)).child(
+        .child(div().text_color(cx.theme().warn).child(
             "Toto SQL bude SKUTEČNĚ PROVEDENO, aby bylo možné změřit skutečný plán, a poté vráceno \
              zpět (ROLLBACK). Vedlejší efekty MIMO transakci (např. hodnoty sekvencí/IDENTITY, \
              volání externích funkcí) NEBUDOU vráceny zpět.",
@@ -2366,18 +2367,18 @@ fn render_analyze_write_confirm_panel(
             div()
                 .id("analyze-write-sql-preview")
                 .p_1()
-                .bg(rgb(0x181825))
+                .bg(cx.theme().bg_app)
                 .rounded_md()
-                .text_color(rgb(0xa6adc8))
+                .text_color(cx.theme().text_muted)
                 .whitespace_normal()
                 .child(sql),
         );
 
     if running {
-        panel = panel.child(div().text_color(rgb(0xf9e2af)).child("analyzuji (BEGIN…ROLLBACK)…"));
+        panel = panel.child(div().text_color(cx.theme().warn).child("analyzuji (BEGIN…ROLLBACK)…"));
     }
     if let Some(err) = error {
-        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {err}")));
+        panel = panel.child(div().text_color(cx.theme().danger).child(format!("error: {err}")));
     }
 
     panel = panel.child(
@@ -2396,8 +2397,8 @@ fn render_analyze_write_confirm_panel(
                             cx.notify();
                         }))
                     })
-                    .bg(rgb(0x313244))
-                    .text_color(if running { rgb(0x6c7086) } else { rgb(0xcdd6f4) })
+                    .bg(cx.theme().bg_hover)
+                    .text_color(if running { cx.theme().text_disabled } else { cx.theme().text_primary })
                     .px_3()
                     .py_1()
                     .rounded_md()
@@ -2412,8 +2413,8 @@ fn render_analyze_write_confirm_panel(
                         }))
                     })
                     // danger tint — DELETED_ROW_BG family, matches kill-confirm — dimmed while running.
-                    .bg(if running { rgb(0x313244) } else { rgb(0x5d2e2e) })
-                    .text_color(if running { rgb(0x6c7086) } else { rgb(0xcdd6f4) })
+                    .bg(if running { cx.theme().bg_hover } else { cx.theme().diff_deleted_bg })
+                    .text_color(if running { cx.theme().text_disabled } else { cx.theme().text_primary })
                     .px_3()
                     .py_1()
                     .rounded_md()
@@ -2447,15 +2448,15 @@ fn render_compare_dialog_panel(
     let mut panel = div()
         .id("compare-dialog")
         .w(px(680.))
-        .bg(rgb(0x1e1e2e))
+        .bg(cx.theme().bg_panel)
         .border_1()
-        .border_color(rgb(0x45475a))
+        .border_color(cx.theme().border)
         .rounded_md()
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .text_color(rgb(0xcdd6f4))
+        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Porovnat databáze…"))
         .child(
             div()
@@ -2481,11 +2482,11 @@ fn render_compare_dialog_panel(
         );
 
     if let Some(e) = &error {
-        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {e}")));
+        panel = panel.child(div().text_color(cx.theme().danger).child(format!("error: {e}")));
     }
 
     let confirm_button = if both_picked {
-        styled_button("compare-confirm", "Spustit porovnání")
+        styled_button("compare-confirm", "Spustit porovnání", *cx.theme())
             .on_click(cx.listener(|v, _, _, cx| v.confirm_compare_dialog(cx)))
             .into_any_element()
     } else {
@@ -2494,8 +2495,8 @@ fn render_compare_dialog_panel(
             .px_3()
             .py_1()
             .rounded_md()
-            .bg(rgb(0x313244))
-            .text_color(rgb(0x6c7086))
+            .bg(cx.theme().bg_hover)
+            .text_color(cx.theme().text_disabled)
             .child("Spustit porovnání")
             .into_any_element()
     };
@@ -2507,7 +2508,7 @@ fn render_compare_dialog_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("compare-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| {
+            .child(styled_button("compare-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| {
                 v.modal = None;
                 cx.notify();
             })))
@@ -2534,24 +2535,24 @@ fn render_compare_picker_column(
         .h(px(240.))
         .overflow_hidden()
         .border_1()
-        .border_color(rgb(0x313244))
+        .border_color(cx.theme().bg_hover)
         .rounded_md();
 
     if !grouped.favourites.is_empty() {
-        list = list.child(div().text_color(rgb(0xf9e2af)).child("Oblíbené"));
+        list = list.child(div().text_color(cx.theme().warn).child("Oblíbené"));
         for c in &grouped.favourites {
             list = list.child(compare_picker_row(c, side, selected, cx));
         }
     }
     for folder in &grouped.folders {
         let header = if folder.path.is_empty() { "Bez složky".to_string() } else { folder.path.join("/") };
-        list = list.child(div().text_color(rgb(0x6c7086)).child(header));
+        list = list.child(div().text_color(cx.theme().text_disabled).child(header));
         for c in &folder.connections {
             list = list.child(compare_picker_row(c, side, selected, cx));
         }
     }
 
-    div().flex().flex_col().flex_1().gap_1().child(div().text_color(rgb(0x89b4fa)).child(label)).child(list)
+    div().flex().flex_col().flex_1().gap_1().child(div().text_color(cx.theme().accent).child(label)).child(list)
 }
 
 fn compare_picker_row(
@@ -2572,8 +2573,8 @@ fn compare_picker_row(
         .px_1()
         .cursor_pointer()
         .rounded_md()
-        .when(is_selected, |d| d.bg(rgb(0x313244)).text_color(rgb(0xa6e3a1)))
-        .hover(|s| s.bg(rgb(0x313244)))
+        .when(is_selected, |d| d.bg(cx.theme().bg_hover).text_color(cx.theme().success))
+        .hover(|s| s.bg(cx.theme().bg_hover))
         .child(label)
         .on_click(cx.listener(move |view, _, _, cx| {
             view.select_compare_side(side, id.clone(), cx);
