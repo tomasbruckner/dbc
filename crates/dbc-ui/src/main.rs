@@ -684,8 +684,8 @@ fn conn_identity_matches(tab_identity: &str, current: &str) -> bool {
 }
 
 impl AppView {
-    fn on_run_query(&mut self, _: &RunQuery, _window: &mut Window, cx: &mut Context<Self>) {
-        self.run_query(false, cx);
+    fn on_run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_query(false, window, cx);
     }
 
     /// `Ctrl+Shift+Enter`: bypasses ONLY the auto-limit guard. Read-only
@@ -694,10 +694,10 @@ impl AppView {
     fn on_run_query_unlimited(
         &mut self,
         _: &RunQueryUnlimited,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.run_query(true, cx);
+        self.run_query(true, window, cx);
     }
 
     /// Guard order (brief, Task 8): (1) read-only — rejected without ever
@@ -717,14 +717,14 @@ impl AppView {
     /// `PaletteAction::RunQuery`) funnels through this one call before ever
     /// reaching `run_query_with`, so intercepting here covers all three
     /// with one change rather than duplicating the check at each call site.
-    fn run_query(&mut self, bypass_auto_limit: bool, cx: &mut Context<Self>) {
+    fn run_query(&mut self, bypass_auto_limit: bool, window: &mut Window, cx: &mut Context<Self>) {
         let sql = self.sql.read(cx).text();
         if sql.trim().is_empty() {
             return;
         }
         match find_params(&sql) {
             Some(names) if !names.is_empty() => {
-                self.open_query_params_dialog(sql, names, bypass_auto_limit, cx);
+                self.open_query_params_dialog(sql, names, bypass_auto_limit, window, cx);
             }
             // Some(empty) or None (fail-closed scan failure) — proceed
             // exactly as before G6 Task 3, no behavior change.
@@ -739,12 +739,17 @@ impl AppView {
     /// both a saved connection and the CLI-arg `"cli"` sentinel). Refuses
     /// to open a second modal on top of an existing one (same
     /// single-modal-at-a-time invariant `run_query_with` itself enforces
-    /// via its own `self.modal.is_some()` guard).
+    /// via its own `self.modal.is_some()` guard). Focuses the first param's
+    /// `TextField` in the same update that sets `self.modal` — the same
+    /// convention every other modal-opener follows (`open_connection_dialog`,
+    /// the master-password prompts) — T3 review round 1 (finding 1): this
+    /// was missing, so the dialog opened with nothing focused.
     fn open_query_params_dialog(
         &mut self,
         sql: String,
         names: Vec<String>,
         bypass_auto_limit: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.modal.is_some() {
@@ -763,6 +768,7 @@ impl AppView {
                 f
             }));
         }
+        let first_focus = inputs.first().map(|f| f.focus_handle(cx));
         self.modal = Some(connections_ui::ModalState::QueryParams {
             names,
             inputs,
@@ -771,19 +777,28 @@ impl AppView {
             bypass_auto_limit,
             error: None,
         });
+        if let Some(focus) = first_focus {
+            window.focus(&focus, cx);
+        }
         cx.notify();
     }
 
     /// "Spustit" click — reads every input's live text + its `null_flags`
     /// entry, substitutes via `build_param_sql` (which also runs the
     /// CURATION-mandated post-substitution rescan, design §5). On `Ok`:
-    /// persists every value to `self.param_values` (best-effort — a
-    /// `store.set` error degrades silently, same posture `view_prefs`'s own
-    /// callers take), closes the modal, and runs the final SQL with the
-    /// caller's original `bypass_auto_limit`. On `Err`: sets the modal's
-    /// `error` (shown in the dialog) and does NOT close the modal, run
-    /// anything, or persist any value — persistence only ever happens on
-    /// the `Ok` branch, i.e. only on an actual confirmed run.
+    /// persists every value to `self.param_values`, surfacing any
+    /// `store.set` error to `self.status` (same posture
+    /// `save_view_prefs_for_grid` takes, main.rs — NOT silently swallowed;
+    /// T3 review round 1 (finding 2) caught this doc comment's earlier
+    /// "best-effort, degrades silently" claim as wrong), closes the modal,
+    /// and runs the final SQL with the caller's original
+    /// `bypass_auto_limit`. A save failure on one param doesn't stop the
+    /// rest from being attempted — the loop keeps going, so the LAST error
+    /// (if any) is what ends up in `self.status`. On `Err` from
+    /// `build_param_sql`: sets the modal's `error` (shown in the dialog)
+    /// and does NOT close the modal, run anything, or persist any value —
+    /// persistence only ever happens on the `Ok` branch, i.e. only on an
+    /// actual confirmed run.
     fn confirm_query_params(&mut self, cx: &mut Context<Self>) {
         let Some(connections_ui::ModalState::QueryParams {
             names,
@@ -811,11 +826,18 @@ impl AppView {
                 let conn_id = self.current_conn_identity();
                 if let Some(store) = &mut self.param_values {
                     for (name, (text, is_null)) in names.iter().zip(values.iter()) {
-                        let _ = store.set(
+                        if let Err(e) = store.set(
                             &conn_id,
                             name,
                             ParamValue { text: text.clone(), is_null: *is_null },
-                        );
+                        ) {
+                            // Keep saving the remaining params even after a
+                            // failure — a save failure on one param name
+                            // shouldn't stop the others from persisting.
+                            // Last error wins in `self.status` (matches
+                            // `save_view_prefs_for_grid`'s posture).
+                            self.status = format!("error ukládání parametrů: {}", e.message);
+                        }
                     }
                 }
                 self.modal = None;
@@ -1592,7 +1614,7 @@ impl AppView {
                 self.on_dropdown_item_click(id, window, cx);
             }
             PaletteItem::Action { action, .. } => match action {
-                PaletteAction::RunQuery => self.run_query(false, cx),
+                PaletteAction::RunQuery => self.run_query(false, window, cx),
                 PaletteAction::ToggleTree => {
                     self.tree_visible = !self.tree_visible;
                 }
