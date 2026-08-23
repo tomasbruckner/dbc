@@ -121,6 +121,13 @@ impl RowView {
 /// `needle` yields no matches (nothing to jump to, rather than "everything
 /// matches" like an empty filter) since a find-bar's whole purpose is
 /// jumping between specific matches.
+///
+/// Production code (`grid.rs`) calls the capped variant below,
+/// `find_matches_capped`, exclusively — this uncapped wrapper is only
+/// exercised by this module's tests, hence `#[cfg(test)]` (final review
+/// fix #3: it was otherwise dead code in the non-test build, tripping the
+/// zero-warnings gate).
+#[cfg(test)]
 pub fn find_matches(
     rows: usize,
     cols: &[usize],

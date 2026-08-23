@@ -771,6 +771,29 @@ impl ResultGrid {
         // PREVIOUS display order — bump so `toolbar`'s staleness check
         // recomputes them (see `FindState::computed_generation`).
         self.view_generation += 1;
+        // Final review fix #1 (HIGH — stale selection vs. shrunken view):
+        // `selection` is stored in DISPLAY coordinates and deliberately
+        // survives a call here in the common no-sort/no-filter `Identity`
+        // case (`on_batch_grown` routes every streamed batch through this
+        // function; the view only ever grows there, so an in-progress
+        // selection must not be wiped every batch). But a sort/filter
+        // change (header click, a typed column filter, a virtual-column
+        // add/remove that drops a stale sort/filter) can genuinely shrink
+        // the view out from under an existing selection, leaving its row
+        // range pointing past `view.len()` — the scenario that panicked
+        // `on_copy` via `view.source_row`. Drop the selection as soon as
+        // that's detected, rather than leaving it dangling until the next
+        // copy/click; `on_copy` and the double-click cell-detail handler
+        // (grid.rs, mouse-down listener) each ALSO carry their own
+        // defensive bounds check, since a click can still land in the
+        // narrow window between the view shrinking and this rebuild
+        // running (e.g. the click-then-Ctrl+C race, or a click whose
+        // `row_ix` was captured at a since-stale render).
+        if let Some(((r0, _), (r1, _))) = self.selection {
+            if r0.max(r1) >= self.view.len() {
+                self.selection = None;
+            }
+        }
     }
 
     /// Called from `main.rs`'s `QueryEvent::Batch` handling for the tab
@@ -1386,6 +1409,14 @@ impl ResultGrid {
         };
         let (rmin, rmax) = (r0.min(r1), r0.max(r1));
         let (cmin, cmax) = (c0.min(c1), c0.max(c1));
+        // Defensive clamp (final review fix #1): `rebuild_view` already
+        // drops a selection it detects has fallen out of range, but a
+        // click can still land after the last rebuild and before this
+        // handler runs (the click-then-Ctrl+C race) — bail rather than
+        // let `view.source_row` panic on an out-of-range display index.
+        if rmax >= self.view.len() {
+            return;
+        }
         let Some(buf) = self.buffer.clone() else {
             return;
         };
@@ -2186,6 +2217,21 @@ impl Render for ResultGrid {
                                         gpui::MouseButton::Left,
                                         cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
                                             window.focus(&this.focus_handle, cx);
+                                            // Defensive clamp (final review
+                                            // fix #1): `row_ix` was captured
+                                            // at render time; if the view
+                                            // shrank (a filter typed, a
+                                            // sort/virtual-col change) in
+                                            // the gap between that render
+                                            // and this click landing, it can
+                                            // now point past `view.len()`.
+                                            // Ignore the click rather than
+                                            // open a stale cell-detail popup
+                                            // or set a selection anchor
+                                            // `on_copy` would later see.
+                                            if row_ix >= this.view.len() {
+                                                return;
+                                            }
                                             // G4 Task 3: double-click (or
                                             // more) opens the cell-detail
                                             // popup instead of touching

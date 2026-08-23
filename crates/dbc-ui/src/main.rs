@@ -276,6 +276,20 @@ struct AppView {
     sql: Entity<SqlInput>,
     cancel: Option<CancelToken>,
     started_at: Option<std::time::Instant>,
+    /// Bumped at the top of every `run_query_with` dispatch; captured by
+    /// that run's spawned event loop as `my_generation`. Final review
+    /// fix #2: the loop's post-`while` tail clears `view.cancel` for its
+    /// own run, but `rx.recv().await` can go `Pending` after the terminal
+    /// event has already been processed (the runner thread hasn't yet
+    /// dropped its sender) — a new run can legitimately start in that
+    /// gap and set a fresh `cancel`. The tail (and any other end-of-run
+    /// tail mutation) applies only when `run_generation` still matches,
+    /// so a newer run's state is never clobbered by an older run's
+    /// finally-arriving channel close. Supersedes the narrower
+    /// `retriggered` flag, which only covered the Task 6 saved-fk-join
+    /// retrigger — this covers every way a new run can start in that
+    /// window (Ctrl+Enter, palette, preview, a ☰ toggle).
+    run_generation: u64,
     // --- Task 7: connection manager state ---
     config: AppConfig,
     config_path: PathBuf,
@@ -479,6 +493,11 @@ impl AppView {
         let cancel = CancelToken::new();
         self.cancel = Some(cancel.clone());
         self.started_at = Some(std::time::Instant::now());
+        // Final review fix #2: this run's identity, checked by its own
+        // spawned loop's tail before mutating `view.cancel` — see
+        // `run_generation`'s doc comment.
+        self.run_generation += 1;
+        let my_generation = self.run_generation;
         self.status = format!("connecting…{limit_suffix}");
         cx.notify();
 
@@ -521,16 +540,14 @@ impl AppView {
             // one-query-at-a-time guard would otherwise silently drop it if
             // dispatched from inside `Started`.
             let mut pending_join_retrigger: Option<PreviewTarget> = None;
-            // G4 Task 6: set true when `pending_join_retrigger` is actually
-            // dispatched below — `view.run_query_with` synchronously sets a
-            // FRESH `view.cancel` for that new run before this closure
-            // returns, so the tail cleanup after the loop (which
-            // unconditionally reset `view.cancel = None` for THIS run) must
-            // skip doing so in that case, or it would immediately wipe out
-            // the new run's cancel token (the channel closes right after
-            // `Finished`, so `rx.recv()` resolves without yielding and this
-            // tail runs before the new run has any chance to progress).
-            let mut retriggered = false;
+            // G4 Task 6: when `pending_join_retrigger` is actually
+            // dispatched below, `view.run_query_with` synchronously bumps
+            // `view.run_generation` and sets a FRESH `view.cancel` for
+            // that new run before this closure returns — so the tail
+            // cleanup after the loop, guarded on `run_generation` still
+            // matching `my_generation` (final review fix #2), naturally
+            // skips clobbering it, the same as it does for any other run
+            // started while this one's channel-close is still pending.
             while let Some(ev) = rx.recv().await {
                 let stop = this
                     .update(cx, |view, cx| {
@@ -766,7 +783,6 @@ impl AppView {
                                                 &pt.joins,
                                             );
                                             view.run_query_with(sql, Some(pt), true, cx);
-                                            retriggered = true;
                                         }
                                     }
                                 }
@@ -810,9 +826,17 @@ impl AppView {
                 }
             }
             let _ = this.update(cx, |view, cx| {
-                // G4 Task 6: don't clobber the freshly-dispatched retrigger
-                // run's own `view.cancel` — see `retriggered`'s doc comment.
-                if !retriggered {
+                // Final review fix #2: only clear `view.cancel` if no
+                // newer run has started since — `rx.recv()` above can go
+                // `Pending` after the terminal event was already
+                // processed (the runner thread hasn't dropped its sender
+                // yet), and a new run legitimately started in that gap
+                // (Ctrl+Enter, palette, preview, a ☰ toggle, or this run's
+                // own saved-fk-join retrigger) already bumped
+                // `run_generation` and set its own `cancel` — an
+                // unconditional clear here would wipe that out from under
+                // it. See `run_generation`'s doc comment.
+                if view.run_generation == my_generation {
                     view.cancel = None;
                 }
                 cx.notify();
@@ -1998,6 +2022,7 @@ fn main() {
                             sql,
                             cancel: None,
                             started_at: None,
+                            run_generation: 0,
                             config,
                             config_path,
                             config_load_error,
