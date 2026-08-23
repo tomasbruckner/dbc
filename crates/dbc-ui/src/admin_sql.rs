@@ -281,11 +281,30 @@ mod catalog_tests {
 /// construction, never post-hoc replace). Lives here (pure module, no
 /// GPUI) per design §5 T2 "mutation builders + WriteStatement";
 /// runner.rs imports it in T3.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// T1+T2 review carry-forward (BLOCKER 1): the plan's interface spec calls
+/// for `#[derive(Debug, ...)]`, but `exec_sql` carries the REAL,
+/// unredacted password for password-bearing statements — a derived
+/// `{:?}` would print it verbatim into any log/panic/assert message that
+/// happens to format a `WriteStatement`. That security requirement
+/// supersedes the plan's derive: `Debug` is implemented BY HAND below,
+/// printing `display_sql` (already '***'-redacted where it matters) and
+/// never touching `exec_sql`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct WriteStatement {
     pub exec_sql: String,
     pub display_sql: String,
     pub expected_affected: Option<u64>,
+}
+
+impl std::fmt::Debug for WriteStatement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteStatement")
+            .field("display_sql", &self.display_sql)
+            .field("exec_sql", &"<redacted>")
+            .field("expected_affected", &self.expected_affected)
+            .finish()
+    }
 }
 
 /// G5's sandbox statements: exec == display, always.
@@ -690,6 +709,16 @@ mod mutation_tests {
         assert_eq!(drop_schema(Engine::Postgres, "reports", true)[0].exec_sql, "DROP SCHEMA \"reports\" CASCADE");
         // T-SQL has no DROP SCHEMA … CASCADE — the flag never leaks.
         assert_eq!(drop_schema(Engine::Mssql, "reports", true)[0].exec_sql, "DROP SCHEMA [reports]");
+    }
+
+    // BLOCKER 1 carry-forward: WriteStatement's hand-written Debug must
+    // never format the real password, whatever debug/log call formats it.
+    #[test]
+    fn write_statement_debug_never_contains_the_real_password() {
+        let stmts = create_role(Engine::Postgres, "app_user", "s3cr'et", &RoleFlags::default());
+        let debug = format!("{:?}", stmts[0]);
+        assert!(!debug.contains("s3cr"), "Debug leaked the real password: {debug}");
+        assert!(debug.contains("'***'"), "Debug should show the redacted display_sql: {debug}");
     }
 
     #[test]
