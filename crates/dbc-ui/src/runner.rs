@@ -280,7 +280,6 @@ impl QueryRunner {
     /// renders (belt-and-braces, design §6). Dropping the returned `Sender`
     /// ends the loop and drops the connection ("drop tears everything
     /// down", same as OpenConnection/Tunnel).
-    #[allow(dead_code)] // wired by T6's open_monitor_tab; allow removed there
     pub fn open_monitor(
         &self,
         spec: ConnectSpec,

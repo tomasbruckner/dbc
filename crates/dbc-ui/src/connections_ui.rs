@@ -931,7 +931,6 @@ pub enum ModalState {
     /// `error` is a failed kill's message: the dialog stays open with it
     /// (same "error stays in the modal" precedent as Apply's
     /// rollback-error UX).
-    #[allow(dead_code)] // constructed by T6's on_monitor_view_event; allow removed there
     KillConfirm {
         pid: i64,
         label: String, // "{user} · {application} · běží {n}s"
