@@ -33,6 +33,43 @@ progress tab is a third `TabContent` variant); `crates/dbc-state/src/
 history.rs` (`HistoryEntry`'s fixed field set — script/CSV runs reuse it via
 a synthetic `sql` string, no schema migration).
 
+> **CURATION (2026-08-23, binding):**
+> 1. **§3-novela reconciliation (supersedes G10 §0's wording where they
+>    conflict):** the app-wide write invariant is the PATTERN, not one
+>    function: *every* write reaches `Connection::execute` only through (a) a
+>    confirm modal showing the exact SQL that will run, (b) a runner-owned
+>    method with explicit transaction discipline, and (c) the SHARED
+>    read-only guard at the runner choke point. Sanctioned runner write
+>    methods after G12: `run_write_transaction` (sandbox Apply + G10 admin),
+>    `run_script` (write statements per §2's dispatch matrix), the CSV-import
+>    batch runner, `connect_and_run_many` (editor multi-statement — its
+>    per-statement read-only rejection counts as (c)). All four MUST call one
+>    shared guard helper — no fresh read-only logic per method. Update
+>    `execute()`'s doc comment once (per §7) to state the pattern + the
+>    sanctioned-caller list.
+> 2. **Stale driver claims superseded:** `dbc-driver-mssql` AND
+>    `dbc-driver-duckdb` exist as of v0.5.0 (both unwired). `Dialect::Mssql`
+>    + the GO line-pre-pass remain a follow-up (correct call). When DuckDB
+>    wiring lands, map `Engine::Duckdb → Dialect::Postgres` — DuckDB supports
+>    `$$` dollar-quoting and pg-style syntax; add one test for that mapping
+>    at wiring time.
+> 3. **G6 interaction — interception order in `run_query_with` is fixed as:**
+>    param scan/substitution (G6, on the full editor text) → `split_sql` →
+>    per-statement guards/auto-limit → dispatch. Rationale: `:name` params
+>    must be resolved before splitting so a substituted literal containing
+>    `;` inside quotes is handled by the splitter's normal string rules, and
+>    the G6 mandatory post-substitution re-scan still runs on the full text
+>    before any split. Add a test: two statements each carrying `:p`.
+> 4. **REQUIRED tests (read-only discipline, mirrors G9/G10):** (a) script
+>    containing a write statement over a `read_only` connection → that
+>    statement rejected client-side before the driver, error-policy matrix
+>    honored; (b) CSV import entry point hidden/disabled on read-only AND the
+>    runtime guard refuses if reached anyway; (c) editor multi-statement
+>    `SELECT 1; UPDATE …` on read-only runs the SELECT, stops at the UPDATE.
+> 5. **T1 (`dbc-core/split.rs`) is approved to start immediately as an
+>    orthogonal parallel track** — zero file overlap with G6's tail or any
+>    other in-flight work.
+
 ## 1. Statement splitter (`dbc-core`, new module beside `guards.rs`)
 
 - **Location:** `crates/dbc-core/src/split.rs`, `mod split;` added to

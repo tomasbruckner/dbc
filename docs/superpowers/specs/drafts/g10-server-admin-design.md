@@ -11,6 +11,39 @@ editing" + G5 design pass block (style model), §3 constraints;
 (`run_write_transaction` — the machinery this design reuses);
 `crates/dbc-core/src/connection.rs` (`Connection::execute` + its invariants).
 
+> **CURATION (2026-08-23, binding):**
+> 1. **§0 amendment APPROVED** — it matches the planned spec-wide novela:
+>    confirm-modal + `run_write_transaction` is the ONLY write path; sandbox
+>    Apply and G10 admin are its two callers. Promote this wording into the
+>    main spec §3 when drafts are promoted.
+> 2. **Stale prerequisite corrected:** `dbc-driver-mssql` (odbc-api) EXISTS
+>    as of v0.5.0 but is unwired — `connect.rs` doesn't construct it and the
+>    UI still gates `Engine::Mssql`. §6's "no MSSQL driver exists" is
+>    superseded. G10's MSSQL builders still ship string-unit-tested only;
+>    live MSSQL admin lights up when the orthogonal wiring task lands. The
+>    driver-doc blocker also applies here: MSSQL identifier quoting MUST be
+>    bracket-form — which §4's `quote_ident_for` already provides; do NOT
+>    route MSSQL through `dbc_core::quote_ident`.
+> 3. **Redaction hardening (additional requirement):** the runner must never
+>    interpolate `exec_sql` into any `QueryError` message, status line, or
+>    log it surfaces — errors shown in the modal are paired with
+>    `display_sql` only. Add a unit test: a failing password-bearing
+>    statement's surfaced error context contains `'***'` and never the real
+>    password.
+> 4. **Password memory hygiene:** the modal-local password is read into
+>    `zeroize::Zeroizing<String>` (same discipline as the vault/dbc-mcp key
+>    path), and `WriteStatement.exec_sql` for password-bearing statements is
+>    dropped immediately after the transaction completes (it already dies
+>    with the Vec; just don't cache it in panel state).
+> 5. **`acldefault` claim corrected:** if `acldefault()` is unavailable the
+>    whole SELECT errors — `COALESCE` does not save it. Baseline is hard
+>    PG ≥ 10 (2017); on error the privileges sub-view shows the error, no
+>    fallback query. Delete the "degrading gracefully" clause from §1 intent.
+> 6. **REQUIRED test (mirrors G9's kill test):** admin Apply attempted over a
+>    connection whose `cfg.read_only` is set must be refused by the runner
+>    guard before any driver call — one unit test at the guard, one UI-level
+>    test that the entry point is disabled.
+
 ## 0. Amendment to §3 "Sandbox Apply is the ONLY write path"
 
 - **Amended statement:** the Apply confirm-modal + `run_write_transaction`
