@@ -337,6 +337,151 @@ impl QueryRunner {
         });
         (cmd_tx, event_rx)
     }
+
+    /// G7 T5: two independent one-shot schema fetches, run CONCURRENTLY
+    /// (`tokio::join!`), reusing `open_spec` unchanged — the same
+    /// "ephemeral one-shot connection, opened and dropped" pattern
+    /// `fetch_schema`/`fetch_lookup`/`test_connect` already use, just issued
+    /// twice. Neither leg touches `active_connection_id`. Each `Result` is
+    /// independent — a failure on one side does not cancel or block the
+    /// other.
+    ///
+    /// `#[allow(dead_code)]`: no caller exists yet in this worktree — G7 T6
+    /// (`connections_ui.rs`'s `CompareDialog` confirm handler) is the first
+    /// call site. The plain `cargo build` (no `#[cfg(test)]`) has no reader
+    /// at all today; `diff_fetch_tests` exercises the underlying logic
+    /// directly (mirroring `fetch_diff_side_inner`'s own reasoning) rather
+    /// than through this method, since spawning a full `QueryRunner` inside
+    /// a `#[tokio::test]` async fn panics on drop (see this module's
+    /// `diff_fetch_tests` doc comments). Remove this allow once T6 wires a
+    /// real call site.
+    #[allow(dead_code)]
+    pub fn fetch_schema_pair(
+        &self,
+        spec_a: ConnectSpec,
+        spec_b: ConnectSpec,
+    ) -> tokio::sync::oneshot::Receiver<(Result<SchemaSnapshot, QueryError>, Result<SchemaSnapshot, QueryError>)>
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle_a = self.handle();
+        let handle_b = self.handle();
+        self.runtime.spawn(async move {
+            let fetch_a = async {
+                match open_spec(spec_a, handle_a).await {
+                    Ok(mut opened) => opened.conn.schema().await,
+                    Err(e) => Err(e),
+                }
+            };
+            let fetch_b = async {
+                match open_spec(spec_b, handle_b).await {
+                    Ok(mut opened) => opened.conn.schema().await,
+                    Err(e) => Err(e),
+                }
+            };
+            let (result_a, result_b) = tokio::join!(fetch_a, fetch_b);
+            let _ = tx.send((result_a, result_b));
+        });
+        rx
+    }
+
+    /// G7 T5: full `SELECT * FROM {quoted table}` [+ `WHERE {where_clause}`],
+    /// drained into a `dbc_buffer::ResultBuffer` — NOT `LIMIT`-bounded (a
+    /// diff must see the whole table or explicitly say it didn't). The
+    /// WHERE box is refused CLIENT-SIDE (before any connection is
+    /// attempted) unless the COMPOSED statement passes
+    /// `dbc_core::is_read_statement` — CURATION binding requirement (design
+    /// CURATION §0.1(b)/§0.2). Returns the composed SQL alongside the
+    /// result so the caller can show it verbatim in the compare tab header.
+    ///
+    /// `#[allow(dead_code)]`: no caller exists yet in this worktree — G7 T8
+    /// (`compare.rs`'s data-diff fetch) is the first call site. Same
+    /// rationale as `fetch_schema_pair`'s allow above: `diff_fetch_tests`
+    /// exercises `fetch_diff_side_inner`/`compose_diff_select` directly, not
+    /// this thin spawn wrapper. Remove this allow once T8 wires a real call
+    /// site.
+    #[allow(dead_code)]
+    pub fn fetch_diff_side(
+        &self,
+        spec: ConnectSpec,
+        schema: Option<String>,
+        table: String,
+        where_clause: Option<String>,
+    ) -> tokio::sync::oneshot::Receiver<Result<(String, SchemaRef, dbc_buffer::ResultBuffer), QueryError>>
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            let result = fetch_diff_side_inner(spec, schema, table, where_clause, handle).await;
+            let _ = tx.send(result);
+        });
+        rx
+    }
+}
+
+/// G7 T5: pure SQL composer + guard, extracted as a standalone function
+/// specifically so the CURATION-REQUIRED test can prove the WHERE-box guard
+/// fires BEFORE `open_spec` is ever called (design CURATION §0.2: "REQUIRED
+/// test: `fetch_diff_side` with a WHERE-box payload failing
+/// `is_read_statement` is refused client-side"). `dbc_core::quote_qualified`
+/// is the SAME quoting function `sandbox.rs` already uses for its own
+/// write-path SQL (Global Constraints' quoting note — MSSQL bracket
+/// quoting via `admin_sql::quote_ident_for` is out of scope here since
+/// MSSQL is unwired in `connect::open_config` today).
+fn compose_diff_select(
+    schema: Option<&str>,
+    table: &str,
+    where_clause: Option<&str>,
+) -> Result<String, QueryError> {
+    let base = format!("SELECT * FROM {}", dbc_core::quote_qualified(schema, table));
+    let sql = match where_clause {
+        Some(w) if !w.trim().is_empty() => format!("{base} WHERE {w}"),
+        _ => base,
+    };
+    if !dbc_core::is_read_statement(&sql) {
+        return Err(QueryError::msg(
+            "WHERE výraz nelze spustit — musí jít o čistě čtecí SQL (žádné oddělené příkazy)"
+                .to_string(),
+        ));
+    }
+    Ok(sql)
+}
+
+/// G7 T5: `QueryRunner::fetch_diff_side`'s async body — composes + guards
+/// the SELECT (see `compose_diff_select`'s doc comment) BEFORE `open_spec`
+/// is called at all, then drains the result into a `ResultBuffer`, bounded
+/// by `dbc_diff::data_diff::DIFF_ROW_CAP` as an EXPLICIT error (never a
+/// silent truncation — design §4), same "row-cap check inside the drain
+/// loop" shape `fetch_lookup_inner`'s `LOOKUP_ROW_CAP` break uses, except
+/// hard-`Err` here rather than a silent `break`.
+async fn fetch_diff_side_inner(
+    spec: ConnectSpec,
+    schema: Option<String>,
+    table: String,
+    where_clause: Option<String>,
+    handle: tokio::runtime::Handle,
+) -> Result<(String, SchemaRef, dbc_buffer::ResultBuffer), QueryError> {
+    // Composed + guarded BEFORE `open_spec` — a failing WHERE box never
+    // reaches a connection attempt (CURATION binding requirement).
+    let sql = compose_diff_select(schema.as_deref(), &table, where_clause.as_deref())?;
+    let mut opened = open_spec(spec, handle).await?;
+    let mut stream = opened.conn.query(&sql, CancelToken::new()).await?;
+    let columns = stream.columns.clone();
+    let mut buf = dbc_buffer::ResultBuffer::new(columns.clone());
+    while let Some(item) = stream.batches.recv().await {
+        match item {
+            Ok(b) => {
+                buf.push(b).map_err(|e| QueryError::msg(e.to_string()))?;
+                if buf.row_count() > dbc_diff::data_diff::DIFF_ROW_CAP {
+                    return Err(QueryError::msg(format!(
+                        "tabulka má víc než {} řádků — porovnání dat na tak velké tabulce zatím není podporováno; zúžete výběr přes WHERE",
+                        dbc_diff::data_diff::DIFF_ROW_CAP
+                    )));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((sql, columns, buf))
 }
 
 /// Exact rollback message the brief mandates for an affected-rows mismatch
@@ -1870,5 +2015,142 @@ mod monitor_pg_tests {
             drop(cmd_tx);
             let _ = tokio::time::timeout(Duration::from_secs(5), loop_task).await;
         });
+    }
+}
+
+/// G7 T5: `fetch_schema_pair`/`fetch_diff_side` + the client-side WHERE-box
+/// guard (design CURATION §0.1(b)/§0.2 — REQUIRED). `compose_diff_select_*`
+/// tests exercise the pure composer/guard directly (no `ConnectSpec`/
+/// `open_spec` anywhere in their call path — the strongest possible proof
+/// that a rejected WHERE box never reaches a connection attempt); the
+/// end-to-end test drives `fetch_diff_side` over a real (writable) sqlite
+/// connection to prove the guard fires before the driver is ever touched,
+/// even though sqlite would happily run a multi-statement batch if asked.
+#[cfg(test)]
+mod diff_fetch_tests {
+    use super::*;
+
+    #[test]
+    fn compose_diff_select_quotes_table_and_appends_where() {
+        assert_eq!(
+            compose_diff_select(Some("public"), "orders", None).unwrap(),
+            "SELECT * FROM \"public\".\"orders\""
+        );
+        assert_eq!(
+            compose_diff_select(None, "orders", Some("id > 10")).unwrap(),
+            "SELECT * FROM \"orders\" WHERE id > 10"
+        );
+    }
+
+    /// CURATION §0.1(b)/§0.2 REQUIRED test: a WHERE-box payload that would
+    /// smuggle a second statement is refused BEFORE any connection is
+    /// attempted — proven by calling the pure composer directly, with no
+    /// `ConnectSpec`/`open_spec` anywhere in this test's call path at all
+    /// (the strongest possible proof of "client-side, never reaches the
+    /// driver": there is no driver reachable from this test in the first
+    /// place).
+    #[test]
+    fn compose_diff_select_refuses_multi_statement_injection_client_side() {
+        let err = compose_diff_select(None, "orders", Some("1=1; DROP TABLE orders")).unwrap_err();
+        assert!(err.message.contains("WHERE"));
+    }
+
+    #[test]
+    fn compose_diff_select_allows_a_read_only_subquery_in_where() {
+        assert!(compose_diff_select(None, "t", Some("id IN (SELECT id FROM other)")).is_ok());
+    }
+
+    #[test]
+    fn compose_diff_select_empty_where_is_treated_as_absent() {
+        assert_eq!(compose_diff_select(None, "t", Some("   ")).unwrap(), "SELECT * FROM \"t\"");
+    }
+
+    /// End-to-end proof over a REAL (writable) sqlite connection: the guard
+    /// fires even though the underlying driver would happily run a
+    /// multi-statement batch if asked — the table is untouched afterward.
+    #[tokio::test]
+    async fn fetch_diff_side_end_to_end_refuses_before_touching_the_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        {
+            let handle = tokio::runtime::Handle::current();
+            let mut conn = crate::connect::open(db_path.to_str().unwrap(), &handle).unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new())
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'a')", CancelToken::new()).await.unwrap();
+        }
+        // Exercises `fetch_diff_side_inner` directly (the same body
+        // `QueryRunner::fetch_diff_side` spawns) over the CURRENT test
+        // runtime's handle — constructing a whole `QueryRunner` here would
+        // build (and, at end of scope, drop) its own nested multi-thread
+        // `tokio::runtime::Runtime`, which tokio forbids doing synchronously
+        // from inside an async context (see
+        // `write_transaction_tests::run_write_transaction_refuses_read_only_connection_without_connecting`'s
+        // doc comment for the same rationale).
+        let spec = ConnectSpec::Url(db_path.to_str().unwrap().to_string());
+        let handle = tokio::runtime::Handle::current();
+        let result = fetch_diff_side_inner(
+            spec,
+            None,
+            "t".to_string(),
+            Some("1=1; DELETE FROM t".to_string()),
+            handle,
+        )
+        .await;
+        assert!(result.is_err());
+
+        // Table untouched — the malicious WHERE never reached the driver.
+        let handle = tokio::runtime::Handle::current();
+        let mut verify = crate::connect::open(db_path.to_str().unwrap(), &handle).unwrap();
+        let mut stream = verify.query("SELECT COUNT(*) FROM t", CancelToken::new()).await.unwrap();
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.unwrap()).unwrap();
+        }
+        assert_eq!(buf.cell_text(0, 0), "1", "row count must be unchanged — the WHERE-box injection never executed");
+    }
+
+    /// `fetch_schema_pair` runs both legs concurrently and reports each
+    /// side's outcome independently — a bad spec on one side doesn't cancel
+    /// or fail the other. Driven directly over `open_spec` +
+    /// `Connection::schema()` (the exact two steps `fetch_schema_pair`'s
+    /// spawned body performs per leg) using the CURRENT test runtime's
+    /// handle — same "no nested `QueryRunner`" rationale as
+    /// `fetch_diff_side_end_to_end_refuses_before_touching_the_connection`
+    /// above — over one real sqlite temp file plus an unreachable postgres
+    /// port (fails fast, no docker/network dependency).
+    #[tokio::test]
+    async fn fetch_schema_pair_reports_each_side_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok_path = dir.path().join("ok.db");
+        {
+            let handle = tokio::runtime::Handle::current();
+            let mut conn = crate::connect::open(ok_path.to_str().unwrap(), &handle).unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", CancelToken::new()).await.unwrap();
+        }
+        let spec_ok = ConnectSpec::Url(ok_path.to_str().unwrap().to_string());
+        // Postgres URL to an unreachable port — fails fast without a real
+        // server, giving the "other leg failed" case with no docker
+        // dependency.
+        let spec_bad = ConnectSpec::Url("postgres://user:pass@127.0.0.1:1/nosuchdb".to_string());
+
+        let handle_a = tokio::runtime::Handle::current();
+        let handle_b = tokio::runtime::Handle::current();
+        let fetch_a = async {
+            match open_spec(spec_ok, handle_a).await {
+                Ok(mut opened) => opened.conn.schema().await,
+                Err(e) => Err(e),
+            }
+        };
+        let fetch_b = async {
+            match open_spec(spec_bad, handle_b).await {
+                Ok(mut opened) => opened.conn.schema().await,
+                Err(e) => Err(e),
+            }
+        };
+        let (result_a, result_b) = tokio::join!(fetch_a, fetch_b);
+        assert!(result_a.is_ok(), "the good side must succeed independently of the bad side: {result_a:?}");
+        assert!(result_b.is_err(), "the bad side must fail without being masked by the good side");
     }
 }

@@ -8,6 +8,7 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "907ed09c9f4476caf
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "907ed09c9f4476caf250e6ce4bbffb23b4622f3b" }
 dbc-core = { path = "../dbc-core" }
 dbc-buffer = { path = "../dbc-buffer" }
+dbc-diff = { path = "../dbc-diff" }
 dbc-state = { path = "../dbc-state" }
 dbc-driver-sqlite = { path = "../dbc-driver-sqlite" }
 dbc-driver-postgres = { path = "../dbc-driver-postgres" }
