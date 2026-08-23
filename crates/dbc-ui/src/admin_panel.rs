@@ -563,8 +563,161 @@ fn is_privileges_batch(rows: &[(&'static str, AdminCatalogRows)]) -> bool {
 }
 
 // ---------------------------------------------------------------------
-// 5. GPUI entity.
+// 5. Databases & schemas sizes (T6) — read-only lists + direct-to-confirm
+//    schema DDL.
 // ---------------------------------------------------------------------
+
+/// `AdminPanel::apply_catalog`'s routing predicate for T6, same shape as
+/// `is_privileges_batch` — `true` when `rows` carries any of
+/// `admin_sql::sizes_catalog`'s labels (identical label set on both
+/// engines: `current_db_size`/`databases`/`schema_sizes`).
+fn is_sizes_batch(rows: &[(&'static str, AdminCatalogRows)]) -> bool {
+    rows.iter().any(|(l, _)| matches!(*l, "current_db_size" | "databases" | "schema_sizes"))
+}
+
+/// "1.2 GB" / "340.5 MB" / "512 B" — binary units, one decimal above B (no
+/// decimal at all under 1 KB, matching `0 B`/`512 B`'s exact test shape).
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else if bytes < GB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    }
+}
+
+/// Bar width fraction in `[0, 1]`; `0` when `max` is `0` (an all-empty list
+/// — nothing to compare against, not a divide-by-zero crash). Clamped
+/// defensively in case a size query races a concurrent DDL and `bytes`
+/// ends up briefly larger than the `max` computed a moment earlier.
+pub fn bar_fraction(bytes: u64, max: u64) -> f32 {
+    if max == 0 {
+        return 0.0;
+    }
+    (bytes as f64 / max as f64).clamp(0.0, 1.0) as f32
+}
+
+/// pg `"databases"` rows (`datname`, `bytes`) → `(name, Some(bytes))`.
+/// MSSQL `"databases"` rows (`name`, `database_id`, `create_date`,
+/// `state_desc`) carry NO per-db size at all (`sys.databases` has none) →
+/// `(name, None)` — the render shows "—", no bar.
+pub fn parse_db_sizes(engine: Engine, rows: &AdminCatalogRows) -> Vec<(String, Option<u64>)> {
+    let (cols, data) = rows;
+    match engine {
+        Engine::Postgres => {
+            let name_ix = cols.iter().position(|c| c == "datname").unwrap_or(0);
+            let bytes_ix = cols.iter().position(|c| c == "bytes");
+            data.iter()
+                .map(|row| {
+                    let name = row.get(name_ix).cloned().flatten().unwrap_or_default();
+                    let bytes = bytes_ix
+                        .and_then(|ix| row.get(ix))
+                        .cloned()
+                        .flatten()
+                        .and_then(|s| s.parse::<u64>().ok());
+                    (name, bytes)
+                })
+                .collect()
+        }
+        Engine::Mssql | Engine::Sqlite => {
+            let name_ix = cols.iter().position(|c| c == "name").unwrap_or(0);
+            data.iter()
+                .map(|row| (row.get(name_ix).cloned().flatten().unwrap_or_default(), None))
+                .collect()
+        }
+    }
+}
+
+/// pg `"schema_sizes"` rows (`schema`, `bytes`) — a NULL `SUM` (a schema
+/// with no tables at all) reads as `0`, not a parse error/crash. MSSQL
+/// (`schema_name`, `reserved_kb`, `used_kb`) — `reserved_kb` converted to
+/// bytes (`* 1024`).
+pub fn parse_schema_sizes(engine: Engine, rows: &AdminCatalogRows) -> Vec<(String, u64)> {
+    let (cols, data) = rows;
+    match engine {
+        Engine::Postgres => {
+            let schema_ix = cols.iter().position(|c| c == "schema").unwrap_or(0);
+            let bytes_ix = cols.iter().position(|c| c == "bytes");
+            data.iter()
+                .map(|row| {
+                    let schema = row.get(schema_ix).cloned().flatten().unwrap_or_default();
+                    let bytes = bytes_ix
+                        .and_then(|ix| row.get(ix))
+                        .cloned()
+                        .flatten()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    (schema, bytes)
+                })
+                .collect()
+        }
+        Engine::Mssql | Engine::Sqlite => {
+            let schema_ix = cols.iter().position(|c| c == "schema_name").unwrap_or(0);
+            let kb_ix = cols.iter().position(|c| c == "reserved_kb");
+            data.iter()
+                .map(|row| {
+                    let schema = row.get(schema_ix).cloned().flatten().unwrap_or_default();
+                    let kb = kb_ix
+                        .and_then(|ix| row.get(ix))
+                        .cloned()
+                        .flatten()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    (schema, kb * 1024)
+                })
+                .collect()
+        }
+    }
+}
+
+/// The Grounding's headline line's value half (`"Aktuální databáze: {…}"`
+/// — the prefix is added by the render, not here). Postgres's
+/// `current_db_size` query already ships a human-formatted `pretty` column
+/// (`pg_size_pretty`) — used verbatim, not re-derived through
+/// `format_bytes` (so it stays byte-for-byte what a DBA would expect from
+/// `pg_size_pretty`). MSSQL has no such column (`sys.database_files`'s
+/// `data_mb`/`log_mb` are raw numbers) — summed and run through
+/// `format_bytes` instead. `None` when the row/columns aren't there yet
+/// (loading) or can't be parsed.
+pub fn current_db_size_label(engine: Engine, rows: &AdminCatalogRows) -> Option<String> {
+    let (cols, data) = rows;
+    let row = data.first()?;
+    match engine {
+        Engine::Postgres => {
+            let ix = cols.iter().position(|c| c == "pretty")?;
+            row.get(ix).cloned().flatten()
+        }
+        Engine::Mssql => {
+            let data_ix = cols.iter().position(|c| c == "data_mb")?;
+            let log_ix = cols.iter().position(|c| c == "log_mb")?;
+            let data_mb: f64 = row.get(data_ix).cloned().flatten()?.parse().ok()?;
+            let log_mb: f64 = row.get(log_ix).cloned().flatten()?.parse().ok()?;
+            let bytes = ((data_mb + log_mb) * 1024.0 * 1024.0).round() as u64;
+            Some(format_bytes(bytes))
+        }
+        Engine::Sqlite => None,
+    }
+}
+
+// ---------------------------------------------------------------------
+// 6. GPUI entity.
+// ---------------------------------------------------------------------
+
+/// T6: a fixed-width "track" with a proportionally-filled "bar" — shared by
+/// `render_databases_body`'s two size lists (databases; schemas). Plain
+/// `div`s, not a dedicated bar-chart primitive; `fraction` is already
+/// clamped to `[0, 1]` by `bar_fraction`.
+fn render_size_bar(fraction: f32) -> impl IntoElement {
+    div().w(px(160.)).h(px(10.)).bg(rgb(0x313244)).rounded_sm().child(
+        div().w(px(160. * fraction)).h(px(10.)).bg(rgb(0x89b4fa)).rounded_sm(),
+    )
+}
 
 /// Which boolean flag on `AdminModal::NewRole` a checkbox click toggles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -615,7 +768,18 @@ enum AdminModal {
         role: String,
         password: Entity<connections_ui::TextField>,
     },
-    // T6 adds NewSchema/DropSchema here.
+    /// T6: direct-to-confirm (design §2/"Resolved design ambiguities" item
+    /// 6 — unlike Roles' `staged_role_actions`, schema mutations are never
+    /// locally staged; this modal's confirm emits `AdminEvent::RequestApply`
+    /// straight away, one statement, "one transaction per user-visible
+    /// action").
+    NewSchema { name: Entity<connections_ui::TextField> },
+    /// `cascade` defaults unchecked; the confirm modal's own checkbox
+    /// toggles it. Confirm builds `admin_sql::drop_schema(engine, &schema,
+    /// cascade)` and — only when `cascade` is set — a red warning line
+    /// (design §2) that T4's Apply dialog already renders via
+    /// `ApplyDialogState.warning`.
+    DropSchema { schema: String, cascade: bool },
 }
 
 /// Panel → main.rs (main owns the runner and the confirm dialog — §3-novela:
@@ -677,6 +841,22 @@ pub struct AdminPanel {
     current_database: Option<String>,
     matrix: MatrixState,
 
+    /// T6: `sizes_catalog`'s `"databases"` label, parsed via
+    /// `parse_db_sizes`.
+    db_sizes: Vec<(String, Option<u64>)>,
+    /// T6: `sizes_catalog`'s `"schema_sizes"` label, parsed via
+    /// `parse_schema_sizes` — schemas of the CURRENT database only.
+    schema_sizes: Vec<(String, u64)>,
+    /// T6: `sizes_catalog`'s `"current_db_size"` label, parsed via
+    /// `current_db_size_label` — the headline's value half.
+    current_db_size_label: Option<String>,
+    /// T6: which `schema_sizes` row is selected as "Smazat schéma"'s
+    /// target — separate from T5's `selected_schema` (the Privileges
+    /// sub-view's SCOPE selector, a different concept entirely, and the
+    /// two sub-views' selections must survive independently across a
+    /// sub-view round-trip).
+    selected_size_schema: Option<String>,
+
     modal: Option<AdminModal>,
     /// A sub-view switch OR a schema/grantee re-selection requested while
     /// the CURRENT sub-view is dirty — renders the "Zahodit neuložené
@@ -706,6 +886,10 @@ impl AdminPanel {
             selected_grantee: None,
             current_database: None,
             matrix: MatrixState::default(),
+            db_sizes: Vec::new(),
+            schema_sizes: Vec::new(),
+            current_db_size_label: None,
+            selected_size_schema: None,
             modal: None,
             discard_confirm: None,
             focus_handle: cx.focus_handle(),
@@ -770,6 +954,22 @@ impl AdminPanel {
             return;
         }
 
+        // T6: a sizes-catalog batch is per-label like Roles' own routing
+        // (unlike Privileges' whole-batch routing above) — each label maps
+        // to its OWN independent field, no cross-label combination needed.
+        if is_sizes_batch(&rows) {
+            for (label, data) in &rows {
+                match *label {
+                    "current_db_size" => self.current_db_size_label = current_db_size_label(self.engine, data),
+                    "databases" => self.db_sizes = parse_db_sizes(self.engine, data),
+                    "schema_sizes" => self.schema_sizes = parse_schema_sizes(self.engine, data),
+                    _ => {}
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         for (label, data) in rows {
             match label {
                 "roles" | "server_principals" => self.roles = parse_roles(&data),
@@ -809,8 +1009,7 @@ impl AdminPanel {
                 let schema = self.selected_schema.as_deref()?;
                 Some(admin_sql::privileges_catalog(self.engine, schema))
             }
-            // T6 wires this to sizes_catalog.
-            AdminSubView::Databases => None,
+            AdminSubView::Databases => Some(admin_sql::sizes_catalog(self.engine)),
         }
     }
 
@@ -865,6 +1064,14 @@ impl AdminPanel {
         // across an unrelated sub-view round-trip would risk showing data
         // that's since drifted.
         self.matrix = MatrixState::default();
+        // T6: same "drop stale display data on a sub-view round-trip"
+        // posture — no staged diff here (schema DDL is direct-to-confirm,
+        // never locally staged), just display fields that a fresh fetch
+        // repopulates.
+        self.db_sizes.clear();
+        self.schema_sizes.clear();
+        self.current_db_size_label = None;
+        self.selected_size_schema = None;
         self.loading = true;
         cx.notify();
         if let Some(queries) = self.fetch_queries_for(target) {
@@ -1044,6 +1251,85 @@ impl AdminPanel {
     fn stage_drop_role(&mut self, cx: &mut Context<Self>) {
         let Some(name) = self.selected_role.take() else { return };
         self.staged_role_actions.extend(admin_sql::drop_role(self.engine, &name));
+        cx.notify();
+    }
+
+    /// T6: "Smazat schéma"'s row-click target selector.
+    fn select_size_schema(&mut self, name: String, cx: &mut Context<Self>) {
+        self.selected_size_schema = Some(name);
+        cx.notify();
+    }
+
+    /// T6: "Nové schéma…" — opens the name-entry modal.
+    fn open_new_schema_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        let name = cx.new(|cx| connections_ui::TextField::new(cx, "název schématu", false));
+        let focus = name.focus_handle(cx);
+        self.modal = Some(AdminModal::NewSchema { name });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// T6: "Smazat schéma" — opens the CASCADE-checkbox confirm modal for
+    /// `self.selected_size_schema`. No `TextField` here, so no focus
+    /// hand-off (same posture as `stage_drop_role`'s modal-less action).
+    fn open_drop_schema_modal(&mut self, cx: &mut Context<Self>) {
+        let Some(schema) = self.selected_size_schema.clone() else { return };
+        if self.modal.is_some() {
+            return;
+        }
+        self.modal = Some(AdminModal::DropSchema { schema, cascade: false });
+        cx.notify();
+    }
+
+    fn toggle_drop_schema_cascade(&mut self, cx: &mut Context<Self>) {
+        if let Some(AdminModal::DropSchema { cascade, .. }) = &mut self.modal {
+            *cascade = !*cascade;
+            cx.notify();
+        }
+    }
+
+    /// T6: direct-to-confirm (design §2, "Resolved design ambiguities"
+    /// item 6) — unlike the Roles modals, this does NOT stage into
+    /// `staged_role_actions`; it emits `RequestApply` immediately, exactly
+    /// one `CREATE SCHEMA` statement, matching "one transaction per
+    /// user-visible action".
+    fn confirm_new_schema(&mut self, cx: &mut Context<Self>) {
+        let Some(AdminModal::NewSchema { name }) = &self.modal else { return };
+        let schema_name = name.read(cx).text();
+        if schema_name.trim().is_empty() {
+            return;
+        }
+        let statements = admin_sql::create_schema(self.engine, schema_name.trim());
+        self.modal = None;
+        if statements.is_empty() {
+            cx.notify();
+            return;
+        }
+        cx.emit(AdminEvent::RequestApply { statements, warning: None });
+        cx.notify();
+    }
+
+    /// T6: direct-to-confirm, same shape as `confirm_new_schema` — the
+    /// CASCADE checkbox becomes both `drop_schema`'s `cascade` argument AND
+    /// (when checked) the dialog's red warning line (design §2: "unchecked
+    /// plain DROP SCHEMA failing on a non-empty schema surfaces the
+    /// engine's own error in the dialog — let the server say no").
+    fn confirm_drop_schema(&mut self, cx: &mut Context<Self>) {
+        let Some(AdminModal::DropSchema { schema, cascade }) = &self.modal else { return };
+        let schema = schema.clone();
+        let cascade = *cascade;
+        let statements = admin_sql::drop_schema(self.engine, &schema, cascade);
+        self.modal = None;
+        self.selected_size_schema = None;
+        if statements.is_empty() {
+            cx.notify();
+            return;
+        }
+        let warning = cascade.then(|| "tato akce je nevratná a smaže i obsah schématu".to_string());
+        cx.emit(AdminEvent::RequestApply { statements, warning });
         cx.notify();
     }
 
@@ -1460,6 +1746,112 @@ impl AdminPanel {
         root.into_any_element()
     }
 
+    /// T6: "Databáze a schémata" — a headline size line, then TWO
+    /// read-only bar lists (databases; the current database's schemas),
+    /// then the direct-to-confirm "Nové schéma…"/"Smazat schéma" buttons.
+    /// Both lists are plain loops, NOT `uniform_list`: unlike the
+    /// Privileges object grid (which can hold hundreds of tables), a
+    /// server's database count and a database's schema count are both
+    /// small in practice — same bounded-but-unvirtualized posture
+    /// `render_roles_body`'s role list and `render_privileges_body`'s
+    /// schema/grantee chip rows already take. `CREATE DATABASE`/
+    /// `DROP DATABASE` have deliberately NO UI anywhere in this function
+    /// (design §3's transaction-block landmine — not silently
+    /// reintroduced).
+    fn render_databases_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let headline = match &self.current_db_size_label {
+            Some(label) => format!("Aktuální databáze: {label}"),
+            None => "Aktuální databáze: …".to_string(),
+        };
+
+        let db_sizes = self.db_sizes.clone();
+        let max_db_bytes = db_sizes.iter().filter_map(|(_, b)| *b).max().unwrap_or(0);
+        let mut db_list = div().flex().flex_col().gap_1().px_2().py_1();
+        for (ix, (name, bytes)) in db_sizes.iter().enumerate() {
+            let mut row = div().id(("admin-db-size-row", ix)).flex().flex_row().items_center().gap_2();
+            row = row.child(div().w(px(180.)).overflow_hidden().text_color(rgb(0xcdd6f4)).child(name.clone()));
+            row = match bytes {
+                Some(b) => row
+                    .child(render_size_bar(bar_fraction(*b, max_db_bytes)))
+                    .child(div().text_color(rgb(0xa6adc8)).child(format_bytes(*b))),
+                None => row.child(div().text_color(rgb(0x6c7086)).child("—")),
+            };
+            db_list = db_list.child(row);
+        }
+
+        let schema_sizes = self.schema_sizes.clone();
+        let selected_size_schema = self.selected_size_schema.clone();
+        let max_schema_bytes = schema_sizes.iter().map(|(_, b)| *b).max().unwrap_or(0);
+        let mut schema_list = div().flex().flex_col().gap_1().px_2().py_1();
+        for (ix, (name, bytes)) in schema_sizes.iter().enumerate() {
+            let is_sel = selected_size_schema.as_deref() == Some(name.as_str());
+            let name_for_click = name.clone();
+            let mut row = div()
+                .id(("admin-schema-size-row", ix))
+                .cursor_pointer()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .when(is_sel, |d| d.bg(rgb(0x45475a)))
+                .hover(|s| s.bg(rgb(0x313244)))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    this.select_size_schema(name_for_click.clone(), cx);
+                }));
+            row = row.child(div().w(px(180.)).overflow_hidden().text_color(rgb(0xcdd6f4)).child(name.clone()));
+            row = row
+                .child(render_size_bar(bar_fraction(*bytes, max_schema_bytes)))
+                .child(div().text_color(rgb(0xa6adc8)).child(format_bytes(*bytes)));
+            schema_list = schema_list.child(row);
+        }
+
+        let drop_enabled = selected_size_schema.is_some();
+        let buttons = div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .p_2()
+            .child(
+                div()
+                    .id("admin-new-schema")
+                    .cursor_pointer()
+                    .bg(rgb(0x313244))
+                    .px_2()
+                    .rounded_md()
+                    .text_color(rgb(0xcdd6f4))
+                    .child("Nové schéma…")
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.open_new_schema_modal(window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id("admin-drop-schema")
+                    .when(drop_enabled, |d| d.cursor_pointer())
+                    .bg(rgb(0x313244))
+                    .px_2()
+                    .rounded_md()
+                    .text_color(if drop_enabled { rgb(0xf38ba8) } else { rgb(0x6c7086) })
+                    .child("Smazat schéma")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.open_drop_schema_modal(cx);
+                    })),
+            );
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_hidden()
+            .child(div().px_2().py_1().text_color(rgb(0xcdd6f4)).child(headline))
+            .child(buttons)
+            .child(div().px_2().text_color(rgb(0xa6adc8)).child("Databáze"))
+            .child(db_list)
+            .child(div().px_2().text_color(rgb(0xa6adc8)).child("Schémata"))
+            .child(schema_list)
+            .into_any_element()
+    }
+
     /// `ix` is this row's position within its OWN list (`member_list` or
     /// `srv_list` in `render_roles_body`) — combined with a per-list
     /// literal prefix, that's the same collision-safe `(&'static str,
@@ -1663,6 +2055,115 @@ impl AdminPanel {
                                 })),
                         ),
                 ),
+            AdminModal::NewSchema { name } => div()
+                .id("admin-modal-new-schema")
+                .w(px(360.))
+                .bg(rgb(0x1e1e2e))
+                .border_1()
+                .border_color(rgb(0x45475a))
+                .rounded_md()
+                .flex()
+                .flex_col()
+                .p_2()
+                .gap_2()
+                .text_color(rgb(0xcdd6f4))
+                .child("Nové schéma")
+                .child(name.clone())
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("admin-modal-confirm")
+                                .cursor_pointer()
+                                .bg(rgb(0x313244))
+                                .px_2()
+                                .rounded_md()
+                                .text_color(rgb(0xa6e3a1))
+                                .child("Vytvořit")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.confirm_new_schema(cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("admin-modal-cancel")
+                                .cursor_pointer()
+                                .bg(rgb(0x313244))
+                                .px_2()
+                                .rounded_md()
+                                .text_color(rgb(0xcdd6f4))
+                                .child("Zrušit")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.close_modal(cx);
+                                })),
+                        ),
+                ),
+            AdminModal::DropSchema { schema, cascade } => {
+                let mark = if *cascade { "☑" } else { "☐" };
+                div()
+                    .id("admin-modal-drop-schema")
+                    .w(px(420.))
+                    .bg(rgb(0x1e1e2e))
+                    .border_1()
+                    .border_color(rgb(0x45475a))
+                    .rounded_md()
+                    .flex()
+                    .flex_col()
+                    .p_2()
+                    .gap_2()
+                    .text_color(rgb(0xcdd6f4))
+                    .child(format!("Smazat schéma — {schema}"))
+                    .child(
+                        div()
+                            .id("admin-drop-schema-cascade")
+                            .cursor_pointer()
+                            .flex()
+                            .flex_row()
+                            .gap_1()
+                            .text_color(rgb(0xf9e2af))
+                            .child(format!("{mark} včetně CASCADE (smaže i obsah schématu)"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.toggle_drop_schema_cascade(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("admin-modal-confirm")
+                                    .cursor_pointer()
+                                    .bg(rgb(0x313244))
+                                    .px_2()
+                                    .rounded_md()
+                                    .text_color(rgb(0xf38ba8))
+                                    .child("Smazat")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                        this.confirm_drop_schema(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("admin-modal-cancel")
+                                    .cursor_pointer()
+                                    .bg(rgb(0x313244))
+                                    .px_2()
+                                    .rounded_md()
+                                    .text_color(rgb(0xcdd6f4))
+                                    .child("Zrušit")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                        this.close_modal(cx);
+                                    })),
+                            ),
+                    )
+            }
         };
 
         Some(
@@ -1780,12 +2281,7 @@ impl Render for AdminPanel {
         let body: AnyElement = match self.sub_view {
             AdminSubView::Roles => self.render_roles_body(cx),
             AdminSubView::Privileges => self.render_privileges_body(cx),
-            AdminSubView::Databases => div()
-                .flex_1()
-                .p_2()
-                .text_color(rgb(0x6c7086))
-                .child("Bude doplněno.")
-                .into_any_element(),
+            AdminSubView::Databases => self.render_databases_body(cx),
         };
         root = root.child(body);
 
@@ -2114,5 +2610,106 @@ mod matrix_tests {
             .map(|(l, _)| (l, (Vec::new(), Vec::new())))
             .collect::<Vec<_>>();
         assert!(!is_privileges_batch(&roles));
+    }
+}
+
+#[cfg(test)]
+mod sizes_tests {
+    use super::*;
+    use dbc_state::Engine;
+
+    #[test]
+    fn format_bytes_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2048), "2.0 KB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn bar_fraction_clamps_and_handles_zero_max() {
+        assert_eq!(bar_fraction(0, 0), 0.0);
+        assert_eq!(bar_fraction(50, 100), 0.5);
+        assert_eq!(bar_fraction(100, 100), 1.0);
+    }
+
+    fn rows(cols: &[&str], data: &[&[Option<&str>]]) -> AdminCatalogRows {
+        (
+            cols.iter().map(|c| c.to_string()).collect(),
+            data.iter().map(|r| r.iter().map(|c| c.map(|s| s.to_string())).collect()).collect(),
+        )
+    }
+
+    #[test]
+    fn parse_db_sizes_pg_has_bytes_mssql_has_none() {
+        let pg = rows(&["datname", "bytes"], &[&[Some("appdb"), Some("1048576")]]);
+        assert_eq!(parse_db_sizes(Engine::Postgres, &pg), vec![("appdb".to_string(), Some(1_048_576))]);
+        let ms = rows(
+            &["name", "database_id", "create_date", "state_desc"],
+            &[&[Some("appdb"), Some("5"), Some("2026-01-01"), Some("ONLINE")]],
+        );
+        assert_eq!(parse_db_sizes(Engine::Mssql, &ms), vec![("appdb".to_string(), None)]);
+    }
+
+    #[test]
+    fn parse_schema_sizes_pg_bytes_mssql_kb() {
+        let pg = rows(&["schema", "bytes"], &[&[Some("public"), Some("2048")], &[Some("empty"), None]]);
+        // NULL SUM (schema with no tables) → 0, not a crash.
+        assert_eq!(
+            parse_schema_sizes(Engine::Postgres, &pg),
+            vec![("public".to_string(), 2048), ("empty".to_string(), 0)]
+        );
+        let ms = rows(&["schema_name", "reserved_kb", "used_kb"], &[&[Some("dbo"), Some("16"), Some("8")]]);
+        assert_eq!(parse_schema_sizes(Engine::Mssql, &ms), vec![("dbo".to_string(), 16 * 1024)]);
+    }
+
+    // Not in the plan's own test list, but exercises the headline value
+    // half the Grounding calls for: pg uses pg_size_pretty's column
+    // verbatim; MSSQL has no such column and must be derived via
+    // format_bytes from data_mb+log_mb.
+    #[test]
+    fn current_db_size_label_pg_uses_pretty_column_mssql_derives_from_mb() {
+        let pg = rows(&["bytes", "pretty"], &[&[Some("1048576"), Some("1024 kB")]]);
+        assert_eq!(current_db_size_label(Engine::Postgres, &pg), Some("1024 kB".to_string()));
+
+        let ms = rows(
+            &["database_name", "data_mb", "log_mb"],
+            &[&[Some("appdb"), Some("8.00"), Some("2.00")]],
+        );
+        // (8 + 2) MB = 10 MB, formatted through format_bytes.
+        assert_eq!(current_db_size_label(Engine::Mssql, &ms), Some(format_bytes(10 * 1024 * 1024)));
+
+        // No rows at all (still loading) -> None, not a panic.
+        let empty = rows(&["bytes", "pretty"], &[]);
+        assert_eq!(current_db_size_label(Engine::Postgres, &empty), None);
+    }
+
+    // `AdminPanel::apply_catalog`'s T6 routing predicate, proven against
+    // the ACTUAL labels `admin_sql::sizes_catalog` emits for both engines
+    // — same discipline as T5's `is_privileges_batch` test.
+    #[test]
+    fn is_sizes_batch_detects_both_engines_and_never_privileges_or_roles_labels() {
+        let pg = admin_sql::sizes_catalog(Engine::Postgres)
+            .into_iter()
+            .map(|(l, _)| (l, (Vec::new(), Vec::new())))
+            .collect::<Vec<_>>();
+        assert!(is_sizes_batch(&pg));
+        let mssql = admin_sql::sizes_catalog(Engine::Mssql)
+            .into_iter()
+            .map(|(l, _)| (l, (Vec::new(), Vec::new())))
+            .collect::<Vec<_>>();
+        assert!(is_sizes_batch(&mssql));
+
+        let privileges = admin_sql::privileges_catalog(Engine::Postgres, "public")
+            .into_iter()
+            .map(|(l, _)| (l, (Vec::new(), Vec::new())))
+            .collect::<Vec<_>>();
+        assert!(!is_sizes_batch(&privileges));
+        let roles = admin_sql::roles_catalog(Engine::Postgres)
+            .into_iter()
+            .map(|(l, _)| (l, (Vec::new(), Vec::new())))
+            .collect::<Vec<_>>();
+        assert!(!is_sizes_batch(&roles));
     }
 }

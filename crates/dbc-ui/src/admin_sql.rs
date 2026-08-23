@@ -157,9 +157,19 @@ pub fn sizes_catalog(engine: Engine) -> Vec<(&'static str, String)> {
                  pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(current_database())) AS pretty".to_string()),
             ("databases", "SELECT datname, pg_catalog.pg_database_size(datname) AS bytes \
                  FROM pg_catalog.pg_database WHERE datistemplate = false ORDER BY datname".to_string()),
+            // G10 T6 live-docker fix: LEFT JOIN from pg_namespace (not an
+            // INNER JOIN from pg_class) so a schema with zero tables/matviews
+            // still gets a row (NULL SUM, parsed as 0 bytes by
+            // admin_panel::parse_schema_sizes) instead of vanishing from the
+            // list entirely — caught by a live PG run: a freshly
+            // CREATE SCHEMA'd empty schema never appeared in a refetch under
+            // the prior INNER JOIN shape, even though this file's OWN test
+            // fixture (parse_schema_sizes_pg_bytes_mssql_kb's "empty" row)
+            // already anticipated a NULL-bytes row for exactly this case.
             ("schema_sizes", "SELECT n.nspname AS schema, SUM(pg_catalog.pg_total_relation_size(c.oid)) AS bytes \
-                 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE c.relkind IN ('r','m') GROUP BY n.nspname ORDER BY n.nspname".to_string()),
+                 FROM pg_catalog.pg_namespace n \
+                 LEFT JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relkind IN ('r','m') \
+                 GROUP BY n.nspname ORDER BY n.nspname".to_string()),
         ],
         Engine::Mssql => vec![
             ("current_db_size", "SELECT DB_NAME() AS database_name, \

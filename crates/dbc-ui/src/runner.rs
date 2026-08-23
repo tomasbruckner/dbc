@@ -4591,4 +4591,146 @@ mod admin_pg_tests {
             );
         });
     }
+
+    /// G10 T6: `admin_sql::sizes_catalog`/`create_schema`/`drop_schema` had
+    /// never run against live PostgreSQL before this task (T3's docker
+    /// tests only ever exercised `privileges_catalog` and the role write
+    /// path) — closes that gap. Fetches `sizes_catalog`, parses it through
+    /// the SAME `admin_panel` pure functions the Databases sub-view uses
+    /// (`current_db_size_label`/`parse_db_sizes`/`parse_schema_sizes`) and
+    /// asserts sane results; then exercises the full schema-DDL path live:
+    /// `create_schema` -> appears in a refetch's `schema_sizes`; a plain
+    /// `DROP SCHEMA` on that now-non-empty schema fails (design §2/§6 "let
+    /// the server say no" — the engine's own error, not app-level
+    /// pre-flight checking); `drop_schema(..., cascade: true)` succeeds and
+    /// the schema disappears from a final refetch.
+    #[test]
+    #[ignore]
+    fn admin_pg_sizes_catalog_and_schema_ddl_round_trip_on_live_postgres() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let node = Postgres::default().with_tag("16.13").start().await.unwrap();
+            let url = pg_url(&node).await;
+            let engine = dbc_state::Engine::Postgres;
+            let schema = "g10_sizes_test_schema";
+
+            {
+                let mut setup = open_pg(&url).await;
+                setup
+                    .execute("CREATE TABLE sizes_t (id integer PRIMARY KEY, v text)", CancelToken::new())
+                    .await
+                    .unwrap();
+                setup
+                    .execute("INSERT INTO sizes_t SELECT g, 'x' FROM generate_series(1, 100) g", CancelToken::new())
+                    .await
+                    .unwrap();
+            }
+
+            let fetch_sizes = |url: String| async move {
+                fetch_admin_catalog_inner(
+                    ConnectSpec::Url(url),
+                    admin_sql::sizes_catalog(engine),
+                    tokio::runtime::Handle::current(),
+                )
+                .await
+                .expect("sizes_catalog must run cleanly against live PG")
+            };
+
+            // --- sanity: sizes_catalog's three labels parse to sane values.
+            let rows = fetch_sizes(url.clone()).await;
+            let headline = rows
+                .iter()
+                .find(|(l, _)| *l == "current_db_size")
+                .and_then(|(_, data)| crate::admin_panel::current_db_size_label(engine, data));
+            assert!(headline.is_some(), "current_db_size must parse to a non-empty label: {rows:?}");
+
+            let databases = rows
+                .iter()
+                .find(|(l, _)| *l == "databases")
+                .map(|(_, data)| crate::admin_panel::parse_db_sizes(engine, data))
+                .unwrap();
+            assert!(
+                databases.iter().any(|(name, bytes)| name == "postgres" && bytes.unwrap_or(0) > 0),
+                "the postgres database itself must appear with a nonzero size: {databases:?}"
+            );
+
+            let schema_sizes_before = rows
+                .iter()
+                .find(|(l, _)| *l == "schema_sizes")
+                .map(|(_, data)| crate::admin_panel::parse_schema_sizes(engine, data))
+                .unwrap();
+            assert!(
+                schema_sizes_before.iter().any(|(s, bytes)| s == "public" && *bytes > 0),
+                "public must show a nonzero size after seeding sizes_t: {schema_sizes_before:?}"
+            );
+            assert!(!schema_sizes_before.iter().any(|(s, _)| s == schema), "test schema must not exist yet");
+
+            // --- create_schema, live.
+            let create_stmts = admin_sql::create_schema(engine, schema);
+            run_write_transaction_inner(
+                ConnectSpec::Url(url.clone()),
+                create_stmts,
+                None,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("CREATE SCHEMA must commit against live PG");
+
+            let after_create = fetch_sizes(url.clone()).await;
+            let schema_sizes_after_create = after_create
+                .iter()
+                .find(|(l, _)| *l == "schema_sizes")
+                .map(|(_, data)| crate::admin_panel::parse_schema_sizes(engine, data))
+                .unwrap();
+            assert!(
+                schema_sizes_after_create.iter().any(|(s, _)| s == schema),
+                "the new schema must appear in a refetch: {schema_sizes_after_create:?}"
+            );
+
+            // Populate the new schema so it's non-empty for the next step.
+            {
+                let mut conn = open_pg(&url).await;
+                conn.execute(&format!("CREATE TABLE {schema}.t (id integer)"), CancelToken::new())
+                    .await
+                    .unwrap();
+            }
+
+            // --- plain DROP SCHEMA on a non-empty schema must fail — the
+            // engine's own error, "let the server say no" (design §2/§6).
+            let drop_no_cascade = admin_sql::drop_schema(engine, schema, false);
+            let err = run_write_transaction_inner(
+                ConnectSpec::Url(url.clone()),
+                drop_no_cascade,
+                None,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect_err("DROP SCHEMA without CASCADE must fail on a non-empty schema");
+            assert!(!err.message.is_empty());
+
+            // --- DROP SCHEMA ... CASCADE succeeds and removes it.
+            let drop_cascade = admin_sql::drop_schema(engine, schema, true);
+            assert!(drop_cascade[0].exec_sql.ends_with(" CASCADE"));
+            run_write_transaction_inner(
+                ConnectSpec::Url(url.clone()),
+                drop_cascade,
+                None,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("DROP SCHEMA ... CASCADE must commit against live PG");
+
+            let after_drop = fetch_sizes(url).await;
+            let schema_sizes_after_drop = after_drop
+                .iter()
+                .find(|(l, _)| *l == "schema_sizes")
+                .map(|(_, data)| crate::admin_panel::parse_schema_sizes(engine, data))
+                .unwrap();
+            assert!(
+                !schema_sizes_after_drop.iter().any(|(s, _)| s == schema),
+                "the schema must be gone after CASCADE drop: {schema_sizes_after_drop:?}"
+            );
+        });
+    }
 }
