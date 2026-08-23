@@ -103,7 +103,19 @@ impl ColBuilder {
 /// tag (currently always `1`) before the same UTF-8 JSON text (Postgres
 /// source: `jsonb_send`/`jsonb_recv`, `src/backend/utils/adt/jsonb.c`).
 fn decode_json_bytes(ty: &Type, raw: &[u8]) -> Result<String, Box<dyn StdError + Sync + Send>> {
-    let text_bytes = if *ty == Type::JSONB { raw.get(1..).unwrap_or(&[]) } else { raw };
+    let text_bytes = if *ty == Type::JSONB {
+        // Fail closed on anything but version 1 (the only version Postgres
+        // has ever shipped) — a future format bump must surface as an error,
+        // not silently decode garbage. Mirrors postgres-types' reference
+        // impl, which read_exact's the tag and rejects `!= 1`.
+        match raw.split_first() {
+            Some((1, rest)) => rest,
+            Some((v, _)) => return Err(format!("nepodporovaná verze jsonb formátu: {v}").into()),
+            None => return Err("prázdná jsonb hodnota bez verzového bajtu".into()),
+        }
+    } else {
+        raw
+    };
     Ok(std::str::from_utf8(text_bytes)?.to_string())
 }
 
@@ -207,5 +219,17 @@ mod json_decode_tests {
     fn invalid_utf8_is_err_not_panic() {
         let raw = vec![0xff, 0xfe];
         assert!(decode_json_bytes(&Type::JSON, &raw).is_err());
+    }
+
+    #[test]
+    fn jsonb_unknown_version_byte_is_err_not_silent_decode() {
+        let mut raw = vec![2u8]; // hypothetical future format version
+        raw.extend_from_slice(br#"{"a":1}"#);
+        assert!(decode_json_bytes(&Type::JSONB, &raw).is_err());
+    }
+
+    #[test]
+    fn jsonb_zero_bytes_is_err_not_empty_string() {
+        assert!(decode_json_bytes(&Type::JSONB, &[]).is_err());
     }
 }
