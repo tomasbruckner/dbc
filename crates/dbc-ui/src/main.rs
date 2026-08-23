@@ -9,6 +9,8 @@ mod history_panel;
 mod monitor;
 #[allow(dead_code)] // consumed from T3 on; allow removed in T6
 mod monitor_sql;
+#[allow(dead_code)] // wired by T6's open_monitor_tab; allow removed there
+mod monitor_view;
 mod palette;
 mod row_view;
 mod runner;
@@ -1303,6 +1305,7 @@ impl AppView {
                                                 grid.update(cx, |g, _| g.on_stream_finished())
                                             }
                                             TabContent::Text { .. } => None,
+                                            TabContent::Monitor { .. } => None,
                                         }
                                     })
                                 });
@@ -2679,6 +2682,7 @@ impl AppView {
         let (tab_id, tab_conn_identity, grid) = match &active.content {
             TabContent::Grid { grid, .. } => (active.id, active.conn_identity.clone(), grid.clone()),
             TabContent::Text { .. } => return,
+            TabContent::Monitor { .. } => return,
         };
         let current_identity = self.current_conn_identity();
         if !conn_identity_matches(&tab_conn_identity, &current_identity) {
@@ -3005,6 +3009,7 @@ impl AppView {
                         (buffer.borrow().row_count(), grid.read(cx).edit_state.is_dirty())
                     }
                     TabContent::Text { .. } => (0, false),
+                    TabContent::Monitor { .. } => (0, false),
                 };
                 // G5 Task 3, brief contract #7: dirty (unapplied staged
                 // edits) tabs get a " •" title suffix — the apply bar
@@ -3155,7 +3160,19 @@ impl AppView {
                     .child(body)
                     .into_any_element()
             }
+            TabContent::Monitor { view } => view.clone().into_any_element(),
         }
+    }
+
+    /// The `MonitorView` entity behind an open Monitor tab, by tab id —
+    /// used by the kill-confirm dialog (T5) and the per-tab timer loop
+    /// (T6).
+    #[allow(dead_code)] // consumed by T5's confirm_kill_confirm and T6's spawn_monitor_timer
+    fn monitor_view_for_tab(&self, tab_id: u64) -> Option<Entity<monitor_view::MonitorView>> {
+        self.tabs.iter().find(|t| t.id == tab_id).and_then(|t| match &t.content {
+            TabContent::Monitor { view } => Some(view.clone()),
+            _ => None,
+        })
     }
 
     /// G5 Task 4, brief contract #1: apply bar above the status bar

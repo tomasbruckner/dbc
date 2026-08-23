@@ -34,6 +34,15 @@ pub enum TabContent {
     /// — the schema browser that will is a later task.
     #[allow(dead_code)]
     Text { text: String, scroll_lines: usize },
+    /// G9: server-monitor dashboard tab (one per connection at a time —
+    /// keyed via `preview_key = "monitor:{conn_identity}"`, activated
+    /// not re-stacked on reopen; see AppView::open_monitor_tab).
+    ///
+    /// Not constructed by production code until T6's `open_monitor_tab`
+    /// (T4 only adds the exhaustive-match arms that read it) — allow
+    /// removed there, same precedent as `Text` above.
+    #[allow(dead_code)]
+    Monitor { view: Entity<crate::monitor_view::MonitorView> },
 }
 
 pub struct ResultTab {

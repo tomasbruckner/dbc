@@ -24,7 +24,6 @@ pub enum ConnectSpec {
 }
 
 /// G9 T3: commands the view (T4) sends into a held `open_monitor` loop.
-#[allow(dead_code)] // constructed by T4's MonitorView; allow removed there
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MonitorCmd {
     Refresh { generation: u64 },
@@ -32,12 +31,22 @@ pub enum MonitorCmd {
 }
 
 /// G9 T3: events the `monitor_loop` background task sends back.
-#[allow(dead_code)] // Data's fields consumed by T4's MonitorView; allow removed there
 #[derive(Debug)]
 pub enum MonitorEvent {
     Data { generation: u64, snapshot: monitor::MonitorSnapshot },
     Error { generation: u64, message: String },
-    KillResult { generation: u64, pid: i64, result: Result<u64, QueryError> },
+    KillResult {
+        /// G9 T4 review finding: carried for symmetry with Data/Error and
+        /// asserted by T3's own tests, but deliberately NOT read by
+        /// `MonitorView::on_event` — a kill outcome is never superseded by
+        /// refresh generations (design §4 gates Data/Error only, not
+        /// KillResult). Plain `cargo build` (no test cfg) has no reader at
+        /// all, hence the explicit allow.
+        #[allow(dead_code)]
+        generation: u64,
+        pid: i64,
+        result: Result<u64, QueryError>,
+    },
 }
 
 /// Design §0/§9.1: the app-level read_only flag is the ONLY kill
