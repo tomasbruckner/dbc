@@ -104,15 +104,19 @@ const HIGHLIGHTS_SCM: &str = r#"
 /// (priority, color) — priority resolves same-range capture collisions (a
 /// single node can legitimately satisfy two patterns at once, e.g. a
 /// numeric literal gets both the unconditional `@string` pattern and the
-/// predicate-gated `@number` pattern); higher priority wins.
-fn color_for_capture(name: &str) -> Option<(u8, gpui::Hsla)> {
+/// predicate-gated `@number` pattern); higher priority wins. Colors come
+/// from the passed theme (G14 CURATION 1c) instead of hardcoded literals.
+fn color_for_capture(
+    name: &str,
+    syntax: &crate::theme::EditorSyntaxTheme,
+) -> Option<(u8, gpui::Hsla)> {
     match name {
-        "keyword" => Some((1, gpui::rgb(0xcba6f7).into())), // mauve
-        "string" => Some((1, gpui::rgb(0xa6e3a1).into())),  // green
-        "comment" => Some((1, gpui::rgb(0x6c7086).into())), // overlay gray
-        "type" | "type.builtin" => Some((1, gpui::rgb(0x94e2d5).into())), // teal
-        "number" => Some((2, gpui::rgb(0xfab387).into())),  // peach — outranks "string"
-        "function.call" => Some((2, gpui::rgb(0x89b4fa).into())), // blue — outranks "type"
+        "keyword" => Some((1, syntax.keyword)),
+        "string" => Some((1, syntax.string)),
+        "comment" => Some((1, syntax.comment)),
+        "type" | "type.builtin" => Some((1, syntax.type_)),
+        "number" => Some((2, syntax.number)),           // outranks "string"
+        "function.call" => Some((2, syntax.function)),  // outranks "type"
         _ => None,
     }
 }
@@ -153,7 +157,7 @@ fn cached_query() -> Option<(&'static tree_sitter::Language, &'static tree_sitte
 /// on T-SQL-only syntax or an unterminated comment. If the cached query
 /// failed to compile (defensive only — see `cached_query`), this returns
 /// empty spans rather than panicking.
-pub fn highlight(text: &str) -> Vec<HighlightSpan> {
+pub fn highlight(text: &str, syntax: &crate::theme::EditorSyntaxTheme) -> Vec<HighlightSpan> {
     let Some((language, query)) = cached_query() else {
         return Vec::new();
     };
@@ -184,7 +188,7 @@ pub fn highlight(text: &str) -> Vec<HighlightSpan> {
         for cap in m.captures {
             let name = query.capture_names()[cap.index as usize];
             let range = cap.node.byte_range();
-            let Some((priority, color)) = color_for_capture(name) else {
+            let Some((priority, color)) = color_for_capture(name, syntax) else {
                 continue;
             };
             if let Some(existing) = spans.iter_mut().find(|(r, _, _, _)| *r == range) {
@@ -211,8 +215,33 @@ pub fn highlight(text: &str) -> Vec<HighlightSpan> {
 mod tests {
     use super::*;
 
+    fn dark_syntax() -> crate::theme::EditorSyntaxTheme {
+        crate::theme::Theme::dark().syntax
+    }
+
+    fn highlight(text: &str) -> Vec<HighlightSpan> {
+        super::highlight(text, &dark_syntax())
+    }
+
     fn color_at(spans: &[HighlightSpan], byte: usize) -> Option<gpui::Hsla> {
         spans.iter().find(|s| s.range.contains(&byte)).map(|s| s.color)
+    }
+
+    /// Migration regression (G14 Task 6): `highlight()` now takes the theme
+    /// as an explicit parameter instead of hardcoded literals. The dark
+    /// theme reproduces the shipped G6 colors byte-for-byte (plumbing
+    /// change, not a recolor), and a different theme yields different
+    /// colors from the same input.
+    #[test]
+    fn colors_come_from_the_passed_syntax_theme() {
+        let dark = crate::theme::Theme::dark().syntax;
+        let spans = super::highlight("SELECT 1", &dark);
+        assert_eq!(color_at(&spans, 0), Some(dark.keyword));
+
+        let light = crate::theme::Theme::light().syntax;
+        let spans_l = super::highlight("SELECT 1", &light);
+        assert_eq!(color_at(&spans_l, 0), Some(light.keyword));
+        assert_ne!(dark.keyword, light.keyword);
     }
 
     #[test]
@@ -281,11 +310,11 @@ mod tests {
     }
 
     fn keyword_color() -> gpui::Hsla {
-        color_for_capture("keyword").unwrap().1
+        color_for_capture("keyword", &dark_syntax()).unwrap().1
     }
 
     fn number_color() -> gpui::Hsla {
-        color_for_capture("number").unwrap().1
+        color_for_capture("number", &dark_syntax()).unwrap().1
     }
 
     #[test]

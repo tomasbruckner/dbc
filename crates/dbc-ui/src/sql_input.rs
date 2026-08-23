@@ -50,16 +50,16 @@
 use std::ops::Range;
 
 use gpui::{
-    actions, div, fill, hsla, point, prelude::*, px, relative, rgba, size, App, Bounds,
-    ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, Hsla, KeyBinding, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
-    UnderlineStyle, Window,
+    actions, div, fill, hsla, point, prelude::*, px, relative, size, App, Bounds, ClipboardItem,
+    Context, CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
+    Focusable, GlobalElementId, Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollDelta, ScrollWheelEvent,
+    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 
 use crate::sql_highlight::{self, HighlightSpan};
 use crate::text_model::MultilineBuffer;
+use crate::theme::ActiveTheme;
 
 actions!(
     sql_input,
@@ -431,12 +431,16 @@ impl SqlInput {
         self.highlight_generation += 1;
         let my_generation = self.highlight_generation;
         let text = self.buffer.text().to_string();
+        // G14: the syntax palette is captured HERE, on the main thread — a
+        // background task cannot read a GPUI global. EditorSyntaxTheme is
+        // Copy + Send precisely for this hop (grounding correction 2).
+        let syntax = cx.theme().syntax;
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(60))
                 .await;
             let spans = cx
-                .background_spawn(async move { sql_highlight::highlight(&text) })
+                .background_spawn(async move { sql_highlight::highlight(&text, &syntax) })
                 .await;
             this.update(cx, |this, cx| {
                 if this.highlight_generation == my_generation {
@@ -981,6 +985,7 @@ impl Element for TextElement {
         let font = style.font();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
+        let selection_bg = cx.theme().bg_selection;
 
         let line_count = if text.is_empty() {
             1
@@ -1089,7 +1094,7 @@ impl Element for TextElement {
                                     point(bounds.left() + x0, bounds.top() + line_height * row),
                                     size(x1 - x0, line_height),
                                 ),
-                                rgba(0x3311ff30),
+                                selection_bg,
                             )
                         })
                 });
