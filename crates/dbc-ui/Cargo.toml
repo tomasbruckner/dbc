@@ -1,6 +1,6 @@
 [package]
 name = "dbc-ui"
-version = "0.6.0"
+version = "0.10.0"
 edition.workspace = true
 
 [dependencies]
@@ -8,6 +8,7 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "907ed09c9f4476caf
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "907ed09c9f4476caf250e6ce4bbffb23b4622f3b" }
 dbc-core = { path = "../dbc-core" }
 dbc-buffer = { path = "../dbc-buffer" }
+dbc-diff = { path = "../dbc-diff" }
 dbc-state = { path = "../dbc-state" }
 dbc-driver-sqlite = { path = "../dbc-driver-sqlite" }
 dbc-driver-postgres = { path = "../dbc-driver-postgres" }
@@ -17,6 +18,14 @@ tokio-postgres = "0.7"
 dirs.workspace = true
 tree-sitter = "0.25"
 tree-sitter-sequel = "0.3"
+quick-xml = "0.41"
+# Plan's Files list only calls out serde_json, but the grounding code's
+# `#[derive(Deserialize)]` on `PgPlanJson`/`PgExplainRoot` needs the `serde`
+# crate itself as a direct dependency too (edition-2021 extern-crate
+# resolution doesn't pick it up transitively via dbc-state) — adding it here
+# with the workspace's existing `derive`-feature pin.
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -26,3 +35,7 @@ async-trait.workspace = true
 # paused/auto-advancing virtual clock (`#[tokio::test(start_paused = true)]`)
 # instead of actually sleeping for real wall-clock seconds.
 tokio = { version = "1", features = ["test-util"] }
+# docker-gated integration tests (G9 T7 monitor, G13 T2 pg EXPLAIN fixtures)
+# — same crate+version dbc-driver-postgres's own integration tests pin, so
+# no version skew.
+testcontainers-modules = { version = "0.13", features = ["postgres"] }

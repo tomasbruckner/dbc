@@ -1,0 +1,16 @@
+[
+  {
+    "Plan": {
+      "Node Type": "Seq Scan",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Relation Name": "users",
+      "Alias": "users",
+      "Startup Cost": 0.00,
+      "Total Cost": 377.00,
+      "Plan Rows": 333,
+      "Plan Width": 17,
+      "Filter": "(age = 42)"
+    }
+  }
+]

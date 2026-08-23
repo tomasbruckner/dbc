@@ -189,8 +189,10 @@ version is part of each phase's merge checklist.
   `dbc-state` crate consumed by `dbc-ui` — core and drivers stay stateless.
 - Errors are values; no panics on DB or user-data paths (sandbox Apply
   errors surface in the dialog, not as crashes).
-- Sandbox Apply is the ONLY write path in the app; MCP (future) remains
-  read-only per the original spec.
+- Sandbox Apply (grid edits) and confirmed admin actions (server-monitor
+  kill) are the app's only write paths, both exclusively through
+  `Connection::execute()`; MCP (future) remains read-only per the original
+  spec. (Amended by G9 per its design §0.)
 - GPUI stays git-pinned; upgrades are isolated commits.
 
 ## 4. Out of scope of this spec

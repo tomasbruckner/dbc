@@ -1,0 +1,55 @@
+[
+  {
+    "Plan": {
+      "Node Type": "Hash Join",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 577.00,
+      "Total Cost": 1499.19,
+      "Plan Rows": 9977,
+      "Plan Width": 29,
+      "Inner Unique": true,
+      "Hash Cond": "(o.user_id = u.id)",
+      "Plans": [
+        {
+          "Node Type": "Seq Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Relation Name": "orders",
+          "Alias": "o",
+          "Startup Cost": 0.00,
+          "Total Cost": 896.00,
+          "Plan Rows": 9977,
+          "Plan Width": 12,
+          "Filter": "(amount > '400'::numeric)"
+        },
+        {
+          "Node Type": "Hash",
+          "Parent Relationship": "Inner",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 327.00,
+          "Total Cost": 327.00,
+          "Plan Rows": 20000,
+          "Plan Width": 17,
+          "Plans": [
+            {
+              "Node Type": "Seq Scan",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Relation Name": "users",
+              "Alias": "u",
+              "Startup Cost": 0.00,
+              "Total Cost": 327.00,
+              "Plan Rows": 20000,
+              "Plan Width": 17
+            }
+          ]
+        }
+      ]
+    }
+  }
+]
