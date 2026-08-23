@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dbc-core", "crates/dbc-buffer", "crates/dbc-ui", "crates/dbc-driver-sqlite", "crates/dbc-driver-postgres", "crates/dbc-state"]
+members = ["crates/dbc-core", "crates/dbc-buffer", "crates/dbc-ui", "crates/dbc-driver-sqlite", "crates/dbc-driver-postgres", "crates/dbc-state", "crates/dbc-mcp"]
 
 [workspace.package]
 edition = "2021"
