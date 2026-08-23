@@ -46,10 +46,16 @@ const ZOOM_MAX: f32 = 3.0;
 const HEADER_H: f32 = 24.0;
 const ROW_H: f32 = 18.0;
 
+/// G8 T7 (design §3): past this many tables in the scoped selection,
+/// `AppView::open_er_diagram` truncates (alphabetical, via `cap_tables`)
+/// rather than laying out an unreadable/slow graph. No viewport culling in
+/// v1 — GPUI repaints whole scenes every frame regardless, so culling buys
+/// nothing below this cap without real profiling evidence of a problem.
+pub const DIAGRAM_TABLE_CAP: usize = 150;
+
 pub struct ErDiagramView {
     pub(crate) layout: DiagramLayout,
     pub(crate) tables: Vec<TableInfo>,
-    #[allow(dead_code)] // shown by T6's tab title / large-schema notice, not painted directly by T4
     pub(crate) schema_label: String,
     pub(crate) pan: Point<f32>,
     pub(crate) zoom: f32,
@@ -75,6 +81,14 @@ pub struct ErDiagramView {
     /// mouse-down and cleared on mouse-up — the same drag-capture shape
     /// `grid.rs`'s column-resize drag uses.
     pub(crate) drag_state: Option<(Point<Pixels>, Point<f32>)>,
+    /// T7: set by `AppView::open_er_diagram` when the scoped table list was
+    /// truncated to `DIAGRAM_TABLE_CAP` — `render` shows this as a one-line
+    /// warning banner above the canvas whenever it's `Some`.
+    pub(crate) truncated_notice: Option<String>,
+    /// T6: export status ("volím cíl exportu…" / "exportováno: {path}" /
+    /// "export zrušen" / "error: …"), same "status_note, shown once" idiom
+    /// `ResultGrid` already establishes (`main.rs::render_tab_content`).
+    pub(crate) status_note: Option<String>,
 }
 
 impl ErDiagramView {
@@ -89,7 +103,54 @@ impl ErDiagramView {
             hit_boxes: Vec::new(),
             canvas_origin: point(px(0.0), px(0.0)),
             drag_state: None,
+            truncated_notice: None,
+            status_note: None,
         }
+    }
+
+    /// G8 T6: "Export…" button — save-as dialog (no filter; the pinned
+    /// GPUI's `prompt_for_new_path` doesn't take one at all, see the export
+    /// pattern already established at `grid.rs::start_export`), then a
+    /// lossless SVG export of the CURRENT (possibly T7-truncated) layout via
+    /// `dbc_core::erd::svg::export_svg`. Simpler than `grid.rs`'s CSV/TSV/JSON
+    /// export: no chunking, no background-executor split — an SVG string for
+    /// at most `DIAGRAM_TABLE_CAP` nodes is small.
+    fn start_export_svg(&mut self, cx: &mut Context<Self>) {
+        let suggested_name = format!("{}.svg", self.schema_label);
+        self.status_note = Some("volím cíl exportu…".to_string());
+        cx.notify();
+        let dialog = cx.prompt_for_new_path(&std::path::PathBuf::new(), Some(&suggested_name));
+        let layout = self.layout.clone();
+        let tables = self.tables.clone();
+        cx.spawn(async move |this, cx| {
+            let path = match dialog.await {
+                Ok(Ok(Some(p))) => p,
+                Ok(Ok(None)) => {
+                    let _ = this.update(cx, |v, cx| {
+                        v.status_note = Some("export zrušen".to_string());
+                        cx.notify();
+                    });
+                    return;
+                }
+                _ => {
+                    let _ = this.update(cx, |v, cx| {
+                        v.status_note = Some("error: export dialog selhal".to_string());
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let svg = dbc_core::erd::svg::export_svg(&layout, &tables);
+            let result = std::fs::write(&path, svg);
+            let _ = this.update(cx, |v, cx| {
+                v.status_note = Some(match result {
+                    Ok(()) => format!("exportováno: {}", path.display()),
+                    Err(e) => format!("error: {e}"),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// World-space (x, y) -> screen-space Pixels, given the current pan/
@@ -114,10 +175,12 @@ impl Render for ErDiagramView {
         let selected = self.selected.clone();
         let dragging = self.drag_state.is_some();
         let entity = cx.entity();
+        let schema_label = self.schema_label.clone();
+        let truncated_notice = self.truncated_notice.clone();
 
-        let mut root = div()
+        let mut canvas_area = div()
             .id("er-diagram-root")
-            .size_full()
+            .flex_1()
             .bg(rgb(0x1e1e2e))
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -180,7 +243,7 @@ impl Render for ErDiagramView {
             );
 
         if dragging {
-            root = root
+            canvas_area = canvas_area
                 .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _window, cx| {
                     if let Some((start_pos, start_pan)) = this.drag_state {
                         let zoom = this.zoom.max(0.0001);
@@ -206,8 +269,70 @@ impl Render for ErDiagramView {
                 );
         }
 
-        root
+        // G8 T6/T7: header bar (schema label + "Export…" button) and, when
+        // T7's cap truncated the scoped table list, a one-line warning
+        // banner — both above the canvas, which keeps `flex_1()` and fills
+        // the rest of the tab.
+        let header = div()
+            .id("er-diagram-header")
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px_2()
+            .py_1()
+            .bg(rgb(0x181825))
+            .text_color(rgb(0xcdd6f4))
+            .child(format!("ER: {schema_label}"))
+            .child(
+                div()
+                    .id("er-diagram-export")
+                    .cursor_pointer()
+                    .bg(rgb(0x313244))
+                    .text_color(rgb(0xcdd6f4))
+                    .px_2()
+                    .rounded_md()
+                    .child("Export…")
+                    .on_click(cx.listener(|v, _, _window, cx| v.start_export_svg(cx))),
+            );
+
+        let banner = truncated_notice.map(|msg| {
+            div()
+                .id("er-diagram-truncated-notice")
+                .w_full()
+                .px_2()
+                .py_1()
+                .bg(rgb(0x45475a))
+                .text_color(rgb(0xf9e2af))
+                .child(msg)
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(0x1e1e2e))
+            .child(header)
+            .children(banner)
+            .child(canvas_area)
     }
+}
+
+/// G8 T7: pure truncation predicate — extracted so it doesn't need a live
+/// `SchemaSnapshot`/GPUI to test. `AppView::open_er_diagram` calls this on
+/// the schema-scoped table slice BEFORE `build_graph`/`compute_layout` ever
+/// run (`dbc-core`'s layout stays scale-agnostic; the cap is this crate's
+/// rendering/UX-scale concern, not a graph-correctness one). Returns the
+/// (possibly truncated) table list and `Some(hidden_count)` when truncation
+/// happened, `None` when `tables.len() <= cap`.
+pub fn cap_tables(mut tables: Vec<TableInfo>, cap: usize) -> (Vec<TableInfo>, Option<usize>) {
+    if tables.len() <= cap {
+        return (tables, None);
+    }
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+    let hidden = tables.len() - cap;
+    tables.truncate(cap);
+    (tables, Some(hidden))
 }
 
 /// Pure hit-test: walks `hit_boxes` in reverse paint order (topmost node
@@ -627,5 +752,38 @@ mod zoom_math_tests {
             assert!(z >= ZOOM_MIN && z <= ZOOM_MAX, "z={z} out of clamp range");
             assert!(pan.0.is_finite() && pan.1.is_finite(), "pan {pan:?} not finite");
         }
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    fn t(name: &str) -> TableInfo {
+        TableInfo { name: name.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn under_cap_is_untouched_and_unsorted() {
+        let (out, hidden) = cap_tables(vec![t("z"), t("a")], 150);
+        assert_eq!(hidden, None);
+        assert_eq!(out.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["z", "a"]);
+    }
+
+    #[test]
+    fn over_cap_truncates_alphabetically_and_reports_hidden_count() {
+        let tables: Vec<TableInfo> = (0..5).map(|i| t(&format!("t{i}"))).collect();
+        let (out, hidden) = cap_tables(tables, 3);
+        assert_eq!(hidden, Some(2));
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].name, "t0"); // already alphabetical in this fixture
+    }
+
+    #[test]
+    fn over_cap_sorts_before_truncating() {
+        let tables = vec![t("zeta"), t("alpha"), t("mid")];
+        let (out, hidden) = cap_tables(tables, 2);
+        assert_eq!(hidden, Some(1));
+        assert_eq!(out.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["alpha", "mid"]);
     }
 }

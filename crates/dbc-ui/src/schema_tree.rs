@@ -84,6 +84,9 @@ pub enum TreeEvent {
     /// `FavouriteSection`) — `main.rs` applies `config.toggle_favourite` +
     /// a guarded save, then pushes the updated set back via `set_favourites`.
     ToggleFavourite(FavouriteObject),
+    /// G8 T6: the "⊞" icon on a `NodeId::Schema(_)` row was clicked —
+    /// `main.rs` opens (or re-scopes) the ER diagram tab for this schema.
+    OpenErDiagram { schema: Option<String> },
 }
 
 /// One visible row: `(id, depth, label, is_expandable)`.
@@ -999,6 +1002,31 @@ impl Render for SchemaTree {
                                     }))
                             });
 
+                            // G8 T6: a second icon-button, gated to
+                            // `NodeId::Schema(_)` rows only — the schema-tree
+                            // entry point for the ER diagram tab.
+                            let diagram_icon = if let NodeId::Schema(s) = &id {
+                                let schema_for_click =
+                                    if s.is_empty() { None } else { Some(s.clone()) };
+                                Some(
+                                    div()
+                                        .id(("tree-erd", ix))
+                                        .px_1()
+                                        .flex_shrink_0()
+                                        .cursor_pointer()
+                                        .text_color(rgb(0x89b4fa))
+                                        .child("⊞")
+                                        .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
+                                            cx.stop_propagation();
+                                            cx.emit(TreeEvent::OpenErDiagram {
+                                                schema: schema_for_click.clone(),
+                                            });
+                                        })),
+                                )
+                            } else {
+                                None
+                            };
+
                             let mut row = div()
                                 .id(("tree-row", ix))
                                 .flex()
@@ -1037,6 +1065,9 @@ impl Render for SchemaTree {
                                 }));
                             if let Some(star) = star {
                                 row = row.child(star);
+                            }
+                            if let Some(icon) = diagram_icon {
+                                row = row.child(icon);
                             }
                             items.push(row);
                         }

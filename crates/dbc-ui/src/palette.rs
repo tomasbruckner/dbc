@@ -102,6 +102,10 @@ pub enum PaletteAction {
     NewConnection,
     RefreshSchema,
     OpenMonitor,
+    /// G8 T6: opens the ER diagram tab for the single unambiguous schema in
+    /// the current snapshot (`AppView::resolve_er_diagram_schema`), or
+    /// refuses with a Czech status pointing at the schema-tree icon.
+    ShowErDiagram,
 }
 
 /// One table/view from the current schema snapshot, plus whether it's
@@ -143,6 +147,7 @@ pub fn fixed_actions(monitor_available: bool) -> Vec<(String, PaletteAction)> {
         ("Přepnout historii".to_string(), PaletteAction::ToggleHistory),
         ("Nové spojení…".to_string(), PaletteAction::NewConnection),
         ("Obnovit schéma".to_string(), PaletteAction::RefreshSchema),
+        ("ER diagram".to_string(), PaletteAction::ShowErDiagram),
     ];
     if monitor_available {
         actions.push(("Monitor serveru".to_string(), PaletteAction::OpenMonitor));
@@ -384,7 +389,9 @@ mod rank_items_tests {
         assert_eq!(items[3], PaletteItem::HistoryEntry { id: 2, sql: "select 2".into() });
         assert_eq!(items[4], PaletteItem::Connection { id: "c1".into(), name: "prod".into() });
         assert!(matches!(items[5], PaletteItem::Action { .. }));
-        assert_eq!(items.len(), 2 + 2 + 1 + 5);
+        // 5 base actions + G8 T6's "ER diagram" (`ShowErDiagram` is
+        // unconditional, unlike `OpenMonitor` which is engine-gated).
+        assert_eq!(items.len(), 2 + 2 + 1 + 6);
     }
 
     #[test]

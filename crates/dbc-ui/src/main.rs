@@ -1,10 +1,6 @@
 mod autocomplete;
 mod connect;
 mod connections_ui;
-// G8 T4: unwired until T6 constructs ErDiagramView (TabContent::Diagram +
-// palette action + schema-tree icon) — same temporary-allow-then-remove
-// precedent `monitor_sql.rs`'s doc comment references for `mod plan;`.
-#[allow(dead_code)]
 mod er_diagram_view;
 mod export;
 mod fk_join;
@@ -1308,6 +1304,7 @@ impl AppView {
                                             }
                                             TabContent::Text { .. } => None,
                                             TabContent::Monitor { .. } => None,
+                                            TabContent::Diagram { .. } => None,
                                         }
                                     })
                                 });
@@ -1731,6 +1728,18 @@ impl AppView {
                     }
                 }
                 PaletteAction::OpenMonitor => self.open_monitor_tab(cx),
+                PaletteAction::ShowErDiagram => {
+                    let target = self.resolve_er_diagram_schema(cx);
+                    match target {
+                        Some(schema) => self.open_er_diagram(schema, cx),
+                        None => {
+                            self.status =
+                                "Vyberte schéma ve stromu (klikněte na ikonu vedle schématu)"
+                                    .to_string();
+                            cx.notify();
+                        }
+                    }
+                }
             },
         }
         cx.notify();
@@ -2720,6 +2729,90 @@ impl AppView {
         cx.notify();
     }
 
+    // -----------------------------------------------------------------
+    // G8 T6/T7: ER diagram tab — schema-tree icon + palette entry points,
+    // large-schema truncation (design §3).
+    // -----------------------------------------------------------------
+
+    /// design §3 CURATION: the entry action always operates on ONE schema.
+    /// `schema` is `None` for an engine/snapshot with no schema concept
+    /// (SQLite) — matches every other `Option<String>` schema field in this
+    /// codebase (strict, no "public" guessing).
+    fn open_er_diagram(&mut self, schema: Option<String>, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.tree.read(cx).snapshot() else {
+            self.status = "Nejprve načtěte schéma".to_string();
+            cx.notify();
+            return;
+        };
+        let scoped: Vec<TableInfo> =
+            snapshot.tables.iter().filter(|t| t.schema == schema).cloned().collect();
+        let (scoped, hidden) = er_diagram_view::cap_tables(scoped, er_diagram_view::DIAGRAM_TABLE_CAP);
+        let truncated_notice = hidden.map(|hidden| {
+            format!(
+                "Schéma má {} tabulek — zobrazeno prvních {} podle názvu; použijte filtr.",
+                hidden + er_diagram_view::DIAGRAM_TABLE_CAP,
+                er_diagram_view::DIAGRAM_TABLE_CAP
+            )
+        });
+        let label = schema.clone().unwrap_or_else(|| "(bez schématu)".to_string());
+        let graph = dbc_core::erd::build_graph(&scoped);
+        let layout = dbc_core::erd::layout::compute_layout(&graph);
+        let view = cx.new(|_cx| {
+            let mut v = er_diagram_view::ErDiagramView::new(layout, scoped, label.clone());
+            v.truncated_notice = truncated_notice;
+            v
+        });
+        cx.subscribe(&view, Self::on_er_diagram_event).detach();
+        self.tabs.open(ResultTab {
+            id: 0,
+            title: format!("ER: {label}"),
+            pinned: false,
+            preview_key: None,
+            conn_identity: self.current_conn_identity(),
+            content: TabContent::Diagram { view },
+        });
+        self.status = "ER diagram otevřen".to_string();
+        cx.notify();
+    }
+
+    /// `ErDiagramView` reuses `TreeEvent` verbatim (only ever emits
+    /// `OpenDdl`) — this handler mirrors `on_tree_event`'s `OpenDdl` arm
+    /// exactly rather than duplicating tab-open logic a third time.
+    fn on_er_diagram_event(
+        &mut self,
+        _emitter: Entity<er_diagram_view::ErDiagramView>,
+        event: &TreeEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if let TreeEvent::OpenDdl { title, ddl } = event {
+            self.tabs.open(ResultTab {
+                id: 0,
+                title: format!("DDL: {title}"),
+                pinned: false,
+                preview_key: None,
+                conn_identity: self.current_conn_identity(),
+                content: TabContent::Text { text: ddl.clone(), scroll_lines: 0 },
+            });
+            self.status = format!("DDL otevřeno: {title}");
+            cx.notify();
+        }
+    }
+
+    /// `PaletteAction::ShowErDiagram`'s zero-argument -> one-schema
+    /// resolution: exactly one distinct schema in the snapshot wins
+    /// outright; otherwise `None` (caller shows the Czech refusal status
+    /// text pointing at the schema-tree icon, the primary entry point).
+    fn resolve_er_diagram_schema(&self, cx: &Context<Self>) -> Option<Option<String>> {
+        let snapshot = self.tree.read(cx).snapshot()?;
+        let mut schemas: Vec<Option<String>> = snapshot.tables.iter().map(|t| t.schema.clone()).collect();
+        schemas.sort();
+        schemas.dedup();
+        if schemas.len() == 1 {
+            return schemas.into_iter().next();
+        }
+        None
+    }
+
     /// One timer loop per open monitor tab (design §4), on the SAME
     /// `cx.background_executor().timer` primitive `grid.rs`'s export
     /// chunking uses. Hidden-tab gating is automatic: a tick only reaches
@@ -2858,6 +2951,7 @@ impl AppView {
             TabContent::Grid { grid, .. } => (active.id, active.conn_identity.clone(), grid.clone()),
             TabContent::Text { .. } => return,
             TabContent::Monitor { .. } => return,
+            TabContent::Diagram { .. } => return,
         };
         let current_identity = self.current_conn_identity();
         if !conn_identity_matches(&tab_conn_identity, &current_identity) {
@@ -3165,6 +3259,9 @@ impl AppView {
                 self.tree.update(cx, |t, cx| t.set_favourites(favourites, active_id, cx));
                 cx.notify();
             }
+            TreeEvent::OpenErDiagram { schema } => {
+                self.open_er_diagram(schema.clone(), cx);
+            }
         }
     }
 
@@ -3185,6 +3282,7 @@ impl AppView {
                     }
                     TabContent::Text { .. } => (0, false),
                     TabContent::Monitor { .. } => (0, false),
+                    TabContent::Diagram { .. } => (0, false),
                 };
                 // G5 Task 3, brief contract #7: dirty (unapplied staged
                 // edits) tabs get a " •" title suffix — the apply bar
@@ -3336,6 +3434,15 @@ impl AppView {
                     .into_any_element()
             }
             TabContent::Monitor { view } => view.clone().into_any_element(),
+            TabContent::Diagram { view } => {
+                // G8 T6: mirrors `ResultGrid`'s `status_note` idiom above —
+                // taken once so the export flow's status text surfaces in
+                // `AppView::status` exactly once, not stuck forever.
+                if let Some(note) = view.update(cx, |v, _| v.status_note.take()) {
+                    self.status = note;
+                }
+                view.clone().into_any_element()
+            }
         }
     }
 

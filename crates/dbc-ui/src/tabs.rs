@@ -39,6 +39,10 @@ pub enum TabContent {
     /// not re-stacked on reopen; see AppView::open_monitor_tab).
     ///
     Monitor { view: Entity<crate::monitor_view::MonitorView> },
+    /// G8 T6: ER diagram tab — one per `open_er_diagram` call (schema-tree
+    /// icon or the "ER diagram" palette action), titled `"ER: {schema}"`.
+    /// Read-only, never editable — see `crate::er_diagram_view::ErDiagramView`.
+    Diagram { view: Entity<crate::er_diagram_view::ErDiagramView> },
 }
 
 pub struct ResultTab {
