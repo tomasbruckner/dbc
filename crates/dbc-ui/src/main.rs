@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use dbc_buffer::ResultBuffer;
+use dbc_core::arrow::datatypes::SchemaRef;
 use dbc_core::{
     apply_auto_limit, find_params, is_read_statement, quote_qualified, substitute_params,
     CancelToken, FkRef, QueryError, SchemaSnapshot, TableInfo,
@@ -43,7 +44,7 @@ use gpui::{
 use gpui_platform::application;
 use grid::{GridEvent, ResultGrid};
 use palette::{PaletteAction, PaletteItem};
-use runner::{ConnectSpec, QueryEvent, QueryRunner};
+use runner::{ConnectSpec, MultiQueryEvent, QueryEvent, QueryRunner};
 use schema_tree::{SchemaTree, TreeEvent};
 use sql_input::SqlInput;
 use tabs::{collapse_title, ResultTab, TabContent, Tabs};
@@ -245,6 +246,42 @@ fn engine_from_url(url: &str) -> dbc_state::Engine {
     } else {
         dbc_state::Engine::Sqlite
     }
+}
+
+/// G12 T5: engine -> splitter dialect for the editor's multi-statement
+/// unlock. `Mssql` (and any future engine without a dialect) returns `None`
+/// -> today's single-statement path, unchanged (CURATION item 2: the `GO`
+/// pre-pass is an explicit non-goal for this phase — when DuckDB wiring
+/// lands, map `Duckdb -> Dialect::Postgres` + one test, not now; no
+/// `Duckdb` variant exists on this branch's `dbc_state::Engine` to map
+/// anyway).
+fn dialect_for_engine(engine: dbc_state::Engine) -> Option<dbc_core::Dialect> {
+    match engine {
+        dbc_state::Engine::Postgres => Some(dbc_core::Dialect::Postgres),
+        dbc_state::Engine::Sqlite => Some(dbc_core::Dialect::Sqlite),
+        dbc_state::Engine::Mssql => None,
+    }
+}
+
+/// G12 T5: per-statement auto-limit (design §4) — only bare `SELECT`s in
+/// the already-split statement list get a `LIMIT` appended (before the
+/// split, a multi-statement blob never got limited at all: `apply_auto_limit`
+/// only fires when the WHOLE string starts with `SELECT`, guards.rs). Returns
+/// the rewritten list plus whether ANY statement changed (drives the caller's
+/// " · auto-LIMIT {n}" status suffix, same convention as the single-statement
+/// path).
+fn auto_limit_each(statements: Vec<String>, limit: Option<u64>, bypass: bool) -> (Vec<String>, bool) {
+    let Some(n) = limit.filter(|_| !bypass) else { return (statements, false) };
+    let mut changed_any = false;
+    let out = statements
+        .into_iter()
+        .map(|s| {
+            let (rewritten, changed) = apply_auto_limit(&s, n);
+            changed_any |= changed;
+            rewritten
+        })
+        .collect();
+    (out, changed_any)
 }
 
 /// `conn_meta`: `Some((read_only, engine))` — for a saved `ConnectionConfig`
@@ -1004,6 +1041,33 @@ impl AppView {
         };
         let (read_only, auto_limit, timeout_secs, conn_meta, spec) = spec;
 
+        // G12 T5: multi-statement unlock. Params were already substituted
+        // upstream (`run_query`, G6) — CURATION-fixed order: params ->
+        // split -> per-statement guards/auto-limit -> dispatch. A preview
+        // run (`preview.is_some()`) never carries more than one statement
+        // (`preview_sql`'s own output), so it always falls through
+        // unchanged. When the split yields 0 or 1 statements, this also
+        // falls through to the existing single-statement pipeline below
+        // (Guard 1 read-only on the full text, Guard 2 auto-limit),
+        // byte-for-byte unchanged.
+        if preview.is_none() {
+            if let Some(dialect) = conn_meta.map(|(_, e)| e).and_then(dialect_for_engine) {
+                match dbc_core::split_sql(&sql, dialect) {
+                    Err(e) => {
+                        self.status = format!("error: SQL nelze rozdělit na příkazy: {e:?}");
+                        cx.notify();
+                        return;
+                    }
+                    Ok(stmts) if stmts.len() > 1 => {
+                        let (stmts, limited) = auto_limit_each(stmts, auto_limit, bypass_auto_limit);
+                        self.run_many(spec, sql, stmts, limited, timeout_secs, cx);
+                        return;
+                    }
+                    Ok(_) => {}
+                }
+            }
+        }
+
         // Guard 1: read-only — rejected client-side without connecting.
         // (Server-side enforcement lives in connect::open_config: Postgres
         // `default_transaction_read_only=on`, SQLite `SQLITE_OPEN_READ_ONLY`
@@ -1445,6 +1509,250 @@ impl AppView {
                 // `run_generation` and set its own `cancel` — an
                 // unconditional clear here would wipe that out from under
                 // it. See `run_generation`'s doc comment.
+                if view.run_generation == my_generation {
+                    view.cancel = None;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // -----------------------------------------------------------------
+    // G12 T5: editor multi-statement unlock.
+    // -----------------------------------------------------------------
+
+    /// The AD-HOC subset of `run_query_with`'s own `QueryEvent::Started`
+    /// arm (buffer, FK metadata for the ☰ menu, grid entity, subscription,
+    /// tab open) — extracted for `run_many`'s per-row-producing-statement
+    /// tabs ONLY. Deliberately NOT used to refactor the single-run
+    /// `Started` arm above (leave working code untouched; the duplication
+    /// is deliberate and documented, same precedent `history_panel::
+    /// collapse_sql` sets against `tabs::collapse_title`). No preview
+    /// context, no editability, no per-table view-prefs — a multi-statement
+    /// run's tabs are always plain ad-hoc results, same as today's
+    /// single-statement ad-hoc path.
+    fn open_adhoc_result_tab(
+        &mut self,
+        columns: SchemaRef,
+        title_sql: &str,
+        conn_identity: &str,
+        cx: &mut Context<Self>,
+    ) -> (u64, Rc<RefCell<ResultBuffer>>) {
+        let buf = Rc::new(RefCell::new(ResultBuffer::new(columns)));
+        let result_cols: Vec<String> =
+            buf.borrow().schema().fields().iter().map(|f| f.name().to_string()).collect();
+        let (fk_info, ref_cols) = self.fk_info_for_adhoc(&result_cols, cx);
+        let grid = cx.new(ResultGrid::new);
+        grid.update(cx, |g, cx| {
+            g.set_buffer(buf.clone(), cx);
+            g.set_fk_info(fk_info, ref_cols);
+        });
+        cx.subscribe(&grid, AppView::on_grid_event).detach();
+        let id = self.tabs.open(ResultTab {
+            id: 0,
+            title: collapse_title(title_sql),
+            pinned: false,
+            preview_key: None,
+            conn_identity: conn_identity.to_string(),
+            content: TabContent::Grid { grid, buffer: buf.clone() },
+        });
+        (id, buf)
+    }
+
+    /// `run_query_with`'s multi-statement dispatch (>1 statement after
+    /// `split_sql`) — single-flight guards already ran in the caller; sets
+    /// `cancel`/`run_generation`/`started_at`/status the same way, then
+    /// consumes `runner::connect_and_run_many`, opening one
+    /// `open_adhoc_result_tab` per row-producing statement and recording
+    /// ONE history entry for the whole run (`sql` = the original full
+    /// post-params editor text, `row_count` = returned rows + affected sum
+    /// — design silent on the combined metric, flagged as a judgment call).
+    fn run_many(
+        &mut self,
+        spec: ConnectSpec,
+        sql: String,
+        statements: Vec<String>,
+        limited: bool,
+        timeout_secs: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        let limit_suffix = if limited { " · auto-LIMIT".to_string() } else { String::new() };
+        let cancel = CancelToken::new();
+        self.cancel = Some(cancel.clone());
+        self.started_at = Some(std::time::Instant::now());
+        self.run_generation += 1;
+        let my_generation = self.run_generation;
+        self.status = format!("connecting…{limit_suffix}");
+        cx.notify();
+
+        let history_started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let history_conn_name = self.active_connection_name_for_history();
+        let conn_identity = self.current_conn_identity();
+        let total_statements = statements.len();
+        let mut rx = self.runner.connect_and_run_many(spec, statements.clone(), cancel, timeout_secs);
+        cx.spawn(async move |this, cx| {
+            let mut buffer: Option<Rc<RefCell<ResultBuffer>>> = None;
+            let mut tab_id: Option<u64> = None;
+            let mut errored: Option<String> = None;
+            let mut rows_returned: u64 = 0;
+            let mut total_affected: u64 = 0;
+            let mut with_rows: usize = 0;
+            let mut writes: usize = 0;
+
+            while let Some(ev) = rx.recv().await {
+                let stop = this
+                    .update(cx, |view, cx| {
+                        let mut stop = false;
+                        match ev {
+                            MultiQueryEvent::StatementStarted { index, total, columns: Some(cols) } => {
+                                let title_sql =
+                                    statements.get(index).map(String::as_str).unwrap_or("");
+                                let (id, buf) =
+                                    view.open_adhoc_result_tab(cols, title_sql, &conn_identity, cx);
+                                tab_id = Some(id);
+                                buffer = Some(buf);
+                                with_rows += 1;
+                                view.status = format!("příkaz {}/{total}…{limit_suffix}", index + 1);
+                            }
+                            MultiQueryEvent::StatementStarted { index, total, columns: None } => {
+                                view.status = format!("příkaz {}/{total}…{limit_suffix}", index + 1);
+                            }
+                            MultiQueryEvent::Batch(b) => {
+                                if errored.is_some() {
+                                    // Already failed — drop further batches.
+                                } else if tab_id.is_some_and(|id| view.tabs.iter().all(|t| t.id != id)) {
+                                    stop = true;
+                                    if let Some(token) = view.cancel.take() {
+                                        token.cancel();
+                                    }
+                                    view.status = "zrušeno (tab zavřen)".into();
+                                } else if let Some(Err(e)) =
+                                    buffer.as_ref().map(|buf| buf.borrow_mut().push(b))
+                                {
+                                    let err_text = e.to_string();
+                                    view.status = format!("error: {err_text}");
+                                    errored = Some(err_text);
+                                    if let Some(token) = view.cancel.take() {
+                                        token.cancel();
+                                    }
+                                } else if let Some(id) = tab_id {
+                                    if let Some(TabContent::Grid { grid, .. }) =
+                                        view.tabs.iter().find(|t| t.id == id).map(|t| &t.content)
+                                    {
+                                        grid.update(cx, |g, _| g.on_batch_grown());
+                                    }
+                                }
+                            }
+                            MultiQueryEvent::StatementFinished { index, affected: Some(n), elapsed } => {
+                                total_affected += n;
+                                writes += 1;
+                                view.status = format!(
+                                    "příkaz {} dokončen ({n} řádků, {elapsed:.2?}){limit_suffix}",
+                                    index + 1
+                                );
+                            }
+                            MultiQueryEvent::StatementFinished { index, affected: None, elapsed } => {
+                                // Accumulated, not overwritten — more than one
+                                // read statement in the same run each gets its
+                                // own fresh tab/buffer (`StatementStarted`
+                                // above), so this fires once per read with
+                                // THAT statement's own total, never double-
+                                // counting the same buffer twice.
+                                let rows = buffer.as_ref().map_or(0, |b| b.borrow().row_count());
+                                rows_returned += rows as u64;
+                                if let Some(id) = tab_id {
+                                    if let Some(TabContent::Grid { grid, .. }) =
+                                        view.tabs.iter().find(|t| t.id == id).map(|t| &t.content)
+                                    {
+                                        grid.update(cx, |g, _| {
+                                            g.on_stream_finished();
+                                        });
+                                    }
+                                }
+                                view.status = format!(
+                                    "příkaz {} dokončen ({rows} řádků, {elapsed:.2?}){limit_suffix}",
+                                    index + 1
+                                );
+                            }
+                            MultiQueryEvent::StatementFailed { index, error } => {
+                                match &errored {
+                                    None => {
+                                        view.status = format!("selhalo na příkazu #{}: {error}", index + 1);
+                                        let err_text = error.to_string();
+                                        view.record_history(
+                                            &sql,
+                                            &history_conn_name,
+                                            history_started_at,
+                                            None,
+                                            None,
+                                            Some(&err_text),
+                                            cx,
+                                        );
+                                    }
+                                    Some(err_text) => {
+                                        view.record_history(
+                                            &sql,
+                                            &history_conn_name,
+                                            history_started_at,
+                                            None,
+                                            None,
+                                            Some(err_text),
+                                            cx,
+                                        );
+                                    }
+                                }
+                                view.cancel = None;
+                            }
+                            MultiQueryEvent::RunFinished => {
+                                let elapsed_ms = view
+                                    .started_at
+                                    .map(|t| t.elapsed().as_millis() as i64)
+                                    .unwrap_or(0);
+                                match &errored {
+                                    None => {
+                                        view.status = format!(
+                                            "{total_statements} příkazů, {with_rows} s výsledky, \
+                                             {writes} zápisů ({total_affected} řádků) — hotovo{limit_suffix}"
+                                        );
+                                        let row_count = rows_returned as i64 + total_affected as i64;
+                                        view.record_history(
+                                            &sql,
+                                            &history_conn_name,
+                                            history_started_at,
+                                            Some(elapsed_ms),
+                                            Some(row_count),
+                                            None,
+                                            cx,
+                                        );
+                                    }
+                                    Some(err_text) => {
+                                        view.record_history(
+                                            &sql,
+                                            &history_conn_name,
+                                            history_started_at,
+                                            None,
+                                            None,
+                                            Some(err_text),
+                                            cx,
+                                        );
+                                    }
+                                }
+                                view.cancel = None;
+                            }
+                        }
+                        cx.notify();
+                        stop
+                    })
+                    .unwrap_or(false);
+                if stop {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |view, cx| {
                 if view.run_generation == my_generation {
                     view.cancel = None;
                 }
@@ -4560,6 +4868,58 @@ mod engine_from_url_tests {
         assert_eq!(engine_from_url("C:/data/app.db"), dbc_state::Engine::Sqlite);
         assert_eq!(engine_from_url("./relative.sqlite"), dbc_state::Engine::Sqlite);
         assert_eq!(engine_from_url(":memory:"), dbc_state::Engine::Sqlite);
+    }
+}
+
+/// G12 T5: `dialect_for_engine`/`auto_limit_each` pure-decision tests, plus
+/// CURATION item 3's mandated test (params resolve BEFORE splitting).
+#[cfg(test)]
+mod multi_statement_tests {
+    use super::*;
+
+    #[test]
+    fn dialect_for_engine_maps_pg_sqlite_and_refuses_mssql() {
+        assert_eq!(dialect_for_engine(dbc_state::Engine::Postgres), Some(dbc_core::Dialect::Postgres));
+        assert_eq!(dialect_for_engine(dbc_state::Engine::Sqlite), Some(dbc_core::Dialect::Sqlite));
+        assert_eq!(dialect_for_engine(dbc_state::Engine::Mssql), None);
+    }
+
+    #[test]
+    fn auto_limit_each_limits_only_bare_selects() {
+        let stmts = vec![
+            "SELECT * FROM a".to_string(),
+            "UPDATE t SET x = 1".to_string(),
+            "SELECT * FROM b LIMIT 5".to_string(),
+        ];
+        let (out, changed) = auto_limit_each(stmts, Some(100), false);
+        assert!(changed);
+        assert_eq!(out[0], "SELECT * FROM a LIMIT 100");
+        assert_eq!(out[1], "UPDATE t SET x = 1");
+        assert_eq!(out[2], "SELECT * FROM b LIMIT 5");
+    }
+
+    #[test]
+    fn auto_limit_each_bypass_and_none_are_noops() {
+        let stmts = vec!["SELECT 1".to_string()];
+        assert_eq!(auto_limit_each(stmts.clone(), Some(100), true), (stmts.clone(), false));
+        assert_eq!(auto_limit_each(stmts.clone(), None, false), (stmts, false));
+    }
+
+    /// CURATION item 3's mandated test: two statements each carrying `:p` —
+    /// params resolve BEFORE splitting, so a substituted literal containing
+    /// `;` inside quotes is handled by the splitter's normal string rules.
+    #[test]
+    fn params_resolve_before_split_two_statements() {
+        let names = vec!["p".to_string()];
+        let out = build_param_sql(
+            "SELECT :p; UPDATE t SET x = :p;",
+            &names,
+            &[("a;b".to_string(), false)],
+        )
+        .unwrap();
+        assert_eq!(out, "SELECT 'a;b'; UPDATE t SET x = 'a;b';");
+        let stmts = dbc_core::split_sql(&out, dbc_core::Dialect::Sqlite).unwrap();
+        assert_eq!(stmts, vec!["SELECT 'a;b'".to_string(), "UPDATE t SET x = 'a;b'".to_string()]);
     }
 }
 

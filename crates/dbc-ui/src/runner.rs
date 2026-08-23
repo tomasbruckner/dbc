@@ -15,6 +15,24 @@ pub enum QueryEvent {
     Failed(QueryError),
 }
 
+/// G12 T5: streaming progress events for `QueryRunner::connect_and_run_many`
+/// (the editor's multi-statement unlock) — one connection, N statements,
+/// STOP on first error (design §4: error-policy choice is a
+/// script-runner-only concept, `run_script`'s `ErrorPolicy` doesn't apply
+/// here).
+pub enum MultiQueryEvent {
+    /// `columns: Some` = a row-producing statement (`Batch`es follow before
+    /// its `StatementFinished`); `None` = a non-row statement (a write) —
+    /// no result tab opens for it.
+    StatementStarted { index: usize, total: usize, columns: Option<SchemaRef> },
+    Batch(RecordBatch),
+    /// `affected: Some(n)` for a write; `None` for a read (its rows went to
+    /// the caller's tab via `Batch`, not a count).
+    StatementFinished { index: usize, affected: Option<u64>, elapsed: Duration },
+    StatementFailed { index: usize, error: QueryError },
+    RunFinished,
+}
+
 /// Where to connect from for a `connect_and_run` dispatch: either a saved
 /// [`ConnectionConfig`] (Task 7's connection manager — may carry a secret
 /// and/or an SSH tunnel), or the back-compat CLI-arg connection string.
@@ -477,6 +495,30 @@ impl QueryRunner {
         });
         rx
     }
+
+    /// G12 T5: the editor's multi-statement unlock — one connection, every
+    /// statement in `statements` in order, STOP on the first error (no
+    /// `ErrorPolicy` here, that's `run_script`-only). Per-statement
+    /// read-only rejection via the SHARED `guard_not_read_only` guard
+    /// (CURATION item 1(c)/4(c)) and a per-statement child-token timeout,
+    /// same shape `run_script` uses. `statements` is caller-supplied
+    /// ALREADY split + already auto-limited (see `main.rs`'s
+    /// `dialect_for_engine`/`auto_limit_each`) — this method just dispatches
+    /// them in order.
+    pub fn connect_and_run_many(
+        &self,
+        spec: ConnectSpec,
+        statements: Vec<String>,
+        cancel: CancelToken,
+        timeout_secs: Option<u64>,
+    ) -> tokio::sync::mpsc::Receiver<MultiQueryEvent> {
+        let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            connect_and_run_many_inner(spec, statements, cancel, timeout_secs, handle, tx).await;
+        });
+        rx
+    }
 }
 
 /// Exact rollback message the brief mandates for an affected-rows mismatch
@@ -516,19 +558,17 @@ fn spec_is_read_only(spec: &ConnectSpec) -> bool {
 /// reads — same posture `is_read_statement`'s own doc comment mandates, so
 /// an ambiguous statement on a read-only connection is rejected rather than
 /// risked.
-/// See `TxScope`'s doc comment for the `#[allow(dead_code)]` rationale —
-/// Task 2 (`connect_and_run_many`) also consumes `dispatch_statement`, so
-/// this one may already be reachable from `main.rs` by the time both tasks
-/// have landed; left in place defensively either way.
+/// Consumed by both `run_script` (Task 1, still unwired) and
+/// `connect_and_run_many` (Task 2, wired into `main.rs::run_many`) — no
+/// `#[allow(dead_code)]` needed, this one is genuinely reachable from
+/// `main` via the latter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum StmtDispatch {
     RunAsRead,
     RunAsWrite,
     RejectReadOnly,
 }
 
-#[allow(dead_code)]
 pub fn dispatch_statement(sql: &str, read_only: bool) -> StmtDispatch {
     if dbc_core::is_read_statement(sql) {
         StmtDispatch::RunAsRead
@@ -1175,6 +1215,130 @@ async fn drive_script(
             aborted,
         })
         .await;
+}
+
+/// G12 T5: runs ONE statement of a `connect_and_run_many` batch — dispatch
+/// per the read-only matrix (CURATION item 1(c): the SHARED guard produces
+/// the rejection, no fresh read-only logic here), sending
+/// `MultiQueryEvent::StatementStarted`/`Batch`/`StatementFinished` as it
+/// streams a read, or just `StatementStarted{columns: None}` +
+/// `StatementFinished{affected: Some(n)}` for a write. `Err(())` means this
+/// statement failed — its `StatementFailed` has already been sent, and the
+/// caller stops (design §4: stop on first error, no continue policy here).
+async fn run_one_multi_statement(
+    conn: &mut dyn Connection,
+    index: usize,
+    total: usize,
+    sql: &str,
+    read_only: bool,
+    timeout_secs: Option<u64>,
+    run_cancel: &CancelToken,
+    tx: &tokio::sync::mpsc::Sender<MultiQueryEvent>,
+) -> Result<(), ()> {
+    let action = dispatch_statement(sql, read_only);
+    if action == StmtDispatch::RejectReadOnly {
+        let _ = tx
+            .send(MultiQueryEvent::StatementFailed { index, error: guard_not_read_only(true).unwrap_err() })
+            .await;
+        return Err(());
+    }
+    let stmt_cancel = run_cancel.child_token();
+    let started = Instant::now();
+    let fut = async {
+        match action {
+            StmtDispatch::RunAsRead => {
+                let mut stream = conn.query(sql, stmt_cancel.clone()).await?;
+                let _ = tx
+                    .send(MultiQueryEvent::StatementStarted {
+                        index,
+                        total,
+                        columns: Some(stream.columns.clone()),
+                    })
+                    .await;
+                while let Some(item) = stream.batches.recv().await {
+                    let _ = tx.send(MultiQueryEvent::Batch(item?)).await;
+                }
+                Ok(None)
+            }
+            StmtDispatch::RunAsWrite => {
+                let _ =
+                    tx.send(MultiQueryEvent::StatementStarted { index, total, columns: None }).await;
+                conn.execute(sql, stmt_cancel.clone()).await.map(Some)
+            }
+            StmtDispatch::RejectReadOnly => unreachable!("handled above"),
+        }
+    };
+    let result = match timeout_secs {
+        Some(t) => match tokio::time::timeout(Duration::from_secs(t), fut).await {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                stmt_cancel.cancel();
+                Err(QueryError::msg(format!("[timeout] statement exceeded {t}s")))
+            }
+        },
+        None => fut.await,
+    };
+    match result {
+        Ok(affected) => {
+            let _ = tx
+                .send(MultiQueryEvent::StatementFinished { index, affected, elapsed: started.elapsed() })
+                .await;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = tx.send(MultiQueryEvent::StatementFailed { index, error: e }).await;
+            Err(())
+        }
+    }
+}
+
+/// G12 T5: `QueryRunner::connect_and_run_many`'s async body — one dedicated
+/// connection for the whole batch (same `Connection::execute`
+/// session-sharing rationale every other one-shot in this file follows),
+/// dispatching every statement via `run_one_multi_statement` in order,
+/// stopping at the first failure. Extracted from the `spawn` closure so
+/// it's directly testable — same "`_inner` function, driven under
+/// `#[tokio::test]` with `Handle::current()`" precedent as
+/// `run_write_transaction_inner`.
+async fn connect_and_run_many_inner(
+    spec: ConnectSpec,
+    statements: Vec<String>,
+    cancel: CancelToken,
+    timeout_secs: Option<u64>,
+    handle: tokio::runtime::Handle,
+    tx: tokio::sync::mpsc::Sender<MultiQueryEvent>,
+) {
+    if cancel.is_cancelled() {
+        return;
+    }
+    // Captured BEFORE `spec` moves into `open_spec` — same convention
+    // `run_script`/`open_monitor` use.
+    let read_only = spec_is_read_only(&spec);
+    let mut opened = match open_spec(spec, handle).await {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = tx.send(MultiQueryEvent::StatementFailed { index: 0, error: e }).await;
+            return;
+        }
+    };
+    if cancel.is_cancelled() {
+        return;
+    }
+    let conn = &mut *opened.conn;
+    let total = statements.len();
+    for (index, sql) in statements.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return;
+        }
+        if run_one_multi_statement(conn, index, total, sql, read_only, timeout_secs, &cancel, &tx)
+            .await
+            .is_err()
+        {
+            return; // stop on first error (design §4) — `opened` drops here.
+        }
+    }
+    let _ = tx.send(MultiQueryEvent::RunFinished).await;
+    // `opened` (connection + tunnel) drops here unconditionally.
 }
 
 /// Defensive cap on materialized lookup rows — see `QueryRunner::fetch_lookup`.
@@ -2255,6 +2419,169 @@ mod script_run_tests {
         let events = drive_collect(&mut *conn, false, &[f1], &opts).await;
         assert!(events.iter().any(|e| matches!(e,
             ScriptEvent::StatementFinished { affected: Some(3), .. })));
+    }
+}
+
+/// G12 T5: `connect_and_run_many`'s integration tests, driven directly over
+/// `connect_and_run_many_inner` with `Handle::current()` — same precedent
+/// as `write_transaction_tests::run_write_transaction_refuses_read_only_connection_without_connecting`.
+/// `tx` is moved into a `tokio::spawn`ed task (owning it, dropping it when
+/// the task returns) rather than borrowed + manually dropped — see
+/// `script_run_tests::drive_collect`'s doc comment for why a borrowed `tx`
+/// that outlives its producing future deadlocks a concurrent drain.
+#[cfg(test)]
+mod run_many_tests {
+    use super::*;
+
+    fn sqlite_cfg(database: String, read_only: bool) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "x".into(),
+            name: "x".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Sqlite,
+            database,
+            host: String::new(),
+            port: None,
+            user: String::new(),
+            read_only,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+        }
+    }
+
+    /// CURATION item 4(c): `SELECT 1; UPDATE …` on a READ-ONLY connection
+    /// runs the SELECT (`Started` with columns + `Finished`), then stops at
+    /// the UPDATE with the SHARED guard's message; nothing after it runs.
+    #[tokio::test]
+    async fn read_only_multi_run_runs_select_then_stops_at_update() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        {
+            // Prepare the fixture via a WRITABLE open first.
+            let mut conn = crate::connect::open(f.path().to_str().expect("utf8 path"), &handle)
+                .expect("open sqlite");
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new())
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'a')", CancelToken::new()).await.unwrap();
+        }
+
+        let cfg = sqlite_cfg(f.path().to_str().unwrap().to_string(), true);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let statements = vec![
+            "SELECT 1".to_string(),
+            "UPDATE t SET n = 'x'".to_string(),
+            "SELECT 2".to_string(),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let task = tokio::spawn(connect_and_run_many_inner(
+            spec,
+            statements,
+            CancelToken::new(),
+            None,
+            handle.clone(),
+            tx,
+        ));
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        task.await.unwrap();
+
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementStarted { index: 0, columns: Some(_), .. })));
+        assert!(events.iter().any(|e| matches!(e, MultiQueryEvent::StatementFinished { index: 0, .. })));
+        let guard_msg = guard_not_read_only(true).unwrap_err().message;
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementFailed { index: 1, error } if error.message == guard_msg)));
+        // Nothing for statement index 2, no RunFinished.
+        assert!(!events.iter().any(|e| matches!(e, MultiQueryEvent::StatementStarted { index: 2, .. })));
+        assert!(!events.iter().any(|e| matches!(e, MultiQueryEvent::RunFinished)));
+
+        // The write never reached the driver — table unchanged.
+        let mut verify = crate::connect::open(f.path().to_str().unwrap(), &handle).expect("reopen");
+        let mut stream =
+            verify.query("SELECT n FROM t WHERE id = 1", CancelToken::new()).await.unwrap();
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.unwrap()).unwrap();
+        }
+        assert_eq!(buf.cell_text(0, 0), "a");
+    }
+
+    #[tokio::test]
+    async fn multi_run_mixed_reads_and_writes_over_writable_connection() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        let cfg = sqlite_cfg(f.path().to_str().unwrap().to_string(), false);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let statements = vec![
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)".to_string(),
+            "INSERT INTO t VALUES (1, 'a')".to_string(),
+            "SELECT * FROM t".to_string(),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let task = tokio::spawn(connect_and_run_many_inner(
+            spec,
+            statements,
+            CancelToken::new(),
+            None,
+            handle,
+            tx,
+        ));
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        task.await.unwrap();
+
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementStarted { index: 0, columns: None, .. })));
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementFinished { index: 0, affected: Some(0), .. })));
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementStarted { index: 1, columns: None, .. })));
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementFinished { index: 1, affected: Some(1), .. })));
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementStarted { index: 2, columns: Some(_), .. })));
+        assert!(events.iter().any(|e| matches!(e,
+            MultiQueryEvent::StatementFinished { index: 2, affected: None, .. })));
+        assert!(matches!(events.last(), Some(MultiQueryEvent::RunFinished)));
+    }
+
+    #[tokio::test]
+    async fn multi_run_stops_on_first_error() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        let cfg = sqlite_cfg(f.path().to_str().unwrap().to_string(), false);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let statements = vec![
+            "CREATE TABLE t(id INTEGER PRIMARY KEY)".to_string(),
+            "UPDATE no_such_table SET x = 1".to_string(),
+            "SELECT 1".to_string(),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let task = tokio::spawn(connect_and_run_many_inner(
+            spec,
+            statements,
+            CancelToken::new(),
+            None,
+            handle,
+            tx,
+        ));
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        task.await.unwrap();
+
+        assert!(events.iter().any(|e| matches!(e, MultiQueryEvent::StatementFailed { index: 1, .. })));
+        // Statement 2 never dispatched — no third StatementStarted.
+        assert!(!events.iter().any(|e| matches!(e, MultiQueryEvent::StatementStarted { index: 2, .. })));
+        assert!(!events.iter().any(|e| matches!(e, MultiQueryEvent::RunFinished)));
     }
 }
 
