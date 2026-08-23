@@ -344,6 +344,36 @@ impl QueryRunner {
         rx
     }
 
+    /// G10 T3, design §5: one-shot fetch of the admin sub-views' labeled
+    /// catalog SELECTs (`admin_sql::{roles_catalog, privileges_catalog,
+    /// sizes_catalog}`'s output) — opens `spec` (same `open_spec` dispatch
+    /// as every other one-shot here), runs each `(label, sql)` pair
+    /// SEQUENTIALLY over the one connection, and drains each into
+    /// materialized rows via `drain_all_rows` (the same drain path
+    /// `fetch_lookup` uses). No read-only guard: this is a read, same
+    /// posture as `fetch_lookup`/`fetch_schema`. The first query to error
+    /// aborts the whole batch (CURATION item 5: no fallback query).
+    ///
+    /// Allow dead_code: T3 lands ahead of T4-T6's UI consumer
+    /// (`admin_panel.rs`'s `AdminEvent::FetchCatalog` handler) — exercised
+    /// directly by this file's own tests until then. Remove once T4 wires
+    /// it into `main.rs`.
+    #[allow(dead_code)]
+    pub fn fetch_admin_catalog(
+        &self,
+        spec: ConnectSpec,
+        queries: Vec<(&'static str, String)>,
+    ) -> tokio::sync::oneshot::Receiver<Result<Vec<(&'static str, AdminCatalogRows)>, QueryError>>
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            let result = fetch_admin_catalog_inner(spec, queries, handle).await;
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
     /// G5 Task 4: the sandbox Apply flow's execution — the app's ONLY write
     /// path. Opens ONE dedicated connection (same `open_spec` dispatch every
     /// other one-shot here uses) used EXCLUSIVELY for this BEGIN…COMMIT
@@ -353,9 +383,15 @@ impl QueryRunner {
     /// comment on `dbc-core`: no other `query()`/`execute()` call ever runs
     /// over this same connection while the transaction is open.
     ///
-    /// `statements` is `sandbox::generate_statements`' output verbatim
-    /// (`main.rs` builds it, this module stays decoupled from `sandbox`'s
-    /// types — a plain `Vec<(String, Option<u64>)>` is all this needs).
+    /// G10 T3: widened from `Vec<(String, Option<u64>)>` to
+    /// `Vec<admin_sql::WriteStatement>` (design §0) — still the app's ONLY
+    /// write path, now with TWO sanctioned callers (G5's sandbox Apply,
+    /// whose statements arrive via `WriteStatement::from((String,
+    /// Option<u64>))` so `exec_sql == display_sql`, and G10's admin Apply,
+    /// whose password-bearing statements have a real `exec_sql` and a
+    /// `'***'`-redacted `display_sql`), both through `main.rs`'s one
+    /// confirm dialog, both behind the SAME `guard_not_read_only` choke
+    /// point below — no fresh read-only logic added for admin.
     /// `timeout_secs` bounds the WHOLE sequence (not just the connect step),
     /// same "race the whole thing with `tokio::time::timeout`" shape
     /// `connect_and_run`'s watchdog uses.
@@ -366,7 +402,7 @@ impl QueryRunner {
     pub fn run_write_transaction(
         &self,
         spec: ConnectSpec,
-        statements: Vec<(String, Option<u64>)>,
+        statements: Vec<crate::admin_sql::WriteStatement>,
         timeout_secs: Option<u64>,
     ) -> tokio::sync::oneshot::Receiver<Result<u64, QueryError>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -819,7 +855,7 @@ pub fn affected_mismatch(expected: Option<u64>, reported: u64) -> bool {
 /// rather than constructing `SqliteConnection` here).
 async fn drive_write_sequence(
     conn: &mut dyn Connection,
-    statements: &[(String, Option<u64>)],
+    statements: &[crate::admin_sql::WriteStatement],
     cancel: CancelToken,
 ) -> Result<u64, QueryError> {
     if let Err(e) = conn.execute("BEGIN", cancel.clone()).await {
@@ -827,10 +863,10 @@ async fn drive_write_sequence(
         return Err(e);
     }
     let mut total: u64 = 0;
-    for (sql, expected) in statements {
-        match conn.execute(sql, cancel.clone()).await {
+    for st in statements {
+        match conn.execute(&st.exec_sql, cancel.clone()).await {
             Ok(affected) => {
-                if affected_mismatch(*expected, affected) {
+                if affected_mismatch(st.expected_affected, affected) {
                     let _ = conn.execute("ROLLBACK", cancel.clone()).await;
                     return Err(QueryError::msg(AFFECTED_MISMATCH_MSG));
                 }
@@ -838,7 +874,16 @@ async fn drive_write_sequence(
             }
             Err(e) => {
                 let _ = conn.execute("ROLLBACK", cancel.clone()).await;
-                return Err(e);
+                // G10 CURATION item 3 (redaction hardening): the surfaced
+                // error is paired with `display_sql` ONLY — `exec_sql` is
+                // used exactly once, in the `execute()` call above, and
+                // must never appear in any error/status/log/history string.
+                // For sandbox statements display_sql == exec_sql, so G5's
+                // error surface just gains helpful statement context.
+                return Err(QueryError::msg(format!(
+                    "{} — příkaz: {}",
+                    e.message, st.display_sql
+                )));
             }
         }
     }
@@ -888,7 +933,7 @@ const ROLLBACK_GRACE_SECS: u64 = 5;
 /// Postgres, no `ConnectSpec`/`open_spec` needed).
 async fn drive_write_sequence_bounded(
     conn: &mut dyn Connection,
-    statements: &[(String, Option<u64>)],
+    statements: &[crate::admin_sql::WriteStatement],
     cancel: CancelToken,
     timeout_secs: Option<u64>,
 ) -> Result<u64, QueryError> {
@@ -923,7 +968,7 @@ async fn drive_write_sequence_bounded(
 /// for the timeout/cancel/rollback mechanics.
 async fn run_write_transaction_inner(
     spec: ConnectSpec,
-    statements: Vec<(String, Option<u64>)>,
+    statements: Vec<crate::admin_sql::WriteStatement>,
     timeout_secs: Option<u64>,
     handle: tokio::runtime::Handle,
 ) -> Result<u64, QueryError> {
@@ -1682,15 +1727,26 @@ const LOOKUP_ROW_CAP: usize = 100_000;
 /// `rows[r][0]` is always the key column (see `fk_join::build_lookup_sql`,
 /// which puts it first); `rows[r][1..]` line up with the caller's
 /// `wanted_cols`, in order.
-type LookupResult = (Vec<String>, Vec<Vec<Option<String>>>);
+type LookupResult = AdminCatalogRows;
 
-async fn fetch_lookup_inner(
-    spec: ConnectSpec,
-    sql: String,
-    handle: tokio::runtime::Handle,
-) -> Result<LookupResult, QueryError> {
-    let mut opened = open_spec(spec, handle).await?;
-    let mut stream = opened.conn.query(&sql, CancelToken::new()).await?;
+/// G10 T3: `(column names, rows)` — the same shape `fetch_lookup`'s
+/// private `LookupResult` already had (now an alias of this), shared with
+/// `fetch_admin_catalog`'s labeled multi-SELECT results.
+pub type AdminCatalogRows = (Vec<String>, Vec<Vec<Option<String>>>);
+
+/// G10 T3: runs `sql` on an ALREADY-OPEN connection and drains the full
+/// result into materialized rows via a throwaway `dbc_buffer::ResultBuffer`,
+/// capped at `cap` rows — extracted out of `fetch_lookup_inner`'s body
+/// (moved verbatim) so `fetch_admin_catalog_inner` doesn't re-implement
+/// arrow batch draining. Shared by both: `fetch_lookup_inner` keeps its own
+/// `LOOKUP_ROW_CAP`; catalog results are small but capped defensively with
+/// the same constant.
+async fn drain_all_rows(
+    conn: &mut dyn Connection,
+    sql: &str,
+    cap: usize,
+) -> Result<AdminCatalogRows, QueryError> {
+    let mut stream = conn.query(sql, CancelToken::new()).await?;
     let col_names: Vec<String> =
         stream.columns.fields().iter().map(|f| f.name().to_string()).collect();
     let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
@@ -1698,14 +1754,14 @@ async fn fetch_lookup_inner(
         match item {
             Ok(b) => {
                 buf.push(b).map_err(|e| QueryError::msg(e.to_string()))?;
-                if buf.row_count() >= LOOKUP_ROW_CAP {
+                if buf.row_count() >= cap {
                     break;
                 }
             }
             Err(e) => return Err(e),
         }
     }
-    let n = buf.row_count().min(LOOKUP_ROW_CAP);
+    let n = buf.row_count().min(cap);
     let ncols = buf.column_count();
     let mut rows = Vec::with_capacity(n);
     for r in 0..n {
@@ -1716,6 +1772,33 @@ async fn fetch_lookup_inner(
         rows.push(row);
     }
     Ok((col_names, rows))
+}
+
+async fn fetch_lookup_inner(
+    spec: ConnectSpec,
+    sql: String,
+    handle: tokio::runtime::Handle,
+) -> Result<LookupResult, QueryError> {
+    let mut opened = open_spec(spec, handle).await?;
+    drain_all_rows(&mut *opened.conn, &sql, LOOKUP_ROW_CAP).await
+}
+
+/// G10 T3, design §5: one connection (`open_spec`, same dispatch as
+/// `fetch_schema`/`fetch_lookup`), each labeled SELECT run SEQUENTIALLY
+/// through the READ path (`Connection::query`, via `drain_all_rows`) —
+/// never `execute`. First error aborts the whole fetch (CURATION item 5:
+/// the privileges sub-view shows the error — there is no fallback query).
+async fn fetch_admin_catalog_inner(
+    spec: ConnectSpec,
+    queries: Vec<(&'static str, String)>,
+    handle: tokio::runtime::Handle,
+) -> Result<Vec<(&'static str, AdminCatalogRows)>, QueryError> {
+    let mut opened = open_spec(spec, handle).await?;
+    let mut out = Vec::with_capacity(queries.len());
+    for (label, sql) in queries {
+        out.push((label, drain_all_rows(&mut *opened.conn, &sql, LOOKUP_ROW_CAP).await?));
+    }
+    Ok(out)
 }
 
 /// Dispatches a `ConnectSpec` to the right driver inside `spawn_blocking`
@@ -1943,6 +2026,15 @@ async fn drain_rows(
 #[cfg(test)]
 mod write_transaction_tests {
     use super::*;
+    use crate::admin_sql::{self, WriteStatement};
+
+    /// G10 T3: builds a `WriteStatement` where `exec_sql == display_sql`,
+    /// matching `WriteStatement::from((String, Option<u64>))` — the
+    /// pre-G10 tests below only ever needed sandbox-shaped (non-redacted)
+    /// statements.
+    fn ws(sql: &str, expected: Option<u64>) -> WriteStatement {
+        (sql.to_string(), expected).into()
+    }
 
     #[test]
     fn affected_mismatch_pure() {
@@ -2028,8 +2120,8 @@ mod write_transaction_tests {
         conn.execute("INSERT INTO t(id, name) VALUES (1, 'a')", CancelToken::new()).await.unwrap();
 
         let stmts = vec![
-            ("UPDATE t SET name = 'b' WHERE id = 1".to_string(), Some(1)),
-            ("INSERT INTO t(id, name) VALUES (2, 'c')".to_string(), None),
+            ws("UPDATE t SET name = 'b' WHERE id = 1", Some(1)),
+            ws("INSERT INTO t(id, name) VALUES (2, 'c')", None),
         ];
         let total = drive_write_sequence(&mut *conn, &stmts, CancelToken::new()).await.unwrap();
         // 1 (the UPDATE's reported affected rows) + 1 (the INSERT's, even
@@ -2053,8 +2145,8 @@ mod write_transaction_tests {
         // but only 1 row matches -> mismatch -> the WHOLE transaction
         // (including the first, already-successful statement) rolls back.
         let stmts = vec![
-            ("UPDATE t SET name = 'b' WHERE id = 1".to_string(), Some(1)),
-            ("UPDATE t SET name = 'z' WHERE id = 1".to_string(), Some(2)),
+            ws("UPDATE t SET name = 'b' WHERE id = 1", Some(1)),
+            ws("UPDATE t SET name = 'z' WHERE id = 1", Some(2)),
         ];
         let err = drive_write_sequence(&mut *conn, &stmts, CancelToken::new()).await.unwrap_err();
         assert_eq!(err.message, AFFECTED_MISMATCH_MSG);
@@ -2073,8 +2165,8 @@ mod write_transaction_tests {
         // First statement succeeds; second is invalid SQL (unknown table) —
         // stops at the first error, rolls back the first statement too.
         let stmts = vec![
-            ("UPDATE t SET name = 'b' WHERE id = 1".to_string(), Some(1)),
-            ("UPDATE no_such_table SET name = 'x'".to_string(), None),
+            ws("UPDATE t SET name = 'b' WHERE id = 1", Some(1)),
+            ws("UPDATE no_such_table SET name = 'x'", None),
         ];
         let err = drive_write_sequence(&mut *conn, &stmts, CancelToken::new()).await.unwrap_err();
         assert_ne!(err.message, AFFECTED_MISMATCH_MSG);
@@ -2123,6 +2215,74 @@ mod write_transaction_tests {
         let handle = tokio::runtime::Handle::current();
         let err = run_write_transaction_inner(spec, Vec::new(), None, handle).await.unwrap_err();
         assert!(!err.message.is_empty());
+    }
+
+    /// G10 CURATION item 3's REQUIRED test: a mock `Connection` that fails
+    /// exactly the password-bearing `ALTER ROLE` statement with a generic
+    /// driver message — the runner's own error-pairing must attach
+    /// `display_sql` (redacted), never `exec_sql` (the real password).
+    struct FailsOnAlter;
+
+    #[async_trait::async_trait]
+    impl Connection for FailsOnAlter {
+        async fn query(
+            &mut self,
+            _sql: &str,
+            _cancel: CancelToken,
+        ) -> Result<dbc_core::QueryStream, QueryError> {
+            Err(QueryError::msg("not exercised"))
+        }
+        async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError> {
+            Err(QueryError::msg("not exercised"))
+        }
+        async fn execute(&mut self, sql: &str, _cancel: CancelToken) -> Result<u64, QueryError> {
+            if sql.starts_with("ALTER ROLE") {
+                return Err(QueryError::msg("syntax error"));
+            }
+            Ok(0) // BEGIN / ROLLBACK
+        }
+    }
+
+    /// BINDING carry-forward #1/#4 + CURATION item 3: the surfaced error
+    /// for a failing password-bearing statement must carry the redacted
+    /// `display_sql` and NEVER the real password from `exec_sql`.
+    #[tokio::test]
+    async fn statement_failure_pairs_display_sql_never_exec_sql() {
+        let mut conn = FailsOnAlter;
+        let stmts = admin_sql::alter_password(dbc_state::Engine::Postgres, "app_user", "s3cr'et");
+        let err = drive_write_sequence(&mut conn, &stmts, CancelToken::new()).await.unwrap_err();
+        assert!(err.message.contains("'***'"), "error must carry the redacted display_sql: {}", err.message);
+        assert!(err.message.contains("ALTER ROLE \"app_user\""));
+        assert!(!err.message.contains("s3cr"), "real password leaked into surfaced error: {}", err.message);
+    }
+
+    /// CURATION item 6's REQUIRED guard-level test: admin statements over a
+    /// read_only cfg are refused by the SHARED guard before any driver call
+    /// — same choke point G5's own refusal test already exercises, now
+    /// proven with admin-built statements (§3-novela: no fresh read-only
+    /// logic for admin — the guard is shared).
+    #[tokio::test]
+    async fn admin_statements_refused_on_read_only_before_any_driver_call() {
+        let cfg = dbc_state::ConnectionConfig {
+            id: "x".into(),
+            name: "x".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Postgres,
+            host: String::new(),
+            port: None,
+            database: "\0invalid".into(),
+            user: String::new(),
+            read_only: true,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+        };
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let stmts = admin_sql::drop_role(dbc_state::Engine::Postgres, "bob");
+        let handle = tokio::runtime::Handle::current();
+        let err = run_write_transaction_inner(spec, stmts, None, handle).await.unwrap_err();
+        assert_eq!(err.message, "připojení je jen pro čtení");
     }
 
     /// T4 review round 1, MAJOR 2: a mock `Connection` whose `execute()`
@@ -2178,7 +2338,7 @@ mod write_transaction_tests {
     async fn drive_write_sequence_bounded_always_returns_even_when_rollback_hangs() {
         let rollback_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut conn = HangingConnection { rollback_calls: rollback_calls.clone() };
-        let stmts = vec![("UPDATE t SET x = 1 WHERE id = 1".to_string(), Some(1))];
+        let stmts = vec![ws("UPDATE t SET x = 1 WHERE id = 1", Some(1))];
         let cancel = CancelToken::new();
 
         let start = tokio::time::Instant::now();
@@ -2204,6 +2364,78 @@ mod write_transaction_tests {
             "the SAME cancel token threaded through every execute() call must be cancelled on \
              timeout — this is what reaches the backend for real on Postgres (part (b) of the fix)"
         );
+    }
+}
+
+/// G10 T3: `drain_all_rows`/`fetch_admin_catalog_inner`'s sqlite-backed
+/// tests — generic SELECTs over a temp-file sqlite connection (same
+/// `open_sqlite_test_conn` pattern as `write_transaction_tests`, duplicated
+/// here for the same "private items don't cross sibling test-module
+/// boundaries" reason that module's own doc comment gives), exercising the
+/// drain shape and the sequential-labels/abort-on-first-error contract
+/// without any docker/live-pg dependency.
+#[cfg(test)]
+mod admin_catalog_tests {
+    use super::*;
+
+    async fn open_sqlite_test_conn() -> (tempfile::NamedTempFile, Box<dyn Connection>) {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        let conn =
+            crate::connect::open(f.path().to_str().expect("utf8 temp path"), &handle).expect("open sqlite");
+        (f, conn)
+    }
+
+    #[tokio::test]
+    async fn drains_labeled_queries_in_order() {
+        let (_f, mut conn) = open_sqlite_test_conn().await;
+        conn.execute("CREATE TABLE t(a TEXT)", CancelToken::new()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES ('x'), (NULL)", CancelToken::new()).await.unwrap();
+
+        let (cols, rows) =
+            drain_all_rows(&mut *conn, "SELECT a FROM t ORDER BY a IS NULL", 100).await.unwrap();
+        assert_eq!(cols, vec!["a".to_string()]);
+        assert_eq!(rows, vec![vec![Some("x".to_string())], vec![None]]);
+    }
+
+    #[tokio::test]
+    async fn first_error_aborts_whole_catalog_fetch() {
+        let (_f, mut conn) = open_sqlite_test_conn().await;
+        // No fallback (CURATION item 5): an erroring catalog SELECT is a
+        // hard Err for the whole labeled batch.
+        let err = drain_all_rows(&mut *conn, "SELECT * FROM no_such_catalog", 100).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_admin_catalog_inner_runs_labels_sequentially_and_stops_at_first_error() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        {
+            let mut conn =
+                crate::connect::open(f.path().to_str().expect("utf8 temp path"), &handle).expect("open sqlite");
+            conn.execute("CREATE TABLE t(a TEXT)", CancelToken::new()).await.unwrap();
+            conn.execute("INSERT INTO t VALUES ('x')", CancelToken::new()).await.unwrap();
+        }
+        let url = f.path().to_str().expect("utf8 temp path").to_string();
+
+        let ok = fetch_admin_catalog_inner(
+            ConnectSpec::Url(url.clone()),
+            vec![("first", "SELECT a FROM t".to_string()), ("second", "SELECT a FROM t".to_string())],
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.iter().map(|(l, _)| *l).collect::<Vec<_>>(), vec!["first", "second"]);
+        assert_eq!(ok[0].1, (vec!["a".to_string()], vec![vec![Some("x".to_string())]]));
+
+        let err = fetch_admin_catalog_inner(
+            ConnectSpec::Url(url),
+            vec![("ok", "SELECT a FROM t".to_string()), ("bad", "SELECT * FROM no_such_catalog".to_string())],
+            tokio::runtime::Handle::current(),
+        )
+        .await;
+        assert!(err.is_err(), "the second label's error must abort the whole batch");
     }
 }
 
@@ -4112,6 +4344,170 @@ mod compare_pg_tests {
             let (_, _, mut buf) = rx2.await.unwrap().expect("clean fetch must succeed");
             assert_eq!(buf.row_count(), 1, "row must be untouched — the injected DELETE never executed");
             assert_eq!(buf.cell_text(0, 0), "1", "the surviving row must still be id=1");
+        });
+    }
+}
+
+/// G10 T1+T2 review carry-forward (BLOCKER 2): `admin_sql::privileges_catalog`'s
+/// Postgres SQL (`aclexplode`/`acldefault`) had never run against a live
+/// PostgreSQL server — string-unit-tested only. This module closes that gap,
+/// plus proves the full admin write path (create role -> grant -> revoke ->
+/// drop) end-to-end through the SAME sanctioned `run_write_transaction_inner`
+/// every admin Apply click will use.
+///
+/// Same "plain #[test] + `runner.handle().block_on(...)`, NEVER
+/// `#[tokio::test]`" discipline as `monitor_pg_tests`/`compare_pg_tests`
+/// above (see either module's doc comment for the full nested-runtime-panic
+/// rationale) — `open_spec` is used for every connection (never
+/// `connect::open` directly).
+#[cfg(test)]
+mod admin_pg_tests {
+    use super::*;
+    use crate::admin_sql;
+    use testcontainers_modules::{
+        postgres::Postgres,
+        testcontainers::{runners::AsyncRunner, ImageExt},
+    };
+
+    async fn pg_url(
+        node: &testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+    ) -> String {
+        format!(
+            "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+            node.get_host_port_ipv4(5432).await.unwrap()
+        )
+    }
+
+    /// open_spec (NOT connect::open): see the module doc comment above.
+    async fn open_pg(url: &str) -> Box<dyn Connection> {
+        let handle = tokio::runtime::Handle::current();
+        open_spec(ConnectSpec::Url(url.to_string()), handle).await.expect("connect").conn
+    }
+
+    /// BLOCKER 2: runs `admin_sql::privileges_catalog(Postgres, "public")`
+    /// (via `fetch_admin_catalog_inner`, the exact function the runner's
+    /// public `fetch_admin_catalog` spawns) against a live PG 16.13 with a
+    /// table, an extra role, and an explicit GRANT seeded — asserts the
+    /// labeled result shape AND that the seeded grant is actually visible in
+    /// `object_acl`'s rows, proving `aclexplode`/`acldefault` parse and run
+    /// for real (never exercised end-to-end before this test).
+    #[test]
+    #[ignore]
+    fn admin_pg_privileges_catalog_sees_seeded_grant_on_live_postgres() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let node = Postgres::default().with_tag("16.13").start().await.unwrap();
+            let url = pg_url(&node).await;
+
+            {
+                let mut setup = open_pg(&url).await;
+                setup
+                    .execute("CREATE TABLE priv_t (id integer PRIMARY KEY)", CancelToken::new())
+                    .await
+                    .unwrap();
+                setup
+                    .execute("CREATE ROLE priv_grantee LOGIN", CancelToken::new())
+                    .await
+                    .unwrap();
+                setup
+                    .execute("GRANT SELECT ON priv_t TO priv_grantee", CancelToken::new())
+                    .await
+                    .unwrap();
+            }
+
+            let queries = admin_sql::privileges_catalog(dbc_state::Engine::Postgres, "public");
+            let result = fetch_admin_catalog_inner(
+                ConnectSpec::Url(url),
+                queries,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("privileges_catalog must run cleanly against live PG (aclexplode/acldefault)");
+
+            assert_eq!(
+                result.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+                vec!["object_acl", "schema_acl", "db_acl"]
+            );
+
+            let (_, (cols, rows)) = &result[0]; // object_acl
+            assert_eq!(cols, &vec![
+                "schema".to_string(), "object".to_string(), "kind".to_string(),
+                "grantee".to_string(), "privilege_type".to_string(), "is_grantable".to_string(),
+            ]);
+            let grantee_ix = cols.iter().position(|c| c == "grantee").unwrap();
+            let object_ix = cols.iter().position(|c| c == "object").unwrap();
+            let priv_ix = cols.iter().position(|c| c == "privilege_type").unwrap();
+            assert!(
+                rows.iter().any(|r| {
+                    r[object_ix].as_deref() == Some("priv_t")
+                        && r[grantee_ix].as_deref() == Some("priv_grantee")
+                        && r[priv_ix].as_deref() == Some("SELECT")
+                }),
+                "seeded GRANT SELECT ON priv_t TO priv_grantee must appear in object_acl rows: {rows:?}"
+            );
+
+            // schema_acl/db_acl must at least run without error and return
+            // their declared columns — sanity, not exhaustive (no schema-
+            // or database-level grant was seeded).
+            let (_, (schema_cols, _)) = &result[1];
+            assert!(schema_cols.contains(&"grantee".to_string()));
+            let (_, (db_cols, _)) = &result[2];
+            assert!(db_cols.contains(&"grantee".to_string()));
+        });
+    }
+
+    /// Plan T3 step 4 (adapted to this file's testcontainers discipline
+    /// rather than the plan's `DBC_PG_ADMIN_URL` env-var variant — Docker is
+    /// available in this environment, so the live test can actually run
+    /// here rather than merely being documented): end-to-end create role ->
+    /// grant -> revoke -> drop through the REAL write path
+    /// (`run_write_transaction_inner`, the same body
+    /// `QueryRunner::run_write_transaction` spawns), asserting the
+    /// history-bound display join is redacted and the whole sequence
+    /// commits successfully against live PG.
+    #[test]
+    #[ignore]
+    fn admin_pg_roundtrip_create_grant_revoke_drop() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let node = Postgres::default().with_tag("16.13").start().await.unwrap();
+            let url = pg_url(&node).await;
+            let engine = dbc_state::Engine::Postgres;
+            let password = "tajne'heslo";
+            let role = "g10_admin_test_role";
+
+            let mut stmts = admin_sql::create_role(
+                engine,
+                role,
+                password,
+                &admin_sql::RoleFlags { login: true, ..Default::default() },
+            );
+            stmts.extend(admin_sql::database_privilege_pg(
+                "postgres",
+                "CONNECT",
+                role,
+                admin_sql::CellState::Granted,
+            ));
+            stmts.extend(admin_sql::database_privilege_pg(
+                "postgres",
+                "CONNECT",
+                role,
+                admin_sql::CellState::NotSet,
+            ));
+            stmts.extend(admin_sql::drop_role(engine, role));
+
+            // What record_history/the confirm modal would show — display only.
+            let shown = stmts.iter().map(|s| s.display_sql.as_str()).collect::<Vec<_>>().join("\n");
+            assert!(shown.contains("'***'"));
+            assert!(!shown.contains("tajne"));
+
+            let total =
+                run_write_transaction_inner(ConnectSpec::Url(url), stmts, None, tokio::runtime::Handle::current())
+                    .await
+                    .expect("create -> grant -> revoke -> drop must commit against live PG");
+            let _ = total; // DDL affected counts are driver-defined; success is the assertion
         });
     }
 }

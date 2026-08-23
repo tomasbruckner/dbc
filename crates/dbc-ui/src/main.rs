@@ -4942,7 +4942,16 @@ impl AppView {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let started = std::time::Instant::now();
-        let rx = self.runner.run_write_transaction(spec, statements, timeout_secs);
+        // G10 T3: run_write_transaction now takes admin_sql::WriteStatement —
+        // the sandbox Apply flow's tuples convert via the blanket `From`
+        // impl (exec_sql == display_sql for these). ApplyDialogState.statements
+        // itself stays Vec<(String, Option<u64>)> in this task; T4
+        // generalizes the dialog to build WriteStatement earlier.
+        let rx = self.runner.run_write_transaction(
+            spec,
+            statements.into_iter().map(admin_sql::WriteStatement::from).collect(),
+            timeout_secs,
+        );
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |view, cx| {
