@@ -104,6 +104,49 @@ One window, hybrid layout (user choice "C"):
   primary key; tables without one are read-only with a status-bar notice.
   "Discard" drops all local changes.
 
+### G5 design pass (2026-08-23, per §4 — designed autonomously under the
+### standing mandate; decisions recorded here for later user review)
+
+- **Scope:** cell edits, row delete, row insert — on PREVIEW tabs only
+  (ad-hoc results have no reliable table identity). Requires: connection not
+  read-only, table has a detected PK (from `ColumnInfo::is_pk`), engine is
+  sqlite/postgres.
+- **Edit UX:** double-click a cell in an editable preview enters a cell
+  editor (single-line TextField overlay; Enter = stage locally, Esc =
+  cancel; a "NULL" button stages SQL NULL — an empty string and NULL are
+  distinct). Staged cells tint yellow; "Smazat řádek" via row context
+  affordance tints red; "+ řádek" appends a green editable row. Cell detail
+  (read popup) moves to right-double-click… no — stays on double-click for
+  NON-editable tabs; editable tabs open the editor instead (detail available
+  from the editor popup).
+- **Apply:** bottom apply bar when dirty ("{n} změn · Aplikovat · Zahodit").
+  Aplikovat opens a modal listing the EXACT generated SQL statements.
+  Confirm runs them in ONE transaction (BEGIN → statements → COMMIT;
+  any error or affected-rows mismatch → ROLLBACK, error shown in the modal,
+  edits stay staged). Success: edits cleared, preview re-run, write recorded
+  in history.
+- **SQL generation rules:** `UPDATE t SET "c" = v, … WHERE "pk1" = v1 AND …`
+  one statement per edited row; `DELETE FROM t WHERE …` per deleted row;
+  `INSERT INTO t ("c1", …) VALUES (…)` per new row (only columns the user
+  filled; others take table defaults). Values: staged NULL → `NULL`;
+  otherwise single-quoted with `''` escaping — numeric-typed columns (from
+  the Arrow schema of the preview result) are emitted unquoted after a
+  strict numeric-parse check (parse failure → quoted string, let the server
+  decide). PK WHERE uses ORIGINAL values (pre-edit), quoted by the same
+  rules. Editing PK columns themselves is allowed (WHERE still uses the
+  original values).
+- **Concurrency handling:** every UPDATE/DELETE checks driver-reported
+  affected rows == 1; a mismatch (row changed/vanished under us) aborts the
+  whole transaction with a rollback and the message
+  `řádek se mezitím změnil — aplikace zrušena`. No row-versioning beyond
+  this (PK-based optimistic check), matching DataGrip's default posture.
+- **Write path plumbing:** new `Connection::execute(sql, cancel) ->
+  Result<u64, QueryError>` (affected rows) on the trait, implemented for
+  sqlite + postgres; the Apply runner method drives
+  BEGIN/…/COMMIT/ROLLBACK through it sequentially. This is the app's ONLY
+  write path (constraint §3 upheld); the editor's read pipeline and guards
+  are untouched by Apply.
+
 ## 2. Phasing
 
 Each phase is independently shippable; order minimises risk (first DB write
