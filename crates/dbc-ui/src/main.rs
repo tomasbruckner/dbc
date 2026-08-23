@@ -1,6 +1,11 @@
 mod autocomplete;
 mod connect;
 mod connections_ui;
+// G8 T4: unwired until T6 constructs ErDiagramView (TabContent::Diagram +
+// palette action + schema-tree icon) — same temporary-allow-then-remove
+// precedent `monitor_sql.rs`'s doc comment references for `mod plan;`.
+#[allow(dead_code)]
+mod er_diagram_view;
 mod export;
 mod fk_join;
 mod grid;
