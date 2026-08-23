@@ -1202,3 +1202,357 @@ mod monitor_tests {
         drop(f);
     }
 }
+
+/// G9 T7: docker-gated proof of the pg monitor SQL against a live server —
+/// real refresh over all 8 tiles, a genuine lock-wait blocking chain, a
+/// real kill through `monitor_loop`, and the review-mandated kill-
+/// promptness-during-slow-refresh characterization. Docker required. Run
+/// with:
+///   %USERPROFILE%\.cargo\bin\cargo.exe test -p dbc-ui -- --ignored monitor_pg_tests::
+///
+/// NOTE (deviation from the plan's grounding — the same hazard G13 T2 hit
+/// first and fixed, see `plan.rs`'s `pg_docker_tests` module for the fuller
+/// writeup): every test here is a plain, NON-async `#[test]` that owns a
+/// `QueryRunner` on an ordinary OS thread and drives the whole body through
+/// `runner.handle().block_on(...)`, NOT `#[tokio::test]`. Wrapping a test in
+/// `#[tokio::test]` runs its body ON a tokio runtime worker thread; calling
+/// `connect::open`'s Postgres arm (which itself calls `runtime.block_on`)
+/// from there panics ("Cannot start a runtime from within a runtime").
+/// `open_spec` (used everywhere below, never `connect::open` directly)
+/// avoids that by wrapping the same call in `spawn_blocking`, which is the
+/// only place a nested `block_on` is legal to call from again — but that
+/// alone doesn't fix a second, independent hazard: `QueryRunner::new()`
+/// builds its OWN fully independent multi-thread `tokio::Runtime`, and
+/// dropping a `Runtime` from inside an async context (e.g. at the end of a
+/// `#[tokio::test]` fn, when `runner` would go out of scope inside that
+/// fn's own ambient runtime) panics too. A plain `#[test]` fn is ordinary
+/// sync context, so `runner` drops safely there instead.
+#[cfg(test)]
+mod monitor_pg_tests {
+    use super::*;
+    use testcontainers_modules::{
+        postgres::Postgres,
+        testcontainers::{runners::AsyncRunner, ImageExt},
+    };
+
+    async fn pg_url(
+        node: &testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+    ) -> String {
+        format!(
+            "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+            node.get_host_port_ipv4(5432).await.unwrap()
+        )
+    }
+
+    /// open_spec (NOT connect::open): see the module doc comment above.
+    /// Also keeps this file free of driver-crate names.
+    async fn open_pg(url: &str) -> Box<dyn Connection> {
+        let handle = tokio::runtime::Handle::current();
+        open_spec(ConnectSpec::Url(url.to_string()), handle).await.expect("connect").conn
+    }
+
+    #[test]
+    #[ignore]
+    fn monitor_refresh_produces_populated_snapshot_on_live_postgres() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let node = Postgres::default().with_tag("16.13").start().await.unwrap();
+            let url = pg_url(&node).await;
+
+            // Setup session: a table with data so the tables section is non-empty.
+            let mut setup = open_pg(&url).await;
+            setup
+                .execute("CREATE TABLE mon_t(id INT PRIMARY KEY, v TEXT)", CancelToken::new())
+                .await
+                .unwrap();
+            setup
+                .execute(
+                    "INSERT INTO mon_t SELECT g, 'v' || g FROM generate_series(1, 1000) g",
+                    CancelToken::new(),
+                )
+                .await
+                .unwrap();
+
+            let mut conn = open_pg(&url).await;
+            let results =
+                run_monitor_refresh(&mut *conn, dbc_state::Engine::Postgres, CancelToken::new())
+                    .await;
+            let snap = monitor::assemble_snapshot(results, Instant::now()).expect("snapshot");
+
+            let connections = snap.connections.expect("connections tile");
+            assert!(connections.max.unwrap_or(0) > 0, "max_connections should parse");
+            assert!(snap.locks.is_some());
+            assert!(snap.size.data_bytes.unwrap_or(0) > 0, "database has a size");
+            // Container's postgres superuser may read pg_ls_waldir:
+            assert!(snap.size.wal_or_log_bytes.is_some(), "WAL size readable as superuser");
+            let perf = snap.perf.expect("perf tile");
+            assert!(perf.uptime_secs >= 0);
+            assert!(perf.xact_total.is_some());
+            assert_eq!(perf.tps, None, "tps is a client-side delta, never parsed");
+            assert!(snap.running.is_some());
+            let tables = snap.tables.expect("tables section");
+            assert!(
+                tables.iter().any(|t| t.table == "mon_t"),
+                "created table must appear in per-table sizes"
+            );
+        });
+    }
+
+    /// Design §8 T7: a deliberate lock wait — session A holds a row lock,
+    /// session B blocks on it; the blocking-chain query must return the
+    /// waiter/blocker pair and build_blocking_tree must nest them.
+    #[test]
+    #[ignore]
+    fn blocking_chain_query_sees_a_real_lock_wait() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let node = Postgres::default().with_tag("16.13").start().await.unwrap();
+            let url = pg_url(&node).await;
+
+            let mut setup = open_pg(&url).await;
+            setup
+                .execute("CREATE TABLE lock_t(id INT PRIMARY KEY, v INT)", CancelToken::new())
+                .await
+                .unwrap();
+            setup.execute("INSERT INTO lock_t VALUES (1, 0)", CancelToken::new()).await.unwrap();
+
+            // Session A: open transaction holding the row lock.
+            let mut a = open_pg(&url).await;
+            a.execute("BEGIN", CancelToken::new()).await.unwrap();
+            a.execute("UPDATE lock_t SET v = 1 WHERE id = 1", CancelToken::new()).await.unwrap();
+
+            // Session B: blocks on the same row, in a background task.
+            let mut b = open_pg(&url).await;
+            let b_task = tokio::spawn(async move {
+                let _ = b.execute("UPDATE lock_t SET v = 2 WHERE id = 1", CancelToken::new()).await;
+                b
+            });
+            tokio::time::sleep(Duration::from_secs(2)).await; // let B reach the lock queue
+
+            let mut mon = open_pg(&url).await;
+            let results =
+                run_monitor_refresh(&mut *mon, dbc_state::Engine::Postgres, CancelToken::new())
+                    .await;
+            let snap = monitor::assemble_snapshot(results, Instant::now()).expect("snapshot");
+
+            let tree = snap.blocking.expect("blocking section");
+            assert_eq!(tree.len(), 1, "exactly one blocking chain expected, got {tree:?}");
+            assert_eq!(tree[0].children.len(), 1, "one waiter under the blocker");
+            assert!(!tree[0].cycle && !tree[0].children[0].cycle);
+            assert!(
+                tree[0].children[0].query.as_deref().unwrap_or("").contains("UPDATE lock_t"),
+                "waiter query text should surface"
+            );
+            let waiting = snap.locks.expect("locks tile").waiting;
+            assert!(waiting >= 1, "waiting-locks counter must see the queued lock");
+
+            // Release: A rolls back, B completes.
+            a.execute("ROLLBACK", CancelToken::new()).await.unwrap();
+            let _b = tokio::time::timeout(Duration::from_secs(10), b_task)
+                .await
+                .expect("B unblocks once A rolls back")
+                .unwrap();
+        });
+    }
+
+    /// End-to-end kill through the REAL loop: find the pg_sleep session's
+    /// pid via a refresh, Kill it, assert KillResult Ok — the full
+    /// execute()-path counterpart of T3's mock-level gate tests.
+    #[test]
+    #[ignore]
+    fn kill_terminates_a_live_session_via_monitor_loop() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let node = Postgres::default().with_tag("16.13").start().await.unwrap();
+            let url = pg_url(&node).await;
+
+            // Victim session: a long sleep, driven in a background task.
+            let mut victim = open_pg(&url).await;
+            let victim_task = tokio::spawn(async move {
+                let cancel = CancelToken::new();
+                match victim.query("SELECT pg_sleep(600)", cancel).await {
+                    Ok(mut s) => {
+                        while let Some(item) = s.batches.recv().await {
+                            if item.is_err() {
+                                return true; // stream errored = terminated
+                            }
+                        }
+                        false
+                    }
+                    Err(_) => true,
+                }
+            });
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let mon = open_pg(&url).await;
+            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+            let loop_task = tokio::spawn(monitor_loop(
+                mon,
+                dbc_state::Engine::Postgres,
+                /* read_only */ false,
+                cmd_rx,
+                event_tx,
+            ));
+
+            // Refresh to learn the victim's pid.
+            cmd_tx.send(MonitorCmd::Refresh { generation: 1 }).await.unwrap();
+            let pid = loop {
+                match tokio::time::timeout(Duration::from_secs(30), event_rx.recv())
+                    .await
+                    .expect("event")
+                    .expect("channel open")
+                {
+                    MonitorEvent::Data { snapshot, .. } => {
+                        let running = snapshot.running.expect("running section");
+                        let found = running
+                            .iter()
+                            .find(|r| r.query.as_deref().unwrap_or("").contains("pg_sleep(600)"))
+                            .map(|r| r.pid);
+                        break found.expect("victim session visible in running queries");
+                    }
+                    MonitorEvent::Error { message, .. } => panic!("refresh failed: {message}"),
+                    MonitorEvent::KillResult { .. } => unreachable!("no kill dispatched yet"),
+                }
+            };
+
+            cmd_tx.send(MonitorCmd::Kill { generation: 1, pid }).await.unwrap();
+            match tokio::time::timeout(Duration::from_secs(30), event_rx.recv())
+                .await
+                .expect("event")
+                .expect("channel open")
+            {
+                MonitorEvent::KillResult { pid: killed, result, .. } => {
+                    assert_eq!(killed, pid);
+                    assert!(result.is_ok(), "kill failed: {result:?}");
+                }
+                other => panic!("expected KillResult, got {other:?}"),
+            }
+
+            let terminated = tokio::time::timeout(Duration::from_secs(30), victim_task)
+                .await
+                .expect("victim query ends after termination")
+                .unwrap();
+            assert!(terminated, "victim's stream must surface the termination error");
+
+            drop(cmd_tx);
+            tokio::time::timeout(Duration::from_secs(5), loop_task).await.unwrap().unwrap();
+        });
+    }
+
+    /// REVIEW-MANDATED (T3's accepted MINOR, recorded in the phase ledger):
+    /// characterizes kill promptness when Kill is dispatched WHILE a
+    /// refresh is genuinely stuck — not touching production SQL to
+    /// manufacture the stall. TABLES's `pg_relation_size`/`pg_indexes_size`
+    /// calls need an AccessShareLock on each relation they measure; holding
+    /// an ACCESS EXCLUSIVE lock on the one user table in this database from
+    /// a second session makes that statement block for real, mid-refresh,
+    /// the same way an operator's ALTER TABLE/VACUUM FULL would in
+    /// production — no pg_sleep injected into monitor SQL.
+    ///
+    /// Bound rationale: Kill is NOT instant here by design (`monitor_loop`'s
+    /// doc comment: "a kill never interleaves with an in-flight refresh:
+    /// the tokio::select! ... cancels the refresh first"). Promptness has
+    /// two real steps, not zero: (a) the `select!` noticing `cmd_rx` over
+    /// the still-pending refresh future — effectively immediate, tokio
+    /// polls the ready branch on the next wake — then (b) the ONE dedicated
+    /// connection actually absorbing the cancel-triggered error from the
+    /// stuck TABLES statement before the KILL statement can even be SENT
+    /// (single-connection wire pipelining, same session-sharing caveat
+    /// `Connection::execute`'s doc comment describes). Both are protocol-
+    /// level round trips against a local docker container, NOT proportional
+    /// to how long the lock would otherwise be held (nothing here ever
+    /// releases `slow_t`'s lock before the kill completes) — 8s
+    /// comfortably covers that round trip on a local container while still
+    /// failing a regression that made Kill wait out the stuck statement
+    /// instead of pre-empting it.
+    #[test]
+    #[ignore]
+    fn kill_is_prompt_when_dispatched_mid_slow_refresh() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let node = Postgres::default().with_tag("16.13").start().await.unwrap();
+            let url = pg_url(&node).await;
+
+            let mut setup = open_pg(&url).await;
+            setup
+                .execute("CREATE TABLE slow_t(id INT PRIMARY KEY)", CancelToken::new())
+                .await
+                .unwrap();
+
+            // Locker session: holds an ACCESS EXCLUSIVE lock so the
+            // refresh's TABLES statement genuinely blocks instead of
+            // racing to finish before the Kill is dispatched.
+            let mut locker = open_pg(&url).await;
+            locker.execute("BEGIN", CancelToken::new()).await.unwrap();
+            let pid_rows = drain_rows(&mut *locker, "SELECT pg_backend_pid()", &CancelToken::new())
+                .await
+                .expect("pid query");
+            let locker_pid: i64 = pid_rows[0][0]
+                .as_deref()
+                .expect("pg_backend_pid() is never NULL")
+                .parse()
+                .expect("pid is numeric");
+            locker
+                .execute("LOCK TABLE slow_t IN ACCESS EXCLUSIVE MODE", CancelToken::new())
+                .await
+                .unwrap();
+
+            let mon = open_pg(&url).await;
+            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+            let loop_task = tokio::spawn(monitor_loop(
+                mon,
+                dbc_state::Engine::Postgres,
+                /* read_only */ false,
+                cmd_rx,
+                event_tx,
+            ));
+
+            cmd_tx.send(MonitorCmd::Refresh { generation: 1 }).await.unwrap();
+            // Give the refresh time to run the first 7 (fast, metadata-only)
+            // statements and reach TABLES, where it blocks for real on
+            // slow_t's lock.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let kill_dispatched_at = Instant::now();
+            cmd_tx.send(MonitorCmd::Kill { generation: 1, pid: locker_pid }).await.unwrap();
+
+            let event = tokio::time::timeout(Duration::from_secs(30), event_rx.recv())
+                .await
+                .expect("KillResult must arrive well before a hard 30s ceiling")
+                .expect("channel open");
+            let elapsed = kill_dispatched_at.elapsed();
+
+            match &event {
+                MonitorEvent::KillResult { pid, result, .. } => {
+                    assert_eq!(*pid, locker_pid);
+                    assert!(result.is_ok(), "kill failed: {result:?}");
+                }
+                other => panic!(
+                    "expected the select!'s cmd_rx branch to pre-empt the stuck refresh and \
+                     yield a KillResult first, got {other:?}"
+                ),
+            }
+            assert!(
+                elapsed < Duration::from_secs(8),
+                "kill took {elapsed:?} while a refresh was stuck on a lock wait — expected the \
+                 select!'s cancel-on-arrival path to pre-empt it promptly, not wait out the lock \
+                 (see this test's doc comment for the bound rationale)"
+            );
+
+            // Sanity: the kill genuinely terminated the locker's backend
+            // (not merely accepted well-formed SQL) — a follow-up
+            // statement on that same connection must now fail.
+            let after = locker.execute("SELECT 1", CancelToken::new()).await;
+            assert!(after.is_err(), "locker's connection must be dead after being terminated");
+
+            drop(cmd_tx);
+            let _ = tokio::time::timeout(Duration::from_secs(5), loop_task).await;
+        });
+    }
+}
