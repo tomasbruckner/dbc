@@ -17,9 +17,13 @@ pub trait Connection: Send {
     async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError>;
 
     /// Executes a non-returning statement, reporting affected rows. This is
-    /// the app's write path — ONLY the sandbox Apply flow and the
+    /// the app's write path — ONLY the sandbox Apply flow, the
     /// server-monitor's confirmed kill action (G9: `pg_terminate_backend` /
     /// `KILL <spid>`, confirm-dialog-gated, refused on read-only
+    /// connections), and the ANALYZE-on-a-write sequence (G13:
+    /// `QueryRunner::run_analyze_write` — a dedicated connection, BEGIN …
+    /// the user's write wrapped in `EXPLAIN ANALYZE` … ROLLBACK, ALWAYS,
+    /// never COMMIT — confirm-dialog-gated, refused on read-only
     /// connections) may call it.
     ///
     /// Transactions are per-connection: a caller driving `BEGIN` … `COMMIT`/

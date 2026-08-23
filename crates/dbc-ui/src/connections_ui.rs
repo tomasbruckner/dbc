@@ -951,6 +951,13 @@ pub enum ModalState {
         error: Option<String>,
         dispatched: bool,
     },
+    /// G13 T6 (design §5 case 3 / §3-novela): confirm dialog for
+    /// "Analyzovat" on a write statement over a WRITABLE connection — `sql`
+    /// is the ORIGINAL (pre-`EXPLAIN ANALYZE`-wrap) editor text, shown
+    /// verbatim so the user sees exactly what will actually run (and be
+    /// rolled back). `engine` is needed at confirm time to rebuild the
+    /// wrapped `EXPLAIN ANALYZE` SQL via `plan::explain_analyze_sql`.
+    AnalyzeWriteConfirm { sql: String, engine: Engine },
 }
 
 // ---------------------------------------------------------------------
@@ -1076,6 +1083,9 @@ impl AppView {
             }
             ModalState::KillConfirm { pid, label, sql, error, dispatched, .. } => {
                 render_kill_confirm_panel(pid, &label, &sql, &error, dispatched, cx)
+            }
+            ModalState::AnalyzeWriteConfirm { sql, engine } => {
+                render_analyze_write_confirm_panel(&sql, engine, cx)
             }
         };
         Some(
@@ -2160,6 +2170,74 @@ fn render_kill_confirm_panel(
             .child(confirm_button),
     );
     panel.into_any_element()
+}
+
+/// G13 T6 (design §5 case 3 / §3-novela): confirm dialog for "Analyzovat"
+/// on a write over a writable connection. Shows the LITERAL SQL that will
+/// actually run — same "show the exact generated SQL" principle as the
+/// Apply dialog and the kill-confirm panel above — plus an explicit warning
+/// that side effects OUTSIDE the wrapping transaction (sequence/IDENTITY
+/// advances, external function calls) are not undone by the ROLLBACK.
+/// Confirming dispatches `AppView::on_confirm_analyze_write` (main.rs),
+/// which resolves the spec, rebuilds the wrapped `EXPLAIN ANALYZE` SQL, and
+/// calls `QueryRunner::run_analyze_write`.
+fn render_analyze_write_confirm_panel(
+    sql: &str,
+    engine: Engine,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let sql = sql.to_string();
+    div()
+        .id("analyze-write-confirm")
+        .w(px(520.))
+        .bg(rgb(0x1e1e2e))
+        .border_1()
+        .border_color(rgb(0x45475a))
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(rgb(0xcdd6f4))
+        .child(div().text_size(px(16.)).child("Analyzovat (EXPLAIN ANALYZE)"))
+        .child(div().text_color(rgb(0xf9e2af)).child(
+            "Toto SQL bude SKUTEČNĚ PROVEDENO, aby bylo možné změřit skutečný plán, a poté vráceno \
+             zpět (ROLLBACK). Vedlejší efekty MIMO transakci (např. hodnoty sekvencí/IDENTITY, \
+             volání externích funkcí) NEBUDOU vráceny zpět.",
+        ))
+        .child(
+            div()
+                .id("analyze-write-sql-preview")
+                .p_1()
+                .bg(rgb(0x181825))
+                .rounded_md()
+                .text_color(rgb(0xa6adc8))
+                .whitespace_normal()
+                .child(sql),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .justify_end()
+                .mt_2()
+                .child(
+                    styled_button("analyze-write-cancel", "Zrušit")
+                        .on_click(cx.listener(|v, _, _, cx| {
+                            v.modal = None;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    styled_button("analyze-write-confirm-btn", "Analyzovat")
+                        .bg(rgb(0x5d2e2e)) // danger tint — DELETED_ROW_BG family, matches kill-confirm
+                        .on_click(cx.listener(move |v, _, window, cx| {
+                            v.on_confirm_analyze_write(engine, window, cx);
+                        })),
+                ),
+        )
+        .into_any_element()
 }
 
 #[cfg(test)]
