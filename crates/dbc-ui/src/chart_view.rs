@@ -33,6 +33,20 @@ const PAD_TOP: f32 = 8.0;
 const PAD_BOTTOM: f32 = 22.0; // x tick labels
 const LABEL_MIN_PX: f32 = 60.0; // label every Nth tick so labels don't collide
 
+/// Review hardening (M1): X columns are unfiltered — any type, including
+/// TEXT/VARCHAR(MAX) — so an x-label must be capped BEFORE it's stored in
+/// `ChartData`, not just sanitized at paint time. Without this, a wide text
+/// column would fully text-shape a multi-KB string on every visible tick,
+/// every repaint. Char-count cap (not byte-slicing — must stay UTF-8 safe).
+const X_LABEL_CHAR_CAP: usize = 40;
+
+/// Review hardening (M3): belt only — the real UX bound is the picker's
+/// checkbox list (Task 11), which offers at most `column_count()` numeric
+/// columns. This stops an unbounded/malformed `y_cols` list (e.g. a future
+/// non-picker caller) from painting an unbounded number of series, and thus
+/// doing unbounded work, on every repaint.
+const MAX_SERIES: usize = 8;
+
 pub enum ChartViewEvent {
     /// "Upravit…" clicked — main.rs reopens `ModalState::ChartPicker`
     /// seeded from `picker_seed()`, edit-in-place (design §2.4's only
@@ -70,13 +84,21 @@ impl ChartView {
         let total = buf.row_count();
         let rows = total.min(chart_data::CHART_ROW_HARD_CAP);
         // Belt: the picker only offers real columns, but never panic on an
-        // out-of-range index — silently drop it (tested).
-        let y_cols: Vec<usize> =
-            y_cols.iter().copied().filter(|&c| c < buf.column_count()).collect();
+        // out-of-range index — silently drop it (tested). Also belt-caps
+        // the series count (M3) — see MAX_SERIES doc comment.
+        let y_cols: Vec<usize> = y_cols
+            .iter()
+            .copied()
+            .filter(|&c| c < buf.column_count())
+            .take(MAX_SERIES)
+            .collect();
         // names first — schema() borrows buf, cell_text needs &mut:
         let names: Vec<String> =
             y_cols.iter().map(|&c| buf.schema().field(c).name().clone()).collect();
-        let x_labels: Vec<String> = (0..rows).map(|r| buf.cell_text(r, x_col)).collect();
+        // (M1) cap each x-label's char count BEFORE it's stored — see
+        // X_LABEL_CHAR_CAP doc comment.
+        let x_labels: Vec<String> =
+            (0..rows).map(|r| cap_x_label(buf.cell_text(r, x_col))).collect();
         let y_columns: Vec<(String, Vec<Option<String>>)> = y_cols
             .iter()
             .zip(names)
@@ -178,6 +200,18 @@ impl Render for ChartView {
     }
 }
 
+/// Char-count cap (UTF-8 safe — never slices mid-codepoint), not a byte cap.
+/// See `X_LABEL_CHAR_CAP` doc comment (M1).
+fn cap_x_label(s: String) -> String {
+    if s.chars().count() <= X_LABEL_CHAR_CAP {
+        s
+    } else {
+        let mut truncated: String = s.chars().take(X_LABEL_CHAR_CAP).collect();
+        truncated.push('…');
+        truncated
+    }
+}
+
 fn series_color(theme: &Theme, i: usize) -> Hsla {
     // design §2.1: fixed 4-color rotation, wrap-around accepted for v1.
     [theme.accent, theme.success, theme.warn, theme.danger][i % 4]
@@ -191,13 +225,14 @@ fn paint_chart(
     app: &mut App,
 ) {
     let theme = *app.theme(); // Theme is Copy — one read, then paint freely
-    let plot = Bounds::new(
-        bounds.origin + point(px(PAD_LEFT), px(PAD_TOP)),
-        size(
-            bounds.size.width - px(PAD_LEFT + PAD_RIGHT),
-            bounds.size.height - px(PAD_TOP + PAD_BOTTOM),
-        ),
-    );
+    // (M2) clamp to non-negative — when the pane is smaller than the fixed
+    // padding (a narrow/short tab, a live resize mid-drag), an unclamped
+    // subtraction here would give paint_quad negative-size Bounds for the
+    // axis lines below (a visual glitch, not a panic, but still wrong).
+    let plot_w = (f32::from(bounds.size.width) - (PAD_LEFT + PAD_RIGHT)).max(0.0);
+    let plot_h = (f32::from(bounds.size.height) - (PAD_TOP + PAD_BOTTOM)).max(0.0);
+    let plot =
+        Bounds::new(bounds.origin + point(px(PAD_LEFT), px(PAD_TOP)), size(px(plot_w), px(plot_h)));
     // axes: 1px quads (design §2.3)
     window.paint_quad(gpui::fill(
         Bounds::new(point(plot.left(), plot.bottom()), size(plot.size.width, px(1.))),
@@ -397,5 +432,54 @@ mod tests {
         let buffer = test_buffer();
         let data = ChartView::compute(&buffer, 0, &[1, 99]); // 99: belt only
         assert_eq!(data.series.len(), 1);
+    }
+
+    /// M1: a pathologically wide x-column cell (e.g. TEXT/VARCHAR(MAX) —
+    /// x-columns are unfiltered by type) must be capped BEFORE it's stored,
+    /// not just sanitized at paint time.
+    #[test]
+    fn compute_caps_x_label_length_and_marks_truncation() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("label", DataType::Utf8, false),
+            Field::new("y", DataType::Int64, true),
+        ]));
+        let long = "x".repeat(10_000);
+        let labels = StringArray::from_iter_values([long]);
+        let ys = Int64Array::from_iter([Some(1)]);
+        let b = RecordBatch::try_new(schema, vec![Arc::new(labels), Arc::new(ys)]).unwrap();
+        let mut buf = ResultBuffer::new(b.schema());
+        buf.push(b).unwrap();
+        let buffer = Rc::new(RefCell::new(buf));
+
+        let data = ChartView::compute(&buffer, 0, &[1]);
+        assert_eq!(data.x_labels.len(), 1);
+        let capped = &data.x_labels[0];
+        assert!(capped.chars().count() <= X_LABEL_CHAR_CAP + 1, "got {} chars", capped.chars().count());
+        assert!(capped.ends_with('…'));
+    }
+
+    /// M3: belt cap on series count — the picker (Task 11) is the real UX
+    /// bound, this only stops a runaway y_cols list from painting an
+    /// unbounded number of series.
+    #[test]
+    fn compute_caps_series_count_at_max_series() {
+        let n = MAX_SERIES + 5;
+        let mut fields = vec![Field::new("label", DataType::Utf8, false)];
+        let mut arrays: Vec<Arc<dyn dbc_core::arrow::array::Array>> = vec![Arc::new(
+            StringArray::from_iter_values((0..1).map(|i| format!("r{i}"))),
+        )];
+        for i in 0..n {
+            fields.push(Field::new(format!("y{i}"), DataType::Int64, true));
+            arrays.push(Arc::new(Int64Array::from_iter([Some(i as i64)])));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let b = RecordBatch::try_new(schema, arrays).unwrap();
+        let mut buf = ResultBuffer::new(b.schema());
+        buf.push(b).unwrap();
+        let buffer = Rc::new(RefCell::new(buf));
+
+        let y_cols: Vec<usize> = (1..=n).collect(); // all n y-columns, 1-indexed past label
+        let data = ChartView::compute(&buffer, 0, &y_cols);
+        assert_eq!(data.series.len(), MAX_SERIES);
     }
 }
