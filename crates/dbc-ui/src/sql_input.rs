@@ -427,7 +427,7 @@ impl SqlInput {
     /// `.detach()`ing is safe here specifically because coalescing happens
     /// on write-back, not by cancelling the stale task (same idiom as
     /// `main.rs`'s `run_generation`).
-    fn kick_highlight(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn kick_highlight(&mut self, cx: &mut Context<Self>) {
         self.highlight_generation += 1;
         let my_generation = self.highlight_generation;
         let text = self.buffer.text().to_string();

@@ -124,6 +124,9 @@ pub enum PaletteAction {
     /// G12 T3: same flow, folder mode — non-recursive `*.sql` listing
     /// (`AppView::start_script_pick(true, ..)`).
     RunSqlFolder,
+    /// G14 T10: toggles dark<->light directly (no submenu) — unconditional,
+    /// same posture as every other always-listed fixed action (design §1.5).
+    ToggleTheme,
 }
 
 /// One table/view from the current schema snapshot, plus whether it's
@@ -174,6 +177,11 @@ pub fn fixed_actions(monitor_available: bool, connection_active: bool) -> Vec<(S
         ("Porovnat databáze…".to_string(), PaletteAction::OpenCompare),
         ("Spustit SQL soubor…".to_string(), PaletteAction::RunSqlFile),
         ("Spustit SQL složku…".to_string(), PaletteAction::RunSqlFolder),
+        // G14 T10: unconditional — always listed, kept ahead of the
+        // conditional monitor/backup/restore rows below so
+        // `backup_restore_actions_present_and_last_when_connection_active`'s
+        // "last two rows" assumption keeps holding.
+        ("Přepnout motiv".to_string(), PaletteAction::ToggleTheme),
     ];
     if monitor_available {
         actions.push(("Monitor serveru".to_string(), PaletteAction::OpenMonitor));
@@ -424,9 +432,10 @@ mod rank_items_tests {
         assert!(matches!(items[5], PaletteItem::Action { .. }));
         // 5 base actions + G8 T6's "ER diagram" (`ShowErDiagram`) + G7's
         // "Porovnat databáze…" (`OpenCompare`) + G12 T3's "Spustit SQL
-        // soubor…"/"Spustit SQL složku…" — all unconditional, unlike
-        // `OpenMonitor` which is engine-gated (monitor_available=false here).
-        assert_eq!(items.len(), 2 + 2 + 1 + 9);
+        // soubor…"/"Spustit SQL složku…" + G14 T10's "Přepnout motiv"
+        // (`ToggleTheme`) — all unconditional, unlike `OpenMonitor` which is
+        // engine-gated (monitor_available=false here).
+        assert_eq!(items.len(), 2 + 2 + 1 + 10);
     }
 
     #[test]
@@ -531,5 +540,21 @@ mod rank_items_tests {
         assert!(items
             .iter()
             .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::RestoreDatabase, .. })));
+    }
+
+    // --- G14 T10: theme toggle is an unconditional fixed action ---
+    #[test]
+    fn theme_toggle_action_is_always_present() {
+        let items = rank_items("", &[], &[], &[], false, 30, false);
+        assert!(items.iter().any(|i| matches!(
+            i,
+            PaletteItem::Action { action: PaletteAction::ToggleTheme, .. }
+        )));
+        // and it fuzzy-matches by its Czech label:
+        let items = rank_items("motiv", &[], &[], &[], false, 30, false);
+        assert!(items.iter().any(|i| matches!(
+            i,
+            PaletteItem::Action { action: PaletteAction::ToggleTheme, .. }
+        )));
     }
 }

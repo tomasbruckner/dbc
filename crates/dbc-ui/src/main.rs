@@ -3350,6 +3350,9 @@ impl AppView {
                 // same reasoning `QueryParams` documents above.
                 connections_ui::ModalState::ScriptRun { .. } => true,
                 connections_ui::ModalState::CsvImport { .. } => true,
+                // G14 T10: no secret/unsaved-run state at all — a benign
+                // display-only panel, same reasoning as `QueryParams` above.
+                connections_ui::ModalState::Settings => true,
                 _ => false,
             };
             if closable {
@@ -3627,9 +3630,51 @@ impl AppView {
                 }
                 PaletteAction::RunSqlFile => self.start_script_pick(false, cx),
                 PaletteAction::RunSqlFolder => self.start_script_pick(true, cx),
+                PaletteAction::ToggleTheme => self.toggle_theme(cx),
             },
         }
         cx.notify();
+    }
+
+    /// G14 T10: single write-through path for both toggle surfaces (design
+    /// §1.5) — the settings-modal radio buttons AND the palette's "Přepnout
+    /// motiv" action both call this. A config-save failure still switches
+    /// the SESSION theme (the live switch must never be hostage to a
+    /// read-only disk) — the error is surfaced in the status line instead,
+    /// same "save failure degrades to session-only + status message" shape
+    /// as `on_tree_event`'s `ToggleFavourite` arm above.
+    fn set_theme(&mut self, mode: dbc_state::ThemeMode, cx: &mut Context<Self>) {
+        if self.config.theme != mode {
+            self.config.theme = mode;
+            self.status = match self.config.save(&self.config_path) {
+                Ok(()) => format!(
+                    "motiv: {}",
+                    match mode {
+                        dbc_state::ThemeMode::Dark => "tmavý",
+                        dbc_state::ThemeMode::Light => "světlý",
+                    }
+                ),
+                Err(e) => format!("error: motiv se nepodařilo uložit ({e})"),
+            };
+        }
+        cx.set_global(theme::Theme::from_mode(mode));
+        // Re-highlight the editor with the new syntax palette (Task 6's
+        // spans were computed against the old one — a switch must re-kick
+        // it, otherwise the SQL editor keeps stale colors until the next
+        // keystroke), then repaint everything.
+        self.sql.update(cx, |sql, cx| sql.kick_highlight(cx));
+        cx.refresh_windows(); // NOT cx.refresh() — doesn't exist at rev 907ed09
+        cx.notify();
+    }
+
+    /// G14 T10: dark<->light, dispatched from both the palette action and
+    /// the settings-modal gear/topbar entry point.
+    fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+        let next = match self.config.theme {
+            dbc_state::ThemeMode::Dark => dbc_state::ThemeMode::Light,
+            dbc_state::ThemeMode::Light => dbc_state::ThemeMode::Dark,
+        };
+        self.set_theme(next, cx);
     }
 
     /// Centered overlay (brief contract #1), same full-screen-backdrop +

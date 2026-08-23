@@ -1065,6 +1065,12 @@ pub enum ModalState {
         conn_identity: String,
         conn_label: String,
     },
+    /// G14 T10: app settings modal (theme row only, for now). Unit variant —
+    /// all its state (`config.theme`) already lives on `AppView`, same
+    /// "modal only carries display data" posture the other arms follow.
+    /// Opened via the topbar gear or the palette's "Přepnout motiv"
+    /// bypasses this entirely (direct `toggle_theme` dispatch, no modal).
+    Settings,
 }
 
 // ---------------------------------------------------------------------
@@ -1119,6 +1125,22 @@ impl AppView {
                     .ml_auto()
                     .text_color(cx.theme().text_faint)
                     .child(format!("dbc v{}", env!("CARGO_PKG_VERSION"))),
+            )
+            // G14 T10: settings gear — same `cx.stop_propagation()` pattern
+            // as `dropdown_item`'s ★/✎ icon buttons so this click doesn't
+            // also bubble to the row's dropdown-toggle handler above.
+            .child(
+                div()
+                    .id("top-bar-settings")
+                    .px_1()
+                    .cursor_pointer()
+                    .text_color(cx.theme().text_muted)
+                    .hover(|s| s.text_color(cx.theme().text_primary))
+                    .child("⚙")
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        cx.stop_propagation();
+                        view.open_settings(cx);
+                    })),
             )
     }
 
@@ -1234,6 +1256,7 @@ impl AppView {
                 &path, &table, &headers, &columns, &targets, row_count, &sample_sql, &error,
                 &conn_label, cx,
             ),
+            ModalState::Settings => self.render_settings_panel(cx),
         };
         Some(
             div()
@@ -1250,6 +1273,64 @@ impl AppView {
                 .child(panel)
                 .into_any_element(),
         )
+    }
+
+    /// G14 T10: theme row only, for now (design's minimal `ModalState::Settings`
+    /// scope) — the two radios call `set_theme` directly, so the switch is
+    /// visible immediately while the modal stays open (design §1.5: "the
+    /// user sees the live switch"); "Zavřít" (or Esc — see
+    /// `AppView::on_cancel_query`'s closable match) is the only way out.
+    fn render_settings_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mode = self.config.theme;
+        let radio = |id: &'static str,
+                     label: &'static str,
+                     m: dbc_state::ThemeMode,
+                     current: dbc_state::ThemeMode,
+                     cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .bg(if m == current { cx.theme().bg_selected } else { cx.theme().bg_hover })
+                .child(if m == current { "●" } else { "○" })
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_theme(m, cx)))
+        };
+        div()
+            .id("settings-panel")
+            .w(px(360.))
+            .bg(cx.theme().bg_panel)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded_md()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .text_color(cx.theme().text_primary)
+            .child(div().text_size(px(16.)).child("Nastavení"))
+            .child(div().text_color(cx.theme().text_muted).child("Motiv"))
+            .child(radio("settings-theme-dark", "Tmavý", dbc_state::ThemeMode::Dark, mode, cx))
+            .child(radio("settings-theme-light", "Světlý", dbc_state::ThemeMode::Light, mode, cx))
+            .child(
+                div()
+                    .id("settings-close")
+                    .mt_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(cx.theme().bg_hover)
+                    .cursor_pointer()
+                    .child("Zavřít")
+                    .on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))),
+            )
+            .into_any_element()
     }
 
     pub(crate) fn open_connection_dialog(
@@ -1338,6 +1419,17 @@ impl AppView {
         // doc comment (main.rs) for the full teardown-path accounting.
         self.cancel_active_backup_if_running();
         self.modal = None;
+        cx.notify();
+    }
+
+    /// G14 T10: topbar gear entry point. Same single-modal invariant every
+    /// other opener in this file applies (see `open_connection_dialog`'s
+    /// identical guard) — a no-op while any other modal is already open.
+    pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        self.modal = Some(ModalState::Settings);
         cx.notify();
     }
 
