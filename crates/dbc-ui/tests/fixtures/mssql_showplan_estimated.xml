@@ -1,0 +1,16 @@
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
+  <BatchSequence><Batch><Statements><StmtSimple>
+    <QueryPlan>
+      <RelOp NodeId="0" PhysicalOp="Nested Loops" LogicalOp="Inner Join" EstimateRows="3" EstimatedTotalSubtreeCost="0.123">
+        <NestedLoops>
+          <RelOp NodeId="1" PhysicalOp="Index Seek" LogicalOp="Index Seek" EstimateRows="1" EstimatedTotalSubtreeCost="0.01">
+            <IndexScan><Object Table="[dbo].[users]" Index="[PK_users]" Schema="[dbo]" /></IndexScan>
+          </RelOp>
+          <RelOp NodeId="2" PhysicalOp="Clustered Index Seek" LogicalOp="Clustered Index Seek" EstimateRows="3" EstimatedTotalSubtreeCost="0.02">
+            <IndexScan><Object Table="[dbo].[orders]" Index="[PK_orders]" Schema="[dbo]" /></IndexScan>
+          </RelOp>
+        </NestedLoops>
+      </RelOp>
+    </QueryPlan>
+  </StmtSimple></Statements></Batch></BatchSequence>
+</ShowPlanXML>

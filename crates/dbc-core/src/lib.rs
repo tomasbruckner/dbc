@@ -1,6 +1,7 @@
 mod cancel;
 mod connection;
 mod ddl;
+pub mod erd;
 mod error;
 mod guards;
 mod params;

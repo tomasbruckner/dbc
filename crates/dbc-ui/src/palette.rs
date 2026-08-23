@@ -101,6 +101,11 @@ pub enum PaletteAction {
     ToggleHistory,
     NewConnection,
     RefreshSchema,
+    OpenMonitor,
+    /// G8 T6: opens the ER diagram tab for the single unambiguous schema in
+    /// the current snapshot (`AppView::resolve_er_diagram_schema`), or
+    /// refuses with a Czech status pointing at the schema-tree icon.
+    ShowErDiagram,
 }
 
 /// One table/view from the current schema snapshot, plus whether it's
@@ -131,15 +136,23 @@ pub struct ConnectionSource {
 const FAVOURITE_BONUS: i64 = 1000;
 
 /// The fixed action rows, in display order, with their Czech labels (brief
-/// contract #3).
-pub fn fixed_actions() -> Vec<(String, PaletteAction)> {
-    vec![
+/// contract #3). `monitor_available` gates the monitor entry per the ACTIVE
+/// connection's engine (design §7): absent entirely — not disabled-but-
+/// visible — when the engine has no monitor (showing it for an engine
+/// without a monitor would just surface a confusing driver-missing error).
+pub fn fixed_actions(monitor_available: bool) -> Vec<(String, PaletteAction)> {
+    let mut actions = vec![
         ("Spustit dotaz".to_string(), PaletteAction::RunQuery),
         ("Přepnout strom".to_string(), PaletteAction::ToggleTree),
         ("Přepnout historii".to_string(), PaletteAction::ToggleHistory),
         ("Nové spojení…".to_string(), PaletteAction::NewConnection),
         ("Obnovit schéma".to_string(), PaletteAction::RefreshSchema),
-    ]
+        ("ER diagram".to_string(), PaletteAction::ShowErDiagram),
+    ];
+    if monitor_available {
+        actions.push(("Monitor serveru".to_string(), PaletteAction::OpenMonitor));
+    }
+    actions
 }
 
 fn table_search_text(t: &TableSource) -> String {
@@ -169,6 +182,7 @@ pub fn rank_items(
     tables: &[TableSource],
     history: &[HistorySource],
     connections: &[ConnectionSource],
+    monitor_available: bool,
     cap: usize,
 ) -> Vec<PaletteItem> {
     if query.trim().is_empty() {
@@ -185,7 +199,7 @@ pub fn rank_items(
         for c in connections {
             out.push(PaletteItem::Connection { id: c.id.clone(), name: c.name.clone() });
         }
-        for (label, action) in fixed_actions() {
+        for (label, action) in fixed_actions(monitor_available) {
             out.push(PaletteItem::Action { label, action });
         }
 
@@ -216,7 +230,7 @@ pub fn rank_items(
             scored.push((score, PaletteItem::Connection { id: c.id.clone(), name: c.name.clone() }));
         }
     }
-    for (label, action) in fixed_actions() {
+    for (label, action) in fixed_actions(monitor_available) {
         if let Some(score) = fuzzy_score(query, &label) {
             scored.push((score, PaletteItem::Action { label, action }));
         }
@@ -362,7 +376,7 @@ mod rank_items_tests {
         let history = vec![history(1, "select 1"), history(2, "select 2")];
         let connections = vec![conn("c1", "prod", false)];
 
-        let items = rank_items("", &tables, &history, &connections, 30);
+        let items = rank_items("", &tables, &history, &connections, false, 30);
 
         // Favourites (alphabetical) first, then history (as given), then
         // connections, then the 5 fixed actions.
@@ -375,7 +389,9 @@ mod rank_items_tests {
         assert_eq!(items[3], PaletteItem::HistoryEntry { id: 2, sql: "select 2".into() });
         assert_eq!(items[4], PaletteItem::Connection { id: "c1".into(), name: "prod".into() });
         assert!(matches!(items[5], PaletteItem::Action { .. }));
-        assert_eq!(items.len(), 2 + 2 + 1 + 5);
+        // 5 base actions + G8 T6's "ER diagram" (`ShowErDiagram` is
+        // unconditional, unlike `OpenMonitor` which is engine-gated).
+        assert_eq!(items.len(), 2 + 2 + 1 + 6);
     }
 
     #[test]
@@ -384,14 +400,14 @@ mod rank_items_tests {
         // query (brief contract #3 lists favourites/history/connections/
         // actions — not the whole unfiltered table list).
         let tables: Vec<TableSource> = (0..50).map(|i| table(None, &format!("t{i}"), true)).collect();
-        let items = rank_items("", &tables, &[], &[], 30);
+        let items = rank_items("", &tables, &[], &[], false, 30);
         assert_eq!(items.len(), 30);
     }
 
     #[test]
     fn non_matching_query_drops_items_that_dont_subsequence_match() {
         let tables = vec![table(None, "orders", false)];
-        let items = rank_items("zzz", &tables, &[], &[], 30);
+        let items = rank_items("zzz", &tables, &[], &[], false, 30);
         assert!(items.is_empty());
     }
 
@@ -407,7 +423,7 @@ mod rank_items_tests {
             fuzzy_score("orders", &table_search_text(&tables[1])),
             "test setup must produce a genuine base-score tie"
         );
-        let items = rank_items("orders", &tables, &[], &[], 30);
+        let items = rank_items("orders", &tables, &[], &[], false, 30);
         assert_eq!(
             items[0],
             PaletteItem::Table { schema: Some("bbbbb".into()), name: "orders".into() }
@@ -430,14 +446,26 @@ mod rank_items_tests {
         weak_match.push_str(&"z".repeat(30)); // long target: length penalty on top
 
         let tables = vec![table(None, &weak_match, true), table(None, "orders", false)];
-        let items = rank_items("orders", &tables, &[], &[], 30);
+        let items = rank_items("orders", &tables, &[], &[], false, 30);
         assert_eq!(items[0], PaletteItem::Table { schema: None, name: "orders".into() });
+    }
+
+    #[test]
+    fn monitor_entry_present_only_when_available() {
+        let items = rank_items("", &[], &[], &[], true, 30);
+        assert!(items
+            .iter()
+            .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::OpenMonitor, .. })));
+        let items = rank_items("", &[], &[], &[], false, 30);
+        assert!(items
+            .iter()
+            .all(|i| !matches!(i, PaletteItem::Action { action: PaletteAction::OpenMonitor, .. })));
     }
 
     #[test]
     fn results_are_capped_at_30() {
         let tables: Vec<TableSource> = (0..50).map(|i| table(None, &format!("orders_{i}"), false)).collect();
-        let items = rank_items("orders", &tables, &[], &[], 30);
+        let items = rank_items("orders", &tables, &[], &[], false, 30);
         assert_eq!(items.len(), 30);
     }
 }
