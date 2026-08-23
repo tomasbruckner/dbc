@@ -39,6 +39,13 @@ pub fn validate_pg_dbname(name: &str) -> Result<(), String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgDumpFormat {
     Custom,
+    /// Exercised by `pure_tests` (`pg_dump_args_plain_format_omits_compress`)
+    /// and reachable through this type's public API, but T6's dispatch
+    /// currently only ever constructs `Custom` (compress=6) — the plan's
+    /// "Postgres format radio" UI toggle was a scope trim (see this phase's
+    /// final report); `#[allow(dead_code)]` documents that, rather than
+    /// papering over an actual bug, until a format picker lands.
+    #[allow(dead_code)]
     Plain,
 }
 
@@ -298,6 +305,24 @@ pub fn display_command_line(program: &str, args: &[String], secret: Option<&str>
 /// no trimming (the user must type the exact name shown).
 pub fn confirm_matches(typed: &str, expected: &str) -> bool {
     typed == expected
+}
+
+/// T6 binding carry-forward (connection-identity staleness across an async
+/// window — a file-save/open dialog can take arbitrarily long): `true` only
+/// when the connection id a backup/restore dialog was opened for is STILL
+/// present in the caller's current connection list at confirm/dispatch time
+/// — i.e. it wasn't deleted while the OS file dialog was open. The caller
+/// (`main.rs`) re-resolves a FRESH `ConnectionConfig` from this same lookup
+/// rather than reusing anything captured at dialog-open time, so an edited
+/// connection (read-only toggled, password changed) is picked up too, not
+/// just a deleted one. Mirrors this codebase's established
+/// `conn_identity_matches` convention (`main.rs`), specialized to backup/
+/// restore's "dispatch by a specific connection id" shape — unlike the
+/// Apply dialog, a backup/restore dialog never targets "whatever connection
+/// is currently active", so `current_conn_identity()` itself isn't the
+/// right comparison target here.
+pub fn backup_dispatch_allowed(captured_id: &str, current_ids: &[String]) -> bool {
+    !captured_id.is_empty() && current_ids.iter().any(|id| id == captured_id)
 }
 
 #[cfg(test)]
@@ -653,6 +678,24 @@ mod pure_tests {
         assert!(!confirm_matches("Shop_Prod", "shop_prod"));
         assert!(!confirm_matches("shop_prod ", "shop_prod"));
         assert!(!confirm_matches("", "shop_prod"));
+    }
+
+    // --- backup_dispatch_allowed (connection-identity staleness) ---
+    #[test]
+    fn backup_dispatch_allowed_when_id_still_present() {
+        let ids = vec!["a".to_string(), "b".to_string()];
+        assert!(backup_dispatch_allowed("a", &ids));
+    }
+
+    #[test]
+    fn backup_dispatch_refused_when_id_no_longer_present() {
+        let ids = vec!["a".to_string(), "b".to_string()];
+        assert!(!backup_dispatch_allowed("deleted-while-dialog-open", &ids));
+    }
+
+    #[test]
+    fn backup_dispatch_refused_on_empty_captured_id() {
+        assert!(!backup_dispatch_allowed("", &["a".to_string()]));
     }
 }
 
@@ -1095,5 +1138,142 @@ mod process_tests {
     fn empty_or_all_non_numeric_is_none() {
         assert_eq!(pick_highest_version_dir(&[]), None);
         assert_eq!(pick_highest_version_dir(&[(r"C:\x\abc".to_string(), t(1))]), None);
+    }
+}
+
+// --- UI-facing session state (T6) -------------------------------------
+//
+// Lives here (not connections_ui.rs) so backup.rs stays the single home for
+// every backup/restore type — mirrors plan.rs's (G13) "one file, pure half
+// then UI-adjacent half" convention this plan's Architecture section
+// commits to.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupKind {
+    Backup,
+    Restore,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BackupStatus {
+    /// Restore only — the typed-database-name confirm step. Backup skips
+    /// straight to `Running` (design §2 vs §3: only Restore gets the
+    /// GitHub-delete-repo-pattern typed-name friction).
+    Confirming,
+    Running,
+    Succeeded,
+    Failed(String),
+    Cancelled,
+}
+
+/// Cancel switch for whatever is actually running. `RefCell`-wrapped
+/// (DEVIATION from the plan's literal `pub cancel: Rc<dyn Fn()>` — grounded
+/// below) since the real cancellation closure isn't known until dispatch:
+/// `BackupSession` is constructed by `open_backup_dialog`/`open_restore_dialog`
+/// (main.rs) before any process/task exists to cancel, and a `Confirming`
+/// Restore session genuinely has nothing to cancel yet. `start_backup`/
+/// `start_restore` fill this slot in once the real `BackupHandle::cancel`
+/// (Postgres) exists; MSSQL/SQLite runs never fill it (T4's runner methods
+/// for those two engines expose no cancel hook — see `BackupSession`'s doc
+/// comment) so it stays `None` for their whole run, and `cancel_now` is
+/// always safe to call regardless: a no-op before dispatch, after a
+/// terminal state, or for an engine with nothing to cancel.
+pub type CancelSlot = std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>;
+
+/// UI session state for one backup/restore run, held by
+/// `connections_ui::ModalState::BackupRestore`. `Clone` is cheap (every
+/// field is either `Copy`, a `String`, or an `Rc`/`Entity` handle) — GPUI's
+/// `ModalState::clone()`-per-render convention (every other `ModalState`
+/// arm does the same) relies on this.
+#[derive(Clone)]
+pub struct BackupSession {
+    pub kind: BackupKind,
+    pub engine: dbc_state::Engine,
+    /// `ConnectionConfig.id` this session was opened for — NOT necessarily
+    /// the app's currently-active connection (the dropdown's 🗄/♻ icons work
+    /// on ANY row, not just the active one). Re-checked via
+    /// `backup_dispatch_allowed` before every dispatch (staleness guard).
+    pub connection_id: String,
+    pub connection_name: String,
+    pub database: String,
+    pub log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    pub status: std::rc::Rc<std::cell::RefCell<BackupStatus>>,
+    pub started_at: std::time::Instant,
+    pub cancel: CancelSlot,
+    /// `Some` only during `Confirming` for a Restore session — the typed
+    /// database-name field; `None` for Backup (no typed-confirm friction).
+    pub confirm_input: Option<gpui::Entity<crate::connections_ui::TextField>>,
+    pub expected_name: String,
+    /// The redacted command/SQL text shown by the confirm/running panel
+    /// (§3-novela: "show exactly what will run before dispatch").
+    pub command_line: String,
+    /// Full local path this run reads from (restore) or writes to (backup)
+    /// — kept separately from `command_line` (the display string) so
+    /// `main.rs` can build the T7 history description without re-parsing it.
+    pub target_path: String,
+}
+
+impl BackupSession {
+    /// Invokes whatever cancel hook is currently installed — a no-op before
+    /// dispatch (`cancel` still empty), once a run has already reached a
+    /// terminal state, or for an engine (MSSQL/SQLite) with no real cancel
+    /// hook at all. Safe to call unconditionally from every teardown path.
+    pub fn cancel_now(&self) {
+        if let Some(f) = self.cancel.borrow().as_ref() {
+            f();
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(*self.status.borrow(), BackupStatus::Running)
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    fn session(status: BackupStatus) -> BackupSession {
+        BackupSession {
+            kind: BackupKind::Backup,
+            engine: dbc_state::Engine::Postgres,
+            connection_id: "c1".into(),
+            connection_name: "demo".into(),
+            database: "shop".into(),
+            log: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            status: std::rc::Rc::new(std::cell::RefCell::new(status)),
+            started_at: std::time::Instant::now(),
+            cancel: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            confirm_input: None,
+            expected_name: String::new(),
+            command_line: String::new(),
+            target_path: String::new(),
+        }
+    }
+
+    #[test]
+    fn cancel_now_is_a_no_op_when_no_hook_installed() {
+        let s = session(BackupStatus::Running);
+        s.cancel_now(); // must not panic
+    }
+
+    #[test]
+    fn cancel_now_invokes_the_installed_hook_exactly_once_per_call() {
+        let s = session(BackupStatus::Running);
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let calls2 = calls.clone();
+        *s.cancel.borrow_mut() = Some(std::rc::Rc::new(move || *calls2.borrow_mut() += 1));
+        s.cancel_now();
+        s.cancel_now();
+        assert_eq!(*calls.borrow(), 2);
+    }
+
+    #[test]
+    fn is_running_matrix() {
+        assert!(session(BackupStatus::Running).is_running());
+        assert!(!session(BackupStatus::Confirming).is_running());
+        assert!(!session(BackupStatus::Succeeded).is_running());
+        assert!(!session(BackupStatus::Failed("x".into())).is_running());
+        assert!(!session(BackupStatus::Cancelled).is_running());
     }
 }

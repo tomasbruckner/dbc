@@ -439,7 +439,6 @@ impl QueryRunner {
     /// panic-recovery degenerate case (`from_already_gone` in the original
     /// plan sketch) is unneeded here: there is no `spawn_blocking` task that
     /// could panic before handing back a handle, so it is not added.
-    #[allow(dead_code)] // G11 T6 wires the first real call site (Postgres backup/restore dispatch); T5's docker tests are a second consumer. Remove once either lands.
     pub fn run_external_tool(
         &self,
         program: String,
@@ -477,7 +476,6 @@ impl QueryRunner {
     /// other MSSQL feature in this app produces today (`connect::open_config`'s
     /// permanent `Engine::Mssql` arm) — no MSSQL-specific handling is added
     /// around that error here.
-    #[allow(dead_code)] // G11 T6 wires the first real call site (backup dialog dispatch for an MSSQL connection). Remove once landed.
     pub fn run_mssql_backup(
         &self,
         spec: ConnectSpec,
@@ -501,7 +499,6 @@ impl QueryRunner {
     /// is discarded" posture). Hard-blocked on read-only, no override
     /// (`backup::guard_backup_restore_read_only(BackupOp::Restore, ..)` is
     /// never exempt).
-    #[allow(dead_code)] // G11 T6 wires the first real call site (restore dialog dispatch for an MSSQL connection). Remove once landed.
     pub fn run_mssql_restore(
         &self,
         spec: ConnectSpec,
@@ -519,7 +516,6 @@ impl QueryRunner {
 
     /// G11 T4: SQLite `VACUUM INTO` via `Connection::execute` — allowed on
     /// read-only (design CURATION item 2).
-    #[allow(dead_code)] // G11 T6 wires the first real call site (backup dialog dispatch for a SQLite connection). Remove once landed.
     pub fn run_sqlite_backup(
         &self,
         spec: ConnectSpec,
@@ -551,7 +547,6 @@ impl QueryRunner {
     /// is kept too (belt-and-braces, matching this codebase's established
     /// "each layer holds on its own" posture), but is no longer this
     /// method's SOLE protection.
-    #[allow(dead_code)] // G11 T6 wires the first real call site (restore dialog dispatch for a SQLite connection). Remove once landed.
     pub fn run_sqlite_restore(
         &self,
         db_path: String,
@@ -958,7 +953,6 @@ fn absolutize(path: &str) -> String {
 /// itself now returning the fully-resolved path rather than the bare
 /// probed name; step 3's glob join is already absolute (`base` is a fixed
 /// absolute root).
-#[allow(dead_code)] // G11 T5's docker tests and T6's dispatch are the first real callers. Remove once either lands.
 pub fn resolve_tool_path(configured: Option<&str>, name: &str) -> Result<String, QueryError> {
     if let Some(path) = configured {
         return if std::path::Path::new(path).is_file() {
