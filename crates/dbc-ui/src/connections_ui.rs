@@ -1278,7 +1278,12 @@ impl AppView {
             selection: crate::compare::CompareSelection::None,
             show_unchanged: crate::compare::ShowUnchanged::default(),
             show_ddl_diff: false,
+            data_where: String::new(),
+            data_diff: crate::compare::DataDiffState::Idle,
+            data_diff_generation: 0,
+            data_buffers: None,
         });
+        cx.subscribe(&view, AppView::on_compare_view_event).detach();
         self.tabs.open(crate::tabs::ResultTab {
             id: 0,
             title: crate::tabs::collapse_title(&format!("Porovnání: {label_a} ↔ {label_b}")),

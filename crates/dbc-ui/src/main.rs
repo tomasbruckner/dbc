@@ -3498,6 +3498,32 @@ impl AppView {
         cx.notify();
     }
 
+    /// G7 T8: `CompareView`'s `CompareViewEvent` subscription (wired by
+    /// `connections_ui::confirm_compare_dialog` at tab-open time) —
+    /// `CompareView` doesn't own a `QueryRunner` (no tab-content entity in
+    /// this codebase does, see `MonitorView`'s `KillRequested` for the same
+    /// shape), so the actual `fetch_diff_side` dispatch for "Porovnat data"
+    /// happens here, reading the CURRENT diff/selection straight off the
+    /// entity before calling back into `CompareView::start_data_diff`
+    /// (which owns the generation guard and the `cx.spawn` completion).
+    pub(crate) fn on_compare_view_event(
+        &mut self,
+        view: Entity<compare::CompareView>,
+        event: &compare::CompareViewEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            compare::CompareViewEvent::DataDiffRequested => {
+                let runner = &self.runner;
+                view.update(cx, |v, cx| {
+                    if let compare::CompareLoadState::Ready { diff, .. } = v.state.clone() {
+                        v.start_data_diff(&diff, runner, cx);
+                    }
+                });
+            }
+        }
+    }
+
     /// `SchemaTree`'s `TreeEvent` subscription (wired in `main`). G2 Task 7:
     /// `OpenPreview` builds the SQL via `preview_sql` and runs it through the
     /// normal guarded pipeline (`run_query_with`, `bypass_auto_limit = true`

@@ -386,13 +386,9 @@ impl QueryRunner {
     /// CURATION §0.1(b)/§0.2). Returns the composed SQL alongside the
     /// result so the caller can show it verbatim in the compare tab header.
     ///
-    /// `#[allow(dead_code)]`: no caller exists yet in this worktree — G7 T8
-    /// (`compare.rs`'s data-diff fetch) is the first call site. Same
-    /// rationale as `fetch_schema_pair`'s allow above: `diff_fetch_tests`
-    /// exercises `fetch_diff_side_inner`/`compose_diff_select` directly, not
-    /// this thin spawn wrapper. Remove this allow once T8 wires a real call
-    /// site.
-    #[allow(dead_code)]
+    /// G7 T8 wired the first real call site (`CompareView::start_data_diff`,
+    /// dispatched from `AppView::on_compare_view_event`) — the
+    /// `#[allow(dead_code)]` this carried through T5/T6/T7 is removed.
     pub fn fetch_diff_side(
         &self,
         spec: ConnectSpec,

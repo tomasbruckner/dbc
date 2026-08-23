@@ -1,28 +1,55 @@
-//! G7 T7: `CompareView` — the per-tab GPUI entity behind
+//! G7 T7/T8: `CompareView` — the per-tab GPUI entity behind
 //! `TabContent::Compare`. Renders the schema diff (`dbc_diff::schema_diff`)
 //! computed by `AppView::on_compare_schema_pair_ready` (main.rs) from a
 //! `fetch_schema_pair` result: a left-pane status-tinted object list
 //! (Tabulky/Funkce/Triggery/Sekvence) and a right-pane detail view
 //! (Added/Removed DDL, Changed field table + optional DDL-diff drill-down)
 //! — design §3. T8 extends this same entity with an in-process PK-based
-//! data diff for one selected matched table pair.
+//! data diff (`dbc_diff::data_diff`) for one selected matched table pair,
+//! dispatched via `runner::fetch_diff_side`.
+//!
+//! T8's data-diff fetch needs a `QueryRunner`, which `CompareView` (like
+//! every other tab-content entity in this codebase, e.g. `MonitorView`)
+//! does not own itself — `AppView` is the sole owner. The "Porovnat data"
+//! click therefore EMITS `CompareViewEvent::DataDiffRequested` rather than
+//! dispatching directly; `AppView::on_compare_view_event` (main.rs) is the
+//! subscriber that actually calls `self.runner.fetch_diff_side` and feeds
+//! the result back into this entity via `Entity::update` — same "view
+//! emits, AppView owns the runner and subscribes" shape `MonitorView`'s
+//! `KillRequested` uses.
 //!
 //! READ-ONLY end to end: nothing in this file ever calls `.execute(` — the
-//! only SQL text this feature ever shows the user (T8, `fetch_diff_side`'s
-//! composed `SELECT`) is display/copy only, never re-run from here (design
-//! CURATION §0.1(d)/Global Constraints — no sync-script generation of any
-//! kind).
+//! only SQL text ever shown to the user is the exact composed `SELECT`
+//! `fetch_diff_side` ran (design CURATION §0.1(d)/Global Constraints — no
+//! sync-script generation of any kind).
 
+use dbc_core::arrow::array::{Array, StringArray};
+use dbc_core::arrow::datatypes::SchemaRef;
 use dbc_core::{synthesize_create_table, QueryError, RoutineInfo, TableInfo, TriggerInfo};
+use dbc_diff::data_diff::{self, DataDiffOutcome, RowDiff};
 use dbc_diff::schema_diff::{CompareMode, FieldChange, ObjectDiff, SchemaDiff, TableDiff, TableStatus};
 use dbc_diff::text_diff::{diff_lines, DiffLine, DiffTag};
-use gpui::{div, prelude::*, px, rgb, AnyElement, ClickEvent, Context, Div, SharedString, Stateful, Window};
+use gpui::{
+    div, prelude::*, px, rgb, AnyElement, ClickEvent, Context, Div, EventEmitter, SharedString, Stateful, Window,
+};
+
+use crate::runner::{ConnectSpec, QueryRunner};
 
 // Mirrors grid.rs's sandbox diff tints (grid.rs:26-28) — same convention,
 // different module (those constants are private to grid.rs).
 const TINT_ADDED: u32 = 0x2e5d3a; // green
 const TINT_REMOVED: u32 = 0x5d2e2e; // red
 const TINT_CHANGED: u32 = 0x6b5d2e; // amber/yellow
+
+/// T8: bounds how many individual row lines the three data-diff sections
+/// ever render, INDEPENDENT of `data_diff::DIFF_ROW_CAP` (1,000,000) — that
+/// cap bounds the DIFF COMPUTATION, not on-screen rendering. Rendering a
+/// million `div`s would hang the UI thread regardless of how correct the
+/// diff is; this is the "don't re-introduce unbounded rendering" guard
+/// called out in this task's constraints. The exact SQL each side ran is
+/// always shown in full (see `render_data_diff_outcome`) so a user who
+/// needs the full row set can always re-run it in a normal query tab.
+const DISPLAY_ROW_CAP: usize = 200;
 
 // ---------------------------------------------------------------------
 // Pure logic (fully unit-tested below).
@@ -53,13 +80,6 @@ pub fn count_table_statuses(tables: &[TableDiff]) -> StatusCounts {
 /// engine gating a READ-ONLY data-diff feature must not inherit. A view is
 /// never PK-diffable regardless of a (possibly stale) reported `is_pk`
 /// column.
-///
-/// `#[allow(dead_code)]`: no caller exists yet in this worktree — G7 T8
-/// (`data_diff_available`'s "Porovnat data" gating) is the first call site,
-/// same posture `runner.rs`'s `fetch_schema_pair`/`fetch_diff_side` allows
-/// took through T5/T6. `table_has_pk_requires_a_real_pk_column_on_a_base_table`
-/// exercises it directly. Remove this allow once T8 wires a real call site.
-#[allow(dead_code)]
 pub fn table_has_pk(t: &TableInfo) -> bool {
     t.kind == dbc_core::TableKind::Table && t.columns.iter().any(|c| c.is_pk)
 }
@@ -165,6 +185,32 @@ fn tint_for_object<T>(o: &ObjectDiff<T>) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------
+// Pure logic — data half (T8).
+// ---------------------------------------------------------------------
+
+/// RESULT-column indices (into `result_columns`, in `result_columns`'
+/// order) of `table`'s PK columns — mirrors `main.rs::detect_editable_pk`'s
+/// name-matching technique (main.rs:242-247) without ANY of its
+/// read-only/engine gating (data diff needs neither).
+pub fn pk_result_cols(table: &TableInfo, result_columns: &[String]) -> Vec<usize> {
+    table
+        .columns
+        .iter()
+        .filter(|c| c.is_pk)
+        .filter_map(|c| result_columns.iter().position(|h| h == &c.name))
+        .collect()
+}
+
+/// design §4: the "Porovnat data" affordance is enabled only for a matched
+/// (present on both sides), PK'd-on-both-sides table pair.
+pub fn data_diff_available(t: &TableDiff) -> bool {
+    match (&t.left, &t.right) {
+        (Some(l), Some(r)) => table_has_pk(l) && table_has_pk(r),
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------
 // Entity state.
 // ---------------------------------------------------------------------
 
@@ -203,23 +249,66 @@ pub struct ShowUnchanged {
     pub sequences: bool,
 }
 
+/// T8: data-diff state for ONE selected matched table pair. `Idle` before
+/// any "Porovnat data" click; reset to `Idle` whenever the LEFT-pane
+/// selection changes to a different table so a stale outcome for table A
+/// never lingers while table B is selected (see the table-row click
+/// handler in `render_table_section`).
+pub enum DataDiffState {
+    Idle,
+    Loading,
+    Ready { outcome: DataDiffOutcome, sql_a: String, sql_b: String },
+    /// design §4: `DIFF_ROW_CAP` hit — a banner, not silent.
+    RowCapExceeded { message: String },
+    Error(QueryError),
+}
+
+/// The two fetched sides' raw buffers behind a `DataDiffState::Ready`
+/// outcome, kept so `build_changed_batch` can run once the outcome is known
+/// (needs `&mut ResultBuffer` for both sides — cell reads mutate a
+/// one-slot spill cache, see `dbc_buffer::ResultBuffer`'s doc comment).
+pub struct DataBuffers {
+    pub left: dbc_buffer::ResultBuffer,
+    pub left_names: Vec<String>,
+    pub right: dbc_buffer::ResultBuffer,
+    pub right_names: Vec<String>,
+}
+
 pub struct CompareView {
     pub label_a: String,
     pub label_b: String,
     pub conn_a: dbc_state::ConnectionConfig,
-    /// `#[allow(dead_code)]`: not read anywhere in T7 — T8's
-    /// `start_data_diff` (`fetch_diff_side`'s per-side vault secret) is the
-    /// first reader. Removed once T8 wires that call site.
-    #[allow(dead_code)]
     pub secret_a: Option<String>,
     pub conn_b: dbc_state::ConnectionConfig,
-    #[allow(dead_code)]
     pub secret_b: Option<String>,
     pub state: CompareLoadState,
     pub selection: CompareSelection,
     pub show_unchanged: ShowUnchanged,
     pub show_ddl_diff: bool,
+    // --- T8: data-diff ---
+    /// design §4: ONE optional free-text field, shared identically by both
+    /// sides' composed `SELECT` (CURATION §0.1(b) — "one optional text
+    /// field per side-pair", not one box per side).
+    pub data_where: String,
+    pub data_diff: DataDiffState,
+    /// Bumped on every "Porovnat data" dispatch; a `fetch_diff_side` pair's
+    /// result only applies if the generation still matches — same
+    /// last-dispatched-wins guard `AppView::trigger_schema_fetch` uses.
+    pub data_diff_generation: u64,
+    pub data_buffers: Option<DataBuffers>,
 }
+
+/// Emitted toward `AppView` (subscription wired in
+/// `connections_ui::confirm_compare_dialog` at tab-open time). `CompareView`
+/// does not own a `QueryRunner` (no tab-content entity in this codebase
+/// does — see `MonitorView`'s `KillRequested` for the same shape), so the
+/// actual `fetch_diff_side` dispatch happens in
+/// `AppView::on_compare_view_event`.
+#[derive(Debug, Clone, Copy)]
+pub enum CompareViewEvent {
+    DataDiffRequested,
+}
+impl EventEmitter<CompareViewEvent> for CompareView {}
 
 impl CompareView {
     /// `(conn_a.engine, conn_b.engine)` — `AppView::on_compare_schema_pair_ready`
@@ -227,6 +316,101 @@ impl CompareView {
     /// needing its own copy of either `ConnectionConfig`.
     pub fn engines(&self) -> (dbc_state::Engine, dbc_state::Engine) {
         (self.conn_a.engine, self.conn_b.engine)
+    }
+
+    /// The `TableDiff` currently backing a `DataDiffState` other than
+    /// `Idle` — `None` unless the left-pane selection is a table.
+    fn selected_table<'a>(&self, diff: &'a SchemaDiff) -> Option<&'a TableDiff> {
+        match self.selection {
+            CompareSelection::Table(ix) => diff.tables.get(ix),
+            _ => None,
+        }
+    }
+
+    /// "Porovnat data" — dispatches `fetch_diff_side` for BOTH sides of the
+    /// currently-selected matched table pair (design §4). Fire-and-forget,
+    /// generation-guarded exactly like `trigger_schema_fetch`/
+    /// `confirm_compare_dialog`. Called from `AppView::on_compare_view_event`
+    /// (which owns `runner`), not from this entity's own click handler
+    /// directly. A no-op if the current selection isn't a data-diffable
+    /// table pair (belt-and-braces — the button is already hidden/disabled
+    /// in that state).
+    pub fn start_data_diff(&mut self, diff: &SchemaDiff, runner: &QueryRunner, cx: &mut Context<Self>) {
+        let Some(t) = self.selected_table(diff) else { return };
+        if !data_diff_available(t) {
+            return;
+        }
+        let (Some(left_tbl), Some(right_tbl)) = (t.left.clone(), t.right.clone()) else { return };
+        let schema = t.schema.clone();
+        let table_name = t.name.clone();
+        let where_text = self.data_where.trim();
+        let where_a = if where_text.is_empty() { None } else { Some(where_text.to_string()) };
+        let where_b = where_a.clone();
+
+        self.data_diff_generation += 1;
+        let my_generation = self.data_diff_generation;
+        self.data_diff = DataDiffState::Loading;
+        self.data_buffers = None;
+
+        let spec_a = ConnectSpec::Config { cfg: Box::new(self.conn_a.clone()), secret: self.secret_a.clone() };
+        let spec_b = ConnectSpec::Config { cfg: Box::new(self.conn_b.clone()), secret: self.secret_b.clone() };
+        let rx_a = runner.fetch_diff_side(spec_a, schema.clone(), table_name.clone(), where_a);
+        let rx_b = runner.fetch_diff_side(spec_b, schema, table_name, where_b);
+
+        cx.spawn(async move |this, cx| {
+            let (result_a, result_b) = (rx_a.await, rx_b.await);
+            let _ = this.update(cx, |view, cx| {
+                if view.data_diff_generation != my_generation {
+                    return; // superseded by a newer dispatch — last-dispatched wins
+                }
+                view.apply_data_diff_result(&left_tbl, &right_tbl, result_a, result_b, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn apply_data_diff_result(
+        &mut self,
+        left_tbl: &TableInfo,
+        right_tbl: &TableInfo,
+        result_a: Result<Result<(String, SchemaRef, dbc_buffer::ResultBuffer), QueryError>, tokio::sync::oneshot::error::RecvError>,
+        result_b: Result<Result<(String, SchemaRef, dbc_buffer::ResultBuffer), QueryError>, tokio::sync::oneshot::error::RecvError>,
+        cx: &mut Context<Self>,
+    ) {
+        let a = result_a.unwrap_or_else(|_| Err(QueryError::msg("fetch zrušen".to_string())));
+        let b = result_b.unwrap_or_else(|_| Err(QueryError::msg("fetch zrušen".to_string())));
+        let (sql_a, schema_a, mut buf_a, sql_b, schema_b, mut buf_b) = match (a, b) {
+            (Ok((sql_a, schema_a, buf_a)), Ok((sql_b, schema_b, buf_b))) => (sql_a, schema_a, buf_a, sql_b, schema_b, buf_b),
+            (Err(e), _) | (_, Err(e)) => {
+                self.data_diff = DataDiffState::Error(e);
+                cx.notify();
+                return;
+            }
+        };
+        let left_names: Vec<String> = schema_a.fields().iter().map(|f| f.name().to_string()).collect();
+        let right_names: Vec<String> = schema_b.fields().iter().map(|f| f.name().to_string()).collect();
+        let left_pk = pk_result_cols(left_tbl, &left_names);
+        let right_pk = pk_result_cols(right_tbl, &right_names);
+
+        if left_pk.is_empty() || right_pk.is_empty() {
+            self.data_diff = DataDiffState::Error(QueryError::msg(
+                "primární klíč nebyl nalezen mezi sloupci výsledku — porovnání dat přerušeno".to_string(),
+            ));
+            cx.notify();
+            return;
+        }
+
+        match data_diff::diff_data(&mut buf_a, &left_names, &left_pk, &mut buf_b, &right_names, &right_pk) {
+            Ok(outcome) => {
+                self.data_buffers = Some(DataBuffers { left: buf_a, left_names, right: buf_b, right_names });
+                self.data_diff = DataDiffState::Ready { outcome, sql_a, sql_b };
+            }
+            Err(msg) => {
+                self.data_diff = DataDiffState::RowCapExceeded { message: msg };
+            }
+        }
+        cx.notify();
     }
 }
 
@@ -352,6 +536,8 @@ impl CompareView {
                 compare_row(SharedString::from(format!("compare-table-row-{ix}")), label, tint, is_selected)
                     .on_click(cx.listener(move |v, _, _, cx| {
                         v.selection = CompareSelection::Table(ix);
+                        v.data_diff = DataDiffState::Idle; // new selection invalidates any prior data diff
+                        v.data_buffers = None;
                         cx.notify();
                     })),
             );
@@ -556,8 +742,176 @@ impl CompareView {
             }
         }
 
+        // T8: "Porovnat data" affordance — only for a matched, PK'd-on-both-
+        // sides table pair (design §4).
+        if data_diff_available(t) {
+            detail = detail.child(self.render_data_diff_section(cx));
+        } else if matches!(t.status, TableStatus::Changed | TableStatus::Unchanged) {
+            detail = detail.child(
+                div().text_color(rgb(0x6c7086)).child("Porovnání dat: tabulka nemá primární klíč na obou stranách"),
+            );
+        }
+
         detail
     }
+
+    fn render_data_diff_section(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut section =
+            div().flex().flex_col().gap_2().mt_2().p_2().border_1().border_color(rgb(0x313244)).rounded_md();
+        section = section.child(div().text_color(rgb(0x89b4fa)).child("Porovnání dat"));
+
+        let where_text = self.data_where.clone();
+        section = section.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .items_center()
+                .child(div().text_color(rgb(0x6c7086)).child("WHERE"))
+                .child(
+                    div()
+                        .id("compare-data-where")
+                        .flex_1()
+                        .px_1()
+                        .bg(rgb(0x181825))
+                        .rounded_md()
+                        .text_color(rgb(0xcdd6f4))
+                        .child(if where_text.is_empty() { "(bez omezení)".to_string() } else { where_text }),
+                ),
+        );
+
+        section = section.child(compare_button("compare-run-data-diff", "Porovnat data").on_click(cx.listener(
+            |_v, _, _, cx| {
+                cx.emit(CompareViewEvent::DataDiffRequested);
+            },
+        )));
+
+        match &self.data_diff {
+            DataDiffState::Idle => {}
+            DataDiffState::Loading => {
+                section = section.child(div().text_color(rgb(0xf9e2af)).child("Načítám data…"));
+            }
+            DataDiffState::Error(e) => {
+                section = section.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {e}")));
+            }
+            DataDiffState::RowCapExceeded { message } => {
+                section = section.child(div().text_color(rgb(0xf38ba8)).child(message.clone()));
+            }
+            DataDiffState::Ready { .. } => {
+                section = section.child(self.render_data_diff_outcome());
+            }
+        }
+        section
+    }
+
+    fn render_data_diff_outcome(&mut self) -> impl IntoElement {
+        let DataDiffState::Ready { outcome, sql_a, sql_b } = &self.data_diff else {
+            return div();
+        };
+        let added = outcome.rows.iter().filter(|r| matches!(r, RowDiff::Added { .. })).count();
+        let removed = outcome.rows.iter().filter(|r| matches!(r, RowDiff::Removed { .. })).count();
+        let changed = outcome.rows.iter().filter(|r| matches!(r, RowDiff::Changed { .. })).count();
+        let total_left = outcome.rows.iter().filter(|r| !matches!(r, RowDiff::Added { .. })).count();
+        let sql_a = sql_a.clone();
+        let sql_b = sql_b.clone();
+        let outcome = outcome.clone();
+
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(div().text_color(rgb(0xa6adc8)).child(format!(
+            "{added} přidáno, {removed} odebráno, {changed} změněno (z {total_left} řádků na levé straně)"
+        )));
+        block = block.child(ddl_block(&format!("A: {sql_a}")));
+        block = block.child(ddl_block(&format!("B: {sql_b}")));
+
+        block = block.child(row_id_list("Přidané řádky", TINT_ADDED, &outcome.rows, |r| match r {
+            RowDiff::Added { right_row } => Some(*right_row),
+            _ => None,
+        }));
+        block = block.child(row_id_list("Odebrané řádky", TINT_REMOVED, &outcome.rows, |r| match r {
+            RowDiff::Removed { left_row } => Some(*left_row),
+            _ => None,
+        }));
+        block = block.child(self.render_changed_rows(&outcome));
+        block
+    }
+
+    /// `build_changed_batch`'s synthetic all-Utf8 "old → new" batch,
+    /// rendered as a bounded (`DISPLAY_ROW_CAP`) text table with the
+    /// changed cells tinted `TINT_CHANGED`.
+    fn render_changed_rows(&mut self, outcome: &DataDiffOutcome) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_1();
+        block = block.child(div().text_color(rgb(TINT_CHANGED)).child("Změněné řádky"));
+        let Some(buffers) = &mut self.data_buffers else { return block };
+        let (batch, tinted) = data_diff::build_changed_batch(
+            &mut buffers.left,
+            &mut buffers.right,
+            &outcome.intersection_columns,
+            &buffers.left_names,
+            &buffers.right_names,
+            &outcome.rows,
+        );
+        let total_rows = batch.num_rows();
+        if total_rows == 0 {
+            return block;
+        }
+
+        let mut header = div().flex().flex_row().gap_2().text_color(rgb(0x6c7086));
+        for name in &outcome.intersection_columns {
+            header = header.child(div().w(px(160.)).child(name.clone()));
+        }
+        block = block.child(header);
+
+        let shown = total_rows.min(DISPLAY_ROW_CAP);
+        for row in 0..shown {
+            let mut r = div().flex().flex_row().gap_2();
+            for col in 0..outcome.intersection_columns.len() {
+                let text = batch
+                    .column(col)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .map(|a| a.value(row).to_string())
+                    .unwrap_or_default();
+                let mut cell = div().w(px(160.)).child(text);
+                if tinted.contains(&(row, col)) {
+                    cell = cell.bg(rgb(TINT_CHANGED));
+                }
+                r = r.child(cell);
+            }
+            block = block.child(r);
+        }
+        if total_rows > shown {
+            block = block.child(
+                div()
+                    .text_color(rgb(0x6c7086))
+                    .child(format!("… zobrazeno prvních {shown} z {total_rows} změněných řádků")),
+            );
+        }
+        block
+    }
+}
+
+/// Bounded (`DISPLAY_ROW_CAP`) list of row indices matching `extract` — used
+/// for the "Přidané řádky"/"Odebrané řádky" sections (design §4). Row
+/// values are NOT re-read from the buffers here (only the row index is
+/// shown) — the composed SQL shown above the sections is the source of
+/// truth for what each side actually returned; a user who needs the full
+/// row contents can re-run that exact SQL in a normal query tab.
+fn row_id_list(title: &str, tint: u32, rows: &[RowDiff], extract: impl Fn(&RowDiff) -> Option<usize>) -> impl IntoElement {
+    let mut block = div().flex().flex_col().gap_1();
+    block = block.child(div().text_color(rgb(tint)).child(title.to_string()));
+    let indices: Vec<usize> = rows.iter().filter_map(extract).collect();
+    let shown = indices.len().min(DISPLAY_ROW_CAP);
+    for &ix in &indices[..shown] {
+        block = block.child(div().text_color(rgb(0xa6adc8)).child(format!("řádek {ix}")));
+    }
+    if indices.len() > shown {
+        block = block.child(
+            div()
+                .text_color(rgb(0x6c7086))
+                .child(format!("… zobrazeno prvních {shown} z {} řádků", indices.len())),
+        );
+    }
+    block
 }
 
 fn section_header(
@@ -592,6 +946,19 @@ fn compare_row(id: SharedString, label: String, tint: Option<u32>, selected: boo
         row = row.text_color(rgb(0xf9e2af));
     }
     row
+}
+
+fn compare_button(id: &'static str, label: &'static str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .w(px(140.))
+        .bg(rgb(0x313244))
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0x45475a)))
+        .child(label)
 }
 
 fn ddl_block(text: &str) -> impl IntoElement {
@@ -758,5 +1125,47 @@ mod tests {
         let (added, removed) = table_existence_rows(&t);
         assert_eq!(added, vec!["sloupec new_col".to_string()]);
         assert_eq!(removed, vec!["sloupec gone".to_string()]);
+    }
+
+    #[test]
+    fn pk_result_cols_maps_by_name_ignoring_gating() {
+        let table = TableInfo {
+            columns: vec![
+                ColumnInfo { name: "id".into(), is_pk: true, ..Default::default() },
+                ColumnInfo { name: "tenant".into(), is_pk: true, ..Default::default() },
+                ColumnInfo { name: "note".into(), is_pk: false, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let result_cols = vec!["note".to_string(), "id".to_string(), "tenant".to_string()];
+        assert_eq!(pk_result_cols(&table, &result_cols), vec![1, 2]);
+    }
+
+    #[test]
+    fn pk_result_cols_missing_pk_column_in_the_result_is_silently_skipped_not_a_panic() {
+        let table = TableInfo {
+            columns: vec![ColumnInfo { name: "id".into(), is_pk: true, ..Default::default() }],
+            ..Default::default()
+        };
+        assert_eq!(pk_result_cols(&table, &["other".to_string()]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn data_diff_available_requires_pk_on_both_matched_sides() {
+        let mut t = table_diff(TableStatus::Changed);
+        let with_pk = || TableInfo {
+            kind: dbc_core::TableKind::Table,
+            columns: vec![ColumnInfo { name: "id".into(), is_pk: true, ..Default::default() }],
+            ..Default::default()
+        };
+        let without_pk = || TableInfo { kind: dbc_core::TableKind::Table, ..Default::default() };
+
+        assert!(!data_diff_available(&t), "no left/right at all");
+        t.left = Some(with_pk());
+        assert!(!data_diff_available(&t), "right side missing");
+        t.right = Some(without_pk());
+        assert!(!data_diff_available(&t), "right side has no PK");
+        t.right = Some(with_pk());
+        assert!(data_diff_available(&t));
     }
 }
