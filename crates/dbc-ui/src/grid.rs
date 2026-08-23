@@ -96,6 +96,21 @@ pub enum GridEvent {
         /// last-arrived).
         generation: u64,
     },
+    /// G4 Task 6: emitted by a PREVIEW tab whenever its local view state
+    /// changes in a way `main.rs` should persist via `ViewPrefsStore` — sort
+    /// (`on_header_click`), column visibility (`toggle_column_visibility`),
+    /// or a width-drag END (the `on_mouse_up`/`on_mouse_up_out` handlers in
+    /// `Render::render`, never mid-drag — see those call sites). Ad-hoc tabs
+    /// never emit this (every call site is guarded by `self.is_preview`).
+    /// Carries nothing: `main.rs`'s handler reads everything it needs
+    /// (identity + current sort/hidden/widths/fk-joins) straight off
+    /// `emitter` via `ResultGrid::{preview_identity,column_names,view_state,
+    /// col_widths,active_fk_join_names}` rather than duplicating that state
+    /// into the event payload. fk-join changes are NOT saved through this
+    /// event — a ☰ toggle re-runs the query (`RerunPreviewJoins`) and the
+    /// resulting new grid's state is saved once its `Started` event lands
+    /// instead (see `main.rs::apply_view_prefs_to_grid`'s doc comment).
+    ViewChanged,
 }
 
 /// Bind ResultGrid's own keys. Scoped to the `"ResultGrid"` key context so
@@ -794,15 +809,22 @@ impl ResultGrid {
             _ => Some((col, true)),
         };
         self.rebuild_view();
+        // G4 Task 6: persist the new sort for a PREVIEW tab (see
+        // `GridEvent::ViewChanged`'s doc comment) — a no-op emit target for
+        // an ad-hoc tab, so guard here rather than relying on the (absent)
+        // subscriber to ignore it.
+        if self.is_preview {
+            cx.emit(GridEvent::ViewChanged);
+        }
         cx.notify();
     }
 
     /// Public seam for Task 6 persistence (view_prefs): applies a saved
     /// sort + hidden-column set and rebuilds. `hidden` is by SOURCE column
-    /// index, same convention as `hidden_cols`. Not called anywhere yet —
-    /// Task 6 wires it up once `dbc-state::ViewPrefsStore` (Task 1) is
-    /// loaded and a preview tab's schema is known.
-    #[allow(dead_code)]
+    /// index, same convention as `hidden_cols`. Called by
+    /// `main.rs::apply_view_prefs_to_grid` on a PREVIEW tab's `Started`
+    /// event, once `dbc-state::ViewPrefsStore` prefs have been mapped from
+    /// saved names to this result's current indices.
     pub fn set_view_state(&mut self, sort: Option<(usize, bool)>, hidden: Vec<bool>) {
         self.view.sort = sort;
         self.hidden_cols = hidden;
@@ -810,11 +832,51 @@ impl ResultGrid {
     }
 
     /// Public seam for Task 6 persistence: current sort + hidden-column
-    /// state, by SOURCE column index. Not called anywhere yet — see
-    /// `set_view_state`.
-    #[allow(dead_code)]
+    /// state, by SOURCE column index — read by
+    /// `main.rs::save_view_prefs_for_grid`.
     pub fn view_state(&self) -> (Option<(usize, bool)>, Vec<bool>) {
         (self.view.sort, self.hidden_cols.clone())
+    }
+
+    /// G4 Task 6: this PREVIEW tab's identity for `ViewPrefsStore::get`/
+    /// `set` — `None` for an ad-hoc tab (never persisted, brief contract:
+    /// "ad-hoc tabs: per-tab only, nothing persisted"). `(schema, table)`,
+    /// exactly `PreviewTarget`'s own fields — `main.rs` still supplies the
+    /// connection id itself (the grid doesn't know it).
+    pub fn preview_identity(&self) -> Option<(Option<String>, String)> {
+        if self.is_preview {
+            Some((self.preview_schema.clone(), self.table_name.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// G4 Task 6: the CURRENT result's column names, in source-column order
+    /// — what `main.rs` maps saved/current view state through (name↔ix), so
+    /// prefs survive a column reorder in the underlying table and silently
+    /// drop a renamed/removed one (brief contract #4) rather than trusting a
+    /// stale index.
+    pub fn column_names(&self) -> Vec<String> {
+        self.buffer
+            .as_ref()
+            .map(|b| b.borrow().schema().fields().iter().map(|f| f.name().to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// G4 Task 6: SOURCE column names with at least one ref-column currently
+    /// checked in their ☰ menu — i.e. this PREVIEW tab's active fk-joins by
+    /// name, exactly `TableViewPrefs::fk_joins`'s shape. Read by
+    /// `main.rs::save_view_prefs_for_grid`; note this only ever has entries
+    /// on a PREVIEW tab (`fk_checked` on an ad-hoc tab drives `RunLookup`/
+    /// `virtual_cols` instead, never persisted).
+    pub fn active_fk_join_names(&self) -> Vec<String> {
+        let names = self.column_names();
+        self.fk_checked
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| !set.is_empty())
+            .filter_map(|(i, _)| names.get(i).cloned())
+            .collect()
     }
 
     /// "Filtr" button click. Turning the row OFF also clears every active
@@ -1059,6 +1121,11 @@ impl ResultGrid {
         // be pure waste and would incorrectly flash the "řadím…" status note
         // for a large result on a mere show/hide click.
         self.view_generation += 1;
+        // G4 Task 6: persist the new visibility for a PREVIEW tab — same
+        // guard as `on_header_click`.
+        if self.is_preview {
+            cx.emit(GridEvent::ViewChanged);
+        }
         cx.notify();
     }
 
@@ -2204,6 +2271,12 @@ impl Render for ResultGrid {
                     gpui::MouseButton::Left,
                     cx.listener(|this, _e, _w, cx| {
                         this.resizing = None;
+                        // G4 Task 6: width-drag END (never mid-drag, brief
+                        // contract #3) — same PREVIEW-only guard as
+                        // `on_header_click`/`toggle_column_visibility`.
+                        if this.is_preview {
+                            cx.emit(GridEvent::ViewChanged);
+                        }
                         cx.notify();
                     }),
                 )
@@ -2211,6 +2284,9 @@ impl Render for ResultGrid {
                     gpui::MouseButton::Left,
                     cx.listener(|this, _e, _w, cx| {
                         this.resizing = None;
+                        if this.is_preview {
+                            cx.emit(GridEvent::ViewChanged);
+                        }
                         cx.notify();
                     }),
                 );

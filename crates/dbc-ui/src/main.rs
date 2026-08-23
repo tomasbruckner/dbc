@@ -22,7 +22,7 @@ use dbc_core::{
     apply_auto_limit, is_read_statement, quote_qualified, CancelToken, FkRef, QueryError,
     SchemaSnapshot, TableInfo,
 };
-use dbc_state::{AppConfig, HistoryDb, HistoryEntry, Vault};
+use dbc_state::{AppConfig, HistoryDb, HistoryEntry, TableViewPrefs, Vault, ViewPrefsStore};
 use gpui::{
     actions, div, prelude::*, px, rgb, rgba, size, AnyElement, App, Bounds, ClipboardItem,
     Context, Entity, Focusable, KeyBinding, ScrollDelta, ScrollWheelEvent, Window, WindowBounds,
@@ -91,6 +91,73 @@ fn fk_info_from_table(
         ref_cols.push(refcols);
     }
     (fk_info, ref_cols)
+}
+
+/// G4 Task 6: maps SAVED preference names to the CURRENT result's source
+/// column indices by exact name match — a name no longer present (a column
+/// renamed or dropped since the prefs were saved) is silently skipped
+/// (brief contract #4: "missing/renamed columns are ignored on apply"), not
+/// an error. Order of `names` is preserved in the output (matches are
+/// pushed in `names`' iteration order), duplicates/missing entries just
+/// don't appear.
+fn names_to_ixs(names: &[String], headers: &[String]) -> Vec<usize> {
+    names.iter().filter_map(|n| headers.iter().position(|h| h == n)).collect()
+}
+
+/// G4 Task 6: the SAVE direction — builds a `TableViewPrefs` from a PREVIEW
+/// grid's raw (ix-indexed) state, mapping every ix back to `headers`' name
+/// at that position. `fk_joins` is passed straight through (already names,
+/// from `ResultGrid::active_fk_join_names`). This is what makes "prefs
+/// pruned on next save" (contract #4) automatic: a column that no longer
+/// exists was already dropped by `view_prefs_to_grid_state`'s name→ix
+/// mapping the moment it was applied, so it can never resurface here to be
+/// written back out.
+fn prefs_from_grid_state(
+    headers: &[String],
+    sort: Option<(usize, bool)>,
+    hidden: &[bool],
+    widths: &[f32],
+    fk_joins: Vec<String>,
+) -> TableViewPrefs {
+    let hidden_columns: Vec<String> = hidden
+        .iter()
+        .enumerate()
+        .filter(|(_, &h)| h)
+        .filter_map(|(i, _)| headers.get(i).cloned())
+        .collect();
+    let col_widths: Vec<(String, f32)> =
+        headers.iter().zip(widths.iter()).map(|(n, w)| (n.clone(), *w)).collect();
+    let sort = sort.and_then(|(ix, asc)| headers.get(ix).cloned().map(|n| (n, asc)));
+    TableViewPrefs { hidden_columns, col_widths, sort, fk_joins }
+}
+
+/// G4 Task 6: the APPLY direction — maps a saved `TableViewPrefs` (by name)
+/// onto the CURRENT result's columns (by ix). A sort/hidden/width entry
+/// whose column name isn't in `headers` any more is silently dropped
+/// (contract #4) rather than erroring or leaving a dangling index. `hidden`
+/// is always sized to `headers.len()` (matches
+/// `ResultGrid::set_view_state`'s convention — every source column gets an
+/// explicit true/false); `widths` is a sparse ix→px list, applied directly
+/// onto `ResultGrid::col_widths` by the caller rather than routed through
+/// `set_view_state`.
+fn view_prefs_to_grid_state(
+    prefs: &TableViewPrefs,
+    headers: &[String],
+) -> (Option<(usize, bool)>, Vec<bool>, Vec<(usize, f32)>) {
+    let mut hidden = vec![false; headers.len()];
+    for ix in names_to_ixs(&prefs.hidden_columns, headers) {
+        hidden[ix] = true;
+    }
+    let sort = prefs
+        .sort
+        .as_ref()
+        .and_then(|(name, asc)| headers.iter().position(|h| h == name).map(|ix| (ix, *asc)));
+    let widths: Vec<(usize, f32)> = prefs
+        .col_widths
+        .iter()
+        .filter_map(|(name, w)| headers.iter().position(|h| h == name).map(|ix| (ix, *w)))
+        .collect();
+    (sort, hidden, widths)
 }
 
 /// Set by `TreeEvent::OpenPreview` and threaded through `run_query_with` so
@@ -224,6 +291,13 @@ struct AppView {
     /// convention as `modal`, and mutually exclusive with it (see
     /// `on_open_palette`/`render_palette_overlay`).
     palette: Option<PaletteState>,
+    // --- G4 Task 6: per-table view memory ---
+    /// Opened from `dbc_state::default_view_prefs_path()` at startup;
+    /// `None` when the open failed (surfaced once in the startup status —
+    /// see `main`), in which case the feature is simply off — no apply, no
+    /// save — the rest of the app is fully functional either way, same
+    /// "degrade gracefully" precedent as `history: Option<HistoryDb>`.
+    view_prefs: Option<ViewPrefsStore>,
 }
 
 /// Stable identity for a `ConnectSpec`, used only to decide whether two
@@ -377,6 +451,24 @@ impl AppView {
             // tab") — if the tab was closed mid-stream, the run cancels
             // itself and stops consuming further events.
             let mut tab_id: Option<u64> = None;
+            // G4 Task 6: set by `apply_view_prefs_to_grid` when a saved
+            // fk-join needs re-triggering (this run's own preview target
+            // didn't already carry joins, but the saved prefs do) — deferred
+            // until this run's `Finished` clears `view.cancel` (see the
+            // `QueryEvent::Finished` arm below), since `run_query_with`'s
+            // one-query-at-a-time guard would otherwise silently drop it if
+            // dispatched from inside `Started`.
+            let mut pending_join_retrigger: Option<PreviewTarget> = None;
+            // G4 Task 6: set true when `pending_join_retrigger` is actually
+            // dispatched below — `view.run_query_with` synchronously sets a
+            // FRESH `view.cancel` for that new run before this closure
+            // returns, so the tail cleanup after the loop (which
+            // unconditionally reset `view.cancel = None` for THIS run) must
+            // skip doing so in that case, or it would immediately wipe out
+            // the new run's cancel token (the channel closes right after
+            // `Finished`, so `rx.recv()` resolves without yielding and this
+            // tail runs before the new run has any chance to progress).
+            let mut retriggered = false;
             while let Some(ev) = rx.recv().await {
                 let stop = this
                     .update(cx, |view, cx| {
@@ -429,6 +521,20 @@ impl AppView {
                                         g.apply_active_joins(&p.joins);
                                     }
                                 });
+                                // G4 Task 6: per-table view memory — apply
+                                // saved hidden/sort/widths to this fresh
+                                // grid now that column names are known, and
+                                // (loop-guarded) queue a saved fk-join
+                                // re-run if this Started event isn't already
+                                // ITS result. See `apply_view_prefs_to_grid`'s
+                                // doc comment for the full design.
+                                if let Some(p) = &preview {
+                                    if let Some(retrigger) =
+                                        view.apply_view_prefs_to_grid(&grid, p, &result_cols, cx)
+                                    {
+                                        pending_join_retrigger = Some(retrigger);
+                                    }
+                                }
                                 // G4 Task 5: one subscription per grid
                                 // entity — see `GridEvent`'s doc comment for
                                 // why the event payload carries everything
@@ -571,6 +677,22 @@ impl AppView {
                                     }
                                 }
                                 view.cancel = None;
+                                // G4 Task 6: fire the deferred saved-fk-join
+                                // re-run now that `view.cancel` is clear —
+                                // only on a genuine success (an errored run
+                                // has no valid base result to re-join), see
+                                // `pending_join_retrigger`'s doc comment.
+                                if errored.is_none() {
+                                    if let Some(pt) = pending_join_retrigger.take() {
+                                        let sql = fk_join::build_join_sql(
+                                            pt.schema.as_deref(),
+                                            &pt.table,
+                                            &pt.joins,
+                                        );
+                                        view.run_query_with(sql, Some(pt), true, cx);
+                                        retriggered = true;
+                                    }
+                                }
                             }
                             QueryEvent::Failed(e) => {
                                 match &errored {
@@ -611,7 +733,11 @@ impl AppView {
                 }
             }
             let _ = this.update(cx, |view, cx| {
-                view.cancel = None;
+                // G4 Task 6: don't clobber the freshly-dispatched retrigger
+                // run's own `view.cancel` — see `retriggered`'s doc comment.
+                if !retriggered {
+                    view.cancel = None;
+                }
                 cx.notify();
             });
         })
@@ -1025,6 +1151,141 @@ impl AppView {
         fk_info_from_table(snapshot, t, result_cols)
     }
 
+    /// G4 Task 6: applies saved per-table view prefs (Task 1's
+    /// `ViewPrefsStore`) to a PREVIEW tab's just-`Started` grid — hidden
+    /// columns/sort/widths always; a saved fk-join is handled specially and
+    /// returned to the caller rather than dispatched here directly (see
+    /// below). A no-op (returns `None`, touches nothing) when `view_prefs`
+    /// failed to load, there's no active connection, or no prefs are saved
+    /// for `(connection, p.schema, p.table)` yet.
+    ///
+    /// **Join re-trigger loop guard**: `p.joins` is `PreviewTarget::joins`
+    /// for THIS run — empty for a plain preview open, non-empty when this
+    /// `Started` is itself the result of a join re-run (either a user's ☰
+    /// toggle via `GridEvent::RerunPreviewJoins`, or a saved-fk-join
+    /// retrigger this very function returned on a PRIOR call for the same
+    /// preview identity). Two cases:
+    /// - `p.joins` non-empty: this result's joins are already exactly what
+    ///   should be persisted — save the current state immediately (covers
+    ///   both origins above with one code path) and return `None` (nothing
+    ///   left to retrigger).
+    /// - `p.joins` empty: this is a plain, un-joined result. If saved prefs
+    ///   have a non-empty `fk_joins`, build the equivalent `JoinSpec` list
+    ///   (`build_join_specs_from_names`) and return a `PreviewTarget`
+    ///   carrying them — the caller (`run_query_with`'s `Started` arm)
+    ///   queues it as `pending_join_retrigger`, dispatched once THIS run's
+    ///   `Finished` clears `view.cancel`. That re-run's own `Started` then
+    ///   lands here again with `p.joins` non-empty, hits the first branch
+    ///   above, and does NOT recurse into this branch again — the loop
+    ///   guard is exactly "non-empty joins never re-trigger".
+    fn apply_view_prefs_to_grid(
+        &mut self,
+        grid: &Entity<ResultGrid>,
+        p: &PreviewTarget,
+        headers: &[String],
+        cx: &mut Context<Self>,
+    ) -> Option<PreviewTarget> {
+        let store = self.view_prefs.as_ref()?;
+        let conn_id = self.active_connection_id.clone()?;
+        let prefs = store.get(&conn_id, p.schema.as_deref(), &p.table)?.clone();
+        let (sort, hidden, widths) = view_prefs_to_grid_state(&prefs, headers);
+        grid.update(cx, |g, _| {
+            g.set_view_state(sort, hidden);
+            for (ix, w) in &widths {
+                if let Some(cw) = g.col_widths.get_mut(*ix) {
+                    *cw = *w;
+                }
+            }
+        });
+        if !p.joins.is_empty() {
+            self.save_view_prefs_for_grid(grid, cx);
+            return None;
+        }
+        if prefs.fk_joins.is_empty() {
+            return None;
+        }
+        let join_specs =
+            self.build_join_specs_from_names(&prefs.fk_joins, p.schema.as_deref(), &p.table, headers, cx);
+        if join_specs.is_empty() {
+            return None;
+        }
+        Some(PreviewTarget {
+            title: p.title.clone(),
+            key: p.key.clone(),
+            table: p.table.clone(),
+            schema: p.schema.clone(),
+            joins: join_specs,
+        })
+    }
+
+    /// G4 Task 6: rebuilds `fk_join::JoinSpec`s from saved fk-join COLUMN
+    /// NAMES (`TableViewPrefs::fk_joins` — just names, no per-ref-column
+    /// selection is persisted) against `headers` (the un-joined result's
+    /// current columns) via `fk_info_for_table`. A name with no matching
+    /// current column, no FK metadata, or whose referenced table has no
+    /// columns at all is silently skipped (same "missing → ignored" contract
+    /// as `names_to_ixs`). Since which specific ref-table columns were
+    /// checked isn't persisted, every column of the referenced table is
+    /// selected — the closest available reconstruction of "this fk was
+    /// joined" from the saved shape.
+    fn build_join_specs_from_names(
+        &self,
+        fk_join_names: &[String],
+        schema: Option<&str>,
+        table: &str,
+        headers: &[String],
+        cx: &Context<Self>,
+    ) -> Vec<fk_join::JoinSpec> {
+        let (fk_info, ref_cols) = self.fk_info_for_table(schema, table, headers, cx);
+        let mut specs = Vec::new();
+        for name in fk_join_names {
+            let Some(ix) = headers.iter().position(|h| h == name) else { continue };
+            let Some(Some(fk)) = fk_info.get(ix).cloned() else { continue };
+            let Some(Some(cols)) = ref_cols.get(ix).cloned() else { continue };
+            if cols.is_empty() {
+                continue;
+            }
+            specs.push(fk_join::JoinSpec {
+                fk_col: name.clone(),
+                ref_schema: fk.schema.clone(),
+                ref_table: fk.table.clone(),
+                ref_key: fk.column.clone(),
+                cols,
+            });
+        }
+        specs
+    }
+
+    /// G4 Task 6: persists a PREVIEW tab's CURRENT view state (sort, hidden
+    /// columns, widths, active fk-joins) to `view_prefs` — the single save
+    /// path used both by `GridEvent::ViewChanged` (sort/visibility/
+    /// width-drag-end, emitted directly by `grid.rs`) and by
+    /// `apply_view_prefs_to_grid` right after a join re-run's `Started`
+    /// event lands (see that method's loop-guard doc comment). A no-op for
+    /// an ad-hoc tab (`grid` reports no preview identity), no active
+    /// connection, or a disabled `view_prefs` store (load failed at
+    /// startup). A save failure (e.g. an unwritable config dir) is
+    /// surfaced in the status bar but never blocks the UI action that
+    /// triggered it — same "best-effort persistence" precedent
+    /// `record_history` already follows.
+    fn save_view_prefs_for_grid(&mut self, grid: &Entity<ResultGrid>, cx: &mut Context<Self>) {
+        let Some(conn_id) = self.active_connection_id.clone() else { return };
+        let (schema, table, headers, sort, hidden, widths, fk_joins) = {
+            let g = grid.read(cx);
+            let Some((schema, table)) = g.preview_identity() else { return };
+            let headers = g.column_names();
+            let (sort, hidden) = g.view_state();
+            let widths = g.col_widths.clone();
+            let fk_joins = g.active_fk_join_names();
+            (schema, table, headers, sort, hidden, widths, fk_joins)
+        };
+        let Some(store) = self.view_prefs.as_mut() else { return };
+        let prefs = prefs_from_grid_state(&headers, sort, &hidden, &widths, fk_joins);
+        if let Err(e) = store.set(&conn_id, schema.as_deref(), &table, prefs) {
+            self.status = format!("error ukládání view prefs: {}", e.message);
+        }
+    }
+
     /// G4 Task 5, AD-HOC tabs: `GridEvent::RunLookup`'s handler — resolves
     /// the active connection (brief: "no connection → status error", same
     /// guard `run_query_with` applies), dispatches `runner.fetch_lookup`,
@@ -1174,6 +1435,12 @@ impl AppView {
                     generation: *generation,
                 };
                 self.start_lookup(emitter, req, cx);
+            }
+            // G4 Task 6: sort/visibility/width-drag-end on a PREVIEW tab —
+            // see `GridEvent::ViewChanged`'s doc comment and
+            // `save_view_prefs_for_grid`.
+            GridEvent::ViewChanged => {
+                self.save_view_prefs_for_grid(&emitter, cx);
             }
         }
     }
@@ -1568,6 +1835,15 @@ fn main() {
         Ok(h) => (Some(h), None),
         Err(e) => (None, Some(e.to_string())),
     };
+    // G4 Task 6: opened once at startup; a failure (e.g. a corrupt
+    // views.toml) is surfaced in the status bar below but never blocks the
+    // rest of the app — the feature is just off (`view_prefs: None`), same
+    // "degrade gracefully" precedent `history_open_error` already follows.
+    let (view_prefs, view_prefs_open_error) =
+        match ViewPrefsStore::load(&dbc_state::default_view_prefs_path()) {
+            Ok(v) => (Some(v), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
 
     application().run(move |cx: &mut App| {
         cx.bind_keys([
@@ -1602,13 +1878,18 @@ fn main() {
                         let grouped_cache = connections_ui::group_connections(&config.connections);
                         // config.toml corruption takes priority (it blocks
                         // saving/editing connections outright); a history
-                        // open failure is a lesser, non-blocking notice.
-                        let status = match (&config_load_error, &history_open_error) {
-                            (Some(detail), _) => {
-                                format!("error: config.toml je poškozený – oprav nebo smaž soubor ({detail})")
-                            }
-                            (None, Some(detail)) => format!("error: historie nedostupná ({detail})"),
-                            (None, None) => "ready".into(),
+                        // open failure is a lesser, non-blocking notice; a
+                        // view-prefs open failure (G4 Task 6) is the least
+                        // severe of the three (only per-table grid memory is
+                        // affected).
+                        let status = if let Some(detail) = &config_load_error {
+                            format!("error: config.toml je poškozený – oprav nebo smaž soubor ({detail})")
+                        } else if let Some(detail) = &history_open_error {
+                            format!("error: historie nedostupná ({detail})")
+                        } else if let Some(detail) = &view_prefs_open_error {
+                            format!("error: view prefs nedostupné ({detail})")
+                        } else {
+                            "ready".into()
                         };
                         let editor_focus = sql.focus_handle(cx);
                         let tree = cx.new(|cx| SchemaTree::new(cx, editor_focus));
@@ -1642,6 +1923,7 @@ fn main() {
                             history_cache: Vec::new(),
                             last_history_query: String::new(),
                             palette: None,
+                            view_prefs,
                         }
                     })
                 },
@@ -1689,5 +1971,111 @@ mod preview_sql_tests {
             preview_sql(Some("we\"ird"), "t"),
             "SELECT * FROM \"we\"\"ird\".\"t\" LIMIT 1000"
         );
+    }
+}
+
+/// G4 Task 6: pure name↔ix mapping helpers behind view-prefs apply/save —
+/// no GPUI, no I/O, so tested directly against fixture headers rather than
+/// through a full `ResultGrid`/`ViewPrefsStore` round trip (that's covered
+/// end-to-end by Task 1's persistence tests + manual review per the brief).
+#[cfg(test)]
+mod view_prefs_mapping_tests {
+    use super::*;
+
+    fn headers() -> Vec<String> {
+        vec!["id".to_string(), "name".to_string(), "email".to_string()]
+    }
+
+    #[test]
+    fn names_to_ixs_skips_missing_names_but_keeps_found_ones() {
+        let h = headers();
+        let names = vec!["name".to_string(), "ghost".to_string(), "id".to_string()];
+        assert_eq!(names_to_ixs(&names, &h), vec![1, 0]);
+    }
+
+    #[test]
+    fn names_to_ixs_empty_when_nothing_matches() {
+        let h = headers();
+        let names = vec!["ghost1".to_string(), "ghost2".to_string()];
+        assert!(names_to_ixs(&names, &h).is_empty());
+    }
+
+    #[test]
+    fn prefs_from_grid_state_maps_every_ix_to_its_current_name() {
+        let h = headers();
+        let hidden = vec![false, true, false];
+        let widths = vec![100.0, 150.0, 200.0];
+        let prefs =
+            prefs_from_grid_state(&h, Some((2, false)), &hidden, &widths, vec!["id".to_string()]);
+        assert_eq!(prefs.hidden_columns, vec!["name".to_string()]);
+        assert_eq!(
+            prefs.col_widths,
+            vec![
+                ("id".to_string(), 100.0),
+                ("name".to_string(), 150.0),
+                ("email".to_string(), 200.0),
+            ]
+        );
+        assert_eq!(prefs.sort, Some(("email".to_string(), false)));
+        assert_eq!(prefs.fk_joins, vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn prefs_from_grid_state_no_sort_stays_none() {
+        let h = headers();
+        let hidden = vec![false, false, false];
+        let widths = vec![160.0, 160.0, 160.0];
+        let prefs = prefs_from_grid_state(&h, None, &hidden, &widths, Vec::new());
+        assert_eq!(prefs.sort, None);
+        assert!(prefs.hidden_columns.is_empty());
+        assert!(prefs.fk_joins.is_empty());
+    }
+
+    #[test]
+    fn view_prefs_to_grid_state_roundtrips_through_names() {
+        let h = headers();
+        let prefs = TableViewPrefs {
+            hidden_columns: vec!["email".to_string()],
+            col_widths: vec![("name".to_string(), 222.0)],
+            sort: Some(("name".to_string(), true)),
+            fk_joins: vec!["id".to_string()],
+        };
+        let (sort, hidden, widths) = view_prefs_to_grid_state(&prefs, &h);
+        assert_eq!(sort, Some((1, true)));
+        assert_eq!(hidden, vec![false, false, true]);
+        assert_eq!(widths, vec![(1, 222.0)]);
+    }
+
+    /// A saved sort column that no longer exists (renamed/dropped) is
+    /// dropped entirely rather than falling back to some other column or
+    /// panicking on an out-of-range index — brief contract #4.
+    #[test]
+    fn view_prefs_to_grid_state_ignores_a_missing_sort_column() {
+        let h = headers();
+        let prefs = TableViewPrefs {
+            hidden_columns: Vec::new(),
+            col_widths: Vec::new(),
+            sort: Some(("deleted_col".to_string(), true)),
+            fk_joins: Vec::new(),
+        };
+        let (sort, hidden, widths) = view_prefs_to_grid_state(&prefs, &h);
+        assert_eq!(sort, None);
+        assert_eq!(hidden, vec![false, false, false]);
+        assert!(widths.is_empty());
+    }
+
+    #[test]
+    fn view_prefs_to_grid_state_ignores_missing_hidden_and_width_names() {
+        let h = headers();
+        let prefs = TableViewPrefs {
+            hidden_columns: vec!["ghost".to_string(), "id".to_string()],
+            col_widths: vec![("ghost".to_string(), 50.0), ("email".to_string(), 300.0)],
+            sort: None,
+            fk_joins: Vec::new(),
+        };
+        let (sort, hidden, widths) = view_prefs_to_grid_state(&prefs, &h);
+        assert_eq!(sort, None);
+        assert_eq!(hidden, vec![true, false, false]);
+        assert_eq!(widths, vec![(2, 300.0)]);
     }
 }
