@@ -160,6 +160,60 @@ fn view_prefs_to_grid_state(
     (sort, hidden, widths)
 }
 
+/// Review fix (Task 6 round 1, Issue 1): the outcome of
+/// `apply_view_prefs_to_grid`'s join-state bookkeeping, given the three
+/// facts it has available at a `Started` event — extracted as a pure
+/// function so the ambiguity that caused the "uncheck-last-join lock-in" bug
+/// can be tested directly (all 8 input combinations) rather than only
+/// through the full grid/store integration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinPrefAction {
+    /// Persist THIS run's live join state (whatever it is, empty or not) as
+    /// the new saved `fk_joins`.
+    Save,
+    /// This is a plain preview open with no joins of its own, and saved
+    /// prefs have a non-empty `fk_joins` — rebuild `JoinSpec`s and re-run.
+    Retrigger,
+    /// Nothing to persist, nothing to retrigger.
+    Nothing,
+}
+
+/// Pure decision function for `apply_view_prefs_to_grid`.
+///
+/// `from_join_change` is `true` only when this `Started` resulted from a
+/// `GridEvent::RerunPreviewJoins` dispatch (an explicit user ☰ toggle) —
+/// threaded through `PreviewTarget::from_join_change` rather than inferred
+/// from `joins.is_empty()`, which is what let an explicit "uncheck the last
+/// join" (empty joins, but very much user-driven) get misread as "plain
+/// re-open, nothing changed" and silently reverted by stale saved prefs
+/// (review Issue 1).
+///
+/// - `from_join_change == true`: the user just explicitly set the join
+///   state (possibly to empty) — always `Save`, regardless of the other two
+///   inputs. This is the fix: an explicit uncheck-to-zero now persists the
+///   empty state instead of falling through to the retrigger branch.
+/// - `from_join_change == false`, `joins_empty == false`: this `Started` is
+///   a saved-fk-join retrigger's OWN result (queued by a prior call to this
+///   same function) — `Save` (idempotent re-persist of what's already on
+///   disk) and, critically, does NOT retrigger again — this is the original
+///   loop guard, preserved.
+/// - `from_join_change == false`, `joins_empty == true`: a genuine plain
+///   preview (re-)open with no joins of its own. `Retrigger` if saved prefs
+///   have a non-empty `fk_joins` to restore, else `Nothing`.
+fn decide_join_pref_action(
+    from_join_change: bool,
+    joins_empty: bool,
+    saved_fk_joins_nonempty: bool,
+) -> JoinPrefAction {
+    if from_join_change || !joins_empty {
+        JoinPrefAction::Save
+    } else if saved_fk_joins_nonempty {
+        JoinPrefAction::Retrigger
+    } else {
+        JoinPrefAction::Nothing
+    }
+}
+
 /// Set by `TreeEvent::OpenPreview` and threaded through `run_query_with` so
 /// a preview runs through the exact same guarded pipeline as an
 /// editor-typed query, without ever touching `self.sql`'s text: `title`
@@ -189,6 +243,14 @@ struct PreviewTarget {
     /// so the brand-new grid entity `QueryEvent::Started` creates can
     /// restore checkbox/tint state via `ResultGrid::apply_active_joins`.
     joins: Vec<fk_join::JoinSpec>,
+    /// Review fix (Task 6 round 1, Issue 1): `true` only when this run was
+    /// dispatched from `on_grid_event`'s `GridEvent::RerunPreviewJoins` arm
+    /// — i.e. this run's `joins` (empty or not) is the DIRECT result of an
+    /// explicit user ☰ toggle, not a plain preview open or a saved-fk-join
+    /// retrigger `apply_view_prefs_to_grid` queued itself. See
+    /// `decide_join_pref_action` for why this needs to be an explicit
+    /// marker rather than inferred from `joins.is_empty()`.
+    from_join_change: bool,
 }
 
 /// Review fix (Task 5 round 1, clippy `too_many_arguments`): bundles
@@ -682,15 +744,30 @@ impl AppView {
                                 // only on a genuine success (an errored run
                                 // has no valid base result to re-join), see
                                 // `pending_join_retrigger`'s doc comment.
+                                //
+                                // Review fix (Task 6 round 1, Issue 2): also
+                                // require this run's tab to still be open —
+                                // same "tab closed mid-stream" guard the
+                                // `Batch` arm above already applies. Without
+                                // it, a tab closed in the gap between the
+                                // last `Batch` (or `Started`, if there were
+                                // none) and `Finished` never gets noticed,
+                                // and the retrigger silently re-opens a
+                                // preview tab the user just explicitly
+                                // closed.
                                 if errored.is_none() {
                                     if let Some(pt) = pending_join_retrigger.take() {
-                                        let sql = fk_join::build_join_sql(
-                                            pt.schema.as_deref(),
-                                            &pt.table,
-                                            &pt.joins,
-                                        );
-                                        view.run_query_with(sql, Some(pt), true, cx);
-                                        retriggered = true;
+                                        let tab_still_open = tab_id
+                                            .is_some_and(|id| view.tabs.iter().any(|t| t.id == id));
+                                        if tab_still_open {
+                                            let sql = fk_join::build_join_sql(
+                                                pt.schema.as_deref(),
+                                                &pt.table,
+                                                &pt.joins,
+                                            );
+                                            view.run_query_with(sql, Some(pt), true, cx);
+                                            retriggered = true;
+                                        }
                                     }
                                 }
                             }
@@ -950,6 +1027,7 @@ impl AppView {
                     table: name.clone(),
                     schema,
                     joins: Vec::new(),
+                    from_join_change: false,
                 };
                 self.run_query_with(sql, Some(preview), true, cx);
             }
@@ -1159,25 +1237,19 @@ impl AppView {
     /// failed to load, there's no active connection, or no prefs are saved
     /// for `(connection, p.schema, p.table)` yet.
     ///
-    /// **Join re-trigger loop guard**: `p.joins` is `PreviewTarget::joins`
-    /// for THIS run — empty for a plain preview open, non-empty when this
-    /// `Started` is itself the result of a join re-run (either a user's ☰
-    /// toggle via `GridEvent::RerunPreviewJoins`, or a saved-fk-join
-    /// retrigger this very function returned on a PRIOR call for the same
-    /// preview identity). Two cases:
-    /// - `p.joins` non-empty: this result's joins are already exactly what
-    ///   should be persisted — save the current state immediately (covers
-    ///   both origins above with one code path) and return `None` (nothing
-    ///   left to retrigger).
-    /// - `p.joins` empty: this is a plain, un-joined result. If saved prefs
-    ///   have a non-empty `fk_joins`, build the equivalent `JoinSpec` list
-    ///   (`build_join_specs_from_names`) and return a `PreviewTarget`
-    ///   carrying them — the caller (`run_query_with`'s `Started` arm)
-    ///   queues it as `pending_join_retrigger`, dispatched once THIS run's
-    ///   `Finished` clears `view.cancel`. That re-run's own `Started` then
-    ///   lands here again with `p.joins` non-empty, hits the first branch
-    ///   above, and does NOT recurse into this branch again — the loop
-    ///   guard is exactly "non-empty joins never re-trigger".
+    /// **Join re-trigger loop guard**: delegates the save/retrigger/nothing
+    /// decision to the pure `decide_join_pref_action` (review fix, Task 6
+    /// round 1, Issue 1) rather than inferring it from `p.joins.is_empty()`
+    /// alone — the old inference conflated "plain preview open" with "user
+    /// explicitly unchecked the last join", so an uncheck-to-zero was read
+    /// as a no-op re-open, the empty state was never saved, and the stale
+    /// on-disk `fk_joins` kept re-triggering forever. `p.from_join_change`
+    /// (`true` only for a `GridEvent::RerunPreviewJoins`-dispatched run)
+    /// breaks that ambiguity: an explicit toggle (empty joins or not)
+    /// always saves; only a marker-less empty-joins `Started` (a genuine
+    /// plain open) can still trigger a saved-fk-join retrigger, and that
+    /// retrigger's own `Started` (non-empty joins, no marker) saves and
+    /// does not recurse — same loop guard as before, just unambiguous now.
     fn apply_view_prefs_to_grid(
         &mut self,
         grid: &Entity<ResultGrid>,
@@ -1197,25 +1269,33 @@ impl AppView {
                 }
             }
         });
-        if !p.joins.is_empty() {
-            self.save_view_prefs_for_grid(grid, cx);
-            return None;
+        match decide_join_pref_action(p.from_join_change, p.joins.is_empty(), !prefs.fk_joins.is_empty()) {
+            JoinPrefAction::Save => {
+                self.save_view_prefs_for_grid(grid, cx);
+                None
+            }
+            JoinPrefAction::Nothing => None,
+            JoinPrefAction::Retrigger => {
+                let join_specs = self.build_join_specs_from_names(
+                    &prefs.fk_joins,
+                    p.schema.as_deref(),
+                    &p.table,
+                    headers,
+                    cx,
+                );
+                if join_specs.is_empty() {
+                    return None;
+                }
+                Some(PreviewTarget {
+                    title: p.title.clone(),
+                    key: p.key.clone(),
+                    table: p.table.clone(),
+                    schema: p.schema.clone(),
+                    joins: join_specs,
+                    from_join_change: false,
+                })
+            }
         }
-        if prefs.fk_joins.is_empty() {
-            return None;
-        }
-        let join_specs =
-            self.build_join_specs_from_names(&prefs.fk_joins, p.schema.as_deref(), &p.table, headers, cx);
-        if join_specs.is_empty() {
-            return None;
-        }
-        Some(PreviewTarget {
-            title: p.title.clone(),
-            key: p.key.clone(),
-            table: p.table.clone(),
-            schema: p.schema.clone(),
-            joins: join_specs,
-        })
     }
 
     /// G4 Task 6: rebuilds `fk_join::JoinSpec`s from saved fk-join COLUMN
@@ -1423,6 +1503,12 @@ impl AppView {
                     table: table.clone(),
                     schema: schema.clone(),
                     joins: joins.clone(),
+                    // Review fix (Task 6 round 1, Issue 1): this run's
+                    // `joins` (even if the user just unchecked the last one,
+                    // making it empty) is a direct, explicit user action —
+                    // `apply_view_prefs_to_grid` must save it unconditionally
+                    // rather than reading `joins.is_empty()` as "plain open".
+                    from_join_change: true,
                 };
                 self.run_query_with(sql, Some(preview), true, cx);
             }
@@ -1525,6 +1611,7 @@ impl AppView {
                     table: table.clone(),
                     schema: schema.clone(),
                     joins: Vec::new(),
+                    from_join_change: false,
                 };
                 self.run_query_with(sql, Some(preview), true, cx);
             }
@@ -2077,5 +2164,68 @@ mod view_prefs_mapping_tests {
         assert_eq!(sort, None);
         assert_eq!(hidden, vec![true, false, false]);
         assert_eq!(widths, vec![(2, 300.0)]);
+    }
+}
+
+/// Review fix (Task 6 round 1, Issue 1): `decide_join_pref_action` is the
+/// pure save/retrigger/nothing decision that used to be an inline
+/// `if !p.joins.is_empty()` check conflating "plain open" with "user
+/// explicitly emptied the joins" — all 8 combinations of its 3 boolean
+/// inputs, exhaustively.
+#[cfg(test)]
+mod decide_join_pref_action_tests {
+    use super::*;
+
+    #[test]
+    fn from_join_change_always_saves_regardless_of_the_other_two_inputs() {
+        // This is the Issue 1 fix itself: an explicit uncheck-to-zero
+        // (from_join_change = true, joins_empty = true) must save, not
+        // fall through to a retrigger that silently reverts it.
+        assert_eq!(
+            decide_join_pref_action(true, true, true),
+            JoinPrefAction::Save
+        );
+        assert_eq!(
+            decide_join_pref_action(true, true, false),
+            JoinPrefAction::Save
+        );
+        assert_eq!(
+            decide_join_pref_action(true, false, true),
+            JoinPrefAction::Save
+        );
+        assert_eq!(
+            decide_join_pref_action(true, false, false),
+            JoinPrefAction::Save
+        );
+    }
+
+    #[test]
+    fn no_marker_non_empty_joins_saves_without_retriggering() {
+        // A saved-fk-join retrigger's own `Started`: no marker, but its
+        // joins are already the correct, non-empty state — save (idempotent)
+        // and do not recurse into another retrigger (the original loop
+        // guard).
+        assert_eq!(
+            decide_join_pref_action(false, false, true),
+            JoinPrefAction::Save
+        );
+        assert_eq!(
+            decide_join_pref_action(false, false, false),
+            JoinPrefAction::Save
+        );
+    }
+
+    #[test]
+    fn no_marker_empty_joins_retriggers_only_when_saved_prefs_have_joins() {
+        // A genuine plain preview open: retrigger iff saved prefs have a
+        // non-empty fk_joins to restore, otherwise nothing to do.
+        assert_eq!(
+            decide_join_pref_action(false, true, true),
+            JoinPrefAction::Retrigger
+        );
+        assert_eq!(
+            decide_join_pref_action(false, true, false),
+            JoinPrefAction::Nothing
+        );
     }
 }
