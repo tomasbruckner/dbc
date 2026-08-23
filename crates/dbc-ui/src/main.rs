@@ -6,6 +6,8 @@ mod fk_join;
 mod grid;
 mod history_panel;
 mod palette;
+#[allow(dead_code)] // consumed from T6 on; allow removed in T6
+mod plan;
 mod row_view;
 mod runner;
 mod sandbox;
