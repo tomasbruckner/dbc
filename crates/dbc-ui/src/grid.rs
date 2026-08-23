@@ -123,6 +123,10 @@ pub enum GridEvent {
     /// still clear, starts the CSV-import file-picker/pre-count/mapping
     /// flow for this preview's `(schema, table_name)`.
     ImportCsvRequested { schema: Option<String>, table: String },
+    /// G14 T11: "Graf" toolbar button clicked — `main.rs::on_grid_event`
+    /// opens the axis picker (`ModalState::ChartPicker`) for the tab owning
+    /// this grid (resolved via the emitting Entity).
+    OpenChart,
 }
 
 /// Bind ResultGrid's own keys. Scoped to the `"ResultGrid"` key context so
@@ -1614,6 +1618,21 @@ impl ResultGrid {
                     .child("Sloupce ▾")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_columns_menu(cx);
+                    })),
+            )
+            .child(
+                // G14 T11: "Graf" — main.rs opens the axis picker for the
+                // tab owning this grid.
+                div()
+                    .id("open-chart")
+                    .cursor_pointer()
+                    .px_2()
+                    .rounded_md()
+                    .bg(theme.bg_hover)
+                    .hover(|s| s.bg(theme.bg_selected))
+                    .child("Graf")
+                    .on_click(cx.listener(|_this, _, _, cx| {
+                        cx.emit(GridEvent::OpenChart);
                     })),
             );
 

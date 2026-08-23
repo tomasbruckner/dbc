@@ -34,6 +34,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+use dbc_buffer::ResultBuffer;
 use dbc_state::{ConnectionConfig, Engine, SshTunnelConfig, Vault};
 use gpui::{
     actions, div, fill, hsla, point, prelude::*, px, relative, size, App, AnyElement,
@@ -45,6 +46,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::chart_data::ChartKind;
 use crate::runner::ConnectSpec;
 use crate::text_model::MultilineBuffer;
 use crate::theme::{ActiveTheme, Theme};
@@ -1071,6 +1073,24 @@ pub enum ModalState {
     /// Opened via the topbar gear or the palette's "Přepnout motiv"
     /// bypasses this entirely (direct `toggle_theme` dispatch, no modal).
     Settings,
+    /// G14 T11: bar/line chart axis picker (design §2.1/§2.4) — opened by
+    /// `AppView::open_chart_picker` (grid "Graf" button / palette "Graf z
+    /// výsledku") or reopened editing-in-place by
+    /// `AppView::on_chart_view_event` (a Chart tab's "Upravit…").
+    ChartPicker {
+        source_title: String,
+        buffer: std::rc::Rc<std::cell::RefCell<ResultBuffer>>,
+        /// (column name, is_numeric) per buffer column, display order.
+        columns: Vec<(String, bool)>,
+        kind: ChartKind,
+        x_col: usize,
+        /// One flag per column; only numeric columns are toggleable (design
+        /// §2.1: Y list pre-filtered numeric, X unfiltered).
+        y_selected: Vec<bool>,
+        /// Some(tab_id): re-pick — reconfigure that tab's `ChartView` in
+        /// place instead of opening a new tab.
+        edit_tab: Option<u64>,
+    },
 }
 
 // ---------------------------------------------------------------------
@@ -1257,6 +1277,9 @@ impl AppView {
                 &conn_label, cx,
             ),
             ModalState::Settings => self.render_settings_panel(cx),
+            ModalState::ChartPicker { source_title, columns, kind, x_col, y_selected, edit_tab, .. } => {
+                render_chart_picker_panel(source_title, columns, kind, x_col, y_selected, edit_tab, cx)
+            }
         };
         Some(
             div()
@@ -1459,6 +1482,34 @@ impl AppView {
             match side {
                 CompareSide::A => *conn_a = Some(id),
                 CompareSide::B => *conn_b = Some(id),
+            }
+        }
+        cx.notify();
+    }
+
+    /// G14 T11: the picker's kind toggle ("Sloupcový"/"Čárový") — same
+    /// in-place-mutate-open-modal idiom as `select_compare_side`.
+    pub(crate) fn set_chart_kind(&mut self, kind: ChartKind, cx: &mut Context<Self>) {
+        if let Some(ModalState::ChartPicker { kind: k, .. }) = &mut self.modal {
+            *k = kind;
+        }
+        cx.notify();
+    }
+
+    /// G14 T11: the picker's X-column radio.
+    pub(crate) fn set_chart_x_col(&mut self, col: usize, cx: &mut Context<Self>) {
+        if let Some(ModalState::ChartPicker { x_col, .. }) = &mut self.modal {
+            *x_col = col;
+        }
+        cx.notify();
+    }
+
+    /// G14 T11: a Y-column checkbox toggle (numeric columns only — the
+    /// panel only ever renders a checkbox for a numeric `col`).
+    pub(crate) fn toggle_chart_y_col(&mut self, col: usize, cx: &mut Context<Self>) {
+        if let Some(ModalState::ChartPicker { y_selected, .. }) = &mut self.modal {
+            if let Some(flag) = y_selected.get_mut(col) {
+                *flag = !*flag;
             }
         }
         cx.notify();
@@ -3336,6 +3387,124 @@ fn render_csv_import_panel(
             .child(styled_button("csv-import-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
             .child(confirm_btn),
     );
+    panel.into_any_element()
+}
+
+/// G14 T11 (design §2.1/§2.4): bar/line axis picker — same panel skeleton
+/// as `render_settings_panel`. `columns` is the FULL column list (display
+/// order); the X list shows every column (radio, `x_col` index), the Y list
+/// shows ONLY `numeric == true` columns (checkboxes, `y_selected[i]`) — the
+/// real bound on series count (`chart_view::MAX_SERIES` is only a belt).
+/// Heading/footer label switch on `edit_tab.is_some()` (re-pick vs. create).
+fn render_chart_picker_panel(
+    source_title: String,
+    columns: Vec<(String, bool)>,
+    kind: ChartKind,
+    x_col: usize,
+    y_selected: Vec<bool>,
+    edit_tab: Option<u64>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let theme = *cx.theme();
+    let is_edit = edit_tab.is_some();
+    let numeric_count = columns.iter().filter(|(_, numeric)| *numeric).count();
+
+    let kind_button = |id: &'static str, label: &'static str, this_kind: ChartKind, cx: &mut Context<AppView>| {
+        div()
+            .id(id)
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .bg(if this_kind == kind { cx.theme().bg_selected } else { cx.theme().bg_hover })
+            .child(label)
+            .on_click(cx.listener(move |v, _, _, cx| v.set_chart_kind(this_kind, cx)))
+    };
+
+    let mut panel = div()
+        .id("chart-picker-panel")
+        .w(px(460.))
+        .max_h(px(560.))
+        .bg(theme.bg_panel)
+        .border_1()
+        .border_color(theme.border)
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(theme.text_primary)
+        .child(div().text_size(px(16.)).child(format!("Graf: {source_title}")))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(kind_button("chart-picker-kind-bar", "Sloupcový", ChartKind::Bar, cx))
+                .child(kind_button("chart-picker-kind-line", "Čárový", ChartKind::Line, cx)),
+        )
+        .child(div().text_color(theme.text_muted).child("Osa X"));
+
+    let mut x_list = div().id("chart-picker-x-list").flex().flex_col().gap_1().max_h(px(120.)).overflow_hidden();
+    for (i, (name, _numeric)) in columns.iter().enumerate() {
+        let selected = i == x_col;
+        x_list = x_list.child(
+            div()
+                .id(SharedString::from(format!("chart-picker-x-{i}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .cursor_pointer()
+                .bg(if selected { theme.bg_selected } else { theme.bg_hover })
+                .child(if selected { "●" } else { "○" })
+                .child(name.clone())
+                .on_click(cx.listener(move |v, _, _, cx| v.set_chart_x_col(i, cx))),
+        );
+    }
+    panel = panel.child(x_list).child(div().text_color(theme.text_muted).child("Osa Y (číselné sloupce)"));
+
+    if numeric_count == 0 {
+        panel = panel.child(div().text_color(theme.danger).child("výsledek nemá žádný číselný sloupec"));
+    }
+    let mut y_list = div().id("chart-picker-y-list").flex().flex_col().gap_1().max_h(px(160.)).overflow_hidden();
+    for (i, (name, numeric)) in columns.iter().enumerate() {
+        if !*numeric {
+            continue;
+        }
+        let checked = y_selected.get(i).copied().unwrap_or(false);
+        let mark = if checked { "☑" } else { "☐" };
+        y_list = y_list.child(
+            div()
+                .id(SharedString::from(format!("chart-picker-y-{i}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .cursor_pointer()
+                .child(format!("{mark} {name}"))
+                .on_click(cx.listener(move |v, _, _, cx| v.toggle_chart_y_col(i, cx))),
+        );
+    }
+    panel = panel.child(y_list);
+
+    panel = panel.child(
+        div()
+            .flex()
+            .flex_row()
+            .justify_end()
+            .gap_2()
+            .mt_2()
+            .child(
+                styled_button("chart-picker-cancel", "Zrušit", theme)
+                    .on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))),
+            )
+            .child(
+                styled_button("chart-picker-confirm", if is_edit { "Použít" } else { "Vytvořit graf" }, theme)
+                    .on_click(cx.listener(|v, _, _, cx| v.confirm_chart_picker(cx))),
+            ),
+    );
+
     panel.into_any_element()
 }
 

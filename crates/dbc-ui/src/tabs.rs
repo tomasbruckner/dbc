@@ -54,6 +54,12 @@ pub enum TabContent {
     /// tab (no preview-key dedup — repeated compares of the same pair just
     /// open more tabs, matching `Plan`'s own precedent).
     Compare { view: Entity<crate::compare::CompareView> },
+    /// G14: bar/line chart over a result-buffer snapshot — titled
+    /// "Graf: {source tab title}", stacked like an ad-hoc tab (no
+    /// preview-key dedup). `ChartView` keeps its own `Rc<RefCell<ResultBuffer>>`
+    /// clone internally (see `ChartView::buffer_handle`), so the source
+    /// tab closing never breaks it (design §2.6 snapshot semantics).
+    Chart { view: Entity<crate::chart_view::ChartView> },
     /// G12 T3: live progress tab for a script run (`AppView::confirm_script_run`)
     /// or a CSV import (T4, `AppView::confirm_csv_import` — reuses this same
     /// tab kind, see `ScriptRunState.progress_rows`). Plain data behind an

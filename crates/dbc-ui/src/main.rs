@@ -1693,6 +1693,7 @@ impl AppView {
                                             TabContent::Plan { .. } => None,
                                             TabContent::Diagram { .. } => None,
                                             TabContent::Compare { .. } => None,
+                                            TabContent::Chart { .. } => None,
                                             TabContent::ScriptRun { .. } => None,
                                         }
                                     })
@@ -3353,6 +3354,9 @@ impl AppView {
                 // G14 T10: no secret/unsaved-run state at all — a benign
                 // display-only panel, same reasoning as `QueryParams` above.
                 connections_ui::ModalState::Settings => true,
+                // G14 T11: no secret/unsaved-run state — a pick-then-confirm
+                // dialog, same reasoning as `QueryParams`/`Settings` above.
+                connections_ui::ModalState::ChartPicker { .. } => true,
                 _ => false,
             };
             if closable {
@@ -3539,6 +3543,11 @@ impl AppView {
             .collect();
 
         let monitor_available = self.active_engine().is_some_and(monitor::monitor_available);
+        // G14 T11: absent-not-disabled, same posture as `monitor_available`
+        // — listed only while the active tab is a Grid (design §2.1's entry
+        // gate: a chart needs an existing result buffer to draw from).
+        let chart_available =
+            matches!(self.tabs.active(), Some(ResultTab { content: TabContent::Grid { .. }, .. }));
         palette::rank_items(
             query,
             &tables,
@@ -3547,6 +3556,7 @@ impl AppView {
             monitor_available,
             30,
             self.active_connection_id.is_some(),
+            chart_available,
         )
     }
 
@@ -3631,6 +3641,7 @@ impl AppView {
                 PaletteAction::RunSqlFile => self.start_script_pick(false, cx),
                 PaletteAction::RunSqlFolder => self.start_script_pick(true, cx),
                 PaletteAction::ToggleTheme => self.toggle_theme(cx),
+                PaletteAction::OpenChart => self.open_chart_picker(None, cx),
             },
         }
         cx.notify();
@@ -4467,7 +4478,192 @@ impl AppView {
                 }
                 self.start_csv_import(schema.clone(), table.clone(), cx);
             }
+            GridEvent::OpenChart => self.open_chart_picker(Some(emitter.clone()), cx),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // G14 T11: chart tab wiring (design §2.1/§2.4). Read-only over an
+    // already-materialized `ResultBuffer` snapshot — no execute() surface.
+    // -----------------------------------------------------------------
+
+    /// Opens the axis picker — from the grid toolbar's "Graf" button
+    /// (`from_grid = Some(emitter)`) or the palette's "Graf z výsledku"
+    /// (`from_grid = None`, uses the active tab). Single-modal invariant,
+    /// same guard every other opener in `connections_ui.rs` applies.
+    fn open_chart_picker(&mut self, from_grid: Option<Entity<ResultGrid>>, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            self.status = "zavřete nejprve otevřený dialog".into();
+            cx.notify();
+            return;
+        }
+        // Resolve the source tab: the one owning the emitting grid Entity, or
+        // the active tab (palette path). Entity<T> is comparable by identity.
+        let source = self
+            .tabs
+            .iter()
+            .find(|t| match (&t.content, &from_grid) {
+                (TabContent::Grid { grid, .. }, Some(g)) => grid == g,
+                (TabContent::Grid { .. }, None) => Some(t.id) == self.tabs.active().map(|a| a.id),
+                _ => false,
+            })
+            .map(|t| {
+                (
+                    t.title.clone(),
+                    match &t.content {
+                        TabContent::Grid { buffer, .. } => buffer.clone(),
+                        _ => unreachable!("matched Grid above"),
+                    },
+                )
+            });
+        let Some((source_title, buffer)) = source else {
+            self.status = "graf lze vytvořit jen z výsledkové mřížky".into();
+            cx.notify();
+            return;
+        };
+        // design §2.1: the exact is_numeric scan the preview-editability
+        // path already uses above (`numeric_cols`).
+        let columns: Vec<(String, bool)> = buffer
+            .borrow()
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), f.data_type().is_numeric()))
+            .collect();
+        if !columns.iter().any(|(_, numeric)| *numeric) {
+            self.status = "výsledek nemá žádný číselný sloupec — graf nelze vytvořit".into();
+            cx.notify();
+            return;
+        }
+        let n = columns.len();
+        // default: first numeric column pre-checked as Y, column 0 as X.
+        let mut y_selected = vec![false; n];
+        if let Some(i) = columns.iter().position(|(_, num)| *num) {
+            y_selected[i] = true;
+        }
+        self.modal = Some(connections_ui::ModalState::ChartPicker {
+            source_title,
+            buffer,
+            columns,
+            kind: chart_data::ChartKind::Bar,
+            x_col: 0,
+            y_selected,
+            edit_tab: None,
+        });
+        cx.notify();
+    }
+
+    /// "Vytvořit graf"/"Použít" — validates BEFORE taking the modal (an
+    /// invalid pick leaves the dialog open untouched with a status nudge,
+    /// never a half-configured chart), then either opens a new Chart tab or
+    /// reconfigures the tab named by `edit_tab` in place (design §2.4).
+    fn confirm_chart_picker(&mut self, cx: &mut Context<Self>) {
+        let valid = matches!(
+            &self.modal,
+            Some(connections_ui::ModalState::ChartPicker { y_selected, .. })
+                if y_selected.iter().any(|on| *on)
+        );
+        if !valid {
+            self.status = "vyberte alespoň jeden číselný sloupec pro osu Y".into();
+            cx.notify();
+            return;
+        }
+        let Some(connections_ui::ModalState::ChartPicker {
+            source_title,
+            buffer,
+            columns: _,
+            kind,
+            x_col,
+            y_selected,
+            edit_tab,
+        }) = self.modal.take()
+        else {
+            return;
+        };
+        let y_cols: Vec<usize> =
+            y_selected.iter().enumerate().filter(|(_, on)| **on).map(|(i, _)| i).collect();
+        match edit_tab {
+            Some(id) => {
+                // re-pick: reconfigure the existing tab's view in place (§2.4)
+                let view = self.tabs.iter().find_map(|t| {
+                    (t.id == id).then_some(()).and_then(|()| match &t.content {
+                        TabContent::Chart { view } => Some(view.clone()),
+                        _ => None,
+                    })
+                });
+                if let Some(view) = view {
+                    view.update(cx, |v, cx| v.reconfigure(kind, x_col, y_cols, cx));
+                }
+            }
+            None => {
+                let view = cx.new(|_| {
+                    chart_view::ChartView::new(buffer, kind, x_col, y_cols, source_title.clone())
+                });
+                cx.subscribe(&view, Self::on_chart_view_event).detach();
+                let conn_identity = self.current_conn_identity();
+                self.tabs.open(ResultTab {
+                    id: 0, // Tabs::open assigns
+                    title: tabs::collapse_title(&format!("Graf: {source_title}")),
+                    pinned: false,
+                    preview_key: None, // stacked like ad-hoc tabs, Plan precedent
+                    conn_identity,
+                    content: TabContent::Chart { view },
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// `ChartView`'s only event — "Upravit…" clicked. Reopens the picker
+    /// seeded from that view's current pick, editing that tab's `ChartView`
+    /// in place on confirm (design §2.4's only interaction).
+    fn on_chart_view_event(
+        &mut self,
+        emitter: Entity<chart_view::ChartView>,
+        _event: &chart_view::ChartViewEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal.is_some() {
+            self.status = "zavřete nejprve otevřený dialog".into();
+            cx.notify();
+            return;
+        }
+        let Some(tab_id) = self
+            .tabs
+            .iter()
+            .find(|t| matches!(&t.content, TabContent::Chart { view } if view == &emitter))
+            .map(|t| t.id)
+        else {
+            return;
+        };
+        let (kind, x_col, y_cols) = emitter.read(cx).picker_seed();
+        let (source_title, buffer) = {
+            let v = emitter.read(cx);
+            (v.source_title().to_string(), v.buffer_handle())
+        };
+        let columns: Vec<(String, bool)> = buffer
+            .borrow()
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), f.data_type().is_numeric()))
+            .collect();
+        let mut y_selected = vec![false; columns.len()];
+        for c in &y_cols {
+            if let Some(flag) = y_selected.get_mut(*c) {
+                *flag = true;
+            }
+        }
+        self.modal = Some(connections_ui::ModalState::ChartPicker {
+            source_title,
+            buffer,
+            columns,
+            kind,
+            x_col,
+            y_selected,
+            edit_tab: Some(tab_id),
+        });
+        cx.notify();
     }
 
     // -----------------------------------------------------------------
@@ -4914,6 +5110,7 @@ impl AppView {
             TabContent::Plan { .. } => return,
             TabContent::Diagram { .. } => return,
             TabContent::Compare { .. } => return,
+            TabContent::Chart { .. } => return,
             TabContent::ScriptRun { .. } => return,
         };
         let current_identity = self.current_conn_identity();
@@ -5321,6 +5518,7 @@ impl AppView {
                     TabContent::Plan { .. } => (0, false),
                     TabContent::Diagram { .. } => (0, false),
                     TabContent::Compare { .. } => (0, false),
+                    TabContent::Chart { .. } => (0, false),
                     TabContent::ScriptRun { .. } => (0, false),
                 };
                 // G5 Task 3, brief contract #7: dirty (unapplied staged
@@ -5485,6 +5683,7 @@ impl AppView {
                 view.clone().into_any_element()
             }
             TabContent::Compare { view } => view.clone().into_any_element(),
+            TabContent::Chart { view } => view.clone().into_any_element(),
             // G12 T3/T4: a free function (not a method) — it never touches
             // `self` directly, only `state` (cloned out of `active`) and
             // `cx` (for the "Zrušit" listener) — calling a `&mut self`

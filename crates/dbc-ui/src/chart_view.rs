@@ -11,8 +11,6 @@
 //! Gap semantics (design §2.2, `chart_data`'s contract): a `None` point is a
 //! NULL/unparsable cell — bars simply skip it, lines break the stroked run
 //! (never interpolate across a gap, never draw 0).
-// consumed by main.rs (G14 Task 11); allow removed there
-#![allow(dead_code)]
 
 use std::cell::RefCell;
 use std::rc::Rc;

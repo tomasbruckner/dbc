@@ -4,12 +4,6 @@
 pub const CHART_ROW_HARD_CAP: usize = 500;
 pub const MIN_PX_PER_TICK: f32 = 3.0;
 
-// Variants are threaded through (matched on, stored) by chart_view.rs
-// already, but not yet CONSTRUCTED anywhere reachable outside tests — that
-// happens at the ModalState::ChartPicker call site (G14 Task 11). Targeted
-// allow, not a file-level one — everything else in this module is genuinely
-// used (transitively, via chart_view.rs) as of Task 8.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChartKind {
     Bar,

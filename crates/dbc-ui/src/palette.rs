@@ -127,6 +127,9 @@ pub enum PaletteAction {
     /// G14 T10: toggles dark<->light directly (no submenu) — unconditional,
     /// same posture as every other always-listed fixed action (design §1.5).
     ToggleTheme,
+    /// G14 T11: opens `ModalState::ChartPicker` — the axis picker for the
+    /// active Grid tab's `ResultBuffer` snapshot.
+    OpenChart,
 }
 
 /// One table/view from the current schema snapshot, plus whether it's
@@ -166,7 +169,15 @@ const FAVOURITE_BONUS: i64 = 1000;
 /// active" (design's own words) — an inactive/no-connection state hides
 /// them entirely rather than showing them disabled (no disabled-row
 /// rendering precedent exists anywhere in this file — see T6's Grounding).
-pub fn fixed_actions(monitor_available: bool, connection_active: bool) -> Vec<(String, PaletteAction)> {
+/// `chart_available` (G14 T11, design §2.1): same absent-not-disabled
+/// posture as `monitor_available` — listed only while the active tab is a
+/// Grid with results to chart. Placed BEFORE the backup/restore block so
+/// those two stay the literal last two rows (existing test invariant).
+pub fn fixed_actions(
+    monitor_available: bool,
+    connection_active: bool,
+    chart_available: bool,
+) -> Vec<(String, PaletteAction)> {
     let mut actions = vec![
         ("Spustit dotaz".to_string(), PaletteAction::RunQuery),
         ("Přepnout strom".to_string(), PaletteAction::ToggleTree),
@@ -185,6 +196,9 @@ pub fn fixed_actions(monitor_available: bool, connection_active: bool) -> Vec<(S
     ];
     if monitor_available {
         actions.push(("Monitor serveru".to_string(), PaletteAction::OpenMonitor));
+    }
+    if chart_available {
+        actions.push(("Graf z výsledku".to_string(), PaletteAction::OpenChart));
     }
     if connection_active {
         actions.push(("Zálohovat databázi…".to_string(), PaletteAction::BackupDatabase));
@@ -223,6 +237,7 @@ pub fn rank_items(
     monitor_available: bool,
     cap: usize,
     connection_active: bool,
+    chart_available: bool,
 ) -> Vec<PaletteItem> {
     if query.trim().is_empty() {
         let mut out = Vec::new();
@@ -238,7 +253,7 @@ pub fn rank_items(
         for c in connections {
             out.push(PaletteItem::Connection { id: c.id.clone(), name: c.name.clone() });
         }
-        for (label, action) in fixed_actions(monitor_available, connection_active) {
+        for (label, action) in fixed_actions(monitor_available, connection_active, chart_available) {
             out.push(PaletteItem::Action { label, action });
         }
 
@@ -269,7 +284,7 @@ pub fn rank_items(
             scored.push((score, PaletteItem::Connection { id: c.id.clone(), name: c.name.clone() }));
         }
     }
-    for (label, action) in fixed_actions(monitor_available, connection_active) {
+    for (label, action) in fixed_actions(monitor_available, connection_active, chart_available) {
         if let Some(score) = fuzzy_score(query, &label) {
             scored.push((score, PaletteItem::Action { label, action }));
         }
@@ -415,7 +430,7 @@ mod rank_items_tests {
         let history = vec![history(1, "select 1"), history(2, "select 2")];
         let connections = vec![conn("c1", "prod", false)];
 
-        let items = rank_items("", &tables, &history, &connections, false, 30, false);
+        let items = rank_items("", &tables, &history, &connections, false, 30, false, false);
 
         // Favourites (alphabetical) first, then history (as given), then
         // connections, then the fixed actions (5 base + ER diagram +
@@ -444,14 +459,14 @@ mod rank_items_tests {
         // query (brief contract #3 lists favourites/history/connections/
         // actions — not the whole unfiltered table list).
         let tables: Vec<TableSource> = (0..50).map(|i| table(None, &format!("t{i}"), true)).collect();
-        let items = rank_items("", &tables, &[], &[], false, 30, false);
+        let items = rank_items("", &tables, &[], &[], false, 30, false, false);
         assert_eq!(items.len(), 30);
     }
 
     #[test]
     fn non_matching_query_drops_items_that_dont_subsequence_match() {
         let tables = vec![table(None, "orders", false)];
-        let items = rank_items("zzz", &tables, &[], &[], false, 30, false);
+        let items = rank_items("zzz", &tables, &[], &[], false, 30, false, false);
         assert!(items.is_empty());
     }
 
@@ -467,7 +482,7 @@ mod rank_items_tests {
             fuzzy_score("orders", &table_search_text(&tables[1])),
             "test setup must produce a genuine base-score tie"
         );
-        let items = rank_items("orders", &tables, &[], &[], false, 30, false);
+        let items = rank_items("orders", &tables, &[], &[], false, 30, false, false);
         assert_eq!(
             items[0],
             PaletteItem::Table { schema: Some("bbbbb".into()), name: "orders".into() }
@@ -490,17 +505,17 @@ mod rank_items_tests {
         weak_match.push_str(&"z".repeat(30)); // long target: length penalty on top
 
         let tables = vec![table(None, &weak_match, true), table(None, "orders", false)];
-        let items = rank_items("orders", &tables, &[], &[], false, 30, false);
+        let items = rank_items("orders", &tables, &[], &[], false, 30, false, false);
         assert_eq!(items[0], PaletteItem::Table { schema: None, name: "orders".into() });
     }
 
     #[test]
     fn monitor_entry_present_only_when_available() {
-        let items = rank_items("", &[], &[], &[], true, 30, false);
+        let items = rank_items("", &[], &[], &[], true, 30, false, false);
         assert!(items
             .iter()
             .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::OpenMonitor, .. })));
-        let items = rank_items("", &[], &[], &[], false, 30, false);
+        let items = rank_items("", &[], &[], &[], false, 30, false, false);
         assert!(items
             .iter()
             .all(|i| !matches!(i, PaletteItem::Action { action: PaletteAction::OpenMonitor, .. })));
@@ -509,18 +524,18 @@ mod rank_items_tests {
     #[test]
     fn results_are_capped_at_30() {
         let tables: Vec<TableSource> = (0..50).map(|i| table(None, &format!("orders_{i}"), false)).collect();
-        let items = rank_items("orders", &tables, &[], &[], false, 30, false);
+        let items = rank_items("orders", &tables, &[], &[], false, 30, false, false);
         assert_eq!(items.len(), 30);
     }
 
     // --- G11 T6: backup/restore actions gated on connection_active ---
     #[test]
     fn backup_restore_actions_hidden_without_active_connection() {
-        let actions = fixed_actions(false, false);
+        let actions = fixed_actions(false, false, false);
         assert!(!actions.iter().any(|(_, a)| matches!(a, PaletteAction::BackupDatabase)));
         assert!(!actions.iter().any(|(_, a)| matches!(a, PaletteAction::RestoreDatabase)));
 
-        let items = rank_items("", &[], &[], &[], false, 30, false);
+        let items = rank_items("", &[], &[], &[], false, 30, false, false);
         assert!(items
             .iter()
             .all(|i| !matches!(i, PaletteItem::Action { action: PaletteAction::BackupDatabase, .. })
@@ -529,11 +544,11 @@ mod rank_items_tests {
 
     #[test]
     fn backup_restore_actions_present_and_last_when_connection_active() {
-        let actions = fixed_actions(false, true);
+        let actions = fixed_actions(false, true, false);
         assert_eq!(actions.last().unwrap().1, PaletteAction::RestoreDatabase);
         assert_eq!(actions[actions.len() - 2].1, PaletteAction::BackupDatabase);
 
-        let items = rank_items("", &[], &[], &[], false, 30, true);
+        let items = rank_items("", &[], &[], &[], false, 30, true, false);
         assert!(items
             .iter()
             .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::BackupDatabase, .. })));
@@ -545,16 +560,31 @@ mod rank_items_tests {
     // --- G14 T10: theme toggle is an unconditional fixed action ---
     #[test]
     fn theme_toggle_action_is_always_present() {
-        let items = rank_items("", &[], &[], &[], false, 30, false);
+        let items = rank_items("", &[], &[], &[], false, 30, false, false);
         assert!(items.iter().any(|i| matches!(
             i,
             PaletteItem::Action { action: PaletteAction::ToggleTheme, .. }
         )));
         // and it fuzzy-matches by its Czech label:
-        let items = rank_items("motiv", &[], &[], &[], false, 30, false);
+        let items = rank_items("motiv", &[], &[], &[], false, 30, false, false);
         assert!(items.iter().any(|i| matches!(
             i,
             PaletteItem::Action { action: PaletteAction::ToggleTheme, .. }
+        )));
+    }
+
+    // --- G14 T11: chart entry gated on chart_available (active Grid tab) ---
+    #[test]
+    fn chart_entry_present_only_when_a_grid_tab_is_active() {
+        let items = rank_items("", &[], &[], &[], false, 30, false, true);
+        assert!(items.iter().any(|i| matches!(
+            i,
+            PaletteItem::Action { action: PaletteAction::OpenChart, .. }
+        )));
+        let items = rank_items("", &[], &[], &[], false, 30, false, false);
+        assert!(items.iter().all(|i| !matches!(
+            i,
+            PaletteItem::Action { action: PaletteAction::OpenChart, .. }
         )));
     }
 }
