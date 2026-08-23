@@ -4713,12 +4713,33 @@ impl AppView {
     /// result landing after a newer one is a non-issue: the same sub-view's
     /// re-fetch just overwrites the same parsed fields, and switching
     /// sub-views clears staged state first via `switch_sub_view`).
+    ///
+    /// Review finding M2: `apply_conn_spec()` alone always resolves against
+    /// the CURRENTLY active connection — with no check against `panel`'s
+    /// OWN stamped identity, opening the admin tab for connection A, then
+    /// switching to B, then clicking a sub-nav tab (which re-emits
+    /// `FetchCatalog` — see `switch_sub_view`) would fetch B's catalog and
+    /// render it inside a panel still labeled/stamped A. Writes were always
+    /// safe (`open_admin_apply_dialog` already re-checks `conn_identity`
+    /// before dispatching `run_write_transaction`); this closes the
+    /// display-only gap using the SAME `conn_identity_matches` predicate
+    /// (already unit-tested in `conn_identity_matches_tests`) the write
+    /// path uses — no new decision logic to test separately.
     fn fetch_admin_catalog_into(
         &mut self,
         panel: Entity<admin_panel::AdminPanel>,
         queries: Vec<(&'static str, String)>,
         cx: &mut Context<Self>,
     ) {
+        let panel_conn_identity = panel.read(cx).conn_identity().to_string();
+        let current_identity = self.current_conn_identity();
+        if !conn_identity_matches(&panel_conn_identity, &current_identity) {
+            let from = self.conn_name_for_identity(&panel_conn_identity);
+            panel.update(cx, |p, cx| {
+                p.set_error(&format!("data pocházejí z jiného připojení ({from}) — přepni se zpět"), cx)
+            });
+            return;
+        }
         let Some((spec, _timeout)) = self.apply_conn_spec() else {
             panel.update(cx, |p, cx| p.set_error("Bez připojení — vyberte připojení nahoře.", cx));
             return;
@@ -5345,11 +5366,23 @@ impl AppView {
                             t.set_read_only(read_only, cx);
                             t.set_admin_entry(admin_entry, cx);
                         });
+                        // Review finding M2: only push into an admin panel
+                        // whose OWN stamped identity still matches the
+                        // CURRENTLY active connection — a stale admin tab
+                        // left open from a since-abandoned connection (the
+                        // singleton-per-connection invariant only replaces
+                        // it on the NEXT `open_admin_tab` call, not
+                        // automatically on every switch) must never have
+                        // another connection's schema list silently pushed
+                        // into it.
                         if let Some(panel) = view.tabs.iter().find_map(|t| match &t.content {
                             TabContent::Admin { view } => Some(view.clone()),
                             _ => None,
                         }) {
-                            panel.update(cx, |p, cx| p.set_schemas(schemas_for_admin, cx));
+                            let current_identity = view.current_conn_identity();
+                            if conn_identity_matches(panel.read(cx).conn_identity(), &current_identity) {
+                                panel.update(cx, |p, cx| p.set_schemas(schemas_for_admin, cx));
+                            }
                         }
                         // Review round 3, MAJOR 1: a new snapshot landing
                         // (connection switch OR a same-connection refresh)

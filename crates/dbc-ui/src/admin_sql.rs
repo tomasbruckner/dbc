@@ -166,9 +166,21 @@ pub fn sizes_catalog(engine: Engine) -> Vec<(&'static str, String)> {
             // the prior INNER JOIN shape, even though this file's OWN test
             // fixture (parse_schema_sizes_pg_bytes_mssql_kb's "empty" row)
             // already anticipated a NULL-bytes row for exactly this case.
+            // Review finding M3: the LEFT JOIN alone would also surface
+            // pg_toast/pg_temp_N/pg_toast_temp_N/pg_catalog/information_schema
+            // as "selectable schemas" — filtered out with the SAME
+            // exclusion `dbc-driver-postgres::SCHEMA_EXCLUDE` already uses
+            // for the main schema tree (crates/dbc-driver-postgres/src/lib.rs)
+            // — kept consistent rather than inventing a second filter, so
+            // the Databases sub-view's schema list matches what Privileges'
+            // schema selector (fed from that same SchemaSnapshot) already
+            // shows.
             ("schema_sizes", "SELECT n.nspname AS schema, SUM(pg_catalog.pg_total_relation_size(c.oid)) AS bytes \
                  FROM pg_catalog.pg_namespace n \
                  LEFT JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relkind IN ('r','m') \
+                 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                 AND n.nspname NOT LIKE 'pg\\_temp\\_%' AND n.nspname NOT LIKE 'pg\\_toast\\_temp\\_%' \
+                 AND n.nspname NOT LIKE 'pg\\_toast%' \
                  GROUP BY n.nspname ORDER BY n.nspname".to_string()),
         ],
         Engine::Mssql => vec![
@@ -177,11 +189,26 @@ pub fn sizes_catalog(engine: Engine) -> Vec<(&'static str, String)> {
                  CAST(SUM(CASE WHEN type = 1 THEN size ELSE 0 END) * 8.0 / 1024 AS DECIMAL(15,2)) AS log_mb \
                  FROM sys.database_files".to_string()),
             ("databases", "SELECT name, database_id, create_date, state_desc FROM sys.databases ORDER BY name".to_string()),
-            ("schema_sizes", "SELECT s.name AS schema_name, SUM(ps.reserved_page_count) * 8 AS reserved_kb, \
-                 SUM(ps.used_page_count) * 8 AS used_kb \
-                 FROM sys.dm_db_partition_stats ps \
-                 JOIN sys.tables t ON t.object_id = ps.object_id \
-                 JOIN sys.schemas s ON s.schema_id = t.schema_id \
+            // Review finding M1: the prior shape INNER JOINed
+            // sys.dm_db_partition_stats -> sys.tables -> sys.schemas, so a
+            // schema with zero tables never produced a row at all — the
+            // exact empty-schema bug the pg LEFT JOIN above fixes, mirrored
+            // here (never live-verified — no MSSQL docker available; this
+            // is a static-SQL-shape fix only, honestly noted). Driven FROM
+            // sys.schemas so every real schema gets a row (COALESCE'd to 0
+            // when it owns no tables yet), filtering out MSSQL's fixed
+            // database-role schemas (every one of which is also a `sys.
+            // schemas` row) plus `sys`/`INFORMATION_SCHEMA` — the standard
+            // "not a real user schema" set.
+            ("schema_sizes", "SELECT s.name AS schema_name, \
+                 COALESCE(SUM(ps.reserved_page_count), 0) * 8 AS reserved_kb, \
+                 COALESCE(SUM(ps.used_page_count), 0) * 8 AS used_kb \
+                 FROM sys.schemas s \
+                 LEFT JOIN sys.tables t ON t.schema_id = s.schema_id \
+                 LEFT JOIN sys.dm_db_partition_stats ps ON ps.object_id = t.object_id \
+                 WHERE s.name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest', 'db_owner', 'db_accessadmin', \
+                 'db_securityadmin', 'db_ddladmin', 'db_backupoperator', 'db_datareader', 'db_datawriter', \
+                 'db_denydatareader', 'db_denydatawriter') \
                  GROUP BY s.name ORDER BY s.name".to_string()),
         ],
         Engine::Sqlite => Vec::new(),
@@ -282,6 +309,58 @@ mod catalog_tests {
         assert!(ms[0].1.contains("sys.database_files"));
         assert!(ms[1].1.contains("sys.databases"));
         assert!(ms[2].1.contains("sys.dm_db_partition_stats"));
+    }
+
+    // Review finding M1 (empty-schema visibility) + M3 (pg system-namespace
+    // filter) — static-SQL shape checks only. M1's MSSQL side has NEVER run
+    // against a live server (no MSSQL docker available in this
+    // environment); the pg side WAS re-verified live (see runner.rs's
+    // admin_pg_sizes_catalog_and_schema_ddl_round_trip_on_live_postgres).
+    #[test]
+    fn schema_sizes_drives_from_the_full_schema_list_not_an_inner_join_and_excludes_system_schemas() {
+        let pg = sizes_catalog(Engine::Postgres);
+        let pg_schema_sizes = &pg[2].1;
+        // LEFT JOIN (not the prior INNER JOIN) — a schema with zero tables
+        // must still produce a row.
+        assert!(pg_schema_sizes.contains("FROM pg_catalog.pg_namespace n"));
+        assert!(pg_schema_sizes.contains("LEFT JOIN pg_catalog.pg_class c"));
+        // Same exclusion set dbc-driver-postgres::SCHEMA_EXCLUDE already
+        // uses for the main schema tree (pg_catalog/information_schema +
+        // the toast/temp implementation-detail namespaces).
+        assert!(pg_schema_sizes.contains("NOT IN ('pg_catalog', 'information_schema')"));
+        assert!(pg_schema_sizes.contains("pg\\_temp\\_%"));
+        assert!(pg_schema_sizes.contains("pg\\_toast\\_temp\\_%"));
+        assert!(pg_schema_sizes.contains("pg\\_toast%"));
+
+        let ms = sizes_catalog(Engine::Mssql);
+        let ms_schema_sizes = &ms[2].1;
+        // Driven FROM sys.schemas (not FROM sys.dm_db_partition_stats) with
+        // LEFT JOINs down to the stats — a schema with zero tables must
+        // still produce a row (COALESCE'd to 0, not vanish).
+        assert!(ms_schema_sizes.contains("FROM sys.schemas s"));
+        assert!(ms_schema_sizes.contains("LEFT JOIN sys.tables t"));
+        assert!(ms_schema_sizes.contains("LEFT JOIN sys.dm_db_partition_stats ps"));
+        assert!(ms_schema_sizes.contains("COALESCE(SUM(ps.reserved_page_count), 0)"));
+        // The standard fixed-database-role/system schema exclusion set.
+        for excluded in [
+            "sys",
+            "INFORMATION_SCHEMA",
+            "guest",
+            "db_owner",
+            "db_accessadmin",
+            "db_securityadmin",
+            "db_ddladmin",
+            "db_backupoperator",
+            "db_datareader",
+            "db_datawriter",
+            "db_denydatareader",
+            "db_denydatawriter",
+        ] {
+            assert!(
+                ms_schema_sizes.contains(&format!("'{excluded}'")),
+                "expected {excluded} in the exclusion list: {ms_schema_sizes}"
+            );
+        }
     }
 }
 

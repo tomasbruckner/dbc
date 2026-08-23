@@ -4665,6 +4665,17 @@ mod admin_pg_tests {
                 "public must show a nonzero size after seeding sizes_t: {schema_sizes_before:?}"
             );
             assert!(!schema_sizes_before.iter().any(|(s, _)| s == schema), "test schema must not exist yet");
+            // Review finding M3 (live-verified): pg_catalog/information_schema
+            // and the toast/temp implementation-detail namespaces must never
+            // appear as "selectable schemas" in the Databases sub-view.
+            assert!(
+                !schema_sizes_before.iter().any(|(s, _)| s == "pg_catalog" || s == "information_schema"),
+                "system schemas must be filtered out: {schema_sizes_before:?}"
+            );
+            assert!(
+                !schema_sizes_before.iter().any(|(s, _)| s.starts_with("pg_toast") || s.starts_with("pg_temp_")),
+                "toast/temp namespaces must be filtered out: {schema_sizes_before:?}"
+            );
 
             // --- create_schema, live.
             let create_stmts = admin_sql::create_schema(engine, schema);
