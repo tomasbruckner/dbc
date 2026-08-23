@@ -97,9 +97,17 @@ fn classify_back_edges(nodes: &[TableKey], adj: &BTreeMap<TableKey, Vec<TableKey
 fn assign_layers(nodes: &[TableKey], acyclic_edges: &[(TableKey, TableKey)]) -> HashMap<TableKey, usize> {
     let mut indegree: HashMap<TableKey, usize> = nodes.iter().cloned().map(|k| (k, 0)).collect();
     let mut succ: BTreeMap<TableKey, Vec<TableKey>> = BTreeMap::new();
+    // Defensive: `acyclic_edges` is expected to only reference keys in
+    // `nodes` (compute_layout guarantees this by filtering out edges with
+    // an unknown endpoint before this is ever called), but an edge with a
+    // stray endpoint is silently dropped here rather than panicking — this
+    // function has no I/O and no way to recover otherwise, and a caller
+    // bug shouldn't crash the whole app on layout.
     for (u, v) in acyclic_edges {
-        *indegree.get_mut(v).expect("edge endpoint must be a known node") += 1;
-        succ.entry(u.clone()).or_default().push(v.clone());
+        if let Some(d) = indegree.get_mut(v) {
+            *d += 1;
+            succ.entry(u.clone()).or_default().push(v.clone());
+        }
     }
 
     let mut layer: HashMap<TableKey, usize> = HashMap::new();
@@ -201,10 +209,25 @@ fn self_loop_stub_points(n: &PositionedNode) -> Vec<(f32, f32)> {
 }
 
 pub fn compute_layout(graph: &ErdGraph) -> DiagramLayout {
-    let self_loops: Vec<&super::FkEdge> = graph.edges.iter().filter(|e| e.from == e.to).collect();
-    let plain_edges: Vec<&super::FkEdge> = graph.edges.iter().filter(|e| e.from != e.to).collect();
+    // Drop any FK edge whose endpoint (either side) isn't a table present
+    // in this diagram's node set. `build_graph` doesn't validate `fk.table`/
+    // `fk.schema` against the caller-selected slice (erd.rs: "tables is
+    // caller-selected... this function has no opinion on selection"), so an
+    // ordinary cross-schema FK pointing outside a single-schema slice
+    // produces exactly this: an edge whose `to` isn't in `graph.nodes`. The
+    // referenced table isn't on this diagram anyway, so the edge is simply
+    // not drawn (mirrors export_svg's "no matching table -> silently
+    // skipped" posture) instead of feeding a dangling reference into the
+    // layering pipeline, where it would strand a node at an indegree that
+    // never reaches zero and panic the layer lookup below.
+    let known: HashSet<&TableKey> = graph.nodes.iter().map(|n| &n.key).collect();
+    let known_edges: Vec<&super::FkEdge> =
+        graph.edges.iter().filter(|e| known.contains(&e.from) && known.contains(&e.to)).collect();
 
-    let touched: HashSet<&TableKey> = graph.edges.iter().flat_map(|e| [&e.from, &e.to]).collect();
+    let self_loops: Vec<&super::FkEdge> = known_edges.iter().copied().filter(|e| e.from == e.to).collect();
+    let plain_edges: Vec<&super::FkEdge> = known_edges.iter().copied().filter(|e| e.from != e.to).collect();
+
+    let touched: HashSet<&TableKey> = known_edges.iter().flat_map(|e| [&e.from, &e.to]).collect();
     let mut connected: Vec<TableKey> = graph.nodes.iter().map(|n| n.key.clone()).filter(|k| touched.contains(k)).collect();
     let mut isolated: Vec<TableKey> = graph.nodes.iter().map(|n| n.key.clone()).filter(|k| !touched.contains(k)).collect();
     connected.sort();
@@ -239,7 +262,13 @@ pub fn compute_layout(graph: &ErdGraph) -> DiagramLayout {
     let max_layer = layer_of.values().copied().max().unwrap_or(0);
     let mut layers: Vec<Vec<TableKey>> = vec![Vec::new(); max_layer + 1];
     for k in &connected {
-        layers[layer_of[k]].push(k.clone());
+        // `layer_of` is guaranteed to have an entry for every key in
+        // `connected` now that `plain_edges`/`connected` are built from the
+        // same known-endpoints-only edge set above — but default to layer 0
+        // rather than panicking if that invariant is ever violated by a
+        // future change.
+        let l = layer_of.get(k).copied().unwrap_or(0);
+        layers[l].push(k.clone());
     }
 
     let mut preds: HashMap<TableKey, Vec<TableKey>> = HashMap::new();
@@ -418,6 +447,21 @@ mod tests {
         let y_lonely = layer_of(&l, "lonely");
         let y_b = layer_of(&l, "b");
         assert!(y_lonely > y_b, "isolated row must sit below every connected layer");
+    }
+
+    #[test]
+    fn dangling_cross_schema_fk_is_dropped_not_panicked() {
+        // build_graph doesn't validate fk.table/fk.schema against the
+        // caller-selected slice (erd.rs: "no opinion on selection"), so a
+        // single-schema slice with an outbound cross-schema FK is ordinary
+        // real-schema input: "parent" is referenced but never in `tables`.
+        let child = table("child", vec![col("id", true, None), col("parent_id", false, Some(("parent", "id")))]);
+        let g = build_graph(&[child]);
+        assert_eq!(g.edges.len(), 1, "build_graph still records the dangling FK as an edge");
+        let l = compute_layout(&g); // must not panic
+        assert_eq!(l.nodes.len(), 1);
+        assert_eq!(l.nodes[0].key.name, "child");
+        assert!(l.edges.is_empty(), "dangling FK edge must not be drawn — the referenced table isn't on this diagram");
     }
 
     #[test]
