@@ -3,6 +3,7 @@ mod connection;
 mod ddl;
 mod error;
 mod guards;
+mod params;
 mod schema;
 mod stream;
 
@@ -11,6 +12,7 @@ pub use connection::Connection;
 pub use ddl::{quote_ident, quote_qualified, synthesize_create_table};
 pub use error::QueryError;
 pub use guards::{apply_auto_limit, is_read_statement};
+pub use params::{find_params, substitute_params};
 pub use schema::{
     ColumnInfo, ConstraintInfo, FkRef, IndexInfo, RoutineInfo, RoutineKind, SchemaSnapshot,
     SequenceInfo, TableInfo, TableKind, TriggerInfo,
