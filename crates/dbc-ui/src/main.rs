@@ -4285,11 +4285,9 @@ impl AppView {
     /// Synthetic, secret-free history description (Global Constraints:
     /// "never the command line's raw form, never a password") — `path` is a
     /// local filesystem path, never argv, never a connection string.
-    /// `record_history` (existing, kind-less) is used here rather than
-    /// T7's `record_history_with_kind` — T7 lands as its own commit after
-    /// this one (this phase's task ordering) and upgrades this exact call
-    /// site; every backup/restore run is still recorded today, just without
-    /// the `kind` column/badge T7 adds.
+    /// `record_history_with_kind` (G11 T7) is what makes this run show up
+    /// in the History panel with its 🗄 badge instead of as a plain
+    /// `"query"` entry.
     fn record_backup_restore_history(
         &mut self,
         kind: backup::BackupKind,
@@ -4306,7 +4304,20 @@ impl AppView {
             backup::BackupKind::Restore => ("RESTORE", "<-"),
         };
         let description = format!("-- {verb} {database} {arrow} {path}");
-        self.record_history(&description, connection_name, started_at_unix, Some(elapsed_ms), None, error, cx);
+        let kind_str = match kind {
+            backup::BackupKind::Backup => "backup",
+            backup::BackupKind::Restore => "restore",
+        };
+        self.record_history_with_kind(
+            &description,
+            connection_name,
+            started_at_unix,
+            Some(elapsed_ms),
+            None,
+            error,
+            kind_str,
+            cx,
+        );
     }
 
     /// "🗄" dropdown icon / palette "Zálohovat databázi…" — opens the SAVE
