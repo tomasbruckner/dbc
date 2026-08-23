@@ -970,6 +970,32 @@ pub enum ModalState {
     /// never actually wired to `QueryRunner::run_analyze_write` and so
     /// could be defeated by Escape mid-flight.
     AnalyzeWriteConfirm { sql: String, engine: Engine, running: bool, error: Option<String> },
+    /// G12 T3: script-runner confirm modal (design §3) — opened by
+    /// `AppView::start_script_pick` once the file/folder picker resolves and
+    /// the pre-scan has counted each file's statements. Confirmed via
+    /// `AppView::confirm_script_run`, which RE-RESOLVES the connection spec
+    /// fresh at confirm time (same `resolve_spec_for_explain` precedent
+    /// `AnalyzeWriteConfirm` uses above) rather than storing one here — this
+    /// modal only carries display data plus the user's tx-scope/error-policy
+    /// choice; `conn_label`/`read_only`/`timeout_secs` are a snapshot taken
+    /// at pick time purely for the confirm dialog's own display (the "jen
+    /// pro čtení" badge + timeout line), not re-validated against a possible
+    /// connection switch in between — the modal occludes the top bar, so a
+    /// switch can't happen while it's open.
+    ScriptRun {
+        /// (path, pre-scanned statement count) per file, run order.
+        files: Vec<std::path::PathBuf>,
+        file_counts: Vec<usize>,
+        tx_scope: crate::runner::TxScope,
+        error_policy: crate::runner::ErrorPolicy,
+        /// "{filename}" for a single file, or "{foldername}/ ({n} souborů)"
+        /// for a folder run — drives the modal heading AND the progress
+        /// tab's title.
+        source_label: String,
+        conn_label: String,
+        read_only: bool,
+        timeout_secs: Option<u64>,
+    },
 }
 
 // ---------------------------------------------------------------------
@@ -1099,6 +1125,26 @@ impl AppView {
             ModalState::AnalyzeWriteConfirm { sql, engine, running, error } => {
                 render_analyze_write_confirm_panel(&sql, engine, running, &error, cx)
             }
+            ModalState::ScriptRun {
+                files,
+                file_counts,
+                tx_scope,
+                error_policy,
+                source_label,
+                conn_label,
+                read_only,
+                timeout_secs,
+            } => render_script_run_confirm_panel(
+                &files,
+                &file_counts,
+                tx_scope,
+                error_policy,
+                &source_label,
+                &conn_label,
+                read_only,
+                timeout_secs,
+                cx,
+            ),
         };
         Some(
             div()
@@ -2306,6 +2352,144 @@ fn render_analyze_write_confirm_panel(
                     .child(if running { "Analyzuji…" } else { "Analyzovat" }),
             ),
     );
+    panel.into_any_element()
+}
+
+/// G12 T3: `ModalState::ScriptRun`'s confirm panel — file list (with the
+/// pre-scanned per-file statement counts), the connection's name + a "jen
+/// pro čtení" badge when read-only, the tx-scope/error-policy radios (a
+/// click on a combination `script_options_valid` forbids is a no-op, dimmed
+/// rather than hidden — `AppView::set_script_tx_scope`/
+/// `set_script_error_policy` enforce the same rule server-side of the
+/// click), the fixed per-statement timeout (read from config, not
+/// editable), and "Spustit"/"Zrušit".
+#[allow(clippy::too_many_arguments)]
+fn render_script_run_confirm_panel(
+    files: &[std::path::PathBuf],
+    file_counts: &[usize],
+    tx_scope: crate::runner::TxScope,
+    error_policy: crate::runner::ErrorPolicy,
+    source_label: &str,
+    conn_label: &str,
+    read_only: bool,
+    timeout_secs: Option<u64>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    use crate::runner::{ErrorPolicy, TxScope};
+
+    let total: usize = file_counts.iter().sum();
+    let mut file_list = div().flex().flex_col().gap_1().max_h(px(160.)).overflow_hidden();
+    for (path, count) in files.iter().zip(file_counts.iter()) {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string());
+        file_list = file_list.child(
+            div().text_color(rgb(0xa6adc8)).child(format!("{name} — {count} příkazů")),
+        );
+    }
+
+    let mut conn_line = div().flex().flex_row().gap_2().text_color(rgb(0xa6adc8)).child(conn_label.to_string());
+    if read_only {
+        conn_line = conn_line.child(div().text_color(rgb(0xf9e2af)).child("jen pro čtení"));
+    }
+
+    let tx_option = |id: &'static str, label: &'static str, value: TxScope, current: TxScope| {
+        let valid = crate::script_options_valid(value, error_policy);
+        let selected = value == current;
+        let base = div().id(id).px_2().py_1().rounded_md().child(label);
+        if !valid {
+            base.text_color(rgb(0x45475a))
+        } else if selected {
+            base.cursor_pointer().bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4)).on_click(cx.listener(move |v, _, _, cx| {
+                v.set_script_tx_scope(value, cx);
+            }))
+        } else {
+            base.cursor_pointer().bg(rgb(0x313244)).text_color(rgb(0xa6adc8)).on_click(cx.listener(move |v, _, _, cx| {
+                v.set_script_tx_scope(value, cx);
+            }))
+        }
+    };
+    let policy_option = |id: &'static str, label: &'static str, value: ErrorPolicy, current: ErrorPolicy| {
+        let valid = crate::script_options_valid(tx_scope, value);
+        let selected = value == current;
+        let base = div().id(id).px_2().py_1().rounded_md().child(label);
+        if !valid {
+            base.text_color(rgb(0x45475a))
+        } else if selected {
+            base.cursor_pointer().bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4)).on_click(cx.listener(move |v, _, _, cx| {
+                v.set_script_error_policy(value, cx);
+            }))
+        } else {
+            base.cursor_pointer().bg(rgb(0x313244)).text_color(rgb(0xa6adc8)).on_click(cx.listener(move |v, _, _, cx| {
+                v.set_script_error_policy(value, cx);
+            }))
+        }
+    };
+
+    let timeout_line = match timeout_secs {
+        Some(t) => format!("timeout na příkaz: {t}s"),
+        None => "bez timeoutu".to_string(),
+    };
+
+    let panel = div()
+        .id("script-run-confirm")
+        .w(px(560.))
+        .bg(rgb(0x1e1e2e))
+        .border_1()
+        .border_color(rgb(0x45475a))
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(rgb(0xcdd6f4))
+        .child(div().text_size(px(16.)).child(format!("Spustit skript: {source_label}")))
+        .child(conn_line)
+        .child(file_list)
+        .child(div().text_color(rgb(0xa6adc8)).child(format!("celkem: {total} příkazů")))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_color(rgb(0xa6adc8)).child("Transakce"))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(tx_option("script-tx-none", "žádná transakce", TxScope::None, tx_scope))
+                        .child(tx_option("script-tx-perfile", "transakce na soubor", TxScope::PerFile, tx_scope))
+                        .child(tx_option("script-tx-whole", "jedna transakce na celý běh", TxScope::WholeRun, tx_scope)),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_color(rgb(0xa6adc8)).child("Při chybě"))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(policy_option("script-err-stop", "zastavit", ErrorPolicy::Stop, error_policy))
+                        .child(policy_option("script-err-continue", "pokračovat", ErrorPolicy::Continue, error_policy)),
+                ),
+        )
+        .child(div().text_color(rgb(0xa6adc8)).child(timeout_line))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .justify_end()
+                .mt_2()
+                .child(styled_button("script-run-cancel-modal", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+                .child(
+                    styled_button("script-run-confirm-btn", "Spustit")
+                        .on_click(cx.listener(|v, _, _, cx| v.confirm_script_run(cx))),
+                ),
+        );
     panel.into_any_element()
 }
 

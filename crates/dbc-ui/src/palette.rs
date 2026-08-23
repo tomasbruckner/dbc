@@ -106,6 +106,12 @@ pub enum PaletteAction {
     /// the current snapshot (`AppView::resolve_er_diagram_schema`), or
     /// refuses with a Czech status pointing at the schema-tree icon.
     ShowErDiagram,
+    /// G12 T3: opens the file-picker + pre-scan + confirm-modal flow for a
+    /// single `.sql` script (`AppView::start_script_pick(false, ..)`).
+    RunSqlFile,
+    /// G12 T3: same flow, folder mode — non-recursive `*.sql` listing
+    /// (`AppView::start_script_pick(true, ..)`).
+    RunSqlFolder,
 }
 
 /// One table/view from the current schema snapshot, plus whether it's
@@ -148,6 +154,8 @@ pub fn fixed_actions(monitor_available: bool) -> Vec<(String, PaletteAction)> {
         ("Nové spojení…".to_string(), PaletteAction::NewConnection),
         ("Obnovit schéma".to_string(), PaletteAction::RefreshSchema),
         ("ER diagram".to_string(), PaletteAction::ShowErDiagram),
+        ("Spustit SQL soubor…".to_string(), PaletteAction::RunSqlFile),
+        ("Spustit SQL složku…".to_string(), PaletteAction::RunSqlFolder),
     ];
     if monitor_available {
         actions.push(("Monitor serveru".to_string(), PaletteAction::OpenMonitor));
@@ -390,8 +398,9 @@ mod rank_items_tests {
         assert_eq!(items[4], PaletteItem::Connection { id: "c1".into(), name: "prod".into() });
         assert!(matches!(items[5], PaletteItem::Action { .. }));
         // 5 base actions + G8 T6's "ER diagram" (`ShowErDiagram` is
-        // unconditional, unlike `OpenMonitor` which is engine-gated).
-        assert_eq!(items.len(), 2 + 2 + 1 + 6);
+        // unconditional, unlike `OpenMonitor` which is engine-gated) +
+        // G12 T3's "Spustit SQL soubor…"/"Spustit SQL složku…".
+        assert_eq!(items.len(), 2 + 2 + 1 + 8);
     }
 
     #[test]

@@ -38,16 +38,19 @@ use dbc_state::{
 };
 use gpui::{
     actions, div, prelude::*, px, rgb, rgba, size, uniform_list, AnyElement, App, Bounds,
-    ClipboardItem, Context, Entity, Focusable, KeyBinding, ScrollDelta, ScrollWheelEvent, Window,
-    WindowBounds, WindowOptions,
+    ClipboardItem, Context, Entity, Focusable, KeyBinding, PathPromptOptions, ScrollDelta,
+    ScrollWheelEvent, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use grid::{GridEvent, ResultGrid};
 use palette::{PaletteAction, PaletteItem};
-use runner::{ConnectSpec, MultiQueryEvent, QueryEvent, QueryRunner};
+use runner::{ConnectSpec, MultiQueryEvent, QueryEvent, QueryRunner, ScriptEvent, ScriptRunOptions};
 use schema_tree::{SchemaTree, TreeEvent};
 use sql_input::SqlInput;
-use tabs::{collapse_title, ResultTab, TabContent, Tabs};
+use tabs::{
+    collapse_title, ResultTab, ScriptFileRow, ScriptFileStatus, ScriptRunOutcome, ScriptRunState,
+    TabContent, Tabs,
+};
 
 actions!(
     dbc,
@@ -282,6 +285,198 @@ fn auto_limit_each(statements: Vec<String>, limit: Option<u64>, bypass: bool) ->
         })
         .collect();
     (out, changed_any)
+}
+
+/// G12 T3: read-chunk size for streaming a `.sql` file through its own
+/// `StatementSplitter` — mirrors `runner::SCRIPT_READ_CHUNK`'s size (kept as
+/// an independent constant since `main.rs` doesn't depend on `runner`'s
+/// private items; the two are intentionally the same value).
+const SCRIPT_COUNT_CHUNK: usize = 64 * 1024;
+
+/// G12 T3: streams `path` through a fresh `StatementSplitter` (never the UI
+/// thread — always called inside `cx.background_spawn`) solely to COUNT
+/// statements for the pre-scan modal. An IO error or a split failure
+/// (including an unterminated construct at EOF) yields `Err(text)` — shown
+/// in the status line, the run is not offered for that file.
+fn count_statements_in_file(path: &std::path::Path, dialect: dbc_core::Dialect) -> Result<usize, String> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut splitter = dbc_core::StatementSplitter::new(dialect);
+    let mut buf = vec![0u8; SCRIPT_COUNT_CHUNK];
+    let mut count = 0usize;
+    loop {
+        let n = file.read(&mut buf).map_err(|e| format!("{}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        let stmts = splitter.push(&buf[..n]).map_err(|e| format!("{}: {e:?}", path.display()))?;
+        count += stmts.len();
+    }
+    match splitter.finish() {
+        Ok(Some(_)) => count += 1,
+        Ok(None) => {}
+        Err(e) => return Err(format!("{}: {e:?}", path.display())),
+    }
+    Ok(count)
+}
+
+/// G12 T3: non-recursive `*.sql` listing (case-insensitive extension),
+/// ordered by `file_name()` string comparison — NOT full path (design §3).
+fn list_sql_files(dir: &std::path::Path) -> Result<Vec<PathBuf>, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let is_sql = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("sql"));
+        if is_sql {
+            files.push(path);
+        }
+    }
+    files.sort_by(|a, b| {
+        a.file_name().unwrap_or_default().to_string_lossy().cmp(&b.file_name().unwrap_or_default().to_string_lossy())
+    });
+    Ok(files)
+}
+
+/// G12 T3: the design §2 matrix's UI rule — whole-run transaction scope is
+/// only selectable under a Stop error policy (never `Continue` inside one
+/// open transaction, see `runner::failure_action`'s defensive fallback for
+/// the runner's own belt-and-braces enforcement of this same rule).
+fn script_options_valid(scope: runner::TxScope, policy: runner::ErrorPolicy) -> bool {
+    !(scope == runner::TxScope::WholeRun && policy == runner::ErrorPolicy::Continue)
+}
+
+/// G12 T3: history `sql` synthesis (design §3) — a synthetic description,
+/// NEVER file contents (§3-novela: no credential/result data leaks into
+/// history beyond what the app's existing convention already logs — see
+/// `AppView::confirm_script_run`'s doc comment for the full rationale).
+fn script_history_sql(files: &[(PathBuf, usize)], statements_run: usize, statements_failed: usize) -> String {
+    let total: usize = files.iter().map(|(_, n)| n).sum();
+    if files.len() == 1 {
+        format!(
+            "[skript] {} — {total} příkazů, {statements_run} OK, {statements_failed} chyb",
+            files[0].0.display()
+        )
+    } else {
+        format!(
+            "[skript] {} souborů, {total} příkazů, {statements_run} OK, {statements_failed} chyb",
+            files.len()
+        )
+    }
+}
+
+/// G12 T3/T4: `TabContent::ScriptRun`'s render — a free function (not an
+/// `AppView` method) precisely so it can be called from inside
+/// `AppView::render_tab_content`'s `match &active.content` without
+/// conflicting with `active`'s still-live borrow of `self.tabs` (see the
+/// call site's comment). Renders the summary bar (files/statements/rows
+/// progress, elapsed, outcome, "Zrušit" while running), the per-file status
+/// list, and the log tail — reusing `TabContent::Text`'s wrapped-monospace
+/// idiom for the log rather than a scrollbar (same "render everything,
+/// newest lines visible" posture as `push_log`'s cap already assumes).
+fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<AppView>) -> AnyElement {
+    let s = state.borrow();
+    let files_done = s
+        .files
+        .iter()
+        .filter(|f| !matches!(f.status, ScriptFileStatus::Pending | ScriptFileStatus::Running))
+        .count();
+    let files_total = s.files.len();
+    let elapsed = s.elapsed.unwrap_or_else(|| s.started_at.elapsed());
+    let running = matches!(s.outcome, ScriptRunOutcome::Running);
+    let (outcome_label, outcome_color) = match s.outcome {
+        ScriptRunOutcome::Running => ("běží…", rgb(0xf9e2af)),
+        ScriptRunOutcome::Done => ("Hotovo", rgb(0xa6e3a1)),
+        ScriptRunOutcome::Failed => ("Selhalo", rgb(0xf38ba8)),
+        ScriptRunOutcome::Cancelled => ("Zrušeno", rgb(0x9399b2)),
+    };
+
+    let mut header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .p_2()
+        .bg(rgb(0x181825))
+        .text_color(rgb(0xcdd6f4))
+        .child(format!("{files_done}/{files_total} souborů"))
+        .child(format!("{}/{} příkazů", s.statements_run, s.total_statements));
+    if let Some((done, total)) = s.progress_rows {
+        header = header.child(format!("{done}/{total} řádků"));
+    }
+    header = header
+        .child(format!("{:.1}s", elapsed.as_secs_f32()))
+        .child(div().text_color(outcome_color).child(outcome_label));
+    if running {
+        header = header.child(
+            div()
+                .id("script-run-cancel")
+                .cursor_pointer()
+                .px_2()
+                .py_1()
+                .bg(rgb(0x5d2e2e))
+                .rounded_md()
+                .child("Zrušit")
+                .on_click(cx.listener(|view, _, _, cx| {
+                    if let Some(c) = view.cancel.take() {
+                        c.cancel();
+                        view.status = "cancelling…".to_string();
+                    }
+                    cx.notify();
+                })),
+        );
+    }
+
+    let mut file_list = div().flex().flex_col().gap_1().p_2().text_color(rgb(0xa6adc8));
+    for f in &s.files {
+        let glyph = match f.status {
+            ScriptFileStatus::Pending => "·",
+            ScriptFileStatus::Running => "▶",
+            ScriptFileStatus::Done => "✓",
+            ScriptFileStatus::Failed => "✗",
+            ScriptFileStatus::Skipped => "⊘",
+        };
+        file_list = file_list.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(format!(
+                    "{glyph} {} ({} OK, {} chyb)",
+                    f.name, f.statements_run, f.statements_failed
+                )),
+        );
+    }
+
+    let mut log_body = div()
+        .id("script-run-log")
+        .font_family("Consolas")
+        .flex()
+        .flex_col()
+        .flex_1()
+        .overflow_hidden()
+        .p_2()
+        .text_color(rgb(0x9399b2));
+    for line in s.log.iter() {
+        log_body = log_body.child(div().child(line.clone()));
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .bg(rgb(0x1e1e2e))
+        .child(header)
+        .child(file_list)
+        .child(log_body)
+        .into_any_element()
 }
 
 /// `conn_meta`: `Some((read_only, engine))` — for a saved `ConnectionConfig`
@@ -1372,6 +1567,7 @@ impl AppView {
                                             TabContent::Monitor { .. } => None,
                                             TabContent::Plan { .. } => None,
                                             TabContent::Diagram { .. } => None,
+                                            TabContent::ScriptRun { .. } => None,
                                         }
                                     })
                                 });
@@ -1763,6 +1959,413 @@ impl AppView {
     }
 
     // -----------------------------------------------------------------
+    // G12 T3: script runner UI — file/folder pickers, pre-scan, confirm
+    // modal, live progress tab. Wires up `runner::run_script` (Task 1,
+    // unreachable from `main` until this task — every `#[allow(dead_code)]`
+    // on its types is removed as part of this task).
+    // -----------------------------------------------------------------
+
+    /// Palette „Spustit SQL soubor…“/„Spustit SQL složku…“ entry point.
+    /// Guards mirror `run_query_with`'s single-flight guard (one modal/run
+    /// at a time). Resolves the active connection's dialect via the SAME
+    /// `resolve_spec_for_explain`/`dialect_for_engine` pair Task 2's editor
+    /// unlock and G13 T6's Explain/Analyze already use — an engine without a
+    /// dialect (MSSQL — CURATION item 2's explicit non-goal) refuses with a
+    /// status note rather than offering a picker that could never run
+    /// anything.
+    fn start_script_pick(&mut self, folder: bool, cx: &mut Context<Self>) {
+        if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
+            return;
+        }
+        if self.cancel.is_some() {
+            return;
+        }
+        let Some((read_only, timeout_secs, engine, _spec)) = self.resolve_spec_for_explain(cx) else {
+            return; // resolve_spec_for_explain already set self.status
+        };
+        let Some(dialect) = dialect_for_engine(engine) else {
+            self.status = "error: skripty nejsou podporovány pro tento engine".to_string();
+            cx.notify();
+            return;
+        };
+        let conn_label = self.current_connection_label();
+
+        self.status = "výběr souboru…".to_string();
+        cx.notify();
+        // Grounding (design §7 spike, RESOLVED — no extension-filter API
+        // exists at the pinned rev: `PathPromptOptions` has no filter field,
+        // the Windows `file_open_dialog` never calls `SetFileTypes`).
+        // Client-side `.sql` validation happens below instead.
+        let dialog = cx.prompt_for_paths(PathPromptOptions {
+            files: !folder,
+            directories: folder,
+            multiple: false,
+            prompt: Some("Spustit".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = match dialog.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
+                Ok(Ok(_)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "výběr zrušen".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = format!("error: dialog selhal: {e}");
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_canceled) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "error: dialog není dostupný".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+
+            // Off the UI thread: pre-scan (second sequential read past the
+            // dialog's own stat — accepted per design §3, the count label
+            // says "odhad" nowhere the count is 100% exact anyway since a
+            // concurrent edit could change it before the actual run).
+            let result: Result<(String, Vec<PathBuf>, Vec<usize>), String> = cx
+                .background_spawn(async move {
+                    if folder {
+                        let files = list_sql_files(&picked)?;
+                        if files.is_empty() {
+                            return Err("složka neobsahuje žádné .sql soubory".to_string());
+                        }
+                        let mut counts = Vec::with_capacity(files.len());
+                        for f in &files {
+                            counts.push(count_statements_in_file(f, dialect)?);
+                        }
+                        let name = picked
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| picked.display().to_string());
+                        let label = format!("{name}/ ({} souborů)", files.len());
+                        Ok((label, files, counts))
+                    } else {
+                        let is_sql = picked
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("sql"));
+                        if !is_sql {
+                            return Err("vyberte soubor .sql".to_string());
+                        }
+                        let count = count_statements_in_file(&picked, dialect)?;
+                        let name = picked
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| picked.display().to_string());
+                        Ok((name, vec![picked], vec![count]))
+                    }
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| match result {
+                Ok((source_label, files, file_counts)) => {
+                    view.status = String::new();
+                    view.modal = Some(connections_ui::ModalState::ScriptRun {
+                        files,
+                        file_counts,
+                        tx_scope: runner::TxScope::PerFile,
+                        error_policy: runner::ErrorPolicy::Stop,
+                        source_label,
+                        conn_label,
+                        read_only,
+                        timeout_secs,
+                    });
+                    cx.notify();
+                }
+                Err(e) => {
+                    view.status = format!("error: {e}");
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The modal's „Transakce“ radio — a click on an option that would
+    /// violate `script_options_valid` (whole-run scope + continue policy)
+    /// is a structural no-op, per the design §2 matrix's UI rule.
+    fn set_script_tx_scope(&mut self, scope: runner::TxScope, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::ScriptRun { tx_scope, error_policy, .. }) = &mut self.modal {
+            if script_options_valid(scope, *error_policy) {
+                *tx_scope = scope;
+            }
+        }
+        cx.notify();
+    }
+
+    /// The modal's „Při chybě“ radio — same no-op-on-invalid-combination
+    /// rule as `set_script_tx_scope`.
+    fn set_script_error_policy(&mut self, policy: runner::ErrorPolicy, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::ScriptRun { tx_scope, error_policy, .. }) = &mut self.modal {
+            if script_options_valid(*tx_scope, policy) {
+                *error_policy = policy;
+            }
+        }
+        cx.notify();
+    }
+
+    /// „Spustit“ — closes the modal, opens the `TabContent::ScriptRun`
+    /// progress tab, and drains `runner::run_script`'s event stream into
+    /// `ScriptRunState`.
+    ///
+    /// §3-novela / carry-forward review note (sql_preview credential
+    /// handling): `ScriptEvent`'s `sql_preview` field (and the log lines
+    /// built from it below) is display-safe-capped (200 chars, single-line,
+    /// `runner::sql_preview`) but NOT secret-redacted — a script containing
+    /// e.g. `ALTER USER x PASSWORD 'y'` shows that literal text in the
+    /// progress tab's log, exactly like the app's EXISTING convention for
+    /// every other run: `record_history`/`AppView::run_query_with` already
+    /// store the full literal editor SQL in the history DB unredacted (see
+    /// `history_panel.rs`). The log here is even MORE conservative than
+    /// that existing convention: it only ever holds `sql_preview`'s capped
+    /// text (never full statement text, never file contents), and the
+    /// history entry this run records is a SYNTHETIC description
+    /// (`script_history_sql`) — never the SQL at all. So this matches (and
+    /// narrows) the app's existing "history/log stores literal SQL"
+    /// posture rather than inventing a new, inconsistent redaction rule
+    /// for scripts alone.
+    fn confirm_script_run(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::ScriptRun {
+            files,
+            file_counts,
+            tx_scope,
+            error_policy,
+            source_label,
+            ..
+        }) = self.modal.clone()
+        else {
+            return;
+        };
+        let Some((_, timeout_secs, engine, spec)) = self.resolve_spec_for_explain(cx) else {
+            self.modal = None;
+            return;
+        };
+        let Some(dialect) = dialect_for_engine(engine) else {
+            self.status = "error: skripty nejsou podporovány pro tento engine".to_string();
+            self.modal = None;
+            cx.notify();
+            return;
+        };
+        self.modal = None;
+
+        let opts =
+            ScriptRunOptions { tx_scope, error_policy, dialect, statement_timeout_secs: timeout_secs };
+
+        let file_rows: Vec<ScriptFileRow> = files
+            .iter()
+            .zip(file_counts.iter())
+            .map(|(p, _)| ScriptFileRow {
+                name: p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.display().to_string()),
+                status: ScriptFileStatus::Pending,
+                statements_run: 0,
+                statements_failed: 0,
+            })
+            .collect();
+        let total_statements: usize = file_counts.iter().sum();
+        let state = Rc::new(RefCell::new(ScriptRunState {
+            files: file_rows,
+            total_statements,
+            statements_run: 0,
+            statements_failed: 0,
+            total_affected: 0,
+            progress_rows: None,
+            log: std::collections::VecDeque::new(),
+            outcome: ScriptRunOutcome::Running,
+            started_at: std::time::Instant::now(),
+            elapsed: None,
+        }));
+
+        let conn_identity = self.current_conn_identity();
+        self.tabs.open(ResultTab {
+            id: 0,
+            title: format!("Skript: {source_label}"),
+            pinned: false,
+            preview_key: None,
+            conn_identity,
+            content: TabContent::ScriptRun { state: state.clone() },
+        });
+
+        let cancel = CancelToken::new();
+        self.cancel = Some(cancel.clone());
+        self.run_generation += 1;
+        let my_generation = self.run_generation;
+        self.status = format!("skript {source_label}…");
+        cx.notify();
+
+        let history_started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let history_conn_name = self.active_connection_name_for_history();
+        let files_for_history: Vec<(PathBuf, usize)> = files.iter().cloned().zip(file_counts).collect();
+        let run_cancel = cancel.clone();
+        let mut rx = self.runner.run_script(spec, files, opts, run_cancel);
+
+        cx.spawn(async move |this, cx| {
+            let mut current_file_ix: Option<usize> = None;
+            let mut last_preview = String::new();
+            while let Some(ev) = rx.recv().await {
+                let stop = this
+                    .update(cx, |view, cx| {
+                        match ev {
+                            ScriptEvent::FileStarted { path, index, total_files } => {
+                                current_file_ix = Some(index);
+                                let mut s = state.borrow_mut();
+                                if let Some(row) = s.files.get_mut(index) {
+                                    row.status = ScriptFileStatus::Running;
+                                }
+                                let name = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                s.push_log(format!("▶ soubor {}/{total_files}: {name}", index + 1));
+                            }
+                            ScriptEvent::StatementStarted { stmt_index, sql_preview } => {
+                                last_preview = sql_preview;
+                                view.status = format!("skript {source_label}: příkaz {}…", stmt_index + 1);
+                            }
+                            ScriptEvent::StatementFinished { stmt_index, affected, elapsed } => {
+                                let mut s = state.borrow_mut();
+                                s.statements_run += 1;
+                                if let Some(n) = affected {
+                                    s.total_affected += n;
+                                }
+                                if let Some(ix) = current_file_ix {
+                                    if let Some(row) = s.files.get_mut(ix) {
+                                        row.statements_run += 1;
+                                    }
+                                }
+                                let rows_note =
+                                    affected.map(|n| format!(", {n} řádků")).unwrap_or_default();
+                                s.push_log(format!(
+                                    "✓ #{} {last_preview} ({} ms{rows_note})",
+                                    stmt_index + 1,
+                                    elapsed.as_millis()
+                                ));
+                            }
+                            ScriptEvent::StatementFailed { stmt_index, error } => {
+                                let mut s = state.borrow_mut();
+                                s.statements_failed += 1;
+                                if let Some(ix) = current_file_ix {
+                                    if let Some(row) = s.files.get_mut(ix) {
+                                        row.statements_failed += 1;
+                                    }
+                                }
+                                s.push_log(format!(
+                                    "✗ #{} {last_preview} — chyba: {error}",
+                                    stmt_index + 1
+                                ));
+                            }
+                            ScriptEvent::FileFinished { path, statements_run, statements_failed, elapsed } => {
+                                let mut s = state.borrow_mut();
+                                if let Some(ix) = current_file_ix {
+                                    if let Some(row) = s.files.get_mut(ix) {
+                                        row.status = if statements_failed > 0 {
+                                            ScriptFileStatus::Failed
+                                        } else {
+                                            ScriptFileStatus::Done
+                                        };
+                                    }
+                                }
+                                let name = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                s.push_log(format!(
+                                    "— {name} dokončen: {statements_run} OK, {statements_failed} chyb ({} ms)",
+                                    elapsed.as_millis()
+                                ));
+                            }
+                            ScriptEvent::RunFinished {
+                                files_run,
+                                statements_run,
+                                statements_failed,
+                                elapsed,
+                                aborted,
+                            } => {
+                                {
+                                    let mut s = state.borrow_mut();
+                                    if aborted {
+                                        for row in s.files.iter_mut() {
+                                            if matches!(
+                                                row.status,
+                                                ScriptFileStatus::Pending | ScriptFileStatus::Running
+                                            ) {
+                                                row.status = ScriptFileStatus::Skipped;
+                                            }
+                                        }
+                                    }
+                                    s.elapsed = Some(elapsed);
+                                    s.outcome = if !aborted {
+                                        ScriptRunOutcome::Done
+                                    } else if cancel.is_cancelled() {
+                                        ScriptRunOutcome::Cancelled
+                                    } else {
+                                        ScriptRunOutcome::Failed
+                                    };
+                                }
+                                let hist_sql = script_history_sql(
+                                    &files_for_history,
+                                    statements_run,
+                                    statements_failed,
+                                );
+                                let err_opt: Option<String> =
+                                    if aborted { Some("běh přerušen".to_string()) } else { None };
+                                view.record_history(
+                                    &hist_sql,
+                                    &history_conn_name,
+                                    history_started_at,
+                                    Some(elapsed.as_millis() as i64),
+                                    Some(statements_run as i64),
+                                    err_opt.as_deref(),
+                                    cx,
+                                );
+                                view.status = if aborted {
+                                    format!(
+                                        "skript {source_label}: přerušeno ({files_run} souborů, {statements_run}/{total_statements} příkazů)"
+                                    )
+                                } else {
+                                    format!(
+                                        "skript {source_label}: hotovo ({files_run} souborů, {statements_run} příkazů, {statements_failed} chyb)"
+                                    )
+                                };
+                                if view.run_generation == my_generation {
+                                    view.cancel = None;
+                                }
+                            }
+                        }
+                        cx.notify();
+                        false
+                    })
+                    .unwrap_or(false);
+                if stop {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |view, cx| {
+                if view.run_generation == my_generation {
+                    view.cancel = None;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // -----------------------------------------------------------------
     // G13 T6: "Vysvětlit"/"Analyzovat" status-bar buttons — dispatch,
     // three-case write gate (design §5), and the resulting `TabContent::Plan`
     // tab. See `plan.rs`'s module doc comment / the design's §3-novela
@@ -2118,6 +2721,11 @@ impl AppView {
                 // always cancels the values dialog (no run, no persistence,
                 // same contract as its "Zrušit" button/`cancel_query_params`).
                 connections_ui::ModalState::QueryParams { .. } => true,
+                // G12 T3: no run has started yet (that only happens on
+                // "Spustit" — see `confirm_script_run`) and it holds no
+                // unsaved secret state, so Esc closing it is safe — same
+                // reasoning `QueryParams` documents above.
+                connections_ui::ModalState::ScriptRun { .. } => true,
                 _ => false,
             };
             if closable {
@@ -2374,6 +2982,8 @@ impl AppView {
                         }
                     }
                 }
+                PaletteAction::RunSqlFile => self.start_script_pick(false, cx),
+                PaletteAction::RunSqlFolder => self.start_script_pick(true, cx),
             },
         }
         cx.notify();
@@ -3587,6 +4197,7 @@ impl AppView {
             TabContent::Monitor { .. } => return,
             TabContent::Plan { .. } => return,
             TabContent::Diagram { .. } => return,
+            TabContent::ScriptRun { .. } => return,
         };
         let current_identity = self.current_conn_identity();
         if !conn_identity_matches(&tab_conn_identity, &current_identity) {
@@ -3919,6 +4530,7 @@ impl AppView {
                     TabContent::Monitor { .. } => (0, false),
                     TabContent::Plan { .. } => (0, false),
                     TabContent::Diagram { .. } => (0, false),
+                    TabContent::ScriptRun { .. } => (0, false),
                 };
                 // G5 Task 3, brief contract #7: dirty (unapplied staged
                 // edits) tabs get a " •" title suffix — the apply bar
@@ -4080,6 +4692,14 @@ impl AppView {
                 }
                 view.clone().into_any_element()
             }
+            // G12 T3/T4: a free function (not a method) — it never touches
+            // `self` directly, only `state` (cloned out of `active`) and
+            // `cx` (for the "Zrušit" listener) — calling a `&mut self`
+            // method here instead would conflict with `active`'s still-live
+            // borrow of `self.tabs` (the same reason every other arm above
+            // either avoids `self` or touches only a named field like
+            // `self.status`, never an opaque method call).
+            TabContent::ScriptRun { state } => render_script_run_tab(state.clone(), cx),
         }
     }
 
@@ -4494,6 +5114,42 @@ impl Render for AppView {
                             }))
                             .into_any_element()
                     }
+                })
+                .child({
+                    // G12 T3: „SQL soubor…“/„SQL složku…“ — the script
+                    // runner's picker entry points, same toolbar-row
+                    // placement precedent as Vysvětlit/Analyzovat above
+                    // (adaptation: the plan's grounding describes these as
+                    // separate editor-toolbar buttons, but this status-bar
+                    // row IS the app's existing "run-adjacent action
+                    // buttons" toolbar — reusing it avoids growing a new
+                    // toolbar row for two buttons).
+                    let enabled = self.cancel.is_none() && self.modal.is_none();
+                    let color = if enabled { rgb(0xcdd6f4) } else { rgb(0x45475a) };
+                    div()
+                        .id("btn-run-sql-file")
+                        .cursor_pointer()
+                        .text_color(color)
+                        .child("SQL soubor…")
+                        .on_click(cx.listener(move |view, _, _window, cx| {
+                            if enabled {
+                                view.start_script_pick(false, cx);
+                            }
+                        }))
+                })
+                .child({
+                    let enabled = self.cancel.is_none() && self.modal.is_none();
+                    let color = if enabled { rgb(0xcdd6f4) } else { rgb(0x45475a) };
+                    div()
+                        .id("btn-run-sql-folder")
+                        .cursor_pointer()
+                        .text_color(color)
+                        .child("SQL složku…")
+                        .on_click(cx.listener(move |view, _, _window, cx| {
+                            if enabled {
+                                view.start_script_pick(true, cx);
+                            }
+                        }))
                 })
                 .child(div().flex_1().child(self.status.clone())),
         );
@@ -4920,6 +5576,65 @@ mod multi_statement_tests {
         assert_eq!(out, "SELECT 'a;b'; UPDATE t SET x = 'a;b';");
         let stmts = dbc_core::split_sql(&out, dbc_core::Dialect::Sqlite).unwrap();
         assert_eq!(stmts, vec!["SELECT 'a;b'".to_string(), "UPDATE t SET x = 'a;b'".to_string()]);
+    }
+}
+
+/// G12 T3: pure-helper tests behind the script-runner UI's pre-scan/modal
+/// logic — `count_statements_in_file`/`list_sql_files`/`script_options_valid`/
+/// `script_history_sql`.
+#[cfg(test)]
+mod script_ui_tests {
+    use super::*;
+
+    #[test]
+    fn list_sql_files_filters_and_orders_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.sql"), "select 1;").unwrap();
+        std::fs::write(dir.path().join("A.SQL"), "select 1;").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "nope").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("d.sql"), "select 1;").unwrap(); // non-recursive: ignored
+        let files = list_sql_files(dir.path()).unwrap();
+        let names: Vec<_> =
+            files.iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(names, vec!["A.SQL".to_string(), "b.sql".to_string()]);
+    }
+
+    #[test]
+    fn count_statements_streams_and_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.sql");
+        std::fs::write(&p, "SELECT 1;\n-- c ; c\nSELECT ';';\nSELECT 3").unwrap();
+        assert_eq!(count_statements_in_file(&p, dbc_core::Dialect::Sqlite), Ok(3));
+    }
+
+    #[test]
+    fn count_statements_surfaces_unterminated_as_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("bad.sql");
+        std::fs::write(&p, "SELECT 'oops").unwrap();
+        assert!(count_statements_in_file(&p, dbc_core::Dialect::Sqlite).is_err());
+    }
+
+    #[test]
+    fn whole_run_plus_continue_is_invalid() {
+        use crate::runner::{ErrorPolicy::*, TxScope::*};
+        assert!(script_options_valid(WholeRun, Stop));
+        assert!(!script_options_valid(WholeRun, Continue));
+        assert!(script_options_valid(PerFile, Continue));
+    }
+
+    #[test]
+    fn script_history_sql_single_and_multi_file_wording() {
+        let one = vec![(PathBuf::from("C:/s/a.sql"), 5)];
+        assert_eq!(script_history_sql(&one, 5, 0), format!("[skript] {} — 5 příkazů, 5 OK, 0 chyb", PathBuf::from("C:/s/a.sql").display()));
+        let two = vec![(PathBuf::from("C:/s"), 5), (PathBuf::from("C:/s/b.sql"), 2)];
+        let s = script_history_sql(&two, 6, 1);
+        assert!(s.starts_with("[skript] "));
+        assert!(s.contains("2 souborů"));
+        assert!(s.contains("7 příkazů"));
+        assert!(s.contains("6 OK"));
+        assert!(s.contains("1 chyb"));
     }
 }
 

@@ -77,17 +77,9 @@ pub const MONITOR_READ_ONLY_KILL_MSG: &str =
 /// matrix). `None` = every statement autocommits individually (no
 /// client-managed transaction at all); `PerFile` = one BEGIN…COMMIT per
 /// file; `WholeRun` = one BEGIN…COMMIT spanning every file in the run.
-///
-/// `#[allow(dead_code)]` here and on every other Task 1 item below that
-/// only `run_script`'s own (currently uncalled) tree reaches: nothing in
-/// `main.rs` dispatches a script run yet — that's Task 3's script-runner
-/// UI. Every item is already exercised directly by `script_run_tests`
-/// (zero warnings under `cargo test`); the allow only matters for a PLAIN
-/// `cargo build`, where `run_script` and its whole callee subtree are
-/// unreachable from `main`. Remove every one of these allows once Task 3
-/// wires `run_script` in.
+/// Wired into `main.rs` by Task 3's script-runner UI
+/// (`AppView::confirm_script_run`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum TxScope {
     None,
     PerFile,
@@ -95,18 +87,14 @@ pub enum TxScope {
 }
 
 /// G12 T2: what happens to the rest of the run after one statement fails.
-/// See `TxScope`'s doc comment for the `#[allow(dead_code)]` rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ErrorPolicy {
     Stop,
     Continue,
 }
 
 /// G12 T2: `QueryRunner::run_script`'s options — plain data, GPUI-free,
-/// so `drive_script` is unit-testable without a window. See `TxScope`'s
-/// doc comment for the `#[allow(dead_code)]` rationale.
-#[allow(dead_code)]
+/// so `drive_script` is unit-testable without a window.
 pub struct ScriptRunOptions {
     pub tx_scope: TxScope,
     pub error_policy: ErrorPolicy,
@@ -127,9 +115,7 @@ pub struct ScriptRunOptions {
 /// `sql_preview` (see `sql_preview` below) is the ONLY statement text ever
 /// carried on these events — display-safe, capped, single-line (§3-novela:
 /// no credentials/result data in `ScriptEvent`/logs/errors).
-/// See `TxScope`'s doc comment for the `#[allow(dead_code)]` rationale.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum ScriptEvent {
     FileStarted { path: std::path::PathBuf, index: usize, total_files: usize },
     StatementStarted { stmt_index: usize, sql_preview: String },
@@ -444,9 +430,8 @@ impl QueryRunner {
     /// when the spawned future completes. Read-only connections are NOT
     /// refused up front — a read-only script over a read-only connection is
     /// legitimate; write statements are rejected per-statement instead
-    /// (CURATION item 1(c)/4(a)). See `TxScope`'s doc comment for the
-    /// `#[allow(dead_code)]` rationale — no caller yet, that's Task 3.
-    #[allow(dead_code)]
+    /// (CURATION item 1(c)/4(a)). Called by Task 3's script-runner UI
+    /// (`AppView::confirm_script_run`, main.rs).
     pub fn run_script(
         &self,
         spec: ConnectSpec,
@@ -558,10 +543,8 @@ fn spec_is_read_only(spec: &ConnectSpec) -> bool {
 /// reads — same posture `is_read_statement`'s own doc comment mandates, so
 /// an ambiguous statement on a read-only connection is rejected rather than
 /// risked.
-/// Consumed by both `run_script` (Task 1, still unwired) and
-/// `connect_and_run_many` (Task 2, wired into `main.rs::run_many`) — no
-/// `#[allow(dead_code)]` needed, this one is genuinely reachable from
-/// `main` via the latter.
+/// Consumed by both `run_script` (Task 1, wired into `main.rs` by Task 3)
+/// and `connect_and_run_many` (Task 2, wired into `main.rs::run_many`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StmtDispatch {
     RunAsRead,
@@ -584,16 +567,13 @@ pub fn dispatch_statement(sql: &str, read_only: bool) -> StmtDispatch {
 /// matrix). `(Continue, WholeRun)` is a combination the UI never offers,
 /// but the runner still fails SAFE if it arrives anyway: abort, never
 /// continue inside one open transaction.
-/// See `TxScope`'s doc comment for the `#[allow(dead_code)]` rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum FailureAction {
     AbortRun,
     NextStatement,
     NextFile,
 }
 
-#[allow(dead_code)]
 pub fn failure_action(policy: ErrorPolicy, scope: TxScope) -> FailureAction {
     match (policy, scope) {
         (ErrorPolicy::Stop, _) => FailureAction::AbortRun,
@@ -610,10 +590,7 @@ pub fn failure_action(policy: ErrorPolicy, scope: TxScope) -> FailureAction {
 /// directly with a different cap rather than re-implementing the collapse
 /// (same precedent `history_panel::collapse_sql` itself documents against
 /// `tabs::collapse_title`).
-/// See `TxScope`'s doc comment for the `#[allow(dead_code)]` rationale.
-#[allow(dead_code)]
 pub const SQL_PREVIEW_CAP: usize = 200;
-#[allow(dead_code)]
 pub fn sql_preview(sql: &str) -> String {
     crate::history_panel::collapse_sql(sql, SQL_PREVIEW_CAP)
 }
@@ -864,18 +841,14 @@ async fn run_analyze_write_inner(
 }
 
 /// G12 T2: read-chunk size for streaming `.sql` files into the splitter
-/// (design §2). See `TxScope`'s doc comment for the `#[allow(dead_code)]`
-/// rationale.
-#[allow(dead_code)]
+/// (design §2).
 const SCRIPT_READ_CHUNK: usize = 64 * 1024;
 
 /// G12 T2: one statement — dispatch per the read-only matrix, per-statement
 /// child cancel + timeout. `Ok(Some(n))` — `n` is the drained row count for
 /// a read, the affected-row count for a write. CURATION item 1(c): the
 /// SHARED `guard_not_read_only` guard produces the read-only rejection, no
-/// fresh read-only logic here. See `TxScope`'s doc comment for the
-/// `#[allow(dead_code)]` rationale.
-#[allow(dead_code)]
+/// fresh read-only logic here.
 async fn run_script_statement(
     conn: &mut dyn Connection,
     sql: &str,
@@ -948,9 +921,7 @@ async fn run_script_statement(
 /// dependency just for this, the whole read+split runs inside ONE
 /// `spawn_blocking` over `std::fs`/`std::io::Read` — the same "blocking
 /// work never runs on a runtime worker thread" dispatch `open_spec` already
-/// uses for the driver connect step. See `TxScope`'s doc comment for the
-/// `#[allow(dead_code)]` rationale.
-#[allow(dead_code)]
+/// uses for the driver connect step.
 async fn read_and_split_file(
     path: &std::path::Path,
     dialect: dbc_core::Dialect,
@@ -997,9 +968,7 @@ async fn read_and_split_file(
 /// can't meaningfully "continue to the next statement" of a broken/unopened
 /// file, so they collapse the full `failure_action` matrix down to just
 /// `Stop -> AbortRun`, `Continue -> NextFile`, regardless of `tx_scope`
-/// (design §2 deviation, documented on `drive_script`). See `TxScope`'s
-/// doc comment for the `#[allow(dead_code)]` rationale.
-#[allow(dead_code)]
+/// (design §2 deviation, documented on `drive_script`).
 fn file_level_action(policy: ErrorPolicy) -> FailureAction {
     match policy {
         ErrorPolicy::Stop => FailureAction::AbortRun,
@@ -1014,9 +983,7 @@ fn file_level_action(policy: ErrorPolicy) -> FailureAction {
 /// recursion) so a script with many statements can't stack-overflow
 /// (Global Constraints). Kept generic over `&mut dyn Connection` (not
 /// `ConnectSpec`/`open_spec`) so it's directly testable over a temp-file
-/// sqlite connection, same posture as `drive_write_sequence`. See
-/// `TxScope`'s doc comment for the `#[allow(dead_code)]` rationale.
-#[allow(dead_code)]
+/// sqlite connection, same posture as `drive_write_sequence`.
 async fn drive_script(
     conn: &mut dyn Connection,
     read_only: bool,
