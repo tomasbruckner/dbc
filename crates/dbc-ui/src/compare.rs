@@ -23,10 +23,12 @@
 //! `fetch_diff_side` ran (design CURATION §0.1(d)/Global Constraints — no
 //! sync-script generation of any kind).
 
-use dbc_core::arrow::array::{Array, StringArray};
+use std::collections::HashSet;
+
+use dbc_core::arrow::array::{Array, RecordBatch, StringArray};
 use dbc_core::arrow::datatypes::SchemaRef;
 use dbc_core::{synthesize_create_table, QueryError, RoutineInfo, TableInfo, TriggerInfo};
-use dbc_diff::data_diff::{self, DataDiffOutcome, RowDiff};
+use dbc_diff::data_diff::{self, RowDiff};
 use dbc_diff::schema_diff::{CompareMode, FieldChange, ObjectDiff, SchemaDiff, TableDiff, TableStatus};
 use dbc_diff::text_diff::{diff_lines, DiffLine, DiffTag};
 use gpui::{
@@ -41,14 +43,20 @@ const TINT_ADDED: u32 = 0x2e5d3a; // green
 const TINT_REMOVED: u32 = 0x5d2e2e; // red
 const TINT_CHANGED: u32 = 0x6b5d2e; // amber/yellow
 
-/// T8: bounds how many individual row lines the three data-diff sections
-/// ever render, INDEPENDENT of `data_diff::DIFF_ROW_CAP` (1,000,000) — that
-/// cap bounds the DIFF COMPUTATION, not on-screen rendering. Rendering a
-/// million `div`s would hang the UI thread regardless of how correct the
-/// diff is; this is the "don't re-introduce unbounded rendering" guard
-/// called out in this task's constraints. The exact SQL each side ran is
-/// always shown in full (see `render_data_diff_outcome`) so a user who
-/// needs the full row set can always re-run it in a normal query tab.
+/// Bounds how many individual rows ANY per-frame render loop in this file
+/// ever emits — both the data-diff sections (Added/Removed/Changed row
+/// lists, T8) and the schema object lists (Tabulky/Funkce/Triggery/
+/// Sekvence, T7 — review fix MINOR 2: those had no cap at all). This is
+/// INDEPENDENT of `data_diff::DIFF_ROW_CAP` (1,000,000), which bounds the
+/// DIFF COMPUTATION, not on-screen rendering — rendering a million (or even
+/// a few thousand) `div`s would freeze the UI thread regardless of how
+/// correct the diff/schema is. For the data-diff sections this cap is also
+/// applied BEFORE the expensive per-row work runs (see
+/// `apply_data_diff_result`/`build_changed_rows_display`), not just at
+/// render time — see the MAJOR review fix note on `DataDiffSummary`. The
+/// exact SQL each side ran for a data diff is always shown in full (see
+/// `render_data_diff_outcome`) so a user who needs the full row set can
+/// always re-run it in a normal query tab.
 const DISPLAY_ROW_CAP: usize = 200;
 
 // ---------------------------------------------------------------------
@@ -254,24 +262,49 @@ pub struct ShowUnchanged {
 /// selection changes to a different table so a stale outcome for table A
 /// never lingers while table B is selected (see the table-row click
 /// handler in `render_table_section`).
+///
+/// Review fix (MAJOR): `Ready` used to carry the raw `DataDiffOutcome`
+/// (up to `DIFF_ROW_CAP` = 1,000,000 `RowDiff` entries) plus the two full
+/// `ResultBuffer`s, and `render_changed_rows` called
+/// `data_diff::build_changed_batch` INSIDE the render path — re-
+/// materializing every changed cell's `"{old} → {new}"` string and a fresh
+/// Arrow batch on EVERY repaint (selection change, WHERE-box edit, any
+/// `cx.notify()`), a multi-second UI freeze on a large diff well under the
+/// advertised cap. `Ready` now carries a `DataDiffSummary`, computed EXACTLY
+/// ONCE by `apply_data_diff_result` — rendering only ever reads it.
 pub enum DataDiffState {
     Idle,
     Loading,
-    Ready { outcome: DataDiffOutcome, sql_a: String, sql_b: String },
+    Ready { summary: DataDiffSummary, sql_a: String, sql_b: String },
     /// design §4: `DIFF_ROW_CAP` hit — a banner, not silent.
     RowCapExceeded { message: String },
     Error(QueryError),
 }
 
-/// The two fetched sides' raw buffers behind a `DataDiffState::Ready`
-/// outcome, kept so `build_changed_batch` can run once the outcome is known
-/// (needs `&mut ResultBuffer` for both sides — cell reads mutate a
-/// one-slot spill cache, see `dbc_buffer::ResultBuffer`'s doc comment).
-pub struct DataBuffers {
-    pub left: dbc_buffer::ResultBuffer,
-    pub left_names: Vec<String>,
-    pub right: dbc_buffer::ResultBuffer,
-    pub right_names: Vec<String>,
+/// Precomputed ONCE by `apply_data_diff_result` from a `DataDiffOutcome` +
+/// the two fetched `ResultBuffer`s — review fix (MAJOR), see
+/// `DataDiffState::Ready`'s doc comment. `render_data_diff_outcome`/
+/// `render_changed_rows_display` do NOT touch `dbc_diff::data_diff` at all;
+/// they only read fields off this struct. Every `Vec` here is ALREADY
+/// capped to `DISPLAY_ROW_CAP` at construction time (see
+/// `build_changed_rows_display`'s `cap` parameter) — the one-time build
+/// itself is bounded, not just "no longer per-frame".
+pub struct DataDiffSummary {
+    pub added: usize,
+    pub removed: usize,
+    pub changed: usize,
+    pub total_left: usize,
+    /// RIGHT-side row indices of the first `DISPLAY_ROW_CAP` Added rows.
+    pub added_shown: Vec<usize>,
+    /// LEFT-side row indices of the first `DISPLAY_ROW_CAP` Removed rows.
+    pub removed_shown: Vec<usize>,
+    pub changed_columns: Vec<String>,
+    /// Cell text for the first `DISPLAY_ROW_CAP` Changed rows — one `Vec`
+    /// per row, column order matching `changed_columns`.
+    pub changed_rows_shown: Vec<Vec<String>>,
+    /// `(row, col)` indices into `changed_rows_shown` whose cell actually
+    /// differs (tinted `TINT_CHANGED` at render time).
+    pub changed_tinted: HashSet<(usize, usize)>,
 }
 
 pub struct CompareView {
@@ -295,7 +328,6 @@ pub struct CompareView {
     /// result only applies if the generation still matches — same
     /// last-dispatched-wins guard `AppView::trigger_schema_fetch` uses.
     pub data_diff_generation: u64,
-    pub data_buffers: Option<DataBuffers>,
 }
 
 /// Emitted toward `AppView` (subscription wired in
@@ -350,7 +382,6 @@ impl CompareView {
         self.data_diff_generation += 1;
         let my_generation = self.data_diff_generation;
         self.data_diff = DataDiffState::Loading;
-        self.data_buffers = None;
 
         let spec_a = ConnectSpec::Config { cfg: Box::new(self.conn_a.clone()), secret: self.secret_a.clone() };
         let spec_b = ConnectSpec::Config { cfg: Box::new(self.conn_b.clone()), secret: self.secret_b.clone() };
@@ -401,10 +432,50 @@ impl CompareView {
             return;
         }
 
+        // review fix (MAJOR): the summary — including the "Změněné řádky"
+        // display batch — is built HERE, exactly once, never again at
+        // render time. `buf_a`/`buf_b` (and the full `outcome.rows`, up to
+        // `DIFF_ROW_CAP`) are dropped at the end of this function; nothing
+        // downstream keeps a reference to them.
         match data_diff::diff_data(&mut buf_a, &left_names, &left_pk, &mut buf_b, &right_names, &right_pk) {
             Ok(outcome) => {
-                self.data_buffers = Some(DataBuffers { left: buf_a, left_names, right: buf_b, right_names });
-                self.data_diff = DataDiffState::Ready { outcome, sql_a, sql_b };
+                let (changed_rows_shown, changed_tinted) = build_changed_rows_display(
+                    &mut buf_a,
+                    &mut buf_b,
+                    &outcome.intersection_columns,
+                    &left_names,
+                    &right_names,
+                    &outcome.rows,
+                    DISPLAY_ROW_CAP,
+                );
+                let summary = DataDiffSummary {
+                    added: outcome.rows.iter().filter(|r| matches!(r, RowDiff::Added { .. })).count(),
+                    removed: outcome.rows.iter().filter(|r| matches!(r, RowDiff::Removed { .. })).count(),
+                    changed: outcome.rows.iter().filter(|r| matches!(r, RowDiff::Changed { .. })).count(),
+                    total_left: outcome.rows.iter().filter(|r| !matches!(r, RowDiff::Added { .. })).count(),
+                    added_shown: outcome
+                        .rows
+                        .iter()
+                        .filter_map(|r| match r {
+                            RowDiff::Added { right_row } => Some(*right_row),
+                            _ => None,
+                        })
+                        .take(DISPLAY_ROW_CAP)
+                        .collect(),
+                    removed_shown: outcome
+                        .rows
+                        .iter()
+                        .filter_map(|r| match r {
+                            RowDiff::Removed { left_row } => Some(*left_row),
+                            _ => None,
+                        })
+                        .take(DISPLAY_ROW_CAP)
+                        .collect(),
+                    changed_columns: outcome.intersection_columns,
+                    changed_rows_shown,
+                    changed_tinted,
+                };
+                self.data_diff = DataDiffState::Ready { summary, sql_a, sql_b };
             }
             Err(msg) => {
                 self.data_diff = DataDiffState::RowCapExceeded { message: msg };
@@ -412,6 +483,46 @@ impl CompareView {
         }
         cx.notify();
     }
+}
+
+/// Pure "prepare the Changed-rows display cache" step — review fix (MAJOR):
+/// extracted specifically so a test can assert (a) this, not any render
+/// function, is what calls `data_diff::build_changed_batch`, and (b) the
+/// INPUT to that call is already bounded to `cap` `RowDiff::Changed`
+/// entries — i.e. the one-time build itself is O(cap), never O(total
+/// changed rows). Called exactly once, from `apply_data_diff_result`.
+fn build_changed_rows_display(
+    left: &mut dbc_buffer::ResultBuffer,
+    right: &mut dbc_buffer::ResultBuffer,
+    intersection_columns: &[String],
+    left_names: &[String],
+    right_names: &[String],
+    rows: &[RowDiff],
+    cap: usize,
+) -> (Vec<Vec<String>>, HashSet<(usize, usize)>) {
+    let capped_changed: Vec<RowDiff> =
+        rows.iter().filter(|r| matches!(r, RowDiff::Changed { .. })).take(cap).cloned().collect();
+    let (batch, tinted) =
+        data_diff::build_changed_batch(left, right, intersection_columns, left_names, right_names, &capped_changed);
+    (batch_to_text_rows(&batch, intersection_columns.len()), tinted)
+}
+
+fn batch_to_text_rows(batch: &RecordBatch, ncols: usize) -> Vec<Vec<String>> {
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let mut cells = Vec::with_capacity(ncols);
+        for col in 0..ncols {
+            let text = batch
+                .column(col)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map(|a| a.value(row).to_string())
+                .unwrap_or_default();
+            cells.push(text);
+        }
+        rows.push(cells);
+    }
+    rows
 }
 
 // ---------------------------------------------------------------------
@@ -422,20 +533,28 @@ impl CompareView {
 
 impl Render for CompareView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Cloning the load state per render frame mirrors this codebase's
-        // own established precedent for modal/tab state
-        // (`connections_ui::render_modal_overlay`'s `self.modal.clone()`) —
-        // not a hot path, simplicity over a borrow-splitting rewrite.
-        let state = self.state.clone();
-        let body: AnyElement = match state {
+        // Review fix (MINOR 1): this used to be `self.state.clone()`, deep-
+        // cloning the ENTIRE `SchemaDiff` (every `TableDiff`, both-side
+        // `TableInfo` — columns/indexes/constraints/DDL text) on EVERY
+        // render frame (selection change, WHERE-box keystroke, any
+        // `cx.notify()`). The `render_modal_overlay`-style "clone is cheap"
+        // precedent this cited does NOT hold for a large schema diff — a
+        // modal's state is a handful of fields, a `SchemaDiff` can be
+        // thousands of tables. None of the `render_*` helpers below
+        // actually need `&mut self` (they only read fields; `cx.listener`
+        // closures capture `&mut Self` themselves, independent of whether
+        // the OUTER render method borrows `self` mutably) — so this reads
+        // `&self.state` by reference instead, and every helper down the
+        // chain takes `&self`.
+        let body: AnyElement = match &self.state {
             CompareLoadState::Loading => div()
                 .flex_1()
                 .p_4()
                 .text_color(rgb(0xcdd6f4))
                 .child("Načítám schéma…")
                 .into_any_element(),
-            CompareLoadState::Error { a, b } => render_error_banner(&a, &b).into_any_element(),
-            CompareLoadState::Ready { diff, mode } => self.render_ready(&diff, mode, cx),
+            CompareLoadState::Error { a, b } => render_error_banner(a, b).into_any_element(),
+            CompareLoadState::Ready { diff, mode } => self.render_ready(diff, *mode, cx),
         };
         div().id("compare-view").flex().flex_col().flex_1().bg(rgb(0x1e1e2e)).child(body)
     }
@@ -453,7 +572,7 @@ fn render_error_banner(a: &Option<QueryError>, b: &Option<QueryError>) -> impl I
 }
 
 impl CompareView {
-    fn render_ready(&mut self, diff: &SchemaDiff, mode: CompareMode, cx: &mut Context<Self>) -> AnyElement {
+    fn render_ready(&self, diff: &SchemaDiff, mode: CompareMode, cx: &mut Context<Self>) -> AnyElement {
         let counts = count_table_statuses(&diff.tables);
         let mut root = div().id("compare-root").flex().flex_col().flex_1();
 
@@ -492,7 +611,7 @@ impl CompareView {
         root.into_any_element()
     }
 
-    fn render_left_pane(&mut self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_left_pane(&self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("compare-left")
             .w(px(320.))
@@ -510,7 +629,7 @@ impl CompareView {
             .child(self.render_sequence_section(diff, cx))
     }
 
-    fn render_table_section(&mut self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_table_section(&self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
         let show_unchanged = self.show_unchanged.tables;
         let unchanged = diff.tables.iter().filter(|t| t.status == TableStatus::Unchanged).count();
         let mut section = div().flex().flex_col().gap_1().child(section_header(
@@ -522,10 +641,13 @@ impl CompareView {
                 cx.notify();
             }),
         ));
-        for (ix, t) in diff.tables.iter().enumerate() {
-            if t.status == TableStatus::Unchanged && !show_unchanged {
-                continue;
-            }
+        // review fix (MINOR 2): visible rows capped at DISPLAY_ROW_CAP — a
+        // schema with thousands of tables must not emit thousands of `div`s
+        // per repaint.
+        let visible: Vec<(usize, &TableDiff)> =
+            diff.tables.iter().enumerate().filter(|(_, t)| show_unchanged || t.status != TableStatus::Unchanged).collect();
+        let shown = visible.len().min(DISPLAY_ROW_CAP);
+        for &(ix, t) in &visible[..shown] {
             let is_selected = self.selection == CompareSelection::Table(ix);
             let label = match &t.schema {
                 Some(s) => format!("{s}.{}", t.name),
@@ -537,15 +659,19 @@ impl CompareView {
                     .on_click(cx.listener(move |v, _, _, cx| {
                         v.selection = CompareSelection::Table(ix);
                         v.data_diff = DataDiffState::Idle; // new selection invalidates any prior data diff
-                        v.data_buffers = None;
                         cx.notify();
                     })),
+            );
+        }
+        if visible.len() > shown {
+            section = section.child(
+                div().text_color(rgb(0x6c7086)).child(format!("… a {} dalších", visible.len() - shown)),
             );
         }
         section
     }
 
-    fn render_routine_section(&mut self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_routine_section(&self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
         let show_unchanged = self.show_unchanged.routines;
         let unchanged = diff.routines.iter().filter(|r| matches!(r, ObjectDiff::Unchanged(_))).count();
         let mut section = div().flex().flex_col().gap_1().child(section_header(
@@ -557,10 +683,14 @@ impl CompareView {
                 cx.notify();
             }),
         ));
-        for (ix, r) in diff.routines.iter().enumerate() {
-            if matches!(r, ObjectDiff::Unchanged(_)) && !show_unchanged {
-                continue;
-            }
+        let visible: Vec<(usize, &ObjectDiff<RoutineInfo>)> = diff
+            .routines
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| show_unchanged || !matches!(r, ObjectDiff::Unchanged(_)))
+            .collect();
+        let shown = visible.len().min(DISPLAY_ROW_CAP);
+        for &(ix, r) in &visible[..shown] {
             let is_selected = self.selection == CompareSelection::Routine(ix);
             let name = match r {
                 ObjectDiff::Added(x) | ObjectDiff::Removed(x) | ObjectDiff::Unchanged(x) => x.name.clone(),
@@ -575,10 +705,15 @@ impl CompareView {
                     })),
             );
         }
+        if visible.len() > shown {
+            section = section.child(
+                div().text_color(rgb(0x6c7086)).child(format!("… a {} dalších", visible.len() - shown)),
+            );
+        }
         section
     }
 
-    fn render_trigger_section(&mut self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_trigger_section(&self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
         let show_unchanged = self.show_unchanged.triggers;
         let unchanged = diff.triggers.iter().filter(|t| matches!(t, ObjectDiff::Unchanged(_))).count();
         let mut section = div().flex().flex_col().gap_1().child(section_header(
@@ -590,10 +725,14 @@ impl CompareView {
                 cx.notify();
             }),
         ));
-        for (ix, t) in diff.triggers.iter().enumerate() {
-            if matches!(t, ObjectDiff::Unchanged(_)) && !show_unchanged {
-                continue;
-            }
+        let visible: Vec<(usize, &ObjectDiff<TriggerInfo>)> = diff
+            .triggers
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| show_unchanged || !matches!(t, ObjectDiff::Unchanged(_)))
+            .collect();
+        let shown = visible.len().min(DISPLAY_ROW_CAP);
+        for &(ix, t) in &visible[..shown] {
             let is_selected = self.selection == CompareSelection::Trigger(ix);
             let name = match t {
                 ObjectDiff::Added(x) | ObjectDiff::Removed(x) | ObjectDiff::Unchanged(x) => x.name.clone(),
@@ -608,6 +747,11 @@ impl CompareView {
                     })),
             );
         }
+        if visible.len() > shown {
+            section = section.child(
+                div().text_color(rgb(0x6c7086)).child(format!("… a {} dalších", visible.len() - shown)),
+            );
+        }
         section
     }
 
@@ -616,7 +760,7 @@ impl CompareView {
     /// unchanged toggle, for consistency) but its rows are inert (no
     /// `CompareSelection` variant exists for them, matching this task's
     /// Interfaces block).
-    fn render_sequence_section(&mut self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sequence_section(&self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
         let show_unchanged = self.show_unchanged.sequences;
         let unchanged = diff.sequences.iter().filter(|s| matches!(s, ObjectDiff::Unchanged(_))).count();
         let mut section = div().flex().flex_col().gap_1().child(section_header(
@@ -628,25 +772,30 @@ impl CompareView {
                 cx.notify();
             }),
         ));
-        for s in diff.sequences.iter() {
-            if matches!(s, ObjectDiff::Unchanged(_)) && !show_unchanged {
-                continue;
-            }
+        let visible: Vec<_> =
+            diff.sequences.iter().filter(|s| show_unchanged || !matches!(s, ObjectDiff::Unchanged(_))).collect();
+        let shown = visible.len().min(DISPLAY_ROW_CAP);
+        for s in &visible[..shown] {
             let name = match s {
                 ObjectDiff::Added(x) | ObjectDiff::Removed(x) | ObjectDiff::Unchanged(x) => x.name.clone(),
                 ObjectDiff::Changed { left, .. } => left.name.clone(),
             };
-            let tint = tint_for_object(s);
+            let tint = tint_for_object(*s);
             let mut row = div().px_1().rounded_md().child(name);
             if let Some(t) = tint {
                 row = row.bg(rgb(t));
             }
             section = section.child(row);
         }
+        if visible.len() > shown {
+            section = section.child(
+                div().text_color(rgb(0x6c7086)).child(format!("… a {} dalších", visible.len() - shown)),
+            );
+        }
         section
     }
 
-    fn render_right_pane(&mut self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_right_pane(&self, diff: &SchemaDiff, cx: &mut Context<Self>) -> impl IntoElement {
         let mut pane = div()
             .id("compare-right")
             .flex()
@@ -695,7 +844,7 @@ impl CompareView {
         pane
     }
 
-    fn render_table_detail(&mut self, t: &TableDiff, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_table_detail(&self, t: &TableDiff, cx: &mut Context<Self>) -> impl IntoElement {
         let title = match &t.schema {
             Some(s) => format!("{s}.{}", t.name),
             None => t.name.clone(),
@@ -755,7 +904,7 @@ impl CompareView {
         detail
     }
 
-    fn render_data_diff_section(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_data_diff_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut section =
             div().flex().flex_col().gap_2().mt_2().p_2().border_1().border_color(rgb(0x313244)).rounded_md();
         section = section.child(div().text_color(rgb(0x89b4fa)).child("Porovnání dat"));
@@ -797,118 +946,93 @@ impl CompareView {
             DataDiffState::RowCapExceeded { message } => {
                 section = section.child(div().text_color(rgb(0xf38ba8)).child(message.clone()));
             }
-            DataDiffState::Ready { .. } => {
-                section = section.child(self.render_data_diff_outcome());
+            DataDiffState::Ready { summary, sql_a, sql_b } => {
+                section = section.child(render_data_diff_outcome(summary, sql_a, sql_b));
             }
         }
         section
     }
-
-    fn render_data_diff_outcome(&mut self) -> impl IntoElement {
-        let DataDiffState::Ready { outcome, sql_a, sql_b } = &self.data_diff else {
-            return div();
-        };
-        let added = outcome.rows.iter().filter(|r| matches!(r, RowDiff::Added { .. })).count();
-        let removed = outcome.rows.iter().filter(|r| matches!(r, RowDiff::Removed { .. })).count();
-        let changed = outcome.rows.iter().filter(|r| matches!(r, RowDiff::Changed { .. })).count();
-        let total_left = outcome.rows.iter().filter(|r| !matches!(r, RowDiff::Added { .. })).count();
-        let sql_a = sql_a.clone();
-        let sql_b = sql_b.clone();
-        let outcome = outcome.clone();
-
-        let mut block = div().flex().flex_col().gap_2();
-        block = block.child(div().text_color(rgb(0xa6adc8)).child(format!(
-            "{added} přidáno, {removed} odebráno, {changed} změněno (z {total_left} řádků na levé straně)"
-        )));
-        block = block.child(ddl_block(&format!("A: {sql_a}")));
-        block = block.child(ddl_block(&format!("B: {sql_b}")));
-
-        block = block.child(row_id_list("Přidané řádky", TINT_ADDED, &outcome.rows, |r| match r {
-            RowDiff::Added { right_row } => Some(*right_row),
-            _ => None,
-        }));
-        block = block.child(row_id_list("Odebrané řádky", TINT_REMOVED, &outcome.rows, |r| match r {
-            RowDiff::Removed { left_row } => Some(*left_row),
-            _ => None,
-        }));
-        block = block.child(self.render_changed_rows(&outcome));
-        block
-    }
-
-    /// `build_changed_batch`'s synthetic all-Utf8 "old → new" batch,
-    /// rendered as a bounded (`DISPLAY_ROW_CAP`) text table with the
-    /// changed cells tinted `TINT_CHANGED`.
-    fn render_changed_rows(&mut self, outcome: &DataDiffOutcome) -> impl IntoElement {
-        let mut block = div().flex().flex_col().gap_1();
-        block = block.child(div().text_color(rgb(TINT_CHANGED)).child("Změněné řádky"));
-        let Some(buffers) = &mut self.data_buffers else { return block };
-        let (batch, tinted) = data_diff::build_changed_batch(
-            &mut buffers.left,
-            &mut buffers.right,
-            &outcome.intersection_columns,
-            &buffers.left_names,
-            &buffers.right_names,
-            &outcome.rows,
-        );
-        let total_rows = batch.num_rows();
-        if total_rows == 0 {
-            return block;
-        }
-
-        let mut header = div().flex().flex_row().gap_2().text_color(rgb(0x6c7086));
-        for name in &outcome.intersection_columns {
-            header = header.child(div().w(px(160.)).child(name.clone()));
-        }
-        block = block.child(header);
-
-        let shown = total_rows.min(DISPLAY_ROW_CAP);
-        for row in 0..shown {
-            let mut r = div().flex().flex_row().gap_2();
-            for col in 0..outcome.intersection_columns.len() {
-                let text = batch
-                    .column(col)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .map(|a| a.value(row).to_string())
-                    .unwrap_or_default();
-                let mut cell = div().w(px(160.)).child(text);
-                if tinted.contains(&(row, col)) {
-                    cell = cell.bg(rgb(TINT_CHANGED));
-                }
-                r = r.child(cell);
-            }
-            block = block.child(r);
-        }
-        if total_rows > shown {
-            block = block.child(
-                div()
-                    .text_color(rgb(0x6c7086))
-                    .child(format!("… zobrazeno prvních {shown} z {total_rows} změněných řádků")),
-            );
-        }
-        block
-    }
 }
 
-/// Bounded (`DISPLAY_ROW_CAP`) list of row indices matching `extract` — used
-/// for the "Přidané řádky"/"Odebrané řádky" sections (design §4). Row
-/// values are NOT re-read from the buffers here (only the row index is
-/// shown) — the composed SQL shown above the sections is the source of
-/// truth for what each side actually returned; a user who needs the full
-/// row contents can re-run that exact SQL in a normal query tab.
-fn row_id_list(title: &str, tint: u32, rows: &[RowDiff], extract: impl Fn(&RowDiff) -> Option<usize>) -> impl IntoElement {
+/// Review fix (MAJOR): reads ONLY from the already-computed
+/// `DataDiffSummary` (built once by `apply_data_diff_result`) — no
+/// `dbc_diff::data_diff` call, no `ResultBuffer` access, no per-cell string
+/// formatting happens here. Every list this renders was already capped to
+/// `DISPLAY_ROW_CAP` at construction time; the "… zobrazeno prvních N z M"
+/// footers use `summary`'s own totals, which ARE the full (uncapped)
+/// counts — cheap `usize` fields, not a re-scan of the row list.
+fn render_data_diff_outcome(summary: &DataDiffSummary, sql_a: &str, sql_b: &str) -> impl IntoElement {
+    let mut block = div().flex().flex_col().gap_2();
+    block = block.child(div().text_color(rgb(0xa6adc8)).child(format!(
+        "{} přidáno, {} odebráno, {} změněno (z {} řádků na levé straně)",
+        summary.added, summary.removed, summary.changed, summary.total_left
+    )));
+    block = block.child(ddl_block(&format!("A: {sql_a}")));
+    block = block.child(ddl_block(&format!("B: {sql_b}")));
+
+    block = block.child(row_id_list("Přidané řádky", TINT_ADDED, &summary.added_shown, summary.added));
+    block = block.child(row_id_list("Odebrané řádky", TINT_REMOVED, &summary.removed_shown, summary.removed));
+    block = block.child(render_changed_rows_display(summary));
+    block
+}
+
+/// `DataDiffSummary::changed_rows_shown`, rendered as a text table with the
+/// changed cells tinted `TINT_CHANGED` — review fix (MAJOR): purely a read
+/// of the precomputed cache, no `build_changed_batch` call here.
+fn render_changed_rows_display(summary: &DataDiffSummary) -> impl IntoElement {
     let mut block = div().flex().flex_col().gap_1();
-    block = block.child(div().text_color(rgb(tint)).child(title.to_string()));
-    let indices: Vec<usize> = rows.iter().filter_map(extract).collect();
-    let shown = indices.len().min(DISPLAY_ROW_CAP);
-    for &ix in &indices[..shown] {
-        block = block.child(div().text_color(rgb(0xa6adc8)).child(format!("řádek {ix}")));
+    block = block.child(div().text_color(rgb(TINT_CHANGED)).child("Změněné řádky"));
+    if summary.changed_rows_shown.is_empty() {
+        return block;
     }
-    if indices.len() > shown {
+
+    let mut header = div().flex().flex_row().gap_2().text_color(rgb(0x6c7086));
+    for name in &summary.changed_columns {
+        header = header.child(div().w(px(160.)).child(name.clone()));
+    }
+    block = block.child(header);
+
+    for (row, cells) in summary.changed_rows_shown.iter().enumerate() {
+        let mut r = div().flex().flex_row().gap_2();
+        for (col, text) in cells.iter().enumerate() {
+            let mut cell = div().w(px(160.)).child(text.clone());
+            if summary.changed_tinted.contains(&(row, col)) {
+                cell = cell.bg(rgb(TINT_CHANGED));
+            }
+            r = r.child(cell);
+        }
+        block = block.child(r);
+    }
+    let shown = summary.changed_rows_shown.len();
+    if summary.changed > shown {
         block = block.child(
             div()
                 .text_color(rgb(0x6c7086))
-                .child(format!("… zobrazeno prvních {shown} z {} řádků", indices.len())),
+                .child(format!("… zobrazeno prvních {shown} z {} změněných řádků", summary.changed)),
+        );
+    }
+    block
+}
+
+/// Renders an already-capped (`DISPLAY_ROW_CAP`, see `DataDiffSummary`)
+/// list of row indices — used for the "Přidané řádky"/"Odebrané řádky"
+/// sections (design §4). `total` is the FULL (uncapped) count, for the "…
+/// zobrazeno prvních N z M" footer. Row values are NOT re-read from any
+/// buffer here (only the row index is shown) — the composed SQL shown
+/// above the sections is the source of truth for what each side actually
+/// returned; a user who needs the full row contents can re-run that exact
+/// SQL in a normal query tab.
+fn row_id_list(title: &str, tint: u32, shown_indices: &[usize], total: usize) -> impl IntoElement {
+    let mut block = div().flex().flex_col().gap_1();
+    block = block.child(div().text_color(rgb(tint)).child(title.to_string()));
+    for &ix in shown_indices {
+        block = block.child(div().text_color(rgb(0xa6adc8)).child(format!("řádek {ix}")));
+    }
+    if total > shown_indices.len() {
+        block = block.child(
+            div()
+                .text_color(rgb(0x6c7086))
+                .child(format!("… zobrazeno prvních {} z {total} řádků", shown_indices.len())),
         );
     }
     block
@@ -1167,5 +1291,80 @@ mod tests {
         assert!(!data_diff_available(&t), "right side has no PK");
         t.right = Some(with_pk());
         assert!(data_diff_available(&t));
+    }
+
+    // --- review fix (MAJOR): `build_changed_rows_display` is the ONLY
+    // place `data_diff::build_changed_batch` is ever called from this file
+    // (see `apply_data_diff_result`'s single call site) — `render_*`
+    // functions only ever read the `DataDiffSummary` it produces. These
+    // tests prove (a) it actually works over real `ResultBuffer`s the same
+    // way `dbc_diff::data_diff`'s own tests do, and (b) — the crux of the
+    // MAJOR finding — the `cap` parameter bounds the INPUT to
+    // `build_changed_batch`, not just the rendered output: passing `cap=2`
+    // over 3 genuinely-changed rows must never materialize the 3rd row at
+    // all, proving the one-time build itself is O(cap), not O(total
+    // changed rows). ---
+
+    fn test_buf(names: &[&str], rows: Vec<Vec<Option<&str>>>) -> (dbc_buffer::ResultBuffer, Vec<String>) {
+        use dbc_core::arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let fields: Vec<Field> = names.iter().map(|n| Field::new(*n, DataType::Utf8, true)).collect();
+        let schema = Arc::new(Schema::new(fields));
+        let ncols = names.len();
+        let mut arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(ncols);
+        for c in 0..ncols {
+            let col: Vec<Option<&str>> = rows.iter().map(|r| r[c]).collect();
+            arrays.push(Arc::new(StringArray::from(col)));
+        }
+        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+        let mut rb = dbc_buffer::ResultBuffer::new(schema);
+        rb.push(batch).unwrap();
+        (rb, names.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn build_changed_rows_display_respects_the_cap_never_materializing_beyond_it() {
+        let (mut left, ln) = test_buf(
+            &["id", "val"],
+            vec![vec![Some("1"), Some("a")], vec![Some("2"), Some("b")], vec![Some("3"), Some("c")]],
+        );
+        let (mut right, rn) = test_buf(
+            &["id", "val"],
+            vec![vec![Some("1"), Some("A")], vec![Some("2"), Some("B")], vec![Some("3"), Some("C")]],
+        );
+        let outcome = data_diff::diff_data(&mut left, &ln, &[0], &mut right, &rn, &[0]).unwrap();
+        assert_eq!(
+            outcome.rows.iter().filter(|r| matches!(r, RowDiff::Changed { .. })).count(),
+            3,
+            "fixture sanity check: all 3 rows must be Changed"
+        );
+
+        let (rows_shown, _tinted) =
+            build_changed_rows_display(&mut left, &mut right, &outcome.intersection_columns, &ln, &rn, &outcome.rows, 2);
+        assert_eq!(rows_shown.len(), 2, "cap=2 must yield exactly 2 display rows, never all 3");
+    }
+
+    #[test]
+    fn build_changed_rows_display_marks_only_the_differing_cells() {
+        let (mut left, ln) = test_buf(&["id", "val"], vec![vec![Some("1"), Some("a")]]);
+        let (mut right, rn) = test_buf(&["id", "val"], vec![vec![Some("1"), Some("b")]]);
+        let outcome = data_diff::diff_data(&mut left, &ln, &[0], &mut right, &rn, &[0]).unwrap();
+
+        let (rows_shown, tinted) = build_changed_rows_display(
+            &mut left,
+            &mut right,
+            &outcome.intersection_columns,
+            &ln,
+            &rn,
+            &outcome.rows,
+            DISPLAY_ROW_CAP,
+        );
+        assert_eq!(rows_shown.len(), 1);
+        let val_col = outcome.intersection_columns.iter().position(|c| c == "val").unwrap();
+        let id_col = outcome.intersection_columns.iter().position(|c| c == "id").unwrap();
+        assert!(tinted.contains(&(0, val_col)), "val differs on both sides — must be tinted");
+        assert!(!tinted.contains(&(0, id_col)), "id is the (unchanged) PK — must not be tinted");
+        assert_eq!(rows_shown[0][val_col], "a → b");
     }
 }

@@ -1281,7 +1281,6 @@ impl AppView {
             data_where: String::new(),
             data_diff: crate::compare::DataDiffState::Idle,
             data_diff_generation: 0,
-            data_buffers: None,
         });
         cx.subscribe(&view, AppView::on_compare_view_event).detach();
         self.tabs.open(crate::tabs::ResultTab {
