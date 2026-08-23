@@ -4261,7 +4261,14 @@ impl AppView {
         error: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        if !matches!(*status.borrow(), backup::BackupStatus::Running) {
+        // Deliberately checks `status` only — NOT `self.modal` — so a
+        // non-cancellable (MSSQL/SQLite) session's real outcome is still
+        // recorded even after the user has closed/switched away from its
+        // modal (`should_cancel_on_teardown` guarantees `status` was never
+        // wrongly flipped to `Cancelled` for those two engines in the
+        // meantime — see both functions' doc comments, review MAJOR fix).
+        let is_running = matches!(*status.borrow(), backup::BackupStatus::Running);
+        if !backup::should_record_terminal_event(is_running) {
             cx.notify();
             return;
         }
@@ -4591,7 +4598,12 @@ impl AppView {
     /// OPEN dialog (single file pick). Layer 1 of the 3-layer read-only
     /// posture: refused right here, before even opening the dialog, if
     /// `cfg.read_only` — Restore is NEVER exempt (design CURATION item 2).
-    fn open_restore_dialog(&mut self, connection_id: String, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Review MINOR A fix: uses `cx.spawn_in(window, ...)` (not the plain
+    /// `cx.spawn`) so the async continuation can still reach `window` once
+    /// the file dialog resolves — `begin_restore_confirm` needs it to focus
+    /// the typed-name field, same as every other modal opener in this
+    /// codebase already does for its own first focusable field.
+    fn open_restore_dialog(&mut self, connection_id: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal.is_some() {
             return;
         }
@@ -4605,6 +4617,17 @@ impl AppView {
             cx.notify();
             return;
         }
+        // Review NIT fix: same cheap early-refusal `begin_restore_confirm`
+        // performs below — no reason to make the user pick a file for a
+        // Postgres/SSH combination that's guaranteed to be refused once
+        // they actually confirm.
+        if cfg.engine == dbc_state::Engine::Postgres && cfg.ssh.is_some() {
+            self.status =
+                "error: obnova přes SSH tunel zatím není podporována pro tento engine — použij přímé připojení"
+                    .to_string();
+            cx.notify();
+            return;
+        }
         self.status = "volím zdroj obnovy…".to_string();
         cx.notify();
         let dialog = cx.prompt_for_paths(PathPromptOptions {
@@ -4613,7 +4636,7 @@ impl AppView {
             multiple: false,
             prompt: Some("Obnovit ze zálohy".into()),
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let path = match dialog.await {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
                 Ok(Ok(_)) => {
@@ -4638,8 +4661,8 @@ impl AppView {
                     return;
                 }
             };
-            let _ = this.update(cx, |view, cx| {
-                view.begin_restore_confirm(connection_id.clone(), path, cx);
+            let _ = this.update_in(cx, |view, window, cx| {
+                view.begin_restore_confirm(connection_id.clone(), path, window, cx);
             });
         })
         .detach();
@@ -4649,8 +4672,16 @@ impl AppView {
     /// binding carry-forward #3's identity re-check — both done RIGHT HERE,
     /// before ever building a confirm panel, since the file dialog above is
     /// the async window this connection's config could have changed under.
-    /// Builds the `Confirming` session (typed-name field, no dispatch yet).
-    fn begin_restore_confirm(&mut self, connection_id: String, path: std::path::PathBuf, cx: &mut Context<Self>) {
+    /// Builds the `Confirming` session (typed-name field, no dispatch yet)
+    /// and focuses it (review MINOR A fix — every sibling modal opener in
+    /// this codebase already focuses its own first field the same way).
+    fn begin_restore_confirm(
+        &mut self,
+        connection_id: String,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let current_ids: Vec<String> = self.config.connections.iter().map(|c| c.id.clone()).collect();
         if !backup::backup_dispatch_allowed(&connection_id, &current_ids) {
             self.status = "připojení se během výběru změnilo — akce zrušena".to_string();
@@ -4664,6 +4695,18 @@ impl AppView {
         };
         if cfg.read_only {
             self.status = "error: připojení je pouze pro čtení — obnovu nelze spustit".to_string();
+            cx.notify();
+            return;
+        }
+        // Review NIT fix: refuse an SSH-tunneled Postgres connection HERE,
+        // before ever building a preview — `run_restore_now` refuses the
+        // exact same case at actual dispatch time (see that method), and
+        // showing a full `pg_restore`/`psql` command preview for a run that
+        // is guaranteed to be refused later is misleading.
+        if cfg.engine == dbc_state::Engine::Postgres && cfg.ssh.is_some() {
+            self.status =
+                "error: obnova přes SSH tunel zatím není podporována pro tento engine — použij přímé připojení"
+                    .to_string();
             cx.notify();
             return;
         }
@@ -4689,6 +4732,11 @@ impl AppView {
 
         let expected_name = cfg.database.clone();
         let input = cx.new(|cx| connections_ui::TextField::new(cx, &expected_name, false));
+        // Review MINOR A fix: focus the typed-name field — every sibling
+        // modal opener in this codebase already focuses its own first
+        // field (`open_connection_dialog`, `on_dropdown_item_click`'s
+        // master-password prompt, ...); this one was missing it.
+        let input_focus = input.focus_handle(cx);
         self.start_backup_session(
             backup::BackupKind::Restore,
             &cfg,
@@ -4699,6 +4747,7 @@ impl AppView {
             backup::BackupStatus::Confirming,
             cx,
         );
+        window.focus(&input_focus, cx);
     }
 
     /// "Obnovit" button (`ModalState::BackupRestore` while `Confirming`) —
@@ -4941,19 +4990,27 @@ impl AppView {
     }
 
     /// "Zrušit" on `ModalState::BackupRestore` — while `Confirming` (nothing
-    /// dispatched yet) this is a plain close; while `Running` it reaches
-    /// for the real kill switch (`BackupSession::cancel_now` — a Postgres
-    /// `BackupHandle::cancel()` or, for MSSQL/SQLite, a documented no-op —
-    /// see that method's doc comment) and flips the UI-visible status to
-    /// `Cancelled` synchronously, so `finish_backup_restore`'s guard refuses
-    /// to let a late-arriving terminal event overwrite it.
+    /// dispatched yet) this is a plain close; while `Running` it only
+    /// reaches for the real kill switch (`BackupSession::cancel_now`) and
+    /// flips the UI-visible status to `Cancelled` when
+    /// `backup::should_cancel_on_teardown` says so — i.e. a REAL cancel
+    /// hook is installed (Postgres). Review MAJOR fix: for MSSQL/SQLite
+    /// (`session.can_cancel() == false` — no OS child process, only a
+    /// `tokio` task driving `Connection::execute`/`fs::copy`, and T4's
+    /// runner methods for them expose no cancel hook), this is now a no-op
+    /// other than repainting — the panel itself renders "Zrušit" as
+    /// non-interactive for that case (`render_backup_restore_panel`), so
+    /// this handler shouldn't even be reachable there; kept as a defensive
+    /// no-op rather than lying about a cancellation that didn't happen (see
+    /// `should_cancel_on_teardown`'s doc comment for the full consequence
+    /// chain a wrongly-flipped status used to cause).
     fn cancel_backup_restore(&mut self, cx: &mut Context<Self>) {
         let Some(connections_ui::ModalState::BackupRestore(session)) = &self.modal else { return };
         if matches!(*session.status.borrow(), backup::BackupStatus::Confirming) {
             self.close_modal(cx);
             return;
         }
-        if session.is_running() {
+        if backup::should_cancel_on_teardown(session.can_cancel(), session.is_running()) {
             session.cancel_now();
             *session.status.borrow_mut() = backup::BackupStatus::Cancelled;
         }
@@ -4979,10 +5036,19 @@ impl AppView {
     ///   `switch_to_connection` directly.
     /// - the app-quit hook (`main()`, below) — window close.
     /// A no-op when no modal is open, the open modal isn't `BackupRestore`,
-    /// or its status isn't `Running`.
+    /// its status isn't `Running`, or (review MAJOR fix) there is no REAL
+    /// cancel hook installed (`session.can_cancel()` — MSSQL/SQLite have
+    /// none, see `backup::should_cancel_on_teardown`'s doc comment). For
+    /// those two engines closing the modal here is still safe to let
+    /// proceed — there is no OS child process to leak, only a `tokio` task
+    /// that will run to completion on its own — but `status` must NOT be
+    /// wrongly flipped to `Cancelled`: `finish_backup_restore` doesn't
+    /// consult `self.modal` at all, so the real outcome (and its history
+    /// record) still lands correctly once that task actually finishes,
+    /// PROVIDED `status` was left as `Running` for it to find.
     pub(crate) fn cancel_active_backup_if_running(&mut self) {
         if let Some(connections_ui::ModalState::BackupRestore(session)) = &self.modal {
-            if session.is_running() {
+            if backup::should_cancel_on_teardown(session.can_cancel(), session.is_running()) {
                 session.cancel_now();
                 *session.status.borrow_mut() = backup::BackupStatus::Cancelled;
             }
@@ -5208,14 +5274,30 @@ enum RestorePlan {
     Sqlite,
 }
 
+/// Reads AT MOST the first 16 bytes of `path` — exactly what
+/// `backup::detect_dump_format`'s `PGDMP`-magic sniff needs, never the
+/// whole file. Review BLOCKER fix: `plan_restore` used to `fs::read` the
+/// ENTIRE dump (realistically gigabytes) into memory, synchronously on the
+/// UI thread, and it runs TWICE per restore (`begin_restore_confirm`'s
+/// preview + `run_restore_now`'s actual dispatch) — same bounded-read shape
+/// `run_sqlite_restore_inner` (runner.rs) already uses for its own magic-
+/// header check. A file shorter than 16 bytes just yields whatever `read`
+/// actually filled (`n` bytes) — never a panic on a short buffer.
+fn read_sniff_prefix(path: &str) -> Result<[u8; 16], String> {
+    use std::io::Read;
+    let mut header = [0u8; 16];
+    let mut f = std::fs::File::open(path).map_err(|e| format!("nelze číst {path}: {e}"))?;
+    f.read(&mut header).map_err(|e| format!("nelze číst {path}: {e}"))?;
+    Ok(header)
+}
+
 fn plan_restore(cfg: &dbc_state::ConnectionConfig, source_path: &str) -> Result<RestorePlan, String> {
     match cfg.engine {
         dbc_state::Engine::Postgres => {
-            let bytes = std::fs::read(source_path).map_err(|e| format!("nelze číst {source_path}: {e}"))?;
-            let sniff_len = bytes.len().min(16);
+            let header = read_sniff_prefix(source_path)?;
             let target_host = cfg.host.clone();
             let target_port = cfg.port.unwrap_or(5432);
-            match backup::detect_dump_format(&bytes[..sniff_len]) {
+            match backup::detect_dump_format(&header) {
                 backup::DumpFormat::Custom => {
                     let args = backup::build_pg_restore_args(
                         cfg,
@@ -5234,6 +5316,95 @@ fn plan_restore(cfg: &dbc_state::ConnectionConfig, source_path: &str) -> Result<
         }
         dbc_state::Engine::Mssql => Ok(RestorePlan::Mssql),
         dbc_state::Engine::Sqlite => Ok(RestorePlan::Sqlite),
+    }
+}
+
+#[cfg(test)]
+mod plan_restore_tests {
+    use super::*;
+
+    fn pg_cfg() -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "c1".into(),
+            name: "demo".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Postgres,
+            host: "db.internal".into(),
+            port: Some(5432),
+            database: "shop".into(),
+            user: "alice".into(),
+            read_only: false,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+        }
+    }
+
+    /// Review BLOCKER fix: `read_sniff_prefix` must detect the `PGDMP`
+    /// custom-format magic from a large file (simulated with a multi-KB
+    /// garbage tail after the magic) while reading only its bounded 16-byte
+    /// prefix — never the whole file.
+    #[test]
+    fn read_sniff_prefix_detects_pgdmp_magic_with_a_large_garbage_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.backup");
+        let mut content = b"PGDMP\x01\x0e\x00rest".to_vec();
+        content.extend(std::iter::repeat(0xABu8).take(4 * 1024 * 1024)); // 4 MiB tail
+        std::fs::write(&path, &content).unwrap();
+
+        let header = read_sniff_prefix(path.to_str().unwrap()).unwrap();
+        assert_eq!(backup::detect_dump_format(&header), backup::DumpFormat::Custom);
+    }
+
+    #[test]
+    fn read_sniff_prefix_never_panics_on_a_short_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.sql");
+        std::fs::write(&path, b"-- x").unwrap();
+
+        let header = read_sniff_prefix(path.to_str().unwrap()).unwrap();
+        assert_eq!(backup::detect_dump_format(&header), backup::DumpFormat::Plain);
+    }
+
+    #[test]
+    fn read_sniff_prefix_missing_file_is_an_error_not_a_panic() {
+        assert!(read_sniff_prefix(r"D:\definitely\not\a\real\path.backup").is_err());
+    }
+
+    #[test]
+    fn plan_restore_postgres_picks_pg_restore_for_custom_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.backup");
+        std::fs::write(&path, b"PGDMP\x01\x0e\x00rest").unwrap();
+
+        let plan = plan_restore(&pg_cfg(), path.to_str().unwrap()).unwrap();
+        assert!(matches!(plan, RestorePlan::PgTool { tool_name, .. } if tool_name == "pg_restore"));
+    }
+
+    #[test]
+    fn plan_restore_postgres_picks_psql_for_plain_sql() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.sql");
+        std::fs::write(&path, b"-- plain sql dump\nCREATE TABLE t (id int);").unwrap();
+
+        let plan = plan_restore(&pg_cfg(), path.to_str().unwrap()).unwrap();
+        assert!(matches!(plan, RestorePlan::PgTool { tool_name, .. } if tool_name == "psql"));
+    }
+
+    #[test]
+    fn plan_restore_mssql_and_sqlite_never_touch_the_filesystem() {
+        // No file created at these paths at all — Mssql/Sqlite variants
+        // must not attempt to read the source file (that's runner-level,
+        // T4's own magic-header check for SQLite; MSSQL has no client-side
+        // sniff at all).
+        let mut mssql = pg_cfg();
+        mssql.engine = dbc_state::Engine::Mssql;
+        assert!(matches!(plan_restore(&mssql, r"D:\nope.bak"), Ok(RestorePlan::Mssql)));
+
+        let mut sqlite = pg_cfg();
+        sqlite.engine = dbc_state::Engine::Sqlite;
+        assert!(matches!(plan_restore(&sqlite, r"D:\nope.sqlite"), Ok(RestorePlan::Sqlite)));
     }
 }
 

@@ -1146,6 +1146,15 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Review MINOR B fix: single-modal invariant, same guard every
+        // other dialog opener in this file already applies (see
+        // `on_monitor_view_event`'s `KillRequested` arm) — the G11 T6
+        // teardown-path accounting for `ModalState::BackupRestore`
+        // specifically depends on this invariant actually holding
+        // everywhere, not just at ITS OWN two opener call sites.
+        if self.modal.is_some() {
+            return;
+        }
         let name = cx.new(|cx| TextField::new(cx, "např. Produkce", false));
         let host = cx.new(|cx| TextField::new(cx, "localhost", false));
         let port = cx.new(|cx| TextField::new(cx, "5432", false));
@@ -1226,6 +1235,12 @@ impl AppView {
     /// dialog can be opened via the palette without the dropdown ever having
     /// been opened this session.
     pub(crate) fn open_compare_dialog(&mut self, cx: &mut Context<Self>) {
+        // Review MINOR B fix: single-modal invariant — see
+        // `open_connection_dialog`'s identical guard for why this matters
+        // beyond just this dialog's own correctness.
+        if self.modal.is_some() {
+            return;
+        }
         self.refresh_grouped_cache();
         self.modal = Some(ModalState::CompareDialog { conn_a: None, conn_b: None, error: None });
         cx.notify();
@@ -2754,17 +2769,32 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
             }
             drop(log);
 
-            panel = panel.child(
+            // Review MAJOR fix: MSSQL/SQLite have no real cancel hook
+            // (`session.can_cancel() == false` — no OS child process, only
+            // a `tokio` task driving `Connection::execute`/`fs::copy`) —
+            // rendering a clickable "Zrušit" there would let the user
+            // believe a click actually stops the in-flight write, when in
+            // fact nothing would happen but the UI lying about it (see
+            // `backup::should_cancel_on_teardown`'s doc comment for the
+            // full consequence chain). Render it non-interactive instead,
+            // same "dimmed div, no `.on_click`" pattern this file already
+            // uses for a disabled Confirming-state "Obnovit".
+            let cancel_button = if session.can_cancel() {
+                styled_button("backup-restore-cancel-running", "Zrušit")
+                    .on_click(cx.listener(|v, _, _, cx| v.cancel_backup_restore(cx)))
+                    .into_any_element()
+            } else {
                 div()
-                    .flex()
-                    .flex_row()
-                    .justify_end()
-                    .mt_2()
-                    .child(
-                        styled_button("backup-restore-cancel-running", "Zrušit")
-                            .on_click(cx.listener(|v, _, _, cx| v.cancel_backup_restore(cx))),
-                    ),
-            );
+                    .id("backup-restore-cancel-running")
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(0x313244))
+                    .text_color(rgb(0x6c7086))
+                    .child("nelze přerušit — čeká se na dokončení")
+                    .into_any_element()
+            };
+            panel = panel.child(div().flex().flex_row().justify_end().mt_2().child(cancel_button));
         }
         BackupStatus::Succeeded | BackupStatus::Failed(_) | BackupStatus::Cancelled => {
             let (line, color) = match &status {

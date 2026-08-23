@@ -1227,6 +1227,56 @@ impl BackupSession {
     pub fn is_running(&self) -> bool {
         matches!(*self.status.borrow(), BackupStatus::Running)
     }
+
+    /// `true` only once a REAL cancel hook is installed (Postgres —
+    /// `run_backup_now`/`run_restore_now` wire a `BackupHandle::cancel`
+    /// closure into `cancel` right after spawning). `false` before dispatch,
+    /// for a terminal session, AND for the whole lifetime of an MSSQL/SQLite
+    /// run — those two engines have no OS child process to kill, only a
+    /// `tokio` task driving `Connection::execute`/`fs::copy`, and T4's
+    /// runner methods for them expose no cancel hook at all (review MAJOR
+    /// finding: the caller must never pretend otherwise).
+    pub fn can_cancel(&self) -> bool {
+        self.cancel.borrow().is_some()
+    }
+}
+
+/// Review MAJOR fix: whether a teardown path (an explicit "Zrušit" click,
+/// `close_modal`, `switch_to_connection`, or the app-quit hook) should flip
+/// a session's UI-visible `status` from `Running` to `Cancelled`. `true`
+/// only when there is BOTH a real cancel hook installed (`can_cancel`) AND
+/// the run is still actually `Running` — flipping status for a
+/// non-cancellable (MSSQL/SQLite) session while its `SET SINGLE_USER ->
+/// RESTORE -> SET MULTI_USER` sequence or `fs::copy` keeps running in the
+/// background would (a) lie to the user ("přerušeno uživatelem" while it's
+/// actually still running), (b) make `finish_backup_restore`'s own
+/// `Running`-only guard silently DROP the real outcome once it eventually
+/// arrives — no history record of a restore that actually happened — and
+/// (c) let the now-"terminal"-looking (but actually still running) modal
+/// be closed and a SECOND overlapping write dispatched against the same
+/// database, defeating the single-modal invariant. Pure so this decision
+/// is unit-tested directly rather than only through GPUI-context-dependent
+/// `AppView` methods (main.rs's `cancel_backup_restore`/
+/// `cancel_active_backup_if_running` are thin callers of this).
+pub fn should_cancel_on_teardown(can_cancel: bool, is_running: bool) -> bool {
+    can_cancel && is_running
+}
+
+/// Review MAJOR fix, second half: whether a terminal event (Postgres'
+/// `Finished`/`Failed`, or an MSSQL/SQLite oneshot's `Ok`/`Err`) should
+/// update `status` and record a history entry — `true` only while `status`
+/// is still `Running`. Deliberately independent of whether the modal that
+/// started this run is still `self.modal` (`AppView::finish_backup_restore`
+/// never reads `self.modal` at all, on purpose) — a user closing or
+/// switching away from a non-cancellable (MSSQL/SQLite) session's modal
+/// (safe to allow — see `should_cancel_on_teardown`'s doc comment) must
+/// NOT suppress the real outcome once the background task actually
+/// completes: as long as nothing wrongly flipped `status` away from
+/// `Running` in the meantime (which is exactly what
+/// `should_cancel_on_teardown` now prevents for those two engines), this
+/// still returns `true` and the run is still recorded.
+pub fn should_record_terminal_event(status_is_running: bool) -> bool {
+    status_is_running
 }
 
 #[cfg(test)]
@@ -1275,5 +1325,37 @@ mod session_tests {
         assert!(!session(BackupStatus::Succeeded).is_running());
         assert!(!session(BackupStatus::Failed("x".into())).is_running());
         assert!(!session(BackupStatus::Cancelled).is_running());
+    }
+
+    // --- review MAJOR fix: can_cancel / should_cancel_on_teardown ---
+    #[test]
+    fn can_cancel_is_false_until_a_hook_is_installed() {
+        let s = session(BackupStatus::Running);
+        assert!(!s.can_cancel());
+        *s.cancel.borrow_mut() = Some(std::rc::Rc::new(|| {}));
+        assert!(s.can_cancel());
+    }
+
+    #[test]
+    fn should_cancel_on_teardown_matrix() {
+        // Postgres-shaped (real hook) — cancel only while actually Running.
+        assert!(should_cancel_on_teardown(true, true));
+        assert!(!should_cancel_on_teardown(true, false));
+        // MSSQL/SQLite-shaped (no hook, ever) — NEVER flip status, even
+        // while Running — the whole point of this fix.
+        assert!(!should_cancel_on_teardown(false, true));
+        assert!(!should_cancel_on_teardown(false, false));
+    }
+
+    #[test]
+    fn should_record_terminal_event_only_while_still_running() {
+        // The case the review's fix restores: a non-cancellable session
+        // whose modal was closed (or the app quit) never has its status
+        // wrongly flipped away from Running by `should_cancel_on_teardown`
+        // — so once the real terminal event arrives, it's still recorded.
+        assert!(should_record_terminal_event(true));
+        // A cancelled (or already-terminal) session's late-arriving event
+        // must NOT overwrite the outcome a second time.
+        assert!(!should_record_terminal_event(false));
     }
 }
