@@ -18,6 +18,28 @@ row, §3 constraints, G5 pass as style model); `crates/dbc-core/src/schema.rs`
 
 ---
 
+> **CURATION (2026-08-23, binding):**
+> 1. **§6 open decisions resolved:** (a) `None`-schema strict matching stays
+>    for v1 — no `None`≈`public` heuristic; the cross-engine banner carries
+>    the caveat. (b) The **minimal WHERE text box ships in v1** for data
+>    diff (one optional text field per side-pair, appended as
+>    `WHERE {text}` to both sides' SELECT): the composed statement MUST
+>    pass `dbc_core::is_read_statement` before dispatch (fail-closed —
+>    blocks `; DROP`-style multi-statement injection through the WHERE box)
+>    and the exact composed SQL is shown in the compare tab header.
+>    (c) `similar` dependency approved. (d) The hard "no SQL sync-script
+>    generation of any kind" line is approved.
+> 2. **Read-only invariant:** the whole phase has zero write paths — no
+>    `execute()` call may appear anywhere in `dbc-diff` or the compare UI.
+>    REQUIRED test: `fetch_diff_side` with a WHERE-box payload failing
+>    `is_read_statement` is refused client-side.
+> 3. **Scheduling note:** T1–T4 (new `dbc-diff` crate) are new-crate work —
+>    fully parallelizable in worktrees alongside any dbc-ui phase. T5–T8
+>    serialize with other dbc-ui work (runner.rs/main.rs/tabs.rs).
+> 4. **Engine note:** MSSQL and DuckDB drivers exist as of v0.5.0 (unwired).
+>    `CompareMode` needs no change for either; once wiring lands they work
+>    through the same equality check.
+
 ## 0. New crate: `dbc-diff`
 
 - **Decision:** new pure crate `crates/dbc-diff`, added to the workspace

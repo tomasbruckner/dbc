@@ -6,6 +6,26 @@ Status: designed autonomously under the standing mandate (per §4 of the
 Scope (spec row G14, lowest priority): theme system with light/dark toggle;
 charts from a result tab (bar/line over selected columns).
 
+> **CURATION (2026-08-23, binding):**
+> 1. **§1.1's G6 hook is stale — G6 is landing now with real syntax
+>    colors.** `sql_highlight.rs` ships hardcoded Catppuccin Mocha:
+>    keyword `0xcba6f7` (mauve), string `0xa6e3a1`, number `0xfab387`
+>    (peach), comment `0x6c7086`, function `0x89b4fa`, type `0x94e2d5`
+>    (teal). Therefore: (a) `EditorSyntaxTheme` gains `function` and
+>    `type_` fields (G6's capture set), (b) its DARK defaults are the
+>    shipped G6 hex values verbatim — NOT "derives from accent" (that
+>    mapping would recolor keywords blue; G6's curated palette wins),
+>    (c) the G14 sweep migrates `sql_highlight::color_for_capture` to
+>    `cx.theme().syntax`, (d) light-mode syntax values are hand-picked
+>    with a contrast check like §1.4's accents.
+> 2. **§0's 136-site count is a snapshot** — G6 (params modal, autocomplete
+>    popup, highlighting) and every phase landing before G14 adds sites.
+>    Re-run the grep audit at T-theme-1 time and treat §0 as method, not
+>    inventory.
+> 3. Chart row cap: adopt the §5 suggestion now — width-derived cap
+>    (`max_bars = plot_width_px / 3`), 500 as the hard upper bound.
+> 4. Read-only phase: zero `execute()` surface in G14.
+
 ## 0. Survey (basis for every decision below)
 
 - **Color hardcoding, honest count:** `rgb(0x......)` literals in

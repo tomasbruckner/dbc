@@ -15,6 +15,23 @@ model); `crates/dbc-core/src/schema.rs` (`SchemaSnapshot` v2, `FkRef` on
 `C:\Users\tomas\.cargo\git\checkouts\zed-a70e2ad075855582\907ed09`, files
 cited inline below.
 
+> **CURATION (2026-08-23, binding):**
+> 1. **SVG export must XML-escape all interpolated text** (table/column
+>    names, schema names) — `<`, `>`, `&`, `"`, `'` via a small local
+>    escape helper in `erd::svg`. REQUIRED test: a table named `a<b&"c`
+>    produces valid escaped SVG. The draft omits this entirely and it is a
+>    correctness hole (a `<` in an identifier yields broken XML).
+> 2. **Palette:** node fill/border, edge, selection-accent and hot colors
+>    reuse the app's Catppuccin Mocha palette (G6 curation) in BOTH the
+>    canvas renderer and the SVG exporter — no new color scheme.
+> 3. **T4 opens with a 30-minute spike:** paint one rounded quad + one
+>    `PathBuilder` bezier inside `canvas()` on Windows before building
+>    `ErDiagramView` — §6's first risk (never-exercised `canvas()`/curve
+>    path on this platform) must be retired before the full view is built.
+> 4. **Scheduling note:** T1–T3 (dbc-core `erd` module) are worktree-
+>    parallelizable; T4–T7 serialize with other dbc-ui phases.
+> 5. **Read-only phase:** zero `execute()` surface anywhere in G8.
+
 ## 0. Data-model gap, decided up front
 
 `ColumnInfo.fk: Option<FkRef>` is per-column; there is no structural link
