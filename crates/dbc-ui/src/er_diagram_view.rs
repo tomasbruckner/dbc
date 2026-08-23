@@ -19,19 +19,29 @@
 //! was needed.
 
 use gpui::{
-    canvas, div, point, prelude::*, px, rgb, size, App, Bounds, Context, PathBuilder, Pixels,
-    Point, TextRun, Window,
+    canvas, div, point, prelude::*, px, rgb, size, App, Bounds, Context, EventEmitter,
+    PathBuilder, Pixels, Point, ScrollDelta, TextRun, Window,
 };
 
 use dbc_core::erd::layout::{DiagramLayout, PositionedNode, RoutedEdge};
-use dbc_core::erd::MAX_VISIBLE_COLS;
+use dbc_core::erd::{TableKey, MAX_VISIBLE_COLS};
 use dbc_core::TableInfo;
+
+use crate::schema_tree::TreeEvent;
 
 const NODE_FILL: u32 = 0x313244;
 const NODE_BORDER: u32 = 0x45475a;
 const TEXT_COLOR: u32 = 0xcdd6f4;
 const MUTED_COLOR: u32 = 0x6c7086;
 const EDGE_COLOR: u32 = 0x89b4fa;
+const ACCENT_COLOR: u32 = 0xf5c2e7;
+
+/// Anchored-zoom clamp bounds (T5 grounding, Constraints: "clamp zoom to a
+/// sane range — no zoom->0 or infinity producing NaN"). `0.2`/`3.0` per the
+/// plan's own `zoom_at` sketch (inside the stricter `[0.1, 5.0]` the brief
+/// allows).
+const ZOOM_MIN: f32 = 0.2;
+const ZOOM_MAX: f32 = 3.0;
 
 const HEADER_H: f32 = 24.0;
 const ROW_H: f32 = 18.0;
@@ -43,38 +53,211 @@ pub struct ErDiagramView {
     pub(crate) schema_label: String,
     pub(crate) pan: Point<f32>,
     pub(crate) zoom: f32,
+    /// T5: the currently-selected node, if any. Cleared on an empty-canvas
+    /// click; set (and `TreeEvent::OpenDdl` emitted) on a node hit.
+    pub(crate) selected: Option<TableKey>,
+    /// T5: screen-space (window-absolute, post pan/zoom) node boxes,
+    /// recomputed every paint pass in the canvas's `prepaint` closure and
+    /// written back onto `self` via the entity handle (canvas closures only
+    /// get `&mut App`, not `&mut Context<Self>` — the entity is not
+    /// borrowed during prepaint/paint, only during `render` itself, so
+    /// `Entity::update` here is the standard GPUI "measure during paint,
+    /// store for the next input event" idiom). Linear scan on hit-test is
+    /// O(n) in node count — fine at this app's schema sizes (`T7`'s
+    /// `DIAGRAM_TABLE_CAP` bounds it further); documented, not optimized.
+    pub(crate) hit_boxes: Vec<(TableKey, Bounds<Pixels>)>,
+    /// T5: the canvas element's own screen-space origin, refreshed
+    /// alongside `hit_boxes` — `zoom_at` needs the cursor position in
+    /// canvas-local space (`mouse_pos - canvas_origin`), matching the
+    /// `to_screen`/`world_to_screen` convention above.
+    pub(crate) canvas_origin: Point<Pixels>,
+    /// T5: `(start mouse pos, start pan)`, captured on an empty-canvas
+    /// mouse-down and cleared on mouse-up — the same drag-capture shape
+    /// `grid.rs`'s column-resize drag uses.
+    pub(crate) drag_state: Option<(Point<Pixels>, Point<f32>)>,
 }
 
 impl ErDiagramView {
     pub fn new(layout: DiagramLayout, tables: Vec<TableInfo>, schema_label: String) -> Self {
-        Self { layout, tables, schema_label, pan: point(0.0, 0.0), zoom: 1.0 }
+        Self {
+            layout,
+            tables,
+            schema_label,
+            pan: point(0.0, 0.0),
+            zoom: 1.0,
+            selected: None,
+            hit_boxes: Vec::new(),
+            canvas_origin: point(px(0.0), px(0.0)),
+            drag_state: None,
+        }
     }
 
     /// World-space (x, y) -> screen-space Pixels, given the current pan/
     /// zoom and the canvas element's own screen-space origin. Shared by
     /// paint (T4) and hit-testing (T5) so the two can never drift apart.
+    #[allow(dead_code)] // exercised via the module-level `to_screen` this delegates to; kept as
+    // the documented `&self` entry point future callers (T6/T7) should prefer.
     fn world_to_screen(&self, origin: Point<Pixels>, world: (f32, f32)) -> Point<Pixels> {
         to_screen(origin, world, self.pan, self.zoom)
     }
 }
 
+impl EventEmitter<TreeEvent> for ErDiagramView {}
+
 impl Render for ErDiagramView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let layout = self.layout.clone();
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let layout_for_prepaint = self.layout.clone();
+        let layout_for_paint = self.layout.clone();
         let tables = self.tables.clone();
         let pan = self.pan;
         let zoom = self.zoom;
+        let selected = self.selected.clone();
+        let dragging = self.drag_state.is_some();
+        let entity = cx.entity();
 
-        div().id("er-diagram-root").size_full().bg(rgb(0x1e1e2e)).child(
-            canvas(
-                move |bounds, _window, _app| bounds,
-                move |_bounds, canvas_bounds: Bounds<Pixels>, window, app| {
-                    paint_diagram(canvas_bounds, &layout, &tables, pan, zoom, window, app);
-                },
+        let mut root = div()
+            .id("er-diagram-root")
+            .size_full()
+            .bg(rgb(0x1e1e2e))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, e: &gpui::MouseDownEvent, _window, cx| {
+                    if let Some(key) = hit_test(&this.hit_boxes, e.position) {
+                        this.selected = Some(key.clone());
+                        this.drag_state = None;
+                        if let Some(t) =
+                            this.tables.iter().find(|t| t.schema == key.schema && t.name == key.name)
+                        {
+                            let ddl = t.ddl.clone().unwrap_or_else(|| dbc_core::synthesize_create_table(t));
+                            cx.emit(TreeEvent::OpenDdl { title: t.name.clone(), ddl });
+                        }
+                    } else {
+                        this.selected = None;
+                        this.drag_state = Some((e.position, this.pan));
+                    }
+                    cx.notify();
+                }),
             )
-            .size_full(),
-        )
+            .on_scroll_wheel(cx.listener(|this, e: &gpui::ScrollWheelEvent, _window, cx| {
+                let delta_lines = match e.delta {
+                    ScrollDelta::Lines(p) => p.y,
+                    ScrollDelta::Pixels(p) => p.y.as_f32() / 20.0,
+                };
+                let factor = 1.1f32.powf(delta_lines);
+                let mouse_local = (
+                    f32::from(e.position.x) - f32::from(this.canvas_origin.x),
+                    f32::from(e.position.y) - f32::from(this.canvas_origin.y),
+                );
+                let (new_pan, new_zoom) = zoom_at((this.pan.x, this.pan.y), this.zoom, mouse_local, factor);
+                this.pan = point(new_pan.0, new_pan.1);
+                this.zoom = new_zoom;
+                cx.notify();
+            }))
+            .child(
+                canvas(
+                    move |bounds, _window, app| {
+                        let boxes = compute_hit_boxes(bounds.origin, &layout_for_prepaint, pan, zoom);
+                        entity.update(app, |view, _cx| {
+                            view.hit_boxes = boxes;
+                            view.canvas_origin = bounds.origin;
+                        });
+                        bounds
+                    },
+                    move |_bounds, canvas_bounds: Bounds<Pixels>, window, app| {
+                        paint_diagram(
+                            canvas_bounds,
+                            &layout_for_paint,
+                            &tables,
+                            pan,
+                            zoom,
+                            selected.as_ref(),
+                            window,
+                            app,
+                        );
+                    },
+                )
+                .size_full(),
+            );
+
+        if dragging {
+            root = root
+                .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _window, cx| {
+                    if let Some((start_pos, start_pan)) = this.drag_state {
+                        let zoom = this.zoom.max(0.0001);
+                        let dx = (f32::from(e.position.x) - f32::from(start_pos.x)) / zoom;
+                        let dy = (f32::from(e.position.y) - f32::from(start_pos.y)) / zoom;
+                        this.pan = point(start_pan.x + dx, start_pan.y + dy);
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _e, _window, cx| {
+                        this.drag_state = None;
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _e, _window, cx| {
+                        this.drag_state = None;
+                        cx.notify();
+                    }),
+                );
+        }
+
+        root
     }
+}
+
+/// Pure hit-test: walks `hit_boxes` in reverse paint order (topmost node
+/// wins on overlap — the layout algorithm guarantees no overlap by
+/// construction, but reverse order is the correct convention regardless) and
+/// returns the first box containing `point`. `Bounds::contains` is the same
+/// primitive used throughout `grid.rs`. O(n) linear scan in node count —
+/// documented, not optimized (T7's `DIAGRAM_TABLE_CAP` bounds n further).
+fn hit_test(hit_boxes: &[(TableKey, Bounds<Pixels>)], point: Point<Pixels>) -> Option<TableKey> {
+    hit_boxes.iter().rev().find(|(_, b)| b.contains(&point)).map(|(k, _)| k.clone())
+}
+
+/// Screen-space (window-absolute) node boxes for the current pan/zoom —
+/// shares `to_screen`/`fmt_coord` with `paint_node` so hit-testing and
+/// painting can never drift apart (same node box math, same non-finite
+/// guard).
+fn compute_hit_boxes(
+    origin: Point<Pixels>,
+    layout: &DiagramLayout,
+    pan: Point<f32>,
+    zoom: f32,
+) -> Vec<(TableKey, Bounds<Pixels>)> {
+    layout
+        .nodes
+        .iter()
+        .map(|n| {
+            let top_left = to_screen(origin, (n.x, n.y), pan, zoom);
+            let sz = size(px(fmt_coord(n.w * zoom)), px(fmt_coord(n.h * zoom)));
+            (n.key.clone(), Bounds::new(top_left, sz))
+        })
+        .collect()
+}
+
+/// Anchored zoom (T5 grounding): given the current `pan`/`zoom` and the
+/// cursor's canvas-local position, returns a new `(pan, zoom)` such that the
+/// world point under the cursor stays under the cursor. Pure, no GPUI types
+/// — plain `f32` tuples, unit-tested standalone (`zoom_math_tests` below).
+/// `new_zoom` is clamped to `[ZOOM_MIN, ZOOM_MAX]` so a runaway scroll delta
+/// (or a `factor` of `0.0`/`inf` from a malformed event) can never collapse
+/// zoom to `0.0` or blow it up to infinity — both of which would feed a
+/// non-finite value into `to_screen` (already guarded by `fmt_coord`, but
+/// the clamp here stops it at the source instead of relying only on that
+/// backstop).
+pub fn zoom_at(pan: (f32, f32), zoom: f32, mouse_local: (f32, f32), factor: f32) -> ((f32, f32), f32) {
+    let safe_zoom = if zoom.is_finite() && zoom > 0.0 { zoom } else { 1.0 };
+    let safe_factor = if factor.is_finite() && factor > 0.0 { factor } else { 1.0 };
+    let new_zoom = (safe_zoom * safe_factor).clamp(ZOOM_MIN, ZOOM_MAX);
+    let world_under = (mouse_local.0 / safe_zoom - pan.0, mouse_local.1 / safe_zoom - pan.1);
+    let new_pan = (mouse_local.0 / new_zoom - world_under.0, mouse_local.1 / new_zoom - world_under.1);
+    (new_pan, new_zoom)
 }
 
 /// Non-finite coordinates (NaN/inf) must never reach GPUI's path/quad
@@ -124,15 +307,25 @@ fn paint_diagram(
     tables: &[TableInfo],
     pan: Point<f32>,
     zoom: f32,
+    selected: Option<&TableKey>,
     window: &mut Window,
     app: &mut App,
 ) {
     for e in &layout.edges {
-        paint_edge(bounds.origin, e, pan, zoom, window);
+        paint_edge(bounds.origin, e, pan, zoom, EDGE_COLOR, window);
     }
     for n in &layout.nodes {
         if let Some(t) = tables.iter().find(|t| t.schema == n.key.schema && t.name == n.key.name) {
-            paint_node(bounds.origin, n, t, pan, zoom, window, app);
+            let is_selected = selected == Some(&n.key);
+            paint_node(bounds.origin, n, t, pan, zoom, is_selected, window, app);
+        }
+    }
+    // T5 selection highlight (grounding): every edge touching the selected
+    // node is repainted a second time, last, in the accent color — cheap
+    // z-order trick, no new state beyond `selected` itself.
+    if let Some(key) = selected {
+        for e in layout.edges.iter().filter(|e| &e.from == key || &e.to == key) {
+            paint_edge(bounds.origin, e, pan, zoom, ACCENT_COLOR, window);
         }
     }
 }
@@ -179,16 +372,19 @@ fn paint_node(
     t: &TableInfo,
     pan: Point<f32>,
     zoom: f32,
+    is_selected: bool,
     window: &mut Window,
     app: &mut App,
 ) {
     let top_left = to_screen(origin, (n.x, n.y), pan, zoom);
     let sz = size(px(fmt_coord(n.w * zoom)), px(fmt_coord(n.h * zoom)));
+    let (border_color, border_w) =
+        if is_selected { (ACCENT_COLOR, px(2.0)) } else { (NODE_BORDER, px(1.0)) };
     window.paint_quad(
         gpui::fill(Bounds::new(top_left, sz), rgb(NODE_FILL))
             .corner_radii(px(4.))
-            .border_widths(px(1.))
-            .border_color(rgb(NODE_BORDER)),
+            .border_widths(border_w)
+            .border_color(rgb(border_color)),
     );
 
     let rem_size = window.rem_size();
@@ -235,7 +431,7 @@ fn paint_node(
     }
 }
 
-fn paint_edge(origin: Point<Pixels>, e: &RoutedEdge, pan: Point<f32>, zoom: f32, window: &mut Window) {
+fn paint_edge(origin: Point<Pixels>, e: &RoutedEdge, pan: Point<f32>, zoom: f32, color: u32, window: &mut Window) {
     if e.points.len() < 2 {
         return;
     }
@@ -247,7 +443,7 @@ fn paint_edge(origin: Point<Pixels>, e: &RoutedEdge, pan: Point<f32>, zoom: f32,
         builder.line_to(to_screen(origin, e.points[1], pan, zoom));
     }
     if let Ok(path) = builder.build() {
-        window.paint_path(path, rgb(EDGE_COLOR));
+        window.paint_path(path, rgb(color));
     }
 }
 
@@ -328,5 +524,108 @@ mod tests {
     fn sanitize_for_display_leaves_non_control_unicode_untouched() {
         let s = sanitize_for_display("tábulka_ěščř");
         assert_eq!(s, "tábulka_ěščř");
+    }
+
+    // --- T5: hit-testing (pure — `Bounds<Pixels>`/`Point<Pixels>` are
+    // plain value types, no live `Window` needed) ---
+
+    fn key(name: &str) -> TableKey {
+        TableKey { schema: None, name: name.into() }
+    }
+
+    fn box_at(name: &str, x: f32, y: f32, w: f32, h: f32) -> (TableKey, Bounds<Pixels>) {
+        (key(name), Bounds::new(point(px(x), px(y)), size(px(w), px(h))))
+    }
+
+    #[test]
+    fn hit_test_finds_containing_box() {
+        let boxes = vec![box_at("a", 0.0, 0.0, 100.0, 50.0), box_at("b", 200.0, 0.0, 100.0, 50.0)];
+        assert_eq!(hit_test(&boxes, point(px(10.0), px(10.0))), Some(key("a")));
+        assert_eq!(hit_test(&boxes, point(px(210.0), px(10.0))), Some(key("b")));
+    }
+
+    #[test]
+    fn hit_test_miss_returns_none() {
+        let boxes = vec![box_at("a", 0.0, 0.0, 100.0, 50.0)];
+        assert_eq!(hit_test(&boxes, point(px(500.0), px(500.0))), None);
+    }
+
+    #[test]
+    fn hit_test_overlap_prefers_topmost_last_painted() {
+        // Reverse-paint-order convention: later entries (painted on top)
+        // win on overlap.
+        let boxes = vec![box_at("under", 0.0, 0.0, 100.0, 100.0), box_at("over", 0.0, 0.0, 100.0, 100.0)];
+        assert_eq!(hit_test(&boxes, point(px(10.0), px(10.0))), Some(key("over")));
+    }
+
+    #[test]
+    fn compute_hit_boxes_matches_to_screen_node_geometry() {
+        let layout = DiagramLayout {
+            nodes: vec![PositionedNode { key: key("t"), x: 10.0, y: 20.0, w: 220.0, h: 60.0 }],
+            edges: vec![],
+        };
+        let origin = point(px(5.0), px(5.0));
+        let pan = point(1.0, 2.0);
+        let zoom = 2.0;
+        let boxes = compute_hit_boxes(origin, &layout, pan, zoom);
+        assert_eq!(boxes.len(), 1);
+        let (k, b) = &boxes[0];
+        assert_eq!(*k, key("t"));
+        let expect_top_left = to_screen(origin, (10.0, 20.0), pan, zoom);
+        assert_eq!(b.origin, expect_top_left);
+        assert_eq!(f32::from(b.size.width), 220.0 * zoom);
+        assert_eq!(f32::from(b.size.height), 60.0 * zoom);
+    }
+}
+
+#[cfg(test)]
+mod zoom_math_tests {
+    use super::*;
+
+    #[test]
+    fn zoom_in_keeps_cursor_world_point_fixed() {
+        let (new_pan, new_zoom) = zoom_at((0.0, 0.0), 1.0, (100.0, 50.0), 1.1);
+        assert!((new_zoom - 1.1).abs() < 1e-6);
+        // Re-derive the world point under the cursor at the NEW pan/zoom
+        // and confirm it matches what it was before the zoom.
+        let world_before = (100.0 / 1.0 - 0.0, 50.0 / 1.0 - 0.0);
+        let world_after = (100.0 / new_zoom - new_pan.0, 50.0 / new_zoom - new_pan.1);
+        assert!((world_before.0 - world_after.0).abs() < 1e-4);
+        assert!((world_before.1 - world_after.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn zoom_out_also_keeps_cursor_world_point_fixed() {
+        let (new_pan, new_zoom) = zoom_at((3.0, -2.0), 1.5, (40.0, 80.0), 0.9);
+        let world_before = (40.0 / 1.5 - 3.0, 80.0 / 1.5 - (-2.0));
+        let world_after = (40.0 / new_zoom - new_pan.0, 80.0 / new_zoom - new_pan.1);
+        assert!((world_before.0 - world_after.0).abs() < 1e-4);
+        assert!((world_before.1 - world_after.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn zoom_clamps_to_bounds() {
+        let (_, z_min) = zoom_at((0.0, 0.0), 0.21, (0.0, 0.0), 0.5);
+        assert!((z_min - ZOOM_MIN).abs() < 1e-6);
+        let (_, z_max) = zoom_at((0.0, 0.0), 2.9, (0.0, 0.0), 2.0);
+        assert!((z_max - ZOOM_MAX).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zoom_never_produces_non_finite_output_from_degenerate_input() {
+        for (zoom, factor) in [
+            (0.0, 1.1),
+            (f32::NAN, 1.1),
+            (f32::INFINITY, 1.1),
+            (1.0, 0.0),
+            (1.0, f32::NAN),
+            (1.0, f32::INFINITY),
+            (f32::NEG_INFINITY, f32::NAN),
+        ] {
+            let (pan, z) = zoom_at((0.0, 0.0), zoom, (10.0, 10.0), factor);
+            assert!(z.is_finite(), "zoom {zoom} factor {factor} produced non-finite z={z}");
+            assert!(z >= ZOOM_MIN && z <= ZOOM_MAX, "z={z} out of clamp range");
+            assert!(pan.0.is_finite() && pan.1.is_finite(), "pan {pan:?} not finite");
+        }
     }
 }
