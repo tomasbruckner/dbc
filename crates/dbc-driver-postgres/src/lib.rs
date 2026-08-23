@@ -209,6 +209,29 @@ impl Connection for PostgresConnection {
     /// shared for the lifetime of this `PostgresConnection`, i.e. one
     /// backend session), so `BEGIN … COMMIT`/`ROLLBACK` issued via successive
     /// `execute` calls run within the same server-side transaction.
+    ///
+    /// T4 review round 1, MAJOR 2 (part b): gives `execute()` the same
+    /// protocol-level cancel watcher `query()` already has (see that
+    /// method's doc comment for the full "must not outlive the query"
+    /// reasoning) — this is what lets `dbc-ui`'s
+    /// `run_write_transaction_bounded` actually reach the backend when its
+    /// outer timeout fires mid-statement, instead of merely dropping the
+    /// Rust-side future while the statement keeps running server-side.
+    ///
+    /// Unlike `query()`, there is no separate streaming task to naturally
+    /// hang the watcher's lifetime off of — so the ACTUAL `client.execute`
+    /// call is ALSO run in an independently `tokio::spawn`ed task here (not
+    /// simply awaited inline in this fn's own stack frame), with the
+    /// watcher's `done_tx` moved into THAT task. This detachment is the
+    /// whole point: a caller that drops the future THIS `execute()` call
+    /// returns (e.g. `dbc-ui`'s `tokio::time::timeout` firing) must not also
+    /// silently kill the watcher — if `done_tx` instead lived in this fn's
+    /// own async-generator frame, dropping this future would drop `done_tx`
+    /// too, and the watcher's `tokio::select!` would take its "done, nothing
+    /// to cancel" branch before a subsequent explicit `cancel.cancel()` call
+    /// ever has a chance to run, losing the race every time. Spawning the
+    /// actual execution keeps it — and the watcher — alive regardless of
+    /// whether the CALLER is still awaiting this returned future.
     async fn execute(&mut self, sql: &str, cancel: CancelToken) -> Result<u64, QueryError> {
         if cancel.is_cancelled() {
             return Err(QueryError {
@@ -217,7 +240,37 @@ impl Connection for PostgresConnection {
                 position: None,
             });
         }
-        self.client.execute(sql, &[]).await.map_err(pg_err)
+
+        let cancel_handle = self.client.cancel_token();
+        let watcher_cancel = cancel.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = watcher_cancel.cancelled() => {
+                    let _ = cancel_handle.cancel_query(NoTls).await;
+                }
+                _ = done_rx => {
+                    // Statement already finished; nothing to cancel.
+                }
+            }
+        });
+
+        let client = self.client.clone();
+        let sql = sql.to_owned();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            // Keep `done_tx` alive for exactly this DETACHED task's
+            // lifetime — see this method's doc comment for why it must NOT
+            // live in the outer (droppable) fn frame instead.
+            let _done_tx = done_tx;
+            let result = client.execute(&sql, &[]).await.map_err(pg_err);
+            // Receiver may already be gone if the caller dropped this
+            // `execute()` call's future (e.g. on timeout) — that's fine,
+            // there's simply nothing left to deliver the result to.
+            let _ = result_tx.send(result);
+        });
+
+        result_rx.await.map_err(|_| QueryError::msg("driver task died"))?
     }
 
     async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError> {

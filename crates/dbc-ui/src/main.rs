@@ -296,6 +296,45 @@ fn decide_join_pref_action(
     }
 }
 
+/// G5 Task 4 review fix (MAJOR 3): the outcome of the saved-fk-join
+/// auto-retrigger's guard, given the two facts `QueryEvent::Finished`'s
+/// handler has available for `pending_join_retrigger`'s tab. The retrigger
+/// dispatches `run_query_with`, which — via `Started` — REPLACES the tab's
+/// grid entity outright (`Tabs::close_by_preview_key` + a fresh
+/// `ResultGrid`), silently dropping any `EditState` staged on the OLD one.
+/// That's fine when there's nothing staged (the common case: the retrigger
+/// exists purely to restore this table's saved FK joins after a plain
+/// re-open), but if the user staged an edit WHILE the base query was still
+/// streaming (between `Started` and this `Finished`), the retrigger must not
+/// run at all — same "never silently drop staged edits" rule the T3-review
+/// dirty guard already enforces at its three other sites
+/// (`DiscardConfirmState`'s doc comment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetriggerAction {
+    /// Dispatch the retrigger — the tab is still open and not dirty.
+    Run,
+    /// The tab is still open but has staged edits — skip, leave the saved
+    /// FK joins un-refreshed rather than risk dropping them.
+    SkipDirty,
+    /// The tab was closed mid-stream (pre-existing Task 6 round 1 Issue 2
+    /// guard) — nothing to retrigger against.
+    SkipClosed,
+}
+
+/// Pure decision function for the `QueryEvent::Finished` handler's
+/// `pending_join_retrigger` dispatch. `dirty_change_count` is
+/// `AppView::grid_dirty_change_count`'s result for the retrigger's tab —
+/// `Some(_)` (never `Some(0)`, see that function's doc comment) means dirty.
+fn decide_retrigger_action(tab_open: bool, dirty_change_count: Option<usize>) -> RetriggerAction {
+    if !tab_open {
+        RetriggerAction::SkipClosed
+    } else if dirty_change_count.is_some() {
+        RetriggerAction::SkipDirty
+    } else {
+        RetriggerAction::Run
+    }
+}
+
 /// Set by `TreeEvent::OpenPreview` and threaded through `run_query_with` so
 /// a preview runs through the exact same guarded pipeline as an
 /// editor-typed query, without ever touching `self.sql`'s text: `title`
@@ -375,6 +414,14 @@ struct ApplyDialogState {
     /// "re-run the preview, existing pipeline") without re-reading grid
     /// state after `clear_edits` has already run.
     preview_identity: (Option<String>, String),
+    /// G5 Task 4 review fix (BLOCKER 1): the tab's `ResultTab::conn_identity`
+    /// at dialog-open time — `on_confirm_apply` re-checks this against
+    /// `AppView::current_conn_identity()` before dispatching (belt-and-
+    /// braces alongside `on_open_apply_dialog`'s own check and the
+    /// apply-bar's disabled button: the dialog's `.occlude()` should make a
+    /// connection switch impossible while it's open, but this is the
+    /// backstop if that assumption is ever wrong).
+    conn_identity: String,
     /// True while `run_write_transaction` is in flight (brief contract #3:
     /// "aplikuji…", buttons disabled).
     running: bool,
@@ -382,6 +429,15 @@ struct ApplyDialogState {
     /// #4: edits stay staged); cleared on a fresh "Potvrdit a spustit"
     /// retry.
     error: Option<String>,
+    /// G5 Task 4 review fix (MINOR 4): captured once at open time so
+    /// `on_open_apply_dialog` can `window.focus` it in the SAME update the
+    /// overlay appears in (same convention `render_palette_overlay`'s/the
+    /// connection dialogs' own `TextField` focus already follow) and
+    /// `render_apply_dialog_overlay` can `.track_focus` the panel with the
+    /// SAME handle — without this, focus stays on the SQL editor
+    /// underneath, and a stray Enter/keystroke while the dialog is open
+    /// would land there instead of being inert.
+    focus_handle: gpui::FocusHandle,
 }
 
 /// G5 Task 4 (folded T3 review issue 2 — dirty guard): the action
@@ -417,6 +473,12 @@ enum PendingDiscard {
 /// `Tabs::close_by_preview_key` before opening the fresh one), and the tab
 /// strip's "✕" (`Tabs::close`). "Zrušit" aborts the action outright — no
 /// query runs, no tab closes — via `on_discard_confirm_no`.
+///
+/// KNOWN GAP (T4 review round 1 NIT, not fixed here — pre-existing app-wide
+/// behaviour): closing the whole app window/quitting while a preview tab is
+/// dirty has NO equivalent guard — staged edits are simply lost, same as
+/// they always were before this dirty-guard existed for in-app actions.
+/// Only in-app actions that would silently replace/close a TAB are covered.
 struct DiscardConfirmState {
     /// Row-granular staged-change count (brief: "Neuložené změny ({n})").
     change_count: usize,
@@ -555,6 +617,25 @@ fn conn_spec_key(spec: &ConnectSpec) -> String {
         ConnectSpec::Config { cfg, .. } => format!("cfg:{}", cfg.id),
         ConnectSpec::Url(u) => format!("url:{u}"),
     }
+}
+
+/// G5 Task 4 review fix (BLOCKER 1): sentinel `ResultTab::conn_identity`/
+/// `AppView::current_conn_identity` use for the CLI-arg back-compat path
+/// (no saved `ConnectionConfig`, hence no stable id to use instead).
+const CLI_CONN_IDENTITY: &str = "cli";
+
+/// G5 Task 4 review fix (BLOCKER 1): pure decision behind the Apply flow's
+/// connection-identity guard — `true` when it is safe to apply `tab`'s
+/// staged edits against the connection identified by `current`. Trivial by
+/// design (a plain equality check on two pre-resolved identity strings) —
+/// pulled out as a named, independently testable function rather than an
+/// inline `==` at each of the three call sites (`on_open_apply_dialog`,
+/// `on_confirm_apply`, `render_apply_bar`) so a future change to the
+/// comparison rule (e.g. treating a deleted-then-recreated connection with
+/// the same id specially) has one place to land, and so the guard's
+/// intent is documented once instead of three times.
+fn conn_identity_matches(tab_identity: &str, current: &str) -> bool {
+    tab_identity == current
 }
 
 impl AppView {
@@ -701,6 +782,11 @@ impl AppView {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let history_conn_name = self.active_connection_name_for_history();
+        // G5 Task 4 review fix (BLOCKER 1): stamped onto the freshly-opened
+        // tab (`Started`, below) so the Apply flow can later tell whether
+        // the active connection has since changed out from under it — see
+        // `current_conn_identity`'s doc comment.
+        let conn_identity = self.current_conn_identity();
         let mut rx = self.runner.connect_and_run(spec, sql, cancel, timeout_secs);
         cx.spawn(async move |this, cx| {
             let mut buffer: Option<Rc<RefCell<ResultBuffer>>> = None;
@@ -852,6 +938,8 @@ impl AppView {
                                     title,
                                     pinned: false,
                                     preview_key: preview.as_ref().map(|p| p.key.clone()),
+                                    // G5 Task 4 review fix (BLOCKER 1).
+                                    conn_identity: conn_identity.clone(),
                                     content: TabContent::Grid { grid, buffer: buf },
                                 });
                                 tab_id = Some(id);
@@ -1001,15 +1089,33 @@ impl AppView {
                                 // closed.
                                 if errored.is_none() {
                                     if let Some(pt) = pending_join_retrigger.take() {
-                                        let tab_still_open = tab_id
-                                            .is_some_and(|id| view.tabs.iter().any(|t| t.id == id));
-                                        if tab_still_open {
-                                            let sql = fk_join::build_join_sql(
-                                                pt.schema.as_deref(),
-                                                &pt.table,
-                                                &pt.joins,
-                                            );
-                                            view.run_query_with(sql, Some(pt), true, cx);
+                                        let tab = tab_id
+                                            .and_then(|id| view.tabs.iter().find(|t| t.id == id));
+                                        let tab_still_open = tab.is_some();
+                                        // G5 Task 4 review fix (MAJOR 3): a
+                                        // dirty tab must not have its grid
+                                        // entity (and staged EditState)
+                                        // silently replaced by this
+                                        // retrigger — see
+                                        // `decide_retrigger_action`'s doc
+                                        // comment.
+                                        let dirty = tab
+                                            .and_then(|t| AppView::grid_dirty_change_count(t, cx));
+                                        match decide_retrigger_action(tab_still_open, dirty) {
+                                            RetriggerAction::Run => {
+                                                let sql = fk_join::build_join_sql(
+                                                    pt.schema.as_deref(),
+                                                    &pt.table,
+                                                    &pt.joins,
+                                                );
+                                                view.run_query_with(sql, Some(pt), true, cx);
+                                            }
+                                            RetriggerAction::SkipDirty => {
+                                                view.status =
+                                                    "FK joins neaktualizovány — máš rozpracované změny"
+                                                        .to_string();
+                                            }
+                                            RetriggerAction::SkipClosed => {}
                                         }
                                     }
                                 }
@@ -1960,6 +2066,35 @@ impl AppView {
     /// (`detect_editable_pk`), so the apply bar/dialog can't even be reached
     /// through one — `run_write_transaction` hard-refuses again regardless
     /// (belt-and-braces, brief contract #5).
+    /// G5 Task 4 review fix (BLOCKER 1): the identity stamped onto every
+    /// freshly-opened `ResultTab::conn_identity` — `active_connection_id`
+    /// when a saved connection is active, else the CLI-arg sentinel. Unlike
+    /// `active_connection_name_for_history` (which resolves to a NAME, and
+    /// collapses "connection since deleted" into the same `"cli"` bucket as
+    /// the real CLI path), this is the raw, stable id — a connection can be
+    /// renamed without invalidating a tab's stamped identity, which a
+    /// name-based comparison would get wrong.
+    fn current_conn_identity(&self) -> String {
+        self.active_connection_id.clone().unwrap_or_else(|| CLI_CONN_IDENTITY.to_string())
+    }
+
+    /// Human-readable name for a `ResultTab::conn_identity` value — used
+    /// only in the Apply flow's mismatch error text ("changes came from
+    /// connection X"). Falls back to the raw identity string itself if the
+    /// connection has since been deleted (rare, but must never panic or
+    /// silently say "cli" for a real connection that's simply gone).
+    fn conn_name_for_identity(&self, identity: &str) -> String {
+        if identity == CLI_CONN_IDENTITY {
+            return "cli".to_string();
+        }
+        self.config
+            .connections
+            .iter()
+            .find(|c| c.id == identity)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| identity.to_string())
+    }
+
     fn apply_conn_spec(&self) -> Option<(ConnectSpec, Option<u64>)> {
         if let Some(id) = self.active_connection_id.clone() {
             let cfg = self.config.connections.iter().find(|c| c.id == id)?.clone();
@@ -1977,15 +2112,37 @@ impl AppView {
     /// active tab, it isn't a `Grid` tab, it isn't `editable`, or (shouldn't
     /// happen — the apply bar only renders when dirty, but checked
     /// defensively) it generates zero statements.
-    fn on_open_apply_dialog(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// G5 Task 4 review fix (BLOCKER 1): also refuses — with a clear Czech
+    /// status message, never silently — when the tab's stamped
+    /// `conn_identity` no longer matches the CURRENTLY active connection
+    /// (belt-and-braces: the apply bar's own "Aplikovat" is already
+    /// disabled in that state, see `render_apply_bar`, but this is reachable
+    /// defensively too).
+    ///
+    /// G5 Task 4 review fix (MINOR 4): closes any open cell editor on this
+    /// grid first (stale residue otherwise sits underneath the dialog and
+    /// reappears when it's cancelled) and moves keyboard focus onto the
+    /// dialog panel itself in this SAME update, via `window`.
+    fn on_open_apply_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal.is_some() || self.discard_confirm.is_some() || self.apply_dialog.is_some() {
             return;
         }
         let Some(active) = self.tabs.active() else { return };
-        let (tab_id, grid) = match &active.content {
-            TabContent::Grid { grid, .. } => (active.id, grid.clone()),
+        let (tab_id, tab_conn_identity, grid) = match &active.content {
+            TabContent::Grid { grid, .. } => (active.id, active.conn_identity.clone(), grid.clone()),
             TabContent::Text { .. } => return,
         };
+        let current_identity = self.current_conn_identity();
+        if !conn_identity_matches(&tab_conn_identity, &current_identity) {
+            let from = self.conn_name_for_identity(&tab_conn_identity);
+            self.status = format!("změny pocházejí z jiného připojení ({from}) — přepni se zpět");
+            cx.notify();
+            return;
+        }
+        grid.update(cx, |g, _| {
+            g.close_overlay_if_open();
+        });
         let (statements, preview_identity) = {
             let g = grid.read(cx);
             let Some(editable) = g.editable.clone() else { return };
@@ -2012,14 +2169,18 @@ impl AppView {
             return;
         }
         let sql_text = statements.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("\n");
+        let focus_handle = cx.focus_handle();
         self.apply_dialog = Some(ApplyDialogState {
             tab_id,
             statements,
             sql_text,
             preview_identity,
+            conn_identity: tab_conn_identity,
             running: false,
             error: None,
+            focus_handle: focus_handle.clone(),
         });
+        window.focus(&focus_handle, cx);
         cx.notify();
     }
 
@@ -2028,6 +2189,15 @@ impl AppView {
     /// `statements` and reacts to the outcome. Re-clickable after a failure
     /// (brief contract #4: the dialog stays open showing the error) — a
     /// retry just re-dispatches the same statements.
+    ///
+    /// G5 Task 4 review fix (BLOCKER 1): re-checks `ad.conn_identity` against
+    /// the CURRENTLY active connection before dispatching — belt-and-braces
+    /// alongside `on_open_apply_dialog`'s own check (the dialog's
+    /// `.occlude()` should make switching connections while it's open
+    /// impossible, but this is the backstop if that's ever wrong). A
+    /// mismatch surfaces as `ad.error` (dialog stays open, same shape as any
+    /// other Apply failure) rather than silently running against the wrong
+    /// connection.
     fn on_confirm_apply(&mut self, cx: &mut Context<Self>) {
         let Some(ad) = &self.apply_dialog else { return };
         if ad.running {
@@ -2037,7 +2207,19 @@ impl AppView {
         let sql_text = ad.sql_text.clone();
         let tab_id = ad.tab_id;
         let preview_identity = ad.preview_identity.clone();
+        let dialog_conn_identity = ad.conn_identity.clone();
         let n_statements = statements.len();
+
+        let current_identity = self.current_conn_identity();
+        if !conn_identity_matches(&dialog_conn_identity, &current_identity) {
+            let from = self.conn_name_for_identity(&dialog_conn_identity);
+            if let Some(ad) = &mut self.apply_dialog {
+                ad.error =
+                    Some(format!("změny pocházejí z jiného připojení ({from}) — přepni se zpět"));
+            }
+            cx.notify();
+            return;
+        }
 
         let Some((spec, timeout_secs)) = self.apply_conn_spec() else {
             if let Some(ad) = &mut self.apply_dialog {
@@ -2216,6 +2398,9 @@ impl AppView {
                     title: format!("DDL: {title}"),
                     pinned: false,
                     preview_key: None,
+                    // Never editable/Grid — the identity is inert here, but
+                    // every `ResultTab` needs a value (see its doc comment).
+                    conn_identity: self.current_conn_identity(),
                     content: TabContent::Text { text: ddl.clone(), scroll_lines: 0 },
                 });
                 self.status = format!("DDL otevřeno: {title}");
@@ -2423,6 +2608,14 @@ impl AppView {
     /// G5 Task 4, brief contract #1: apply bar above the status bar
     /// ("{n} změn · Aplikovat · Zahodit") — `None` (renders nothing) unless
     /// the ACTIVE tab is a `Grid` tab with staged edits.
+    ///
+    /// G5 Task 4 review fix (BLOCKER 1): when the tab's stamped
+    /// `conn_identity` no longer matches the currently active connection
+    /// (staged the edits on connection A, switched to B), "Aplikovat" is
+    /// rendered WITHOUT `cursor_pointer`/`on_click` (visually disabled, dim
+    /// text) plus an inline hint — the bar itself stays visible/dirty-count
+    /// accurate (brief: "bar can stay visible with the hint") since
+    /// "Zahodit" is still a legitimate, safe action in this state.
     fn render_apply_bar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let active = self.tabs.active()?;
         let TabContent::Grid { grid, .. } = &active.content else { return None };
@@ -2430,6 +2623,8 @@ impl AppView {
         if n == 0 {
             return None;
         }
+        let identity_ok =
+            conn_identity_matches(&active.conn_identity, &self.current_conn_identity());
         let grid_for_discard = grid.clone();
         Some(
             div()
@@ -2446,14 +2641,25 @@ impl AppView {
                 .child(
                     div()
                         .id("apply-bar-apply")
-                        .cursor_pointer()
+                        .when(identity_ok, |d| {
+                            d.cursor_pointer()
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.on_open_apply_dialog(window, cx)
+                                }))
+                        })
                         .px_2()
                         .rounded_md()
                         .bg(rgb(0x45475a))
-                        .text_color(rgb(0xa6e3a1))
-                        .child("Aplikovat")
-                        .on_click(cx.listener(|view, _, _, cx| view.on_open_apply_dialog(cx))),
+                        .text_color(if identity_ok { rgb(0xa6e3a1) } else { rgb(0x6c7086) })
+                        .child("Aplikovat"),
                 )
+                .when(!identity_ok, |d| {
+                    d.child(
+                        div()
+                            .text_color(rgb(0x6c7086))
+                            .child("(jiné připojení — přepni se zpět)"),
+                    )
+                })
                 .child(
                     div()
                         .id("apply-bar-discard")
@@ -2556,6 +2762,7 @@ impl AppView {
         let ad = self.apply_dialog.as_ref()?;
         let running = ad.running;
         let error = ad.error.clone();
+        let focus_handle = ad.focus_handle.clone();
         let lines: Vec<String> = ad.statements.iter().map(|(s, _)| s.clone()).collect();
 
         let mut body = div()
@@ -2575,6 +2782,11 @@ impl AppView {
 
         let mut panel = div()
             .id("apply-dialog-panel")
+            // G5 Task 4 review fix (MINOR 4): same handle
+            // `on_open_apply_dialog` moved `window` focus onto — keeps
+            // keyboard focus off the SQL editor underneath while the dialog
+            // is open.
+            .track_focus(&focus_handle)
             .w(px(640.))
             .max_h(px(480.))
             .bg(rgb(0x1e1e2e))
@@ -3251,5 +3463,54 @@ mod decide_join_pref_action_tests {
             decide_join_pref_action(false, true, false),
             JoinPrefAction::Nothing
         );
+    }
+}
+
+// G5 Task 4 review fix (BLOCKER 1): `conn_identity_matches` — the pure
+// decision behind the Apply flow's connection-identity guard.
+#[cfg(test)]
+mod conn_identity_matches_tests {
+    use super::*;
+
+    #[test]
+    fn matches_when_identities_are_equal() {
+        assert!(conn_identity_matches("conn-a", "conn-a"));
+        assert!(conn_identity_matches(CLI_CONN_IDENTITY, CLI_CONN_IDENTITY));
+    }
+
+    #[test]
+    fn does_not_match_when_identities_differ() {
+        assert!(!conn_identity_matches("conn-a", "conn-b"));
+        // Switched from a saved connection to the CLI-arg path (or vice
+        // versa) is also a mismatch — never conflate the two.
+        assert!(!conn_identity_matches("conn-a", CLI_CONN_IDENTITY));
+        assert!(!conn_identity_matches(CLI_CONN_IDENTITY, "conn-a"));
+    }
+}
+
+// G5 Task 4 review fix (MAJOR 3): `decide_retrigger_action` — the pure
+// decision behind the saved-fk-join auto-retrigger's dirty-skip guard.
+#[cfg(test)]
+mod decide_retrigger_action_tests {
+    use super::*;
+
+    #[test]
+    fn runs_when_tab_open_and_clean() {
+        assert_eq!(decide_retrigger_action(true, None), RetriggerAction::Run);
+    }
+
+    #[test]
+    fn skips_dirty_when_tab_open_but_has_staged_changes() {
+        assert_eq!(decide_retrigger_action(true, Some(1)), RetriggerAction::SkipDirty);
+        assert_eq!(decide_retrigger_action(true, Some(3)), RetriggerAction::SkipDirty);
+    }
+
+    #[test]
+    fn skips_closed_when_tab_no_longer_open_regardless_of_dirty() {
+        // Closed-tab takes priority: there is genuinely nothing to
+        // retrigger against either way, and a closed tab can't report a
+        // dirty count in practice, but the guard shouldn't depend on that.
+        assert_eq!(decide_retrigger_action(false, None), RetriggerAction::SkipClosed);
+        assert_eq!(decide_retrigger_action(false, Some(1)), RetriggerAction::SkipClosed);
     }
 }

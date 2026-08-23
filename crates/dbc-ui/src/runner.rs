@@ -297,6 +297,14 @@ pub fn affected_mismatch(expected: Option<u64>, reported: u64) -> bool {
 /// doc comment ("dropping the connection aborts the transaction server-side
 /// on both engines" is the real backstop, this is best-effort).
 ///
+/// `cancel` is threaded through to EVERY `execute()` call in the sequence
+/// (T4 review round 1, MAJOR 2) — `drive_write_sequence_bounded` cancels
+/// this SAME token when its outer timeout fires, and — since T4 review round
+/// 1 also gave `PostgresConnection::execute` the same protocol-level cancel
+/// watcher `query()` already has — that reaches the backend for real on
+/// Postgres, instead of merely being checked once before dispatch (sqlite's
+/// pre-existing "no mid-statement interrupt — statements are tiny" design).
+///
 /// Kept generic over `&mut dyn Connection` (not `ConnectSpec`/`open_spec`)
 /// so it's testable by driving it directly over a `dbc-driver-sqlite`
 /// connection opened via `crate::connect::open` against a temp file — no
@@ -306,8 +314,8 @@ pub fn affected_mismatch(expected: Option<u64>, reported: u64) -> bool {
 async fn drive_write_sequence(
     conn: &mut dyn Connection,
     statements: &[(String, Option<u64>)],
+    cancel: CancelToken,
 ) -> Result<u64, QueryError> {
-    let cancel = CancelToken::new();
     if let Err(e) = conn.execute("BEGIN", cancel.clone()).await {
         let _ = conn.execute("ROLLBACK", cancel.clone()).await;
         return Err(e);
@@ -335,9 +343,78 @@ async fn drive_write_sequence(
     Ok(total)
 }
 
-/// G5 Task 4: `run_write_transaction`'s async body — guard, open, drive,
-/// (optionally) time-bound. See `run_write_transaction`'s doc comment for
-/// the connection-lifetime/decoupling rationale.
+/// T4 review round 1, MAJOR 2: bound on the post-timeout ROLLBACK attempt
+/// below — independent of, and much shorter than, `timeout_secs` itself.
+/// Without this, a ROLLBACK that itself never resolves (e.g. queued behind a
+/// statement still "in flight" server-side — see `drive_write_sequence_bounded`'s
+/// doc comment) would make `run_write_transaction` hang FOREVER: the
+/// `oneshot::Receiver` it returns never resolves, the Apply dialog's
+/// `running` flag is stuck `true`, and even Esc is disabled (per
+/// `AppView::on_cancel_query`'s "no cancellation support while running"
+/// guard) — a fully wedged UI. This constant guarantees the function ALWAYS
+/// returns within `timeout_secs + ROLLBACK_GRACE_SECS`, no exceptions.
+const ROLLBACK_GRACE_SECS: u64 = 5;
+
+/// G5 Task 4: runs `drive_write_sequence` bounded by `timeout_secs` — races
+/// it with `tokio::time::timeout`, and on expiry cancels `cancel` (reaching
+/// the backend for real on Postgres, see `drive_write_sequence`'s doc
+/// comment) and attempts a best-effort ROLLBACK.
+///
+/// T4 review round 1, MAJOR 2 (both parts, this function is where they
+/// meet): (a) that ROLLBACK attempt is ITSELF wrapped in a short
+/// `ROLLBACK_GRACE_SECS` timeout — on ITS expiry this function still returns
+/// the timeout error immediately rather than continuing to wait, tolerating
+/// the ROLLBACK's own failure exactly like `drive_write_sequence` already
+/// tolerates one; the caller-owned `conn` is dropped once this function
+/// returns either way, which aborts the transaction server-side on both
+/// engines regardless of whether the explicit ROLLBACK ever completed
+/// (`Connection::execute`'s doc comment) — so THIS function's return is
+/// unconditionally bounded even in the worst case where nothing else
+/// worked. (b) `cancel.cancel()` fires before the ROLLBACK attempt, over the
+/// SAME token every statement's `execute()` call received, so a Postgres
+/// backend genuinely gets asked to abort whatever statement was still
+/// running when the outer timeout fired — see `drive_write_sequence`'s doc
+/// comment and `dbc-driver-postgres`'s `execute()`.
+///
+/// Extracted as its own function — separate from `run_write_transaction_inner`
+/// — so the "always returns, even when the connection's ROLLBACK hangs"
+/// property is directly testable against a mock `Connection` (no live
+/// Postgres, no `ConnectSpec`/`open_spec` needed).
+async fn drive_write_sequence_bounded(
+    conn: &mut dyn Connection,
+    statements: &[(String, Option<u64>)],
+    cancel: CancelToken,
+    timeout_secs: Option<u64>,
+) -> Result<u64, QueryError> {
+    match timeout_secs {
+        Some(t) => {
+            let sequence = drive_write_sequence(conn, statements, cancel.clone());
+            match tokio::time::timeout(Duration::from_secs(t), sequence).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    // (b): ask the backend itself to abort whatever
+                    // statement was still in flight — see this function's
+                    // doc comment.
+                    cancel.cancel();
+                    // (a): bounded best-effort rollback — see this
+                    // function's doc comment for why this must NOT be
+                    // allowed to hang the whole function.
+                    let rollback = conn.execute("ROLLBACK", CancelToken::new());
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(ROLLBACK_GRACE_SECS), rollback)
+                            .await;
+                    Err(QueryError::msg(format!("[timeout] aplikace překročila {t}s")))
+                }
+            }
+        }
+        None => drive_write_sequence(conn, statements, cancel).await,
+    }
+}
+
+/// G5 Task 4: `run_write_transaction`'s async body — guard, open, drive
+/// (bounded). See `run_write_transaction`'s doc comment for the
+/// connection-lifetime/decoupling rationale, and `drive_write_sequence_bounded`
+/// for the timeout/cancel/rollback mechanics.
 async fn run_write_transaction_inner(
     spec: ConnectSpec,
     statements: Vec<(String, Option<u64>)>,
@@ -346,44 +423,11 @@ async fn run_write_transaction_inner(
 ) -> Result<u64, QueryError> {
     guard_not_read_only(spec_is_read_only(&spec))?;
     let mut opened = open_spec(spec, handle).await?;
-    match timeout_secs {
-        Some(t) => {
-            let sequence = drive_write_sequence(&mut *opened.conn, &statements);
-            match tokio::time::timeout(Duration::from_secs(t), sequence).await {
-                Ok(result) => result,
-                Err(_elapsed) => {
-                    // Best-effort rollback (brief: "on timeout attempt
-                    // ROLLBACK"), tolerated if it fails.
-                    //
-                    // Caveat, honestly flagged rather than hidden: the T1
-                    // sqlite driver's `execute` design note says "no
-                    // mid-statement interrupt needed for v1 — statements are
-                    // tiny" — it takes its persistent connection out of
-                    // `self.exec_conn` for the duration of one call and puts
-                    // it back only after that call's future resolves. If
-                    // THIS timeout fires while a statement's `execute()` is
-                    // still in flight, dropping `sequence` above (which
-                    // `tokio::time::timeout` does internally on the timeout
-                    // branch) can leave `exec_conn` reset to `None`, so this
-                    // ROLLBACK may run over a FRESH underlying handle with
-                    // nothing to roll back (a harmless no-op/error, still
-                    // tolerated) rather than the one with the open
-                    // transaction. That abandoned handle's own transaction
-                    // is still aborted once its connection object is
-                    // dropped at the end of the now-orphaned blocking
-                    // closure — the same "dropping aborts server-side"
-                    // backstop `Connection::execute`'s doc comment relies on
-                    // — so correctness doesn't depend on this ROLLBACK
-                    // landing on the right handle, only on `opened` being
-                    // dropped (which happens unconditionally when this
-                    // function returns).
-                    let _ = opened.conn.execute("ROLLBACK", CancelToken::new()).await;
-                    Err(QueryError::msg(format!("[timeout] aplikace překročila {t}s")))
-                }
-            }
-        }
-        None => drive_write_sequence(&mut *opened.conn, &statements).await,
-    }
+    let cancel = CancelToken::new();
+    drive_write_sequence_bounded(&mut *opened.conn, &statements, cancel, timeout_secs).await
+    // `opened` (connection + tunnel) drops here unconditionally, tearing the
+    // connection down — the ultimate backstop regardless of how the write
+    // sequence above resolved.
 }
 
 /// Defensive cap on materialized lookup rows — see `QueryRunner::fetch_lookup`.
@@ -595,7 +639,7 @@ mod write_transaction_tests {
             ("UPDATE t SET name = 'b' WHERE id = 1".to_string(), Some(1)),
             ("INSERT INTO t(id, name) VALUES (2, 'c')".to_string(), None),
         ];
-        let total = drive_write_sequence(&mut *conn, &stmts).await.unwrap();
+        let total = drive_write_sequence(&mut *conn, &stmts, CancelToken::new()).await.unwrap();
         // 1 (the UPDATE's reported affected rows) + 1 (the INSERT's, even
         // though INSERT carries no expectation — the driver still reports
         // it, and it still counts toward the total).
@@ -620,7 +664,7 @@ mod write_transaction_tests {
             ("UPDATE t SET name = 'b' WHERE id = 1".to_string(), Some(1)),
             ("UPDATE t SET name = 'z' WHERE id = 1".to_string(), Some(2)),
         ];
-        let err = drive_write_sequence(&mut *conn, &stmts).await.unwrap_err();
+        let err = drive_write_sequence(&mut *conn, &stmts, CancelToken::new()).await.unwrap_err();
         assert_eq!(err.message, AFFECTED_MISMATCH_MSG);
 
         assert_eq!(read_one(&mut *conn, "SELECT name FROM t WHERE id = 1").await, Some("a".to_string()));
@@ -640,7 +684,7 @@ mod write_transaction_tests {
             ("UPDATE t SET name = 'b' WHERE id = 1".to_string(), Some(1)),
             ("UPDATE no_such_table SET name = 'x'".to_string(), None),
         ];
-        let err = drive_write_sequence(&mut *conn, &stmts).await.unwrap_err();
+        let err = drive_write_sequence(&mut *conn, &stmts, CancelToken::new()).await.unwrap_err();
         assert_ne!(err.message, AFFECTED_MISMATCH_MSG);
 
         assert_eq!(read_one(&mut *conn, "SELECT name FROM t WHERE id = 1").await, Some("a".to_string()));
@@ -650,7 +694,7 @@ mod write_transaction_tests {
     async fn drive_write_sequence_empty_statements_still_begins_and_commits() {
         let (_f, mut conn) = open_sqlite_test_conn().await;
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", CancelToken::new()).await.unwrap();
-        let total = drive_write_sequence(&mut *conn, &[]).await.unwrap();
+        let total = drive_write_sequence(&mut *conn, &[], CancelToken::new()).await.unwrap();
         assert_eq!(total, 0);
     }
 
@@ -687,5 +731,86 @@ mod write_transaction_tests {
         let handle = tokio::runtime::Handle::current();
         let err = run_write_transaction_inner(spec, Vec::new(), None, handle).await.unwrap_err();
         assert!(!err.message.is_empty());
+    }
+
+    /// T4 review round 1, MAJOR 2: a mock `Connection` whose `execute()`
+    /// calls never resolve on their own (`ROLLBACK` included) — simulates a
+    /// Postgres backend still busy with a statement that was "in flight"
+    /// when the outer timeout fired, the exact scenario that could
+    /// previously make `run_write_transaction` hang forever. `query()`/
+    /// `schema()` aren't exercised by this test; they return an error rather
+    /// than panicking if something unexpectedly calls them.
+    struct HangingConnection {
+        rollback_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for HangingConnection {
+        async fn query(
+            &mut self,
+            _sql: &str,
+            _cancel: CancelToken,
+        ) -> Result<dbc_core::QueryStream, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn execute(&mut self, sql: &str, _cancel: CancelToken) -> Result<u64, QueryError> {
+            if sql == "BEGIN" {
+                return Ok(0);
+            }
+            if sql == "ROLLBACK" {
+                self.rollback_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            // Never resolves on its own — only a surrounding timeout (in
+            // `drive_write_sequence_bounded`) can end this call.
+            tokio::time::sleep(Duration::from_secs(9_999)).await;
+            unreachable!("must be bounded by drive_write_sequence_bounded's own timeouts");
+        }
+    }
+
+    /// T4 review round 1, MAJOR 2 (both parts): proves
+    /// `drive_write_sequence_bounded` ALWAYS returns — within
+    /// `timeout_secs + ROLLBACK_GRACE_SECS` — even when the statement AND
+    /// the post-timeout ROLLBACK attempt both hang on the underlying
+    /// connection, and that the `cancel` token threaded through every
+    /// `execute()` call is actually cancelled once the outer timeout fires
+    /// (part (b) — what makes `dbc-driver-postgres`'s new cancel watcher
+    /// reachable). Runs under a paused/virtual clock
+    /// (`#[tokio::test(start_paused = true)]`, `tokio` `test-util` dev-dep
+    /// feature) so the test completes near-instantly in real wall-clock
+    /// time while still exercising the genuine timeout/grace-period
+    /// durations.
+    #[tokio::test(start_paused = true)]
+    async fn drive_write_sequence_bounded_always_returns_even_when_rollback_hangs() {
+        let rollback_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut conn = HangingConnection { rollback_calls: rollback_calls.clone() };
+        let stmts = vec![("UPDATE t SET x = 1 WHERE id = 1".to_string(), Some(1))];
+        let cancel = CancelToken::new();
+
+        let start = tokio::time::Instant::now();
+        let result =
+            drive_write_sequence_bounded(&mut conn, &stmts, cancel.clone(), Some(1)).await;
+        let elapsed = start.elapsed();
+
+        let err = result.unwrap_err();
+        assert!(err.message.contains("timeout"), "unexpected error: {}", err.message);
+        // Bounded by timeout_secs (1s) + ROLLBACK_GRACE_SECS (5s) — NOT by
+        // the connection's simulated 9999s hang on either call.
+        assert!(
+            elapsed <= Duration::from_secs(1 + ROLLBACK_GRACE_SECS + 1),
+            "took {elapsed:?}, should have been bounded"
+        );
+        assert_eq!(
+            rollback_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "ROLLBACK must still be attempted exactly once after the outer timeout fires"
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "the SAME cancel token threaded through every execute() call must be cancelled on \
+             timeout — this is what reaches the backend for real on Postgres (part (b) of the fix)"
+        );
     }
 }

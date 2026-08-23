@@ -51,6 +51,19 @@ pub struct ResultTab {
     /// `close_by_preview_key` find and replace an existing preview for the
     /// same table instead of stacking a duplicate (brief contract #1).
     pub preview_key: Option<String>,
+    /// G5 Task 4 review fix (BLOCKER 1): the connection identity (`main.rs::
+    /// AppView::current_conn_identity` — `active_connection_id`, or the
+    /// CLI-arg sentinel) THIS tab's data was fetched from, stamped once at
+    /// open time. The Apply flow refuses to touch a tab's staged edits once
+    /// this no longer matches the CURRENTLY active identity (switching
+    /// connections after staging edits on a preview must never let
+    /// "Aplikovat" run those edits' PK-based statements against a
+    /// DIFFERENT, currently-active connection/database) — see
+    /// `AppView::conn_identity_matches` and its call sites
+    /// (`on_open_apply_dialog`/`on_confirm_apply`/`render_apply_bar`).
+    /// Meaningless (but always present, for a uniform `ResultTab` shape) on
+    /// a non-editable/`Text` tab.
+    pub conn_identity: String,
     pub content: TabContent,
 }
 
@@ -184,6 +197,7 @@ mod tests {
             title: "t".into(),
             pinned,
             preview_key: None,
+            conn_identity: "conn-a".into(),
             content: TabContent::Text { text: String::new(), scroll_lines: 0 },
         }
     }
@@ -194,6 +208,7 @@ mod tests {
             title: format!("Náhled: {key}"),
             pinned: false,
             preview_key: Some(key.to_string()),
+            conn_identity: "conn-a".into(),
             content: TabContent::Text { text: String::new(), scroll_lines: 0 },
         }
     }
@@ -320,5 +335,19 @@ mod tests {
         let a = tabs.open(text_tab(false));
         tabs.close_by_preview_key("nope");
         assert!(tabs.iter().any(|t| t.id == a));
+    }
+
+    // G5 Task 4 review fix (BLOCKER 1): `Tabs::open` must not touch/drop
+    // `conn_identity` — the Apply flow's connection-identity guard depends on
+    // it surviving exactly as stamped, unmodified by tab-cap eviction, id
+    // assignment, or activation bookkeeping.
+    #[test]
+    fn conn_identity_survives_open_and_is_readable_off_the_tab() {
+        let mut tabs = Tabs::new();
+        let mut tab = text_tab(false);
+        tab.conn_identity = "conn-B-id".to_string();
+        let id = tabs.open(tab);
+        let found = tabs.iter().find(|t| t.id == id).expect("tab just opened");
+        assert_eq!(found.conn_identity, "conn-B-id");
     }
 }

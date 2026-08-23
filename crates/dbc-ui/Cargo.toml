@@ -18,3 +18,9 @@ dirs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+async-trait.workspace = true
+# T4 review round 1, MAJOR 2: unions with the main `tokio.workspace = true`
+# dependency above for test builds — lets the bounded-timeout test use a
+# paused/auto-advancing virtual clock (`#[tokio::test(start_paused = true)]`)
+# instead of actually sleeping for real wall-clock seconds.
+tokio = { version = "1", features = ["test-util"] }
