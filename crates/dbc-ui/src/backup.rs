@@ -10,6 +10,32 @@ fn sql_string_literal(s: &str) -> String {
 
 // --- Postgres argument builders -------------------------------------------
 
+/// SECURITY: libpq's `-d`/`--dbname` argument is special-cased by
+/// `pg_dump`/`pg_restore`/`psql` — if the value contains `=` (a
+/// `keyword=value` conninfo string) or looks like a `scheme://` URI, it is
+/// parsed as a FULL connection string that can override `host`/`port`/
+/// `sslmode`/etc., not merely name a database. `ConnectionConfig.database`
+/// is free-text with no validation elsewhere in this codebase, so a value
+/// like `"dbname=x host=evil.example.com sslmode=disable"` would silently
+/// redirect the spawned tool to an attacker-controlled host WHILE
+/// `PGPASSWORD` is still set on that same child process's environment —
+/// exfiltrating the real database password to the attacker's server. This
+/// function rejects any dbname that could be reinterpreted this way, fail
+/// closed, before it is ever placed into an argv. CONSIDERED AND RULED
+/// OUT: `host`/`port`/`user` are NOT exposed to this same class of
+/// injection — they are passed as their OWN separate `-h`/`-p`/`-U`
+/// arguments, and libpq's conninfo-or-URI special-case parsing applies
+/// only to the value given via `-d`/`--dbname`, never to `-h`/`-p`/`-U`.
+pub fn validate_pg_dbname(name: &str) -> Result<(), String> {
+    if name.contains('=') || name.contains("://") {
+        Err(format!(
+            "neplatný název databáze (obsahuje '=' nebo '://', což by mohlo být vyloženo jako connection string): {name}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgDumpFormat {
     Custom,
@@ -26,14 +52,18 @@ pub struct PgBackupOptions {
 /// `pg_dump -h host -p port -U user -d database --format=c|p --file=<path>
 /// [--compress=N] -v` (design §2: `-v` is what makes pg_dump emit the
 /// per-object progress lines the log pane shows). PGPASSWORD is NEVER part
-/// of this Vec — see the SECURITY test below.
+/// of this Vec — see the SECURITY test below. `cfg.database` is validated
+/// via `validate_pg_dbname` first (SECURITY: conninfo/URI injection via
+/// `-d` — see that function's doc comment); a rejected name never reaches
+/// argv.
 pub fn build_pg_dump_args(
     cfg: &ConnectionConfig,
     target_host: &str,
     target_port: u16,
     opts: &PgBackupOptions,
     out_path: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
+    validate_pg_dbname(&cfg.database)?;
     let mut args = vec![
         "-h".to_string(),
         target_host.to_string(),
@@ -56,7 +86,7 @@ pub fn build_pg_dump_args(
         args.push(format!("--compress={}", opts.compress.min(9)));
     }
     args.push("-v".to_string());
-    args
+    Ok(args)
 }
 
 #[derive(Debug, Clone)]
@@ -80,13 +110,16 @@ impl Default for PgRestoreOptions {
 
 /// `pg_restore -h host -p port -U user -d database [--clean --if-exists]
 /// [--create] [--no-owner --no-privileges] [-1] <dump_path>` — design §3.
+/// `cfg.database` is validated via `validate_pg_dbname` first (SECURITY:
+/// conninfo/URI injection via `-d` — see that function's doc comment).
 pub fn build_pg_restore_args(
     cfg: &ConnectionConfig,
     target_host: &str,
     target_port: u16,
     opts: &PgRestoreOptions,
     dump_path: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
+    validate_pg_dbname(&cfg.database)?;
     let mut args = vec![
         "-h".to_string(),
         target_host.to_string(),
@@ -112,18 +145,21 @@ pub fn build_pg_restore_args(
         args.push("-1".to_string());
     }
     args.push(dump_path.to_string());
-    args
+    Ok(args)
 }
 
 /// `psql -h host -p port -U user -d database -f <dump_path>` — plain-SQL
 /// restore, design §3 ("no equivalent transaction flag is forced").
+/// `cfg.database` is validated via `validate_pg_dbname` first (SECURITY:
+/// conninfo/URI injection via `-d` — see that function's doc comment).
 pub fn build_psql_args(
     cfg: &ConnectionConfig,
     target_host: &str,
     target_port: u16,
     dump_path: &str,
-) -> Vec<String> {
-    vec![
+) -> Result<Vec<String>, String> {
+    validate_pg_dbname(&cfg.database)?;
+    Ok(vec![
         "-h".to_string(),
         target_host.to_string(),
         "-p".to_string(),
@@ -134,7 +170,7 @@ pub fn build_psql_args(
         cfg.database.clone(),
         "-f".to_string(),
         dump_path.to_string(),
-    ]
+    ])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,7 +331,7 @@ mod pure_tests {
             format: PgDumpFormat::Custom,
             compress: 6,
         };
-        let args = build_pg_dump_args(&cfg(), "127.0.0.1", 15432, &opts, r"D:\bk\shop.backup");
+        let args = build_pg_dump_args(&cfg(), "127.0.0.1", 15432, &opts, r"D:\bk\shop.backup").unwrap();
         assert!(!args.iter().any(|a| a.contains(NASTY_PASSWORD)));
     }
 
@@ -307,13 +343,14 @@ mod pure_tests {
             15432,
             &PgRestoreOptions::default(),
             r"D:\bk\shop.backup",
-        );
+        )
+        .unwrap();
         assert!(!args.iter().any(|a| a.contains(NASTY_PASSWORD)));
     }
 
     #[test]
     fn psql_args_never_contain_the_password() {
-        let args = build_psql_args(&cfg(), "127.0.0.1", 15432, r"D:\bk\shop.sql");
+        let args = build_psql_args(&cfg(), "127.0.0.1", 15432, r"D:\bk\shop.sql").unwrap();
         assert!(!args.iter().any(|a| a.contains(NASTY_PASSWORD)));
     }
 
@@ -324,7 +361,7 @@ mod pure_tests {
             format: PgDumpFormat::Custom,
             compress: 6,
         };
-        let args = build_pg_dump_args(&cfg(), "127.0.0.1", 15432, &opts, r"D:\bk\shop.backup");
+        let args = build_pg_dump_args(&cfg(), "127.0.0.1", 15432, &opts, r"D:\bk\shop.backup").unwrap();
         assert_eq!(
             args,
             vec![
@@ -350,7 +387,7 @@ mod pure_tests {
             format: PgDumpFormat::Plain,
             compress: 6,
         };
-        let args = build_pg_dump_args(&cfg(), "127.0.0.1", 15432, &opts, r"D:\bk\shop.sql");
+        let args = build_pg_dump_args(&cfg(), "127.0.0.1", 15432, &opts, r"D:\bk\shop.sql").unwrap();
         assert!(!args.iter().any(|a| a.starts_with("--compress")));
         assert!(args.contains(&"--format=p".to_string()));
     }
@@ -361,7 +398,7 @@ mod pure_tests {
             format: PgDumpFormat::Custom,
             compress: 200,
         };
-        let args = build_pg_dump_args(&cfg(), "h", 1, &opts, "f");
+        let args = build_pg_dump_args(&cfg(), "h", 1, &opts, "f").unwrap();
         assert!(args.contains(&"--compress=9".to_string()));
     }
 
@@ -373,7 +410,8 @@ mod pure_tests {
             15432,
             &PgRestoreOptions::default(),
             r"D:\bk\shop.backup",
-        );
+        )
+        .unwrap();
         assert_eq!(
             args,
             vec![
@@ -403,7 +441,7 @@ mod pure_tests {
             no_owner_no_privileges: false,
             single_transaction: false,
         };
-        let args = build_pg_restore_args(&cfg(), "h", 1, &opts, "f.backup");
+        let args = build_pg_restore_args(&cfg(), "h", 1, &opts, "f.backup").unwrap();
         assert_eq!(
             args,
             vec!["-h", "h", "-p", "1", "-U", "alice", "-d", "shop", "f.backup"]
@@ -414,17 +452,65 @@ mod pure_tests {
     fn pg_restore_create_db_adds_flag() {
         let mut opts = PgRestoreOptions::default();
         opts.create_db = true;
-        let args = build_pg_restore_args(&cfg(), "h", 1, &opts, "f.backup");
+        let args = build_pg_restore_args(&cfg(), "h", 1, &opts, "f.backup").unwrap();
         assert!(args.contains(&"--create".to_string()));
     }
 
     #[test]
     fn psql_args_shape() {
-        let args = build_psql_args(&cfg(), "127.0.0.1", 15432, r"D:\bk\shop.sql");
+        let args = build_psql_args(&cfg(), "127.0.0.1", 15432, r"D:\bk\shop.sql").unwrap();
         assert_eq!(
             args,
             vec!["-h", "127.0.0.1", "-p", "15432", "-U", "alice", "-d", "shop", "-f", r"D:\bk\shop.sql"]
         );
+    }
+
+    // --- SECURITY: -d/--dbname conninfo/URI injection (validate_pg_dbname) ---
+    #[test]
+    fn validate_pg_dbname_rejects_the_exfiltration_probe() {
+        assert!(validate_pg_dbname("dbname=x host=evil.example.com sslmode=disable").is_err());
+    }
+
+    #[test]
+    fn validate_pg_dbname_rejects_bare_keyword_value_form() {
+        assert!(validate_pg_dbname("dbname=x").is_err());
+    }
+
+    #[test]
+    fn validate_pg_dbname_rejects_uri_form() {
+        assert!(validate_pg_dbname("postgresql://evil.example.com/x").is_err());
+        assert!(validate_pg_dbname("postgres://evil.example.com/x").is_err());
+    }
+
+    #[test]
+    fn validate_pg_dbname_accepts_normal_names() {
+        assert!(validate_pg_dbname("my_db").is_ok());
+        assert!(validate_pg_dbname("shop prod ěščř").is_ok());
+    }
+
+    #[test]
+    fn build_pg_dump_args_rejects_injectable_dbname() {
+        let mut c = cfg();
+        c.database = "dbname=x host=evil.example.com sslmode=disable".into();
+        let opts = PgBackupOptions {
+            format: PgDumpFormat::Custom,
+            compress: 6,
+        };
+        assert!(build_pg_dump_args(&c, "127.0.0.1", 15432, &opts, "f").is_err());
+    }
+
+    #[test]
+    fn build_pg_restore_args_rejects_injectable_dbname() {
+        let mut c = cfg();
+        c.database = "postgresql://evil.example.com/x".into();
+        assert!(build_pg_restore_args(&c, "127.0.0.1", 15432, &PgRestoreOptions::default(), "f").is_err());
+    }
+
+    #[test]
+    fn build_psql_args_rejects_injectable_dbname() {
+        let mut c = cfg();
+        c.database = "dbname=x".into();
+        assert!(build_psql_args(&c, "127.0.0.1", 15432, "f").is_err());
     }
 
     // --- dump format sniff ---
@@ -554,7 +640,8 @@ mod pure_tests {
                 compress: 6,
             },
             "f",
-        );
+        )
+        .unwrap();
         let line = display_command_line("pg_dump", &args, Some(NASTY_PASSWORD));
         assert!(!line.contains(NASTY_PASSWORD));
     }
