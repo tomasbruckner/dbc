@@ -3150,3 +3150,273 @@ mod backup_runner_tests {
         });
     }
 }
+
+/// G11 T5: docker + a real, locally-installed `pg_dump`/`pg_restore`
+/// required — validates T4's `run_external_tool`/`resolve_tool_path` against
+/// a live `postgres:16.13` container, end to end (tool resolution, real
+/// `ConnectionConfig`-driven arg building, PGPASSWORD-via-env, spawn, log
+/// streaming, redaction) rather than just the pure builders `backup.rs`'s
+/// own unit tests already cover. Same hazard/pattern as
+/// `monitor_pg_tests`/`compare_pg_tests` above (see those modules' doc
+/// comments for the full nested-runtime rationale, not repeated here):
+/// every test is a plain, NON-async `#[test]` driven through
+/// `runner.handle().block_on(...)`, NOT `#[tokio::test]`.
+///
+/// Local `pg_dump`/`pg_restore` install is a real prerequisite, same class
+/// of external requirement docker itself is. Unlike `resolve_tool_path`'s
+/// own unit tests (which expect a hard failure), a MISSING install here is
+/// NOT a test failure — these tests skip gracefully (an `eprintln!` note,
+/// then an early `return`) rather than panicking, since "is PostgreSQL
+/// client tools installed on this machine" is an environment fact, not a
+/// regression this suite should ever fail CI over. Run with:
+///   %USERPROFILE%\.cargo\bin\cargo.exe test -p dbc-ui -- --ignored backup_docker_tests::
+#[cfg(test)]
+mod backup_docker_tests {
+    use super::*;
+    use testcontainers_modules::{
+        postgres::Postgres,
+        testcontainers::{runners::AsyncRunner, ImageExt},
+    };
+
+    async fn pg_url(
+        node: &testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+        db: &str,
+    ) -> String {
+        format!(
+            "postgres://postgres:postgres@127.0.0.1:{}/{db}",
+            node.get_host_port_ipv4(5432).await.unwrap()
+        )
+    }
+
+    /// open_spec (NOT connect::open): see `monitor_pg_tests`'s doc comment.
+    async fn open_pg(url: &str) -> Box<dyn Connection> {
+        let handle = tokio::runtime::Handle::current();
+        open_spec(ConnectSpec::Url(url.to_string()), handle).await.expect("connect").conn
+    }
+
+    async fn create_database(default_db_url: &str, name: &str) {
+        let mut conn = open_pg(default_db_url).await;
+        conn.execute(&format!("CREATE DATABASE {name}"), CancelToken::new()).await.unwrap();
+    }
+
+    fn cfg_for(host: &str, port: u16, database: &str) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "docker-pg".into(),
+            name: "docker-pg".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Postgres,
+            host: host.into(),
+            port: Some(port),
+            database: database.into(),
+            user: "postgres".into(),
+            read_only: false,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+        }
+    }
+
+    /// Skip-gracefully helper (see module doc comment) — `None` means the
+    /// caller should log and return early rather than fail the test.
+    fn try_resolve(name: &str) -> Option<String> {
+        match resolve_tool_path(None, name) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!(
+                    "SKIP backup_docker_tests: {name} not resolvable ({e}) — install PostgreSQL client tools to run this test live"
+                );
+                None
+            }
+        }
+    }
+
+    /// Seed a live source database with known data -> real `pg_dump` (Custom
+    /// format) -> assert the dump file exists, is non-empty, sniffs as
+    /// Custom (PGDMP magic), and contains the seeded table's name in its
+    /// TOC -> real `pg_restore` into a FRESH throwaway database -> assert
+    /// the seeded rows actually roundtripped (queried back through the
+    /// restored database, not just a `Finished` event).
+    #[test]
+    #[ignore]
+    fn real_pg_dump_backup_then_pg_restore_roundtrip() {
+        let Some(pg_dump) = try_resolve("pg_dump") else { return };
+        let Some(pg_restore) = try_resolve("pg_restore") else { return };
+
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let node = Postgres::default().with_tag("16.13").start().await.unwrap();
+            let port = node.get_host_port_ipv4(5432).await.unwrap();
+            let default_url = pg_url(&node, "postgres").await;
+
+            {
+                let mut setup = open_pg(&default_url).await;
+                setup
+                    .execute("CREATE TABLE roundtrip_t (id INT PRIMARY KEY, v TEXT)", CancelToken::new())
+                    .await
+                    .unwrap();
+                setup
+                    .execute(
+                        "INSERT INTO roundtrip_t VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')",
+                        CancelToken::new(),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let cfg = cfg_for("127.0.0.1", port, "postgres");
+            let out_dir = tempfile::tempdir().unwrap();
+            let out_path = out_dir.path().join("roundtrip.backup");
+
+            let opts = backup::PgBackupOptions { format: backup::PgDumpFormat::Custom, compress: 6 };
+            let args = backup::build_pg_dump_args(
+                &cfg,
+                &cfg.host,
+                cfg.port.unwrap(),
+                &opts,
+                out_path.to_str().unwrap(),
+            )
+            .expect("dbname passes validate_pg_dbname");
+
+            let (mut rx, _handle) = runner.run_external_tool(pg_dump, args, Some("postgres".to_string()));
+            let mut finished = false;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    backup::BackupEvent::Finished => {
+                        finished = true;
+                        break;
+                    }
+                    backup::BackupEvent::Failed(m) => panic!("pg_dump failed: {m}"),
+                    backup::BackupEvent::Log(_) => {}
+                }
+            }
+            assert!(finished, "pg_dump did not report Finished");
+            assert!(out_path.is_file(), "dump file must exist");
+            let dumped = std::fs::read(&out_path).unwrap();
+            assert!(!dumped.is_empty(), "dump file must be non-empty");
+            assert_eq!(
+                backup::detect_dump_format(&dumped[..dumped.len().min(64)]),
+                backup::DumpFormat::Custom,
+                "a -Fc dump must sniff as Custom via the PGDMP magic"
+            );
+            // Custom-format archives embed their TOC entry tags (object
+            // names, including table names) as plain readable text —
+            // best-effort proof the real seeded DDL made it into the dump,
+            // not just a magic-header check.
+            let dumped_text = String::from_utf8_lossy(&dumped);
+            assert!(
+                dumped_text.contains("roundtrip_t"),
+                "dump must contain the seeded table's name in its TOC"
+            );
+
+            create_database(&default_url, "roundtrip_target").await;
+            let restore_cfg = cfg_for("127.0.0.1", port, "roundtrip_target");
+            let restore_opts = backup::PgRestoreOptions::default();
+            let restore_args = backup::build_pg_restore_args(
+                &restore_cfg,
+                &restore_cfg.host,
+                restore_cfg.port.unwrap(),
+                &restore_opts,
+                out_path.to_str().unwrap(),
+            )
+            .expect("dbname passes validate_pg_dbname");
+
+            let (mut rx2, _h2) =
+                runner.run_external_tool(pg_restore, restore_args, Some("postgres".to_string()));
+            let mut restored = false;
+            while let Some(ev) = rx2.recv().await {
+                match ev {
+                    backup::BackupEvent::Finished => {
+                        restored = true;
+                        break;
+                    }
+                    backup::BackupEvent::Failed(m) => panic!("pg_restore failed: {m}"),
+                    backup::BackupEvent::Log(_) => {}
+                }
+            }
+            assert!(restored, "pg_restore did not report Finished");
+
+            // Prove the DATA genuinely roundtripped — not just a Finished
+            // event — by querying the restored database back.
+            let target_url = pg_url(&node, "roundtrip_target").await;
+            let mut verify = open_pg(&target_url).await;
+            let mut stream = verify
+                .query("SELECT id, v FROM roundtrip_t ORDER BY id", CancelToken::new())
+                .await
+                .unwrap();
+            let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+            while let Some(item) = stream.batches.recv().await {
+                buf.push(item.unwrap()).unwrap();
+            }
+            assert_eq!(buf.row_count(), 3, "all 3 seeded rows must roundtrip");
+            assert_eq!(buf.cell_text(0, 1), "alpha");
+            assert_eq!(buf.cell_text(1, 1), "beta");
+            assert_eq!(buf.cell_text(2, 1), "gamma");
+        });
+    }
+
+    /// SECURITY REQUIRED (Global Constraints item 3): a deliberately WRONG
+    /// password against a real Postgres container makes `pg_dump` fail via
+    /// its own auth rejection — the resulting `BackupEvent::Failed`/`Log`
+    /// text must never contain the real (wrong-but-still-a-real-string)
+    /// password anywhere. A second, defense-in-depth assertion ties this
+    /// SAME live error text to the redaction mechanism directly: run
+    /// through `backup::redact_secret` (the exact function every
+    /// `run_and_stream` log line/failure message already passes through)
+    /// with the real password appended, proving that had the password
+    /// leaked into pg_dump's own stderr, it would have come back as `***`
+    /// rather than as plaintext.
+    #[test]
+    #[ignore]
+    fn wrong_password_error_never_contains_the_real_password() {
+        let Some(pg_dump) = try_resolve("pg_dump") else { return };
+
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let node = Postgres::default().with_tag("16.13").start().await.unwrap();
+            let port = node.get_host_port_ipv4(5432).await.unwrap();
+            let cfg = cfg_for("127.0.0.1", port, "postgres");
+
+            let out_dir = tempfile::tempdir().unwrap();
+            let out_path = out_dir.path().join("should_not_exist.backup");
+            let opts = backup::PgBackupOptions { format: backup::PgDumpFormat::Custom, compress: 0 };
+            let args = backup::build_pg_dump_args(
+                &cfg,
+                &cfg.host,
+                cfg.port.unwrap(),
+                &opts,
+                out_path.to_str().unwrap(),
+            )
+            .expect("dbname passes validate_pg_dbname");
+
+            const WRONG_PASSWORD: &str = "definitely-the-wrong-password-42";
+            let (mut rx, _handle) =
+                runner.run_external_tool(pg_dump, args, Some(WRONG_PASSWORD.to_string()));
+            let mut failure_text = String::new();
+            let mut saw_finished = false;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    backup::BackupEvent::Failed(m) => {
+                        failure_text = m;
+                        break;
+                    }
+                    backup::BackupEvent::Finished => {
+                        saw_finished = true;
+                        break;
+                    }
+                    backup::BackupEvent::Log(l) => failure_text.push_str(&l),
+                }
+            }
+            assert!(!saw_finished, "expected an auth failure with the wrong password, got Finished");
+            assert!(!failure_text.contains(WRONG_PASSWORD), "leaked password in: {failure_text}");
+            assert!(!out_path.exists(), "no dump file should be produced on an auth failure");
+
+            let synthetic_leak = format!("{failure_text} PGPASSWORD={WRONG_PASSWORD}");
+            let redacted = backup::redact_secret(&synthetic_leak, Some(WRONG_PASSWORD));
+            assert!(redacted.contains("***"), "redaction must substitute the secret with ***");
+            assert!(!redacted.contains(WRONG_PASSWORD), "redacted text must never contain the real secret");
+        });
+    }
+}
