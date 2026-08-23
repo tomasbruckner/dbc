@@ -1,0 +1,13 @@
+[package]
+name = "dbc-driver-mssql"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+dbc-core = { path = "../dbc-core" }
+tokio.workspace = true
+async-trait.workspace = true
+odbc-api = "29"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
