@@ -17,7 +17,10 @@ pub trait Connection: Send {
     async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError>;
 
     /// Executes a non-returning statement, reporting affected rows. This is
-    /// the app's write path — ONLY the sandbox Apply flow may call it.
+    /// the app's write path — ONLY the sandbox Apply flow and the
+    /// server-monitor's confirmed kill action (G9: `pg_terminate_backend` /
+    /// `KILL <spid>`, confirm-dialog-gated, refused on read-only
+    /// connections) may call it.
     ///
     /// Transactions are per-connection: a caller driving `BEGIN` … `COMMIT`/
     /// `ROLLBACK` MUST issue every statement in that sequence over the SAME

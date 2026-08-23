@@ -5,6 +5,9 @@ mod export;
 mod fk_join;
 mod grid;
 mod history_panel;
+mod monitor;
+mod monitor_sql;
+mod monitor_view;
 mod palette;
 #[allow(dead_code)] // consumed from T6 on; allow removed in T6
 mod plan;
@@ -1301,6 +1304,7 @@ impl AppView {
                                                 grid.update(cx, |g, _| g.on_stream_finished())
                                             }
                                             TabContent::Text { .. } => None,
+                                            TabContent::Monitor { .. } => None,
                                         }
                                     })
                                 });
@@ -1665,7 +1669,8 @@ impl AppView {
             .map(|c| palette::ConnectionSource { id: c.id.clone(), name: c.name.clone(), favourite: c.favourite })
             .collect();
 
-        palette::rank_items(query, &tables, &history, &connections, 30)
+        let monitor_available = self.active_engine().is_some_and(monitor::monitor_available);
+        palette::rank_items(query, &tables, &history, &connections, monitor_available, 30)
     }
 
     /// Brief contract #4: execution routes through EXISTING paths only —
@@ -1722,6 +1727,7 @@ impl AppView {
                         self.tree.update(cx, |t, cx| t.clear(cx));
                     }
                 }
+                PaletteAction::OpenMonitor => self.open_monitor_tab(cx),
             },
         }
         cx.notify();
@@ -2640,6 +2646,177 @@ impl AppView {
             .unwrap_or_else(|| identity.to_string())
     }
 
+    // -----------------------------------------------------------------
+    // G9 T6: server-monitor tab — open action, timer loop, kill-dialog
+    // bridge (design §4/§6/§7).
+    // -----------------------------------------------------------------
+
+    /// The ACTIVE connection's engine: saved config's `cfg.engine`, or
+    /// `engine_from_url` for the CLI-arg back-compat path, `None` with no
+    /// active connection at all (design §7's three-way gating input).
+    fn active_engine(&self) -> Option<dbc_state::Engine> {
+        if let Some(id) = &self.active_connection_id {
+            return self.config.connections.iter().find(|c| &c.id == id).map(|c| c.engine);
+        }
+        self.conn_url.as_deref().map(engine_from_url)
+    }
+
+    /// Opens (or re-activates) the monitor tab for the active connection.
+    /// `preview_key = "monitor:{conn_identity}"` gives one-monitor-per-
+    /// connection: unlike table previews (`close_by_preview_key` replaces),
+    /// reopening just ACTIVATES the existing tab (design §5).
+    fn open_monitor_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.active_engine() else {
+            self.status = "Bez připojení — vyberte připojení nahoře.".into();
+            cx.notify();
+            return;
+        };
+        if !monitor::monitor_available(engine) {
+            // The palette already hides the entry (build_palette_items);
+            // this is the belt for any other entry point.
+            self.status = "monitor serveru není pro tento engine k dispozici".into();
+            cx.notify();
+            return;
+        }
+        let key = format!("monitor:{}", self.current_conn_identity());
+        let existing_id =
+            self.tabs.iter().find(|t| t.preview_key.as_deref() == Some(key.as_str())).map(|t| t.id);
+        if let Some(id) = existing_id {
+            self.tabs.activate(id);
+            cx.notify();
+            return;
+        }
+        let Some(spec) = self.active_conn_spec() else {
+            self.status = "Bez připojení — vyberte připojení nahoře.".into();
+            cx.notify();
+            return;
+        };
+        // Same read-only resolution runner::spec_is_read_only applies:
+        // config flag, or always-writable for the CLI-arg URL path.
+        let read_only = match &spec {
+            ConnectSpec::Config { cfg, .. } => cfg.read_only,
+            ConnectSpec::Url(_) => false,
+        };
+        let (cmd_tx, event_rx) = self.runner.open_monitor(spec, read_only, engine);
+        let view = cx.new(|cx| monitor_view::MonitorView::new(cx, cmd_tx, event_rx, read_only, engine));
+        let title = collapse_title(&format!("Monitor: {}", self.current_connection_label()));
+        let conn_identity = self.current_conn_identity();
+        let tab_id = self.tabs.open(ResultTab {
+            id: 0,
+            title,
+            pinned: false,
+            preview_key: Some(key),
+            conn_identity,
+            content: TabContent::Monitor { view: view.clone() },
+        });
+        cx.subscribe(&view, move |this, _emitter, event, cx| {
+            this.on_monitor_view_event(tab_id, event, cx);
+        })
+        .detach();
+        self.spawn_monitor_timer(tab_id, cx);
+        cx.notify();
+    }
+
+    /// One timer loop per open monitor tab (design §4), on the SAME
+    /// `cx.background_executor().timer` primitive `grid.rs`'s export
+    /// chunking uses. Hidden-tab gating is automatic: a tick only reaches
+    /// `tick_if_idle` when this tab is the active one; pause/awaiting are
+    /// checked inside `MonitorView`. The loop BREAKS (never a forever-no-op)
+    /// when the tab or the `AppView` is gone.
+    fn spawn_monitor_timer(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                // Re-read the CURRENT interval each lap — backoff can
+                // change it between ticks. None = tab closed.
+                let interval = match this.update(cx, |view, cx| {
+                    view.monitor_view_for_tab(tab_id).map(|m| m.read(cx).interval_secs())
+                }) {
+                    Ok(Some(secs)) => secs,
+                    Ok(None) | Err(_) => break,
+                };
+                cx.background_executor().timer(std::time::Duration::from_secs(interval)).await;
+                let tick = this.update(cx, |view, cx| {
+                    let visible = view.tabs.active().is_some_and(|t| t.id == tab_id);
+                    if visible {
+                        if let Some(m) = view.monitor_view_for_tab(tab_id) {
+                            m.update(cx, |m, cx| m.tick_if_idle(cx));
+                        }
+                    }
+                });
+                if tick.is_err() {
+                    break; // AppView released
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// `MonitorView` -> `AppView` event bridge (subscription wired in
+    /// `open_monitor_tab`). `KillRequested` opens the confirm dialog;
+    /// `KillFinished` resolves it (design §6's success/failure UX).
+    fn on_monitor_view_event(
+        &mut self,
+        tab_id: u64,
+        event: &monitor_view::MonitorViewEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            monitor_view::MonitorViewEvent::KillRequested { pid, label, sql } => {
+                if self.modal.is_some() {
+                    return; // single-modal invariant, same as every dialog opener
+                }
+                self.modal = Some(connections_ui::ModalState::KillConfirm {
+                    pid: *pid,
+                    label: label.clone(),
+                    sql: sql.clone(),
+                    tab_id,
+                    error: None,
+                    dispatched: false,
+                });
+                cx.notify();
+            }
+            monitor_view::MonitorViewEvent::KillFinished { pid, result } => {
+                // MAJOR review fix: only touch `self.modal` when it's STILL
+                // the KillConfirm dialog THIS event belongs to (same pid AND
+                // same originating tab) — otherwise a stale/cancelled kill's
+                // outcome can land in an unrelated, currently-open dialog
+                // (same tab, different pid; or a different monitor tab
+                // entirely) and either overwrite its error or silently
+                // close it out from under the user. `tab_id` here is this
+                // handler's own parameter — fixed per-subscription to the
+                // tab whose MonitorView emitted the event (see
+                // `open_monitor_tab`'s `cx.subscribe`), so it IS the
+                // event's true origin, no extra plumbing needed.
+                let matches_open_dialog = connections_ui::kill_confirm_matches(&self.modal, tab_id, *pid);
+                match result {
+                    Ok(()) => {
+                        if matches_open_dialog {
+                            self.modal = None;
+                        }
+                        // pg reports Ok even when the pid already exited
+                        // (the function returns false, not an error) — the
+                        // out-of-cycle refresh MonitorView already
+                        // dispatched shows the truth momentarily (design
+                        // §6).
+                        self.status = format!("proces {pid} ukončen");
+                    }
+                    Err(msg) => {
+                        if matches_open_dialog {
+                            // Dialog stays open with the error; NEW MINOR
+                            // review fix: also resets `dispatched` so a
+                            // genuine failure can be retried (see
+                            // `apply_kill_error_to_modal`'s doc comment).
+                            connections_ui::apply_kill_error_to_modal(&mut self.modal, tab_id, *pid, msg);
+                        } else {
+                            self.status = format!("error: {msg}");
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+    }
+
     fn apply_conn_spec(&self) -> Option<(ConnectSpec, Option<u64>)> {
         if let Some(id) = self.active_connection_id.clone() {
             let cfg = self.config.connections.iter().find(|c| c.id == id)?.clone();
@@ -2677,6 +2854,7 @@ impl AppView {
         let (tab_id, tab_conn_identity, grid) = match &active.content {
             TabContent::Grid { grid, .. } => (active.id, active.conn_identity.clone(), grid.clone()),
             TabContent::Text { .. } => return,
+            TabContent::Monitor { .. } => return,
         };
         let current_identity = self.current_conn_identity();
         if !conn_identity_matches(&tab_conn_identity, &current_identity) {
@@ -3003,6 +3181,7 @@ impl AppView {
                         (buffer.borrow().row_count(), grid.read(cx).edit_state.is_dirty())
                     }
                     TabContent::Text { .. } => (0, false),
+                    TabContent::Monitor { .. } => (0, false),
                 };
                 // G5 Task 3, brief contract #7: dirty (unapplied staged
                 // edits) tabs get a " •" title suffix — the apply bar
@@ -3153,7 +3332,18 @@ impl AppView {
                     .child(body)
                     .into_any_element()
             }
+            TabContent::Monitor { view } => view.clone().into_any_element(),
         }
+    }
+
+    /// The `MonitorView` entity behind an open Monitor tab, by tab id —
+    /// used by the kill-confirm dialog (T5) and the per-tab timer loop
+    /// (T6).
+    fn monitor_view_for_tab(&self, tab_id: u64) -> Option<Entity<monitor_view::MonitorView>> {
+        self.tabs.iter().find(|t| t.id == tab_id).and_then(|t| match &t.content {
+            TabContent::Monitor { view } => Some(view.clone()),
+            _ => None,
+        })
     }
 
     /// G5 Task 4, brief contract #1: apply bar above the status bar

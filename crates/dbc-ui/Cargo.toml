@@ -1,6 +1,6 @@
 [package]
 name = "dbc-ui"
-version = "0.6.0"
+version = "0.7.0"
 edition.workspace = true
 
 [dependencies]
@@ -34,7 +34,7 @@ async-trait.workspace = true
 # paused/auto-advancing virtual clock (`#[tokio::test(start_paused = true)]`)
 # instead of actually sleeping for real wall-clock seconds.
 tokio = { version = "1", features = ["test-util"] }
-# G13 T2: docker-gated live-fixture-capture test for the Postgres EXPLAIN
-# JSON parser — same crate+version dbc-driver-postgres's own integration
-# tests already pin, so this introduces no version skew.
+# docker-gated integration tests (G9 T7 monitor, G13 T2 pg EXPLAIN fixtures)
+# — same crate+version dbc-driver-postgres's own integration tests pin, so
+# no version skew.
 testcontainers-modules = { version = "0.13", features = ["postgres"] }
