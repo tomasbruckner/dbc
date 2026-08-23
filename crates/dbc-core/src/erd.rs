@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crate::schema::TableInfo;
 
 pub mod layout;
+pub mod svg;
 
 pub const MAX_VISIBLE_COLS: usize = 6;
 
