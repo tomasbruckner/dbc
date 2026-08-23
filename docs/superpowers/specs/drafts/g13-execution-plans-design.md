@@ -35,6 +35,33 @@ or `dbc-ui` today; `serde`/`serde_json` already workspace deps used by
 `dbc-state`). No MSSQL driver crate exists yet (orthogonal, unscheduled) —
 every MSSQL-specific decision below is flagged needs-verification in §6.
 
+> **CURATION (2026-08-23, binding):**
+> 1. **Stale driver claim superseded:** `dbc-driver-mssql` (odbc-api 29) and
+>    `dbc-driver-duckdb` exist as of v0.5.0, both unwired. §1b's open
+>    question is partly answered: odbc-api DOES expose multiple result sets
+>    (`Cursor::more_results()`), so "skip statement result set, read the
+>    trailing plan XML" is feasible driver-side without a trait change —
+>    still needs-verification against a live server, T7 stays deferred.
+>    DuckDB plans (`EXPLAIN` / `EXPLAIN ANALYZE`, own format) are NOT in
+>    G13 v1 scope — follow-up at DuckDB wiring time.
+> 2. **§3-novela alignment (see G12 curation item 1):** the Analyze-write
+>    sequence (dedicated connection, BEGIN → EXPLAIN ANALYZE → ROLLBACK)
+>    is a new sanctioned runner write method. It MUST (a) live in
+>    `runner.rs` as its own method, (b) call the SHARED read-only guard
+>    helper (no fresh logic), (c) be dispatched only from the
+>    `AnalyzeWriteConfirm` modal. Add it to `execute()`'s
+>    sanctioned-caller doc list.
+> 3. **REQUIRED test (read-only discipline):** `analyze_gate` with a write
+>    statement + `read_only == true` returns `Blocked` before any driver
+>    call — plus the three-case gate table and the CTE/comment bypass edges
+>    from `guards.rs`'s test suite.
+> 4. **Palette naming fix:** the app palette is Catppuccin Mocha (G6
+>    curation), not "Tokyo-Night-ish" — the hex values `0xf38ba8`/`0xf9e2af`
+>    in §2 are correct Mocha red/yellow; keep them.
+> 5. **T2 fixture capture against docker-pg is REQUIRED before T2 closes**
+>    (including one parallel-worker plan with `Workers Launched > 0` per §7)
+>    — the serde derive alone is not a correctness gate.
+
 ## 0. Architecture decision, up front: plans ride the existing `query()` path
 
 The brief's read-first note says it explicitly and the trait bears it out:

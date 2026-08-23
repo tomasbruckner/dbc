@@ -19,6 +19,40 @@ pattern, reused for the MSSQL T-SQL path and the restore confirm modal);
 plaintext, `AppConfig` for non-secret metadata); `crates/dbc-core/src/
 connection.rs` (the `execute()` write-path contract this phase extends).
 
+> **CURATION (2026-08-23, binding):**
+> 1. **Gap fixed — `psql` missing from tool detection:** §3's plain-SQL
+>    restore pipes through `psql`, but §1's `ToolPaths` only has
+>    `pg_dump`/`pg_restore`. Add `psql: Option<String>` to `ToolPaths` with
+>    identical detection/override/persistence; plain-SQL restore errors
+>    with the same "nenalezen — nastavte cestu" flow when absent.
+> 2. **Backup-on-read-only exemption ACCEPTED, but explicit:** MSSQL
+>    `BACKUP DATABASE` and SQLite `VACUUM INTO` on a `read_only` connection
+>    are allowed via ONE documented exemption predicate (e.g.
+>    `fn backup_exempt_from_read_only(...) -> bool`) with its own unit
+>    tests — never by weakening the shared read-only guard or
+>    `is_read_statement`. RESTORE stays hard-blocked on read-only, no
+>    override (REQUIRED test, mirrors G9/G10/G12). If the server-side
+>    session is itself read-only and refuses BACKUP, the error surfaces
+>    verbatim — acceptable.
+> 3. **§3-novela alignment (see G12 curation item 1):** the MSSQL
+>    SINGLE_USER/RESTORE/MULTI_USER sequence, MSSQL BACKUP, and SQLite
+>    `VACUUM INTO`/file-replace are sanctioned runner-owned write methods —
+>    each a named method in `runner.rs`/`backup.rs`, restore dispatchable
+>    only from the typed-database-name confirm modal (typed-name friction
+>    APPROVED). Add all to `execute()`'s sanctioned-caller doc list.
+> 4. **SQLite restore validation:** before `fs::copy`, read the picked
+>    file's first 16 bytes and require the `SQLite format 3\0` magic
+>    header — refuse otherwise ("soubor není SQLite databáze"). Cheap
+>    guard against copying garbage over a live database.
+> 5. **Stale driver claim superseded:** `dbc-driver-mssql` exists as of
+>    v0.5.0 (unwired). The STATS=10 info-message question is now concrete:
+>    odbc-api exposes diagnostic records, but whether our driver's
+>    `execute()` surfaces mid-statement INFO messages stays
+>    needs-verification (spike inside T5, spinner fallback stands).
+> 6. **PGPASSWORD env mechanism APPROVED** (never argv, never logged,
+>    vault-read at spawn) — consistent with the secrets invariant; the
+>    argv-echo line in the log must be built from the args Vec only.
+
 ## 1. Tool detection (Postgres only — MSSQL/SQLite need no external binary)
 
 - **Persistence:** new `AppConfig.tool_paths: ToolPaths { pg_dump:
