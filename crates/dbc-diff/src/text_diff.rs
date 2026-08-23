@@ -19,7 +19,9 @@ pub fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
                 ChangeTag::Insert => DiffTag::Insert,
                 ChangeTag::Delete => DiffTag::Delete,
             };
-            DiffLine { tag, text: c.to_string().trim_end_matches('\n').to_string() }
+            // Trim `\r` too: engine-reported DDL may be CRLF on Windows, and a
+            // dangling `\r` would render as a ghost glyph in the diff panel.
+            DiffLine { tag, text: c.to_string().trim_end_matches('\n').trim_end_matches('\r').to_string() }
         })
         .collect()
 }
