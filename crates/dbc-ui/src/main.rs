@@ -1,4 +1,6 @@
 mod autocomplete;
+#[allow(dead_code)] // consumed from T3/T4 on
+mod backup;
 mod connect;
 mod connections_ui;
 mod export;
