@@ -24,5 +24,21 @@ pub trait Connection: Send {
     /// `Connection` instance, sequentially. Implementations must never
     /// re-open or pool connections underneath `execute` — doing so would
     /// silently split a transaction across separate server-side sessions.
+    ///
+    /// Engine divergence callers MUST respect (T1 review issue 1,
+    /// empirically verified): after a failed statement inside an open
+    /// transaction, SQLite leaves the transaction open and usable, while
+    /// PostgreSQL aborts it — every further statement fails with "current
+    /// transaction is aborted" until ROLLBACK. A transaction driver must
+    /// therefore stop at the FIRST error and roll back; it must not attempt
+    /// to continue, and it must tolerate the ROLLBACK itself failing
+    /// (dropping the connection aborts the transaction server-side on both
+    /// engines).
+    ///
+    /// Session-sharing caveat (issue 2): on PostgreSQL, `query()` shares the
+    /// same server session; a caller in an open transaction must not
+    /// interleave `query()` calls on this instance. The Apply flow satisfies
+    /// this by opening a DEDICATED connection used exclusively for its
+    /// BEGIN…COMMIT sequence and dropped immediately after.
     async fn execute(&mut self, sql: &str, cancel: CancelToken) -> Result<u64, QueryError>;
 }

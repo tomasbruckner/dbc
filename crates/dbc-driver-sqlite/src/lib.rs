@@ -670,4 +670,25 @@ mod tests {
         }
         assert_eq!(rows, 0, "row inserted inside the rolled-back transaction must be absent");
     }
+
+    // T1 review issue 6: the read-only flag must reach exec_conn too — a
+    // read-only connection's write path fails, same as its query path.
+    #[tokio::test]
+    async fn read_only_connection_rejects_execute_writes() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut w = SqliteConnection::new(f.path());
+            w.execute("CREATE TABLE t(id INTEGER)", CancelToken::new()).await.unwrap();
+        }
+        let mut c = SqliteConnection::new_with_options(f.path(), true);
+        let err = c
+            .execute("INSERT INTO t(id) VALUES (1)", CancelToken::new())
+            .await
+            .unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("readonly") || msg.contains("read-only") || msg.contains("read only"),
+            "expected a read-only rejection, got: {msg}"
+        );
+    }
 }
