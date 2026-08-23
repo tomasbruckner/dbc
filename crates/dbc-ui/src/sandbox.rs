@@ -87,8 +87,20 @@ impl EditState {
         self.inserted_rows.len() - 1
     }
 
+    /// Stages a value into an inserted row's cell. Bounds-checked and a no-op
+    /// when `ins_ix`/`col` are out of range: like `remove_insert_row`, the
+    /// grid's cell-editor captures `ins_ix` at render time, and a concurrent
+    /// `remove_insert_row` (its `Vec::remove` shifts later rows down) can land
+    /// before a repaint — a stale target must never panic (crashing the app
+    /// loses every staged edit in the tab) nor silently write into the wrong
+    /// row. Callers should also re-validate `ins_ix` at click time; this is the
+    /// belt-and-braces backstop. (T3 review issue 1.)
     pub fn stage_insert_cell(&mut self, ins_ix: usize, col: usize, v: Option<String>) {
-        self.inserted_rows[ins_ix][col] = Some(v);
+        if let Some(row) = self.inserted_rows.get_mut(ins_ix) {
+            if let Some(cell) = row.get_mut(col) {
+                *cell = Some(v);
+            }
+        }
     }
 
     /// G5 Task 3: removes insert row `ins_ix` entirely (the grid's "␡" per
@@ -640,6 +652,22 @@ mod tests {
         edits.add_insert_row(1);
         edits.remove_insert_row(5);
         assert_eq!(edits.inserted_rows.len(), 1);
+    }
+
+    #[test]
+    fn stage_insert_cell_out_of_range_is_a_noop() {
+        // T3 review issue 1: a stale `ins_ix`/`col` (captured before a
+        // concurrent remove_insert_row shifted the vec) must never panic nor
+        // write into the wrong slot — it is a silent no-op.
+        let mut edits = EditState::default();
+        edits.add_insert_row(2);
+        edits.stage_insert_cell(5, 0, Some("x".to_string())); // row OOB
+        edits.stage_insert_cell(0, 9, Some("y".to_string())); // col OOB
+        assert_eq!(edits.inserted_rows.len(), 1);
+        assert_eq!(edits.inserted_rows[0], vec![None, None]);
+        // A valid target still writes.
+        edits.stage_insert_cell(0, 1, Some("ok".to_string()));
+        assert_eq!(edits.inserted_rows[0][1], Some(Some("ok".to_string())));
     }
 
     #[test]

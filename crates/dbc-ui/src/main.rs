@@ -149,6 +149,16 @@ fn detect_editable_pk(
     headers: &[String],
 ) -> EditableDecision {
     let Some(t) = table else { return EditableDecision::NotEditable };
+    // T3 review issue 3: only base tables are editable. This is the function
+    // that gates whether the app may generate UPDATE/DELETE/INSERT, so it must
+    // enforce table-vs-view itself rather than lean on the incidental fact that
+    // neither driver currently reports `is_pk` for view columns — a future
+    // driver, or a view with an INSTEAD OF trigger whose PK gets attributed,
+    // would otherwise slip through and produce writes against a non-updatable
+    // relation. Views/materialized views are never sandbox-editable.
+    if t.kind != dbc_core::TableKind::Table {
+        return EditableDecision::NotEditable;
+    }
     let pk_cols: Vec<usize> = t
         .columns
         .iter()
@@ -2326,6 +2336,32 @@ mod editable_detection_tests {
         assert_eq!(
             detect_editable_pk(rw_engine(dbc_state::Engine::Postgres), Some(&t), &h),
             EditableDecision::Editable(vec![0, 2])
+        );
+    }
+
+    #[test]
+    fn view_with_a_mapped_pk_is_not_editable() {
+        // T3 review issue 3: even if a view somehow reports a PK column that
+        // maps onto the headers, a view is never sandbox-editable — the
+        // table-kind guard must reject it rather than relying on drivers never
+        // marking view columns as PK.
+        use dbc_core::TableKind;
+        let t = TableInfo {
+            name: "v".to_string(),
+            kind: TableKind::View,
+            columns: vec![col("id", true), col("name", false)],
+            ..Default::default()
+        };
+        let h = headers(&["id", "name"]);
+        assert_eq!(
+            detect_editable_pk(rw_engine(dbc_state::Engine::Postgres), Some(&t), &h),
+            EditableDecision::NotEditable
+        );
+        // A materialized view is likewise not editable.
+        let mv = TableInfo { kind: TableKind::MaterializedView, ..t };
+        assert_eq!(
+            detect_editable_pk(rw_engine(dbc_state::Engine::Postgres), Some(&mv), &h),
+            EditableDecision::NotEditable
         );
     }
 

@@ -2553,6 +2553,22 @@ impl Render for ResultGrid {
                                             cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
                                                 window.focus(&this.focus_handle, cx);
                                                 if e.click_count >= 2 {
+                                                    // T3 review issue 1: `ins_ix`
+                                                    // was captured at render time.
+                                                    // A concurrent "␡" removal of
+                                                    // an earlier insert row shifts
+                                                    // later rows down (Vec::remove),
+                                                    // so a stale `ins_ix` can now
+                                                    // point past the vec or at a
+                                                    // different row. Re-validate
+                                                    // before opening the editor —
+                                                    // mirror the real-row
+                                                    // `row_ix >= view.len()` clamp.
+                                                    // (stage_insert_cell is also a
+                                                    // no-op on OOB as a backstop.)
+                                                    if ins_ix >= this.edit_state.inserted_rows.len() {
+                                                        return;
+                                                    }
                                                     this.open_cell_editor(
                                                         EditTarget::Insert { ins_ix, col },
                                                         column_name.clone(),
