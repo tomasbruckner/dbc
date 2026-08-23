@@ -2258,6 +2258,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbc-diff"
+version = "0.1.0"
+dependencies = [
+ "arrow 59.2.0",
+ "dbc-buffer",
+ "dbc-core",
+]
+
+[[package]]
 name = "dbc-driver-duckdb"
 version = "0.1.0"
 dependencies = [
