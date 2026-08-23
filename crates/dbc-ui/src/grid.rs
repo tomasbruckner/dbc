@@ -5,8 +5,8 @@ use std::rc::Rc;
 use dbc_buffer::ResultBuffer;
 use dbc_core::FkRef;
 use gpui::{
-    actions, div, prelude::*, px, rgb, rgba, uniform_list, AnyElement, ClipboardItem, Context,
-    Entity, EventEmitter, FocusHandle, Focusable, KeyBinding, ScrollDelta, ScrollStrategy,
+    actions, div, prelude::*, px, uniform_list, AnyElement, ClipboardItem, Context, Entity,
+    EventEmitter, FocusHandle, Focusable, KeyBinding, ScrollDelta, ScrollStrategy,
     ScrollWheelEvent, UniformListScrollHandle, Window,
 };
 
@@ -15,6 +15,7 @@ use crate::export::{self, ExportFormat};
 use crate::fk_join::{self, JoinSpec, VirtualCol};
 use crate::row_view::{self, RowView};
 use crate::sandbox::{self, EditState, Editable};
+use crate::theme::ActiveTheme;
 
 pub const ROW_HEIGHT: f32 = 24.0;
 pub const DEFAULT_COL_WIDTH: f32 = 160.0;
@@ -22,10 +23,6 @@ pub const DEFAULT_COL_WIDTH: f32 = 160.0;
 /// (toggle delete) per real row, "␡" (remove) per inserted row. Narrow by
 /// design (brief: "~24 px") since it holds a single glyph, not text.
 const GUTTER_WIDTH: f32 = 24.0;
-/// G5 Task 3 diff tints (brief contract #3, exact values).
-const STAGED_CELL_BG: u32 = 0x6b5d2e;
-const DELETED_ROW_BG: u32 = 0x5d2e2e;
-const INSERTED_ROW_BG: u32 = 0x2e5d3a;
 /// G4 Task 2: above this many rows, a sort click sets `status_note` to
 /// "řadím…" before `rebuild_view` runs. `rebuild` is synchronous today, so
 /// this note is a retroactive "that sort was over a big set" marker rather
@@ -1552,6 +1549,7 @@ impl ResultGrid {
         self.poll_filters(cx);
         self.poll_find(cx);
 
+        let theme = *cx.theme();
         let shown = self.view.len();
         let total = self.buffer.as_ref().map_or(0, |b| b.borrow().row_count());
         let filtered = !self.view.filters.is_empty();
@@ -1565,15 +1563,15 @@ impl ResultGrid {
             .gap_2()
             .h(px(ROW_HEIGHT))
             .px_2()
-            .bg(rgb(0x181825))
-            .text_color(rgb(0xcdd6f4))
+            .bg(theme.bg_app)
+            .text_color(theme.text_primary)
             .child(
                 div()
                     .id("toggle-filters")
                     .cursor_pointer()
                     .px_2()
                     .rounded_md()
-                    .bg(if filters_open { rgb(0x45475a) } else { rgb(0x313244) })
+                    .bg(if filters_open { theme.bg_selected } else { theme.bg_hover })
                     .child("Filtr")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_filters(cx);
@@ -1585,7 +1583,7 @@ impl ResultGrid {
                     .cursor_pointer()
                     .px_2()
                     .rounded_md()
-                    .bg(if self.export_open { rgb(0x45475a) } else { rgb(0x313244) })
+                    .bg(if self.export_open { theme.bg_selected } else { theme.bg_hover })
                     .child("Export ▾")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_export_menu(cx);
@@ -1597,7 +1595,7 @@ impl ResultGrid {
                     .cursor_pointer()
                     .px_2()
                     .rounded_md()
-                    .bg(if self.columns_open { rgb(0x45475a) } else { rgb(0x313244) })
+                    .bg(if self.columns_open { theme.bg_selected } else { theme.bg_hover })
                     .child("Sloupce ▾")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_columns_menu(cx);
@@ -1612,7 +1610,7 @@ impl ResultGrid {
                     .cursor_pointer()
                     .px_2()
                     .rounded_md()
-                    .bg(rgb(0x313244))
+                    .bg(theme.bg_hover)
                     .child("+ řádek")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.add_insert_row(cx);
@@ -1676,8 +1674,8 @@ impl ResultGrid {
     /// Hidden columns are skipped entirely (brief: "hidden columns keep no
     /// filter input") even though `filter_inputs`/`filter_cache` still hold
     /// an entry for them.
-    fn filter_row(&self) -> impl IntoElement {
-        let mut row = div().flex().flex_row().bg(rgb(0x181825));
+    fn filter_row(&self, theme: &crate::theme::Theme) -> impl IntoElement {
+        let mut row = div().flex().flex_row().bg(theme.bg_app);
         // G5 Task 3: same gutter-width alignment spacer as `header`.
         if self.editable.is_some() {
             row = row.child(div().w(px(GUTTER_WIDTH)).h(px(ROW_HEIGHT)));
@@ -1713,21 +1711,22 @@ impl ResultGrid {
     /// `on_mouse_down_out` closes it on an outside click, positioned
     /// `.absolute()` under the (`.relative()`) root `render` builds.
     fn render_export_menu_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
         let mut panel = div()
             .id("export-menu")
             .absolute()
             .top(px(ROW_HEIGHT))
             .left(px(70.))
             .w(px(140.))
-            .bg(rgb(0x1e1e2e))
+            .bg(theme.bg_panel)
             .border_1()
-            .border_color(rgb(0x45475a))
+            .border_color(theme.border)
             .rounded_md()
             .p_1()
             .flex()
             .flex_col()
             .gap_1()
-            .text_color(rgb(0xcdd6f4))
+            .text_color(theme.text_primary)
             .occlude()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.export_open = false;
@@ -1745,7 +1744,7 @@ impl ResultGrid {
                     .cursor_pointer()
                     .px_2()
                     .rounded_md()
-                    .hover(|s| s.bg(rgb(0x313244)))
+                    .hover(|s| s.bg(theme.bg_hover))
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.export_open = false;
@@ -1762,6 +1761,7 @@ impl ResultGrid {
     /// visible ones (unlike `filter_row`/`header`) — this is the one place
     /// a hidden column is ever shown again, so it can be re-checked.
     fn render_columns_menu_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
         let mut panel = div()
             .id("columns-menu")
             .absolute()
@@ -1770,15 +1770,15 @@ impl ResultGrid {
             .w(px(220.))
             .max_h(px(320.))
             .overflow_hidden()
-            .bg(rgb(0x1e1e2e))
+            .bg(theme.bg_panel)
             .border_1()
-            .border_color(rgb(0x45475a))
+            .border_color(theme.border)
             .rounded_md()
             .p_1()
             .flex()
             .flex_col()
             .gap_1()
-            .text_color(rgb(0xcdd6f4))
+            .text_color(theme.text_primary)
             .occlude()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.columns_open = false;
@@ -1802,8 +1802,8 @@ impl ResultGrid {
                         .gap_2()
                         .px_2()
                         .rounded_md()
-                        .when(!disabled, |d| d.cursor_pointer().hover(|s| s.bg(rgb(0x313244))))
-                        .text_color(if disabled { rgb(0x6c7086) } else { rgb(0xcdd6f4) })
+                        .when(!disabled, |d| d.cursor_pointer().hover(|s| s.bg(theme.bg_hover)))
+                        .text_color(if disabled { theme.text_disabled } else { theme.text_primary })
                         .child(if hidden { "☐" } else { "☑" })
                         .child(name)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1823,6 +1823,7 @@ impl ResultGrid {
     /// rendered line-by-line with wheel-driven `scroll_lines`, exactly like
     /// `main.rs`'s `TabContent::Text` body — reused rather than reinvented.
     fn render_cell_detail_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = *cx.theme();
         let detail = self.cell_detail.clone()?;
         let text_for_copy = detail.text.clone();
         let lines: Vec<&str> = detail.text.lines().collect();
@@ -1836,7 +1837,7 @@ impl ResultGrid {
             .flex_1()
             .overflow_hidden()
             .p_2()
-            .text_color(rgb(0xcdd6f4))
+            .text_color(theme.text_primary)
             .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, _, cx| {
                 let delta_lines = match e.delta {
                     ScrollDelta::Lines(p) => p.y,
@@ -1858,9 +1859,9 @@ impl ResultGrid {
             .id("cell-detail-panel")
             .w(px(560.))
             .max_h(px(420.))
-            .bg(rgb(0x1e1e2e))
+            .bg(theme.bg_panel)
             .border_1()
-            .border_color(rgb(0x45475a))
+            .border_color(theme.border)
             .rounded_md()
             .flex()
             .flex_col()
@@ -1870,8 +1871,8 @@ impl ResultGrid {
                     div()
                         .id("cell-detail-copy")
                         .cursor_pointer()
-                        .bg(rgb(0x313244))
-                        .text_color(rgb(0xcdd6f4))
+                        .bg(theme.bg_hover)
+                        .text_color(theme.text_primary)
                         .px_2()
                         .rounded_md()
                         .child("Kopírovat")
@@ -1882,8 +1883,8 @@ impl ResultGrid {
                     div()
                         .id("cell-detail-close")
                         .cursor_pointer()
-                        .bg(rgb(0x313244))
-                        .text_color(rgb(0xcdd6f4))
+                        .bg(theme.bg_hover)
+                        .text_color(theme.text_primary)
                         .px_2()
                         .rounded_md()
                         .child("Zavřít")
@@ -1904,7 +1905,7 @@ impl ResultGrid {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(0x00000099))
+                .bg(theme.bg_backdrop)
                 .occlude()
                 .child(panel)
                 .into_any_element(),
@@ -2050,6 +2051,7 @@ impl ResultGrid {
     /// modal is acceptable") so this covers the old cell-detail "see the
     /// full text" use case too.
     fn render_cell_editor_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = *cx.theme();
         let ed = self.cell_editor.as_ref()?;
         let column_name = ed.column_name.clone();
         let original_text = ed.original_text.clone();
@@ -2060,25 +2062,25 @@ impl ResultGrid {
             .id("cell-editor-panel")
             .w(px(480.))
             .max_h(px(360.))
-            .bg(rgb(0x1e1e2e))
+            .bg(theme.bg_panel)
             .border_1()
-            .border_color(rgb(0x45475a))
+            .border_color(theme.border)
             .rounded_md()
             .flex()
             .flex_col()
             .p_2()
             .gap_2()
-            .text_color(rgb(0xcdd6f4))
-            .child(div().text_color(rgb(0xf9e2af)).child(column_name))
+            .text_color(theme.text_primary)
+            .child(div().text_color(theme.warn).child(column_name))
             .child(
                 div()
                     .id("cell-editor-original")
                     .max_h(px(120.))
                     .overflow_hidden()
                     .p_1()
-                    .bg(rgb(0x181825))
+                    .bg(theme.bg_app)
                     .rounded_md()
-                    .text_color(rgb(0xa6adc8))
+                    .text_color(theme.text_muted)
                     .whitespace_normal()
                     .child(if original_text.is_empty() {
                         "(prázdné/NULL)".to_string()
@@ -2092,7 +2094,7 @@ impl ResultGrid {
             .when(currently_staged_null, |d| {
                 d.child(
                     div()
-                        .text_color(rgb(0xf38ba8))
+                        .text_color(theme.danger)
                         .child("aktuálně: (NULL) — prázdné Uložit přepíše na '', ne NULL"),
                 )
             })
@@ -2102,8 +2104,8 @@ impl ResultGrid {
                     div()
                         .id("cell-editor-save")
                         .cursor_pointer()
-                        .bg(rgb(0x313244))
-                        .text_color(rgb(0xcdd6f4))
+                        .bg(theme.bg_hover)
+                        .text_color(theme.text_primary)
                         .px_2()
                         .rounded_md()
                         .child("Uložit")
@@ -2112,8 +2114,8 @@ impl ResultGrid {
                     div()
                         .id("cell-editor-null")
                         .cursor_pointer()
-                        .bg(rgb(0x313244))
-                        .text_color(rgb(0xcdd6f4))
+                        .bg(theme.bg_hover)
+                        .text_color(theme.text_primary)
                         .px_2()
                         .rounded_md()
                         .child("NULL")
@@ -2122,8 +2124,8 @@ impl ResultGrid {
                     div()
                         .id("cell-editor-cancel")
                         .cursor_pointer()
-                        .bg(rgb(0x313244))
-                        .text_color(rgb(0xcdd6f4))
+                        .bg(theme.bg_hover)
+                        .text_color(theme.text_primary)
                         .px_2()
                         .rounded_md()
                         .child("Zrušit")
@@ -2144,7 +2146,7 @@ impl ResultGrid {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(0x00000099))
+                .bg(theme.bg_backdrop)
                 .occlude()
                 .child(panel)
                 .into_any_element(),
@@ -2159,7 +2161,8 @@ impl ResultGrid {
     /// resize handle is a separate sibling element so a resize drag never
     /// also fires a sort toggle.
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut row = div().flex().flex_row().bg(rgb(0x313244)).text_color(rgb(0xf9e2af));
+        let theme = *cx.theme();
+        let mut row = div().flex().flex_row().bg(theme.bg_hover).text_color(theme.warn);
         // G5 Task 3: blank gutter-width spacer so the header stays aligned
         // with each row's own leading "✕"/"␡" gutter cell (brief contract
         // #4) — editable tabs only.
@@ -2182,7 +2185,7 @@ impl ResultGrid {
             // G4 Task 5: joined columns (preview re-run output) render
             // tinted (brief: bg 0x2a2a3d).
             let joined = self.joined_cols.get(i).copied().unwrap_or(false);
-            let bg = if joined { rgb(0x2a2a3d) } else { rgb(0x313244) };
+            let bg = if joined { theme.bg_joined_col } else { theme.bg_hover };
             // ☰ only on columns the ☰-menu can actually do something with —
             // `fk_info[i].is_some()`.
             let has_fk = matches!(self.fk_info.get(i), Some(Some(_)));
@@ -2273,7 +2276,7 @@ impl ResultGrid {
                 div()
                     .w(px(self.col_widths.get(col_ix).copied().unwrap_or(DEFAULT_COL_WIDTH)))
                     .h(px(ROW_HEIGHT))
-                    .bg(rgb(0x2a2a3d))
+                    .bg(theme.bg_joined_col)
                     .child(
                         div()
                             .id(("header-label-v", vi))
@@ -2302,6 +2305,7 @@ impl ResultGrid {
     /// scrolled header, unlike Export/Sloupce which live in the fixed
     /// toolbar).
     fn render_fk_menu_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = *cx.theme();
         let col = self.fk_menu_open?;
         let fk = self.fk_info.get(col)?.clone()?;
         let ref_cols = self.fk_ref_columns.get(col).cloned().flatten().unwrap_or_default();
@@ -2316,15 +2320,15 @@ impl ResultGrid {
             .w(px(220.))
             .max_h(px(320.))
             .overflow_hidden()
-            .bg(rgb(0x1e1e2e))
+            .bg(theme.bg_panel)
             .border_1()
-            .border_color(rgb(0x45475a))
+            .border_color(theme.border)
             .rounded_md()
             .p_1()
             .flex()
             .flex_col()
             .gap_1()
-            .text_color(rgb(0xcdd6f4))
+            .text_color(theme.text_primary)
             .occlude()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.fk_menu_open = None;
@@ -2333,7 +2337,7 @@ impl ResultGrid {
             .child(
                 div()
                     .px_2()
-                    .text_color(rgb(0xa6adc8))
+                    .text_color(theme.text_muted)
                     .child(format!("Přidat sloupce z {}", fk.table)),
             );
         for c in ref_cols {
@@ -2349,7 +2353,7 @@ impl ResultGrid {
                     .px_2()
                     .rounded_md()
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x313244)))
+                    .hover(|s| s.bg(theme.bg_hover))
                     .child(if is_checked { "☑" } else { "☐" })
                     .child(c)
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -2508,7 +2512,8 @@ impl Render for ResultGrid {
         if has_buffer {
             root = root.child(self.toolbar(cx));
             if self.filters_open {
-                root = root.child(self.filter_row());
+                let theme = *cx.theme();
+                root = root.child(self.filter_row(&theme));
             }
         }
 
@@ -2532,6 +2537,7 @@ impl Render for ResultGrid {
                 "result-rows",
                 row_count,
                 cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                    let theme = *cx.theme();
                     let mut items = Vec::with_capacity(range.len());
                     if let Some(buf) = &buffer {
                         let mut buf = buf.borrow_mut();
@@ -2557,7 +2563,7 @@ impl Render for ResultGrid {
                                     .flex()
                                     .flex_row()
                                     .h(px(ROW_HEIGHT))
-                                    .bg(rgb(INSERTED_ROW_BG));
+                                    .bg(theme.diff_inserted_bg);
                                 row = row.child(
                                     div()
                                         .id(("gutter-ins", ins_ix))
@@ -2567,7 +2573,7 @@ impl Render for ResultGrid {
                                         .items_center()
                                         .justify_center()
                                         .cursor_pointer()
-                                        .text_color(rgb(0x6c7086))
+                                        .text_color(theme.text_disabled)
                                         .child("␡")
                                         .on_click(cx.listener(move |this, _e, _w, cx| {
                                             cx.stop_propagation();
@@ -2597,8 +2603,8 @@ impl Render for ResultGrid {
                                         .w(px(widths.get(col).copied().unwrap_or(DEFAULT_COL_WIDTH)))
                                         .px_2()
                                         .overflow_hidden()
-                                        .text_color(rgb(0xcdd6f4))
-                                        .bg(rgb(INSERTED_ROW_BG))
+                                        .text_color(theme.text_primary)
+                                        .bg(theme.diff_inserted_bg)
                                         .cursor_pointer()
                                         .on_mouse_down(
                                             gpui::MouseButton::Left,
@@ -2647,11 +2653,12 @@ impl Render for ResultGrid {
                                 .flex_row()
                                 .h(px(ROW_HEIGHT))
                                 .bg(if is_deleted {
-                                    rgb(DELETED_ROW_BG)
+                                    theme.diff_deleted_bg
                                 } else if row_ix % 2 == 0 {
-                                    rgb(0x1e1e2e)
+                                    theme.bg_panel
                                 } else {
-                                    rgb(0x232334)
+                                    // G14 Task 2: bg_panel_alt zebra confirmed intentional.
+                                    theme.bg_panel_alt
                                 });
                             // G5 Task 3, brief contract #4: "✕" toggles this
                             // SOURCE row's delete flag; `stop_propagation`
@@ -2668,9 +2675,9 @@ impl Render for ResultGrid {
                                         .justify_center()
                                         .cursor_pointer()
                                         .text_color(if is_deleted {
-                                            rgb(0xf38ba8)
+                                            theme.danger
                                         } else {
-                                            rgb(0x6c7086)
+                                            theme.text_disabled
                                         })
                                         .child("✕")
                                         .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -2730,7 +2737,7 @@ impl Render for ResultGrid {
                                     .w(px(widths.get(col).copied().unwrap_or(DEFAULT_COL_WIDTH)))
                                     .px_2()
                                     .overflow_hidden()
-                                    .text_color(rgb(0xcdd6f4))
+                                    .text_color(theme.text_primary)
                                     .on_mouse_down(
                                         gpui::MouseButton::Left,
                                         cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
@@ -2834,15 +2841,15 @@ impl Render for ResultGrid {
                                     )
                                     .child(text);
                                 if is_deleted {
-                                    cell = cell.bg(rgb(DELETED_ROW_BG));
+                                    cell = cell.bg(theme.diff_deleted_bg);
                                 } else if is_find_match {
-                                    cell = cell.bg(rgb(0x585b70));
+                                    cell = cell.bg(theme.bg_find_match);
                                 } else if selected {
-                                    cell = cell.bg(rgb(0x45475a));
+                                    cell = cell.bg(theme.bg_selected);
                                 } else if is_staged {
-                                    cell = cell.bg(rgb(STAGED_CELL_BG));
+                                    cell = cell.bg(theme.diff_staged_bg);
                                 } else if joined {
-                                    cell = cell.bg(rgb(0x2a2a3d));
+                                    cell = cell.bg(theme.bg_joined_col);
                                 }
                                 row = row.child(cell);
                             }
