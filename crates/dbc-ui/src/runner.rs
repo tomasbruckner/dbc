@@ -136,6 +136,30 @@ pub enum ScriptEvent {
     },
 }
 
+/// G12 T7: streaming progress events for `QueryRunner::run_csv_import`
+/// (design §5) — ONE transaction for the whole import, so `BatchFinished`'s
+/// `rows_committed_so_far` is "executed inside the still-open transaction",
+/// not durable, until `Finished` actually lands (nothing is committed on a
+/// `Failed`).
+#[derive(Debug)]
+pub enum CsvImportEvent {
+    BatchStarted { batch_index: usize, rows_in_batch: usize },
+    BatchFinished { batch_index: usize, rows_committed_so_far: u64 },
+    Failed { error: QueryError },
+    Finished { rows_imported: u64, elapsed: Duration },
+}
+
+/// G12 T7: one CSV import job — `main.rs`'s peek/pre-count pass builds this
+/// from the file picker's chosen path, the schema snapshot's `TableInfo`
+/// (`columns`), and the mapping modal's live `ColumnMapping`.
+pub struct CsvImportJob {
+    pub path: std::path::PathBuf,
+    pub schema: Option<String>,
+    pub table: String,
+    pub columns: Vec<crate::csv_import::TargetColumn>,
+    pub mapping: crate::csv_import::ColumnMapping,
+}
+
 /// Owns the tokio runtime. All DB I/O lives here; the UI thread only ever
 /// awaits the event channel from inside `cx.spawn`.
 pub struct QueryRunner {
@@ -501,6 +525,30 @@ impl QueryRunner {
         let handle = self.handle();
         self.runtime.spawn(async move {
             connect_and_run_many_inner(spec, statements, cancel, timeout_secs, handle, tx).await;
+        });
+        rx
+    }
+
+    /// G12 T7: runs a CSV import (design T7) — a SANCTIONED runner-owned
+    /// write path (§3-novela): ONE transaction for the WHOLE import (not
+    /// configurable, unlike `run_script`'s `tx_scope`), streaming batched
+    /// `INSERT`s via `csv_import::generate_insert_batches`. FIRST action,
+    /// before any file or DB touch: the SHARED `guard_not_read_only` guard
+    /// (CURATION items 1(c)/4(b)'s runtime half). Cancellation is checked
+    /// BETWEEN batches only (bounded by the 500-row cap); `timeout_secs`
+    /// bounds each batch statement via the same per-statement child-token
+    /// shape `run_script_statement` uses.
+    pub fn run_csv_import(
+        &self,
+        spec: ConnectSpec,
+        job: CsvImportJob,
+        cancel: CancelToken,
+        timeout_secs: Option<u64>,
+    ) -> tokio::sync::mpsc::Receiver<CsvImportEvent> {
+        let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            run_csv_import_inner(spec, job, cancel, timeout_secs, handle, tx).await;
         });
         rx
     }
@@ -1305,6 +1353,169 @@ async fn connect_and_run_many_inner(
         }
     }
     let _ = tx.send(MultiQueryEvent::RunFinished).await;
+    // `opened` (connection + tunnel) drops here unconditionally.
+}
+
+/// G12 T7: read-chunk producer channel depth — small and bounded (design
+/// §5: the producer never gets more than this many batches ahead of the
+/// driver, so at most `CSV_IMPORT_PRODUCER_DEPTH * CSV_IMPORT_BATCH_SIZE`
+/// rows are ever buffered in memory at once).
+const CSV_IMPORT_PRODUCER_DEPTH: usize = 4;
+
+/// G12 T7: the run driver — SHARED guard first, then BEGIN, then streams
+/// `job.path` through a `spawn_blocking` producer (the `csv` crate's
+/// `Reader` is synchronous; this is the same "blocking work never runs on a
+/// runtime worker thread" dispatch `open_spec`/`read_and_split_file`
+/// already use) that chunks rows into `CSV_IMPORT_BATCH_SIZE`-row pieces
+/// over a bounded channel, executing one `INSERT` per chunk via
+/// `csv_import::generate_insert_batches`. ANY failure (guard refusal, open
+/// error, producer parse/IO error, a chunk's generated statement erroring)
+/// ROLLBACKs and reports zero rows imported — never partial.
+async fn run_csv_import_inner(
+    spec: ConnectSpec,
+    job: CsvImportJob,
+    cancel: CancelToken,
+    timeout_secs: Option<u64>,
+    handle: tokio::runtime::Handle,
+    tx: tokio::sync::mpsc::Sender<CsvImportEvent>,
+) {
+    let started = Instant::now();
+    // CURATION items 1(c)/4(b): the SHARED guard, checked before any file or
+    // DB touch — a read-only spec is refused without ever opening the CSV
+    // file or connecting.
+    if let Err(e) = guard_not_read_only(spec_is_read_only(&spec)) {
+        let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
+        return;
+    }
+    if cancel.is_cancelled() {
+        let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg("cancelled") }).await;
+        return;
+    }
+    let mut opened = match open_spec(spec, handle).await {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
+            return;
+        }
+    };
+    if cancel.is_cancelled() {
+        let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg("cancelled") }).await;
+        return;
+    }
+    let conn = &mut *opened.conn;
+    if let Err(e) = conn.execute("BEGIN", cancel.child_token()).await {
+        let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
+        return;
+    }
+
+    let (chunk_tx, mut chunk_rx) =
+        tokio::sync::mpsc::channel::<Result<Vec<crate::csv_import::CsvRow>, String>>(
+            CSV_IMPORT_PRODUCER_DEPTH,
+        );
+    let producer_path = job.path.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut reader = match csv::Reader::from_path(&producer_path) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = chunk_tx
+                    .blocking_send(Err(format!("[CSV] {}: {e}", producer_path.display())));
+                return;
+            }
+        };
+        let mut chunk: Vec<crate::csv_import::CsvRow> = Vec::with_capacity(crate::csv_import::CSV_IMPORT_BATCH_SIZE);
+        for record in reader.records() {
+            let record = match record {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = chunk_tx
+                        .blocking_send(Err(format!("[CSV] {}: {e}", producer_path.display())));
+                    return;
+                }
+            };
+            let row: crate::csv_import::CsvRow =
+                record.iter().map(crate::csv_field_to_value).collect();
+            chunk.push(row);
+            if chunk.len() >= crate::csv_import::CSV_IMPORT_BATCH_SIZE {
+                if chunk_tx.blocking_send(Ok(std::mem::take(&mut chunk))).is_err() {
+                    return; // driver side hung up (already failed/rolled back)
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = chunk_tx.blocking_send(Ok(chunk));
+        }
+        // `chunk_tx` drops here, closing the channel — the driver loop below
+        // sees `None` and knows the whole file has been read.
+    });
+
+    let mut rows_committed: u64 = 0;
+    let mut batch_index: usize = 0;
+    while let Some(chunk_result) = chunk_rx.recv().await {
+        if cancel.is_cancelled() {
+            let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+            let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg("cancelled") }).await;
+            return;
+        }
+        let rows = match chunk_result {
+            Ok(rows) => rows,
+            Err(msg) => {
+                let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg(msg) }).await;
+                return;
+            }
+        };
+        let _ = tx
+            .send(CsvImportEvent::BatchStarted { batch_index, rows_in_batch: rows.len() })
+            .await;
+        let stmts = crate::csv_import::generate_insert_batches(
+            job.schema.as_deref(),
+            &job.table,
+            &job.columns,
+            &job.mapping,
+            &rows,
+        );
+        let stmt = match stmts {
+            Ok(stmts) => stmts.into_iter().next(),
+            Err(msg) => {
+                let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg(msg) }).await;
+                return;
+            }
+        };
+        if let Some(stmt) = stmt {
+            let stmt_cancel = cancel.child_token();
+            let fut = conn.execute(&stmt, stmt_cancel.clone());
+            let result = match timeout_secs {
+                Some(t) => match tokio::time::timeout(Duration::from_secs(t), fut).await {
+                    Ok(r) => r,
+                    Err(_elapsed) => {
+                        stmt_cancel.cancel();
+                        Err(QueryError::msg(format!("[timeout] statement exceeded {t}s")))
+                    }
+                },
+                None => fut.await,
+            };
+            if let Err(e) = result {
+                let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
+                return;
+            }
+        }
+        rows_committed += rows.len() as u64;
+        batch_index += 1;
+        let _ = tx
+            .send(CsvImportEvent::BatchFinished { batch_index: batch_index - 1, rows_committed_so_far: rows_committed })
+            .await;
+    }
+
+    if let Err(e) = conn.execute("COMMIT", cancel.child_token()).await {
+        let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+        let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
+        return;
+    }
+    let _ = tx
+        .send(CsvImportEvent::Finished { rows_imported: rows_committed, elapsed: started.elapsed() })
+        .await;
     // `opened` (connection + tunnel) drops here unconditionally.
 }
 
@@ -2549,6 +2760,185 @@ mod run_many_tests {
         // Statement 2 never dispatched — no third StatementStarted.
         assert!(!events.iter().any(|e| matches!(e, MultiQueryEvent::StatementStarted { index: 2, .. })));
         assert!(!events.iter().any(|e| matches!(e, MultiQueryEvent::RunFinished)));
+    }
+}
+
+/// G12 T7: `run_csv_import_inner` integration tests over a temp-file sqlite
+/// connection — same `sqlite_cfg`/`ConnectSpec::Config` fixture shape as
+/// `run_many_tests`.
+#[cfg(test)]
+mod csv_import_tests {
+    use super::*;
+    use crate::csv_import::{ColumnMapping, TargetColumn};
+
+    fn sqlite_cfg(database: String, read_only: bool) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "x".into(),
+            name: "x".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Sqlite,
+            database,
+            host: String::new(),
+            port: None,
+            user: String::new(),
+            read_only,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+        }
+    }
+
+    async fn drive_csv_import(spec: ConnectSpec, job: CsvImportJob) -> Vec<CsvImportEvent> {
+        let handle = tokio::runtime::Handle::current();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let task =
+            tokio::spawn(run_csv_import_inner(spec, job, CancelToken::new(), None, handle, tx));
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        task.await.unwrap();
+        events
+    }
+
+    /// CURATION item 4(b), runtime half: a read-only spec is refused by the
+    /// SHARED guard before any file or DB is touched (a nonsense path
+    /// proves it — same pattern as
+    /// `write_transaction_tests::run_write_transaction_refuses_read_only_connection_without_connecting`).
+    #[tokio::test]
+    async fn run_csv_import_refuses_read_only_spec_without_touching_anything() {
+        let cfg = sqlite_cfg("\0invalid".to_string(), true);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let job = CsvImportJob {
+            path: std::path::PathBuf::from("Z:/does/not/exist.csv"),
+            schema: None,
+            table: "t".to_string(),
+            columns: vec![TargetColumn { name: "id".into(), numeric: true }],
+            mapping: ColumnMapping { targets: vec![Some(0)] },
+        };
+        let events = drive_csv_import(spec, job).await;
+        let guard_msg = guard_not_read_only(true).unwrap_err().message;
+        assert!(events.iter().any(|e| matches!(e,
+            CsvImportEvent::Failed { error } if error.message == guard_msg)));
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn csv_import_commits_all_rows_in_one_transaction() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        {
+            let mut conn = crate::connect::open(f.path().to_str().expect("utf8 path"), &handle)
+                .expect("open sqlite");
+            conn.execute("CREATE TABLE t(id INTEGER, name TEXT, note TEXT)", CancelToken::new())
+                .await
+                .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("rows.csv");
+        std::fs::write(&csv_path, "id,name,note\n1,alice,\n2,\"bob, jr\",''\n").unwrap();
+
+        let cfg = sqlite_cfg(f.path().to_str().unwrap().to_string(), false);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let job = CsvImportJob {
+            path: csv_path,
+            schema: None,
+            table: "t".to_string(),
+            columns: vec![
+                TargetColumn { name: "id".into(), numeric: true },
+                TargetColumn { name: "name".into(), numeric: false },
+                TargetColumn { name: "note".into(), numeric: false },
+            ],
+            mapping: ColumnMapping { targets: vec![Some(0), Some(1), Some(2)] },
+        };
+        let events = drive_csv_import(spec, job).await;
+        assert!(matches!(events.last(), Some(CsvImportEvent::Finished { rows_imported: 2, .. })));
+
+        let mut verify = crate::connect::open(f.path().to_str().unwrap(), &handle).expect("reopen");
+        let mut stream = verify.query("SELECT id, name, note FROM t ORDER BY id", CancelToken::new()).await.unwrap();
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.unwrap()).unwrap();
+        }
+        assert_eq!(buf.row_count(), 2);
+        assert_eq!(buf.cell_text(0, 1), "alice");
+        assert!(buf.cell_is_null(0, 2)); // empty field -> NULL
+        assert_eq!(buf.cell_text(1, 1), "bob, jr");
+        assert_eq!(buf.cell_text(1, 2), "''"); // literal two-quote text, not NULL
+    }
+
+    #[tokio::test]
+    async fn csv_import_rolls_back_everything_on_batch_failure() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        {
+            let mut conn = crate::connect::open(f.path().to_str().expect("utf8 path"), &handle)
+                .expect("open sqlite");
+            conn.execute("CREATE TABLE t(id INTEGER, name TEXT NOT NULL)", CancelToken::new())
+                .await
+                .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("rows.csv");
+        // Last row's `name` field is empty -> NULL -> violates NOT NULL.
+        std::fs::write(&csv_path, "id,name\n1,alice\n2,\n").unwrap();
+
+        let cfg = sqlite_cfg(f.path().to_str().unwrap().to_string(), false);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let job = CsvImportJob {
+            path: csv_path,
+            schema: None,
+            table: "t".to_string(),
+            columns: vec![
+                TargetColumn { name: "id".into(), numeric: true },
+                TargetColumn { name: "name".into(), numeric: false },
+            ],
+            mapping: ColumnMapping { targets: vec![Some(0), Some(1)] },
+        };
+        let events = drive_csv_import(spec, job).await;
+        assert!(matches!(events.last(), Some(CsvImportEvent::Failed { .. })));
+
+        let mut verify = crate::connect::open(f.path().to_str().unwrap(), &handle).expect("reopen");
+        let mut stream = verify.query("SELECT COUNT(*) FROM t", CancelToken::new()).await.unwrap();
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.unwrap()).unwrap();
+        }
+        assert_eq!(buf.cell_text(0, 0), "0"); // nothing partial — zero rows.
+    }
+
+    #[tokio::test]
+    async fn csv_import_batches_by_500() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        {
+            let mut conn = crate::connect::open(f.path().to_str().expect("utf8 path"), &handle)
+                .expect("open sqlite");
+            conn.execute("CREATE TABLE t(id INTEGER)", CancelToken::new()).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("rows.csv");
+        let mut content = String::from("id\n");
+        for i in 0..1100 {
+            content.push_str(&format!("{i}\n"));
+        }
+        std::fs::write(&csv_path, content).unwrap();
+
+        let cfg = sqlite_cfg(f.path().to_str().unwrap().to_string(), false);
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let job = CsvImportJob {
+            path: csv_path,
+            schema: None,
+            table: "t".to_string(),
+            columns: vec![TargetColumn { name: "id".into(), numeric: true }],
+            mapping: ColumnMapping { targets: vec![Some(0)] },
+        };
+        let events = drive_csv_import(spec, job).await;
+        let started =
+            events.iter().filter(|e| matches!(e, CsvImportEvent::BatchStarted { .. })).count();
+        assert_eq!(started, 3); // 500/500/100
+        assert!(matches!(events.last(), Some(CsvImportEvent::Finished { rows_imported: 1100, .. })));
     }
 }
 

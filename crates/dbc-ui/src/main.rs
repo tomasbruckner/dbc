@@ -44,7 +44,10 @@ use gpui::{
 use gpui_platform::application;
 use grid::{GridEvent, ResultGrid};
 use palette::{PaletteAction, PaletteItem};
-use runner::{ConnectSpec, MultiQueryEvent, QueryEvent, QueryRunner, ScriptEvent, ScriptRunOptions};
+use runner::{
+    ConnectSpec, CsvImportEvent, CsvImportJob, MultiQueryEvent, QueryEvent, QueryRunner,
+    ScriptEvent, ScriptRunOptions,
+};
 use schema_tree::{SchemaTree, TreeEvent};
 use sql_input::SqlInput;
 use tabs::{
@@ -477,6 +480,34 @@ fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<Ap
         .child(file_list)
         .child(log_body)
         .into_any_element()
+}
+
+/// G12 T4: any empty CSV field -> SQL NULL, any non-empty field -> a value
+/// (the `csv` crate 1.4.0's `StringRecord` unescapes fields and retains no
+/// "was this quoted" metadata, verified against the resolved crate's source
+/// per Task 4 Step 1 — `a,,c` and `a,"",c` are indistinguishable post-parse,
+/// so the design's quoted-empty-vs-unquoted-empty distinction is
+/// unimplementable without hand-writing an RFC-4180 scanner, which §5
+/// explicitly decided against). Also used by `runner::run_csv_import_inner`
+/// (called there as `crate::csv_field_to_value`) for the actual import, not
+/// just this preview/mapping path — one rule, one place.
+pub(crate) fn csv_field_to_value(field: &str) -> Option<String> {
+    if field.is_empty() { None } else { Some(field.to_string()) }
+}
+
+/// G12 T4: auto-maps CSV headers onto target columns by case-insensitive
+/// name equality; any header with no matching column starts as skipped
+/// (`None`) — the user can still map it manually via the mapping modal's
+/// cycle-button.
+fn default_csv_mapping(
+    headers: &[String],
+    columns: &[csv_import::TargetColumn],
+) -> csv_import::ColumnMapping {
+    let targets = headers
+        .iter()
+        .map(|h| columns.iter().position(|c| c.name.eq_ignore_ascii_case(h)))
+        .collect();
+    csv_import::ColumnMapping { targets }
 }
 
 /// `conn_meta`: `Some((read_only, engine))` — for a saved `ConnectionConfig`
@@ -1414,6 +1445,18 @@ impl AppView {
                                     if let Some(p) = &preview {
                                         g.set_table_name(p.table.clone());
                                         g.set_preview_context(p.schema.clone(), p.key.clone(), p.title.clone());
+                                        // G12 T4: entry-gate half of
+                                        // CURATION item 4(b) — the "Import
+                                        // CSV" toolbar button only exists on
+                                        // a preview tab whose connection is
+                                        // NOT read-only (`conn_meta` is
+                                        // `None` only when neither a saved
+                                        // connection nor a CLI-arg URL
+                                        // resolved, which never reaches
+                                        // `Started` in practice — treated as
+                                        // not-enabled defensively).
+                                        g.csv_import_enabled =
+                                            conn_meta.is_some_and(|(read_only, _)| !read_only);
                                     }
                                     g.set_fk_info(fk_info, ref_cols);
                                     // G5 Task 3: `None` on an ad-hoc tab
@@ -2366,6 +2409,379 @@ impl AppView {
     }
 
     // -----------------------------------------------------------------
+    // G12 T4: CSV import UI — file picker, header/row pre-count peek,
+    // column-mapping modal, batched-execute via `runner::run_csv_import`
+    // (Task 1/T7's sanctioned write path). Reuses Task 3's
+    // `TabContent::ScriptRun` progress-tab kind (`progress_rows` drives the
+    // honest rows-done/rows-total display CSV import needs and script runs
+    // don't). Entry points: `TreeEvent::ImportCsv` (schema tree "⇪") and
+    // `GridEvent::ImportCsvRequested` (preview toolbar "Import CSV") — both
+    // gated read-only at the UI layer (tree icon absent / grid button
+    // absent) AND re-checked here AND by `run_csv_import`'s own shared
+    // guard (CURATION item 4(b), all three layers).
+    // -----------------------------------------------------------------
+
+    /// Schema-tree "⇪" / preview-toolbar "Import CSV" entry point.
+    fn start_csv_import(&mut self, schema: Option<String>, table: String, cx: &mut Context<Self>) {
+        if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
+            return;
+        }
+        if self.cancel.is_some() {
+            return;
+        }
+        if self.active_read_only() {
+            self.status = "error: připojení je jen pro čtení".to_string();
+            cx.notify();
+            return;
+        }
+        let Some(snapshot) = self.tree.read(cx).snapshot() else {
+            self.status = "error: schéma není načteno".to_string();
+            cx.notify();
+            return;
+        };
+        let Some(t) = snapshot.tables.iter().find(|t| t.schema == schema && t.name == table) else {
+            self.status = "error: tabulka nenalezena ve schématu".to_string();
+            cx.notify();
+            return;
+        };
+        let columns: Vec<csv_import::TargetColumn> = t
+            .columns
+            .iter()
+            .map(|c| csv_import::TargetColumn {
+                name: c.name.clone(),
+                numeric: csv_import::is_numeric_type_name(&c.data_type),
+            })
+            .collect();
+
+        self.status = "výběr CSV souboru…".to_string();
+        cx.notify();
+        let dialog = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = match dialog.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
+                Ok(Ok(_)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "výběr zrušen".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = format!("error: dialog selhal: {e}");
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_canceled) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "error: dialog není dostupný".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let is_csv = picked
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
+            if !is_csv {
+                let _ = this.update(cx, |view, cx| {
+                    view.status = "error: vyberte soubor .csv".to_string();
+                    cx.notify();
+                });
+                return;
+            }
+
+            let peek_path = picked.clone();
+            let peek: Result<(Vec<String>, usize, Vec<csv_import::CsvRow>), String> = cx
+                .background_spawn(async move {
+                    let mut reader = csv::Reader::from_path(&peek_path)
+                        .map_err(|e| format!("{}: {e}", peek_path.display()))?;
+                    let headers: Vec<String> = reader
+                        .headers()
+                        .map_err(|e| format!("{}: {e}", peek_path.display()))?
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    let mut row_count = 0usize;
+                    let mut first_rows: Vec<csv_import::CsvRow> = Vec::new();
+                    for rec in reader.records() {
+                        let rec = rec.map_err(|e| format!("{}: {e}", peek_path.display()))?;
+                        if first_rows.len() < csv_import::CSV_IMPORT_BATCH_SIZE {
+                            first_rows.push(rec.iter().map(csv_field_to_value).collect());
+                        }
+                        row_count += 1;
+                    }
+                    Ok((headers, row_count, first_rows))
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| match peek {
+                Ok((headers, row_count, first_rows)) => {
+                    let mapping = default_csv_mapping(&headers, &columns);
+                    let sample_sql = csv_import::generate_insert_batches(
+                        schema.as_deref(),
+                        &table,
+                        &columns,
+                        &mapping,
+                        &first_rows,
+                    );
+                    let (sample_sql, error) = match sample_sql {
+                        Ok(stmts) => (stmts.into_iter().next(), None),
+                        Err(msg) => (None, Some(msg)),
+                    };
+                    view.status = String::new();
+                    view.modal = Some(connections_ui::ModalState::CsvImport {
+                        path: picked,
+                        schema,
+                        table,
+                        headers,
+                        columns,
+                        targets: mapping.targets,
+                        row_count,
+                        first_rows,
+                        sample_sql,
+                        error,
+                    });
+                    cx.notify();
+                }
+                Err(e) => {
+                    view.status = format!("error: {e}");
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The mapping modal's per-header cycle-button — `(přeskočit)` -> each
+    /// target column in order, wrapping back to `(přeskočit)`.
+    fn cycle_csv_target(&mut self, header_ix: usize, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::CsvImport { targets, columns, .. }) = &mut self.modal
+        {
+            if let Some(t) = targets.get_mut(header_ix) {
+                *t = match *t {
+                    None if columns.is_empty() => None,
+                    None => Some(0),
+                    Some(i) if i + 1 < columns.len() => Some(i + 1),
+                    Some(_) => None,
+                };
+            }
+        }
+        self.recompute_csv_sample(cx);
+    }
+
+    /// Recomputes `sample_sql`/`error` from the REAL first batch on every
+    /// mapping change (never a synthetic example) — an `Err` (duplicate
+    /// target) fills `error` and disables "Spustit import" (see
+    /// `render_csv_import_panel`'s `can_run` gate).
+    fn recompute_csv_sample(&mut self, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::CsvImport {
+            schema,
+            table,
+            columns,
+            targets,
+            first_rows,
+            sample_sql,
+            error,
+            ..
+        }) = &mut self.modal
+        {
+            let mapping = csv_import::ColumnMapping { targets: targets.clone() };
+            match csv_import::generate_insert_batches(
+                schema.as_deref(),
+                table,
+                columns.as_slice(),
+                &mapping,
+                first_rows.as_slice(),
+            ) {
+                Ok(stmts) => {
+                    *sample_sql = stmts.into_iter().next();
+                    *error = if sample_sql.is_none() {
+                        Some("žádný sloupec není namapován".to_string())
+                    } else {
+                        None
+                    };
+                }
+                Err(msg) => {
+                    *sample_sql = None;
+                    *error = Some(msg);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// „Spustit import“ — closes the modal, opens the `TabContent::ScriptRun`
+    /// progress tab (`progress_rows: Some((0, row_count))`), and drains
+    /// `runner::run_csv_import`'s event stream.
+    fn confirm_csv_import(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::CsvImport {
+            path,
+            schema,
+            table,
+            columns,
+            targets,
+            row_count,
+            error,
+            ..
+        }) = self.modal.clone()
+        else {
+            return;
+        };
+        if error.is_some() {
+            return; // "Spustit import" is rendered disabled in this state too.
+        }
+        let Some((_, timeout_secs, _, spec)) = self.resolve_spec_for_explain(cx) else {
+            self.modal = None;
+            return;
+        };
+        self.modal = None;
+
+        let mapping = csv_import::ColumnMapping { targets };
+        let job = CsvImportJob { path: path.clone(), schema, table: table.clone(), columns, mapping };
+
+        let batch_count = row_count.div_ceil(csv_import::CSV_IMPORT_BATCH_SIZE);
+        let state = Rc::new(RefCell::new(ScriptRunState {
+            files: Vec::new(),
+            total_statements: batch_count,
+            statements_run: 0,
+            statements_failed: 0,
+            total_affected: 0,
+            progress_rows: Some((0, row_count as u64)),
+            log: std::collections::VecDeque::new(),
+            outcome: ScriptRunOutcome::Running,
+            started_at: std::time::Instant::now(),
+            elapsed: None,
+        }));
+
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        let conn_identity = self.current_conn_identity();
+        self.tabs.open(ResultTab {
+            id: 0,
+            title: format!("CSV import: {file_name}"),
+            pinned: false,
+            preview_key: None,
+            conn_identity,
+            content: TabContent::ScriptRun { state: state.clone() },
+        });
+
+        let cancel = CancelToken::new();
+        self.cancel = Some(cancel.clone());
+        self.run_generation += 1;
+        let my_generation = self.run_generation;
+        self.status = format!("CSV import {file_name}…");
+        cx.notify();
+
+        let history_started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let history_conn_name = self.active_connection_name_for_history();
+        let run_cancel = cancel.clone();
+        let mut rx = self.runner.run_csv_import(spec, job, run_cancel, timeout_secs);
+
+        cx.spawn(async move |this, cx| {
+            while let Some(ev) = rx.recv().await {
+                let stop = this
+                    .update(cx, |view, cx| {
+                        match ev {
+                            CsvImportEvent::BatchStarted { batch_index, rows_in_batch } => {
+                                let mut s = state.borrow_mut();
+                                s.push_log(format!("▶ dávka #{} ({rows_in_batch} řádků)", batch_index + 1));
+                            }
+                            CsvImportEvent::BatchFinished { batch_index, rows_committed_so_far } => {
+                                let mut s = state.borrow_mut();
+                                s.statements_run += 1;
+                                s.progress_rows = Some((rows_committed_so_far, row_count as u64));
+                                s.push_log(format!(
+                                    "✓ dávka #{} — celkem {rows_committed_so_far} řádků",
+                                    batch_index + 1
+                                ));
+                            }
+                            CsvImportEvent::Failed { error } => {
+                                {
+                                    let mut s = state.borrow_mut();
+                                    s.statements_failed += 1;
+                                    s.outcome = if cancel.is_cancelled() {
+                                        ScriptRunOutcome::Cancelled
+                                    } else {
+                                        ScriptRunOutcome::Failed
+                                    };
+                                    s.push_log(format!(
+                                        "✗ chyba: {error} — import zrušen, žádná data nezapsána"
+                                    ));
+                                }
+                                let err_text = error.to_string();
+                                view.record_history(
+                                    &format!("[CSV import] {} → {table}", path.display()),
+                                    &history_conn_name,
+                                    history_started_at,
+                                    None,
+                                    Some(0),
+                                    Some(&err_text),
+                                    cx,
+                                );
+                                view.status = format!("CSV import selhal: {error}");
+                                if view.run_generation == my_generation {
+                                    view.cancel = None;
+                                }
+                            }
+                            CsvImportEvent::Finished { rows_imported, elapsed } => {
+                                {
+                                    let mut s = state.borrow_mut();
+                                    s.outcome = ScriptRunOutcome::Done;
+                                    s.elapsed = Some(elapsed);
+                                    s.progress_rows = Some((rows_imported, row_count as u64));
+                                }
+                                let hist_sql = format!(
+                                    "[CSV import] {} → {table} ({rows_imported} řádků, dávka {})",
+                                    path.display(),
+                                    csv_import::CSV_IMPORT_BATCH_SIZE
+                                );
+                                view.record_history(
+                                    &hist_sql,
+                                    &history_conn_name,
+                                    history_started_at,
+                                    Some(elapsed.as_millis() as i64),
+                                    Some(rows_imported as i64),
+                                    None,
+                                    cx,
+                                );
+                                view.status = format!("CSV import hotovo: {rows_imported} řádků");
+                                if view.run_generation == my_generation {
+                                    view.cancel = None;
+                                }
+                            }
+                        }
+                        cx.notify();
+                        false
+                    })
+                    .unwrap_or(false);
+                if stop {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |view, cx| {
+                if view.run_generation == my_generation {
+                    view.cancel = None;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // -----------------------------------------------------------------
     // G13 T6: "Vysvětlit"/"Analyzovat" status-bar buttons — dispatch,
     // three-case write gate (design §5), and the resulting `TabContent::Plan`
     // tab. See `plan.rs`'s module doc comment / the design's §3-novela
@@ -2721,11 +3137,13 @@ impl AppView {
                 // always cancels the values dialog (no run, no persistence,
                 // same contract as its "Zrušit" button/`cancel_query_params`).
                 connections_ui::ModalState::QueryParams { .. } => true,
-                // G12 T3: no run has started yet (that only happens on
-                // "Spustit" — see `confirm_script_run`) and it holds no
-                // unsaved secret state, so Esc closing it is safe — same
-                // reasoning `QueryParams` documents above.
+                // G12 T3/T4: no run has started yet (that only happens on
+                // "Spustit"/"Spustit import" — see
+                // `confirm_script_run`/`confirm_csv_import`) and neither
+                // holds unsaved secret state, so Esc closing them is safe —
+                // same reasoning `QueryParams` documents above.
                 connections_ui::ModalState::ScriptRun { .. } => true,
+                connections_ui::ModalState::CsvImport { .. } => true,
                 _ => false,
             };
             if closable {
@@ -3764,6 +4182,18 @@ impl AppView {
             GridEvent::ViewChanged => {
                 self.save_view_prefs_for_grid(&emitter, cx);
             }
+            GridEvent::ImportCsvRequested { schema, table } => {
+                // CURATION item 4(b): belt-and-braces re-check above the
+                // button's own gating (`csv_import_enabled` set only for a
+                // non-read-only preview) AND the runner's own up-front
+                // guard in `run_csv_import`.
+                if self.active_read_only() {
+                    self.status = "error: připojení je jen pro čtení".to_string();
+                    cx.notify();
+                    return;
+                }
+                self.start_csv_import(schema.clone(), table.clone(), cx);
+            }
         }
     }
 
@@ -3915,6 +4345,19 @@ impl AppView {
             return self.config.connections.iter().find(|c| &c.id == id).map(|c| c.engine);
         }
         self.conn_url.as_deref().map(engine_from_url)
+    }
+
+    /// G12 T4: `cfg.read_only` for the active saved connection, or `false`
+    /// for the CLI-arg URL path (no read-only concept there — same
+    /// convention `run_query_with`'s own spec resolution applies) and for
+    /// "no active connection at all" (nothing to gate CSV import against
+    /// yet). Feeds `SchemaTree::set_read_only` (the tree's ⇪ affordance)
+    /// and `grid.rs`'s `csv_import_enabled` flag.
+    fn active_read_only(&self) -> bool {
+        if let Some(id) = &self.active_connection_id {
+            return self.config.connections.iter().find(|c| &c.id == id).is_some_and(|c| c.read_only);
+        }
+        false
     }
 
     /// Opens (or re-activates) the monitor tab for the active connection.
@@ -4428,9 +4871,11 @@ impl AppView {
                         // too since `set_snapshot` doesn't touch it.
                         let favourites = view.config.favourite_objects.clone();
                         let active_id = view.active_connection_id.clone();
+                        let read_only = view.active_read_only();
                         view.tree.update(cx, |t, cx| {
                             t.set_snapshot(snapshot, same_connection, cx);
                             t.set_favourites(favourites, active_id, cx);
+                            t.set_read_only(read_only, cx);
                         });
                         // Review round 3, MAJOR 1: a new snapshot landing
                         // (connection switch OR a same-connection refresh)
@@ -4507,6 +4952,9 @@ impl AppView {
             }
             TreeEvent::OpenErDiagram { schema } => {
                 self.open_er_diagram(schema.clone(), cx);
+            }
+            TreeEvent::ImportCsv { schema, table } => {
+                self.start_csv_import(schema.clone(), table.clone(), cx);
             }
         }
     }
@@ -5635,6 +6083,31 @@ mod script_ui_tests {
         assert!(s.contains("7 příkazů"));
         assert!(s.contains("6 OK"));
         assert!(s.contains("1 chyb"));
+    }
+}
+
+/// G12 T4: pure-helper tests behind the CSV import mapping modal —
+/// `default_csv_mapping`/`csv_field_to_value`.
+#[cfg(test)]
+mod csv_ui_tests {
+    use super::*;
+
+    #[test]
+    fn default_csv_mapping_matches_names_case_insensitively() {
+        let headers = vec!["ID".to_string(), "Name".to_string(), "extra".to_string()];
+        let cols = vec![
+            csv_import::TargetColumn { name: "id".into(), numeric: true },
+            csv_import::TargetColumn { name: "name".into(), numeric: false },
+        ];
+        let m = default_csv_mapping(&headers, &cols);
+        assert_eq!(m.targets, vec![Some(0), Some(1), None]);
+    }
+
+    #[test]
+    fn csv_field_to_value_empty_is_null() {
+        assert_eq!(csv_field_to_value(""), None);
+        assert_eq!(csv_field_to_value("0"), Some("0".to_string()));
+        assert_eq!(csv_field_to_value(" "), Some(" ".to_string()));
     }
 }
 

@@ -996,6 +996,28 @@ pub enum ModalState {
         read_only: bool,
         timeout_secs: Option<u64>,
     },
+    /// G12 T4: CSV import mapping modal (design §5) — opened once the file
+    /// picker + header/row pre-count pass resolve (`AppView::start_csv_import`).
+    /// `targets` is the live mapping being edited
+    /// (`AppView::cycle_csv_target`); `sample_sql` is recomputed on every
+    /// mapping change (`AppView::recompute_csv_sample`) from the REAL first
+    /// batch, never a synthetic example — an `Err` from
+    /// `csv_import::generate_insert_batches` (duplicate target) fills
+    /// `error` and disables "Spustit import". Same "re-resolve the spec
+    /// fresh at confirm time" posture as `ScriptRun` above — this modal only
+    /// carries display/editing data.
+    CsvImport {
+        path: std::path::PathBuf,
+        schema: Option<String>,
+        table: String,
+        headers: Vec<String>,
+        columns: Vec<crate::csv_import::TargetColumn>,
+        targets: Vec<Option<usize>>,
+        row_count: usize,
+        first_rows: Vec<crate::csv_import::CsvRow>,
+        sample_sql: Option<String>,
+        error: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------
@@ -1144,6 +1166,19 @@ impl AppView {
                 read_only,
                 timeout_secs,
                 cx,
+            ),
+            ModalState::CsvImport {
+                path,
+                table,
+                headers,
+                columns,
+                targets,
+                row_count,
+                sample_sql,
+                error,
+                ..
+            } => render_csv_import_panel(
+                &path, &table, &headers, &columns, &targets, row_count, &sample_sql, &error, cx,
             ),
         };
         Some(
@@ -2490,6 +2525,130 @@ fn render_script_run_confirm_panel(
                         .on_click(cx.listener(|v, _, _, cx| v.confirm_script_run(cx))),
                 ),
         );
+    panel.into_any_element()
+}
+
+/// G12 T4: `ModalState::CsvImport`'s mapping panel — file path, target
+/// table, per-header mapping row (a lightweight cycle-button through
+/// "(přeskočit)" -> each target column, same idiom as the grid's "Export ▾"
+/// menu rather than a real dropdown — `AppView::cycle_csv_target`), exact
+/// row count, the fixed batch size, and the REAL first batch's `INSERT`
+/// verbatim (recomputed on every mapping change by
+/// `AppView::recompute_csv_sample`) in a scrollable monospace box. A
+/// duplicate-target `error` disables "Spustit import".
+#[allow(clippy::too_many_arguments)]
+fn render_csv_import_panel(
+    path: &std::path::Path,
+    table: &str,
+    headers: &[String],
+    columns: &[crate::csv_import::TargetColumn],
+    targets: &[Option<usize>],
+    row_count: usize,
+    sample_sql: &Option<String>,
+    error: &Option<String>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let mut mapping_rows = div().flex().flex_col().gap_1().max_h(px(220.)).overflow_hidden();
+    for (ix, header) in headers.iter().enumerate() {
+        let target_label = targets
+            .get(ix)
+            .copied()
+            .flatten()
+            .and_then(|t| columns.get(t))
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "(přeskočit)".to_string());
+        mapping_rows = mapping_rows.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(div().w(px(160.)).text_color(rgb(0xa6adc8)).child(header.clone()))
+                .child(
+                    div()
+                        .id(("csv-target-cycle", ix))
+                        .px_2()
+                        .py_1()
+                        .bg(rgb(0x313244))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .child(format!("→ {target_label}"))
+                        .on_click(cx.listener(move |v, _, _, cx| v.cycle_csv_target(ix, cx))),
+                ),
+        );
+    }
+
+    let mut panel = div()
+        .id("csv-import-modal")
+        .w(px(600.))
+        .bg(rgb(0x1e1e2e))
+        .border_1()
+        .border_color(rgb(0x45475a))
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(rgb(0xcdd6f4))
+        .child(div().text_size(px(16.)).child(format!("Import CSV do {table}")))
+        .child(div().text_color(rgb(0xa6adc8)).child(path.display().to_string()))
+        .child(mapping_rows)
+        .child(div().text_color(rgb(0xa6adc8)).child(format!(
+            "{row_count} řádků · dávka: {} řádků",
+            crate::csv_import::CSV_IMPORT_BATCH_SIZE
+        )))
+        .child(
+            div()
+                .text_color(rgb(0xa6adc8))
+                .child("prázdné pole → NULL; hlavičkový řádek je povinný"),
+        );
+
+    if let Some(sql) = sample_sql {
+        panel = panel.child(
+            div()
+                .id("csv-sample-sql")
+                .max_h(px(140.))
+                .overflow_hidden()
+                .p_1()
+                .bg(rgb(0x181825))
+                .rounded_md()
+                .text_color(rgb(0xa6adc8))
+                .font_family("Consolas")
+                .whitespace_normal()
+                .child(sql.clone()),
+        );
+    }
+    if let Some(e) = error {
+        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {e}")));
+    }
+
+    let can_run = error.is_none() && sample_sql.is_some();
+    let confirm_btn = if can_run {
+        styled_button("csv-import-confirm-btn", "Spustit import")
+            .on_click(cx.listener(|v, _, _, cx| v.confirm_csv_import(cx)))
+            .into_any_element()
+    } else {
+        div()
+            .id("csv-import-confirm-btn")
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0x313244))
+            .text_color(rgb(0x6c7086))
+            .child("Spustit import")
+            .into_any_element()
+    };
+
+    panel = panel.child(
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .justify_end()
+            .mt_2()
+            .child(styled_button("csv-import-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+            .child(confirm_btn),
+    );
     panel.into_any_element()
 }
 

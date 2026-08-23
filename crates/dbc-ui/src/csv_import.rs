@@ -12,12 +12,8 @@
 //!
 //! T7 (CSV import UI) is what actually calls into this module (file picker,
 //! header peek, mapping modal, row pre-count, the runner method that drives
-//! `generate_insert_batches` against a real connection) -- until then
-//! nothing in the app calls these items, hence the module-level
-//! `#![allow(dead_code)]`, matching the same convention `sandbox.rs` and
-//! `tunnel.rs` use for not-yet-wired pure modules.
-
-#![allow(dead_code)]
+//! `generate_insert_batches` against a real connection) -- wired in by
+//! `runner::run_csv_import`/`main.rs`'s CSV import UI.
 
 use std::collections::HashSet;
 
