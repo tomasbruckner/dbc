@@ -79,20 +79,20 @@ block: terse, one decision per bullet, no TBDs.
   with_writer(std::io::stderr)`) — called out explicitly because it's a
   real footgun (a stray `println!` anywhere in `dbc-mcp` or a transitive
   dep corrupts the protocol stream).
-- **User-facing setup (Claude Code):**
-  `claude mcp add dbc --env DBC_MCP_MASTER_PASSWORD=<pw> -- dbc-mcp`
+- **User-facing setup (Claude Code), per the §3 curation override:** first
+  run `dbc-mcp setup` once in a terminal (stores the derived key in the OS
+  credential store), then register with NO secrets in the config:
+  `claude mcp add dbc -- dbc-mcp`
   (optionally `--config <path>` / `--vault <path>` flags if the user keeps
   non-default file locations; defaults match `dbc-ui`'s own
   `dbc_state::config::default_config_path()` /
   `vault::default_vault_path()`, i.e. `%APPDATA%/dbc/{config.toml,
   vault.bin}` on Windows / `~/.config/dbc/...` elsewhere via the `dirs`
   crate).
-- **Claude Desktop:** equivalent `claude_desktop_config.json` entry:
+- **Claude Desktop:** equivalent `claude_desktop_config.json` entry (no
+  `env` block — nothing secret belongs in this file):
   ```json
-  "dbc": {
-    "command": "dbc-mcp",
-    "env": { "DBC_MCP_MASTER_PASSWORD": "<pw>" }
-  }
+  "dbc": { "command": "dbc-mcp" }
   ```
 - No HTTP/SSE transport in v1 (non-goal — see §3 unlock-model discussion
   for why an "always-unlocked GUI-hosted server" would need a non-stdio
@@ -145,18 +145,19 @@ Two options considered, per the brief:
     user-bound (DPAPI), revocable via `setup --remove` or by re-keying
     the vault; nothing secret ever appears in the MCP client's config —
     the registration is just `claude mcp add dbc -- dbc-mcp` with no env.
-- **Fail closed:** missing env var, wrong password, or a corrupt vault
-  file all produce a one-line stderr message and a non-zero exit *before*
-  the stdio server loop starts — never a silent "no vault" mode with every
-  connection unusable but the process pretending to be healthy.
+- **Fail closed:** missing/undecryptable Credential Manager entry, wrong
+  key, or a corrupt vault file all produce a one-line stderr message and a
+  non-zero exit *before* the stdio server loop starts — never a silent "no
+  vault" mode with every connection unusable but the process pretending to
+  be healthy. (Updated for the curation override — originally worded for
+  the rejected env-var model.)
 - **Explicit tradeoff vs. the GUI:** the GUI prompts interactively once
-  per app start and never persists the master password anywhere. The MCP
-  path instead persists it at rest in the *MCP client's own* config file
-  (`claude_desktop_config.json` / Claude Code's server registry) — a
-  strictly weaker guarantee, stated plainly rather than glossed over. An
-  OS-keychain-backed unlock is a named **v2** improvement, not designed
-  further here (no TBD in v1's design: v1 ships with the env-var model,
-  full stop).
+  per app start and never persists anything. The MCP path persists the
+  DERIVED KEY (never the password) in the OS credential store,
+  DPAPI-encrypted and user-bound, revocable via `dbc-mcp setup --remove`
+  or by re-keying the vault. Nothing secret appears in the MCP client's
+  config file. (This section originally described the rejected env-var
+  model; superseded by the §3 curation override.)
 - Per-connection secrets: once the vault is unlocked, `dbc-mcp` resolves a
   connection's password via `vault.get_secret(cfg.id)`, exactly like
   `dbc-ui`'s `main.rs` (`self.vault.as_ref().and_then(|v|
@@ -365,8 +366,8 @@ other two:
   Test: hand-build a `SchemaSnapshot`, serialize, assert the JSON shape
   matches §5's documented contract (field names, nesting) — this is the
   contract `get_schema`'s handler relies on.
-- **T3 — `dbc-mcp` connect + vault unlock.** `DBC_MCP_MASTER_PASSWORD` →
-  `Vault::unlock` (fail closed, §3); `AppConfig::load`; `open_for_mcp(cfg,
+- **T3 — `dbc-mcp` connect + vault unlock.** Credential-store key →
+  `Vault::unlock_with_key` (fail closed, §3 curation override); `AppConfig::load`; `open_for_mcp(cfg,
   secret)` forcing read-only unconditionally at the driver layer (§4
   layer 2), erroring on `Engine::Mssql` and on any `ssh: Some(_)` config
   (§1 non-goal). No `Tunnel`/SSH dependency at all. Test (sqlite fixture,
@@ -458,12 +459,14 @@ integration point. T9 last.
   measured** against a real large-schema fixture (e.g. a few-hundred-table
   warehouse schema). Flagged as tune-after-first-real-use, not a hard v1
   requirement to get exactly right.
-- **`DBC_MCP_MASTER_PASSWORD` exposure window** (process environment
-  during startup before `remove_var`; at-rest in the MCP client's own
-  config file) is an accepted v1 risk, restated here rather than only in
-  §3 — this is the single biggest security tradeoff in this design and
-  deserves to be visible in the risk list, not just buried in the
-  rationale that led to it.
+- **Derived-key at rest in the OS credential store** (per the §3 curation
+  override) is the design's main security tradeoff: DPAPI-encrypted and
+  user-bound, but any process running as the user can read it via the
+  keyring API. Accepted for v1 (same trust model as every OS-keychain-based
+  credential helper); revocable via `dbc-mcp setup --remove` or re-keying
+  the vault. The originally-drafted env-var password model (strictly
+  weaker: plaintext at rest in the MCP client config) was rejected in
+  curation and is NOT shipped.
 - **Postgres read-only is session-level, not per-statement.**
   `default_transaction_read_only=on` is set once via `options()` at
   connect time — a known limitation already accepted by the GUI's own
