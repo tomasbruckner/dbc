@@ -1259,7 +1259,15 @@ impl AppView {
     ) -> Option<PreviewTarget> {
         let store = self.view_prefs.as_ref()?;
         let conn_id = self.active_connection_id.clone()?;
-        let prefs = store.get(&conn_id, p.schema.as_deref(), &p.table)?.clone();
+        // No saved entry is NOT an early return: a `from_join_change` run on
+        // a table with no prior prefs must still reach the Save branch below
+        // (re-review issue 3 — otherwise the very first join on a virgin
+        // table never persists). Default prefs = nothing to apply, no saved
+        // joins.
+        let prefs = store
+            .get(&conn_id, p.schema.as_deref(), &p.table)
+            .cloned()
+            .unwrap_or_default();
         let (sort, hidden, widths) = view_prefs_to_grid_state(&prefs, headers);
         grid.update(cx, |g, _| {
             g.set_view_state(sort, hidden);
