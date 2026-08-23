@@ -1262,15 +1262,32 @@ impl AppView {
         let spec_a = ConnectSpec::Config { cfg: Box::new(cfg_a.clone()), secret: secret_a.clone() };
         let spec_b = ConnectSpec::Config { cfg: Box::new(cfg_b.clone()), secret: secret_b.clone() };
         let rx = self.runner.fetch_schema_pair(spec_a, spec_b);
-        let pending = crate::PendingCompare {
-            label_a,
-            label_b,
+
+        // design §3: the Compare tab opens IMMEDIATELY (`CompareLoadState::
+        // Loading`, "Načítám schéma…") — `on_compare_schema_pair_ready`
+        // (main.rs) updates this SAME entity in place once the fetch
+        // resolves, rather than a second entity/tab being created then.
+        let view = cx.new(|_| crate::compare::CompareView {
+            label_a: label_a.clone(),
+            label_b: label_b.clone(),
             conn_a: cfg_a,
             secret_a,
             conn_b: cfg_b,
             secret_b,
-            generation: my_generation,
-        };
+            state: crate::compare::CompareLoadState::Loading,
+            selection: crate::compare::CompareSelection::None,
+            show_unchanged: crate::compare::ShowUnchanged::default(),
+            show_ddl_diff: false,
+        });
+        self.tabs.open(crate::tabs::ResultTab {
+            id: 0,
+            title: crate::tabs::collapse_title(&format!("Porovnání: {label_a} ↔ {label_b}")),
+            pinned: false,
+            preview_key: None,
+            conn_identity: self.current_conn_identity(),
+            content: crate::tabs::TabContent::Compare { view: view.clone() },
+        });
+        let pending = crate::PendingCompare { view, generation: my_generation };
 
         cx.spawn(async move |this, cx| {
             let result = rx.await;

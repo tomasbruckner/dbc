@@ -1,4 +1,5 @@
 mod autocomplete;
+mod compare;
 mod connect;
 mod connections_ui;
 mod export;
@@ -599,29 +600,18 @@ struct DiscardConfirmState {
     action: PendingDiscard,
 }
 
-/// G7 T6: the pending-fetch state `connections_ui::confirm_compare_dialog`
+/// G7 T7: the pending-fetch state `connections_ui::confirm_compare_dialog`
 /// hands to `AppView::on_compare_schema_pair_ready` once `fetch_schema_pair`
-/// resolves. `label_a`/`label_b` are precomputed display labels ("{name}
-/// ({engine})") for the eventual Compare tab title; `conn_a`/`conn_b` +
-/// their secrets are carried through so a failed-leg retry (T7's error
-/// banner) can re-dispatch without re-resolving the vault. `generation`
-/// mirrors `schema_fetch_generation`'s guard shape — a newer dispatch's
-/// result always wins over an older, still-in-flight one.
-///
-/// `#[allow(dead_code)]`: deviation from the plan's literal Step 6 note
-/// (which expected only the stub *function* to need an allow) — with
-/// `on_compare_schema_pair_ready`'s body still a T7-completed stub, every
-/// field here is constructed by `confirm_compare_dialog` but never READ
-/// anywhere yet, which is a per-field dead-code warning, not a per-function
-/// one. Removed once T7's real body reads these fields.
-#[allow(dead_code)] // fields read by T7's real on_compare_schema_pair_ready body
+/// resolves. The Compare tab (and its `CompareView` entity, in
+/// `CompareLoadState::Loading`) is opened immediately at dispatch time —
+/// `view` is that SAME entity, updated in place once the fetch resolves
+/// (rather than a second entity being constructed here), so the tab
+/// actually shows "Načítám schéma…" for the duration of the fetch instead
+/// of only appearing once it's already done. `generation` mirrors
+/// `schema_fetch_generation`'s guard shape — a newer dispatch's result
+/// always wins over an older, still-in-flight one.
 pub(crate) struct PendingCompare {
-    pub label_a: String,
-    pub label_b: String,
-    pub conn_a: dbc_state::ConnectionConfig,
-    pub secret_a: Option<String>,
-    pub conn_b: dbc_state::ConnectionConfig,
-    pub secret_b: Option<String>,
+    pub view: Entity<compare::CompareView>,
     pub generation: u64,
 }
 
@@ -1336,6 +1326,7 @@ impl AppView {
                                             TabContent::Text { .. } => None,
                                             TabContent::Monitor { .. } => None,
                                             TabContent::Plan { .. } => None,
+                                            TabContent::Compare { .. } => None,
                                         }
                                     })
                                 });
@@ -3211,6 +3202,7 @@ impl AppView {
             TabContent::Text { .. } => return,
             TabContent::Monitor { .. } => return,
             TabContent::Plan { .. } => return,
+            TabContent::Compare { .. } => return,
         };
         let current_identity = self.current_conn_identity();
         if !conn_identity_matches(&tab_conn_identity, &current_identity) {
@@ -3465,22 +3457,45 @@ impl AppView {
         .detach();
     }
 
-    /// G7 T6 stub: `#[allow(dead_code)]` — T7 opens the Compare tab here
-    /// (design §3). Signature matches `confirm_compare_dialog`'s dispatch:
-    /// `pending` carries the resolved connections/secrets/labels;
-    /// `result` is `fetch_schema_pair`'s oneshot outcome (an `Err` is the
-    /// channel closing — the runner task panicked or was dropped, which
-    /// never happens in normal operation, but is still a `Result`, not an
-    /// `unwrap`, same posture `trigger_schema_fetch` takes on its own
-    /// oneshot).
-    #[allow(dead_code)] // body completed by T7
+    /// G7 T7: computes `mode` from the two connections' engines, runs
+    /// `dbc_diff::schema_diff::diff_schema`, and updates the ALREADY-OPEN
+    /// Compare tab's `CompareView` entity (`pending.view`, created and
+    /// opened by `connections_ui::confirm_compare_dialog` in
+    /// `CompareLoadState::Loading` at dispatch time — design §3) in place.
+    /// `result`'s `Err` case (the oneshot channel closing — the runner task
+    /// panicked/dropped, which never happens in normal operation, but is
+    /// still a `Result`, not an `unwrap`, same posture `trigger_schema_fetch`
+    /// takes on its own oneshot) surfaces as a `CompareLoadState::Error` on
+    /// BOTH legs rather than leaving the tab stuck on "Načítám schéma…".
     pub(crate) fn on_compare_schema_pair_ready(
         &mut self,
-        _pending: PendingCompare,
-        _result: Result<(Result<SchemaSnapshot, QueryError>, Result<SchemaSnapshot, QueryError>), tokio::sync::oneshot::error::RecvError>,
-        _cx: &mut Context<Self>,
+        pending: PendingCompare,
+        result: Result<(Result<SchemaSnapshot, QueryError>, Result<SchemaSnapshot, QueryError>), tokio::sync::oneshot::error::RecvError>,
+        cx: &mut Context<Self>,
     ) {
-        // T7 fills this in.
+        let (result_a, result_b) = result.unwrap_or_else(|_| {
+            let cancelled = || Err(QueryError::msg("fetch zrušen".to_string()));
+            (cancelled(), cancelled())
+        });
+        let (engine_a, engine_b) = pending.view.read(cx).engines();
+        let mode = if engine_a == engine_b {
+            dbc_diff::schema_diff::CompareMode::SameEngine
+        } else {
+            dbc_diff::schema_diff::CompareMode::CrossEngine
+        };
+        let state = match (result_a, result_b) {
+            (Ok(snap_a), Ok(snap_b)) => {
+                let diff = dbc_diff::schema_diff::diff_schema(&snap_a, &snap_b, mode);
+                compare::CompareLoadState::Ready { diff, mode }
+            }
+            (a, b) => compare::CompareLoadState::Error { a: a.err(), b: b.err() },
+        };
+        pending.view.update(cx, |v, cx| {
+            v.state = state;
+            cx.notify();
+        });
+        self.status = "Porovnání schématu dokončeno".to_string();
+        cx.notify();
     }
 
     /// `SchemaTree`'s `TreeEvent` subscription (wired in `main`). G2 Task 7:
@@ -3557,6 +3572,7 @@ impl AppView {
                     TabContent::Text { .. } => (0, false),
                     TabContent::Monitor { .. } => (0, false),
                     TabContent::Plan { .. } => (0, false),
+                    TabContent::Compare { .. } => (0, false),
                 };
                 // G5 Task 3, brief contract #7: dirty (unapplied staged
                 // edits) tabs get a " •" title suffix — the apply bar
@@ -3709,6 +3725,7 @@ impl AppView {
             }
             TabContent::Monitor { view } => view.clone().into_any_element(),
             TabContent::Plan { view } => view.clone().into_any_element(),
+            TabContent::Compare { view } => view.clone().into_any_element(),
         }
     }
 
