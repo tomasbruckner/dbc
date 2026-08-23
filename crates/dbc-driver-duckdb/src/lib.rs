@@ -20,6 +20,18 @@ pub struct DuckdbConnection {
     /// the underlying database open (and the process-wide [`registry`] entry
     /// alive) for as long as this `DuckdbConnection` exists, even between
     /// calls where nothing is actively running.
+    ///
+    /// This is not the only thing that can keep an entry alive, though:
+    /// `query`/`schema`'s `spawn_blocking` closures `move`-capture their OWN
+    /// clone of this same `Arc` (see their bodies below), independent of
+    /// `self.root`. That's intentional — a streaming `query()` whose
+    /// `QueryStream` outlives a `drop(self)` (e.g. the owning
+    /// `DuckdbConnection` is dropped while a caller is still draining
+    /// `batches`) must keep the underlying database open until that
+    /// background task actually finishes, not just until this struct goes
+    /// away. So an entry's true lifetime is "at least as long as any
+    /// `DuckdbConnection` bound to it, or any in-flight `query`/`schema`
+    /// call spawned from one, whichever is longer."
     root: Option<Arc<RegistryEntry>>,
     /// Lazily-cloned-from-root connection reused across [`Connection::
     /// execute`] calls so a `BEGIN … COMMIT`/`ROLLBACK` sequence runs over
@@ -231,6 +243,19 @@ fn mixed_mode_error(path: &Path, existing_read_only: bool, requested_read_only: 
 /// Looks up (or lazily creates) the shared root for `path`, enforcing the
 /// mixed-mode policy documented on [`mixed_mode_error`]. See the
 /// [`RegistryEntry`] doc comment for the overall design this is part of.
+///
+/// IMPORTANT for future maintainers: `map` (the registry `Mutex`) is held
+/// for the ENTIRE function body, including the `open_conn` call below. That
+/// is deliberate, not an oversight to "optimize" by narrowing the lock to
+/// just the map lookup/insert. `open_conn` is what actually creates a new
+/// OS-level file handle; if two threads raced to create a root for the same
+/// never-before-seen path with the lock released around `open_conn`, both
+/// would call `open_conn` concurrently and one would lose to the exact
+/// double-open conflict this whole registry exists to prevent (see the
+/// [`RegistryEntry`] doc comment). Holding the lock across the call
+/// serializes root creation per path — the second thread to reach this
+/// function for the same path blocks until the first one has inserted its
+/// `Weak` and returns, upgrades it, and never calls `open_conn` at all.
 fn get_or_create_root(path: &Path, read_only: bool) -> Result<Arc<RegistryEntry>, QueryError> {
     let key = canonical_key(path);
     let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
@@ -246,6 +271,7 @@ fn get_or_create_root(path: &Path, read_only: bool) -> Result<Arc<RegistryEntry>
         return Ok(existing);
     }
 
+    // Still holding `map`'s lock here — see the doc comment above.
     let conn = open_conn(path, read_only).map_err(|e| translate_open_error(e, path))?;
     let entry = Arc::new(RegistryEntry { root: Mutex::new(conn), read_only });
     map.insert(key, Arc::downgrade(&entry));
@@ -854,6 +880,21 @@ mod tests {
     async fn cancel_interrupts_long_query() {
         let f = fixture_db();
         let mut c = DuckdbConnection::new(&*f);
+        // DuckDB defaults to using every available core for a single
+        // connection's query. That's fine standalone, but this whole test
+        // suite runs many `DuckdbConnection`s (each its own root/database
+        // instance) in parallel, and this specific query is by far the
+        // heaviest — left at the default, it was observed to starve the
+        // rest of the parallel suite badly enough that even THIS test's own
+        // 200ms-delayed cancel signal and 30s safety-net timer got starved
+        // of scheduling time, well past what heavy-contention flakiness
+        // alone would explain. Capping this one connection's own thread
+        // count makes it a better citizen under `cargo test`'s parallelism
+        // without touching the driver's production defaults (`SET threads`
+        // is a per-database-instance setting; this fixture's temp file is
+        // never shared with another test).
+        c.execute("SET threads TO 2", CancelToken::new()).await.unwrap();
+
         let cancel = CancelToken::new();
         let watcher_cancel = cancel.clone();
         // DuckDB runs `query()` to completion before returning control (see
@@ -876,11 +917,11 @@ mod tests {
         // combinatorial CPU work but returns exactly one row, regardless of
         // whether the interrupt lands in time.
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(45),
             c.query("SELECT count(*) FROM t a, t b, t c", cancel),
         )
         .await
-        .expect("query was not interrupted within 30s");
+        .expect("query was not interrupted within 45s");
 
         let err = match result {
             Ok(_) => panic!("expected the interrupted query to fail"),
@@ -1309,6 +1350,91 @@ mod tests {
         let err = ro.query("SELECT id FROM t", CancelToken::new()).await.unwrap_err();
         assert_eq!(err.code.as_deref(), Some("mixed-access-mode"));
         assert!(err.message.contains("jiném režimu"), "expected the Czech mixed-mode message, got: {}", err.message);
+    }
+
+    /// Reverse direction of the mixed-mode policy: a READ-ONLY root already
+    /// open, and a NEW instance requesting read-write, must also be
+    /// rejected. This is the direction where a clone off the existing root
+    /// would be impossible to make writable even if this driver tried
+    /// (DuckDB fixes access mode at the database level) — see
+    /// `mixed_mode_error`'s doc comment — but the point of this test is
+    /// that BOTH directions fail the same clear way, not just the RW-root
+    /// direction covered by `mixed_access_mode_is_rejected` above.
+    #[tokio::test]
+    async fn mixed_access_mode_is_rejected_read_only_root_then_read_write_request() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let path = f.into_temp_path();
+        std::fs::remove_file(&path).ok();
+        {
+            let mut w = DuckdbConnection::new(&path);
+            w.execute("CREATE TABLE t(id INTEGER)", CancelToken::new()).await.unwrap();
+        }
+
+        let mut ro = DuckdbConnection::new_with_options(&path, true);
+        let mut s = ro.query("SELECT id FROM t", CancelToken::new()).await.unwrap();
+        while let Some(b) = s.batches.recv().await {
+            b.unwrap();
+        }
+
+        // A read-write instance on the SAME path, while `ro`'s read-only
+        // root is still alive, must be rejected rather than silently
+        // sharing a root that's fixed read-only at the database level.
+        let mut rw = DuckdbConnection::new(&path);
+        let err = rw.execute("INSERT INTO t(id) VALUES (1)", CancelToken::new()).await.unwrap_err();
+        assert_eq!(err.code.as_deref(), Some("mixed-access-mode"));
+        assert!(err.message.contains("jiném režimu"), "expected the Czech mixed-mode message, got: {}", err.message);
+    }
+
+    /// `canonical_key`'s entire purpose: two textually different but
+    /// filesystem-equivalent spellings of the same database path must
+    /// resolve to the SAME registry entry, or two `DuckdbConnection`
+    /// instances that are "obviously" pointed at one file would each try to
+    /// open their own root and hit the double-open lock conflict this
+    /// registry exists to prevent. Uses a path with a redundant `.`
+    /// component rather than changing the process's current directory (via
+    /// `std::env::set_current_dir`), which would race every OTHER test
+    /// running in parallel in this same process.
+    #[tokio::test]
+    async fn canonical_key_unifies_equivalent_path_spellings() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let path = f.into_temp_path();
+        std::fs::remove_file(&path).ok();
+
+        let mut plain = DuckdbConnection::new(&path);
+        // Autocommitted, but `exec_conn` (and therefore `plain`'s root)
+        // stays open for `plain`'s whole lifetime regardless — same as
+        // every other `execute()` call.
+        plain.execute("CREATE TABLE t(id INTEGER)", CancelToken::new()).await.unwrap();
+
+        // A `.` component alone won't do here: `Path`/`PathBuf`'s own
+        // `PartialEq`/`Hash` already normalize interior `.` components away
+        // (per `Path::components`' documented behavior), so `parent.join(".")
+        // .join(file_name) == parent.join(file_name)` even as *plain*
+        // `PathBuf`s, before `canonical_key` (or any canonicalization) gets
+        // involved — that wouldn't prove `canonical_key` does anything. A
+        // `..` component is NOT lexically normalized away (`Components`
+        // keeps it as a real `ParentDir` token), so it genuinely requires
+        // filesystem resolution — exactly what `canonical_key` is for. It
+        // does need a real intermediate directory to resolve through
+        // (`std::fs::canonicalize` requires every path segment to exist).
+        let parent = path.parent().unwrap();
+        let file_name = path.file_name().unwrap();
+        let subdir = parent.join(format!("canonical_key_probe_{}", file_name.to_string_lossy()));
+        std::fs::create_dir(&subdir).unwrap();
+        let redundant = subdir.join("..").join(file_name);
+        assert_ne!(redundant, path.to_path_buf(), "test setup: the two spellings must actually differ textually");
+
+        // If `canonical_key` failed to unify these two spellings, this
+        // would try to open a SECOND independent root for the same file
+        // while `plain`'s root is still alive and fail outright with a
+        // lock-conflict error, instead of sharing `plain`'s root.
+        let mut via_redundant_path = DuckdbConnection::new(&redundant);
+        let mut s = via_redundant_path.query("SELECT id FROM t", CancelToken::new()).await.unwrap();
+        while let Some(b) = s.batches.recv().await {
+            b.unwrap();
+        }
+
+        std::fs::remove_dir(&subdir).ok();
     }
 
     /// Direct reproduction of the raw OS lock conflict this whole registry
