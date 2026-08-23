@@ -62,6 +62,13 @@ pub enum TabContent {
     /// type" posture the rest of this file keeps; rendering lives on
     /// `AppView::render_tab_content` like every other variant.
     ScriptRun { state: Rc<RefCell<ScriptRunState>> },
+    /// G10 T4: the "Správa serveru" admin panel — one per connection at a
+    /// time (`preview_key = admin_panel::ADMIN_PREVIEW_KEY`, re-focused on
+    /// same-connection reopen, closed+replaced on a stale-connection
+    /// reopen; see `AppView::open_admin_tab`). Typed `Entity` handle, same
+    /// "tabs.rs stays GPUI-free beyond this type name" posture as `Grid`/
+    /// `Compare`.
+    Admin { view: Entity<crate::admin_panel::AdminPanel> },
 }
 
 /// G12 T3: outcome of a script/CSV-import run, driving the progress tab's
