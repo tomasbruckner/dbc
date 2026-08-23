@@ -108,6 +108,22 @@ pub enum PaletteAction {
     ShowErDiagram,
     /// G7 T6: opens `ModalState::CompareDialog` (design §3's entry point).
     OpenCompare,
+    /// G11 T6: opens `ModalState::BackupRestore` in `BackupKind::Backup`
+    /// mode for the currently active connection.
+    BackupDatabase,
+    /// G11 T6: opens `ModalState::BackupRestore` in `BackupKind::Restore`
+    /// mode for the currently active connection. Listed (discoverable)
+    /// whenever a connection is active regardless of its read-only flag —
+    /// the read-only refusal happens at CLICK time (design's own scope
+    /// reduction, see this plan's T6 Grounding: no disabled-row rendering
+    /// precedent exists in this file today).
+    RestoreDatabase,
+    /// G12 T3: opens the file-picker + pre-scan + confirm-modal flow for a
+    /// single `.sql` script (`AppView::start_script_pick(false, ..)`).
+    RunSqlFile,
+    /// G12 T3: same flow, folder mode — non-recursive `*.sql` listing
+    /// (`AppView::start_script_pick(true, ..)`).
+    RunSqlFolder,
 }
 
 /// One table/view from the current schema snapshot, plus whether it's
@@ -142,7 +158,12 @@ const FAVOURITE_BONUS: i64 = 1000;
 /// connection's engine (design §7): absent entirely — not disabled-but-
 /// visible — when the engine has no monitor (showing it for an engine
 /// without a monitor would just surface a confusing driver-missing error).
-pub fn fixed_actions(monitor_available: bool) -> Vec<(String, PaletteAction)> {
+/// `connection_active` (G11 T6, design §4c): the two backup/restore entries
+/// are appended LAST, and only "shown only when a connection is currently
+/// active" (design's own words) — an inactive/no-connection state hides
+/// them entirely rather than showing them disabled (no disabled-row
+/// rendering precedent exists anywhere in this file — see T6's Grounding).
+pub fn fixed_actions(monitor_available: bool, connection_active: bool) -> Vec<(String, PaletteAction)> {
     let mut actions = vec![
         ("Spustit dotaz".to_string(), PaletteAction::RunQuery),
         ("Přepnout strom".to_string(), PaletteAction::ToggleTree),
@@ -151,9 +172,15 @@ pub fn fixed_actions(monitor_available: bool) -> Vec<(String, PaletteAction)> {
         ("Obnovit schéma".to_string(), PaletteAction::RefreshSchema),
         ("ER diagram".to_string(), PaletteAction::ShowErDiagram),
         ("Porovnat databáze…".to_string(), PaletteAction::OpenCompare),
+        ("Spustit SQL soubor…".to_string(), PaletteAction::RunSqlFile),
+        ("Spustit SQL složku…".to_string(), PaletteAction::RunSqlFolder),
     ];
     if monitor_available {
         actions.push(("Monitor serveru".to_string(), PaletteAction::OpenMonitor));
+    }
+    if connection_active {
+        actions.push(("Zálohovat databázi…".to_string(), PaletteAction::BackupDatabase));
+        actions.push(("Obnovit databázi ze zálohy…".to_string(), PaletteAction::RestoreDatabase));
     }
     actions
 }
@@ -187,6 +214,7 @@ pub fn rank_items(
     connections: &[ConnectionSource],
     monitor_available: bool,
     cap: usize,
+    connection_active: bool,
 ) -> Vec<PaletteItem> {
     if query.trim().is_empty() {
         let mut out = Vec::new();
@@ -202,7 +230,7 @@ pub fn rank_items(
         for c in connections {
             out.push(PaletteItem::Connection { id: c.id.clone(), name: c.name.clone() });
         }
-        for (label, action) in fixed_actions(monitor_available) {
+        for (label, action) in fixed_actions(monitor_available, connection_active) {
             out.push(PaletteItem::Action { label, action });
         }
 
@@ -233,7 +261,7 @@ pub fn rank_items(
             scored.push((score, PaletteItem::Connection { id: c.id.clone(), name: c.name.clone() }));
         }
     }
-    for (label, action) in fixed_actions(monitor_available) {
+    for (label, action) in fixed_actions(monitor_available, connection_active) {
         if let Some(score) = fuzzy_score(query, &label) {
             scored.push((score, PaletteItem::Action { label, action }));
         }
@@ -379,11 +407,12 @@ mod rank_items_tests {
         let history = vec![history(1, "select 1"), history(2, "select 2")];
         let connections = vec![conn("c1", "prod", false)];
 
-        let items = rank_items("", &tables, &history, &connections, false, 30);
+        let items = rank_items("", &tables, &history, &connections, false, 30, false);
 
         // Favourites (alphabetical) first, then history (as given), then
-        // connections, then the fixed actions (5 base + G7 T6's
-        // "Porovnat databáze…" = 6, monitor_available=false here).
+        // connections, then the fixed actions (5 base + ER diagram +
+        // G7's compare + G12's two script actions = 9,
+        // monitor_available=false here).
         assert_eq!(
             items[0],
             PaletteItem::Table { schema: None, name: "aaa_fav".into() }
@@ -393,10 +422,11 @@ mod rank_items_tests {
         assert_eq!(items[3], PaletteItem::HistoryEntry { id: 2, sql: "select 2".into() });
         assert_eq!(items[4], PaletteItem::Connection { id: "c1".into(), name: "prod".into() });
         assert!(matches!(items[5], PaletteItem::Action { .. }));
-        // base actions + G8's "ER diagram" (ShowErDiagram) + G7's "Porovnat
-        // databáze…" (OpenCompare) — both unconditional, unlike OpenMonitor
-        // which is engine-gated.
-        assert_eq!(items.len(), 2 + 2 + 1 + 7);
+        // 5 base actions + G8 T6's "ER diagram" (`ShowErDiagram`) + G7's
+        // "Porovnat databáze…" (`OpenCompare`) + G12 T3's "Spustit SQL
+        // soubor…"/"Spustit SQL složku…" — all unconditional, unlike
+        // `OpenMonitor` which is engine-gated (monitor_available=false here).
+        assert_eq!(items.len(), 2 + 2 + 1 + 9);
     }
 
     #[test]
@@ -405,14 +435,14 @@ mod rank_items_tests {
         // query (brief contract #3 lists favourites/history/connections/
         // actions — not the whole unfiltered table list).
         let tables: Vec<TableSource> = (0..50).map(|i| table(None, &format!("t{i}"), true)).collect();
-        let items = rank_items("", &tables, &[], &[], false, 30);
+        let items = rank_items("", &tables, &[], &[], false, 30, false);
         assert_eq!(items.len(), 30);
     }
 
     #[test]
     fn non_matching_query_drops_items_that_dont_subsequence_match() {
         let tables = vec![table(None, "orders", false)];
-        let items = rank_items("zzz", &tables, &[], &[], false, 30);
+        let items = rank_items("zzz", &tables, &[], &[], false, 30, false);
         assert!(items.is_empty());
     }
 
@@ -428,7 +458,7 @@ mod rank_items_tests {
             fuzzy_score("orders", &table_search_text(&tables[1])),
             "test setup must produce a genuine base-score tie"
         );
-        let items = rank_items("orders", &tables, &[], &[], false, 30);
+        let items = rank_items("orders", &tables, &[], &[], false, 30, false);
         assert_eq!(
             items[0],
             PaletteItem::Table { schema: Some("bbbbb".into()), name: "orders".into() }
@@ -451,17 +481,17 @@ mod rank_items_tests {
         weak_match.push_str(&"z".repeat(30)); // long target: length penalty on top
 
         let tables = vec![table(None, &weak_match, true), table(None, "orders", false)];
-        let items = rank_items("orders", &tables, &[], &[], false, 30);
+        let items = rank_items("orders", &tables, &[], &[], false, 30, false);
         assert_eq!(items[0], PaletteItem::Table { schema: None, name: "orders".into() });
     }
 
     #[test]
     fn monitor_entry_present_only_when_available() {
-        let items = rank_items("", &[], &[], &[], true, 30);
+        let items = rank_items("", &[], &[], &[], true, 30, false);
         assert!(items
             .iter()
             .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::OpenMonitor, .. })));
-        let items = rank_items("", &[], &[], &[], false, 30);
+        let items = rank_items("", &[], &[], &[], false, 30, false);
         assert!(items
             .iter()
             .all(|i| !matches!(i, PaletteItem::Action { action: PaletteAction::OpenMonitor, .. })));
@@ -470,7 +500,36 @@ mod rank_items_tests {
     #[test]
     fn results_are_capped_at_30() {
         let tables: Vec<TableSource> = (0..50).map(|i| table(None, &format!("orders_{i}"), false)).collect();
-        let items = rank_items("orders", &tables, &[], &[], false, 30);
+        let items = rank_items("orders", &tables, &[], &[], false, 30, false);
         assert_eq!(items.len(), 30);
+    }
+
+    // --- G11 T6: backup/restore actions gated on connection_active ---
+    #[test]
+    fn backup_restore_actions_hidden_without_active_connection() {
+        let actions = fixed_actions(false, false);
+        assert!(!actions.iter().any(|(_, a)| matches!(a, PaletteAction::BackupDatabase)));
+        assert!(!actions.iter().any(|(_, a)| matches!(a, PaletteAction::RestoreDatabase)));
+
+        let items = rank_items("", &[], &[], &[], false, 30, false);
+        assert!(items
+            .iter()
+            .all(|i| !matches!(i, PaletteItem::Action { action: PaletteAction::BackupDatabase, .. })
+                && !matches!(i, PaletteItem::Action { action: PaletteAction::RestoreDatabase, .. })));
+    }
+
+    #[test]
+    fn backup_restore_actions_present_and_last_when_connection_active() {
+        let actions = fixed_actions(false, true);
+        assert_eq!(actions.last().unwrap().1, PaletteAction::RestoreDatabase);
+        assert_eq!(actions[actions.len() - 2].1, PaletteAction::BackupDatabase);
+
+        let items = rank_items("", &[], &[], &[], false, 30, true);
+        assert!(items
+            .iter()
+            .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::BackupDatabase, .. })));
+        assert!(items
+            .iter()
+            .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::RestoreDatabase, .. })));
     }
 }

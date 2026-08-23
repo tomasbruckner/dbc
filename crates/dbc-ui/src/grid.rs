@@ -117,6 +117,12 @@ pub enum GridEvent {
     /// resulting new grid's state is saved once its `Started` event lands
     /// instead (see `main.rs::apply_view_prefs_to_grid`'s doc comment).
     ViewChanged,
+    /// G12 T4: the toolbar's "Import CSV" button was clicked (only rendered
+    /// when `csv_import_enabled`) — `main.rs::on_grid_event` re-checks
+    /// read-only (belt-and-braces above this button's own gating) and, if
+    /// still clear, starts the CSV-import file-picker/pre-count/mapping
+    /// flow for this preview's `(schema, table_name)`.
+    ImportCsvRequested { schema: Option<String>, table: String },
 }
 
 /// Bind ResultGrid's own keys. Scoped to the `"ResultGrid"` key context so
@@ -294,6 +300,14 @@ pub struct ResultGrid {
     /// `set_table_name` right after `set_buffer` since it DOES know its
     /// table (`main.rs`'s `QueryEvent::Started` handling).
     pub table_name: String,
+    /// G12 T4: set by `main.rs` right after `set_buffer`/`set_table_name`
+    /// for a PREVIEW tab whose active connection is NOT read-only — gates
+    /// the toolbar's "Import CSV" button (CURATION item 4(b)'s entry-gate
+    /// half: absent entirely, not merely disabled, same posture as the
+    /// schema tree's "⇪" icon). `false` (the `set_buffer` default) for
+    /// every ad-hoc SQL-editor result AND every preview over a read-only
+    /// connection.
+    pub csv_import_enabled: bool,
     /// "Export ▾" dropdown open/closed.
     export_open: bool,
     /// "Sloupce ▾" dropdown open/closed.
@@ -405,6 +419,7 @@ impl ResultGrid {
             cell_detail: None,
             scroll_handle: UniformListScrollHandle::new(),
             table_name: "export".to_string(),
+            csv_import_enabled: false,
             export_open: false,
             columns_open: false,
             fk_info: Vec::new(),
@@ -1614,6 +1629,26 @@ impl ResultGrid {
                     .child("+ řádek")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.add_insert_row(cx);
+                    })),
+            );
+        }
+
+        // G12 T4: "Import CSV" — only rendered when `main.rs` has enabled it
+        // for this (preview, non-read-only) tab; see `csv_import_enabled`'s
+        // doc comment.
+        if self.csv_import_enabled {
+            let schema = self.preview_schema.clone();
+            let table = self.table_name.clone();
+            row = row.child(
+                div()
+                    .id("import-csv")
+                    .cursor_pointer()
+                    .px_2()
+                    .rounded_md()
+                    .bg(theme.bg_hover)
+                    .child("Import CSV")
+                    .on_click(cx.listener(move |_this, _, _, cx| {
+                        cx.emit(GridEvent::ImportCsvRequested { schema: schema.clone(), table: table.clone() });
                     })),
             );
         }

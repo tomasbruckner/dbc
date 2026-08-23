@@ -89,6 +89,12 @@ pub enum TreeEvent {
     /// G8 T6: the "⊞" icon on a `NodeId::Schema(_)` row was clicked —
     /// `main.rs` opens (or re-scopes) the ER diagram tab for this schema.
     OpenErDiagram { schema: Option<String> },
+    /// G12 T4: the "⇪" icon on a `NodeId::Table(_, _)` row was clicked —
+    /// `main.rs` starts the CSV-import file-picker/pre-count/mapping flow
+    /// for this table. Never emitted while the tree is `read_only` (the
+    /// icon isn't rendered at all in that state — see `read_only`'s doc
+    /// comment).
+    ImportCsv { schema: Option<String>, table: String },
 }
 
 /// One visible row: `(id, depth, label, is_expandable)`.
@@ -593,6 +599,12 @@ pub struct SchemaTree {
     /// against, so the "Oblíbené" section stays hidden) or before any
     /// connection has been chosen.
     active_connection_id: Option<String>,
+    /// G12 T4: `AppView::active_read_only()`, pushed in alongside every
+    /// snapshot/favourites update (`main.rs::trigger_schema_fetch`) — gates
+    /// the per-table-row "⇪" CSV-import affordance (CURATION item 4(b)'s
+    /// entry-gate half: hidden entirely, not merely disabled, on a
+    /// read-only connection).
+    read_only: bool,
 }
 
 impl SchemaTree {
@@ -608,7 +620,14 @@ impl SchemaTree {
             editor_focus,
             favourites: Vec::new(),
             active_connection_id: None,
+            read_only: false,
         }
+    }
+
+    /// G12 T4: see the `read_only` field's doc comment.
+    pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        self.read_only = read_only;
+        cx.notify();
     }
 
     /// Called by `main.rs` on every schema-fetch apply (`trigger_schema_fetch`)
@@ -1032,6 +1051,39 @@ impl Render for SchemaTree {
                                 None
                             };
 
+                            // G12 T4: a third icon-button, gated to
+                            // `NodeId::Table(_, _)` rows AND hidden entirely
+                            // (not merely disabled) when the tree is
+                            // `read_only` — CURATION item 4(b)'s entry-gate
+                            // half.
+                            let csv_icon = if let NodeId::Table(schema, name) = &id {
+                                if this.read_only {
+                                    None
+                                } else {
+                                    let schema_for_click =
+                                        if schema.is_empty() { None } else { Some(schema.clone()) };
+                                    let table_for_click = name.clone();
+                                    Some(
+                                        div()
+                                            .id(("tree-csv", ix))
+                                            .px_1()
+                                            .flex_shrink_0()
+                                            .cursor_pointer()
+                                            .text_color(cx.theme().success)
+                                            .child("⇪")
+                                            .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
+                                                cx.stop_propagation();
+                                                cx.emit(TreeEvent::ImportCsv {
+                                                    schema: schema_for_click.clone(),
+                                                    table: table_for_click.clone(),
+                                                });
+                                            })),
+                                    )
+                                }
+                            } else {
+                                None
+                            };
+
                             let mut row = div()
                                 .id(("tree-row", ix))
                                 .flex()
@@ -1072,6 +1124,9 @@ impl Render for SchemaTree {
                                 row = row.child(star);
                             }
                             if let Some(icon) = diagram_icon {
+                                row = row.child(icon);
+                            }
+                            if let Some(icon) = csv_icon {
                                 row = row.child(icon);
                             }
                             items.push(row);

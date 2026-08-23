@@ -1,9 +1,11 @@
 mod autocomplete;
+mod backup;
 mod chart_data;
 mod chart_view;
 mod compare;
 mod connect;
 mod connections_ui;
+mod csv_import;
 mod er_diagram_view;
 mod export;
 mod fk_join;
@@ -30,6 +32,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use dbc_buffer::ResultBuffer;
+use dbc_core::arrow::datatypes::SchemaRef;
 use dbc_core::{
     apply_auto_limit, find_params, is_read_statement, quote_qualified, substitute_params,
     CancelToken, FkRef, QueryError, SchemaSnapshot, TableInfo,
@@ -40,16 +43,22 @@ use dbc_state::{
 };
 use gpui::{
     actions, div, prelude::*, px, rgb, rgba, size, uniform_list, AnyElement, App, Bounds,
-    ClipboardItem, Context, Entity, Focusable, KeyBinding, ScrollDelta, ScrollWheelEvent, Window,
-    WindowBounds, WindowOptions,
+    ClipboardItem, Context, Entity, Focusable, KeyBinding, PathPromptOptions, ScrollDelta,
+    ScrollWheelEvent, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use grid::{GridEvent, ResultGrid};
 use palette::{PaletteAction, PaletteItem};
-use runner::{ConnectSpec, QueryEvent, QueryRunner};
+use runner::{
+    ConnectSpec, CsvImportEvent, CsvImportJob, MultiQueryEvent, QueryEvent, QueryRunner,
+    ScriptEvent, ScriptRunOptions,
+};
 use schema_tree::{SchemaTree, TreeEvent};
 use sql_input::SqlInput;
-use tabs::{collapse_title, ResultTab, TabContent, Tabs};
+use tabs::{
+    collapse_title, ResultTab, ScriptFileRow, ScriptFileStatus, ScriptRunOutcome, ScriptRunState,
+    TabContent, Tabs,
+};
 
 actions!(
     dbc,
@@ -247,6 +256,313 @@ fn engine_from_url(url: &str) -> dbc_state::Engine {
         dbc_state::Engine::Postgres
     } else {
         dbc_state::Engine::Sqlite
+    }
+}
+
+/// G12 T5: engine -> splitter dialect for the editor's multi-statement
+/// unlock. `Mssql` (and any future engine without a dialect) returns `None`
+/// -> today's single-statement path, unchanged (CURATION item 2: the `GO`
+/// pre-pass is an explicit non-goal for this phase — when DuckDB wiring
+/// lands, map `Duckdb -> Dialect::Postgres` + one test, not now; no
+/// `Duckdb` variant exists on this branch's `dbc_state::Engine` to map
+/// anyway).
+fn dialect_for_engine(engine: dbc_state::Engine) -> Option<dbc_core::Dialect> {
+    match engine {
+        dbc_state::Engine::Postgres => Some(dbc_core::Dialect::Postgres),
+        dbc_state::Engine::Sqlite => Some(dbc_core::Dialect::Sqlite),
+        dbc_state::Engine::Mssql => None,
+    }
+}
+
+/// G12 T5: per-statement auto-limit (design §4) — only bare `SELECT`s in
+/// the already-split statement list get a `LIMIT` appended (before the
+/// split, a multi-statement blob never got limited at all: `apply_auto_limit`
+/// only fires when the WHOLE string starts with `SELECT`, guards.rs). Returns
+/// the rewritten list plus whether ANY statement changed (drives the caller's
+/// " · auto-LIMIT {n}" status suffix, same convention as the single-statement
+/// path).
+fn auto_limit_each(statements: Vec<String>, limit: Option<u64>, bypass: bool) -> (Vec<String>, bool) {
+    let Some(n) = limit.filter(|_| !bypass) else { return (statements, false) };
+    let mut changed_any = false;
+    let out = statements
+        .into_iter()
+        .map(|s| {
+            let (rewritten, changed) = apply_auto_limit(&s, n);
+            changed_any |= changed;
+            rewritten
+        })
+        .collect();
+    (out, changed_any)
+}
+
+/// G12 T3: read-chunk size for streaming a `.sql` file through its own
+/// `StatementSplitter` — mirrors `runner::SCRIPT_READ_CHUNK`'s size (kept as
+/// an independent constant since `main.rs` doesn't depend on `runner`'s
+/// private items; the two are intentionally the same value).
+const SCRIPT_COUNT_CHUNK: usize = 64 * 1024;
+
+/// G12 T3: streams `path` through a fresh `StatementSplitter` (never the UI
+/// thread — always called inside `cx.background_spawn`) solely to COUNT
+/// statements for the pre-scan modal. An IO error or a split failure
+/// (including an unterminated construct at EOF) yields `Err(text)` — shown
+/// in the status line, the run is not offered for that file.
+fn count_statements_in_file(path: &std::path::Path, dialect: dbc_core::Dialect) -> Result<usize, String> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut splitter = dbc_core::StatementSplitter::new(dialect);
+    let mut buf = vec![0u8; SCRIPT_COUNT_CHUNK];
+    let mut count = 0usize;
+    loop {
+        let n = file.read(&mut buf).map_err(|e| format!("{}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        let stmts = splitter.push(&buf[..n]).map_err(|e| format!("{}: {e:?}", path.display()))?;
+        count += stmts.len();
+    }
+    match splitter.finish() {
+        Ok(Some(_)) => count += 1,
+        Ok(None) => {}
+        Err(e) => return Err(format!("{}: {e:?}", path.display())),
+    }
+    Ok(count)
+}
+
+/// G12 T3: non-recursive `*.sql` listing (case-insensitive extension),
+/// ordered by `file_name()` string comparison — NOT full path (design §3).
+fn list_sql_files(dir: &std::path::Path) -> Result<Vec<PathBuf>, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let is_sql = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("sql"));
+        if is_sql {
+            files.push(path);
+        }
+    }
+    files.sort_by(|a, b| {
+        a.file_name().unwrap_or_default().to_string_lossy().cmp(&b.file_name().unwrap_or_default().to_string_lossy())
+    });
+    Ok(files)
+}
+
+/// G12 T3: the design §2 matrix's UI rule — whole-run transaction scope is
+/// only selectable under a Stop error policy (never `Continue` inside one
+/// open transaction, see `runner::failure_action`'s defensive fallback for
+/// the runner's own belt-and-braces enforcement of this same rule).
+fn script_options_valid(scope: runner::TxScope, policy: runner::ErrorPolicy) -> bool {
+    !(scope == runner::TxScope::WholeRun && policy == runner::ErrorPolicy::Continue)
+}
+
+/// G12 T3: history `sql` synthesis (design §3) — a synthetic description,
+/// NEVER file contents (§3-novela: no credential/result data leaks into
+/// history beyond what the app's existing convention already logs — see
+/// `AppView::confirm_script_run`'s doc comment for the full rationale).
+fn script_history_sql(files: &[(PathBuf, usize)], statements_run: usize, statements_failed: usize) -> String {
+    let total: usize = files.iter().map(|(_, n)| n).sum();
+    if files.len() == 1 {
+        format!(
+            "[skript] {} — {total} příkazů, {statements_run} OK, {statements_failed} chyb",
+            files[0].0.display()
+        )
+    } else {
+        format!(
+            "[skript] {} souborů, {total} příkazů, {statements_run} OK, {statements_failed} chyb",
+            files.len()
+        )
+    }
+}
+
+/// G12 T3/T4: `TabContent::ScriptRun`'s render — a free function (not an
+/// `AppView` method) precisely so it can be called from inside
+/// `AppView::render_tab_content`'s `match &active.content` without
+/// conflicting with `active`'s still-live borrow of `self.tabs` (see the
+/// call site's comment). Renders the summary bar (files/statements/rows
+/// progress, elapsed, outcome, "Zrušit" while running), the per-file status
+/// list, and the log tail — reusing `TabContent::Text`'s wrapped-monospace
+/// idiom for the log rather than a scrollbar (same "render everything,
+/// newest lines visible" posture as `push_log`'s cap already assumes).
+fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<AppView>) -> AnyElement {
+    let s = state.borrow();
+    let files_done = s
+        .files
+        .iter()
+        .filter(|f| !matches!(f.status, ScriptFileStatus::Pending | ScriptFileStatus::Running))
+        .count();
+    let files_total = s.files.len();
+    let elapsed = s.elapsed.unwrap_or_else(|| s.started_at.elapsed());
+    let running = matches!(s.outcome, ScriptRunOutcome::Running);
+    let (outcome_label, outcome_color) = match s.outcome {
+        ScriptRunOutcome::Running => ("běží…", rgb(0xf9e2af)),
+        ScriptRunOutcome::Done => ("Hotovo", rgb(0xa6e3a1)),
+        ScriptRunOutcome::Failed => ("Selhalo", rgb(0xf38ba8)),
+        ScriptRunOutcome::Cancelled => ("Zrušeno", rgb(0x9399b2)),
+    };
+
+    let mut header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .p_2()
+        .bg(rgb(0x181825))
+        .text_color(rgb(0xcdd6f4))
+        .child(format!("{files_done}/{files_total} souborů"))
+        .child(format!("{}/{} příkazů", s.statements_run, s.total_statements));
+    if let Some((done, total)) = s.progress_rows {
+        header = header.child(format!("{done}/{total} řádků"));
+    }
+    header = header
+        .child(format!("{:.1}s", elapsed.as_secs_f32()))
+        .child(div().text_color(outcome_color).child(outcome_label));
+    if running {
+        header = header.child(
+            div()
+                .id("script-run-cancel")
+                .cursor_pointer()
+                .px_2()
+                .py_1()
+                .bg(rgb(0x5d2e2e))
+                .rounded_md()
+                .child("Zrušit")
+                .on_click(cx.listener(|view, _, _, cx| {
+                    if let Some(c) = view.cancel.take() {
+                        c.cancel();
+                        view.status = "cancelling…".to_string();
+                    }
+                    cx.notify();
+                })),
+        );
+    }
+
+    let mut file_list = div().flex().flex_col().gap_1().p_2().text_color(rgb(0xa6adc8));
+    for f in &s.files {
+        let glyph = match f.status {
+            ScriptFileStatus::Pending => "·",
+            ScriptFileStatus::Running => "▶",
+            ScriptFileStatus::Done => "✓",
+            ScriptFileStatus::Failed => "✗",
+            ScriptFileStatus::Skipped => "⊘",
+        };
+        file_list = file_list.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(format!(
+                    "{glyph} {} ({} OK, {} chyb)",
+                    f.name, f.statements_run, f.statements_failed
+                )),
+        );
+    }
+
+    let mut log_body = div()
+        .id("script-run-log")
+        .font_family("Consolas")
+        .flex()
+        .flex_col()
+        .flex_1()
+        .overflow_hidden()
+        .p_2()
+        .text_color(rgb(0x9399b2));
+    for line in s.log.iter() {
+        log_body = log_body.child(div().child(line.clone()));
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .bg(rgb(0x1e1e2e))
+        .child(header)
+        .child(file_list)
+        .child(log_body)
+        .into_any_element()
+}
+
+/// G12 T4: any empty CSV field -> SQL NULL, any non-empty field -> a value
+/// (the `csv` crate 1.4.0's `StringRecord` unescapes fields and retains no
+/// "was this quoted" metadata, verified against the resolved crate's source
+/// per Task 4 Step 1 — `a,,c` and `a,"",c` are indistinguishable post-parse,
+/// so the design's quoted-empty-vs-unquoted-empty distinction is
+/// unimplementable without hand-writing an RFC-4180 scanner, which §5
+/// explicitly decided against). Also used by `runner::run_csv_import_inner`
+/// (called there as `crate::csv_field_to_value`) for the actual import, not
+/// just this preview/mapping path — one rule, one place.
+pub(crate) fn csv_field_to_value(field: &str) -> Option<String> {
+    if field.is_empty() { None } else { Some(field.to_string()) }
+}
+
+/// G12 T4: auto-maps CSV headers onto target columns by case-insensitive
+/// name equality; any header with no matching column starts as skipped
+/// (`None`) — the user can still map it manually via the mapping modal's
+/// cycle-button.
+fn default_csv_mapping(
+    headers: &[String],
+    columns: &[csv_import::TargetColumn],
+) -> csv_import::ColumnMapping {
+    let targets = headers
+        .iter()
+        .map(|h| columns.iter().position(|c| c.name.eq_ignore_ascii_case(h)))
+        .collect();
+    csv_import::ColumnMapping { targets }
+}
+
+/// G12 T4 review fix (BLOCKER): pure decision behind `confirm_csv_import`'s
+/// connection-identity guard — the file picker + background pre-count pass
+/// in `start_csv_import` don't block the UI, so the connection dropdown
+/// stays clickable while `ModalState::CsvImport` is being built and while
+/// it's open. `captured_identity` is the identity `start_csv_import`
+/// snapshotted at dispatch time (before the picker ever opened);
+/// `current_identity` is `self.current_conn_identity()` evaluated fresh at
+/// confirm time. `false` means "the active connection changed under this
+/// import" — `confirm_csv_import` refuses (closes the modal, sets a status
+/// message) BEFORE resolving a spec or building a `CsvImportJob`, so a
+/// stale `(schema, table, columns)` snapshot can never be dispatched
+/// against a different, currently-active (writable) database. Just
+/// `conn_identity_matches` under a task-specific name — pulled out as its
+/// own named predicate (not an inline call) so this guard has a direct
+/// unit test without needing a full GPUI window (`confirm_csv_import`
+/// itself can't be driven headlessly).
+fn csv_import_dispatch_allowed(captured_identity: &str, current_identity: &str) -> bool {
+    conn_identity_matches(captured_identity, current_identity)
+}
+
+/// G12 T3 review fix (MAJOR 1): pure decision behind `confirm_script_run`'s
+/// connection-identity guard — same shape/rationale as
+/// `csv_import_dispatch_allowed` above (the script picker + background
+/// pre-scan pass don't block the UI either, so the connection dropdown
+/// stays clickable while `ModalState::ScriptRun` is being built and while
+/// it's open). `captured_identity` is what `start_script_pick` snapshotted
+/// before the picker ever opened; `current_identity` is
+/// `self.current_conn_identity()` evaluated fresh at confirm time.
+fn script_run_dispatch_allowed(captured_identity: &str, current_identity: &str) -> bool {
+    conn_identity_matches(captured_identity, current_identity)
+}
+
+/// G12 T4 review fix (MINOR 5): char budget for `ModalState::CsvImport`'s
+/// DISPLAYED `sample_sql` — a real first-batch `INSERT` can run to
+/// several hundred rows' worth of text. `self.modal` is `.clone()`d every
+/// render frame (an app-wide convention this fix deliberately does NOT
+/// restructure — see the review), so the cap is applied ONCE, wherever
+/// `sample_sql` is computed (`start_csv_import`'s completion closure,
+/// `recompute_csv_sample`), never inside a render function — the STORED
+/// string is already display-ready, not re-truncated per frame.
+const CSV_SAMPLE_SQL_DISPLAY_CAP: usize = 2000;
+
+fn cap_sql_sample(sql: String) -> String {
+    if sql.chars().count() <= CSV_SAMPLE_SQL_DISPLAY_CAP {
+        sql
+    } else {
+        let truncated: String = sql.chars().take(CSV_SAMPLE_SQL_DISPLAY_CAP).collect();
+        format!("{truncated}…")
     }
 }
 
@@ -1027,6 +1343,33 @@ impl AppView {
         };
         let (read_only, auto_limit, timeout_secs, conn_meta, spec) = spec;
 
+        // G12 T5: multi-statement unlock. Params were already substituted
+        // upstream (`run_query`, G6) — CURATION-fixed order: params ->
+        // split -> per-statement guards/auto-limit -> dispatch. A preview
+        // run (`preview.is_some()`) never carries more than one statement
+        // (`preview_sql`'s own output), so it always falls through
+        // unchanged. When the split yields 0 or 1 statements, this also
+        // falls through to the existing single-statement pipeline below
+        // (Guard 1 read-only on the full text, Guard 2 auto-limit),
+        // byte-for-byte unchanged.
+        if preview.is_none() {
+            if let Some(dialect) = conn_meta.map(|(_, e)| e).and_then(dialect_for_engine) {
+                match dbc_core::split_sql(&sql, dialect) {
+                    Err(e) => {
+                        self.status = format!("error: SQL nelze rozdělit na příkazy: {e:?}");
+                        cx.notify();
+                        return;
+                    }
+                    Ok(stmts) if stmts.len() > 1 => {
+                        let (stmts, limited) = auto_limit_each(stmts, auto_limit, bypass_auto_limit);
+                        self.run_many(spec, sql, stmts, limited, timeout_secs, cx);
+                        return;
+                    }
+                    Ok(_) => {}
+                }
+            }
+        }
+
         // Guard 1: read-only — rejected client-side without connecting.
         // (Server-side enforcement lives in connect::open_config: Postgres
         // `default_transaction_read_only=on`, SQLite `SQLITE_OPEN_READ_ONLY`
@@ -1178,6 +1521,18 @@ impl AppView {
                                     if let Some(p) = &preview {
                                         g.set_table_name(p.table.clone());
                                         g.set_preview_context(p.schema.clone(), p.key.clone(), p.title.clone());
+                                        // G12 T4: entry-gate half of
+                                        // CURATION item 4(b) — the "Import
+                                        // CSV" toolbar button only exists on
+                                        // a preview tab whose connection is
+                                        // NOT read-only (`conn_meta` is
+                                        // `None` only when neither a saved
+                                        // connection nor a CLI-arg URL
+                                        // resolved, which never reaches
+                                        // `Started` in practice — treated as
+                                        // not-enabled defensively).
+                                        g.csv_import_enabled =
+                                            conn_meta.is_some_and(|(read_only, _)| !read_only);
                                     }
                                     g.set_fk_info(fk_info, ref_cols);
                                     // G5 Task 3: `None` on an ad-hoc tab
@@ -1332,6 +1687,7 @@ impl AppView {
                                             TabContent::Plan { .. } => None,
                                             TabContent::Diagram { .. } => None,
                                             TabContent::Compare { .. } => None,
+                                            TabContent::ScriptRun { .. } => None,
                                         }
                                     })
                                 });
@@ -1469,6 +1825,1146 @@ impl AppView {
                 // `run_generation` and set its own `cancel` — an
                 // unconditional clear here would wipe that out from under
                 // it. See `run_generation`'s doc comment.
+                if view.run_generation == my_generation {
+                    view.cancel = None;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // -----------------------------------------------------------------
+    // G12 T5: editor multi-statement unlock.
+    // -----------------------------------------------------------------
+
+    /// The AD-HOC subset of `run_query_with`'s own `QueryEvent::Started`
+    /// arm (buffer, FK metadata for the ☰ menu, grid entity, subscription,
+    /// tab open) — extracted for `run_many`'s per-row-producing-statement
+    /// tabs ONLY. Deliberately NOT used to refactor the single-run
+    /// `Started` arm above (leave working code untouched; the duplication
+    /// is deliberate and documented, same precedent `history_panel::
+    /// collapse_sql` sets against `tabs::collapse_title`). No preview
+    /// context, no editability, no per-table view-prefs — a multi-statement
+    /// run's tabs are always plain ad-hoc results, same as today's
+    /// single-statement ad-hoc path.
+    fn open_adhoc_result_tab(
+        &mut self,
+        columns: SchemaRef,
+        title_sql: &str,
+        conn_identity: &str,
+        cx: &mut Context<Self>,
+    ) -> (u64, Rc<RefCell<ResultBuffer>>) {
+        let buf = Rc::new(RefCell::new(ResultBuffer::new(columns)));
+        let result_cols: Vec<String> =
+            buf.borrow().schema().fields().iter().map(|f| f.name().to_string()).collect();
+        let (fk_info, ref_cols) = self.fk_info_for_adhoc(&result_cols, cx);
+        let grid = cx.new(ResultGrid::new);
+        grid.update(cx, |g, cx| {
+            g.set_buffer(buf.clone(), cx);
+            g.set_fk_info(fk_info, ref_cols);
+        });
+        cx.subscribe(&grid, AppView::on_grid_event).detach();
+        let id = self.tabs.open(ResultTab {
+            id: 0,
+            title: collapse_title(title_sql),
+            pinned: false,
+            preview_key: None,
+            conn_identity: conn_identity.to_string(),
+            content: TabContent::Grid { grid, buffer: buf.clone() },
+        });
+        (id, buf)
+    }
+
+    /// `run_query_with`'s multi-statement dispatch (>1 statement after
+    /// `split_sql`) — single-flight guards already ran in the caller; sets
+    /// `cancel`/`run_generation`/`started_at`/status the same way, then
+    /// consumes `runner::connect_and_run_many`, opening one
+    /// `open_adhoc_result_tab` per row-producing statement and recording
+    /// ONE history entry for the whole run (`sql` = the original full
+    /// post-params editor text, `row_count` = returned rows + affected sum
+    /// — design silent on the combined metric, flagged as a judgment call).
+    fn run_many(
+        &mut self,
+        spec: ConnectSpec,
+        sql: String,
+        statements: Vec<String>,
+        limited: bool,
+        timeout_secs: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        let limit_suffix = if limited { " · auto-LIMIT".to_string() } else { String::new() };
+        let cancel = CancelToken::new();
+        self.cancel = Some(cancel.clone());
+        self.started_at = Some(std::time::Instant::now());
+        self.run_generation += 1;
+        let my_generation = self.run_generation;
+        self.status = format!("connecting…{limit_suffix}");
+        cx.notify();
+
+        let history_started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let history_conn_name = self.active_connection_name_for_history();
+        let conn_identity = self.current_conn_identity();
+        let total_statements = statements.len();
+        let mut rx = self.runner.connect_and_run_many(spec, statements.clone(), cancel, timeout_secs);
+        cx.spawn(async move |this, cx| {
+            let mut buffer: Option<Rc<RefCell<ResultBuffer>>> = None;
+            let mut tab_id: Option<u64> = None;
+            let mut errored: Option<String> = None;
+            let mut rows_returned: u64 = 0;
+            let mut total_affected: u64 = 0;
+            let mut with_rows: usize = 0;
+            let mut writes: usize = 0;
+
+            while let Some(ev) = rx.recv().await {
+                let stop = this
+                    .update(cx, |view, cx| {
+                        let mut stop = false;
+                        match ev {
+                            MultiQueryEvent::StatementStarted { index, total, columns: Some(cols) } => {
+                                let title_sql =
+                                    statements.get(index).map(String::as_str).unwrap_or("");
+                                let (id, buf) =
+                                    view.open_adhoc_result_tab(cols, title_sql, &conn_identity, cx);
+                                tab_id = Some(id);
+                                buffer = Some(buf);
+                                with_rows += 1;
+                                view.status = format!("příkaz {}/{total}…{limit_suffix}", index + 1);
+                            }
+                            MultiQueryEvent::StatementStarted { index, total, columns: None } => {
+                                view.status = format!("příkaz {}/{total}…{limit_suffix}", index + 1);
+                            }
+                            MultiQueryEvent::Batch(b) => {
+                                if errored.is_some() {
+                                    // Already failed — drop further batches.
+                                } else if tab_id.is_some_and(|id| view.tabs.iter().all(|t| t.id != id)) {
+                                    stop = true;
+                                    if let Some(token) = view.cancel.take() {
+                                        token.cancel();
+                                    }
+                                    view.status = "zrušeno (tab zavřen)".into();
+                                } else if let Some(Err(e)) =
+                                    buffer.as_ref().map(|buf| buf.borrow_mut().push(b))
+                                {
+                                    let err_text = e.to_string();
+                                    view.status = format!("error: {err_text}");
+                                    errored = Some(err_text);
+                                    if let Some(token) = view.cancel.take() {
+                                        token.cancel();
+                                    }
+                                } else if let Some(id) = tab_id {
+                                    if let Some(TabContent::Grid { grid, .. }) =
+                                        view.tabs.iter().find(|t| t.id == id).map(|t| &t.content)
+                                    {
+                                        grid.update(cx, |g, _| g.on_batch_grown());
+                                    }
+                                }
+                            }
+                            MultiQueryEvent::StatementFinished { index, affected: Some(n), elapsed } => {
+                                total_affected += n;
+                                writes += 1;
+                                view.status = format!(
+                                    "příkaz {} dokončen ({n} řádků, {elapsed:.2?}){limit_suffix}",
+                                    index + 1
+                                );
+                            }
+                            MultiQueryEvent::StatementFinished { index, affected: None, elapsed } => {
+                                // Accumulated, not overwritten — more than one
+                                // read statement in the same run each gets its
+                                // own fresh tab/buffer (`StatementStarted`
+                                // above), so this fires once per read with
+                                // THAT statement's own total, never double-
+                                // counting the same buffer twice.
+                                let rows = buffer.as_ref().map_or(0, |b| b.borrow().row_count());
+                                rows_returned += rows as u64;
+                                if let Some(id) = tab_id {
+                                    if let Some(TabContent::Grid { grid, .. }) =
+                                        view.tabs.iter().find(|t| t.id == id).map(|t| &t.content)
+                                    {
+                                        grid.update(cx, |g, _| {
+                                            g.on_stream_finished();
+                                        });
+                                    }
+                                }
+                                view.status = format!(
+                                    "příkaz {} dokončen ({rows} řádků, {elapsed:.2?}){limit_suffix}",
+                                    index + 1
+                                );
+                            }
+                            MultiQueryEvent::StatementFailed { index, error } => {
+                                match &errored {
+                                    None => {
+                                        view.status = format!("selhalo na příkazu #{}: {error}", index + 1);
+                                        let err_text = error.to_string();
+                                        view.record_history(
+                                            &sql,
+                                            &history_conn_name,
+                                            history_started_at,
+                                            None,
+                                            None,
+                                            Some(&err_text),
+                                            cx,
+                                        );
+                                    }
+                                    Some(err_text) => {
+                                        view.record_history(
+                                            &sql,
+                                            &history_conn_name,
+                                            history_started_at,
+                                            None,
+                                            None,
+                                            Some(err_text),
+                                            cx,
+                                        );
+                                    }
+                                }
+                                view.cancel = None;
+                            }
+                            MultiQueryEvent::RunFinished => {
+                                let elapsed_ms = view
+                                    .started_at
+                                    .map(|t| t.elapsed().as_millis() as i64)
+                                    .unwrap_or(0);
+                                match &errored {
+                                    None => {
+                                        view.status = format!(
+                                            "{total_statements} příkazů, {with_rows} s výsledky, \
+                                             {writes} zápisů ({total_affected} řádků) — hotovo{limit_suffix}"
+                                        );
+                                        let row_count = rows_returned as i64 + total_affected as i64;
+                                        view.record_history(
+                                            &sql,
+                                            &history_conn_name,
+                                            history_started_at,
+                                            Some(elapsed_ms),
+                                            Some(row_count),
+                                            None,
+                                            cx,
+                                        );
+                                    }
+                                    Some(err_text) => {
+                                        view.record_history(
+                                            &sql,
+                                            &history_conn_name,
+                                            history_started_at,
+                                            None,
+                                            None,
+                                            Some(err_text),
+                                            cx,
+                                        );
+                                    }
+                                }
+                                view.cancel = None;
+                            }
+                        }
+                        cx.notify();
+                        stop
+                    })
+                    .unwrap_or(false);
+                if stop {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |view, cx| {
+                if view.run_generation == my_generation {
+                    view.cancel = None;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // -----------------------------------------------------------------
+    // G12 T3: script runner UI — file/folder pickers, pre-scan, confirm
+    // modal, live progress tab. Wires up `runner::run_script` (Task 1,
+    // unreachable from `main` until this task — every `#[allow(dead_code)]`
+    // on its types is removed as part of this task).
+    // -----------------------------------------------------------------
+
+    /// Palette „Spustit SQL soubor…“/„Spustit SQL složku…“ entry point.
+    /// Guards mirror `run_query_with`'s single-flight guard (one modal/run
+    /// at a time). Resolves the active connection's dialect via the SAME
+    /// `resolve_spec_for_explain`/`dialect_for_engine` pair Task 2's editor
+    /// unlock and G13 T6's Explain/Analyze already use — an engine without a
+    /// dialect (MSSQL — CURATION item 2's explicit non-goal) refuses with a
+    /// status note rather than offering a picker that could never run
+    /// anything.
+    fn start_script_pick(&mut self, folder: bool, cx: &mut Context<Self>) {
+        if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
+            return;
+        }
+        if self.cancel.is_some() {
+            return;
+        }
+        let Some((read_only, timeout_secs, engine, _spec)) = self.resolve_spec_for_explain(cx) else {
+            return; // resolve_spec_for_explain already set self.status
+        };
+        let Some(dialect) = dialect_for_engine(engine) else {
+            self.status = "error: skripty nejsou podporovány pro tento engine".to_string();
+            cx.notify();
+            return;
+        };
+        let conn_label = self.current_connection_label();
+        // Review fix (MAJOR 1, same pattern as `start_csv_import`'s
+        // `conn_identity` — see 46f6fc1): captured HERE, before the file
+        // picker + background pre-scan pass — the connection dropdown stays
+        // clickable through both, so `confirm_script_run` must re-verify
+        // this identity against whatever is active AT CONFIRM TIME before
+        // dispatching anything.
+        let conn_identity = self.current_conn_identity();
+
+        self.status = "výběr souboru…".to_string();
+        cx.notify();
+        // Grounding (design §7 spike, RESOLVED — no extension-filter API
+        // exists at the pinned rev: `PathPromptOptions` has no filter field,
+        // the Windows `file_open_dialog` never calls `SetFileTypes`).
+        // Client-side `.sql` validation happens below instead.
+        let dialog = cx.prompt_for_paths(PathPromptOptions {
+            files: !folder,
+            directories: folder,
+            multiple: false,
+            prompt: Some("Spustit".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = match dialog.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
+                Ok(Ok(_)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "výběr zrušen".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = format!("error: dialog selhal: {e}");
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_canceled) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "error: dialog není dostupný".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+
+            // Off the UI thread: pre-scan (second sequential read past the
+            // dialog's own stat — accepted per design §3, the count label
+            // says "odhad" nowhere the count is 100% exact anyway since a
+            // concurrent edit could change it before the actual run).
+            let result: Result<(String, Vec<PathBuf>, Vec<usize>), String> = cx
+                .background_spawn(async move {
+                    if folder {
+                        let files = list_sql_files(&picked)?;
+                        if files.is_empty() {
+                            return Err("složka neobsahuje žádné .sql soubory".to_string());
+                        }
+                        let mut counts = Vec::with_capacity(files.len());
+                        for f in &files {
+                            counts.push(count_statements_in_file(f, dialect)?);
+                        }
+                        let name = picked
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| picked.display().to_string());
+                        let label = format!("{name}/ ({} souborů)", files.len());
+                        Ok((label, files, counts))
+                    } else {
+                        let is_sql = picked
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("sql"));
+                        if !is_sql {
+                            return Err("vyberte soubor .sql".to_string());
+                        }
+                        let count = count_statements_in_file(&picked, dialect)?;
+                        let name = picked
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| picked.display().to_string());
+                        Ok((name, vec![picked], vec![count]))
+                    }
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| match result {
+                Ok((source_label, files, file_counts)) => {
+                    // Review fix (MINOR 4): a modal the user opened WHILE
+                    // this picker/pre-scan was in flight wins — don't
+                    // clobber it with a stale script-run pick.
+                    if view.modal.is_some() {
+                        view.status =
+                            "výběr skriptu zahozen — je otevřený jiný dialog".to_string();
+                        cx.notify();
+                        return;
+                    }
+                    // Review fix (MAJOR 1), defense in depth (same posture
+                    // as CSV's `start_csv_import`): the picker + pre-scan
+                    // didn't block the connection dropdown — if it already
+                    // changed, don't even open the modal with a stale
+                    // file/folder selection; `confirm_script_run` re-checks
+                    // this same identity again regardless (the actual
+                    // guard), so this is purely a faster/friendlier
+                    // refusal.
+                    if !conn_identity_matches(&conn_identity, &view.current_conn_identity()) {
+                        view.status =
+                            "připojení se během výběru změnilo — spuštění zrušeno".to_string();
+                        cx.notify();
+                        return;
+                    }
+                    view.status = String::new();
+                    view.modal = Some(connections_ui::ModalState::ScriptRun {
+                        files,
+                        file_counts,
+                        tx_scope: runner::TxScope::PerFile,
+                        error_policy: runner::ErrorPolicy::Stop,
+                        source_label,
+                        conn_label,
+                        read_only,
+                        timeout_secs,
+                        conn_identity,
+                    });
+                    cx.notify();
+                }
+                Err(e) => {
+                    view.status = format!("error: {e}");
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The modal's „Transakce“ radio — a click on an option that would
+    /// violate `script_options_valid` (whole-run scope + continue policy)
+    /// is a structural no-op, per the design §2 matrix's UI rule.
+    fn set_script_tx_scope(&mut self, scope: runner::TxScope, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::ScriptRun { tx_scope, error_policy, .. }) = &mut self.modal {
+            if script_options_valid(scope, *error_policy) {
+                *tx_scope = scope;
+            }
+        }
+        cx.notify();
+    }
+
+    /// The modal's „Při chybě“ radio — same no-op-on-invalid-combination
+    /// rule as `set_script_tx_scope`.
+    fn set_script_error_policy(&mut self, policy: runner::ErrorPolicy, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::ScriptRun { tx_scope, error_policy, .. }) = &mut self.modal {
+            if script_options_valid(*tx_scope, policy) {
+                *error_policy = policy;
+            }
+        }
+        cx.notify();
+    }
+
+    /// „Spustit“ — closes the modal, opens the `TabContent::ScriptRun`
+    /// progress tab, and drains `runner::run_script`'s event stream into
+    /// `ScriptRunState`.
+    ///
+    /// §3-novela / carry-forward review note (sql_preview credential
+    /// handling): `ScriptEvent`'s `sql_preview` field (and the log lines
+    /// built from it below) is display-safe-capped (200 chars, single-line,
+    /// `runner::sql_preview`) but NOT secret-redacted — a script containing
+    /// e.g. `ALTER USER x PASSWORD 'y'` shows that literal text in the
+    /// progress tab's log, exactly like the app's EXISTING convention for
+    /// every other run: `record_history`/`AppView::run_query_with` already
+    /// store the full literal editor SQL in the history DB unredacted (see
+    /// `history_panel.rs`). The log here is even MORE conservative than
+    /// that existing convention: it only ever holds `sql_preview`'s capped
+    /// text (never full statement text, never file contents), and the
+    /// history entry this run records is a SYNTHETIC description
+    /// (`script_history_sql`) — never the SQL at all. So this matches (and
+    /// narrows) the app's existing "history/log stores literal SQL"
+    /// posture rather than inventing a new, inconsistent redaction rule
+    /// for scripts alone.
+    fn confirm_script_run(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::ScriptRun {
+            files,
+            file_counts,
+            tx_scope,
+            error_policy,
+            source_label,
+            conn_identity,
+            ..
+        }) = self.modal.clone()
+        else {
+            return;
+        };
+        // Review fix (MINOR 3): a query started DURING the picker/pre-scan
+        // window can still be streaming — confirming now would start a
+        // second concurrent run and silently orphan the first token
+        // (`self.cancel` clobbered). Refuse and keep the modal open (don't
+        // clear `self.modal`) so the user can retry once the other run
+        // finishes.
+        if self.cancel.is_some() {
+            self.status = "jiný dotaz stále běží — počkejte na dokončení".to_string();
+            cx.notify();
+            return;
+        }
+        // Review fix (MAJOR 1): re-verify the connection identity captured
+        // at `start_script_pick` time against whatever is active NOW — same
+        // pattern as `confirm_csv_import`'s guard (46f6fc1). On mismatch:
+        // close the modal and refuse — no spec is ever resolved,
+        // `self.runner.run_script` is never reached.
+        if !script_run_dispatch_allowed(&conn_identity, &self.current_conn_identity()) {
+            self.modal = None;
+            self.status = "připojení se během výběru změnilo — spuštění zrušeno".to_string();
+            cx.notify();
+            return;
+        }
+        let Some((_, timeout_secs, engine, spec)) = self.resolve_spec_for_explain(cx) else {
+            self.modal = None;
+            return;
+        };
+        let Some(dialect) = dialect_for_engine(engine) else {
+            self.status = "error: skripty nejsou podporovány pro tento engine".to_string();
+            self.modal = None;
+            cx.notify();
+            return;
+        };
+        self.modal = None;
+
+        let opts =
+            ScriptRunOptions { tx_scope, error_policy, dialect, statement_timeout_secs: timeout_secs };
+
+        let file_rows: Vec<ScriptFileRow> = files
+            .iter()
+            .zip(file_counts.iter())
+            .map(|(p, _)| ScriptFileRow {
+                name: p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.display().to_string()),
+                status: ScriptFileStatus::Pending,
+                statements_run: 0,
+                statements_failed: 0,
+            })
+            .collect();
+        let total_statements: usize = file_counts.iter().sum();
+        let state = Rc::new(RefCell::new(ScriptRunState {
+            files: file_rows,
+            total_statements,
+            statements_run: 0,
+            statements_failed: 0,
+            total_affected: 0,
+            progress_rows: None,
+            log: std::collections::VecDeque::new(),
+            outcome: ScriptRunOutcome::Running,
+            started_at: std::time::Instant::now(),
+            elapsed: None,
+        }));
+
+        let conn_identity = self.current_conn_identity();
+        self.tabs.open(ResultTab {
+            id: 0,
+            title: format!("Skript: {source_label}"),
+            pinned: false,
+            preview_key: None,
+            conn_identity,
+            content: TabContent::ScriptRun { state: state.clone() },
+        });
+
+        let cancel = CancelToken::new();
+        self.cancel = Some(cancel.clone());
+        self.run_generation += 1;
+        let my_generation = self.run_generation;
+        self.status = format!("skript {source_label}…");
+        cx.notify();
+
+        let history_started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let history_conn_name = self.active_connection_name_for_history();
+        let files_for_history: Vec<(PathBuf, usize)> = files.iter().cloned().zip(file_counts).collect();
+        let run_cancel = cancel.clone();
+        let mut rx = self.runner.run_script(spec, files, opts, run_cancel);
+
+        cx.spawn(async move |this, cx| {
+            let mut current_file_ix: Option<usize> = None;
+            let mut last_preview = String::new();
+            while let Some(ev) = rx.recv().await {
+                let stop = this
+                    .update(cx, |view, cx| {
+                        match ev {
+                            ScriptEvent::FileStarted { path, index, total_files } => {
+                                current_file_ix = Some(index);
+                                let mut s = state.borrow_mut();
+                                if let Some(row) = s.files.get_mut(index) {
+                                    row.status = ScriptFileStatus::Running;
+                                }
+                                let name = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                s.push_log(format!("▶ soubor {}/{total_files}: {name}", index + 1));
+                            }
+                            ScriptEvent::StatementStarted { stmt_index, sql_preview } => {
+                                last_preview = sql_preview;
+                                view.status = format!("skript {source_label}: příkaz {}…", stmt_index + 1);
+                            }
+                            ScriptEvent::StatementFinished { stmt_index, affected, elapsed } => {
+                                let mut s = state.borrow_mut();
+                                s.statements_run += 1;
+                                if let Some(n) = affected {
+                                    s.total_affected += n;
+                                }
+                                if let Some(ix) = current_file_ix {
+                                    if let Some(row) = s.files.get_mut(ix) {
+                                        row.statements_run += 1;
+                                    }
+                                }
+                                let rows_note =
+                                    affected.map(|n| format!(", {n} řádků")).unwrap_or_default();
+                                s.push_log(format!(
+                                    "✓ #{} {last_preview} ({} ms{rows_note})",
+                                    stmt_index + 1,
+                                    elapsed.as_millis()
+                                ));
+                            }
+                            ScriptEvent::StatementFailed { stmt_index, error } => {
+                                let mut s = state.borrow_mut();
+                                s.statements_failed += 1;
+                                if let Some(ix) = current_file_ix {
+                                    if let Some(row) = s.files.get_mut(ix) {
+                                        row.statements_failed += 1;
+                                    }
+                                }
+                                s.push_log(format!(
+                                    "✗ #{} {last_preview} — chyba: {error}",
+                                    stmt_index + 1
+                                ));
+                            }
+                            ScriptEvent::FileFinished { path, statements_run, statements_failed, elapsed } => {
+                                let mut s = state.borrow_mut();
+                                if let Some(ix) = current_file_ix {
+                                    if let Some(row) = s.files.get_mut(ix) {
+                                        row.status = if statements_failed > 0 {
+                                            ScriptFileStatus::Failed
+                                        } else {
+                                            ScriptFileStatus::Done
+                                        };
+                                    }
+                                }
+                                let name = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                s.push_log(format!(
+                                    "— {name} dokončen: {statements_run} OK, {statements_failed} chyb ({} ms)",
+                                    elapsed.as_millis()
+                                ));
+                            }
+                            ScriptEvent::RunFinished {
+                                files_run,
+                                statements_run,
+                                statements_failed,
+                                elapsed,
+                                aborted,
+                            } => {
+                                {
+                                    let mut s = state.borrow_mut();
+                                    if aborted {
+                                        for row in s.files.iter_mut() {
+                                            if matches!(
+                                                row.status,
+                                                ScriptFileStatus::Pending | ScriptFileStatus::Running
+                                            ) {
+                                                row.status = ScriptFileStatus::Skipped;
+                                            }
+                                        }
+                                    }
+                                    s.elapsed = Some(elapsed);
+                                    s.outcome = if !aborted {
+                                        ScriptRunOutcome::Done
+                                    } else if cancel.is_cancelled() {
+                                        ScriptRunOutcome::Cancelled
+                                    } else {
+                                        ScriptRunOutcome::Failed
+                                    };
+                                }
+                                let hist_sql = script_history_sql(
+                                    &files_for_history,
+                                    statements_run,
+                                    statements_failed,
+                                );
+                                let err_opt: Option<String> =
+                                    if aborted { Some("běh přerušen".to_string()) } else { None };
+                                view.record_history(
+                                    &hist_sql,
+                                    &history_conn_name,
+                                    history_started_at,
+                                    Some(elapsed.as_millis() as i64),
+                                    Some(statements_run as i64),
+                                    err_opt.as_deref(),
+                                    cx,
+                                );
+                                view.status = if aborted {
+                                    format!(
+                                        "skript {source_label}: přerušeno ({files_run} souborů, {statements_run}/{total_statements} příkazů)"
+                                    )
+                                } else {
+                                    format!(
+                                        "skript {source_label}: hotovo ({files_run} souborů, {statements_run} příkazů, {statements_failed} chyb)"
+                                    )
+                                };
+                                if view.run_generation == my_generation {
+                                    view.cancel = None;
+                                }
+                            }
+                        }
+                        cx.notify();
+                        false
+                    })
+                    .unwrap_or(false);
+                if stop {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |view, cx| {
+                if view.run_generation == my_generation {
+                    view.cancel = None;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // -----------------------------------------------------------------
+    // G12 T4: CSV import UI — file picker, header/row pre-count peek,
+    // column-mapping modal, batched-execute via `runner::run_csv_import`
+    // (Task 1/T7's sanctioned write path). Reuses Task 3's
+    // `TabContent::ScriptRun` progress-tab kind (`progress_rows` drives the
+    // honest rows-done/rows-total display CSV import needs and script runs
+    // don't). Entry points: `TreeEvent::ImportCsv` (schema tree "⇪") and
+    // `GridEvent::ImportCsvRequested` (preview toolbar "Import CSV") — both
+    // gated read-only at the UI layer (tree icon absent / grid button
+    // absent) AND re-checked here AND by `run_csv_import`'s own shared
+    // guard (CURATION item 4(b), all three layers).
+    // -----------------------------------------------------------------
+
+    /// Schema-tree "⇪" / preview-toolbar "Import CSV" entry point.
+    fn start_csv_import(&mut self, schema: Option<String>, table: String, cx: &mut Context<Self>) {
+        if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
+            return;
+        }
+        if self.cancel.is_some() {
+            return;
+        }
+        if self.active_read_only() {
+            self.status = "error: připojení je jen pro čtení".to_string();
+            cx.notify();
+            return;
+        }
+        let Some(snapshot) = self.tree.read(cx).snapshot() else {
+            self.status = "error: schéma není načteno".to_string();
+            cx.notify();
+            return;
+        };
+        let Some(t) = snapshot.tables.iter().find(|t| t.schema == schema && t.name == table) else {
+            self.status = "error: tabulka nenalezena ve schématu".to_string();
+            cx.notify();
+            return;
+        };
+        let columns: Vec<csv_import::TargetColumn> = t
+            .columns
+            .iter()
+            .map(|c| csv_import::TargetColumn {
+                name: c.name.clone(),
+                numeric: csv_import::is_numeric_type_name(&c.data_type),
+            })
+            .collect();
+
+        // Review fix (BLOCKER): captured HERE, before the (non-blocking)
+        // file picker + background pre-count pass — the connection dropdown
+        // stays clickable through both, so `confirm_csv_import` must
+        // re-verify this identity against whatever is active AT CONFIRM
+        // TIME before dispatching anything (see `ModalState::CsvImport`'s
+        // doc comment). `conn_identity` is the STABLE value the guard
+        // actually compares; `conn_label` is display-only.
+        let conn_identity = self.current_conn_identity();
+        let conn_label = self.current_connection_label();
+
+        self.status = "výběr CSV souboru…".to_string();
+        cx.notify();
+        let dialog = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = match dialog.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
+                Ok(Ok(_)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "výběr zrušen".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = format!("error: dialog selhal: {e}");
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_canceled) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "error: dialog není dostupný".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let is_csv = picked
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
+            if !is_csv {
+                let _ = this.update(cx, |view, cx| {
+                    view.status = "error: vyberte soubor .csv".to_string();
+                    cx.notify();
+                });
+                return;
+            }
+
+            let peek_path = picked.clone();
+            let peek: Result<(Vec<String>, usize, Vec<csv_import::CsvRow>), String> = cx
+                .background_spawn(async move {
+                    let mut reader = csv::Reader::from_path(&peek_path)
+                        .map_err(|e| format!("{}: {e}", peek_path.display()))?;
+                    let headers: Vec<String> = reader
+                        .headers()
+                        .map_err(|e| format!("{}: {e}", peek_path.display()))?
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    let mut row_count = 0usize;
+                    let mut first_rows: Vec<csv_import::CsvRow> = Vec::new();
+                    for rec in reader.records() {
+                        let rec = rec.map_err(|e| format!("{}: {e}", peek_path.display()))?;
+                        if first_rows.len() < csv_import::CSV_IMPORT_BATCH_SIZE {
+                            first_rows.push(rec.iter().map(csv_field_to_value).collect());
+                        }
+                        row_count += 1;
+                    }
+                    Ok((headers, row_count, first_rows))
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| match peek {
+                Ok((headers, row_count, first_rows)) => {
+                    let mapping = default_csv_mapping(&headers, &columns);
+                    let sample_sql = csv_import::generate_insert_batches(
+                        schema.as_deref(),
+                        &table,
+                        &columns,
+                        &mapping,
+                        &first_rows,
+                    );
+                    let (sample_sql, error) = match sample_sql {
+                        Ok(stmts) => (stmts.into_iter().next().map(cap_sql_sample), None),
+                        Err(msg) => (None, Some(msg)),
+                    };
+                    // Review fix (MINOR 4): a modal the user opened WHILE
+                    // this picker/peek was in flight wins — don't clobber
+                    // it with a stale CSV-import pick.
+                    if view.modal.is_some() {
+                        view.status =
+                            "výběr CSV zahozen — je otevřený jiný dialog".to_string();
+                        cx.notify();
+                        return;
+                    }
+                    // Review fix, defense in depth (optional per the
+                    // review, cheap here): the picker + this background
+                    // pre-count pass didn't block the connection dropdown —
+                    // if it already changed, don't even open the modal with
+                    // stale schema/columns; `confirm_csv_import` re-checks
+                    // this same identity again regardless (the actual
+                    // BLOCKER fix), so this is purely a faster/friendlier
+                    // refusal, not the enforcement point.
+                    if !conn_identity_matches(&conn_identity, &view.current_conn_identity()) {
+                        view.status =
+                            "připojení se během importu změnilo — import zrušen".to_string();
+                        cx.notify();
+                        return;
+                    }
+                    view.status = String::new();
+                    view.modal = Some(connections_ui::ModalState::CsvImport {
+                        path: picked,
+                        schema,
+                        table,
+                        headers,
+                        columns,
+                        targets: mapping.targets,
+                        row_count,
+                        first_rows,
+                        sample_sql,
+                        error,
+                        conn_identity,
+                        conn_label,
+                    });
+                    cx.notify();
+                }
+                Err(e) => {
+                    view.status = format!("error: {e}");
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The mapping modal's per-header cycle-button — `(přeskočit)` -> each
+    /// target column in order, wrapping back to `(přeskočit)`.
+    fn cycle_csv_target(&mut self, header_ix: usize, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::CsvImport { targets, columns, .. }) = &mut self.modal
+        {
+            if let Some(t) = targets.get_mut(header_ix) {
+                *t = match *t {
+                    None if columns.is_empty() => None,
+                    None => Some(0),
+                    Some(i) if i + 1 < columns.len() => Some(i + 1),
+                    Some(_) => None,
+                };
+            }
+        }
+        self.recompute_csv_sample(cx);
+    }
+
+    /// Recomputes `sample_sql`/`error` from the REAL first batch on every
+    /// mapping change (never a synthetic example) — an `Err` (duplicate
+    /// target) fills `error` and disables "Spustit import" (see
+    /// `render_csv_import_panel`'s `can_run` gate).
+    fn recompute_csv_sample(&mut self, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::CsvImport {
+            schema,
+            table,
+            columns,
+            targets,
+            first_rows,
+            sample_sql,
+            error,
+            ..
+        }) = &mut self.modal
+        {
+            let mapping = csv_import::ColumnMapping { targets: targets.clone() };
+            match csv_import::generate_insert_batches(
+                schema.as_deref(),
+                table,
+                columns.as_slice(),
+                &mapping,
+                first_rows.as_slice(),
+            ) {
+                Ok(stmts) => {
+                    *sample_sql = stmts.into_iter().next().map(cap_sql_sample);
+                    *error = if sample_sql.is_none() {
+                        Some("žádný sloupec není namapován".to_string())
+                    } else {
+                        None
+                    };
+                }
+                Err(msg) => {
+                    *sample_sql = None;
+                    *error = Some(msg);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// „Spustit import“ — closes the modal, opens the `TabContent::ScriptRun`
+    /// progress tab (`progress_rows: Some((0, row_count))`), and drains
+    /// `runner::run_csv_import`'s event stream.
+    ///
+    /// Review fix (BLOCKER): the FIRST thing this does, before resolving a
+    /// fresh spec or touching `columns`/`schema`/`table` at all, is
+    /// re-verify the connection identity captured at `start_csv_import`
+    /// time against whatever is active NOW — see `csv_import_dispatch_allowed`
+    /// and `ModalState::CsvImport`'s doc comment for why this is needed
+    /// (the picker + pre-count pass don't block the connection dropdown).
+    /// On mismatch: close the modal and refuse — no `CsvImportJob` is ever
+    /// built, `resolve_spec_for_explain`/`self.runner.run_csv_import` are
+    /// never reached.
+    fn confirm_csv_import(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::CsvImport {
+            path,
+            schema,
+            table,
+            columns,
+            targets,
+            row_count,
+            error,
+            conn_identity,
+            ..
+        }) = self.modal.clone()
+        else {
+            return;
+        };
+        if error.is_some() {
+            return; // "Spustit import" is rendered disabled in this state too.
+        }
+        // Review fix (MINOR 3): same guard as `confirm_script_run` — a
+        // query started DURING the picker/peek window can still be
+        // streaming; confirming now would start a second concurrent run
+        // and silently orphan the first token. Refuse and keep the modal
+        // open.
+        if self.cancel.is_some() {
+            self.status = "jiný dotaz stále běží — počkejte na dokončení".to_string();
+            cx.notify();
+            return;
+        }
+        if !csv_import_dispatch_allowed(&conn_identity, &self.current_conn_identity()) {
+            self.modal = None;
+            self.status = "připojení se během importu změnilo — import zrušen".to_string();
+            cx.notify();
+            return;
+        }
+        let Some((_, timeout_secs, _, spec)) = self.resolve_spec_for_explain(cx) else {
+            self.modal = None;
+            return;
+        };
+        self.modal = None;
+
+        let mapping = csv_import::ColumnMapping { targets };
+        let job = CsvImportJob { path: path.clone(), schema, table: table.clone(), columns, mapping };
+
+        let batch_count = row_count.div_ceil(csv_import::CSV_IMPORT_BATCH_SIZE);
+        let state = Rc::new(RefCell::new(ScriptRunState {
+            files: Vec::new(),
+            total_statements: batch_count,
+            statements_run: 0,
+            statements_failed: 0,
+            total_affected: 0,
+            progress_rows: Some((0, row_count as u64)),
+            log: std::collections::VecDeque::new(),
+            outcome: ScriptRunOutcome::Running,
+            started_at: std::time::Instant::now(),
+            elapsed: None,
+        }));
+
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        let conn_identity = self.current_conn_identity();
+        self.tabs.open(ResultTab {
+            id: 0,
+            title: format!("CSV import: {file_name}"),
+            pinned: false,
+            preview_key: None,
+            conn_identity,
+            content: TabContent::ScriptRun { state: state.clone() },
+        });
+
+        let cancel = CancelToken::new();
+        self.cancel = Some(cancel.clone());
+        self.run_generation += 1;
+        let my_generation = self.run_generation;
+        self.status = format!("CSV import {file_name}…");
+        cx.notify();
+
+        let history_started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let history_conn_name = self.active_connection_name_for_history();
+        let run_cancel = cancel.clone();
+        let mut rx = self.runner.run_csv_import(spec, job, run_cancel, timeout_secs);
+
+        cx.spawn(async move |this, cx| {
+            while let Some(ev) = rx.recv().await {
+                let stop = this
+                    .update(cx, |view, cx| {
+                        match ev {
+                            CsvImportEvent::BatchStarted { batch_index, rows_in_batch } => {
+                                let mut s = state.borrow_mut();
+                                s.push_log(format!("▶ dávka #{} ({rows_in_batch} řádků)", batch_index + 1));
+                            }
+                            CsvImportEvent::BatchFinished { batch_index, rows_committed_so_far } => {
+                                let mut s = state.borrow_mut();
+                                s.statements_run += 1;
+                                s.progress_rows = Some((rows_committed_so_far, row_count as u64));
+                                s.push_log(format!(
+                                    "✓ dávka #{} — celkem {rows_committed_so_far} řádků",
+                                    batch_index + 1
+                                ));
+                            }
+                            CsvImportEvent::Failed { error } => {
+                                {
+                                    let mut s = state.borrow_mut();
+                                    s.statements_failed += 1;
+                                    s.outcome = if cancel.is_cancelled() {
+                                        ScriptRunOutcome::Cancelled
+                                    } else {
+                                        ScriptRunOutcome::Failed
+                                    };
+                                    s.push_log(format!(
+                                        "✗ chyba: {error} — import zrušen, žádná data nezapsána"
+                                    ));
+                                }
+                                let err_text = error.to_string();
+                                view.record_history(
+                                    &format!("[CSV import] {} → {table}", path.display()),
+                                    &history_conn_name,
+                                    history_started_at,
+                                    None,
+                                    Some(0),
+                                    Some(&err_text),
+                                    cx,
+                                );
+                                view.status = format!("CSV import selhal: {error}");
+                                if view.run_generation == my_generation {
+                                    view.cancel = None;
+                                }
+                            }
+                            CsvImportEvent::Finished { rows_imported, elapsed } => {
+                                {
+                                    let mut s = state.borrow_mut();
+                                    s.outcome = ScriptRunOutcome::Done;
+                                    s.elapsed = Some(elapsed);
+                                    s.progress_rows = Some((rows_imported, row_count as u64));
+                                }
+                                let hist_sql = format!(
+                                    "[CSV import] {} → {table} ({rows_imported} řádků, dávka {})",
+                                    path.display(),
+                                    csv_import::CSV_IMPORT_BATCH_SIZE
+                                );
+                                view.record_history(
+                                    &hist_sql,
+                                    &history_conn_name,
+                                    history_started_at,
+                                    Some(elapsed.as_millis() as i64),
+                                    Some(rows_imported as i64),
+                                    None,
+                                    cx,
+                                );
+                                view.status = format!("CSV import hotovo: {rows_imported} řádků");
+                                if view.run_generation == my_generation {
+                                    view.cancel = None;
+                                }
+                            }
+                        }
+                        cx.notify();
+                        false
+                    })
+                    .unwrap_or(false);
+                if stop {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |view, cx| {
                 if view.run_generation == my_generation {
                     view.cancel = None;
                 }
@@ -1834,6 +3330,20 @@ impl AppView {
                 // always cancels the values dialog (no run, no persistence,
                 // same contract as its "Zrušit" button/`cancel_query_params`).
                 connections_ui::ModalState::QueryParams { .. } => true,
+                // G11 T6: not closable while a backup/restore is actually
+                // running (design: Esc must never abandon a running
+                // pg_dump/pg_restore/psql child or an in-flight MSSQL/
+                // SQLite write silently) — closable once it reaches a
+                // terminal state or is still only `Confirming` (nothing
+                // dispatched yet).
+                connections_ui::ModalState::BackupRestore(session) => !session.is_running(),
+                // G12 T3/T4: no run has started yet (that only happens on
+                // "Spustit"/"Spustit import" — see
+                // `confirm_script_run`/`confirm_csv_import`) and neither
+                // holds unsaved secret state, so Esc closing them is safe —
+                // same reasoning `QueryParams` documents above.
+                connections_ui::ModalState::ScriptRun { .. } => true,
+                connections_ui::ModalState::CsvImport { .. } => true,
                 _ => false,
             };
             if closable {
@@ -2020,7 +3530,15 @@ impl AppView {
             .collect();
 
         let monitor_available = self.active_engine().is_some_and(monitor::monitor_available);
-        palette::rank_items(query, &tables, &history, &connections, monitor_available, 30)
+        palette::rank_items(
+            query,
+            &tables,
+            &history,
+            &connections,
+            monitor_available,
+            30,
+            self.active_connection_id.is_some(),
+        )
     }
 
     /// Brief contract #4: execution routes through EXISTING paths only —
@@ -2091,6 +3609,18 @@ impl AppView {
                     }
                 }
                 PaletteAction::OpenCompare => self.open_compare_dialog(cx),
+                PaletteAction::BackupDatabase => {
+                    if let Some(id) = self.active_connection_id.clone() {
+                        self.open_backup_dialog(id, window, cx);
+                    }
+                }
+                PaletteAction::RestoreDatabase => {
+                    if let Some(id) = self.active_connection_id.clone() {
+                        self.open_restore_dialog(id, window, cx);
+                    }
+                }
+                PaletteAction::RunSqlFile => self.start_script_pick(false, cx),
+                PaletteAction::RunSqlFolder => self.start_script_pick(true, cx),
             },
         }
         cx.notify();
@@ -2871,6 +4401,18 @@ impl AppView {
             GridEvent::ViewChanged => {
                 self.save_view_prefs_for_grid(&emitter, cx);
             }
+            GridEvent::ImportCsvRequested { schema, table } => {
+                // CURATION item 4(b): belt-and-braces re-check above the
+                // button's own gating (`csv_import_enabled` set only for a
+                // non-read-only preview) AND the runner's own up-front
+                // guard in `run_csv_import`.
+                if self.active_read_only() {
+                    self.status = "error: připojení je jen pro čtení".to_string();
+                    cx.notify();
+                    return;
+                }
+                self.start_csv_import(schema.clone(), table.clone(), cx);
+            }
         }
     }
 
@@ -3022,6 +4564,19 @@ impl AppView {
             return self.config.connections.iter().find(|c| &c.id == id).map(|c| c.engine);
         }
         self.conn_url.as_deref().map(engine_from_url)
+    }
+
+    /// G12 T4: `cfg.read_only` for the active saved connection, or `false`
+    /// for the CLI-arg URL path (no read-only concept there — same
+    /// convention `run_query_with`'s own spec resolution applies) and for
+    /// "no active connection at all" (nothing to gate CSV import against
+    /// yet). Feeds `SchemaTree::set_read_only` (the tree's ⇪ affordance)
+    /// and `grid.rs`'s `csv_import_enabled` flag.
+    fn active_read_only(&self) -> bool {
+        if let Some(id) = &self.active_connection_id {
+            return self.config.connections.iter().find(|c| &c.id == id).is_some_and(|c| c.read_only);
+        }
+        false
     }
 
     /// Opens (or re-activates) the monitor tab for the active connection.
@@ -3305,6 +4860,7 @@ impl AppView {
             TabContent::Plan { .. } => return,
             TabContent::Diagram { .. } => return,
             TabContent::Compare { .. } => return,
+            TabContent::ScriptRun { .. } => return,
         };
         let current_identity = self.current_conn_identity();
         if !conn_identity_matches(&tab_conn_identity, &current_identity) {
@@ -3535,9 +5091,11 @@ impl AppView {
                         // too since `set_snapshot` doesn't touch it.
                         let favourites = view.config.favourite_objects.clone();
                         let active_id = view.active_connection_id.clone();
+                        let read_only = view.active_read_only();
                         view.tree.update(cx, |t, cx| {
                             t.set_snapshot(snapshot, same_connection, cx);
                             t.set_favourites(favourites, active_id, cx);
+                            t.set_read_only(read_only, cx);
                         });
                         // Review round 3, MAJOR 1: a new snapshot landing
                         // (connection switch OR a same-connection refresh)
@@ -3682,6 +5240,9 @@ impl AppView {
             TreeEvent::OpenErDiagram { schema } => {
                 self.open_er_diagram(schema.clone(), cx);
             }
+            TreeEvent::ImportCsv { schema, table } => {
+                self.start_csv_import(schema.clone(), table.clone(), cx);
+            }
         }
     }
 
@@ -3705,6 +5266,7 @@ impl AppView {
                     TabContent::Plan { .. } => (0, false),
                     TabContent::Diagram { .. } => (0, false),
                     TabContent::Compare { .. } => (0, false),
+                    TabContent::ScriptRun { .. } => (0, false),
                 };
                 // G5 Task 3, brief contract #7: dirty (unapplied staged
                 // edits) tabs get a " •" title suffix — the apply bar
@@ -3867,6 +5429,14 @@ impl AppView {
                 view.clone().into_any_element()
             }
             TabContent::Compare { view } => view.clone().into_any_element(),
+            // G12 T3/T4: a free function (not a method) — it never touches
+            // `self` directly, only `state` (cloned out of `active`) and
+            // `cx` (for the "Zrušit" listener) — calling a `&mut self`
+            // method here instead would conflict with `active`'s still-live
+            // borrow of `self.tabs` (the same reason every other arm above
+            // either avoids `self` or touches only a named field like
+            // `self.status`, never an opaque method call).
+            TabContent::ScriptRun { state } => render_script_run_tab(state.clone(), cx),
         }
     }
 
@@ -4135,6 +5705,924 @@ impl AppView {
                 .into_any_element(),
         )
     }
+
+    // -----------------------------------------------------------------
+    // G11 T6: backup/restore dispatch.
+    //
+    // Flow: `open_backup_dialog`/`open_restore_dialog` (dropdown 🗄/♻ icons
+    // and the palette's two new actions) resolve the target connection,
+    // open the platform file dialog, and on a picked path re-verify the
+    // connection is still there (`backup::backup_dispatch_allowed` —
+    // binding carry-forward #3: an OS file dialog can take arbitrarily
+    // long, and the connection list is mutable state the user could have
+    // edited/deleted meanwhile) before EVER resolving a spec. Backup
+    // dispatches immediately (`run_backup_now` — no typed-confirm step,
+    // design §2 vs §3); Restore stops at `BackupStatus::Confirming` first
+    // (`begin_restore_confirm`) and only reaches `run_restore_now` once
+    // "Obnovit" is clicked with the typed database name matching AND the
+    // read-only gate re-passes (`confirm_restore` — the THIRD independent
+    // read-only check, after the dropdown icon's dimming and this method's
+    // own pre-dialog check).
+    //
+    // Every `BackupHandle` (Postgres external process) this dispatches is
+    // reachable for `cancel()` from THREE places: the session's own
+    // "Zrušit" button (`cancel_backup_restore`), `close_modal`
+    // (connections_ui.rs — covers every other way the modal closes, e.g. a
+    // future code path that calls it directly), and the app-quit hook
+    // (`main()`, below) — see `cancel_active_backup_if_running`'s doc
+    // comment for the full accounting. MSSQL/SQLite runs go through
+    // `Connection::execute`/plain file I/O inside a `tokio` task with no
+    // OS child process to leak; `cancel_now()` is a documented no-op for
+    // those two engines (see `BackupSession::cancel`'s doc comment) — only
+    // the UI-visible status flips to `Cancelled` so a late completion
+    // doesn't silently overwrite it (`finish_backup_restore`'s own guard).
+
+    /// Looks up a `ConnectionConfig` + its vault secret (if any) by id —
+    /// shared by every backup/restore entry point. `None` when the
+    /// connection has since been deleted.
+    fn resolve_conn_for_backup(&self, id: &str) -> Option<(dbc_state::ConnectionConfig, Option<String>)> {
+        let cfg = self.config.connections.iter().find(|c| c.id == id)?.clone();
+        let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+        Some((cfg, secret))
+    }
+
+    /// Builds a fresh `BackupSession`, stashes it as `self.modal`, and
+    /// returns the `log`/`status`/`cancel` handles the caller needs to wire
+    /// up the actual dispatch (or, for a Restore `Confirming` session,
+    /// nothing further — dispatch happens later from `confirm_restore`).
+    /// Called ONCE per state transition (Backup: once, straight to
+    /// `Running`; Restore: once for `Confirming`, then again — with a
+    /// brand-new set of handles, nothing shared with the aborted
+    /// `Confirming` attempt — for `Running` once "Obnovit" is confirmed).
+    fn start_backup_session(
+        &mut self,
+        kind: backup::BackupKind,
+        cfg: &dbc_state::ConnectionConfig,
+        target_path: &str,
+        command_line: String,
+        expected_name: String,
+        confirm_input: Option<Entity<connections_ui::TextField>>,
+        status: backup::BackupStatus,
+        cx: &mut Context<Self>,
+    ) -> (backup::BackupLog, Rc<RefCell<backup::BackupStatus>>, backup::CancelSlot) {
+        let log: backup::BackupLog = Rc::new(RefCell::new(backup::BackupLogState::default()));
+        let status_cell = Rc::new(RefCell::new(status));
+        let cancel_slot: backup::CancelSlot = Rc::new(RefCell::new(None));
+        let session = backup::BackupSession {
+            kind,
+            engine: cfg.engine,
+            connection_id: cfg.id.clone(),
+            connection_name: cfg.name.clone(),
+            database: cfg.database.clone(),
+            log: log.clone(),
+            status: status_cell.clone(),
+            started_at: std::time::Instant::now(),
+            cancel: cancel_slot.clone(),
+            confirm_input,
+            expected_name,
+            command_line,
+            target_path: target_path.to_string(),
+        };
+        self.modal = Some(connections_ui::ModalState::BackupRestore(session));
+        cx.notify();
+        (log, status_cell, cancel_slot)
+    }
+
+    /// Terminal-event handler shared by every engine's dispatch loop below.
+    /// Guards against a late-arriving `Finished`/`Failed`/`Ok`/`Err` that
+    /// lands AFTER the user already clicked "Zrušit" (which sets `status`
+    /// to `Cancelled` immediately, synchronously — see
+    /// `cancel_backup_restore`): once `status` is anything other than
+    /// `Running`, this is a no-op other than repainting, so a cancelled run
+    /// never gets silently overwritten back to Succeeded/Failed, and never
+    /// double-records a history entry for the same run.
+    fn finish_backup_restore(
+        &mut self,
+        status: &Rc<RefCell<backup::BackupStatus>>,
+        kind: backup::BackupKind,
+        connection_name: &str,
+        database: &str,
+        path: &str,
+        started_at_unix: i64,
+        elapsed_ms: i64,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        // Deliberately checks `status` only — NOT `self.modal` — so a
+        // non-cancellable (MSSQL/SQLite) session's real outcome is still
+        // recorded even after the user has closed/switched away from its
+        // modal (`should_cancel_on_teardown` guarantees `status` was never
+        // wrongly flipped to `Cancelled` for those two engines in the
+        // meantime — see both functions' doc comments, review MAJOR fix).
+        let is_running = matches!(*status.borrow(), backup::BackupStatus::Running);
+        if !backup::should_record_terminal_event(is_running) {
+            cx.notify();
+            return;
+        }
+        *status.borrow_mut() = match &error {
+            None => backup::BackupStatus::Succeeded,
+            Some(e) => backup::BackupStatus::Failed(e.clone()),
+        };
+        self.record_backup_restore_history(
+            kind,
+            connection_name,
+            database,
+            path,
+            started_at_unix,
+            elapsed_ms,
+            error.as_deref(),
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Synthetic, secret-free history description (Global Constraints:
+    /// "never the command line's raw form, never a password") — `path` is a
+    /// local filesystem path, never argv, never a connection string.
+    /// `record_history_with_kind` (G11 T7) is what makes this run show up
+    /// in the History panel with its 🗄 badge instead of as a plain
+    /// `"query"` entry.
+    fn record_backup_restore_history(
+        &mut self,
+        kind: backup::BackupKind,
+        connection_name: &str,
+        database: &str,
+        path: &str,
+        started_at_unix: i64,
+        elapsed_ms: i64,
+        error: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let (verb, arrow) = match kind {
+            backup::BackupKind::Backup => ("BACKUP", "->"),
+            backup::BackupKind::Restore => ("RESTORE", "<-"),
+        };
+        let description = format!("-- {verb} {database} {arrow} {path}");
+        let kind_str = match kind {
+            backup::BackupKind::Backup => "backup",
+            backup::BackupKind::Restore => "restore",
+        };
+        self.record_history_with_kind(
+            &description,
+            connection_name,
+            started_at_unix,
+            Some(elapsed_ms),
+            None,
+            error,
+            kind_str,
+            cx,
+        );
+    }
+
+    /// "🗄" dropdown icon / palette "Zálohovat databázi…" — opens the SAVE
+    /// dialog. Backup is the ONE documented read-only exemption (design
+    /// CURATION item 2) — no read-only check anywhere in this method, on
+    /// purpose.
+    fn open_backup_dialog(&mut self, connection_id: String, _window: &mut Window, cx: &mut Context<Self>) {
+        // Single-modal invariant — same guard every dialog opener in this
+        // codebase already applies (see `on_monitor_view_event`'s
+        // `KillRequested` arm) — also what makes "starting a new operation
+        // while one runs" refuse rather than abandon the first one's handle.
+        if self.modal.is_some() {
+            return;
+        }
+        let Some((cfg, _secret)) = self.resolve_conn_for_backup(&connection_id) else {
+            self.status = "error: připojení nenalezeno".to_string();
+            cx.notify();
+            return;
+        };
+        let ext = backup_file_ext(cfg.engine);
+        let suggested_name = format!("{}-{}.{ext}", cfg.database, backup_timestamp());
+        self.status = "volím cíl zálohy…".to_string();
+        cx.notify();
+        let dialog = cx.prompt_for_new_path(&std::path::PathBuf::new(), Some(&suggested_name));
+        cx.spawn(async move |this, cx| {
+            let path = match dialog.await {
+                Ok(Ok(Some(p))) => p,
+                Ok(Ok(None)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "záloha zrušena".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = format!("error: dialog pro uložení selhal ({e})");
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_canceled) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "error: dialog pro uložení není dostupný".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let _ = this.update(cx, |view, cx| {
+                // Review fix (MINOR 1, final whole-branch review): a modal
+                // the user opened WHILE this save dialog was in flight wins
+                // — same idiom G12's script-run picker continuation uses
+                // (main.rs, `start_script_pick`'s post-pick `this.update`
+                // arm) — don't let `run_backup_now`/`start_backup_session`
+                // clobber it by unconditionally overwriting `self.modal`.
+                if view.modal.is_some() {
+                    view.status = "záloha zahozena — je otevřený jiný dialog".to_string();
+                    cx.notify();
+                    return;
+                }
+                // Binding carry-forward #3: re-verify the connection still
+                // exists RIGHT HERE, first, before resolving anything else
+                // — the save dialog's async window may have taken
+                // arbitrarily long.
+                let current_ids: Vec<String> = view.config.connections.iter().map(|c| c.id.clone()).collect();
+                if !backup::backup_dispatch_allowed(&connection_id, &current_ids) {
+                    view.status = "připojení se během výběru změnilo — akce zrušena".to_string();
+                    cx.notify();
+                    return;
+                }
+                let Some((cfg, secret)) = view.resolve_conn_for_backup(&connection_id) else {
+                    view.status = "error: připojení nenalezeno".to_string();
+                    cx.notify();
+                    return;
+                };
+                let dest_path = path.to_string_lossy().to_string();
+                view.run_backup_now(cfg, secret, dest_path, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Dispatches a backup run for `cfg`'s engine — builds the confirm/log
+    /// panel (`start_backup_session`, status `Running` immediately — Backup
+    /// has no typed-confirm step) then spawns the actual work.
+    fn run_backup_now(
+        &mut self,
+        cfg: dbc_state::ConnectionConfig,
+        secret: Option<String>,
+        dest_path: String,
+        cx: &mut Context<Self>,
+    ) {
+        let connection_name = cfg.name.clone();
+        let database = cfg.database.clone();
+        let started_at_unix = unix_now();
+
+        match cfg.engine {
+            dbc_state::Engine::Postgres => {
+                // Scope reduction (documented, not silent — see this
+                // phase's final report): SSH-tunneled Postgres connections
+                // aren't tunneled for the EXTERNAL pg_dump/pg_restore/psql
+                // path (unlike the normal driver connection, which already
+                // tunnels via `connect::open_config`) — refusing outright
+                // is safer than either stalling the UI thread opening a
+                // tunnel inline or silently dialing the untunneled host
+                // with the real password in the child's env.
+                if cfg.ssh.is_some() {
+                    self.status =
+                        "error: zálohování přes SSH tunel zatím není podporováno pro tento engine — použij přímé připojení"
+                            .to_string();
+                    cx.notify();
+                    return;
+                }
+                let opts = backup::PgBackupOptions { format: backup::PgDumpFormat::Custom, compress: 6 };
+                let args =
+                    match backup::build_pg_dump_args(&cfg, &cfg.host, cfg.port.unwrap_or(5432), &opts, &dest_path) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.status = format!("error: {e}");
+                            cx.notify();
+                            return;
+                        }
+                    };
+                let program = match runner::resolve_tool_path(self.config.tool_paths.pg_dump.as_deref(), "pg_dump") {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.status = format!("error: {e}");
+                        cx.notify();
+                        return;
+                    }
+                };
+                let command_line = backup::display_command_line(&program, &args, secret.as_deref());
+                let (log, status, cancel_slot) = self.start_backup_session(
+                    backup::BackupKind::Backup,
+                    &cfg,
+                    &dest_path,
+                    command_line,
+                    String::new(),
+                    None,
+                    backup::BackupStatus::Running,
+                    cx,
+                );
+                let (mut rx, handle) = self.runner.run_external_tool(program, args, secret.clone());
+                // BackupHandle wired into the session's cancel slot RIGHT
+                // HERE, before this method returns — every teardown path
+                // that can observe `self.modal` after this point can also
+                // reach this handle's `cancel()`.
+                *cancel_slot.borrow_mut() = Some(Rc::new(move || handle.cancel()));
+                let started = std::time::Instant::now();
+                cx.spawn(async move |this, cx| {
+                    while let Some(ev) = rx.recv().await {
+                        match ev {
+                            backup::BackupEvent::Log(line) => {
+                                let ok = this
+                                    .update(cx, |_view, cx| {
+                                        backup::push_backup_log(&log, line);
+                                        cx.notify();
+                                    })
+                                    .is_ok();
+                                if !ok {
+                                    return;
+                                }
+                            }
+                            backup::BackupEvent::Finished => {
+                                let _ = this.update(cx, |view, cx| {
+                                    view.finish_backup_restore(
+                                        &status,
+                                        backup::BackupKind::Backup,
+                                        &connection_name,
+                                        &database,
+                                        &dest_path,
+                                        started_at_unix,
+                                        started.elapsed().as_millis() as i64,
+                                        None,
+                                        cx,
+                                    );
+                                });
+                                return;
+                            }
+                            backup::BackupEvent::Failed(msg) => {
+                                let _ = this.update(cx, |view, cx| {
+                                    view.finish_backup_restore(
+                                        &status,
+                                        backup::BackupKind::Backup,
+                                        &connection_name,
+                                        &database,
+                                        &dest_path,
+                                        started_at_unix,
+                                        started.elapsed().as_millis() as i64,
+                                        Some(msg),
+                                        cx,
+                                    );
+                                });
+                                return;
+                            }
+                        }
+                    }
+                })
+                .detach();
+            }
+            dbc_state::Engine::Mssql => {
+                let command_line = backup::build_backup_sql(&database, &dest_path);
+                let (_log, status, _cancel_slot) = self.start_backup_session(
+                    backup::BackupKind::Backup,
+                    &cfg,
+                    &dest_path,
+                    command_line,
+                    String::new(),
+                    None,
+                    backup::BackupStatus::Running,
+                    cx,
+                );
+                let spec = ConnectSpec::Config { cfg: Box::new(cfg.clone()), secret: secret.clone() };
+                let rx = self.runner.run_mssql_backup(spec, database.clone(), dest_path.clone());
+                let started = std::time::Instant::now();
+                cx.spawn(async move |this, cx| {
+                    let result = rx.await;
+                    let _ = this.update(cx, |view, cx| {
+                        let err = match result {
+                            Ok(Ok(())) => None,
+                            Ok(Err(e)) => Some(e.message),
+                            Err(_) => Some("backup task panicked".to_string()),
+                        };
+                        view.finish_backup_restore(
+                            &status,
+                            backup::BackupKind::Backup,
+                            &connection_name,
+                            &database,
+                            &dest_path,
+                            started_at_unix,
+                            started.elapsed().as_millis() as i64,
+                            err,
+                            cx,
+                        );
+                    });
+                })
+                .detach();
+            }
+            dbc_state::Engine::Sqlite => {
+                let command_line = backup::build_vacuum_into_sql(&dest_path);
+                let (_log, status, _cancel_slot) = self.start_backup_session(
+                    backup::BackupKind::Backup,
+                    &cfg,
+                    &dest_path,
+                    command_line,
+                    String::new(),
+                    None,
+                    backup::BackupStatus::Running,
+                    cx,
+                );
+                let spec = ConnectSpec::Config { cfg: Box::new(cfg.clone()), secret: secret.clone() };
+                let rx = self.runner.run_sqlite_backup(spec, dest_path.clone());
+                let started = std::time::Instant::now();
+                cx.spawn(async move |this, cx| {
+                    let result = rx.await;
+                    let _ = this.update(cx, |view, cx| {
+                        let err = match result {
+                            Ok(Ok(())) => None,
+                            Ok(Err(e)) => Some(e.message),
+                            Err(_) => Some("backup task panicked".to_string()),
+                        };
+                        view.finish_backup_restore(
+                            &status,
+                            backup::BackupKind::Backup,
+                            &connection_name,
+                            &database,
+                            &dest_path,
+                            started_at_unix,
+                            started.elapsed().as_millis() as i64,
+                            err,
+                            cx,
+                        );
+                    });
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// "♻" dropdown icon / palette "Obnovit databázi ze zálohy…" — opens the
+    /// OPEN dialog (single file pick). Layer 1 of the 3-layer read-only
+    /// posture: refused right here, before even opening the dialog, if
+    /// `cfg.read_only` — Restore is NEVER exempt (design CURATION item 2).
+    /// Review MINOR A fix: uses `cx.spawn_in(window, ...)` (not the plain
+    /// `cx.spawn`) so the async continuation can still reach `window` once
+    /// the file dialog resolves — `begin_restore_confirm` needs it to focus
+    /// the typed-name field, same as every other modal opener in this
+    /// codebase already does for its own first focusable field.
+    fn open_restore_dialog(&mut self, connection_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        let Some((cfg, _secret)) = self.resolve_conn_for_backup(&connection_id) else {
+            self.status = "error: připojení nenalezeno".to_string();
+            cx.notify();
+            return;
+        };
+        if cfg.read_only {
+            self.status = "error: připojení je pouze pro čtení — obnovu nelze spustit".to_string();
+            cx.notify();
+            return;
+        }
+        // Review NIT fix: same cheap early-refusal `begin_restore_confirm`
+        // performs below — no reason to make the user pick a file for a
+        // Postgres/SSH combination that's guaranteed to be refused once
+        // they actually confirm.
+        if cfg.engine == dbc_state::Engine::Postgres && cfg.ssh.is_some() {
+            self.status =
+                "error: obnova přes SSH tunel zatím není podporována pro tento engine — použij přímé připojení"
+                    .to_string();
+            cx.notify();
+            return;
+        }
+        self.status = "volím zdroj obnovy…".to_string();
+        cx.notify();
+        let dialog = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Obnovit ze zálohy".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let path = match dialog.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
+                Ok(Ok(_)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "obnova zrušena".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = format!("error: dialog pro výběr souboru selhal ({e})");
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_canceled) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "error: dialog pro výběr souboru není dostupný".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let _ = this.update_in(cx, |view, window, cx| {
+                view.begin_restore_confirm(connection_id.clone(), path, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Second layer of the 3-layer read-only posture (dialog-open-level) +
+    /// binding carry-forward #3's identity re-check — both done RIGHT HERE,
+    /// before ever building a confirm panel, since the file dialog above is
+    /// the async window this connection's config could have changed under.
+    /// Builds the `Confirming` session (typed-name field, no dispatch yet)
+    /// and focuses it (review MINOR A fix — every sibling modal opener in
+    /// this codebase already focuses its own first field the same way).
+    fn begin_restore_confirm(
+        &mut self,
+        connection_id: String,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Review fix (MINOR 1, final whole-branch review): a modal the user
+        // opened WHILE the open-file dialog was in flight wins — same
+        // idiom G12's script-run picker continuation uses (main.rs,
+        // `start_script_pick`'s post-pick `this.update` arm) — don't let
+        // `start_backup_session` clobber it by unconditionally overwriting
+        // `self.modal`.
+        if self.modal.is_some() {
+            self.status = "obnova zahozena — je otevřený jiný dialog".to_string();
+            cx.notify();
+            return;
+        }
+        let current_ids: Vec<String> = self.config.connections.iter().map(|c| c.id.clone()).collect();
+        if !backup::backup_dispatch_allowed(&connection_id, &current_ids) {
+            self.status = "připojení se během výběru změnilo — akce zrušena".to_string();
+            cx.notify();
+            return;
+        }
+        let Some((cfg, secret)) = self.resolve_conn_for_backup(&connection_id) else {
+            self.status = "error: připojení nenalezeno".to_string();
+            cx.notify();
+            return;
+        };
+        if cfg.read_only {
+            self.status = "error: připojení je pouze pro čtení — obnovu nelze spustit".to_string();
+            cx.notify();
+            return;
+        }
+        // Review NIT fix: refuse an SSH-tunneled Postgres connection HERE,
+        // before ever building a preview — `run_restore_now` refuses the
+        // exact same case at actual dispatch time (see that method), and
+        // showing a full `pg_restore`/`psql` command preview for a run that
+        // is guaranteed to be refused later is misleading.
+        if cfg.engine == dbc_state::Engine::Postgres && cfg.ssh.is_some() {
+            self.status =
+                "error: obnova přes SSH tunel zatím není podporována pro tento engine — použij přímé připojení"
+                    .to_string();
+            cx.notify();
+            return;
+        }
+        let source_path = path.to_string_lossy().to_string();
+
+        let command_line = match plan_restore(&cfg, &source_path) {
+            Ok(RestorePlan::PgTool { tool_name, args }) => {
+                backup::display_command_line(&tool_name, &args, secret.as_deref())
+            }
+            Ok(RestorePlan::Mssql) => format!(
+                "{}\n{}\n{}",
+                backup::build_single_user_sql(&cfg.database, false),
+                backup::build_restore_sql(&cfg.database, &source_path),
+                backup::build_single_user_sql(&cfg.database, true),
+            ),
+            Ok(RestorePlan::Sqlite) => format!("copy {source_path} -> {}", cfg.database),
+            Err(e) => {
+                self.status = format!("error: {e}");
+                cx.notify();
+                return;
+            }
+        };
+
+        let expected_name = cfg.database.clone();
+        let input = cx.new(|cx| connections_ui::TextField::new(cx, &expected_name, false));
+        // Review MINOR A fix: focus the typed-name field — every sibling
+        // modal opener in this codebase already focuses its own first
+        // field (`open_connection_dialog`, `on_dropdown_item_click`'s
+        // master-password prompt, ...); this one was missing it.
+        let input_focus = input.focus_handle(cx);
+        self.start_backup_session(
+            backup::BackupKind::Restore,
+            &cfg,
+            &source_path,
+            command_line,
+            expected_name,
+            Some(input),
+            backup::BackupStatus::Confirming,
+            cx,
+        );
+        window.focus(&input_focus, cx);
+    }
+
+    /// "Obnovit" button (`ModalState::BackupRestore` while `Confirming`) —
+    /// THIRD independent read-only check (belt-and-braces, after the
+    /// dropdown icon's dim and `open_restore_dialog`'s own refusal), plus a
+    /// second `backup_dispatch_allowed` re-check (the typed-name wait is
+    /// itself another async-ish window a user could spend arbitrarily long
+    /// in). A no-op if the typed name doesn't match `expected_name` — the
+    /// button is rendered non-interactive in that case anyway
+    /// (`connections_ui::render_backup_restore_panel`), this is defense in
+    /// depth.
+    fn confirm_restore(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::BackupRestore(session)) = self.modal.clone() else { return };
+        if session.kind != backup::BackupKind::Restore
+            || !matches!(*session.status.borrow(), backup::BackupStatus::Confirming)
+        {
+            return;
+        }
+        let typed = session.confirm_input.as_ref().map(|f| f.read(cx).text()).unwrap_or_default();
+        if !backup::confirm_matches(&typed, &session.expected_name) {
+            return;
+        }
+
+        let current_ids: Vec<String> = self.config.connections.iter().map(|c| c.id.clone()).collect();
+        if !backup::backup_dispatch_allowed(&session.connection_id, &current_ids) {
+            self.status = "připojení se během výběru změnilo — akce zrušena".to_string();
+            self.close_modal(cx);
+            cx.notify();
+            return;
+        }
+        let Some((cfg, secret)) = self.resolve_conn_for_backup(&session.connection_id) else {
+            self.status = "error: připojení nenalezeno".to_string();
+            self.close_modal(cx);
+            cx.notify();
+            return;
+        };
+        if let Err(msg) = backup::guard_backup_restore_read_only(backup::BackupOp::Restore, cfg.read_only) {
+            self.status = format!("error: {msg}");
+            self.close_modal(cx);
+            cx.notify();
+            return;
+        }
+
+        let source_path = session.target_path.clone();
+        self.run_restore_now(cfg, secret, source_path, cx);
+    }
+
+    /// Dispatches the actual restore work — replaces `self.modal` with a
+    /// brand-new `Running` session (fresh `log`/`status`/`cancel` handles;
+    /// nothing shared with the just-abandoned `Confirming` one, which never
+    /// had anything to cancel).
+    fn run_restore_now(
+        &mut self,
+        cfg: dbc_state::ConnectionConfig,
+        secret: Option<String>,
+        source_path: String,
+        cx: &mut Context<Self>,
+    ) {
+        let connection_name = cfg.name.clone();
+        let database = cfg.database.clone();
+        let started_at_unix = unix_now();
+
+        let plan = match plan_restore(&cfg, &source_path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("error: {e}");
+                cx.notify();
+                return;
+            }
+        };
+
+        match plan {
+            RestorePlan::PgTool { tool_name, args } => {
+                if cfg.ssh.is_some() {
+                    self.status =
+                        "error: obnova přes SSH tunel zatím není podporována pro tento engine — použij přímé připojení"
+                            .to_string();
+                    cx.notify();
+                    return;
+                }
+                let configured = match tool_name.as_str() {
+                    "pg_restore" => self.config.tool_paths.pg_restore.as_deref(),
+                    _ => self.config.tool_paths.psql.as_deref(),
+                };
+                let program = match runner::resolve_tool_path(configured, &tool_name) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.status = format!("error: {e}");
+                        cx.notify();
+                        return;
+                    }
+                };
+                let command_line = backup::display_command_line(&program, &args, secret.as_deref());
+                let (log, status, cancel_slot) = self.start_backup_session(
+                    backup::BackupKind::Restore,
+                    &cfg,
+                    &source_path,
+                    command_line,
+                    database.clone(),
+                    None,
+                    backup::BackupStatus::Running,
+                    cx,
+                );
+                let (mut rx, handle) = self.runner.run_external_tool(program, args, secret.clone());
+                *cancel_slot.borrow_mut() = Some(Rc::new(move || handle.cancel()));
+                let started = std::time::Instant::now();
+                cx.spawn(async move |this, cx| {
+                    while let Some(ev) = rx.recv().await {
+                        match ev {
+                            backup::BackupEvent::Log(line) => {
+                                let ok = this
+                                    .update(cx, |_view, cx| {
+                                        backup::push_backup_log(&log, line);
+                                        cx.notify();
+                                    })
+                                    .is_ok();
+                                if !ok {
+                                    return;
+                                }
+                            }
+                            backup::BackupEvent::Finished => {
+                                let _ = this.update(cx, |view, cx| {
+                                    view.finish_backup_restore(
+                                        &status,
+                                        backup::BackupKind::Restore,
+                                        &connection_name,
+                                        &database,
+                                        &source_path,
+                                        started_at_unix,
+                                        started.elapsed().as_millis() as i64,
+                                        None,
+                                        cx,
+                                    );
+                                });
+                                return;
+                            }
+                            backup::BackupEvent::Failed(msg) => {
+                                let _ = this.update(cx, |view, cx| {
+                                    view.finish_backup_restore(
+                                        &status,
+                                        backup::BackupKind::Restore,
+                                        &connection_name,
+                                        &database,
+                                        &source_path,
+                                        started_at_unix,
+                                        started.elapsed().as_millis() as i64,
+                                        Some(msg),
+                                        cx,
+                                    );
+                                });
+                                return;
+                            }
+                        }
+                    }
+                })
+                .detach();
+            }
+            RestorePlan::Mssql => {
+                let command_line = format!(
+                    "{}\n{}\n{}",
+                    backup::build_single_user_sql(&database, false),
+                    backup::build_restore_sql(&database, &source_path),
+                    backup::build_single_user_sql(&database, true),
+                );
+                let (_log, status, _cancel_slot) = self.start_backup_session(
+                    backup::BackupKind::Restore,
+                    &cfg,
+                    &source_path,
+                    command_line,
+                    database.clone(),
+                    None,
+                    backup::BackupStatus::Running,
+                    cx,
+                );
+                let spec = ConnectSpec::Config { cfg: Box::new(cfg.clone()), secret: secret.clone() };
+                let rx = self.runner.run_mssql_restore(spec, database.clone(), source_path.clone());
+                let started = std::time::Instant::now();
+                cx.spawn(async move |this, cx| {
+                    let result = rx.await;
+                    let _ = this.update(cx, |view, cx| {
+                        let err = match result {
+                            Ok(Ok(())) => None,
+                            Ok(Err(e)) => Some(e.message),
+                            Err(_) => Some("restore task panicked".to_string()),
+                        };
+                        view.finish_backup_restore(
+                            &status,
+                            backup::BackupKind::Restore,
+                            &connection_name,
+                            &database,
+                            &source_path,
+                            started_at_unix,
+                            started.elapsed().as_millis() as i64,
+                            err,
+                            cx,
+                        );
+                    });
+                })
+                .detach();
+            }
+            RestorePlan::Sqlite => {
+                let command_line = format!("copy {source_path} -> {database}");
+                let (_log, status, _cancel_slot) = self.start_backup_session(
+                    backup::BackupKind::Restore,
+                    &cfg,
+                    &source_path,
+                    command_line,
+                    database.clone(),
+                    None,
+                    backup::BackupStatus::Running,
+                    cx,
+                );
+                let db_path = database.clone();
+                let rx = self.runner.run_sqlite_restore(db_path, source_path.clone(), cfg.read_only);
+                let started = std::time::Instant::now();
+                cx.spawn(async move |this, cx| {
+                    let result = rx.await;
+                    let _ = this.update(cx, |view, cx| {
+                        let err = match result {
+                            Ok(Ok(())) => None,
+                            Ok(Err(e)) => Some(e.message),
+                            Err(_) => Some("restore task panicked".to_string()),
+                        };
+                        view.finish_backup_restore(
+                            &status,
+                            backup::BackupKind::Restore,
+                            &connection_name,
+                            &database,
+                            &source_path,
+                            started_at_unix,
+                            started.elapsed().as_millis() as i64,
+                            err,
+                            cx,
+                        );
+                    });
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// "Zrušit" on `ModalState::BackupRestore` — while `Confirming` (nothing
+    /// dispatched yet) this is a plain close; while `Running` it only
+    /// reaches for the real kill switch (`BackupSession::cancel_now`) and
+    /// flips the UI-visible status to `Cancelled` when
+    /// `backup::should_cancel_on_teardown` says so — i.e. a REAL cancel
+    /// hook is installed (Postgres). Review MAJOR fix: for MSSQL/SQLite
+    /// (`session.can_cancel() == false` — no OS child process, only a
+    /// `tokio` task driving `Connection::execute`/`fs::copy`, and T4's
+    /// runner methods for them expose no cancel hook), this is now a no-op
+    /// other than repainting — the panel itself renders "Zrušit" as
+    /// non-interactive for that case (`render_backup_restore_panel`), so
+    /// this handler shouldn't even be reachable there; kept as a defensive
+    /// no-op rather than lying about a cancellation that didn't happen (see
+    /// `should_cancel_on_teardown`'s doc comment for the full consequence
+    /// chain a wrongly-flipped status used to cause).
+    fn cancel_backup_restore(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::BackupRestore(session)) = &self.modal else { return };
+        if matches!(*session.status.borrow(), backup::BackupStatus::Confirming) {
+            self.close_modal(cx);
+            return;
+        }
+        if backup::should_cancel_on_teardown(session.can_cancel(), session.is_running()) {
+            session.cancel_now();
+            *session.status.borrow_mut() = backup::BackupStatus::Cancelled;
+        }
+        cx.notify();
+    }
+
+    /// G11 T6 binding carry-forward (BackupHandle has no Drop/kill-on-drop):
+    /// the ONE place every teardown path funnels through to guarantee a
+    /// still-`Running` backup/restore's handle is cancelled before it could
+    /// otherwise be abandoned. Called from:
+    /// - `connections_ui::AppView::close_modal` — covers every UI path that
+    ///   closes the modal (the panel's own "Zavřít"/"Zrušit" buttons already
+    ///   call `cancel_backup_restore` directly for the interactive case;
+    ///   this is the backstop for any OTHER code path that closes the modal
+    ///   without going through that button, e.g. a future feature).
+    /// - `AppView::switch_to_connection` — defensive: `on_open_palette`
+    ///   already refuses to open while `self.modal.is_some()` and the
+    ///   dropdown overlay itself doesn't render while a modal is open
+    ///   (`main.rs`'s `render`: `if self.dropdown_open && self.modal.is_none()`),
+    ///   so this path is not reachable through today's UI — kept anyway,
+    ///   matching this codebase's "each layer holds on its own" posture
+    ///   (`guards.rs`), in case a future entry point calls
+    ///   `switch_to_connection` directly.
+    /// - the app-quit hook (`main()`, below) — window close.
+    /// A no-op when no modal is open, the open modal isn't `BackupRestore`,
+    /// its status isn't `Running`, or (review MAJOR fix) there is no REAL
+    /// cancel hook installed (`session.can_cancel()` — MSSQL/SQLite have
+    /// none, see `backup::should_cancel_on_teardown`'s doc comment). For
+    /// those two engines closing the modal here is still safe to let
+    /// proceed — there is no OS child process to leak, only a `tokio` task
+    /// that will run to completion on its own — but `status` must NOT be
+    /// wrongly flipped to `Cancelled`: `finish_backup_restore` doesn't
+    /// consult `self.modal` at all, so the real outcome (and its history
+    /// record) still lands correctly once that task actually finishes,
+    /// PROVIDED `status` was left as `Running` for it to find.
+    pub(crate) fn cancel_active_backup_if_running(&mut self) {
+        if let Some(connections_ui::ModalState::BackupRestore(session)) = &self.modal {
+            if backup::should_cancel_on_teardown(session.can_cancel(), session.is_running()) {
+                session.cancel_now();
+                *session.status.borrow_mut() = backup::BackupStatus::Cancelled;
+            }
+        }
+    }
 }
 
 impl Render for AppView {
@@ -4282,6 +6770,42 @@ impl Render for AppView {
                             .into_any_element()
                     }
                 })
+                .child({
+                    // G12 T3: „SQL soubor…“/„SQL složku…“ — the script
+                    // runner's picker entry points, same toolbar-row
+                    // placement precedent as Vysvětlit/Analyzovat above
+                    // (adaptation: the plan's grounding describes these as
+                    // separate editor-toolbar buttons, but this status-bar
+                    // row IS the app's existing "run-adjacent action
+                    // buttons" toolbar — reusing it avoids growing a new
+                    // toolbar row for two buttons).
+                    let enabled = self.cancel.is_none() && self.modal.is_none();
+                    let color = if enabled { rgb(0xcdd6f4) } else { rgb(0x45475a) };
+                    div()
+                        .id("btn-run-sql-file")
+                        .cursor_pointer()
+                        .text_color(color)
+                        .child("SQL soubor…")
+                        .on_click(cx.listener(move |view, _, _window, cx| {
+                            if enabled {
+                                view.start_script_pick(false, cx);
+                            }
+                        }))
+                })
+                .child({
+                    let enabled = self.cancel.is_none() && self.modal.is_none();
+                    let color = if enabled { rgb(0xcdd6f4) } else { rgb(0x45475a) };
+                    div()
+                        .id("btn-run-sql-folder")
+                        .cursor_pointer()
+                        .text_color(color)
+                        .child("SQL složku…")
+                        .on_click(cx.listener(move |view, _, _window, cx| {
+                            if enabled {
+                                view.start_script_pick(true, cx);
+                            }
+                        }))
+                })
                 .child(div().flex_1().child(self.status.clone())),
         );
 
@@ -4309,6 +6833,183 @@ impl Render for AppView {
             root = root.child(overlay);
         }
         root
+    }
+
+}
+
+/// `{database}-{unix-seconds}.{ext}` suggested filename for the backup SAVE
+/// dialog — same `SystemTime`-based scheme `grid.rs::export_timestamp` uses
+/// for its own Downloads-fallback filenames (no new date-formatting
+/// dependency added for this).
+fn backup_timestamp() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn backup_file_ext(engine: dbc_state::Engine) -> &'static str {
+    match engine {
+        dbc_state::Engine::Postgres => "backup", // pg_dump -Fc (default format here)
+        dbc_state::Engine::Mssql => "bak",
+        dbc_state::Engine::Sqlite => "sqlite",
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The restore dispatch plan for `cfg`'s engine — shared by
+/// `AppView::begin_restore_confirm`'s preview and `AppView::run_restore_now`'s
+/// actual dispatch so the two can never disagree about which tool/format
+/// was chosen (e.g. a dump-format sniff that somehow differed between
+/// preview time and confirm time because the picked file changed on disk
+/// in between — re-deriving fresh each time, rather than caching the first
+/// result, means a changed file is picked up rather than silently ignored).
+enum RestorePlan {
+    /// Postgres — `tool_name` is `"pg_restore"` or `"psql"`
+    /// (`backup::detect_dump_format`'s sniff), `args` already built
+    /// (`backup::build_pg_restore_args`/`build_psql_args`) but NOT yet
+    /// paired with a resolved program path — that's a separate,
+    /// possibly-failing step (`runner::resolve_tool_path`) the dispatch
+    /// side performs right before spawning.
+    PgTool { tool_name: String, args: Vec<String> },
+    Mssql,
+    Sqlite,
+}
+
+/// Reads AT MOST the first 16 bytes of `path` — exactly what
+/// `backup::detect_dump_format`'s `PGDMP`-magic sniff needs, never the
+/// whole file. Review BLOCKER fix: `plan_restore` used to `fs::read` the
+/// ENTIRE dump (realistically gigabytes) into memory, synchronously on the
+/// UI thread, and it runs TWICE per restore (`begin_restore_confirm`'s
+/// preview + `run_restore_now`'s actual dispatch) — same bounded-read shape
+/// `run_sqlite_restore_inner` (runner.rs) already uses for its own magic-
+/// header check. A file shorter than 16 bytes just yields whatever `read`
+/// actually filled (`n` bytes) — never a panic on a short buffer.
+fn read_sniff_prefix(path: &str) -> Result<[u8; 16], String> {
+    use std::io::Read;
+    let mut header = [0u8; 16];
+    let mut f = std::fs::File::open(path).map_err(|e| format!("nelze číst {path}: {e}"))?;
+    f.read(&mut header).map_err(|e| format!("nelze číst {path}: {e}"))?;
+    Ok(header)
+}
+
+fn plan_restore(cfg: &dbc_state::ConnectionConfig, source_path: &str) -> Result<RestorePlan, String> {
+    match cfg.engine {
+        dbc_state::Engine::Postgres => {
+            let header = read_sniff_prefix(source_path)?;
+            let target_host = cfg.host.clone();
+            let target_port = cfg.port.unwrap_or(5432);
+            match backup::detect_dump_format(&header) {
+                backup::DumpFormat::Custom => {
+                    let args = backup::build_pg_restore_args(
+                        cfg,
+                        &target_host,
+                        target_port,
+                        &backup::PgRestoreOptions::default(),
+                        source_path,
+                    )?;
+                    Ok(RestorePlan::PgTool { tool_name: "pg_restore".to_string(), args })
+                }
+                backup::DumpFormat::Plain => {
+                    let args = backup::build_psql_args(cfg, &target_host, target_port, source_path)?;
+                    Ok(RestorePlan::PgTool { tool_name: "psql".to_string(), args })
+                }
+            }
+        }
+        dbc_state::Engine::Mssql => Ok(RestorePlan::Mssql),
+        dbc_state::Engine::Sqlite => Ok(RestorePlan::Sqlite),
+    }
+}
+
+#[cfg(test)]
+mod plan_restore_tests {
+    use super::*;
+
+    fn pg_cfg() -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "c1".into(),
+            name: "demo".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Postgres,
+            host: "db.internal".into(),
+            port: Some(5432),
+            database: "shop".into(),
+            user: "alice".into(),
+            read_only: false,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+        }
+    }
+
+    /// Review BLOCKER fix: `read_sniff_prefix` must detect the `PGDMP`
+    /// custom-format magic from a large file (simulated with a multi-KB
+    /// garbage tail after the magic) while reading only its bounded 16-byte
+    /// prefix — never the whole file.
+    #[test]
+    fn read_sniff_prefix_detects_pgdmp_magic_with_a_large_garbage_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.backup");
+        let mut content = b"PGDMP\x01\x0e\x00rest".to_vec();
+        content.extend(std::iter::repeat(0xABu8).take(4 * 1024 * 1024)); // 4 MiB tail
+        std::fs::write(&path, &content).unwrap();
+
+        let header = read_sniff_prefix(path.to_str().unwrap()).unwrap();
+        assert_eq!(backup::detect_dump_format(&header), backup::DumpFormat::Custom);
+    }
+
+    #[test]
+    fn read_sniff_prefix_never_panics_on_a_short_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.sql");
+        std::fs::write(&path, b"-- x").unwrap();
+
+        let header = read_sniff_prefix(path.to_str().unwrap()).unwrap();
+        assert_eq!(backup::detect_dump_format(&header), backup::DumpFormat::Plain);
+    }
+
+    #[test]
+    fn read_sniff_prefix_missing_file_is_an_error_not_a_panic() {
+        assert!(read_sniff_prefix(r"D:\definitely\not\a\real\path.backup").is_err());
+    }
+
+    #[test]
+    fn plan_restore_postgres_picks_pg_restore_for_custom_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.backup");
+        std::fs::write(&path, b"PGDMP\x01\x0e\x00rest").unwrap();
+
+        let plan = plan_restore(&pg_cfg(), path.to_str().unwrap()).unwrap();
+        assert!(matches!(plan, RestorePlan::PgTool { tool_name, .. } if tool_name == "pg_restore"));
+    }
+
+    #[test]
+    fn plan_restore_postgres_picks_psql_for_plain_sql() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.sql");
+        std::fs::write(&path, b"-- plain sql dump\nCREATE TABLE t (id int);").unwrap();
+
+        let plan = plan_restore(&pg_cfg(), path.to_str().unwrap()).unwrap();
+        assert!(matches!(plan, RestorePlan::PgTool { tool_name, .. } if tool_name == "psql"));
+    }
+
+    #[test]
+    fn plan_restore_mssql_and_sqlite_never_touch_the_filesystem() {
+        // No file created at these paths at all — Mssql/Sqlite variants
+        // must not attempt to read the source file (that's runner-level,
+        // T4's own magic-header check for SQLite; MSSQL has no client-side
+        // sniff at all).
+        let mut mssql = pg_cfg();
+        mssql.engine = dbc_state::Engine::Mssql;
+        assert!(matches!(plan_restore(&mssql, r"D:\nope.bak"), Ok(RestorePlan::Mssql)));
+
+        let mut sqlite = pg_cfg();
+        sqlite.engine = dbc_state::Engine::Sqlite;
+        assert!(matches!(plan_restore(&sqlite, r"D:\nope.sqlite"), Ok(RestorePlan::Sqlite)));
     }
 }
 
@@ -4410,6 +7111,18 @@ fn main() {
                         let tree = cx.new(|cx| SchemaTree::new(cx, editor_focus));
                         cx.subscribe(&tree, AppView::on_tree_event).detach();
                         let history_search = cx.new(|cx| connections_ui::TextField::new(cx, "Hledat…", false));
+                        // G11 T6 binding carry-forward (BackupHandle has no
+                        // Drop/kill-on-drop): the app-quit hook is the
+                        // teardown path for "window close" — cancel any
+                        // still-Running backup/restore's underlying
+                        // process/task BEFORE the app actually exits, since
+                        // nothing else reaps an abandoned pg_dump/pg_restore
+                        // child.
+                        cx.on_app_quit(|view, _cx| {
+                            view.cancel_active_backup_if_running();
+                            async {}
+                        })
+                        .detach();
                         AppView {
                             tabs: Tabs::new(),
                             status,
@@ -4661,6 +7374,190 @@ mod engine_from_url_tests {
         assert_eq!(engine_from_url("C:/data/app.db"), dbc_state::Engine::Sqlite);
         assert_eq!(engine_from_url("./relative.sqlite"), dbc_state::Engine::Sqlite);
         assert_eq!(engine_from_url(":memory:"), dbc_state::Engine::Sqlite);
+    }
+}
+
+/// G12 T5: `dialect_for_engine`/`auto_limit_each` pure-decision tests, plus
+/// CURATION item 3's mandated test (params resolve BEFORE splitting).
+#[cfg(test)]
+mod multi_statement_tests {
+    use super::*;
+
+    #[test]
+    fn dialect_for_engine_maps_pg_sqlite_and_refuses_mssql() {
+        assert_eq!(dialect_for_engine(dbc_state::Engine::Postgres), Some(dbc_core::Dialect::Postgres));
+        assert_eq!(dialect_for_engine(dbc_state::Engine::Sqlite), Some(dbc_core::Dialect::Sqlite));
+        assert_eq!(dialect_for_engine(dbc_state::Engine::Mssql), None);
+    }
+
+    #[test]
+    fn auto_limit_each_limits_only_bare_selects() {
+        let stmts = vec![
+            "SELECT * FROM a".to_string(),
+            "UPDATE t SET x = 1".to_string(),
+            "SELECT * FROM b LIMIT 5".to_string(),
+        ];
+        let (out, changed) = auto_limit_each(stmts, Some(100), false);
+        assert!(changed);
+        assert_eq!(out[0], "SELECT * FROM a LIMIT 100");
+        assert_eq!(out[1], "UPDATE t SET x = 1");
+        assert_eq!(out[2], "SELECT * FROM b LIMIT 5");
+    }
+
+    #[test]
+    fn auto_limit_each_bypass_and_none_are_noops() {
+        let stmts = vec!["SELECT 1".to_string()];
+        assert_eq!(auto_limit_each(stmts.clone(), Some(100), true), (stmts.clone(), false));
+        assert_eq!(auto_limit_each(stmts.clone(), None, false), (stmts, false));
+    }
+
+    /// CURATION item 3's mandated test: two statements each carrying `:p` —
+    /// params resolve BEFORE splitting, so a substituted literal containing
+    /// `;` inside quotes is handled by the splitter's normal string rules.
+    #[test]
+    fn params_resolve_before_split_two_statements() {
+        let names = vec!["p".to_string()];
+        let out = build_param_sql(
+            "SELECT :p; UPDATE t SET x = :p;",
+            &names,
+            &[("a;b".to_string(), false)],
+        )
+        .unwrap();
+        assert_eq!(out, "SELECT 'a;b'; UPDATE t SET x = 'a;b';");
+        let stmts = dbc_core::split_sql(&out, dbc_core::Dialect::Sqlite).unwrap();
+        assert_eq!(stmts, vec!["SELECT 'a;b'".to_string(), "UPDATE t SET x = 'a;b'".to_string()]);
+    }
+}
+
+/// G12 T3: pure-helper tests behind the script-runner UI's pre-scan/modal
+/// logic — `count_statements_in_file`/`list_sql_files`/`script_options_valid`/
+/// `script_history_sql`.
+#[cfg(test)]
+mod script_ui_tests {
+    use super::*;
+
+    #[test]
+    fn list_sql_files_filters_and_orders_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.sql"), "select 1;").unwrap();
+        std::fs::write(dir.path().join("A.SQL"), "select 1;").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "nope").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("d.sql"), "select 1;").unwrap(); // non-recursive: ignored
+        let files = list_sql_files(dir.path()).unwrap();
+        let names: Vec<_> =
+            files.iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(names, vec!["A.SQL".to_string(), "b.sql".to_string()]);
+    }
+
+    #[test]
+    fn count_statements_streams_and_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.sql");
+        std::fs::write(&p, "SELECT 1;\n-- c ; c\nSELECT ';';\nSELECT 3").unwrap();
+        assert_eq!(count_statements_in_file(&p, dbc_core::Dialect::Sqlite), Ok(3));
+    }
+
+    #[test]
+    fn count_statements_surfaces_unterminated_as_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("bad.sql");
+        std::fs::write(&p, "SELECT 'oops").unwrap();
+        assert!(count_statements_in_file(&p, dbc_core::Dialect::Sqlite).is_err());
+    }
+
+    #[test]
+    fn whole_run_plus_continue_is_invalid() {
+        use crate::runner::{ErrorPolicy::*, TxScope::*};
+        assert!(script_options_valid(WholeRun, Stop));
+        assert!(!script_options_valid(WholeRun, Continue));
+        assert!(script_options_valid(PerFile, Continue));
+    }
+
+    #[test]
+    fn script_history_sql_single_and_multi_file_wording() {
+        let one = vec![(PathBuf::from("C:/s/a.sql"), 5)];
+        assert_eq!(script_history_sql(&one, 5, 0), format!("[skript] {} — 5 příkazů, 5 OK, 0 chyb", PathBuf::from("C:/s/a.sql").display()));
+        let two = vec![(PathBuf::from("C:/s"), 5), (PathBuf::from("C:/s/b.sql"), 2)];
+        let s = script_history_sql(&two, 6, 1);
+        assert!(s.starts_with("[skript] "));
+        assert!(s.contains("2 souborů"));
+        assert!(s.contains("7 příkazů"));
+        assert!(s.contains("6 OK"));
+        assert!(s.contains("1 chyb"));
+    }
+
+    /// Review fix (MAJOR 1): the connection-identity guard behind
+    /// `confirm_script_run` — proves the refuse path (identity captured at
+    /// `start_script_pick` time != active identity at confirm time), same
+    /// shape as `csv_ui_tests::csv_import_dispatch_allowed_refuses_on_identity_mismatch`.
+    #[test]
+    fn script_run_dispatch_allowed_refuses_on_identity_mismatch() {
+        assert!(script_run_dispatch_allowed("conn-a", "conn-a"));
+        assert!(!script_run_dispatch_allowed("conn-a", "conn-b"));
+        assert!(script_run_dispatch_allowed(CLI_CONN_IDENTITY, CLI_CONN_IDENTITY));
+        assert!(!script_run_dispatch_allowed(CLI_CONN_IDENTITY, "conn-a"));
+        assert!(!script_run_dispatch_allowed("conn-a", CLI_CONN_IDENTITY));
+    }
+}
+
+/// G12 T4: pure-helper tests behind the CSV import mapping modal —
+/// `default_csv_mapping`/`csv_field_to_value`.
+#[cfg(test)]
+mod csv_ui_tests {
+    use super::*;
+
+    #[test]
+    fn default_csv_mapping_matches_names_case_insensitively() {
+        let headers = vec!["ID".to_string(), "Name".to_string(), "extra".to_string()];
+        let cols = vec![
+            csv_import::TargetColumn { name: "id".into(), numeric: true },
+            csv_import::TargetColumn { name: "name".into(), numeric: false },
+        ];
+        let m = default_csv_mapping(&headers, &cols);
+        assert_eq!(m.targets, vec![Some(0), Some(1), None]);
+    }
+
+    #[test]
+    fn csv_field_to_value_empty_is_null() {
+        assert_eq!(csv_field_to_value(""), None);
+        assert_eq!(csv_field_to_value("0"), Some("0".to_string()));
+        assert_eq!(csv_field_to_value(" "), Some(" ".to_string()));
+    }
+
+    /// Review fix (BLOCKER): the connection-identity guard behind
+    /// `confirm_csv_import` — proves the refuse path (captured identity at
+    /// `start_csv_import` time != active identity at confirm time) is a
+    /// pure, directly-testable decision, mirroring the shape of
+    /// `runner::csv_import_tests::run_csv_import_refuses_read_only_spec_without_touching_anything`:
+    /// there, the SHARED read-only guard fires before any file/DB touch;
+    /// here, `csv_import_dispatch_allowed` returning `false` is exactly
+    /// what stops `confirm_csv_import` from ever building a `CsvImportJob`
+    /// or calling `resolve_spec_for_explain`/`self.runner.run_csv_import`
+    /// (see the call site in `confirm_csv_import`, main.rs).
+    #[test]
+    fn csv_import_dispatch_allowed_refuses_on_identity_mismatch() {
+        assert!(csv_import_dispatch_allowed("conn-a", "conn-a"));
+        assert!(!csv_import_dispatch_allowed("conn-a", "conn-b"));
+        // CLI-arg back-compat path: same sentinel on both sides is a match,
+        // a switch away from it (to a saved connection, or vice versa) is
+        // caught same as any other identity change.
+        assert!(csv_import_dispatch_allowed(CLI_CONN_IDENTITY, CLI_CONN_IDENTITY));
+        assert!(!csv_import_dispatch_allowed(CLI_CONN_IDENTITY, "conn-a"));
+        assert!(!csv_import_dispatch_allowed("conn-a", CLI_CONN_IDENTITY));
+    }
+
+    /// Review fix (MINOR 5): short text is untouched; long text is
+    /// truncated to the exact char cap plus a trailing ellipsis.
+    #[test]
+    fn cap_sql_sample_leaves_short_text_alone_and_truncates_long_text() {
+        let short = "INSERT INTO t (id) VALUES (1);".to_string();
+        assert_eq!(cap_sql_sample(short.clone()), short);
+
+        let long = "x".repeat(CSV_SAMPLE_SQL_DISPLAY_CAP + 500);
+        let capped = cap_sql_sample(long);
+        assert_eq!(capped.chars().count(), CSV_SAMPLE_SQL_DISPLAY_CAP + 1);
+        assert!(capped.ends_with('…'));
     }
 }
 

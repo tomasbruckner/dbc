@@ -28,6 +28,11 @@ pub struct HistoryEntry {
     pub row_count: Option<i64>,
     pub error: Option<String>, // failed runs recorded with the error text
     pub starred: bool,
+    /// G11 T7: additive. `"query"` for every ordinary run (the column's own
+    /// `DEFAULT 'query'` covers rows written before this migration, and
+    /// `add`'s thin wrapper covers every row written after it via `add`);
+    /// `"backup"`/`"restore"` for G11 runs recorded via `add_with_kind`.
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +71,21 @@ impl HistoryDb {
                 ON entries(starred DESC, started_at DESC);",
         )?;
 
+        // G11 T7: additive `kind` column — SQLite has no `ADD COLUMN IF NOT
+        // EXISTS`, so idempotency comes from probing `PRAGMA table_info`
+        // first, same "probe, then conditionally migrate" shape the star/
+        // time index above already proves works (generalized from an index
+        // to a column). `DEFAULT 'query'` covers every pre-G11 row without
+        // a separate UPDATE pass.
+        let has_kind_column: bool = conn
+            .prepare("PRAGMA table_info(entries)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "kind");
+        if !has_kind_column {
+            conn.execute_batch("ALTER TABLE entries ADD COLUMN kind TEXT NOT NULL DEFAULT 'query';")?;
+        }
+
         // Detect FTS5 availability by attempting to create the external-content
         // table + sync triggers. Some SQLite builds are compiled without FTS5,
         // so this must degrade gracefully to a LIKE-based fallback.
@@ -90,7 +110,9 @@ impl HistoryDb {
         Ok(HistoryDb { conn, mode })
     }
 
-    /// Returns the new entry id.
+    /// Returns the new entry id. Existing 6-argument signature UNCHANGED —
+    /// every current call site keeps compiling with zero edits (G11 T7: now
+    /// a thin `kind = "query"` wrapper around `add_with_kind`).
     pub fn add(
         &mut self,
         sql: &str,
@@ -99,6 +121,25 @@ impl HistoryDb {
         duration_ms: Option<i64>,
         row_count: Option<i64>,
         error: Option<&str>,
+    ) -> Result<i64, StateError> {
+        self.add_with_kind(sql, connection, started_at, duration_ms, row_count, error, "query")
+    }
+
+    /// G11 T7: the ONLY way a non-`"query"` `kind` ever reaches the DB
+    /// (`"backup"`/`"restore"` for G11 runs). Dedup check UNCHANGED in
+    /// shape (still keys on sql+connection+time window — a backup/restore's
+    /// synthetic "sql" description is already unique-per-run via its
+    /// embedded timestamped file path, so this never spuriously collapses
+    /// two different runs); the UPDATE/INSERT additionally write `kind`.
+    pub fn add_with_kind(
+        &mut self,
+        sql: &str,
+        connection: &str,
+        started_at: i64,
+        duration_ms: Option<i64>,
+        row_count: Option<i64>,
+        error: Option<&str>,
+        kind: &str,
     ) -> Result<i64, StateError> {
         let last: Option<(i64, String, String, i64)> = self
             .conn
@@ -122,18 +163,18 @@ impl HistoryDb {
                 && (started_at - last_started_at).abs() <= DEDUP_WINDOW_SECS
             {
                 self.conn.execute(
-                    "UPDATE entries SET started_at = ?1, duration_ms = ?2, row_count = ?3, error = ?4
-                     WHERE id = ?5",
-                    params![started_at, duration_ms, row_count, error, last_id],
+                    "UPDATE entries SET started_at = ?1, duration_ms = ?2, row_count = ?3, error = ?4, kind = ?5
+                     WHERE id = ?6",
+                    params![started_at, duration_ms, row_count, error, kind, last_id],
                 )?;
                 return Ok(last_id);
             }
         }
 
         self.conn.execute(
-            "INSERT INTO entries (sql, connection, started_at, duration_ms, row_count, error, starred)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-            params![sql, connection, started_at, duration_ms, row_count, error],
+            "INSERT INTO entries (sql, connection, started_at, duration_ms, row_count, error, starred, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+            params![sql, connection, started_at, duration_ms, row_count, error, kind],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -143,7 +184,7 @@ impl HistoryDb {
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<HistoryEntry>, StateError> {
         if query.is_empty() {
             let mut stmt = self.conn.prepare(
-                "SELECT id, sql, connection, started_at, duration_ms, row_count, error, starred
+                "SELECT id, sql, connection, started_at, duration_ms, row_count, error, starred, kind
                  FROM entries
                  ORDER BY starred DESC, started_at DESC, id DESC
                  LIMIT ?1",
@@ -157,7 +198,7 @@ impl HistoryDb {
         match self.mode {
             SearchMode::Fts5 => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT e.id, e.sql, e.connection, e.started_at, e.duration_ms, e.row_count, e.error, e.starred
+                    "SELECT e.id, e.sql, e.connection, e.started_at, e.duration_ms, e.row_count, e.error, e.starred, e.kind
                      FROM entries e
                      JOIN entries_fts f ON f.rowid = e.id
                      WHERE entries_fts MATCH ?1
@@ -172,7 +213,7 @@ impl HistoryDb {
             SearchMode::Like => {
                 let pattern = format!("%{}%", like_escape(query));
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, sql, connection, started_at, duration_ms, row_count, error, starred
+                    "SELECT id, sql, connection, started_at, duration_ms, row_count, error, starred, kind
                      FROM entries
                      WHERE sql LIKE ?1 ESCAPE '\\'
                      ORDER BY starred DESC, started_at DESC, id DESC
@@ -208,6 +249,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
         row_count: row.get(5)?,
         error: row.get(6)?,
         starred: row.get::<_, i64>(7)? != 0,
+        kind: row.get(8)?,
     })
 }
 
@@ -343,5 +385,58 @@ mod tests {
         drop(h);
         let h2 = HistoryDb::open(&d.path().join("h.sqlite")).unwrap();
         assert!(has_index(&h2));
+    }
+
+    // --- G11 T7: kind column ---
+    #[test]
+    fn add_defaults_to_query_kind() {
+        let (_d, mut h) = db();
+        h.add("select 1", "demo", 1000, None, None, None).unwrap();
+        assert_eq!(h.search("", 10).unwrap()[0].kind, "query");
+    }
+
+    #[test]
+    fn add_with_kind_records_backup_and_restore() {
+        let (_d, mut h) = db();
+        h.add_with_kind("-- BACKUP demo -> x.backup", "demo", 1000, Some(5000), None, None, "backup").unwrap();
+        h.add_with_kind("-- RESTORE demo <- x.backup", "demo", 2000, Some(3000), None, None, "restore").unwrap();
+        let r = h.search("", 10).unwrap();
+        assert_eq!(r[0].kind, "restore"); // newest first
+        assert_eq!(r[1].kind, "backup");
+    }
+
+    #[test]
+    fn old_db_without_kind_column_migrates_on_reopen() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("h.sqlite");
+        {
+            // Simulate a pre-G11 DB: create the OLD schema directly,
+            // bypassing HistoryDb::open (which would already add the
+            // column).
+            let conn = rusqlite::Connection::open(&p).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE entries (
+                    id INTEGER PRIMARY KEY, sql TEXT NOT NULL, connection TEXT NOT NULL,
+                    started_at INTEGER NOT NULL, duration_ms INTEGER, row_count INTEGER,
+                    error TEXT, starred INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO entries (sql, connection, started_at, starred) VALUES ('select 1', 'demo', 1000, 0);",
+            )
+            .unwrap();
+        }
+        let h = HistoryDb::open(&p).unwrap();
+        let r = h.search("", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].kind, "query", "pre-existing rows must default to 'query' via the column's DEFAULT");
+    }
+
+    #[test]
+    fn kind_column_migration_is_idempotent_on_reopen() {
+        let (d, h) = db();
+        drop(h);
+        // Reopening an ALREADY-migrated (this session's own fresh) DB a
+        // second time must not error on a duplicate ALTER TABLE.
+        let h2 = HistoryDb::open(&d.path().join("h.sqlite"));
+        assert!(h2.is_ok());
     }
 }

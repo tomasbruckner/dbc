@@ -54,6 +54,77 @@ pub enum TabContent {
     /// tab (no preview-key dedup — repeated compares of the same pair just
     /// open more tabs, matching `Plan`'s own precedent).
     Compare { view: Entity<crate::compare::CompareView> },
+    /// G12 T3: live progress tab for a script run (`AppView::confirm_script_run`)
+    /// or a CSV import (T4, `AppView::confirm_csv_import` — reuses this same
+    /// tab kind, see `ScriptRunState.progress_rows`). Plain data behind an
+    /// `Rc<RefCell<_>>` (not an `Entity`) — the spawned event loop mutates it
+    /// directly and calls `cx.notify()` itself, same "no GPUI in the state
+    /// type" posture the rest of this file keeps; rendering lives on
+    /// `AppView::render_tab_content` like every other variant.
+    ScriptRun { state: Rc<RefCell<ScriptRunState>> },
+}
+
+/// G12 T3: outcome of a script/CSV-import run, driving the progress tab's
+/// summary line and its "Zrušit" button's visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptRunOutcome {
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+/// G12 T3: per-file row status in the progress tab's file list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptFileStatus {
+    Pending,
+    Running,
+    Done,
+    Failed,
+    Skipped,
+}
+
+pub struct ScriptFileRow {
+    pub name: String,
+    pub status: ScriptFileStatus,
+    pub statements_run: usize,
+    pub statements_failed: usize,
+}
+
+/// Cap on retained log lines in `ScriptRunState.log` — same fixed-cap
+/// posture as `TAB_CAP`, not user-tunable.
+pub const SCRIPT_LOG_CAP: usize = 1000;
+
+/// G12 T3/T4: plain-data progress state behind `TabContent::ScriptRun`,
+/// mutated in place by the spawned event loop (`AppView::confirm_script_run`
+/// / `AppView::confirm_csv_import`) as `ScriptEvent`/`CsvImportEvent`s
+/// arrive, then rendered fresh every `cx.notify()` — no separate "apply
+/// events to a snapshot" step, the state IS what's rendered.
+pub struct ScriptRunState {
+    pub files: Vec<ScriptFileRow>,
+    /// From the UI pre-scan (scripts) or the row pre-count (CSV, T4).
+    pub total_statements: usize,
+    pub statements_run: usize,
+    pub statements_failed: usize,
+    pub total_affected: u64,
+    /// CSV import only (T4): `(rows done, rows total)` — drives an honest
+    /// progress bar. `None` for script runs.
+    pub progress_rows: Option<(u64, u64)>,
+    pub log: std::collections::VecDeque<String>,
+    pub outcome: ScriptRunOutcome,
+    pub started_at: std::time::Instant,
+    pub elapsed: Option<std::time::Duration>,
+}
+
+impl ScriptRunState {
+    /// Appends `line`, evicting the oldest entries past `SCRIPT_LOG_CAP` —
+    /// same eviction posture as `Tabs::open`'s `TAB_CAP`.
+    pub fn push_log(&mut self, line: String) {
+        self.log.push_back(line);
+        while self.log.len() > SCRIPT_LOG_CAP {
+            self.log.pop_front();
+        }
+    }
 }
 
 pub struct ResultTab {
@@ -361,6 +432,27 @@ mod tests {
     // `conn_identity` — the Apply flow's connection-identity guard depends on
     // it surviving exactly as stamped, unmodified by tab-cap eviction, id
     // assignment, or activation bookkeeping.
+    #[test]
+    fn script_log_caps_at_limit() {
+        let mut s = ScriptRunState {
+            files: Vec::new(),
+            total_statements: 0,
+            statements_run: 0,
+            statements_failed: 0,
+            total_affected: 0,
+            progress_rows: None,
+            log: std::collections::VecDeque::new(),
+            outcome: ScriptRunOutcome::Running,
+            started_at: std::time::Instant::now(),
+            elapsed: None,
+        };
+        for i in 0..(SCRIPT_LOG_CAP + 10) {
+            s.push_log(format!("line {i}"));
+        }
+        assert_eq!(s.log.len(), SCRIPT_LOG_CAP);
+        assert_eq!(s.log.front().map(String::as_str), Some("line 10"));
+    }
+
     #[test]
     fn conn_identity_survives_open_and_is_readable_off_the_tab() {
         let mut tabs = Tabs::new();

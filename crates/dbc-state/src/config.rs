@@ -67,6 +67,20 @@ pub enum ThemeMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ToolPaths {
+    #[serde(default)]
+    pub pg_dump: Option<String>,
+    #[serde(default)]
+    pub pg_restore: Option<String>,
+    /// Design CURATION item 1: was missing from the design's own §1 sketch
+    /// of `ToolPaths` even though §3's plain-SQL restore pipes through
+    /// `psql` — added here with identical shape/detection/override to
+    /// `pg_dump`/`pg_restore`.
+    #[serde(default)]
+    pub psql: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub connections: Vec<ConnectionConfig>,
@@ -74,6 +88,10 @@ pub struct AppConfig {
     pub favourite_objects: Vec<FavouriteObject>,
     #[serde(default)]
     pub theme: ThemeMode,
+    /// Global, not per-connection (an installed tool is a machine property,
+    /// not a connection property) — design §1.
+    #[serde(default)]
+    pub tool_paths: ToolPaths,
 }
 
 impl AppConfig {
@@ -138,6 +156,7 @@ mod tests {
             }],
             favourite_objects: vec![],
             theme: ThemeMode::Dark,
+            tool_paths: ToolPaths::default(),
         }
     }
 
@@ -251,5 +270,40 @@ user = "postgres"
         config.save(&p).unwrap();
         let loaded = AppConfig::load(&p).unwrap();
         assert_eq!(loaded.theme, ThemeMode::Light);
+    }
+
+    fn sample_with_tools() -> AppConfig {
+        let mut c = sample();
+        c.tool_paths = ToolPaths {
+            pg_dump: Some(r"C:\Program Files\PostgreSQL\16\bin\pg_dump.exe".into()),
+            pg_restore: Some(r"C:\Program Files\PostgreSQL\16\bin\pg_restore.exe".into()),
+            psql: Some(r"C:\Program Files\PostgreSQL\16\bin\psql.exe".into()),
+        };
+        c
+    }
+
+    #[test]
+    fn tool_paths_roundtrip_save_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        sample_with_tools().save(&p).unwrap();
+        let loaded = AppConfig::load(&p).unwrap();
+        assert_eq!(loaded, sample_with_tools());
+    }
+
+    #[test]
+    fn tool_paths_defaults_to_none_when_absent_from_old_config() {
+        let toml_str = r#"
+[[connections]]
+id = "c1"
+name = "demo"
+engine = "postgres"
+host = "localhost"
+database = "postgres"
+user = "postgres"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.tool_paths, ToolPaths::default());
+        assert_eq!(config.tool_paths.psql, None);
     }
 }
