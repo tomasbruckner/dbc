@@ -164,7 +164,12 @@ fn build_param_sql(
         Some(remaining) if !remaining.is_empty() => {
             Err("po dosazení hodnot zůstal v SQL neplatný parametr — spuštění zrušeno".to_string())
         }
-        _ => Ok(substituted),
+        Some(_) => Ok(substituted),
+        // Fail closed: an unscannable substitution result (e.g. a value that
+        // re-opened a dollar-quote, `$tag:x$` + `1` → `$tag1$…`) means the
+        // rescan proved nothing — refuse rather than hand the driver SQL the
+        // guard chain could not inspect.
+        None => Err("po dosazení hodnot nelze SQL znovu ověřit — spuštění zrušeno".to_string()),
     }
 }
 
@@ -4178,6 +4183,16 @@ mod query_params_tests {
         // through to the caller.
         let out = build_param_sql("SELECT ':x", &["x".to_string()], &[("1".to_string(), false)]);
         assert!(out.is_err());
+    }
+
+    #[test]
+    fn unscannable_substitution_result_is_refused_not_passed_through() {
+        // Final-review fix: `$tag:x$` scans as literal `$tag` + param `:x` +
+        // `$`; substituting the numeric value `1` yields `$tag1$` — a valid
+        // dollar-quote OPENER with no closer, so the rescan's `find_params`
+        // returns None (unscannable). Fail closed: Err, never Ok.
+        let out = build_param_sql("SELECT $tag:x$", &["x".to_string()], &[("1".to_string(), false)]);
+        assert!(out.is_err(), "unscannable rescan result must be refused, got {out:?}");
     }
 }
 
