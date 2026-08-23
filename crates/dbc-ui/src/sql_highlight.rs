@@ -5,6 +5,18 @@
 //! "parsing itself has no GPUI dependency, but `Hsla` color resolution
 //! does"). No panics — a parse/query error degrades to no highlighting for
 //! the affected sub-tree, never a crash.
+//!
+//! Grammar pin: `tree-sitter-sequel` 0.3.11 generates `LANGUAGE_VERSION` 14,
+//! which is ABI-compatible with the `tree-sitter` 0.25 runtime this crate
+//! depends on today. These two dependencies are versioned independently;
+//! any future bump of either must be a deliberate check that the ABI
+//! versions still line up, not an incidental `cargo update`.
+//!
+//! `T5` (the `sql_input.rs` editor integration) hasn't landed yet, so
+//! nothing in `dbc-ui` outside this module's own tests calls into it —
+//! hence the module-level `#![allow(dead_code)]` below (same convention
+//! `autocomplete.rs` carries for its T6/T7 gap; remove once T5 lands).
+#![allow(dead_code)] // TODO(T5): remove allow once sql_input.rs consumes this module
 
 use std::ops::Range;
 use std::sync::OnceLock;
