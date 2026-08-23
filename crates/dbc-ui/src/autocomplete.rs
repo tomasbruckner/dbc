@@ -243,20 +243,30 @@ fn column_candidates(text: &str, qualifier: &str, prefix: &str, snapshot: Option
     // bound by a `WITH ... AS (...)` in this query, the CTE shadows
     // whatever same-named real table might exist — offer nothing rather
     // than that real table's (likely wrong) columns.
-    let masked = mask_strings_and_comments(text);
-    let masked_chars: Vec<char> = masked.chars().collect();
-    if cte_names(&masked_chars).contains(&target.name.to_uppercase()) {
+    let cte_scan_masked = mask_for_cte_scan(text);
+    let cte_scan_chars: Vec<char> = cte_scan_masked.chars().collect();
+    if cte_names(&cte_scan_chars).contains(&target.name.to_uppercase()) {
         return Vec::new();
     }
 
     let table = match &target.schema {
         // Schema-qualified reference (`hr.users u`) — match schema AND name
-        // exactly; never fall back to a different schema's same-named table
-        // (review round 1, finding 2).
-        Some(schema) => snapshot.tables.iter().find(|t| {
-            t.name.eq_ignore_ascii_case(&target.name)
-                && t.schema.as_deref().map(|s| s.eq_ignore_ascii_case(schema)).unwrap_or(false)
-        }),
+        // exactly, and require EXACTLY ONE such row (same "ambiguous ->
+        // offer nothing" invariant as the bare-name path below; review
+        // round 2 nit — a `.find()` here would silently pick the first of
+        // two literally-duplicate schema+name rows in a corrupt snapshot).
+        // Never fall back to a different schema's same-named table (review
+        // round 1, finding 2).
+        Some(schema) => {
+            let mut matching = snapshot.tables.iter().filter(|t| {
+                t.name.eq_ignore_ascii_case(&target.name)
+                    && t.schema.as_deref().map(|s| s.eq_ignore_ascii_case(schema)).unwrap_or(false)
+            });
+            match (matching.next(), matching.next()) {
+                (Some(t), None) => Some(t),
+                _ => None,
+            }
+        }
         // Bare (schema-less) reference — resolve only if exactly one table
         // in the snapshot has this name; more than one (across different
         // schemas) is ambiguous, same "offer nothing" invariant as alias
@@ -409,10 +419,13 @@ fn insert_alias(map: &mut HashMap<String, TableRef>, key: String, value: TableRe
 
 /// Replaces single-quoted strings, double-quoted identifiers, `--` line
 /// comments and `/* */` block comments with spaces (preserving newlines),
-/// so `resolve_aliases`'/`cte_names`' text scans never mistake their
-/// contents for SQL syntax. Best-effort: an unterminated construct is
-/// masked to end-of-input rather than failing closed (this scanner's
-/// contract has no `None`-for-parse-error case, only `None`-for-ambiguity).
+/// so `resolve_aliases`'s text scan never mistakes their contents for SQL
+/// syntax. Best-effort: an unterminated construct is masked to end-of-input
+/// rather than failing closed (this scanner's contract has no
+/// `None`-for-parse-error case, only `None`-for-ambiguity).
+///
+/// NOT used for `cte_names` — see `mask_for_cte_scan` below, which needs a
+/// different tradeoff (quoted identifier content stays visible).
 fn mask_strings_and_comments(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(chars.len());
@@ -520,6 +533,126 @@ fn mask_strings_and_comments(text: &str) -> String {
     out
 }
 
+/// Like `mask_strings_and_comments`, but PRESERVES double-quoted identifier
+/// content (with the surrounding quote characters stripped, not appended to
+/// the output) instead of blanking it, while still fully blanking
+/// single-quoted strings and comments. Used ONLY by `cte_names` (review
+/// round 2 fix): `mask_strings_and_comments` blanks `"orders"` to spaces
+/// entirely, which made a quoted CTE name like `WITH "orders" AS (...)`
+/// invisible to shadow detection — a real `orders` table would then
+/// silently un-shadow the CTE and return the wrong columns. A `WITH`
+/// keyword or CTE-shaped text that appears INSIDE a single-quoted string or
+/// a comment must still never trigger (those regions stay blanked here,
+/// same as the general mask), which is why this isn't as simple as "don't
+/// mask anything" — only double-quoted identifier content gets the
+/// quotes-stripped treatment.
+fn mask_for_cte_scan(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_line_comment = false;
+    let mut block_depth: u32 = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+                out.push('\n');
+            } else {
+                out.push(' ');
+            }
+            i += 1;
+            continue;
+        }
+
+        if block_depth > 0 {
+            if c == '*' && chars.get(i + 1) == Some(&'/') {
+                block_depth -= 1;
+                out.push_str("  ");
+                i += 2;
+                continue;
+            }
+            if c == '/' && chars.get(i + 1) == Some(&'*') {
+                block_depth += 1;
+                out.push_str("  ");
+                i += 2;
+                continue;
+            }
+            out.push(if c == '\n' { '\n' } else { ' ' });
+            i += 1;
+            continue;
+        }
+
+        if in_single {
+            if c == '\'' {
+                if chars.get(i + 1) == Some(&'\'') {
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+                out.push(' ');
+                i += 1;
+                continue;
+            }
+            out.push(if c == '\n' { '\n' } else { ' ' });
+            i += 1;
+            continue;
+        }
+
+        if in_double {
+            if c == '"' {
+                if chars.get(i + 1) == Some(&'"') {
+                    // Escaped quote inside the identifier — not a valid
+                    // identifier character either way; drop it.
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                in_double = false;
+                i += 1; // drop the closing quote, don't append it
+                continue;
+            }
+            out.push(c); // preserve identifier content verbatim
+            i += 1;
+            continue;
+        }
+
+        // Not inside any construct.
+        if c == '\'' {
+            in_single = true;
+            out.push(' ');
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_double = true;
+            i += 1; // drop the opening quote, don't append it
+            continue;
+        }
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            in_line_comment = true;
+            out.push_str("  ");
+            i += 2;
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            block_depth = 1;
+            out.push_str("  ");
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+
+    out
+}
+
 /// `FROM <table> [AS] <alias>` / `JOIN <table> [AS] <alias>` text scan (NOT
 /// the tree-sitter tree — decouples this module from tree-sitter-sequel's
 /// node shapes, design §2). `<table>` may be schema-qualified
@@ -605,12 +738,15 @@ pub fn resolve_aliases(text: &str) -> Option<HashMap<String, TableRef>> {
 }
 
 /// Names bound by a `WITH <name> [(cols)] AS (...)` / `, <name> [(cols)] AS
-/// (...)` CTE list (an optional leading `RECURSIVE` is skipped). Used only
-/// to detect column-lookup shadowing (review round 1, finding 3): a
-/// `FROM`/`JOIN` reference to a name that's ALSO a CTE name must never
-/// resolve to a same-named real table's columns, since the actual bound
-/// source is the CTE's (unmodeled) result shape, not the table's. `chars`
-/// must already be string/comment-masked (see `mask_strings_and_comments`).
+/// (...)` CTE list (an optional leading `RECURSIVE` is skipped, and `<name>`
+/// may be a double-quoted identifier). Used only to detect column-lookup
+/// shadowing (review round 1, finding 3): a `FROM`/`JOIN` reference to a
+/// name that's ALSO a CTE name must never resolve to a same-named real
+/// table's columns, since the actual bound source is the CTE's (unmodeled)
+/// result shape, not the table's. `chars` must come from
+/// `mask_for_cte_scan`, NOT `mask_strings_and_comments` — the latter would
+/// blank a quoted CTE name (`WITH "orders" AS (...)`) to spaces, making it
+/// invisible here (review round 2 fix).
 fn cte_names(chars: &[char]) -> HashSet<String> {
     let len = chars.len();
     let mut names = HashSet::new();
@@ -957,5 +1093,47 @@ mod tests {
         assert!(ctx2.prefix.chars().all(|c| c.is_ascii()));
         let ctx3 = cursor_context(text2, 10); // also mid-emoji
         assert!(ctx3.prefix.chars().all(|c| c.is_ascii()));
+    }
+
+    // --- Review round 2 fixes ---
+
+    #[test]
+    fn quoted_cte_name_shadowing_real_table_offers_nothing() {
+        // The CTE name is double-quoted; the general string/comment mask
+        // used to blank it entirely, making it invisible to shadow
+        // detection and letting the real `orders` table's columns leak
+        // through. Must offer nothing, same as the unquoted case.
+        let sql = "WITH \"orders\" AS (SELECT 1 AS x) SELECT * FROM orders WHERE orders.";
+        let cursor = sql.len();
+        let cs = candidates(sql, cursor, Some(&snapshot_one_schema()), false, false);
+        assert!(cs.iter().all(|c| c.kind != CandidateKind::Column));
+    }
+
+    #[test]
+    fn quoted_string_content_does_not_create_phantom_cte() {
+        // A single-quoted string literal that merely LOOKS like a quoted
+        // CTE definition (`'"WITH x AS"'`) must not be parsed as one — the
+        // real `orders` table (no shadowing CTE here) must resolve
+        // normally.
+        let sql = "SELECT '\"WITH x AS\"' FROM orders WHERE orders.";
+        let cursor = sql.len();
+        let cs = candidates(sql, cursor, Some(&snapshot_one_schema()), false, false);
+        assert!(cs.iter().any(|c| c.kind == CandidateKind::Column && c.text == "id"));
+        assert!(cs.iter().any(|c| c.kind == CandidateKind::Column && c.text == "total"));
+    }
+
+    #[test]
+    fn schema_qualified_duplicate_rows_offers_nothing() {
+        // Degenerate/corrupt snapshot: two literally identical schema+name
+        // rows. The schema-qualified lookup must require exactly one
+        // match, same invariant as the bare-name path — not silently pick
+        // the first (review round 2 nit).
+        let mut snap = snapshot_duplicate_table_name_across_schemas();
+        let dup = snap.tables[1].clone(); // hr.users again
+        snap.tables.push(dup);
+        let sql = "SELECT * FROM hr.users u WHERE u.";
+        let cursor = sql.len();
+        let cs = candidates(sql, cursor, Some(&snap), false, false);
+        assert!(cs.iter().all(|c| c.kind != CandidateKind::Column));
     }
 }
