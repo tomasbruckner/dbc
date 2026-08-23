@@ -903,23 +903,36 @@ pub fn run_and_stream(
 /// Same PATH-probe shape as `tunnel.rs::ssh_binary` (`Command::new("where")`
 /// on Windows), generalized to any program name — design §1.
 ///
-/// SECURITY (CWE-427, binary planting — G11 T4 review MAJOR 1): returns the
-/// FULLY RESOLVED path, never a bare name. `where`/`which` print the
-/// resolved absolute path to stdout; this function reads and returns the
-/// FIRST line (their own "first match wins" precedence — the same one the
-/// shell's own command lookup uses when more than one PATH entry matches).
-/// Handing back a bare name here would be unsafe: callers (`resolve_tool_path`,
-/// `runner.rs`) pass this string straight to `Command::new`, and on Windows
-/// `CreateProcess` searches the application directory and the CURRENT
-/// WORKING DIRECTORY *before* PATH — a planted `pg_dump.exe` sitting in a
-/// writable CWD would run instead of the real tool, and since `PGPASSWORD`
-/// is set on that spawned child's environment, the planted binary would
-/// receive the real database password. Returning the fully-resolved path
-/// bypasses that CWD/app-dir search order entirely (`CreateProcess` uses a
-/// path containing a directory separator as-is, never re-searching it).
+/// SECURITY (CWE-427, binary planting):
+/// - **G11 T4 review MAJOR 1** (returning an absolute path, not a bare
+///   name): callers (`resolve_tool_path`, `runner.rs`) pass this string
+///   straight to `Command::new`, and on Windows `CreateProcess` searches
+///   the application directory and the CURRENT WORKING DIRECTORY *before*
+///   PATH when given a bare name — a planted `pg_dump.exe` sitting in a
+///   writable CWD would run instead of the real tool, and since
+///   `PGPASSWORD` is set on that spawned child's environment, the planted
+///   binary would receive the real database password. Returning the
+///   fully-resolved path (this function's whole point) bypasses that
+///   CWD/app-dir search order entirely — `CreateProcess` uses a path
+///   containing a directory separator as-is, never re-searching it.
+/// - **Final whole-branch review MAJOR** (the `where` probe's OWN search
+///   order): the fix above only helps once `find_on_path` has already
+///   returned the RIGHT path — but plain `where <name>` on Windows *itself*
+///   searches the current directory before PATH (same precedence
+///   `CreateProcess` uses for a bare name), so a planted binary sitting in
+///   this process's CWD would already win at the `where` step, and the
+///   "absolute path" this function hands back would just BE the planted
+///   binary's absolute path. `where $PATH:<name>` restricts the search to
+///   directories listed in `%PATH%` only, skipping the CWD entirely —
+///   empirically confirmed (reviewer's probe): a planted CWD binary yields
+///   "Could not find files", while `where $PATH:cmd` correctly resolves to
+///   `C:\Windows\System32\cmd.exe`. The Unix `which` branch is unaffected —
+///   `which` has never searched the CWD unless `.` is explicitly listed in
+///   `$PATH` (a user/shell configuration choice outside this function's
+///   control, not a `which`-specific search-order footgun).
 pub fn find_on_path(name: &str) -> Option<String> {
     #[cfg(windows)]
-    let probe = Command::new("where").arg(name).output();
+    let probe = Command::new("where").arg(format!("$PATH:{name}")).output();
     #[cfg(not(windows))]
     let probe = Command::new("which").arg(name).output();
     let output = probe.ok()?;
@@ -1078,6 +1091,18 @@ mod process_tests {
     fn find_on_path_finds_a_universally_present_binary() {
         // `cmd.exe` (Windows) is always on PATH in this repo's CI/dev
         // environment (the tool this test itself just spawned above).
+        //
+        // SECURITY (CWE-427, final whole-branch review MAJOR): this also
+        // exercises the `where $PATH:<name>` argument form (not plain
+        // `where <name>`) — a CWD-planting probe is deliberately NOT added
+        // here (mutating this test process's current directory is global,
+        // shared state that would be flaky under parallel test execution —
+        // same reasoning the review that requested this fix itself
+        // accepted); the reviewer's own manual probe already empirically
+        // confirmed `where $PATH:cmd` resolves to
+        // `C:\Windows\System32\cmd.exe` while a planted CWD binary yields
+        // "Could not find files" — see `find_on_path`'s doc comment for
+        // the full writeup.
         #[cfg(windows)]
         {
             let resolved = find_on_path("cmd").expect("cmd must be on PATH");
@@ -1180,6 +1205,43 @@ pub enum BackupStatus {
 /// terminal state, or for an engine with nothing to cancel.
 pub type CancelSlot = std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>;
 
+/// Cap on retained log lines in a `BackupSession`'s `log` — same fixed-cap
+/// posture as `tabs::SCRIPT_LOG_CAP`, not user-tunable. Review MINOR 2 fix:
+/// `render_backup_restore_panel` re-clones every retained line on every
+/// render frame while `Running`, and `pg_dump -v` emits one line PER
+/// OBJECT — on a huge schema an unbounded log would grow without limit and
+/// get fully re-cloned each frame, O(n²) cumulative cost over the run's
+/// lifetime. 500 (half `SCRIPT_LOG_CAP`) is enough to show meaningful
+/// recent progress without that growth.
+pub const BACKUP_LOG_CAP: usize = 500;
+
+/// `BackupSession.log`'s value type — the retained lines PLUS whether any
+/// were ever evicted past `BACKUP_LOG_CAP` (drives the panel's "… (starší
+/// řádky zahozeny)" notice, review MINOR 2). Eviction here only bounds what
+/// this UI panel keeps in memory to redraw — it never truncates what the
+/// actual `pg_dump`/`pg_restore`/`psql` process itself streamed or did.
+#[derive(Debug, Default, Clone)]
+pub struct BackupLogState {
+    pub lines: std::collections::VecDeque<String>,
+    pub truncated: bool,
+}
+
+pub type BackupLog = std::rc::Rc<std::cell::RefCell<BackupLogState>>;
+
+/// Appends `line` to `log`, evicting the oldest entry past `BACKUP_LOG_CAP`
+/// — same eviction posture as `tabs::ScriptRunState::push_log`. The ONLY
+/// place a line is ever added to a `BackupSession.log` (main.rs's two
+/// `BackupEvent::Log` dispatch-loop arms both call this instead of pushing
+/// directly).
+pub fn push_backup_log(log: &BackupLog, line: String) {
+    let mut state = log.borrow_mut();
+    state.lines.push_back(line);
+    if state.lines.len() > BACKUP_LOG_CAP {
+        state.lines.pop_front();
+        state.truncated = true;
+    }
+}
+
 /// UI session state for one backup/restore run, held by
 /// `connections_ui::ModalState::BackupRestore`. `Clone` is cheap (every
 /// field is either `Copy`, a `String`, or an `Rc`/`Entity` handle) — GPUI's
@@ -1196,7 +1258,7 @@ pub struct BackupSession {
     pub connection_id: String,
     pub connection_name: String,
     pub database: String,
-    pub log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    pub log: BackupLog,
     pub status: std::rc::Rc<std::cell::RefCell<BackupStatus>>,
     pub started_at: std::time::Instant,
     pub cancel: CancelSlot,
@@ -1290,7 +1352,7 @@ mod session_tests {
             connection_id: "c1".into(),
             connection_name: "demo".into(),
             database: "shop".into(),
-            log: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            log: std::rc::Rc::new(std::cell::RefCell::new(BackupLogState::default())),
             status: std::rc::Rc::new(std::cell::RefCell::new(status)),
             started_at: std::time::Instant::now(),
             cancel: std::rc::Rc::new(std::cell::RefCell::new(None)),
@@ -1357,5 +1419,36 @@ mod session_tests {
         // A cancelled (or already-terminal) session's late-arriving event
         // must NOT overwrite the outcome a second time.
         assert!(!should_record_terminal_event(false));
+    }
+
+    // --- review MINOR 2 fix: bounded log retention ---
+    #[test]
+    fn push_backup_log_retains_lines_under_the_cap_untruncated() {
+        let log: BackupLog = std::rc::Rc::new(std::cell::RefCell::new(BackupLogState::default()));
+        for i in 0..10 {
+            push_backup_log(&log, format!("line {i}"));
+        }
+        let state = log.borrow();
+        assert_eq!(state.lines.len(), 10);
+        assert!(!state.truncated);
+        assert_eq!(state.lines.front().map(String::as_str), Some("line 0"));
+        assert_eq!(state.lines.back().map(String::as_str), Some("line 9"));
+    }
+
+    #[test]
+    fn push_backup_log_evicts_oldest_past_the_cap_and_marks_truncated() {
+        let log: BackupLog = std::rc::Rc::new(std::cell::RefCell::new(BackupLogState::default()));
+        for i in 0..(BACKUP_LOG_CAP + 50) {
+            push_backup_log(&log, format!("line {i}"));
+        }
+        let state = log.borrow();
+        assert_eq!(state.lines.len(), BACKUP_LOG_CAP);
+        assert!(state.truncated);
+        // Oldest 50 lines (0..50) evicted — the retained front is line 50.
+        assert_eq!(state.lines.front().map(String::as_str), Some("line 50"));
+        assert_eq!(
+            state.lines.back().map(String::as_str),
+            Some(format!("line {}", BACKUP_LOG_CAP + 49).as_str())
+        );
     }
 }

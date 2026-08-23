@@ -2865,9 +2865,24 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
             panel = panel.child(div().text_color(rgb(0xf9e2af)).child(format!("probíhá… ({elapsed} s)")));
 
             let log = session.log.borrow();
-            let log_len = log.len();
+            let log_len = log.lines.len();
+            // Review MINOR 2 fix: `session.log` retains at most
+            // `backup::BACKUP_LOG_CAP` lines (evicted oldest-first at the
+            // push site, `backup::push_backup_log`) — a `pg_dump -v` run
+            // against a huge schema emits one line per object, and cloning
+            // an unbounded Vec every render frame would be O(n²) cumulative
+            // over the run's lifetime. `truncated` tells the user their
+            // scrollback isn't the whole story.
+            if log.truncated {
+                panel = panel.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(0x6c7086))
+                        .child("… (starší řádky zahozeny)"),
+                );
+            }
             if log_len > 0 {
-                let lines = log.clone();
+                let lines: Vec<String> = log.lines.iter().cloned().collect();
                 let list = uniform_list(
                     "backup-restore-log",
                     log_len,

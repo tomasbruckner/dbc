@@ -5761,8 +5761,8 @@ impl AppView {
         confirm_input: Option<Entity<connections_ui::TextField>>,
         status: backup::BackupStatus,
         cx: &mut Context<Self>,
-    ) -> (Rc<RefCell<Vec<String>>>, Rc<RefCell<backup::BackupStatus>>, backup::CancelSlot) {
-        let log = Rc::new(RefCell::new(Vec::new()));
+    ) -> (backup::BackupLog, Rc<RefCell<backup::BackupStatus>>, backup::CancelSlot) {
+        let log: backup::BackupLog = Rc::new(RefCell::new(backup::BackupLogState::default()));
         let status_cell = Rc::new(RefCell::new(status));
         let cancel_slot: backup::CancelSlot = Rc::new(RefCell::new(None));
         let session = backup::BackupSession {
@@ -5919,6 +5919,17 @@ impl AppView {
                 }
             };
             let _ = this.update(cx, |view, cx| {
+                // Review fix (MINOR 1, final whole-branch review): a modal
+                // the user opened WHILE this save dialog was in flight wins
+                // — same idiom G12's script-run picker continuation uses
+                // (main.rs, `start_script_pick`'s post-pick `this.update`
+                // arm) — don't let `run_backup_now`/`start_backup_session`
+                // clobber it by unconditionally overwriting `self.modal`.
+                if view.modal.is_some() {
+                    view.status = "záloha zahozena — je otevřený jiný dialog".to_string();
+                    cx.notify();
+                    return;
+                }
                 // Binding carry-forward #3: re-verify the connection still
                 // exists RIGHT HERE, first, before resolving anything else
                 // — the save dialog's async window may have taken
@@ -6014,7 +6025,7 @@ impl AppView {
                             backup::BackupEvent::Log(line) => {
                                 let ok = this
                                     .update(cx, |_view, cx| {
-                                        log.borrow_mut().push(line);
+                                        backup::push_backup_log(&log, line);
                                         cx.notify();
                                     })
                                     .is_ok();
@@ -6226,6 +6237,17 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Review fix (MINOR 1, final whole-branch review): a modal the user
+        // opened WHILE the open-file dialog was in flight wins — same
+        // idiom G12's script-run picker continuation uses (main.rs,
+        // `start_script_pick`'s post-pick `this.update` arm) — don't let
+        // `start_backup_session` clobber it by unconditionally overwriting
+        // `self.modal`.
+        if self.modal.is_some() {
+            self.status = "obnova zahozena — je otevřený jiný dialog".to_string();
+            cx.notify();
+            return;
+        }
         let current_ids: Vec<String> = self.config.connections.iter().map(|c| c.id.clone()).collect();
         if !backup::backup_dispatch_allowed(&connection_id, &current_ids) {
             self.status = "připojení se během výběru změnilo — akce zrušena".to_string();
@@ -6404,7 +6426,7 @@ impl AppView {
                             backup::BackupEvent::Log(line) => {
                                 let ok = this
                                     .update(cx, |_view, cx| {
-                                        log.borrow_mut().push(line);
+                                        backup::push_backup_log(&log, line);
                                         cx.notify();
                                     })
                                     .is_ok();
