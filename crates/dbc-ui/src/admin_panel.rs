@@ -1,7 +1,7 @@
-//! G10 T4: "Správa serveru" — the admin panel shell, singleton per
-//! connection, plus its first sub-view ("Role a členství"). T5/T6 extend
-//! this same file with the "Oprávnění" (privileges matrix) and "Databáze a
-//! schémata" sub-views.
+//! G10 T4/T5: "Správa serveru" — the admin panel shell (T4), "Role a
+//! členství" (T4), and "Oprávnění" (T5, the engine-aware
+//! GRANT/REVOKE/DENY privileges matrix). T6 extends this same file with
+//! "Databáze a schémata".
 //!
 //! Layout of this file:
 //!   1. `AdminEntry`/`admin_entry_state` — the entry-point gate (design §2):
@@ -14,7 +14,12 @@
 //!   3. `MembershipEdits` — staged membership diff, mirrors
 //!      `sandbox::EditState`'s staging idiom (toggle stages, toggle again
 //!      un-stages, `to_statements` builds the final `WriteStatement`s).
-//!   4. `AdminModal`/`AdminPanel`/`AdminEvent` — the GPUI entity: owns the
+//!   4. `MatrixState` (T5) — one (schema, grantee) scope's privileges
+//!      matrix: committed state parsed from `admin_sql::privileges_catalog`'s
+//!      ACL rows, staged state as a diff map, same "click cycles via
+//!      `admin_sql::cycle_cell`, staging back to committed clears the
+//!      entry" idiom `MembershipEdits` uses.
+//!   5. `AdminModal`/`AdminPanel`/`AdminEvent` — the GPUI entity: owns the
 //!      parsed catalog + staged edits, renders via plain divs (a sub-nav
 //!      strip, NOT the result-tab strip — design §2), and emits
 //!      `AdminEvent`s for the things it can't do itself (`main.rs` owns the
@@ -28,15 +33,16 @@
 //! `WriteStatement`'s `Debug` output (whose manual impl already redacts
 //! `exec_sql` — see `admin_sql::WriteStatement`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
+use dbc_core::SchemaSnapshot;
 use dbc_state::Engine;
 use gpui::{
-    div, prelude::*, px, rgb, rgba, AnyElement, ClickEvent, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, Window,
+    div, prelude::*, px, rgb, rgba, uniform_list, AnyElement, ClickEvent, Context, Entity,
+    EventEmitter, FocusHandle, Focusable, Window,
 };
 
-use crate::admin_sql::{self, WriteStatement};
+use crate::admin_sql::{self, CellState, WriteStatement};
 use crate::connections_ui;
 use crate::runner::AdminCatalogRows;
 
@@ -227,17 +233,337 @@ impl MembershipEdits {
 /// Pure, GPUI-free half of `AdminPanel::change_count`'s arithmetic —
 /// `staged_role_actions` (create-role/change-password/drop-role, staged
 /// directly with no local diffing of their own) plus `membership_edits`'s
-/// own count. Extracted so the tab-strip "✕" close guard's dirtiness
-/// contract (`main.rs::AppView::grid_dirty_change_count`'s `Admin` arm —
-/// review finding: that match had NO `Admin` arm at all, so closing a
-/// dirty admin tab silently discarded staged writes) is directly
-/// unit-testable without constructing a GPUI `AdminPanel` entity.
-fn combined_change_count(staged_role_actions: usize, membership_edits: &MembershipEdits) -> usize {
-    staged_role_actions + membership_edits.change_count()
+/// own count plus (T5) `matrix_changes` (the Privileges sub-view's staged
+/// cell count — `MatrixState::change_count`). Extracted so the tab-strip
+/// "✕" close guard's dirtiness contract (`main.rs::AppView::
+/// grid_dirty_change_count`'s `Admin` arm — review finding: that match had
+/// NO `Admin` arm at all, so closing a dirty admin tab silently discarded
+/// staged writes) is directly unit-testable without constructing a GPUI
+/// `AdminPanel` entity. This is the SINGLE dirtiness definition for the
+/// whole panel — T5/T6 sub-views fold their own staged-edit counts into
+/// this same function rather than inventing a second one (in practice at
+/// most one of the three terms is ever non-zero at once, since switching
+/// sub-view clears the others — see `AdminPanel::switch_sub_view` — but the
+/// formula stays valid regardless).
+fn combined_change_count(
+    staged_role_actions: usize,
+    membership_edits: &MembershipEdits,
+    matrix_changes: usize,
+) -> usize {
+    staged_role_actions + membership_edits.change_count() + matrix_changes
 }
 
 // ---------------------------------------------------------------------
-// 4. GPUI entity.
+// 4. Privileges matrix (T5) — engine-aware GRANT/REVOKE/DENY.
+// ---------------------------------------------------------------------
+
+/// MSSQL `sys.database_permissions.state_desc` → `CellState` (design §1):
+/// `DENY` → Denied, `GRANT`/`GRANT_WITH_GRANT_OPTION` → Granted — anything
+/// else (a `REVOKE` state never actually appears as a row; defensive only)
+/// → NotSet.
+fn mssql_state_from_desc(state_desc: &str) -> CellState {
+    match state_desc {
+        "DENY" => CellState::Denied,
+        "GRANT" | "GRANT_WITH_GRANT_OPTION" => CellState::Granted,
+        _ => CellState::NotSet,
+    }
+}
+
+/// The privileges matrix's cell glyph (design §2, Grounding): `✓` Granted,
+/// `✗` Denied (MSSQL only — pg's bi-state `cycle_cell` never produces it),
+/// empty NotSet. Shared by the object grid and the fixed schema/db rows.
+fn privilege_glyph(state: CellState) -> &'static str {
+    match state {
+        CellState::Granted => "✓",
+        CellState::Denied => "✗",
+        CellState::NotSet => "",
+    }
+}
+
+/// One (schema, grantee) scope's matrix — committed state parsed from
+/// `admin_sql::privileges_catalog`'s ACL rows, staged state as a diff map
+/// (only cells that differ from committed are present at all — the same
+/// "staging back to committed removes the entry" idiom `MembershipEdits`
+/// uses).
+#[derive(Default)]
+pub struct MatrixState {
+    pub objects: Vec<String>,
+    pub current: HashMap<(String, String), CellState>, // (object, privilege)
+    pub staged: HashMap<(String, String), CellState>,
+    pub schema_current: HashMap<String, CellState>, // privilege -> state
+    pub schema_staged: HashMap<String, CellState>,
+    pub db_current: HashMap<String, CellState>, // pg only
+    pub db_staged: HashMap<String, CellState>,
+}
+
+impl MatrixState {
+    /// Postgres rows (`object_acl`/`schema_acl`/`db_acl`): grantee-filtered,
+    /// `privilege_type` → Granted. MSSQL rows (`object_perms`/
+    /// `schema_perms`): `state_desc` mapped via `mssql_state_from_desc`.
+    /// `objects` = every distinct object seen in the object-level rows,
+    /// REGARDLESS of grantee (`aclexplode` over `acldefault` yields an
+    /// owner-default row for EVERY object, so an object the selected
+    /// grantee has zero privileges on still appears as a matrix row, all
+    /// cells NotSet). Columns are looked up BY NAME (not fixed position),
+    /// so the exact column set `admin_sql`'s queries declare is what's
+    /// actually read.
+    ///
+    /// `engine` is unused in the body — which engine produced `labeled` is
+    /// already implicit in the LABELS present (`object_acl` vs.
+    /// `object_perms`, etc.) and in whether a `state_desc` column exists at
+    /// all (pg has none; presence alone routes to `mssql_state_from_desc`).
+    /// Kept as a parameter anyway for signature parity with `click_cell`/
+    /// `click_schema_cell`/`to_statements` (every other `MatrixState`
+    /// method that touches privilege semantics takes one) and because the
+    /// plan's own interface spec declares it.
+    pub fn from_catalog(
+        _engine: Engine,
+        grantee: &str,
+        labeled: &[(&'static str, AdminCatalogRows)],
+    ) -> MatrixState {
+        let mut m = MatrixState::default();
+        let mut objects: BTreeSet<String> = BTreeSet::new();
+
+        for (label, data) in labeled {
+            let (cols, rows) = data;
+            let ix = |name: &str| cols.iter().position(|c| c == name);
+            match *label {
+                "object_acl" | "object_perms" => {
+                    let Some(object_ix) = ix("object").or_else(|| ix("object_name")) else { continue };
+                    let Some(grantee_ix) = ix("grantee") else { continue };
+                    let priv_col = if *label == "object_acl" { "privilege_type" } else { "permission_name" };
+                    let Some(priv_ix) = ix(priv_col) else { continue };
+                    let state_ix = ix("state_desc"); // MSSQL only
+                    for row in rows {
+                        let Some(object) = row.get(object_ix).cloned().flatten() else { continue };
+                        objects.insert(object.clone());
+                        let row_grantee = row.get(grantee_ix).cloned().flatten().unwrap_or_default();
+                        if row_grantee != grantee {
+                            continue;
+                        }
+                        let Some(priv_name) = row.get(priv_ix).cloned().flatten() else { continue };
+                        let state = match state_ix {
+                            Some(six) => row
+                                .get(six)
+                                .cloned()
+                                .flatten()
+                                .map(|s| mssql_state_from_desc(&s))
+                                .unwrap_or(CellState::Granted),
+                            None => CellState::Granted, // pg: presence in the ACL IS Granted.
+                        };
+                        m.current.insert((object, priv_name), state);
+                    }
+                }
+                "schema_acl" | "schema_perms" => {
+                    let Some(grantee_ix) = ix("grantee") else { continue };
+                    let priv_col = if *label == "schema_acl" { "privilege_type" } else { "permission_name" };
+                    let Some(priv_ix) = ix(priv_col) else { continue };
+                    let state_ix = ix("state_desc");
+                    for row in rows {
+                        let row_grantee = row.get(grantee_ix).cloned().flatten().unwrap_or_default();
+                        if row_grantee != grantee {
+                            continue;
+                        }
+                        let Some(priv_name) = row.get(priv_ix).cloned().flatten() else { continue };
+                        let state = match state_ix {
+                            Some(six) => row
+                                .get(six)
+                                .cloned()
+                                .flatten()
+                                .map(|s| mssql_state_from_desc(&s))
+                                .unwrap_or(CellState::Granted),
+                            None => CellState::Granted,
+                        };
+                        m.schema_current.insert(priv_name, state);
+                    }
+                }
+                "db_acl" => {
+                    // pg only (design §2 — MSSQL has no db-level row).
+                    let (Some(grantee_ix), Some(priv_ix)) = (ix("grantee"), ix("privilege_type")) else {
+                        continue;
+                    };
+                    for row in rows {
+                        let row_grantee = row.get(grantee_ix).cloned().flatten().unwrap_or_default();
+                        if row_grantee != grantee {
+                            continue;
+                        }
+                        let Some(priv_name) = row.get(priv_ix).cloned().flatten() else { continue };
+                        m.db_current.insert(priv_name, CellState::Granted);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        m.objects = objects.into_iter().collect();
+        m
+    }
+
+    /// Staged wins over committed; NotSet is the default for an
+    /// unmentioned object/privilege pair.
+    pub fn effective(&self, object: &str, privilege: &str) -> CellState {
+        let key = (object.to_string(), privilege.to_string());
+        self.staged.get(&key).copied().unwrap_or_else(|| self.current.get(&key).copied().unwrap_or(CellState::NotSet))
+    }
+
+    /// Cycle one cell via `admin_sql::cycle_cell`; staging back to the
+    /// committed state REMOVES the diff entry (yellow tint clears) instead
+    /// of leaving a redundant "staged = committed" entry around.
+    pub fn click_cell(&mut self, engine: Engine, object: &str, privilege: &str) {
+        let key = (object.to_string(), privilege.to_string());
+        let next = admin_sql::cycle_cell(engine, self.effective(object, privilege));
+        let committed = self.current.get(&key).copied().unwrap_or(CellState::NotSet);
+        if next == committed {
+            self.staged.remove(&key);
+        } else {
+            self.staged.insert(key, next);
+        }
+    }
+
+    pub fn click_schema_cell(&mut self, engine: Engine, privilege: &str) {
+        let key = privilege.to_string();
+        let effective = self.schema_staged.get(&key).copied().unwrap_or_else(|| {
+            self.schema_current.get(&key).copied().unwrap_or(CellState::NotSet)
+        });
+        let next = admin_sql::cycle_cell(engine, effective);
+        let committed = self.schema_current.get(&key).copied().unwrap_or(CellState::NotSet);
+        if next == committed {
+            self.schema_staged.remove(&key);
+        } else {
+            self.schema_staged.insert(key, next);
+        }
+    }
+
+    /// pg only — bi-state by construction (always cycles via
+    /// `Engine::Postgres`, since `admin_sql::database_privilege_pg` is
+    /// pg-only too and the UI never renders this row for MSSQL).
+    pub fn click_db_cell(&mut self, privilege: &str) {
+        let key = privilege.to_string();
+        let effective =
+            self.db_staged.get(&key).copied().unwrap_or_else(|| self.db_current.get(&key).copied().unwrap_or(CellState::NotSet));
+        let next = admin_sql::cycle_cell(Engine::Postgres, effective);
+        let committed = self.db_current.get(&key).copied().unwrap_or(CellState::NotSet);
+        if next == committed {
+            self.db_staged.remove(&key);
+        } else {
+            self.db_staged.insert(key, next);
+        }
+    }
+
+    pub fn change_count(&self) -> usize {
+        self.staged.len() + self.schema_staged.len() + self.db_staged.len()
+    }
+
+    /// Kept for API/interface parity (the plan's own spec, and
+    /// `MembershipEdits::is_dirty`'s identical situation) even though
+    /// `AdminPanel::is_dirty` composes its answer from `AdminPanel::
+    /// change_count`/`combined_change_count` instead of calling this — one
+    /// dirtiness definition for the whole panel, not one per sub-view.
+    #[allow(dead_code)]
+    pub fn is_dirty(&self) -> bool {
+        self.change_count() > 0
+    }
+
+    pub fn clear(&mut self) {
+        self.staged.clear();
+        self.schema_staged.clear();
+        self.db_staged.clear();
+    }
+
+    /// Groups staged OBJECT cells by `(object, target state)` so multi-priv
+    /// changes emit one `"GRANT SELECT, INSERT ON …"` statement (design
+    /// §3's table) rather than one per cell — iterated in deterministic
+    /// `(object, privilege-column)` order: `self.objects` is already sorted
+    /// (built from a `BTreeSet` in `from_catalog`), and within an object,
+    /// privilege columns follow `PG_TABLE_PRIVS`/`MSSQL_TABLE_PRIVS`'s
+    /// declared order, not staging/click order. Schema/db cells are one
+    /// statement each, in `SCHEMA_PRIVS`/`PG_DATABASE_PRIVS` order. `Err`
+    /// bubbles `admin_sql`'s own refusals (unreachable via the UI cycles —
+    /// pg never stages Denied, SQLite never renders this sub-view at all —
+    /// the errors-are-values backstop, not a real UI path).
+    pub fn to_statements(
+        &self,
+        engine: Engine,
+        schema: &str,
+        grantee: &str,
+        database: &str,
+    ) -> Result<Vec<WriteStatement>, String> {
+        let priv_columns: &[&str] = match engine {
+            Engine::Postgres => admin_sql::PG_TABLE_PRIVS,
+            Engine::Mssql => admin_sql::MSSQL_TABLE_PRIVS,
+            Engine::Sqlite => &[],
+        };
+        let mut out = Vec::new();
+
+        for object in &self.objects {
+            let mut granted: Vec<&str> = Vec::new();
+            let mut revoked: Vec<&str> = Vec::new();
+            let mut denied: Vec<&str> = Vec::new();
+            for &priv_name in priv_columns {
+                let key = (object.clone(), priv_name.to_string());
+                if let Some(&target) = self.staged.get(&key) {
+                    match target {
+                        CellState::Granted => granted.push(priv_name),
+                        CellState::NotSet => revoked.push(priv_name),
+                        CellState::Denied => denied.push(priv_name),
+                    }
+                }
+            }
+            if !granted.is_empty() {
+                out.push(admin_sql::object_privilege(engine, schema, object, &granted, grantee, CellState::Granted)?);
+            }
+            if !revoked.is_empty() {
+                out.push(admin_sql::object_privilege(engine, schema, object, &revoked, grantee, CellState::NotSet)?);
+            }
+            if !denied.is_empty() {
+                out.push(admin_sql::object_privilege(engine, schema, object, &denied, grantee, CellState::Denied)?);
+            }
+        }
+
+        for &priv_name in admin_sql::SCHEMA_PRIVS {
+            if let Some(&target) = self.schema_staged.get(priv_name) {
+                out.push(admin_sql::schema_privilege(engine, schema, priv_name, grantee, target)?);
+            }
+        }
+
+        for &priv_name in admin_sql::PG_DATABASE_PRIVS {
+            if let Some(&target) = self.db_staged.get(priv_name) {
+                out.push(admin_sql::database_privilege_pg(database, priv_name, grantee, target)?);
+            }
+        }
+
+        Ok(out)
+    }
+}
+
+/// Distinct, sorted schema names from a `SchemaSnapshot`'s tables — feeds
+/// the Privileges sub-view's schema selector (design §2). SQLite's
+/// single-implicit-schema snapshots (every `TableInfo.schema` is `None`)
+/// yield an empty list — harmless, since the admin panel is `Hidden` for
+/// SQLite entirely (`admin_entry_state`), so this is never actually
+/// reached for that engine.
+pub fn distinct_schemas(snapshot: &SchemaSnapshot) -> Vec<String> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for t in &snapshot.tables {
+        if let Some(s) = &t.schema {
+            set.insert(s.clone());
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// `AdminPanel::apply_catalog`'s routing predicate: `true` when `rows`
+/// carries any of `admin_sql::privileges_catalog`'s labels — pulled out as
+/// a standalone, pure function so the label-detection logic (which decides
+/// whether a batch is routed whole into `MatrixState::from_catalog`, or
+/// per-label into the Roles parsers) is directly unit-testable without
+/// constructing an `AdminPanel`/GPUI entity.
+fn is_privileges_batch(rows: &[(&'static str, AdminCatalogRows)]) -> bool {
+    rows.iter().any(|(l, _)| matches!(*l, "object_acl" | "schema_acl" | "db_acl" | "object_perms" | "schema_perms"))
+}
+
+// ---------------------------------------------------------------------
+// 5. GPUI entity.
 // ---------------------------------------------------------------------
 
 /// Which boolean flag on `AdminModal::NewRole` a checkbox click toggles.
@@ -247,6 +573,22 @@ enum RoleFlagKind {
     Superuser,
     Createdb,
     Createrole,
+}
+
+/// T5: the action `AdminPanel::discard_confirm_yes` performs on "Zahodit",
+/// or drops entirely on "Zpět" (`discard_confirm_no`) — generalizes T4's
+/// "sub-view switch only" shape (`SwitchSubView`) to the two NEW actions a
+/// dirty Privileges sub-view can defer: re-selecting the schema or the
+/// grantee (`request_select_schema`/`request_select_grantee`). Not `Copy`
+/// (the `String` payloads), so `render_discard_confirm_overlay` only checks
+/// `self.discard_confirm.is_some()`/`.as_ref()` — it doesn't need to know
+/// WHICH action is pending to render the generic "Zahodit neuložené
+/// změny?" prompt.
+#[derive(Clone)]
+enum PendingAdminAction {
+    SwitchSubView(AdminSubView),
+    SelectSchema(String),
+    SelectGrantee(String),
 }
 
 /// Panel-local overlay state — same visual idiom as the grid cell editor
@@ -312,11 +654,34 @@ pub struct AdminPanel {
     membership_edits: MembershipEdits,
     staged_role_actions: Vec<WriteStatement>,
 
+    /// T5: distinct schema names, pushed in by `main.rs::set_schemas`
+    /// (`open_fresh_admin_tab` at open time, `trigger_schema_fetch` on
+    /// every subsequent refresh) — feeds the Privileges sub-view's schema
+    /// selector.
+    schemas: Vec<String>,
+    /// T5: the Privileges sub-view's (schema, grantee) scope selection —
+    /// both `None` until the user picks each; `fetch_queries_for` only
+    /// dispatches once a schema is chosen (the SQL doesn't need a grantee —
+    /// `MatrixState::from_catalog` filters client-side — but the matrix
+    /// stays empty/unbuilt until both are set, see `apply_catalog`).
+    selected_schema: Option<String>,
+    selected_grantee: Option<String>,
+    /// T5: pg only — parsed out of the `db_acl` batch's `database` column
+    /// (design §1: that query is scoped to `current_database()`, so every
+    /// row it returns carries the SAME name) since `MatrixState`'s own
+    /// shape (design §5's interface spec) has no field for it, and
+    /// `MatrixState::to_statements`'s pg-only `GRANT/REVOKE ... ON DATABASE
+    /// "…"` statements need the literal name. `None` until the first
+    /// Privileges fetch resolves against a live pg connection; MSSQL never
+    /// populates this (no `db_acl` label there) and never reads it either.
+    current_database: Option<String>,
+    matrix: MatrixState,
+
     modal: Option<AdminModal>,
-    /// Sub-view switch requested while the CURRENT sub-view is dirty —
-    /// renders the "Zahodit neuložené změny?" prompt instead of switching
-    /// silently (design §2).
-    discard_confirm: Option<AdminSubView>,
+    /// A sub-view switch OR a schema/grantee re-selection requested while
+    /// the CURRENT sub-view is dirty — renders the "Zahodit neuložené
+    /// změny?" prompt instead of proceeding silently (design §2).
+    discard_confirm: Option<PendingAdminAction>,
 
     #[allow(dead_code)] // reserved for future keyboard/escape handling, same posture as SchemaTree's.
     focus_handle: FocusHandle,
@@ -336,6 +701,11 @@ impl AdminPanel {
             selected_role: None,
             membership_edits: MembershipEdits::default(),
             staged_role_actions: Vec::new(),
+            schemas: Vec::new(),
+            selected_schema: None,
+            selected_grantee: None,
+            current_database: None,
+            matrix: MatrixState::default(),
             modal: None,
             discard_confirm: None,
             focus_handle: cx.focus_handle(),
@@ -344,6 +714,12 @@ impl AdminPanel {
 
     pub fn conn_identity(&self) -> &str {
         &self.conn_identity
+    }
+
+    /// T5: see the `schemas` field's doc comment.
+    pub fn set_schemas(&mut self, schemas: Vec<String>, cx: &mut Context<Self>) {
+        self.schemas = schemas;
+        cx.notify();
     }
 
     pub fn set_loading(&mut self, cx: &mut Context<Self>) {
@@ -365,9 +741,35 @@ impl AdminPanel {
     /// baseline, `db_principals` appends anything not already present) —
     /// the generic `RoleRow` shape doesn't distinguish server- vs.
     /// db-scoped principals beyond that.
+    ///
+    /// T5: a privileges-catalog batch (`object_acl`/`schema_acl`/`db_acl`
+    /// pg, or `object_perms`/`schema_perms` MSSQL) is routed as ONE WHOLE
+    /// batch into `MatrixState::from_catalog` — never per-label like the
+    /// Roles labels below, since the matrix needs every label together to
+    /// build `objects`/`current`/`schema_current`/`db_current` in one pass
+    /// (`MatrixState::from_catalog`'s own signature takes the full labeled
+    /// slice). `current_database` is parsed out of `db_acl`'s rows here
+    /// (see that field's doc comment) since `MatrixState` itself has no
+    /// slot for it.
     pub fn apply_catalog(&mut self, rows: Vec<(&'static str, AdminCatalogRows)>, cx: &mut Context<Self>) {
         self.loading = false;
         self.error = None;
+
+        if is_privileges_batch(&rows) {
+            if let Some((_, (cols, data))) = rows.iter().find(|(l, _)| *l == "db_acl") {
+                if let Some(db_ix) = cols.iter().position(|c| c == "database") {
+                    if let Some(name) = data.first().and_then(|r| r.get(db_ix)).cloned().flatten() {
+                        self.current_database = Some(name);
+                    }
+                }
+            }
+            if let Some(grantee) = self.selected_grantee.clone() {
+                self.matrix = MatrixState::from_catalog(self.engine, &grantee, &rows);
+            }
+            cx.notify();
+            return;
+        }
+
         for (label, data) in rows {
             match label {
                 "roles" | "server_principals" => self.roles = parse_roles(&data),
@@ -386,12 +788,13 @@ impl AdminPanel {
         cx.notify();
     }
 
-    /// Post-Apply-success: clear staged sets + re-request the active
-    /// sub-view's catalog (design §2/§3's "one transaction per user-visible
-    /// action, then refresh").
+    /// Post-Apply-success: clear staged sets (including T5's `matrix`) +
+    /// re-request the active sub-view's catalog (design §2/§3's "one
+    /// transaction per user-visible action, then refresh").
     pub fn on_apply_success(&mut self, cx: &mut Context<Self>) {
         self.staged_role_actions.clear();
         self.membership_edits.clear();
+        self.matrix.clear();
         self.loading = true;
         cx.notify();
         if let Some(queries) = self.fetch_queries_for(self.sub_view) {
@@ -402,8 +805,12 @@ impl AdminPanel {
     fn fetch_queries_for(&self, sub_view: AdminSubView) -> Option<Vec<(&'static str, String)>> {
         match sub_view {
             AdminSubView::Roles => Some(admin_sql::roles_catalog(self.engine)),
-            // T5/T6 wire these to privileges_catalog/sizes_catalog.
-            AdminSubView::Privileges | AdminSubView::Databases => None,
+            AdminSubView::Privileges => {
+                let schema = self.selected_schema.as_deref()?;
+                Some(admin_sql::privileges_catalog(self.engine, schema))
+            }
+            // T6 wires this to sizes_catalog.
+            AdminSubView::Databases => None,
         }
     }
 
@@ -422,9 +829,10 @@ impl AdminPanel {
     /// this codebase has no established "construct a GPUI entity in a test"
     /// precedent (see e.g. `admin_open_decision`/`conn_identity_matches` in
     /// `main.rs`, which keep their pure decisions free of `Context`/`cx`
-    /// too).
+    /// too). T5 folds `MatrixState::change_count` into the SAME formula
+    /// rather than adding a second dirtiness definition.
     pub fn change_count(&self) -> usize {
-        combined_change_count(self.staged_role_actions.len(), &self.membership_edits)
+        combined_change_count(self.staged_role_actions.len(), &self.membership_edits, self.matrix.change_count())
     }
 
     fn is_member(&self, role: &str, member: &str, server_role: bool) -> bool {
@@ -439,7 +847,7 @@ impl AdminPanel {
             return;
         }
         if self.is_dirty() {
-            self.discard_confirm = Some(target);
+            self.discard_confirm = Some(PendingAdminAction::SwitchSubView(target));
             cx.notify();
             return;
         }
@@ -451,16 +859,84 @@ impl AdminPanel {
         self.staged_role_actions.clear();
         self.membership_edits.clear();
         self.selected_role = None;
+        // T5: leaving/entering Privileges always drops the matrix's staged
+        // AND committed state — a fresh fetch (below, once schema+grantee
+        // are set) repopulates `current`; carrying stale committed rows
+        // across an unrelated sub-view round-trip would risk showing data
+        // that's since drifted.
+        self.matrix = MatrixState::default();
         self.loading = true;
         cx.notify();
         if let Some(queries) = self.fetch_queries_for(target) {
             cx.emit(AdminEvent::FetchCatalog { queries });
+        } else {
+            self.loading = false;
+        }
+    }
+
+    /// T5: schema selector click — same dirty-guard shape as
+    /// `request_sub_view`. A no-op when re-selecting the already-selected
+    /// schema.
+    fn request_select_schema(&mut self, schema: String, cx: &mut Context<Self>) {
+        if self.selected_schema.as_deref() == Some(schema.as_str()) {
+            return;
+        }
+        if self.is_dirty() {
+            self.discard_confirm = Some(PendingAdminAction::SelectSchema(schema));
+            cx.notify();
+            return;
+        }
+        self.apply_select_schema(schema, cx);
+    }
+
+    /// T5: grantee selector click — same shape as `request_select_schema`.
+    fn request_select_grantee(&mut self, grantee: String, cx: &mut Context<Self>) {
+        if self.selected_grantee.as_deref() == Some(grantee.as_str()) {
+            return;
+        }
+        if self.is_dirty() {
+            self.discard_confirm = Some(PendingAdminAction::SelectGrantee(grantee));
+            cx.notify();
+            return;
+        }
+        self.apply_select_grantee(grantee, cx);
+    }
+
+    fn apply_select_schema(&mut self, schema: String, cx: &mut Context<Self>) {
+        self.selected_schema = Some(schema);
+        self.refetch_privileges(cx);
+    }
+
+    fn apply_select_grantee(&mut self, grantee: String, cx: &mut Context<Self>) {
+        self.selected_grantee = Some(grantee);
+        self.refetch_privileges(cx);
+    }
+
+    /// T5: drops the matrix's staged+committed state and re-dispatches
+    /// `privileges_catalog(engine, schema)` — the query itself doesn't take
+    /// a grantee (`MatrixState::from_catalog` filters client-side, see its
+    /// doc comment), so a grantee-only change re-runs the SAME query rather
+    /// than re-filtering cached rows; simpler and always-correct at the
+    /// cost of one extra round-trip, acceptable for this phase. A no-op
+    /// (stays `loading = false`) until a schema is actually selected.
+    fn refetch_privileges(&mut self, cx: &mut Context<Self>) {
+        self.matrix = MatrixState::default();
+        self.loading = true;
+        cx.notify();
+        if let Some(queries) = self.fetch_queries_for(AdminSubView::Privileges) {
+            cx.emit(AdminEvent::FetchCatalog { queries });
+        } else {
+            self.loading = false;
         }
     }
 
     fn discard_confirm_yes(&mut self, cx: &mut Context<Self>) {
-        let Some(target) = self.discard_confirm.take() else { return };
-        self.switch_sub_view(target, cx);
+        let Some(action) = self.discard_confirm.take() else { return };
+        match action {
+            PendingAdminAction::SwitchSubView(target) => self.switch_sub_view(target, cx),
+            PendingAdminAction::SelectSchema(schema) => self.apply_select_schema(schema, cx),
+            PendingAdminAction::SelectGrantee(grantee) => self.apply_select_grantee(grantee, cx),
+        }
     }
 
     fn discard_confirm_no(&mut self, cx: &mut Context<Self>) {
@@ -571,19 +1047,54 @@ impl AdminPanel {
         cx.notify();
     }
 
+    /// The Apply bar's "Zahodit" — clears EVERY sub-view's staged state
+    /// (only the active one is ever actually non-empty, per
+    /// `switch_sub_view`'s own clearing, but this stays defensive of that
+    /// invariant rather than relying on it).
     fn discard_staged(&mut self, cx: &mut Context<Self>) {
         self.staged_role_actions.clear();
         self.membership_edits.clear();
+        self.matrix.clear();
         cx.notify();
     }
 
+    /// Builds `AdminEvent::RequestApply`'s statements from whichever
+    /// sub-view is active. T5's Privileges arm surfaces a `MatrixState::
+    /// to_statements` `Err` (unreachable via the UI cycles — the
+    /// errors-are-values backstop) in `self.error` rather than panicking,
+    /// exactly like the plan's Grounding specifies.
     fn request_apply(&mut self, cx: &mut Context<Self>) {
-        let mut statements = self.staged_role_actions.clone();
-        statements.extend(self.membership_edits.to_statements(self.engine));
-        if statements.is_empty() {
-            return;
+        match self.sub_view {
+            AdminSubView::Roles => {
+                let mut statements = self.staged_role_actions.clone();
+                statements.extend(self.membership_edits.to_statements(self.engine));
+                if statements.is_empty() {
+                    return;
+                }
+                cx.emit(AdminEvent::RequestApply { statements, warning: None });
+            }
+            AdminSubView::Privileges => {
+                let (Some(schema), Some(grantee)) =
+                    (self.selected_schema.clone(), self.selected_grantee.clone())
+                else {
+                    return;
+                };
+                let database = self.current_database.clone().unwrap_or_default();
+                match self.matrix.to_statements(self.engine, &schema, &grantee, &database) {
+                    Ok(statements) => {
+                        if statements.is_empty() {
+                            return;
+                        }
+                        cx.emit(AdminEvent::RequestApply { statements, warning: None });
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
+                        cx.notify();
+                    }
+                }
+            }
+            AdminSubView::Databases => {} // T6
         }
-        cx.emit(AdminEvent::RequestApply { statements, warning: None });
     }
 
     // -------------------------------------------------------------
@@ -745,6 +1256,208 @@ impl AdminPanel {
             .child(buttons)
             .child(div().flex().flex_row().flex_1().overflow_hidden().child(list).child(detail))
             .into_any_element()
+    }
+
+    /// T5: "Oprávnění" — schema/grantee selector chips (bounded, small
+    /// lists — same plain-loop posture `render_roles_body`'s own role list
+    /// already takes, unlike the object grid below), the fixed
+    /// schema/db-privilege checkbox row (design §2), and the object×
+    /// privilege grid. The grid is the one part of this sub-view that CAN
+    /// be large (a schema can hold hundreds of tables) — rendered through
+    /// `uniform_list`, same virtualization `schema_tree.rs` uses for its
+    /// row list, never a plain per-object `.child()` loop.
+    fn render_privileges_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let schemas = self.schemas.clone();
+        let roles = self.roles.clone();
+        let selected_schema = self.selected_schema.clone();
+        let selected_grantee = self.selected_grantee.clone();
+
+        let mut schema_row = div().flex().flex_row().items_center().flex_wrap().gap_1().px_2().py_1();
+        schema_row = schema_row.child(div().text_color(rgb(0xa6adc8)).child("Schéma:"));
+        for (ix, s) in schemas.iter().enumerate() {
+            let is_sel = selected_schema.as_deref() == Some(s.as_str());
+            let s_for_click = s.clone();
+            schema_row = schema_row.child(
+                div()
+                    .id(("admin-priv-schema-chip", ix))
+                    .cursor_pointer()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .when(is_sel, |d| d.bg(rgb(0x45475a)))
+                    .hover(|s| s.bg(rgb(0x313244)))
+                    .text_color(rgb(0xcdd6f4))
+                    .child(s.clone())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.request_select_schema(s_for_click.clone(), cx);
+                    })),
+            );
+        }
+
+        let mut grantee_row = div().flex().flex_row().items_center().flex_wrap().gap_1().px_2().py_1();
+        grantee_row = grantee_row.child(div().text_color(rgb(0xa6adc8)).child("Role:"));
+        for (ix, r) in roles.iter().enumerate() {
+            let is_sel = selected_grantee.as_deref() == Some(r.name.as_str());
+            let r_for_click = r.name.clone();
+            grantee_row = grantee_row.child(
+                div()
+                    .id(("admin-priv-grantee-chip", ix))
+                    .cursor_pointer()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .when(is_sel, |d| d.bg(rgb(0x45475a)))
+                    .hover(|s| s.bg(rgb(0x313244)))
+                    .text_color(rgb(0xcdd6f4))
+                    .child(r.name.clone())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.request_select_grantee(r_for_click.clone(), cx);
+                    })),
+            );
+        }
+
+        let mut root = div().flex().flex_col().flex_1().overflow_hidden();
+        root = root.child(schema_row).child(grantee_row);
+
+        let Some(schema) = selected_schema.clone() else {
+            return root
+                .child(div().flex_1().p_2().text_color(rgb(0x6c7086)).child("Vyberte schéma a roli."))
+                .into_any_element();
+        };
+        if selected_grantee.is_none() {
+            return root
+                .child(div().flex_1().p_2().text_color(rgb(0x6c7086)).child("Vyberte roli."))
+                .into_any_element();
+        }
+
+        // Fixed schema/db-privilege checkbox row (design §2) — SCHEMA_PRIVS
+        // always, PG_DATABASE_PRIVS only for Postgres (design §2: the
+        // db-level row is pg only). One clickable cell per privilege,
+        // showing the SAME ✓/✗/empty glyph + yellow staged-tint convention
+        // the object grid below uses.
+        let engine = self.engine;
+        let mut scope_row =
+            div().flex().flex_row().items_center().flex_wrap().gap_2().px_2().py_1().bg(rgb(0x181825));
+        scope_row = scope_row.child(div().text_color(rgb(0xa6adc8)).child(format!("Schéma \"{schema}\":")));
+        for (ix, &priv_name) in admin_sql::SCHEMA_PRIVS.iter().enumerate() {
+            let committed = self.matrix.schema_current.get(priv_name).copied().unwrap_or(CellState::NotSet);
+            let state = self.matrix.schema_staged.get(priv_name).copied().unwrap_or(committed);
+            let staged = state != committed;
+            let glyph = privilege_glyph(state);
+            scope_row = scope_row.child(
+                div()
+                    .id(("admin-priv-schema-cell", ix))
+                    .cursor_pointer()
+                    .px_1()
+                    .when(staged, |d| d.bg(rgba((STAGED_TINT << 8) | 0x40)))
+                    .text_color(rgb(0xcdd6f4))
+                    .child(format!("{priv_name} {glyph}"))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.matrix.click_schema_cell(engine, priv_name);
+                        cx.notify();
+                    })),
+            );
+        }
+        if self.engine == Engine::Postgres {
+            scope_row = scope_row.child(div().text_color(rgb(0xa6adc8)).child("Databáze:"));
+            for (ix, &priv_name) in admin_sql::PG_DATABASE_PRIVS.iter().enumerate() {
+                let committed = self.matrix.db_current.get(priv_name).copied().unwrap_or(CellState::NotSet);
+                let state = self.matrix.db_staged.get(priv_name).copied().unwrap_or(committed);
+                let staged = state != committed;
+                let glyph = privilege_glyph(state);
+                scope_row = scope_row.child(
+                    div()
+                        .id(("admin-priv-db-cell", ix))
+                        .cursor_pointer()
+                        .px_1()
+                        .when(staged, |d| d.bg(rgba((STAGED_TINT << 8) | 0x40)))
+                        .text_color(rgb(0xcdd6f4))
+                        .child(format!("{priv_name} {glyph}"))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                            this.matrix.click_db_cell(priv_name);
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+        root = root.child(scope_row);
+
+        let objects = self.matrix.objects.clone();
+        let n_objects = objects.len();
+        let priv_columns: &'static [&'static str] = match self.engine {
+            Engine::Postgres => admin_sql::PG_TABLE_PRIVS,
+            Engine::Mssql => admin_sql::MSSQL_TABLE_PRIVS,
+            Engine::Sqlite => &[],
+        };
+
+        if n_objects == 0 {
+            return root
+                .child(div().flex_1().p_2().text_color(rgb(0x6c7086)).child("Žádné objekty v tomto schématu."))
+                .into_any_element();
+        }
+
+        let mut header = div().flex().flex_row().px_2().py_1().bg(rgb(0x181825)).text_color(rgb(0xa6adc8));
+        header = header.child(div().w(px(220.)).child("Objekt"));
+        for &p in priv_columns {
+            header = header.child(div().w(px(80.)).child(p));
+        }
+        root = root.child(header);
+
+        let n_cols = priv_columns.len();
+        root = root.child(
+            uniform_list(
+                "admin-priv-object-rows",
+                n_objects,
+                cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                    let mut items = Vec::with_capacity(range.len());
+                    for ix in range {
+                        let object = objects[ix].clone();
+                        let mut row = div()
+                            .id(("admin-priv-object-row", ix))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .px_2()
+                            .py_1()
+                            .text_color(rgb(0xcdd6f4))
+                            .hover(|s| s.bg(rgb(0x313244)));
+                        row = row.child(div().w(px(220.)).overflow_hidden().child(object.clone()));
+                        for (col_ix, &priv_name) in priv_columns.iter().enumerate() {
+                            let key = (object.clone(), priv_name.to_string());
+                            let state = this.matrix.effective(&object, priv_name);
+                            let committed = this.matrix.current.get(&key).copied().unwrap_or(CellState::NotSet);
+                            let staged = state != committed;
+                            let glyph = privilege_glyph(state);
+                            let object_for_click = object.clone();
+                            // `ix * n_cols + col_ix`: a bijective (row, col)
+                            // -> single-usize encoding, the same
+                            // collision-safe `(&'static str, usize)` id
+                            // shape as everywhere else in this file — a
+                            // per-row id alone would collide across this
+                            // row's own N privilege columns.
+                            let cell_ix = ix * n_cols + col_ix;
+                            row = row.child(
+                                div()
+                                    .id(("admin-priv-cell", cell_ix))
+                                    .w(px(80.))
+                                    .cursor_pointer()
+                                    .when(staged, |d| d.bg(rgba((STAGED_TINT << 8) | 0x40)))
+                                    .child(glyph)
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                        this.matrix.click_cell(engine, &object_for_click, priv_name);
+                                        cx.notify();
+                                    })),
+                            );
+                        }
+                        items.push(row);
+                    }
+                    items
+                }),
+            )
+            .flex_1(),
+        );
+
+        root.into_any_element()
     }
 
     /// `ix` is this row's position within its OWN list (`member_list` or
@@ -970,7 +1683,7 @@ impl AdminPanel {
     }
 
     fn render_discard_confirm_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        self.discard_confirm?;
+        self.discard_confirm.as_ref()?;
         let n = self.change_count();
         Some(
             div()
@@ -1066,7 +1779,8 @@ impl Render for AdminPanel {
 
         let body: AnyElement = match self.sub_view {
             AdminSubView::Roles => self.render_roles_body(cx),
-            AdminSubView::Privileges | AdminSubView::Databases => div()
+            AdminSubView::Privileges => self.render_privileges_body(cx),
+            AdminSubView::Databases => div()
                 .flex_1()
                 .p_2()
                 .text_color(rgb(0x6c7086))
@@ -1184,19 +1898,221 @@ mod tests {
         let mut edits = MembershipEdits::default();
         // Zero staged anything -> 0, which `main.rs`'s `(n > 0).then_some(n)`
         // turns into `None` (no close-confirm prompt, no dirty dot).
-        assert_eq!(combined_change_count(0, &edits), 0);
+        assert_eq!(combined_change_count(0, &edits, 0), 0);
 
         // A membership toggle alone must already dirty the tab (a create-
         // role/drop-role/change-password action isn't the only way to
         // stage a write here).
         edits.toggle("readers", "bob", false, false);
-        assert_eq!(combined_change_count(0, &edits), 1);
+        assert_eq!(combined_change_count(0, &edits, 0), 1);
 
         // Staged role actions (e.g. one "Nová role…" + one "Smazat roli")
         // add on top of whatever membership edits are staged.
-        assert_eq!(combined_change_count(2, &edits), 3);
+        assert_eq!(combined_change_count(2, &edits, 0), 3);
 
         edits.clear();
-        assert_eq!(combined_change_count(2, &edits), 2, "role actions alone still count once membership is clean");
+        assert_eq!(combined_change_count(2, &edits, 0), 2, "role actions alone still count once membership is clean");
+
+        // T5: MatrixState::change_count folds into the SAME formula — not a
+        // second dirtiness definition.
+        assert_eq!(combined_change_count(0, &MembershipEdits::default(), 5), 5);
+        assert_eq!(combined_change_count(2, &edits, 5), 7);
+    }
+}
+
+#[cfg(test)]
+mod matrix_tests {
+    use super::*;
+    use crate::admin_sql::CellState;
+    use dbc_state::Engine;
+
+    fn pg_catalog(grantee: &str) -> Vec<(&'static str, AdminCatalogRows)> {
+        let object_acl = (
+            vec![
+                "schema".into(),
+                "object".into(),
+                "kind".into(),
+                "grantee".into(),
+                "privilege_type".into(),
+                "is_grantable".into(),
+            ],
+            vec![
+                vec![
+                    Some("public".into()),
+                    Some("users".into()),
+                    Some("table".into()),
+                    Some(grantee.into()),
+                    Some("SELECT".into()),
+                    Some("false".into()),
+                ],
+                vec![
+                    Some("public".into()),
+                    Some("orders".into()),
+                    Some("table".into()),
+                    Some("owner".into()),
+                    Some("SELECT".into()),
+                    Some("true".into()),
+                ],
+            ],
+        );
+        let schema_acl = (
+            vec!["schema".into(), "grantee".into(), "privilege_type".into(), "is_grantable".into()],
+            vec![vec![Some("public".into()), Some(grantee.into()), Some("USAGE".into()), Some("false".into())]],
+        );
+        let db_acl = (
+            vec!["database".into(), "grantee".into(), "privilege_type".into(), "is_grantable".into()],
+            vec![vec![Some("appdb".into()), Some(grantee.into()), Some("CONNECT".into()), Some("false".into())]],
+        );
+        vec![("object_acl", object_acl), ("schema_acl", schema_acl), ("db_acl", db_acl)]
+    }
+
+    #[test]
+    fn from_catalog_filters_grantee_and_lists_every_object() {
+        let m = MatrixState::from_catalog(Engine::Postgres, "bob", &pg_catalog("bob"));
+        // orders has only an owner row, but still appears as a matrix row.
+        assert_eq!(m.objects, vec!["orders".to_string(), "users".to_string()]);
+        assert_eq!(m.effective("users", "SELECT"), CellState::Granted);
+        assert_eq!(m.effective("orders", "SELECT"), CellState::NotSet);
+        assert_eq!(m.schema_current.get("USAGE"), Some(&CellState::Granted));
+        assert_eq!(m.db_current.get("CONNECT"), Some(&CellState::Granted));
+    }
+
+    #[test]
+    fn mssql_state_desc_maps_deny() {
+        let object_perms = (
+            vec![
+                "schema_name".into(),
+                "object_name".into(),
+                "grantee".into(),
+                "permission_name".into(),
+                "state_desc".into(),
+            ],
+            vec![
+                vec![
+                    Some("dbo".into()),
+                    Some("users".into()),
+                    Some("bob".into()),
+                    Some("SELECT".into()),
+                    Some("DENY".into()),
+                ],
+                vec![
+                    Some("dbo".into()),
+                    Some("users".into()),
+                    Some("bob".into()),
+                    Some("INSERT".into()),
+                    Some("GRANT_WITH_GRANT_OPTION".into()),
+                ],
+            ],
+        );
+        let schema_perms = (
+            vec!["schema_name".into(), "grantee".into(), "permission_name".into(), "state_desc".into()],
+            vec![],
+        );
+        let m = MatrixState::from_catalog(
+            Engine::Mssql,
+            "bob",
+            &[("object_perms", object_perms), ("schema_perms", schema_perms)],
+        );
+        assert_eq!(m.effective("users", "SELECT"), CellState::Denied);
+        assert_eq!(m.effective("users", "INSERT"), CellState::Granted);
+    }
+
+    #[test]
+    fn click_cycles_and_reverting_clears_the_stage() {
+        let mut m = MatrixState::from_catalog(Engine::Postgres, "bob", &pg_catalog("bob"));
+        m.click_cell(Engine::Postgres, "orders", "SELECT"); // NotSet -> Granted
+        assert_eq!(m.effective("orders", "SELECT"), CellState::Granted);
+        assert_eq!(m.change_count(), 1);
+        m.click_cell(Engine::Postgres, "orders", "SELECT"); // Granted -> NotSet == committed
+        assert_eq!(m.change_count(), 0);
+        assert!(!m.is_dirty());
+        // pg bi-state: no click sequence ever reaches Denied.
+        for _ in 0..6 {
+            m.click_cell(Engine::Postgres, "users", "SELECT");
+            assert_ne!(m.effective("users", "SELECT"), CellState::Denied);
+        }
+    }
+
+    #[test]
+    fn to_statements_groups_same_object_same_target() {
+        let mut m = MatrixState::from_catalog(Engine::Postgres, "bob", &pg_catalog("bob"));
+        m.click_cell(Engine::Postgres, "orders", "SELECT"); // grant
+        m.click_cell(Engine::Postgres, "orders", "INSERT"); // grant
+        m.click_cell(Engine::Postgres, "users", "SELECT"); // revoke (was granted)
+        m.click_schema_cell(Engine::Postgres, "CREATE"); // grant
+        m.click_db_cell("TEMP"); // grant
+        let stmts = m.to_statements(Engine::Postgres, "public", "bob", "appdb").unwrap();
+        let sql: Vec<&str> = stmts.iter().map(|s| s.exec_sql.as_str()).collect();
+        assert_eq!(
+            sql,
+            vec![
+                "GRANT SELECT, INSERT ON \"public\".\"orders\" TO \"bob\"",
+                "REVOKE SELECT ON \"public\".\"users\" FROM \"bob\"",
+                "GRANT CREATE ON SCHEMA \"public\" TO \"bob\"",
+                "GRANT TEMP ON DATABASE \"appdb\" TO \"bob\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn to_statements_mssql_emits_deny() {
+        let m0 = (
+            vec![
+                "schema_name".into(),
+                "object_name".into(),
+                "grantee".into(),
+                "permission_name".into(),
+                "state_desc".into(),
+            ],
+            vec![vec![
+                Some("dbo".into()),
+                Some("users".into()),
+                Some("bob".into()),
+                Some("SELECT".into()),
+                Some("GRANT".into()),
+            ]],
+        );
+        let s0 = (vec!["schema_name".into(), "grantee".into(), "permission_name".into(), "state_desc".into()], vec![]);
+        let mut m = MatrixState::from_catalog(Engine::Mssql, "bob", &[("object_perms", m0), ("schema_perms", s0)]);
+        m.click_cell(Engine::Mssql, "users", "SELECT"); // Granted -> Denied
+        let stmts = m.to_statements(Engine::Mssql, "dbo", "bob", "").unwrap();
+        assert_eq!(stmts[0].exec_sql, "DENY SELECT ON [dbo].[users] TO [bob]");
+    }
+
+    // Not in the plan's own test list, but directly exercises the
+    // "errors-are-values backstop" the Grounding calls out: an `Err` from
+    // `admin_sql`'s own refusal (here: SQLite has no schema-level
+    // privileges — unreachable via the real UI, since the admin panel is
+    // `Hidden` for SQLite entirely) must bubble out of `to_statements` as
+    // `Err`, never panic — `AdminPanel::request_apply` depends on this to
+    // surface it in `self.error` instead of crashing.
+    #[test]
+    fn to_statements_bubbles_admin_sql_refusals_as_err() {
+        let mut m = MatrixState::default();
+        m.click_schema_cell(Engine::Sqlite, "USAGE"); // stages NotSet -> Granted
+        let err = m.to_statements(Engine::Sqlite, "s", "grantee", "db").unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    // `AdminPanel::apply_catalog`'s routing decision (whole-batch into
+    // MatrixState vs. per-label into the Roles parsers) — proven against
+    // the ACTUAL labels `admin_sql::privileges_catalog`/`roles_catalog`
+    // emit for both engines, without constructing an `AdminPanel` entity.
+    #[test]
+    fn is_privileges_batch_detects_both_engines_pg_and_mssql_label_sets() {
+        assert!(is_privileges_batch(&pg_catalog("bob")));
+        let mssql = admin_sql::privileges_catalog(Engine::Mssql, "dbo")
+            .into_iter()
+            .map(|(l, _)| (l, (Vec::new(), Vec::new())))
+            .collect::<Vec<_>>();
+        assert!(is_privileges_batch(&mssql));
+        // The Roles sub-view's own labels must NEVER be mistaken for a
+        // privileges batch (or vice versa) — that's the whole point of
+        // apply_catalog routing on this predicate.
+        let roles = admin_sql::roles_catalog(Engine::Postgres)
+            .into_iter()
+            .map(|(l, _)| (l, (Vec::new(), Vec::new())))
+            .collect::<Vec<_>>();
+        assert!(!is_privileges_batch(&roles));
     }
 }

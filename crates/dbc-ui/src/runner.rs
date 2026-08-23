@@ -4510,4 +4510,85 @@ mod admin_pg_tests {
             let _ = total; // DDL affected counts are driver-defined; success is the assertion
         });
     }
+
+    /// G10 T5: the Privileges sub-view's full loop against LIVE PostgreSQL
+    /// — fetch -> `admin_panel::MatrixState::from_catalog` (parsing REAL
+    /// rows, not the hand-built fixtures `matrix_tests` uses) -> click_cell
+    /// (stage a REVOKE) -> `to_statements` -> the SAME sanctioned write path
+    /// (`run_write_transaction_inner`) -> refetch -> `from_catalog` again,
+    /// asserting the revoke actually committed and the untouched privilege
+    /// survived. Closes the gap between T3's separate "catalog SQL runs
+    /// live" and "write path runs live" tests: this is the one place the
+    /// CLIENT-SIDE parsing/diffing logic (`MatrixState`) is proven against
+    /// a real server's column/row shapes rather than fixtures.
+    #[test]
+    #[ignore]
+    fn admin_pg_privileges_matrix_click_revoke_round_trips_on_live_postgres() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let node = Postgres::default().with_tag("16.13").start().await.unwrap();
+            let url = pg_url(&node).await;
+            let engine = dbc_state::Engine::Postgres;
+            let grantee = "g10_matrix_test_role";
+
+            {
+                let mut setup = open_pg(&url).await;
+                setup
+                    .execute("CREATE TABLE priv_matrix_t (id integer PRIMARY KEY)", CancelToken::new())
+                    .await
+                    .unwrap();
+                setup.execute(&format!("CREATE ROLE {grantee} LOGIN"), CancelToken::new()).await.unwrap();
+                setup
+                    .execute(
+                        &format!("GRANT SELECT, INSERT ON priv_matrix_t TO {grantee}"),
+                        CancelToken::new(),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let fetch_matrix = |url: String| {
+                let grantee = grantee.to_string();
+                async move {
+                    let rows = fetch_admin_catalog_inner(
+                        ConnectSpec::Url(url),
+                        admin_sql::privileges_catalog(engine, "public"),
+                        tokio::runtime::Handle::current(),
+                    )
+                    .await
+                    .expect("privileges_catalog must run cleanly against live PG");
+                    crate::admin_panel::MatrixState::from_catalog(engine, &grantee, &rows)
+                }
+            };
+
+            let before = fetch_matrix(url.clone()).await;
+            assert_eq!(before.effective("priv_matrix_t", "SELECT"), admin_sql::CellState::Granted);
+            assert_eq!(before.effective("priv_matrix_t", "INSERT"), admin_sql::CellState::Granted);
+
+            let mut m = before;
+            m.click_cell(engine, "priv_matrix_t", "SELECT"); // Granted -> NotSet (revoke)
+            let stmts = m
+                .to_statements(engine, "public", grantee, "postgres")
+                .expect("no staged Denied/empty-privs cell on pg — must not refuse");
+            assert_eq!(stmts.len(), 1, "only SELECT was staged: {stmts:?}");
+            assert_eq!(stmts[0].exec_sql, format!("REVOKE SELECT ON \"public\".\"priv_matrix_t\" FROM \"{grantee}\""));
+
+            run_write_transaction_inner(ConnectSpec::Url(url.clone()), stmts, None, tokio::runtime::Handle::current())
+                .await
+                .expect("the staged REVOKE must commit against live PG");
+
+            let after = fetch_matrix(url).await;
+            assert_eq!(
+                after.effective("priv_matrix_t", "SELECT"),
+                admin_sql::CellState::NotSet,
+                "SELECT must show revoked after refetch"
+            );
+            assert_eq!(
+                after.effective("priv_matrix_t", "INSERT"),
+                admin_sql::CellState::Granted,
+                "INSERT was never touched — must survive untouched"
+            );
+        });
+    }
 }

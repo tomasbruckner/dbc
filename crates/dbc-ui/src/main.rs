@@ -4675,6 +4675,12 @@ impl AppView {
             conn_identity: identity,
             content: TabContent::Admin { view: panel.clone() },
         });
+        // G10 T5: seeds the Privileges sub-view's schema selector from
+        // whatever's already in the tree's SchemaSnapshot — same source
+        // `trigger_schema_fetch`'s own success arm re-pushes on every
+        // subsequent refresh (see its `set_schemas` call there).
+        let schemas = self.tree.read(cx).snapshot().map(admin_panel::distinct_schemas).unwrap_or_default();
+        panel.update(cx, |p, cx| p.set_schemas(schemas, cx));
         self.fetch_admin_catalog_into(panel, admin_sql::roles_catalog(engine), cx);
         cx.notify();
     }
@@ -5325,12 +5331,26 @@ impl AppView {
                         // tree's pinned "Správa serveru" row visibility must
                         // never lag a connection switch.
                         let admin_entry = admin_panel::admin_entry_state(view.active_engine(), read_only);
+                        // G10 T5: the Privileges sub-view's schema selector,
+                        // computed BEFORE `snapshot` moves into
+                        // `set_snapshot` below — pushed into whichever admin
+                        // tab is currently open (there is at most one, the
+                        // singleton-per-connection invariant), same
+                        // "refreshes alongside every snapshot" posture as
+                        // favourites/read_only/admin_entry.
+                        let schemas_for_admin = admin_panel::distinct_schemas(&snapshot);
                         view.tree.update(cx, |t, cx| {
                             t.set_snapshot(snapshot, same_connection, cx);
                             t.set_favourites(favourites, active_id, cx);
                             t.set_read_only(read_only, cx);
                             t.set_admin_entry(admin_entry, cx);
                         });
+                        if let Some(panel) = view.tabs.iter().find_map(|t| match &t.content {
+                            TabContent::Admin { view } => Some(view.clone()),
+                            _ => None,
+                        }) {
+                            panel.update(cx, |p, cx| p.set_schemas(schemas_for_admin, cx));
+                        }
                         // Review round 3, MAJOR 1: a new snapshot landing
                         // (connection switch OR a same-connection refresh)
                         // invalidates whatever candidates an open popup was
