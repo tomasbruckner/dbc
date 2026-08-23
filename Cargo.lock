@@ -2361,6 +2361,7 @@ dependencies = [
  "dirs",
  "gpui",
  "gpui_platform",
+ "quick-xml",
  "tempfile",
  "tokio",
  "tokio-postgres",
