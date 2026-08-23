@@ -7,3 +7,4 @@ edition.workspace = true
 dbc-core = { path = "../dbc-core" }
 dbc-buffer = { path = "../dbc-buffer" }
 arrow.workspace = true
+similar.workspace = true

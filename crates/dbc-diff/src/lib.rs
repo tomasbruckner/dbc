@@ -3,3 +3,4 @@
 //! submodule for what each half does.
 
 pub mod schema_diff;
+pub mod text_diff;
