@@ -465,3 +465,407 @@ mod model_tests {
         drop(root); // must not overflow — proves PlanNode's custom Drop works end to end.
     }
 }
+
+// --- GPUI-flavoured half of this file (G13 T5): `PlanView`, the tree-
+// rendering entity, plus the pure `flatten_plan`/`expand_all`/`find_by_id`
+// helpers it's built on. Mirrors `schema_tree.rs`'s layout convention: pure
+// flatten helpers first (unit-tested with no GPUI dependency), the entity
+// second.
+
+use std::collections::HashSet;
+use std::rc::Rc;
+use gpui::{
+    div, prelude::*, px, rgb, uniform_list, App, ClickEvent, Context, EventEmitter, FocusHandle,
+    Focusable, MouseButton, Window,
+};
+
+/// Path-based, stable across expand/collapse (mirrors `schema_tree.rs`'s
+/// `NodeId` path-based-not-index-based rationale — `[]` = root, `[0]` =
+/// first child, `[0, 2]` = root's first child's third child).
+pub type PlanNodeId = Vec<usize>;
+
+pub struct PlanFlatNode {
+    pub id: PlanNodeId,
+    pub depth: usize,
+    pub operation: String,
+    pub target: Option<String>,
+    pub est_cost: Option<f64>,
+    pub est_rows: Option<f64>,
+    pub actual_rows: Option<f64>,
+    /// Total across all loops (`actual_time_ms * loops`), for display — NOT
+    /// `self_time_ms` (that's used only for `hot_fraction`, not shown as
+    /// its own column).
+    pub actual_time_total_ms: Option<f64>,
+    pub buffers: Option<BufferStats>,
+    pub hot_fraction: Option<f32>,
+    pub expandable: bool,
+}
+
+/// Iterative pre-order flatten (Global Constraints: never recurse over a
+/// `PlanNode` tree). Only visits nodes whose ancestor chain is fully
+/// `expanded` (or the root, always visited).
+pub fn flatten_plan(result: &PlanResult, expanded: &HashSet<PlanNodeId>) -> Vec<PlanFlatNode> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(&PlanNode, usize, PlanNodeId)> = vec![(&result.root, 0, Vec::new())];
+    while let Some((node, depth, id)) = stack.pop() {
+        let hot = hot_fraction(node, &result.root, result.is_analyze, result.total_execution_time_ms)
+            .map(|f| f as f32);
+        out.push(PlanFlatNode {
+            id: id.clone(),
+            depth,
+            operation: node.operation.clone(),
+            target: node.target.clone(),
+            est_cost: node.est_cost,
+            est_rows: node.est_rows,
+            actual_rows: node.actual_rows,
+            actual_time_total_ms: node.actual_time_ms.map(|t| t * node.loops.unwrap_or(1) as f64),
+            buffers: node.buffers.clone(),
+            hot_fraction: hot,
+            expandable: !node.children.is_empty(),
+        });
+        if node.children.is_empty() || !expanded.contains(&id) {
+            continue;
+        }
+        for (ix, child) in node.children.iter().enumerate().rev() {
+            let mut child_id = id.clone();
+            child_id.push(ix);
+            stack.push((child, depth + 1, child_id));
+        }
+    }
+    out
+}
+
+/// Every node id in `result`'s tree — used to seed `PlanView`'s default
+/// fully-expanded state (a plan is typically tens of nodes, not thousands
+/// of schema objects, so — unlike `SchemaTree`'s deliberately-collapsed
+/// default — showing the whole shape immediately is the useful default).
+/// Iterative, same stack idiom.
+pub fn expand_all(result: &PlanResult) -> HashSet<PlanNodeId> {
+    let mut out = HashSet::new();
+    let mut stack: Vec<(&PlanNode, PlanNodeId)> = vec![(&result.root, Vec::new())];
+    while let Some((node, id)) = stack.pop() {
+        for (ix, child) in node.children.iter().enumerate() {
+            let mut child_id = id.clone();
+            child_id.push(ix);
+            stack.push((child, child_id));
+        }
+        out.insert(id);
+    }
+    out
+}
+
+/// Iterative id-path lookup — same stack idiom as `flatten_plan`, never
+/// recurses.
+fn find_by_id<'a>(root: &'a PlanNode, id: &[usize]) -> Option<&'a PlanNode> {
+    let mut cur = root;
+    for &ix in id {
+        cur = cur.children.get(ix)?;
+    }
+    Some(cur)
+}
+
+/// Mirrors `grid.rs`'s `CellDetail`/`render_cell_detail_overlay` idiom
+/// (grid.rs:180/1825) — same centered-overlay shape and interaction, but a
+/// SEPARATE local instance: `CellDetail` is `ResultGrid`-local state, and
+/// `PlanView` is a different entity with no `ResultGrid` to borrow one
+/// from (same file-location correction G9's plan already made for its own
+/// query-detail popup — see this plan's Self-Review deviations).
+struct PlanNodeDetail {
+    text: String,
+    #[allow(dead_code)] // mirrors grid.rs's CellDetail shape; no scroll-wheel wiring in this task
+    scroll_lines: usize,
+}
+
+pub enum PlanViewEvent {}
+
+pub struct PlanView {
+    result: Rc<PlanResult>,
+    expanded: HashSet<PlanNodeId>,
+    show_raw: bool,
+    node_detail: Option<PlanNodeDetail>,
+    focus_handle: FocusHandle,
+}
+
+impl PlanView {
+    pub fn new(result: Rc<PlanResult>, cx: &mut Context<Self>) -> Self {
+        let expanded = expand_all(&result);
+        Self { result, expanded, show_raw: false, node_detail: None, focus_handle: cx.focus_handle() }
+    }
+
+    fn toggle_expand(&mut self, id: &PlanNodeId) {
+        if !self.expanded.remove(id) {
+            self.expanded.insert(id.clone());
+        }
+    }
+
+    fn open_node_detail(&mut self, flat: &PlanFlatNode) {
+        let mut lines = vec![format!("operation: {}", flat.operation)];
+        if let Some(t) = &flat.target {
+            lines.push(format!("target: {t}"));
+        }
+        // Full `extra` key/values for the clicked node — re-walk to find it
+        // by id (small tree, cheap; avoids storing a parallel index).
+        if let Some(node) = find_by_id(&self.result.root, &flat.id) {
+            for (k, v) in &node.extra {
+                lines.push(format!("{k}: {v}"));
+            }
+            if let Some(b) = &node.buffers {
+                lines.push(format!(
+                    "buffers: hit={:?} read={:?} dirtied={:?} written={:?} temp_read={:?} temp_written={:?}",
+                    b.shared_hit, b.shared_read, b.shared_dirtied, b.shared_written, b.temp_read, b.temp_written
+                ));
+            }
+        }
+        self.node_detail = Some(PlanNodeDetail { text: lines.join("\n"), scroll_lines: 0 });
+    }
+}
+
+impl EventEmitter<PlanViewEvent> for PlanView {}
+
+impl Focusable for PlanView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+fn fmt_metric(v: Option<f64>) -> String {
+    match v {
+        Some(n) => format!("{n:.1}"),
+        None => "—".to_string(),
+    }
+}
+
+impl Render for PlanView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let badge = if self.result.is_analyze { "Skutečný plán" } else { "Odhadovaný plán" };
+        let header = div()
+            .h(px(28.))
+            .px_2()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .bg(rgb(0x181825))
+            .text_color(rgb(0xcdd6f4))
+            .child(format!(
+                "{badge}{}",
+                match (self.result.total_planning_time_ms, self.result.total_execution_time_ms) {
+                    (Some(p), Some(e)) => format!(" · plánování {p:.2} ms · běh {e:.2} ms"),
+                    (None, Some(e)) => format!(" · běh {e:.2} ms"),
+                    _ => String::new(),
+                }
+            ))
+            .child(
+                div()
+                    .id("plan-raw-toggle")
+                    .cursor_pointer()
+                    .px_1()
+                    .child(if self.show_raw { "Strom" } else { "Raw" })
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.show_raw = !this.show_raw;
+                        cx.notify();
+                    })),
+            );
+        let mut root = div()
+            .id("plan-view")
+            .key_context("PlanView")
+            .track_focus(&self.focus_handle)
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(0x1e1e2e))
+            .child(header);
+
+        if !self.result.top_level_hints.is_empty() {
+            let mut banner = div().flex().flex_col().bg(rgb(0x2a2a1e)).text_color(rgb(0xf9e2af)).px_2().py_1();
+            for hint in &self.result.top_level_hints {
+                banner = banner.child(div().child(format!("⚠ {}", hint.message)));
+            }
+            root = root.child(banner);
+        }
+
+        if self.show_raw {
+            root = root.child(
+                div().flex_1().overflow_hidden().p_2().text_color(rgb(0xcdd6f4)).child(self.result.raw_text.clone()),
+            );
+            return root;
+        }
+
+        let rows = flatten_plan(&self.result, &self.expanded);
+        root = root.child(
+            uniform_list(
+                "plan-tree-rows",
+                rows.len(),
+                cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                    let mut items = Vec::with_capacity(range.len());
+                    for ix in range {
+                        let flat = &rows[ix];
+                        let is_expanded = this.expanded.contains(&flat.id);
+                        let chevron = if flat.expandable { if is_expanded { "▾" } else { "▸" } } else { " " };
+                        let chevron_id = flat.id.clone();
+
+                        let label = match &flat.target {
+                            Some(t) => format!("{} ({t})", flat.operation),
+                            None => flat.operation.clone(),
+                        };
+
+                        let mut row = div()
+                            .id(("plan-row", ix))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .h(px(22.))
+                            .pl(px(6. + flat.depth as f32 * 14.))
+                            .text_color(rgb(0xcdd6f4))
+                            .hover(|s| s.bg(rgb(0x313244)));
+                        // Hot-node coloring applies to the ROW background,
+                        // not just one column (design §2/§4).
+                        match flat.hot_fraction {
+                            Some(f) if f >= 0.30 => row = row.bg(rgb(0xf38ba8)),
+                            Some(f) if f >= 0.10 => row = row.bg(rgb(0xf9e2af)),
+                            _ => {}
+                        }
+                        row = row
+                            .child(
+                                div()
+                                    .id(("plan-chevron", ix))
+                                    .w(px(14.))
+                                    .flex_shrink_0()
+                                    .cursor_pointer()
+                                    .child(chevron)
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_expand(&chevron_id);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(("plan-op", ix))
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .cursor_pointer()
+                                    .child(label)
+                                    .on_click(cx.listener({
+                                        let flat_ix = ix;
+                                        move |this, _: &ClickEvent, _window, cx| {
+                                            let rows2 = flatten_plan(&this.result, &this.expanded);
+                                            if let Some(f) = rows2.get(flat_ix) {
+                                                this.open_node_detail(f);
+                                            }
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(div().w(px(70.)).child(fmt_metric(flat.est_cost)))
+                            .child(div().w(px(70.)).child(fmt_metric(flat.est_rows)))
+                            .child(div().w(px(70.)).child(fmt_metric(flat.actual_rows)))
+                            .child(div().w(px(70.)).child(fmt_metric(flat.actual_time_total_ms)))
+                            .child(div().w(px(20.)).child(if flat.buffers.is_some() { "▤" } else { "" }));
+                        items.push(row);
+                    }
+                    items
+                }),
+            )
+            .flex_1(),
+        );
+
+        if let Some(detail) = &self.node_detail {
+            root = root.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .bg(rgb(0x11111b))
+                    .p_4()
+                    .id("plan-node-detail")
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _window, cx| {
+                        this.node_detail = None;
+                        cx.notify();
+                    }))
+                    .child(div().text_color(rgb(0xcdd6f4)).child(detail.text.clone())),
+            );
+        }
+        root
+    }
+}
+
+#[cfg(test)]
+mod plan_view_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn sample_result() -> PlanResult {
+        let mut child_a = PlanNode {
+            operation: "Seq Scan".into(), target: Some("orders".into()), est_cost: Some(30.0),
+            est_rows: Some(100.0), actual_rows: None, actual_time_ms: None, loops: None,
+            rows_removed_by_filter: None, buffers: None, extra: Vec::new(), children: Vec::new(),
+        };
+        let child_b = PlanNode {
+            operation: "Seq Scan".into(), target: Some("users".into()), est_cost: Some(20.0),
+            est_rows: Some(50.0), actual_rows: None, actual_time_ms: None, loops: None,
+            rows_removed_by_filter: None, buffers: None, extra: Vec::new(), children: Vec::new(),
+        };
+        child_a.children = vec![]; // leaf
+        let root = PlanNode {
+            operation: "Hash Join".into(), target: None, est_cost: Some(100.0), est_rows: Some(10.0),
+            actual_rows: None, actual_time_ms: None, loops: None, rows_removed_by_filter: None,
+            buffers: None, extra: Vec::new(), children: vec![child_a, child_b],
+        };
+        PlanResult {
+            root, is_analyze: false, engine: dbc_state::Engine::Postgres,
+            total_planning_time_ms: None, total_execution_time_ms: None,
+            top_level_hints: Vec::new(), raw_text: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn expand_all_covers_every_node() {
+        let result = sample_result();
+        let all = expand_all(&result);
+        assert_eq!(all.len(), 3); // root + 2 children
+        assert!(all.contains(&Vec::<usize>::new()));
+        assert!(all.contains(&vec![0]));
+        assert!(all.contains(&vec![1]));
+    }
+
+    #[test]
+    fn flatten_plan_fully_expanded_visits_all_in_order() {
+        let result = sample_result();
+        let expanded = expand_all(&result);
+        let rows = flatten_plan(&result, &expanded);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].operation, "Hash Join");
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[1].target.as_deref(), Some("orders"));
+        assert_eq!(rows[1].depth, 1);
+        assert_eq!(rows[2].target.as_deref(), Some("users"));
+    }
+
+    #[test]
+    fn flatten_plan_collapsed_root_hides_children() {
+        let result = sample_result();
+        let expanded = HashSet::new(); // nothing expanded
+        let rows = flatten_plan(&result, &expanded);
+        assert_eq!(rows.len(), 1); // just the root
+        assert!(rows[0].expandable);
+    }
+
+    #[test]
+    fn find_by_id_walks_path() {
+        let result = sample_result();
+        assert_eq!(find_by_id(&result.root, &[]).unwrap().operation, "Hash Join");
+        assert_eq!(find_by_id(&result.root, &[0]).unwrap().target.as_deref(), Some("orders"));
+        assert_eq!(find_by_id(&result.root, &[1]).unwrap().target.as_deref(), Some("users"));
+        assert!(find_by_id(&result.root, &[5]).is_none());
+        assert!(find_by_id(&result.root, &[0, 0]).is_none()); // leaf has no children
+    }
+
+    #[test]
+    fn hot_fraction_carried_through_flatten() {
+        let result = sample_result(); // root est_cost 100, child_a 30, child_b 20
+        let expanded = expand_all(&result);
+        let rows = flatten_plan(&result, &expanded);
+        // self_cost(root) = 100 - 30 - 20 = 50 -> 50/100 = 0.5
+        assert_eq!(rows[0].hot_fraction, Some(0.5));
+    }
+}
