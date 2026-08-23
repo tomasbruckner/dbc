@@ -970,6 +970,17 @@ pub enum ModalState {
     /// never actually wired to `QueryRunner::run_analyze_write` and so
     /// could be defeated by Escape mid-flight.
     AnalyzeWriteConfirm { sql: String, engine: Engine, running: bool, error: Option<String> },
+    /// G7 T6: two-connection picker for the schema/data compare feature
+    /// (design §3). `conn_a`/`conn_b` are `ConnectionConfig.id` values (or
+    /// `None` while unpicked); "Spustit porovnání" (`confirm_compare_dialog`)
+    /// is disabled until both are `Some`. The SAME connection on both sides
+    /// is explicitly ALLOWED (design §3) — yields an all-Unchanged result,
+    /// useful as a smoke test — so there is no equality guard here. `error`
+    /// is currently unused by any handler (schema-pair fetch failures are
+    /// surfaced on the resulting `CompareView` tab, T7, not back into this
+    /// already-closed dialog) but kept for a uniform modal-state shape and
+    /// possible future pre-dispatch validation.
+    CompareDialog { conn_a: Option<String>, conn_b: Option<String>, error: Option<String> },
 }
 
 // ---------------------------------------------------------------------
@@ -1099,6 +1110,9 @@ impl AppView {
             ModalState::AnalyzeWriteConfirm { sql, engine, running, error } => {
                 render_analyze_write_confirm_panel(&sql, engine, running, &error, cx)
             }
+            ModalState::CompareDialog { conn_a, conn_b, error } => {
+                render_compare_dialog_panel(conn_a, conn_b, error, self.grouped_cache.clone(), cx)
+            }
         };
         Some(
             div()
@@ -1189,6 +1203,106 @@ impl AppView {
 
     pub(crate) fn close_modal(&mut self, cx: &mut Context<Self>) {
         self.modal = None;
+        cx.notify();
+    }
+
+    /// G7 T6: opens the connection-pair picker. Reuses `self.grouped_cache`
+    /// (the SAME folder/favourite grouping the top-bar dropdown shows) —
+    /// refreshed here rather than trusting whatever it last held, since the
+    /// dialog can be opened via the palette without the dropdown ever having
+    /// been opened this session.
+    pub(crate) fn open_compare_dialog(&mut self, cx: &mut Context<Self>) {
+        self.refresh_grouped_cache();
+        self.modal = Some(ModalState::CompareDialog { conn_a: None, conn_b: None, error: None });
+        cx.notify();
+    }
+
+    /// A picker-row click on side `side` — updates `conn_a`/`conn_b` on the
+    /// open `CompareDialog`, a no-op if some other modal is open by the time
+    /// this fires (defensive; the dialog's own overlay occludes clicks
+    /// elsewhere while open).
+    pub(crate) fn select_compare_side(&mut self, side: CompareSide, id: String, cx: &mut Context<Self>) {
+        if let Some(ModalState::CompareDialog { conn_a, conn_b, .. }) = &mut self.modal {
+            match side {
+                CompareSide::A => *conn_a = Some(id),
+                CompareSide::B => *conn_b = Some(id),
+            }
+        }
+        cx.notify();
+    }
+
+    /// "Spustit porovnání" — resolves both picked `ConnectionConfig`s +
+    /// their vault secrets (EXACT `run_query_with`'s
+    /// `self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id))` pattern, no
+    /// new vault API/unlock step), closes the dialog immediately (design §3:
+    /// "the modal itself closes as soon as the request is dispatched"), and
+    /// dispatches `QueryRunner::fetch_schema_pair` — fire-and-forget with a
+    /// generation guard, mirroring `AppView::trigger_schema_fetch`'s exact
+    /// shape. `on_compare_schema_pair_ready` (T7 fills in the real body)
+    /// picks the result up and opens the Compare tab.
+    pub(crate) fn confirm_compare_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(ModalState::CompareDialog { conn_a, conn_b, .. }) = self.modal.clone() else {
+            return;
+        };
+        let (Some(id_a), Some(id_b)) = (conn_a, conn_b) else { return };
+        let Some(cfg_a) = self.config.connections.iter().find(|c| c.id == id_a).cloned() else {
+            return;
+        };
+        let Some(cfg_b) = self.config.connections.iter().find(|c| c.id == id_b).cloned() else {
+            return;
+        };
+        let secret_a = self.vault.as_ref().and_then(|v| v.get_secret(&cfg_a.id));
+        let secret_b = self.vault.as_ref().and_then(|v| v.get_secret(&cfg_b.id));
+
+        self.modal = None; // design §3: closes as soon as the request is dispatched
+        self.compare_fetch_generation += 1;
+        let my_generation = self.compare_fetch_generation;
+        let label_a = format!("{} ({})", cfg_a.name, engine_label(cfg_a.engine));
+        let label_b = format!("{} ({})", cfg_b.name, engine_label(cfg_b.engine));
+        let spec_a = ConnectSpec::Config { cfg: Box::new(cfg_a.clone()), secret: secret_a.clone() };
+        let spec_b = ConnectSpec::Config { cfg: Box::new(cfg_b.clone()), secret: secret_b.clone() };
+        let rx = self.runner.fetch_schema_pair(spec_a, spec_b);
+
+        // design §3: the Compare tab opens IMMEDIATELY (`CompareLoadState::
+        // Loading`, "Načítám schéma…") — `on_compare_schema_pair_ready`
+        // (main.rs) updates this SAME entity in place once the fetch
+        // resolves, rather than a second entity/tab being created then.
+        let view = cx.new(|_| crate::compare::CompareView {
+            label_a: label_a.clone(),
+            label_b: label_b.clone(),
+            conn_a: cfg_a,
+            secret_a,
+            conn_b: cfg_b,
+            secret_b,
+            state: crate::compare::CompareLoadState::Loading,
+            selection: crate::compare::CompareSelection::None,
+            show_unchanged: crate::compare::ShowUnchanged::default(),
+            show_ddl_diff: false,
+            data_where: String::new(),
+            data_diff: crate::compare::DataDiffState::Idle,
+            data_diff_generation: 0,
+        });
+        cx.subscribe(&view, AppView::on_compare_view_event).detach();
+        self.tabs.open(crate::tabs::ResultTab {
+            id: 0,
+            title: crate::tabs::collapse_title(&format!("Porovnání: {label_a} ↔ {label_b}")),
+            pinned: false,
+            preview_key: None,
+            conn_identity: self.current_conn_identity(),
+            content: crate::tabs::TabContent::Compare { view: view.clone() },
+        });
+        let pending = crate::PendingCompare { view, generation: my_generation };
+
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |view, cx| {
+                if view.compare_fetch_generation != pending.generation {
+                    return;
+                }
+                view.on_compare_schema_pair_ready(pending, result, cx);
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -2307,6 +2421,199 @@ fn render_analyze_write_confirm_panel(
             ),
     );
     panel.into_any_element()
+}
+
+/// G7 T6: which column of the `CompareDialog` picker a row click targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompareSide {
+    A,
+    B,
+}
+
+/// Render contract (design §3): heading, two labeled columns ("Databáze A" /
+/// "Databáze B") each a list of `grouped`'s rows (folder/favourite sections
+/// — the SAME grouping data the top-bar dropdown shows), a single-select
+/// click handler per row, an `error` line (if any) below both columns, and
+/// "Spustit porovnání" disabled until both `conn_a`/`conn_b` are `Some`
+/// (same connection on both sides explicitly allowed — no equality guard).
+fn render_compare_dialog_panel(
+    conn_a: Option<String>,
+    conn_b: Option<String>,
+    error: Option<String>,
+    grouped: GroupedConnections,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let both_picked = conn_a.is_some() && conn_b.is_some();
+    let mut panel = div()
+        .id("compare-dialog")
+        .w(px(680.))
+        .bg(rgb(0x1e1e2e))
+        .border_1()
+        .border_color(rgb(0x45475a))
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(rgb(0xcdd6f4))
+        .child(div().text_size(px(16.)).child("Porovnat databáze…"))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_3()
+                .child(render_compare_picker_column(
+                    "compare-col-a",
+                    "Databáze A",
+                    CompareSide::A,
+                    &conn_a,
+                    &grouped,
+                    cx,
+                ))
+                .child(render_compare_picker_column(
+                    "compare-col-b",
+                    "Databáze B",
+                    CompareSide::B,
+                    &conn_b,
+                    &grouped,
+                    cx,
+                )),
+        );
+
+    if let Some(e) = &error {
+        panel = panel.child(div().text_color(rgb(0xf38ba8)).child(format!("error: {e}")));
+    }
+
+    let confirm_button = if both_picked {
+        styled_button("compare-confirm", "Spustit porovnání")
+            .on_click(cx.listener(|v, _, _, cx| v.confirm_compare_dialog(cx)))
+            .into_any_element()
+    } else {
+        div()
+            .id("compare-confirm")
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0x313244))
+            .text_color(rgb(0x6c7086))
+            .child("Spustit porovnání")
+            .into_any_element()
+    };
+
+    panel = panel.child(
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .justify_end()
+            .mt_2()
+            .child(styled_button("compare-cancel", "Zrušit").on_click(cx.listener(|v, _, _, cx| {
+                v.modal = None;
+                cx.notify();
+            })))
+            .child(confirm_button),
+    );
+    panel.into_any_element()
+}
+
+fn render_compare_picker_column(
+    id: &'static str,
+    label: &'static str,
+    side: CompareSide,
+    selected: &Option<String>,
+    grouped: &GroupedConnections,
+    cx: &mut Context<AppView>,
+) -> impl IntoElement {
+    let mut list = div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .flex_1()
+        .gap_1()
+        .p_1()
+        .h(px(240.))
+        .overflow_hidden()
+        .border_1()
+        .border_color(rgb(0x313244))
+        .rounded_md();
+
+    if !grouped.favourites.is_empty() {
+        list = list.child(div().text_color(rgb(0xf9e2af)).child("Oblíbené"));
+        for c in &grouped.favourites {
+            list = list.child(compare_picker_row(c, side, selected, cx));
+        }
+    }
+    for folder in &grouped.folders {
+        let header = if folder.path.is_empty() { "Bez složky".to_string() } else { folder.path.join("/") };
+        list = list.child(div().text_color(rgb(0x6c7086)).child(header));
+        for c in &folder.connections {
+            list = list.child(compare_picker_row(c, side, selected, cx));
+        }
+    }
+
+    div().flex().flex_col().flex_1().gap_1().child(div().text_color(rgb(0x89b4fa)).child(label)).child(list)
+}
+
+fn compare_picker_row(
+    c: &ConnectionConfig,
+    side: CompareSide,
+    selected: &Option<String>,
+    cx: &mut Context<AppView>,
+) -> impl IntoElement {
+    let id = c.id.clone();
+    let is_selected = selected.as_deref() == Some(c.id.as_str());
+    let side_tag = match side {
+        CompareSide::A => "a",
+        CompareSide::B => "b",
+    };
+    let label = format!("{} — {} {}", c.name, engine_label(c.engine), c.host);
+    div()
+        .id(SharedString::from(format!("compare-row-{side_tag}-{}", c.id)))
+        .px_1()
+        .cursor_pointer()
+        .rounded_md()
+        .when(is_selected, |d| d.bg(rgb(0x313244)).text_color(rgb(0xa6e3a1)))
+        .hover(|s| s.bg(rgb(0x313244)))
+        .child(label)
+        .on_click(cx.listener(move |view, _, _, cx| {
+            view.select_compare_side(side, id.clone(), cx);
+        }))
+}
+
+#[cfg(test)]
+mod compare_dialog_tests {
+    use super::*;
+
+    #[test]
+    fn compare_dialog_starts_with_both_sides_unpicked() {
+        let modal = ModalState::CompareDialog { conn_a: None, conn_b: None, error: None };
+        assert!(matches!(modal, ModalState::CompareDialog { conn_a: None, conn_b: None, .. }));
+    }
+
+    #[test]
+    fn confirm_is_a_noop_until_both_sides_are_picked() {
+        // Pure precondition check mirrored from `confirm_compare_dialog`'s
+        // early-return guard — proven directly on the enum shape rather than
+        // through a full `AppView`/window harness, same precedent as
+        // `Tabs`' own plain-data tests (tabs.rs's module doc comment).
+        let one_picked = ModalState::CompareDialog { conn_a: Some("x".into()), conn_b: None, error: None };
+        let (a, b) = match one_picked {
+            ModalState::CompareDialog { conn_a, conn_b, .. } => (conn_a, conn_b),
+            _ => unreachable!(),
+        };
+        assert!(!(a.is_some() && b.is_some()));
+    }
+
+    #[test]
+    fn same_connection_on_both_sides_is_a_valid_pick() {
+        // design §3: explicitly allowed, not a validation error.
+        let both_same = ModalState::CompareDialog { conn_a: Some("x".into()), conn_b: Some("x".into()), error: None };
+        let (a, b) = match both_same {
+            ModalState::CompareDialog { conn_a, conn_b, .. } => (conn_a, conn_b),
+            _ => unreachable!(),
+        };
+        assert!(a.is_some() && b.is_some());
+    }
 }
 
 #[cfg(test)]

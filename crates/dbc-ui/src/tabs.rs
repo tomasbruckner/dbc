@@ -47,6 +47,13 @@ pub enum TabContent {
     /// icon or the "ER diagram" palette action), titled `"ER: {schema}"`.
     /// Read-only, never editable — see `crate::er_diagram_view::ErDiagramView`.
     Diagram { view: Entity<crate::er_diagram_view::ErDiagramView> },
+    /// G7: schema/data compare tab — a typed `Entity` handle, same shape as
+    /// `Grid`'s (tabs.rs stays GPUI-free beyond this type name, per the
+    /// file's own module doc comment). Opened by
+    /// `AppView::on_compare_schema_pair_ready`, stacked like an ad-hoc query
+    /// tab (no preview-key dedup — repeated compares of the same pair just
+    /// open more tabs, matching `Plan`'s own precedent).
+    Compare { view: Entity<crate::compare::CompareView> },
 }
 
 pub struct ResultTab {

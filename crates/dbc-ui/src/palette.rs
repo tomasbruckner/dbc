@@ -106,6 +106,8 @@ pub enum PaletteAction {
     /// the current snapshot (`AppView::resolve_er_diagram_schema`), or
     /// refuses with a Czech status pointing at the schema-tree icon.
     ShowErDiagram,
+    /// G7 T6: opens `ModalState::CompareDialog` (design §3's entry point).
+    OpenCompare,
 }
 
 /// One table/view from the current schema snapshot, plus whether it's
@@ -148,6 +150,7 @@ pub fn fixed_actions(monitor_available: bool) -> Vec<(String, PaletteAction)> {
         ("Nové spojení…".to_string(), PaletteAction::NewConnection),
         ("Obnovit schéma".to_string(), PaletteAction::RefreshSchema),
         ("ER diagram".to_string(), PaletteAction::ShowErDiagram),
+        ("Porovnat databáze…".to_string(), PaletteAction::OpenCompare),
     ];
     if monitor_available {
         actions.push(("Monitor serveru".to_string(), PaletteAction::OpenMonitor));
@@ -379,7 +382,8 @@ mod rank_items_tests {
         let items = rank_items("", &tables, &history, &connections, false, 30);
 
         // Favourites (alphabetical) first, then history (as given), then
-        // connections, then the 5 fixed actions.
+        // connections, then the fixed actions (5 base + G7 T6's
+        // "Porovnat databáze…" = 6, monitor_available=false here).
         assert_eq!(
             items[0],
             PaletteItem::Table { schema: None, name: "aaa_fav".into() }
@@ -389,9 +393,10 @@ mod rank_items_tests {
         assert_eq!(items[3], PaletteItem::HistoryEntry { id: 2, sql: "select 2".into() });
         assert_eq!(items[4], PaletteItem::Connection { id: "c1".into(), name: "prod".into() });
         assert!(matches!(items[5], PaletteItem::Action { .. }));
-        // 5 base actions + G8 T6's "ER diagram" (`ShowErDiagram` is
-        // unconditional, unlike `OpenMonitor` which is engine-gated).
-        assert_eq!(items.len(), 2 + 2 + 1 + 6);
+        // base actions + G8's "ER diagram" (ShowErDiagram) + G7's "Porovnat
+        // databáze…" (OpenCompare) — both unconditional, unlike OpenMonitor
+        // which is engine-gated.
+        assert_eq!(items.len(), 2 + 2 + 1 + 7);
     }
 
     #[test]

@@ -1,0 +1,10 @@
+[package]
+name = "dbc-diff"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+dbc-core = { path = "../dbc-core" }
+dbc-buffer = { path = "../dbc-buffer" }
+arrow.workspace = true
+similar.workspace = true

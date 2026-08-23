@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dbc-core", "crates/dbc-buffer", "crates/dbc-ui", "crates/dbc-driver-sqlite", "crates/dbc-driver-postgres", "crates/dbc-driver-mssql", "crates/dbc-driver-duckdb", "crates/dbc-state", "crates/dbc-mcp"]
+members = ["crates/dbc-core", "crates/dbc-buffer", "crates/dbc-ui", "crates/dbc-driver-sqlite", "crates/dbc-driver-postgres", "crates/dbc-driver-mssql", "crates/dbc-driver-duckdb", "crates/dbc-state", "crates/dbc-mcp", "crates/dbc-diff"]
 
 [workspace.package]
 edition = "2021"
@@ -22,3 +22,4 @@ base64 = "0.22"
 serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 zeroize = "1"
+similar = "2"

@@ -1,4 +1,5 @@
 mod autocomplete;
+mod compare;
 mod connect;
 mod connections_ui;
 mod er_diagram_view;
@@ -600,6 +601,21 @@ struct DiscardConfirmState {
     action: PendingDiscard,
 }
 
+/// G7 T7: the pending-fetch state `connections_ui::confirm_compare_dialog`
+/// hands to `AppView::on_compare_schema_pair_ready` once `fetch_schema_pair`
+/// resolves. The Compare tab (and its `CompareView` entity, in
+/// `CompareLoadState::Loading`) is opened immediately at dispatch time —
+/// `view` is that SAME entity, updated in place once the fetch resolves
+/// (rather than a second entity being constructed here), so the tab
+/// actually shows "Načítám schéma…" for the duration of the fetch instead
+/// of only appearing once it's already done. `generation` mirrors
+/// `schema_fetch_generation`'s guard shape — a newer dispatch's result
+/// always wins over an older, still-in-flight one.
+pub(crate) struct PendingCompare {
+    pub view: Entity<compare::CompareView>,
+    pub generation: u64,
+}
+
 struct AppView {
     tabs: Tabs,
     status: String,
@@ -665,6 +681,11 @@ struct AppView {
     /// can resolve after a faster fetch for the new connection and silently
     /// overwrite the tree with the wrong connection's schema.
     schema_fetch_generation: u64,
+    /// G7 T6: bumped on every `confirm_compare_dialog` dispatch; an
+    /// `on_compare_schema_pair_ready` result only applies if the generation
+    /// still matches — same last-dispatched-wins guard as
+    /// `schema_fetch_generation`/`switch_generation`.
+    compare_fetch_generation: u64,
     /// Identity (see `conn_spec_key`) of the connection whose schema is
     /// currently being fetched/shown in `tree`, so `trigger_schema_fetch`
     /// can tell `SchemaTree::set_snapshot` whether an incoming snapshot is a
@@ -1307,6 +1328,7 @@ impl AppView {
                                             TabContent::Monitor { .. } => None,
                                             TabContent::Plan { .. } => None,
                                             TabContent::Diagram { .. } => None,
+                                            TabContent::Compare { .. } => None,
                                         }
                                     })
                                 });
@@ -2065,6 +2087,7 @@ impl AppView {
                         }
                     }
                 }
+                PaletteAction::OpenCompare => self.open_compare_dialog(cx),
             },
         }
         cx.notify();
@@ -3278,6 +3301,7 @@ impl AppView {
             TabContent::Monitor { .. } => return,
             TabContent::Plan { .. } => return,
             TabContent::Diagram { .. } => return,
+            TabContent::Compare { .. } => return,
         };
         let current_identity = self.current_conn_identity();
         if !conn_identity_matches(&tab_conn_identity, &current_identity) {
@@ -3532,6 +3556,73 @@ impl AppView {
         .detach();
     }
 
+    /// G7 T7: computes `mode` from the two connections' engines, runs
+    /// `dbc_diff::schema_diff::diff_schema`, and updates the ALREADY-OPEN
+    /// Compare tab's `CompareView` entity (`pending.view`, created and
+    /// opened by `connections_ui::confirm_compare_dialog` in
+    /// `CompareLoadState::Loading` at dispatch time — design §3) in place.
+    /// `result`'s `Err` case (the oneshot channel closing — the runner task
+    /// panicked/dropped, which never happens in normal operation, but is
+    /// still a `Result`, not an `unwrap`, same posture `trigger_schema_fetch`
+    /// takes on its own oneshot) surfaces as a `CompareLoadState::Error` on
+    /// BOTH legs rather than leaving the tab stuck on "Načítám schéma…".
+    pub(crate) fn on_compare_schema_pair_ready(
+        &mut self,
+        pending: PendingCompare,
+        result: Result<(Result<SchemaSnapshot, QueryError>, Result<SchemaSnapshot, QueryError>), tokio::sync::oneshot::error::RecvError>,
+        cx: &mut Context<Self>,
+    ) {
+        let (result_a, result_b) = result.unwrap_or_else(|_| {
+            let cancelled = || Err(QueryError::msg("fetch zrušen".to_string()));
+            (cancelled(), cancelled())
+        });
+        let (engine_a, engine_b) = pending.view.read(cx).engines();
+        let mode = if engine_a == engine_b {
+            dbc_diff::schema_diff::CompareMode::SameEngine
+        } else {
+            dbc_diff::schema_diff::CompareMode::CrossEngine
+        };
+        let state = match (result_a, result_b) {
+            (Ok(snap_a), Ok(snap_b)) => {
+                let diff = dbc_diff::schema_diff::diff_schema(&snap_a, &snap_b, mode);
+                compare::CompareLoadState::Ready { diff, mode }
+            }
+            (a, b) => compare::CompareLoadState::Error { a: a.err(), b: b.err() },
+        };
+        pending.view.update(cx, |v, cx| {
+            v.state = state;
+            cx.notify();
+        });
+        self.status = "Porovnání schématu dokončeno".to_string();
+        cx.notify();
+    }
+
+    /// G7 T8: `CompareView`'s `CompareViewEvent` subscription (wired by
+    /// `connections_ui::confirm_compare_dialog` at tab-open time) —
+    /// `CompareView` doesn't own a `QueryRunner` (no tab-content entity in
+    /// this codebase does, see `MonitorView`'s `KillRequested` for the same
+    /// shape), so the actual `fetch_diff_side` dispatch for "Porovnat data"
+    /// happens here, reading the CURRENT diff/selection straight off the
+    /// entity before calling back into `CompareView::start_data_diff`
+    /// (which owns the generation guard and the `cx.spawn` completion).
+    pub(crate) fn on_compare_view_event(
+        &mut self,
+        view: Entity<compare::CompareView>,
+        event: &compare::CompareViewEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            compare::CompareViewEvent::DataDiffRequested => {
+                let runner = &self.runner;
+                view.update(cx, |v, cx| {
+                    if let compare::CompareLoadState::Ready { diff, .. } = v.state.clone() {
+                        v.start_data_diff(&diff, runner, cx);
+                    }
+                });
+            }
+        }
+    }
+
     /// `SchemaTree`'s `TreeEvent` subscription (wired in `main`). G2 Task 7:
     /// `OpenPreview` builds the SQL via `preview_sql` and runs it through the
     /// normal guarded pipeline (`run_query_with`, `bypass_auto_limit = true`
@@ -3610,6 +3701,7 @@ impl AppView {
                     TabContent::Monitor { .. } => (0, false),
                     TabContent::Plan { .. } => (0, false),
                     TabContent::Diagram { .. } => (0, false),
+                    TabContent::Compare { .. } => (0, false),
                 };
                 // G5 Task 3, brief contract #7: dirty (unapplied staged
                 // edits) tabs get a " •" title suffix — the apply bar
@@ -3771,6 +3863,7 @@ impl AppView {
                 }
                 view.clone().into_any_element()
             }
+            TabContent::Compare { view } => view.clone().into_any_element(),
         }
     }
 
@@ -4331,6 +4424,7 @@ fn main() {
                             tree,
                             tree_visible: true,
                             schema_fetch_generation: 0,
+                            compare_fetch_generation: 0,
                             schema_tree_connection_key: None,
                             history,
                             history_visible: true,
