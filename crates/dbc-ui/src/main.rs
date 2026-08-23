@@ -1,3 +1,4 @@
+mod autocomplete;
 mod connect;
 mod connections_ui;
 mod export;
