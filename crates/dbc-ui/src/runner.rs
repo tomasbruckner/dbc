@@ -6,6 +6,7 @@ use dbc_core::{CancelToken, Connection, QueryError, SchemaSnapshot, CHANNEL_CAPA
 use dbc_state::ConnectionConfig;
 
 use crate::connect;
+use crate::monitor;
 
 pub enum QueryEvent {
     Started { columns: SchemaRef },
@@ -21,6 +22,29 @@ pub enum ConnectSpec {
     Config { cfg: Box<ConnectionConfig>, secret: Option<String> },
     Url(String),
 }
+
+/// G9 T3: commands the view (T4) sends into a held `open_monitor` loop.
+#[allow(dead_code)] // constructed by T4's MonitorView; allow removed there
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorCmd {
+    Refresh { generation: u64 },
+    Kill { generation: u64, pid: i64 },
+}
+
+/// G9 T3: events the `monitor_loop` background task sends back.
+#[allow(dead_code)] // Data's fields consumed by T4's MonitorView; allow removed there
+#[derive(Debug)]
+pub enum MonitorEvent {
+    Data { generation: u64, snapshot: monitor::MonitorSnapshot },
+    Error { generation: u64, message: String },
+    KillResult { generation: u64, pid: i64, result: Result<u64, QueryError> },
+}
+
+/// Design §0/§9.1: the app-level read_only flag is the ONLY kill
+/// enforcement — this exact message is what the background task returns
+/// when it independently refuses a Kill.
+pub const MONITOR_READ_ONLY_KILL_MSG: &str =
+    "spojení je pouze pro čtení — zabití procesu odmítnuto";
 
 /// Owns the tokio runtime. All DB I/O lives here; the UI thread only ever
 /// awaits the event channel from inside `cx.spawn`.
@@ -238,6 +262,50 @@ impl QueryRunner {
             let _ = tx.send(result);
         });
         rx
+    }
+
+    /// G9 T3: opens ONE dedicated connection held for the monitor tab's
+    /// lifetime — no reconnect per tick (design §4). `read_only` and
+    /// `engine` are captured once at open time; the background task refuses
+    /// Kill on its OWN captured `read_only`, independent of whatever the UI
+    /// renders (belt-and-braces, design §6). Dropping the returned `Sender`
+    /// ends the loop and drops the connection ("drop tears everything
+    /// down", same as OpenConnection/Tunnel).
+    #[allow(dead_code)] // wired by T6's open_monitor_tab; allow removed there
+    pub fn open_monitor(
+        &self,
+        spec: ConnectSpec,
+        read_only: bool,
+        engine: dbc_state::Engine,
+    ) -> (tokio::sync::mpsc::Sender<MonitorCmd>, tokio::sync::mpsc::Receiver<MonitorEvent>) {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            let opened = match open_spec(spec, handle).await {
+                Ok(o) => o,
+                Err(e) => {
+                    // Report against the FIRST dispatched command's
+                    // generation (MonitorView sends Refresh{1} immediately
+                    // on open, T4) so the view's generation match doesn't
+                    // silently drop the connect error. If the tab already
+                    // closed, just exit.
+                    if let Some(cmd) = cmd_rx.recv().await {
+                        let generation = match cmd {
+                            MonitorCmd::Refresh { generation } | MonitorCmd::Kill { generation, .. } => generation,
+                        };
+                        let _ = event_tx.send(MonitorEvent::Error { generation, message: e.message }).await;
+                    }
+                    return;
+                }
+            };
+            // Keep the tunnel (if any) alive for the whole loop lifetime.
+            let _tunnel = opened._tunnel;
+            monitor_loop(opened.conn, engine, read_only, cmd_rx, event_tx).await;
+            // conn + _tunnel drop here — DB session closed (design §4's
+            // "no explicit Close command needed").
+        });
+        (cmd_tx, event_rx)
     }
 }
 
@@ -539,6 +607,153 @@ async fn stream_query(
     }
 }
 
+/// Bounds a runaway monitor sub-query result (RUNNING/TABLES are already
+/// LIMIT/TOP-bounded server-side; this is the defensive client-side cap,
+/// same posture as LOOKUP_ROW_CAP above).
+const MONITOR_ROW_CAP: usize = 10_000;
+
+/// Free function (not a method) so tests drive it over a mock Connection
+/// directly — the REQUIRED read-only kill refusal test (design §9.1
+/// CURATION) depends on this seam existing.
+async fn monitor_loop(
+    mut conn: Box<dyn Connection>,
+    engine: dbc_state::Engine,
+    read_only: bool,
+    mut cmd_rx: tokio::sync::mpsc::Receiver<MonitorCmd>,
+    event_tx: tokio::sync::mpsc::Sender<MonitorEvent>,
+) {
+    let mut pending: Option<MonitorCmd> = None;
+    loop {
+        let cmd = match pending.take() {
+            Some(c) => c,
+            None => match cmd_rx.recv().await {
+                Some(c) => c,
+                None => return, // Sender dropped = tab closed (design §4)
+            },
+        };
+        match cmd {
+            MonitorCmd::Refresh { generation } => {
+                let cancel = CancelToken::new();
+                let refresh = run_monitor_refresh(&mut *conn, engine, cancel.clone());
+                // Race the refresh against channel activity — same
+                // tokio::select! shape connect_and_run's watchdog uses
+                // (design §4 "cancellation of an in-flight refresh").
+                tokio::select! {
+                    results = refresh => {
+                        let event = match monitor::assemble_snapshot(results, Instant::now()) {
+                            Ok(snapshot) => MonitorEvent::Data { generation, snapshot },
+                            Err(message) => MonitorEvent::Error { generation, message },
+                        };
+                        if event_tx.send(event).await.is_err() {
+                            return; // receiver (MonitorView) gone
+                        }
+                    }
+                    next = cmd_rx.recv() => {
+                        // A command arrived mid-refresh (only Kill or a
+                        // close can — the UI's `awaiting` flag blocks new
+                        // Refresh dispatches, design §4 overlap prevention).
+                        cancel.cancel(); // protocol-level cancel on pg
+                        match next {
+                            Some(c) => pending = Some(c),
+                            None => return, // tab closed mid-refresh: no stale Data/Error sent
+                        }
+                    }
+                }
+            }
+            MonitorCmd::Kill { generation, pid } => {
+                // BELT-AND-BRACES GATE (design §0/§6/§9.1): this check is
+                // one of the TWO independent code paths implementing the
+                // ONLY real enforcement — neither engine blocks kill
+                // server-side (pg's default_transaction_read_only does NOT
+                // stop pg_terminate_backend). It must run BEFORE any
+                // conn.execute call. Deliberately a direct check rather
+                // than guard_not_read_only() so the design's mandated
+                // message text is exact.
+                let result = if read_only {
+                    Err(QueryError::msg(MONITOR_READ_ONLY_KILL_MSG))
+                } else {
+                    match crate::monitor_sql::kill_sql(engine, pid) {
+                        Some(sql) => conn.execute(&sql, CancelToken::new()).await,
+                        None => Err(QueryError::msg("kill není pro tento engine k dispozici")),
+                    }
+                };
+                if event_tx.send(MonitorEvent::KillResult { generation, pid, result }).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// One full refresh: the 8 pg statements, strictly sequential over the ONE
+/// dedicated connection (session-sharing caveat), each failure captured
+/// per-statement so assemble_snapshot can degrade per-tile (risk #4).
+async fn run_monitor_refresh(
+    conn: &mut dyn Connection,
+    engine: dbc_state::Engine,
+    cancel: CancelToken,
+) -> monitor::RefreshResults {
+    use crate::monitor_sql::pg;
+    match engine {
+        dbc_state::Engine::Postgres => monitor::RefreshResults {
+            connections: drain_rows(conn, pg::CONNECTIONS, &cancel).await,
+            locks: drain_rows(conn, pg::LOCKS, &cancel).await,
+            data_size: drain_rows(conn, pg::DATA_SIZE, &cancel).await,
+            wal_size: drain_rows(conn, pg::WAL_SIZE, &cancel).await,
+            perf: drain_rows(conn, pg::PERF, &cancel).await,
+            running: drain_rows(conn, pg::RUNNING, &cancel).await,
+            blocking: drain_rows(conn, pg::BLOCKING, &cancel).await,
+            tables: drain_rows(conn, pg::TABLES, &cancel).await,
+        },
+        // Unreachable today: monitor_available gates open_monitor to
+        // Postgres. When dbc-driver-mssql lands, this arm switches to the
+        // monitor_sql::mssql statement set (design §7).
+        _ => {
+            let err = || Err("monitor není pro tento engine k dispozici".to_string());
+            monitor::RefreshResults {
+                connections: err(), locks: err(), data_size: err(), wal_size: err(),
+                perf: err(), running: err(), blocking: err(), tables: err(),
+            }
+        }
+    }
+}
+
+/// One statement -> materialized text rows. Mirrors fetch_lookup_inner's
+/// throwaway-ResultBuffer drain (the tested batch-push/cell-read path, not
+/// a second arrow-reading code path — design §1 parse strategy), but over
+/// an EXISTING connection and returning the error as a plain message
+/// String (RefreshResults' per-statement Err type).
+async fn drain_rows(
+    conn: &mut dyn Connection,
+    sql: &str,
+    cancel: &CancelToken,
+) -> Result<Vec<monitor::Row>, String> {
+    let mut stream = conn.query(sql, cancel.clone()).await.map_err(|e| e.message)?;
+    let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+    while let Some(item) = stream.batches.recv().await {
+        match item {
+            Ok(b) => {
+                buf.push(b).map_err(|e| e.to_string())?;
+                if buf.row_count() >= MONITOR_ROW_CAP {
+                    break;
+                }
+            }
+            Err(e) => return Err(e.message),
+        }
+    }
+    let n = buf.row_count().min(MONITOR_ROW_CAP);
+    let ncols = buf.column_count();
+    let mut rows = Vec::with_capacity(n);
+    for r in 0..n {
+        let mut row = Vec::with_capacity(ncols);
+        for c in 0..ncols {
+            row.push(if buf.cell_is_null(r, c) { None } else { Some(buf.cell_text(r, c)) });
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 /// G5 Task 4: pure guard/decision tests (no I/O) plus `drive_write_sequence`
 /// tests driven over the real sqlite driver via `crate::connect::open` (a
 /// temp-file database — no docker/network dependency), matching the plan's
@@ -812,5 +1027,169 @@ mod write_transaction_tests {
             "the SAME cancel token threaded through every execute() call must be cancelled on \
              timeout — this is what reaches the backend for real on Postgres (part (b) of the fix)"
         );
+    }
+}
+
+/// G9 T3: the kill gate + loop-lifecycle tests. The read-only refusal test
+/// is the design's §9.1 CURATION-REQUIRED guard-level test — the app-level
+/// flag is the ONLY enforcement (no server-side backstop on either
+/// engine), so it gets the same test discipline as guards.rs.
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Mock driver: records every execute() call; query() errors (a test
+    /// that never sends Refresh never reaches it).
+    struct RecordingConnection {
+        execute_calls: Arc<AtomicUsize>,
+        executed_sql: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingConnection {
+        fn new() -> (Self, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let sqls = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self { execute_calls: calls.clone(), executed_sql: sqls.clone() },
+                calls,
+                sqls,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for RecordingConnection {
+        async fn query(
+            &mut self,
+            _sql: &str,
+            _cancel: CancelToken,
+        ) -> Result<dbc_core::QueryStream, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn execute(&mut self, sql: &str, _cancel: CancelToken) -> Result<u64, QueryError> {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            self.executed_sql.lock().unwrap().push(sql.to_string());
+            Ok(1)
+        }
+    }
+
+    /// REQUIRED (design §9.1 CURATION): a Kill over a read_only connection
+    /// is refused BEFORE reaching the driver — conn.execute is never
+    /// called, and the exact Czech refusal message comes back, independent
+    /// of whatever the UI renders.
+    #[tokio::test]
+    async fn monitor_kill_refused_on_read_only_before_reaching_driver() {
+        let (conn, calls, _sqls) = RecordingConnection::new();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let loop_task = tokio::spawn(monitor_loop(
+            Box::new(conn),
+            dbc_state::Engine::Postgres,
+            /* read_only */ true,
+            cmd_rx,
+            event_tx,
+        ));
+
+        cmd_tx.send(MonitorCmd::Kill { generation: 7, pid: 42 }).await.unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("event within 5s")
+            .expect("channel open");
+        match ev {
+            MonitorEvent::KillResult { generation, pid, result } => {
+                assert_eq!(generation, 7);
+                assert_eq!(pid, 42);
+                assert_eq!(result.unwrap_err().message, MONITOR_READ_ONLY_KILL_MSG);
+            }
+            other => panic!("expected KillResult, got {other:?}"),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "read-only kill must never reach Connection::execute"
+        );
+
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(5), loop_task)
+            .await
+            .expect("loop exits when the Sender drops")
+            .unwrap();
+    }
+
+    /// Companion positive case: writable connection -> exactly one
+    /// execute() with the exact pid-formatted kill SQL, Ok result echoed.
+    #[tokio::test]
+    async fn monitor_kill_executes_exact_sql_on_writable_connection() {
+        let (conn, calls, sqls) = RecordingConnection::new();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let loop_task = tokio::spawn(monitor_loop(
+            Box::new(conn),
+            dbc_state::Engine::Postgres,
+            /* read_only */ false,
+            cmd_rx,
+            event_tx,
+        ));
+
+        cmd_tx.send(MonitorCmd::Kill { generation: 1, pid: 42 }).await.unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match ev {
+            MonitorEvent::KillResult { pid: 42, result: Ok(1), .. } => {}
+            other => panic!("expected Ok KillResult, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            sqls.lock().unwrap().as_slice(),
+            &["SELECT pg_terminate_backend(42)".to_string()]
+        );
+
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(5), loop_task).await.unwrap().unwrap();
+    }
+
+    /// End-to-end all-failed path without docker: a real sqlite connection
+    /// can't run any pg catalog query, so every drain fails and the loop
+    /// must send Error (with the dispatched generation), not Data and not
+    /// a panic — proving assemble_snapshot's all-failed contract through
+    /// the real drain path.
+    #[tokio::test]
+    async fn monitor_refresh_all_queries_failing_sends_error_with_generation() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let handle = tokio::runtime::Handle::current();
+        let conn =
+            crate::connect::open(f.path().to_str().expect("utf8 path"), &handle).expect("open sqlite");
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let loop_task = tokio::spawn(monitor_loop(
+            conn,
+            dbc_state::Engine::Postgres,
+            false,
+            cmd_rx,
+            event_tx,
+        ));
+
+        cmd_tx.send(MonitorCmd::Refresh { generation: 3 }).await.unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match ev {
+            MonitorEvent::Error { generation: 3, message } => {
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected Error{{generation: 3}}, got {other:?}"),
+        }
+
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(5), loop_task).await.unwrap().unwrap();
+        drop(f);
     }
 }
