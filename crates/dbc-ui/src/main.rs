@@ -40,8 +40,8 @@ use dbc_core::{
     CancelToken, FkRef, QueryError, SchemaSnapshot, TableInfo,
 };
 use dbc_state::{
-    AppConfig, HistoryDb, HistoryEntry, ParamValue, ParamValuesStore, TableViewPrefs, Vault,
-    ViewPrefsStore,
+    AppConfig, ConnectionConfig, HistoryDb, HistoryEntry, ParamValue, ParamValuesStore,
+    TableViewPrefs, Vault, ViewPrefsStore,
 };
 use gpui::{
     actions, div, prelude::*, px, size, uniform_list, AnyElement, App, Bounds, ClipboardItem,
@@ -1079,6 +1079,14 @@ struct AppView {
     /// master password once (brief: prompt on first use, not at startup).
     vault: Option<Vault>,
     active_connection_id: Option<String>,
+    /// Sidebar rework (design §2.2): the active database WITHIN
+    /// `active_connection_id`. `None` = the saved config's `database` (the
+    /// default). Always `None` when `active_connection_id` is `None` (the
+    /// CLI path has no db switching) and always NORMALIZED — explicitly
+    /// picking the default db stores `None`, so identity/store-key/label
+    /// logic has a single canonical spelling (`switch_to_database` enforces
+    /// this; until that lands in T5, nothing writes `Some` here).
+    active_database: Option<String>,
     /// Bumped on every dropdown connection switch; a switch result only
     /// applies if the generation still matches (last-dispatched wins, not
     /// last-resolved).
@@ -1206,9 +1214,12 @@ struct AppView {
 /// `trigger_schema_fetch` dispatches target the "same connection" (see
 /// `schema_tree_connection_key`) — not used for anything security-sensitive,
 /// so the secret on `ConnectSpec::Config` is deliberately not part of it.
+/// Widened by the sidebar rework — its autocomplete/schema caching identity
+/// must distinguish databases; the spec's `cfg.database` is already the
+/// effective one.
 fn conn_spec_key(spec: &ConnectSpec) -> String {
     match spec {
-        ConnectSpec::Config { cfg, .. } => format!("cfg:{}", cfg.id),
+        ConnectSpec::Config { cfg, .. } => format!("cfg:{}\u{1F}{}", cfg.id, cfg.database),
         ConnectSpec::Url(u) => format!("url:{u}"),
     }
 }
@@ -1217,6 +1228,100 @@ fn conn_spec_key(spec: &ConnectSpec) -> String {
 /// `AppView::current_conn_identity` use for the CLI-arg back-compat path
 /// (no saved `ConnectionConfig`, hence no stable id to use instead).
 const CLI_CONN_IDENTITY: &str = "cli";
+
+/// Design §2.3: the widened connection identity. `\u{1F}` (unit separator)
+/// joins id and database — the same convention dbc-state's
+/// view_prefs/params `encode_key` already uses. Ids are app-generated
+/// `conn-{hex}` and can never contain the separator; database names CAN
+/// (design §7 CORRECTION: Postgres identifiers allow any character except
+/// NUL), which is safe HERE because identities are compared atomically by
+/// `conn_identity_matches` — never split for authorization — and never
+/// rendered raw (`conn_name_for_identity` translates, display-only). The
+/// store-bucket keys, which ARE compositional, go through dbc-state's
+/// escaping `connection_scope_key` instead — see `store_scope_key`. The
+/// CLI path keeps the plain `"cli"` sentinel (its URL bakes its own
+/// database).
+pub(crate) fn conn_identity_for(conn_id: &str, database: &str) -> String {
+    format!("{conn_id}\u{1F}{database}")
+}
+
+/// SECURITY (design §3.1): the derived spec inherits EVERYTHING from the
+/// saved config except `database` — same id (⇒ same vault secret, same
+/// favourites/prefs bucket root), same read_only (⇒ `open_config` still
+/// applies default_transaction_read_only / file-engine read-only modes),
+/// same ssh/timeout/auto_limit. No new secret storage, no new config
+/// entry; this function moves a secret field it never reads.
+///
+/// Allow dead_code: T3 lands ahead of T5's consumers (`switch_to_database`
+/// and the sidebar's per-database fetch dispatch) — exercised directly by
+/// `identity_widening_tests` until then. Remove once T5 wires it in.
+#[allow(dead_code)]
+pub(crate) fn spec_for_database(
+    cfg: &ConnectionConfig,
+    db: &str,
+    secret: Option<String>,
+) -> ConnectSpec {
+    let mut cfg = cfg.clone();
+    cfg.database = db.to_string();
+    ConnectSpec::Config { cfg: Box::new(cfg), secret }
+}
+
+/// Design §2.4: the ONE resolved snapshot of the active `(connection,
+/// database)` context. INVARIANT (design §2.4, doc'd here as the single
+/// change point): no other code path may build a `ConnectSpec::Config`
+/// from `active_connection_id` directly — `run_query_with`,
+/// `resolve_spec_for_explain`, `apply_conn_spec` and `active_conn_spec`
+/// are all thin projections of this. Compare and backup build specs from
+/// EXPLICIT configs by design and are exempt (design §5 rows 6–7).
+struct ActiveConn {
+    /// `database` ALREADY swapped to the effective one.
+    cfg: ConnectionConfig,
+    secret: Option<String>,
+    read_only: bool,
+    engine: dbc_state::Engine,
+    timeout_secs: Option<u64>,
+    auto_limit: Option<u64>,
+    /// `conn_identity_for(..)` of the same snapshot — callers that stamp
+    /// and dispatch in one motion use this, never a re-read.
+    ///
+    /// Allow dead_code: T3 lands ahead of T5's stamp-and-dispatch callers
+    /// (`switch_to_database`'s success arm and the sidebar handlers) —
+    /// asserted by `identity_widening_tests` until then. Remove once T5
+    /// wires them in.
+    #[allow(dead_code)]
+    identity: String,
+}
+
+impl ActiveConn {
+    fn into_spec(self) -> ConnectSpec {
+        ConnectSpec::Config { cfg: Box::new(self.cfg), secret: self.secret }
+    }
+}
+
+/// Pure core of `AppView::resolve_active` — free function so it is
+/// testable without a GPUI context (this crate has no GPUI test harness).
+fn resolve_active_from(
+    config: &AppConfig,
+    vault: Option<&Vault>,
+    active_id: &str,
+    active_db: Option<&str>,
+) -> Option<ActiveConn> {
+    let saved = config.connections.iter().find(|c| c.id == active_id)?;
+    let mut cfg = saved.clone();
+    if let Some(db) = active_db {
+        cfg.database = db.to_string();
+    }
+    let secret = connect::resolve_secret_for_connect(vault, &cfg);
+    Some(ActiveConn {
+        identity: conn_identity_for(&cfg.id, &cfg.database),
+        read_only: cfg.read_only,
+        engine: cfg.engine,
+        timeout_secs: cfg.timeout_secs,
+        auto_limit: cfg.auto_limit,
+        secret,
+        cfg,
+    })
+}
 
 /// G5 Task 4 review fix (BLOCKER 1): pure decision behind the Apply flow's
 /// connection-identity guard — `true` when it is safe to apply `tab`'s
@@ -1310,9 +1415,9 @@ impl AppView {
 
     /// Opens the `QueryParams` modal for `sql`'s distinct `:name`s, one
     /// `TextField` + NULL flag per name, prefilled from `self.param_values`
-    /// (keyed by `current_conn_identity()` — the same stable connection
-    /// identity `ResultTab::conn_identity`/`apply_conn_spec` use, covering
-    /// both a saved connection and the CLI-arg `"cli"` sentinel). Refuses
+    /// (keyed by `store_scope_key()` — the legacy-for-default store bucket
+    /// rule, sidebar rework design §7 items 4–5, covering both a saved
+    /// connection and the CLI-arg `"cli"` sentinel). Refuses
     /// to open a second modal on top of an existing one (same
     /// single-modal-at-a-time invariant `run_query_with` itself enforces
     /// via its own `self.modal.is_some()` guard). Focuses the first param's
@@ -1331,7 +1436,7 @@ impl AppView {
         if self.modal.is_some() {
             return;
         }
-        let conn_id = self.current_conn_identity();
+        let conn_id = self.store_scope_key();
         let mut inputs = Vec::with_capacity(names.len());
         let mut null_flags = Vec::with_capacity(names.len());
         for name in &names {
@@ -1399,7 +1504,7 @@ impl AppView {
 
         match build_param_sql(&sql_template, &names, &values) {
             Ok(final_sql) => {
-                let conn_id = self.current_conn_identity();
+                let conn_id = self.store_scope_key();
                 if let Some(store) = &mut self.param_values {
                     for (name, (text, is_null)) in names.iter().zip(values.iter()) {
                         if let Err(e) = store.set(
@@ -1463,23 +1568,21 @@ impl AppView {
             return;
         }
 
-        let spec = if let Some(id) = self.active_connection_id.clone() {
-            let Some(cfg) = self.config.connections.iter().find(|c| c.id == id).cloned() else {
+        let spec = if self.active_connection_id.is_some() {
+            // Sidebar rework: `resolve_active` is the single spec-resolution
+            // site (see `ActiveConn`'s invariant) — it keeps G15 T8 HARD
+            // GATE ITEM 2 (`connect::resolve_secret_for_connect`, not a raw
+            // `vault.get_secret`) inside `resolve_active_from`.
+            let Some(a) = self.resolve_active() else {
                 self.status = "connection no longer exists".into();
                 cx.notify();
                 return;
             };
-            // G15 T8 HARD GATE ITEM 2: `connect::resolve_secret_for_connect`
-            // (not a raw `vault.get_secret`) — skips the vault lookup
-            // entirely for an MSSQL config that's refused before any secret
-            // is ever used (SSH tunnel / empty user), see its doc comment.
-            let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
-            // G5 Task 3: captured before `cfg` moves into `ConnectSpec::Config`
-            // below — `Started`'s `Editable` detection needs both facts (see
-            // `detect_editable_pk`), and `cfg` itself won't survive past this
-            // `if` arm.
-            let conn_meta = Some((cfg.read_only, cfg.engine));
-            (cfg.read_only, cfg.auto_limit, cfg.timeout_secs, conn_meta, ConnectSpec::Config { cfg: Box::new(cfg), secret })
+            // G5 Task 3: captured before the cfg moves into the spec —
+            // `Started`'s `Editable` detection needs both facts (see
+            // `detect_editable_pk`).
+            let conn_meta = Some((a.read_only, a.engine));
+            (a.read_only, a.auto_limit, a.timeout_secs, conn_meta, a.into_spec())
         } else if let Some(url) = self.conn_url.clone() {
             // CLI-arg back-compat path: no `ConnectionConfig` exists for
             // read-only/auto-limit/timeout, but a preview IS still
@@ -3336,15 +3439,13 @@ impl AppView {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<(bool, Option<u64>, dbc_state::Engine, ConnectSpec)> {
-        if let Some(id) = self.active_connection_id.clone() {
-            let Some(cfg) = self.config.connections.iter().find(|c| c.id == id).cloned() else {
+        if self.active_connection_id.is_some() {
+            let Some(a) = self.resolve_active() else {
                 self.status = "connection no longer exists".into();
                 cx.notify();
                 return None;
             };
-            let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
-            let (read_only, timeout_secs, engine) = (cfg.read_only, cfg.timeout_secs, cfg.engine);
-            Some((read_only, timeout_secs, engine, ConnectSpec::Config { cfg: Box::new(cfg), secret }))
+            Some((a.read_only, a.timeout_secs, a.engine, a.into_spec()))
         } else if let Some(url) = self.conn_url.clone() {
             Some((false, None, engine_from_url(&url), ConnectSpec::Url(url)))
         } else {
@@ -4615,13 +4716,20 @@ impl AppView {
     /// returns the spec. `None` means there's nothing to fetch a schema for
     /// (tree shows "Bez připojení").
     fn active_conn_spec(&self) -> Option<ConnectSpec> {
-        if let Some(id) = self.active_connection_id.clone() {
-            let cfg = self.config.connections.iter().find(|c| c.id == id)?.clone();
-            let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
-            Some(ConnectSpec::Config { cfg: Box::new(cfg), secret })
+        if self.active_connection_id.is_some() {
+            self.resolve_active().map(ActiveConn::into_spec)
         } else {
             self.conn_url.clone().map(ConnectSpec::Url)
         }
+    }
+
+    /// The single site where "the database the app talks to" is decided —
+    /// see `ActiveConn`'s doc comment for the invariant. `None` = no active
+    /// saved connection OR the connection was deleted; the CLI-arg URL path
+    /// is handled by callers as today.
+    fn resolve_active(&self) -> Option<ActiveConn> {
+        let id = self.active_connection_id.as_deref()?;
+        resolve_active_from(&self.config, self.vault.as_ref(), id, self.active_database.as_deref())
     }
 
     /// G4 Task 5, PREVIEW tabs: looks the previewed `(schema, table)` up in
@@ -4739,6 +4847,7 @@ impl AppView {
     ) -> Option<PreviewTarget> {
         let store = self.view_prefs.as_ref()?;
         let conn_id = self.active_connection_id.clone()?;
+        let conn_id = dbc_state::connection_scope_key(&conn_id, self.active_database.as_deref());
         // No saved entry is NOT an early return: a `from_join_change` run on
         // a table with no prior prefs must still reach the Save branch below
         // (re-review issue 3 — otherwise the very first join on a virgin
@@ -4838,6 +4947,7 @@ impl AppView {
     /// `record_history` already follows.
     fn save_view_prefs_for_grid(&mut self, grid: &Entity<ResultGrid>, cx: &mut Context<Self>) {
         let Some(conn_id) = self.active_connection_id.clone() else { return };
+        let conn_id = dbc_state::connection_scope_key(&conn_id, self.active_database.as_deref());
         let (schema, table, headers, sort, hidden, widths, fk_joins) = {
             let g = grid.read(cx);
             let Some((schema, table)) = g.preview_identity() else { return };
@@ -5372,8 +5482,44 @@ impl AppView {
     /// the real CLI path), this is the raw, stable id — a connection can be
     /// renamed without invalidating a tab's stamped identity, which a
     /// name-based comparison would get wrong.
+    /// Sidebar rework: composes via `conn_identity_for` — a database switch
+    /// on the SAME connection now changes the identity, which is the
+    /// audit's headline fix (design §7).
     fn current_conn_identity(&self) -> String {
-        self.active_connection_id.clone().unwrap_or_else(|| CLI_CONN_IDENTITY.to_string())
+        match &self.active_connection_id {
+            None => CLI_CONN_IDENTITY.to_string(),
+            Some(id) => {
+                // A deleted-while-active connection (rare, transient) falls
+                // back to the empty db component — still a stable, unequal-
+                // to-everything-real identity, same posture as the old raw
+                // id fallback.
+                let db = self.effective_database().unwrap_or_default();
+                conn_identity_for(id, &db)
+            }
+        }
+    }
+
+    /// The database the active context points at: `active_database`, or
+    /// the saved config's default. `None` = no active saved connection.
+    fn effective_database(&self) -> Option<String> {
+        let id = self.active_connection_id.as_ref()?;
+        if let Some(db) = &self.active_database {
+            return Some(db.clone());
+        }
+        self.config.connections.iter().find(|c| &c.id == id).map(|c| c.database.clone())
+    }
+
+    /// Store bucket key for view_prefs/params (design §7 items 4–5):
+    /// LEGACY bare id for the default database — existing views.toml/
+    /// params.toml entries keep working byte-for-byte — one more `\u{1F}`
+    /// component only for a non-default db; `"cli"` sentinel for the CLI
+    /// path. Deliberately NOT `current_conn_identity()`: embedding the
+    /// composite identity would orphan every pre-phase stored value.
+    fn store_scope_key(&self) -> String {
+        match &self.active_connection_id {
+            Some(id) => dbc_state::connection_scope_key(id, self.active_database.as_deref()),
+            None => CLI_CONN_IDENTITY.to_string(),
+        }
     }
 
     /// Human-readable name for a `ResultTab::conn_identity` value — used
@@ -5381,16 +5527,24 @@ impl AppView {
     /// connection X"). Falls back to the raw identity string itself if the
     /// connection has since been deleted (rare, but must never panic or
     /// silently say "cli" for a real connection that's simply gone).
+    /// Sidebar rework: splits on `\u{1F}`; the db segment renders only when
+    /// ≠ the connection's current default.
     fn conn_name_for_identity(&self, identity: &str) -> String {
         if identity == CLI_CONN_IDENTITY {
             return "cli".to_string();
         }
-        self.config
-            .connections
-            .iter()
-            .find(|c| c.id == identity)
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| identity.to_string())
+        let (id, db) = match identity.split_once('\u{1F}') {
+            Some((id, db)) => (id, Some(db)),
+            None => (identity, None), // defensive: nothing stamps the bare shape any more
+        };
+        match self.config.connections.iter().find(|c| c.id == id) {
+            // Deleted connection: never render the raw control character.
+            None => identity.replace('\u{1F}', " / "),
+            Some(c) => match db {
+                Some(db) if db != c.database => format!("{} / {}", c.name, db),
+                _ => c.name.clone(),
+            },
+        }
     }
 
     // -----------------------------------------------------------------
@@ -5802,11 +5956,11 @@ impl AppView {
     }
 
     fn apply_conn_spec(&self) -> Option<(ConnectSpec, Option<u64>)> {
-        if let Some(id) = self.active_connection_id.clone() {
-            let cfg = self.config.connections.iter().find(|c| c.id == id)?.clone();
-            let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
-            let timeout_secs = cfg.timeout_secs;
-            Some((ConnectSpec::Config { cfg: Box::new(cfg), secret }, timeout_secs))
+        if self.active_connection_id.is_some() {
+            self.resolve_active().map(|a| {
+                let timeout_secs = a.timeout_secs;
+                (a.into_spec(), timeout_secs)
+            })
         } else {
             self.conn_url.clone().map(|url| (ConnectSpec::Url(url), None))
         }
@@ -8441,6 +8595,7 @@ fn main() {
                             vault_path,
                             vault: None,
                             active_connection_id: None,
+                            active_database: None,
                             switch_generation: 0,
                             dropdown_open: false,
                             modal: None,
@@ -9184,6 +9339,93 @@ mod conn_identity_matches_tests {
         // versa) is also a mismatch — never conflate the two.
         assert!(!conn_identity_matches("conn-a", CLI_CONN_IDENTITY));
         assert!(!conn_identity_matches(CLI_CONN_IDENTITY, "conn-a"));
+    }
+}
+
+// Sidebar rework T3: the `(connection, database)` identity widening —
+// `conn_identity_for`, `spec_for_database`, `conn_spec_key`, and the pure
+// core of `resolve_active`.
+#[cfg(test)]
+mod identity_widening_tests {
+    use super::*;
+
+    #[test]
+    fn conn_identity_for_composes_with_unit_separator() {
+        assert_eq!(conn_identity_for("conn-a", "sales"), "conn-a\u{1F}sales");
+    }
+
+    /// THE safety win of the whole phase (design §2.3): the same connection
+    /// on two databases is two different identities — every pending write
+    /// guard (Apply, admin, script, CSV) captured against one refuses to
+    /// dispatch against the other, via the unchanged `conn_identity_matches`.
+    #[test]
+    fn same_connection_different_database_never_matches() {
+        assert!(!conn_identity_matches(
+            &conn_identity_for("conn-a", "sales"),
+            &conn_identity_for("conn-a", "inventory"),
+        ));
+        assert!(conn_identity_matches(
+            &conn_identity_for("conn-a", "sales"),
+            &conn_identity_for("conn-a", "sales"),
+        ));
+        // Bare pre-phase shape never equals the composite (defensive).
+        assert!(!conn_identity_matches("conn-a", &conn_identity_for("conn-a", "sales")));
+    }
+
+    #[test]
+    fn conn_spec_key_distinguishes_databases() {
+        let mut cfg = test_cfg("conn-a", "sales");
+        let key_sales = conn_spec_key(&ConnectSpec::Config { cfg: Box::new(cfg.clone()), secret: None });
+        cfg.database = "inventory".into();
+        let key_inv = conn_spec_key(&ConnectSpec::Config { cfg: Box::new(cfg), secret: None });
+        assert_ne!(key_sales, key_inv);
+        assert_eq!(key_sales, "cfg:conn-a\u{1F}sales");
+    }
+
+    fn test_cfg(id: &str, db: &str) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: id.into(), name: "prod".into(), folder: vec![],
+            engine: dbc_state::Engine::Postgres, host: "localhost".into(),
+            port: Some(5432), database: db.into(), user: "u".into(),
+            read_only: true, timeout_secs: Some(30), auto_limit: Some(500),
+            ssh: None, favourite: false, mssql: None,
+        }
+    }
+
+    /// SECURITY (design §3.1): the derived spec inherits EVERYTHING except
+    /// `database` — same id (⇒ same vault secret, same prefs bucket root),
+    /// same read_only (⇒ server-side enforcement still applies), same
+    /// timeout/auto_limit/ssh. No new secret storage.
+    #[test]
+    fn spec_for_database_swaps_only_the_database() {
+        let cfg = test_cfg("conn-a", "sales");
+        let spec = spec_for_database(&cfg, "inventory", Some("s3cret".into()));
+        let ConnectSpec::Config { cfg: derived, secret } = spec else { panic!("Config expected") };
+        assert_eq!(derived.database, "inventory");
+        assert_eq!(secret.as_deref(), Some("s3cret"));
+        let mut expect = cfg.clone();
+        expect.database = "inventory".into();
+        assert_eq!(*derived, expect); // read_only/timeout/auto_limit/ssh/engine/id all inherited
+    }
+
+    #[test]
+    fn resolve_active_from_swaps_db_and_inherits_flags() {
+        let mut config = dbc_state::AppConfig::default();
+        config.connections.push(test_cfg("conn-a", "sales"));
+        // Default database:
+        let a = resolve_active_from(&config, None, "conn-a", None).unwrap();
+        assert_eq!(a.cfg.database, "sales");
+        assert_eq!(a.identity, conn_identity_for("conn-a", "sales"));
+        assert!(a.read_only);
+        assert_eq!(a.timeout_secs, Some(30));
+        assert_eq!(a.auto_limit, Some(500));
+        // Non-default database:
+        let a = resolve_active_from(&config, None, "conn-a", Some("inventory")).unwrap();
+        assert_eq!(a.cfg.database, "inventory");
+        assert_eq!(a.identity, conn_identity_for("conn-a", "inventory"));
+        assert!(a.read_only, "read_only inherits into every derived db (design §4.2)");
+        // Deleted connection:
+        assert!(resolve_active_from(&config, None, "gone", None).is_none());
     }
 }
 
