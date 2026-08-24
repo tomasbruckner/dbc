@@ -211,14 +211,42 @@ async fn autocommit_does_not_commit_between_execute_calls_inside_open_tx() {
     exec(&mut c, &trancount_probe(1)).await.expect("BEGIN TRANSACTION must open a real tx (trancount 1)");
     exec(&mut c, &format!("INSERT INTO {table} (id) VALUES (1)")).await.unwrap();
 
-    // Fresh second connection. NEVER read with READUNCOMMITTED here — that
-    // would see the uncommitted row regardless of autocommit interference
-    // and prove nothing. A lock timeout under the default isolation level
-    // is an equally valid proof of non-visibility as a bare 0 count.
-    let mut c2 = connect();
-    exec(&mut c2, "SET LOCK_TIMEOUT 1000").await.unwrap();
-    match count_rows(&mut c2, &table).await {
-        Ok(n) => assert_eq!(n, 0, "uncommitted row must not be visible to a second connection"),
+    // Fresh second connection. `query()` always opens a brand-new
+    // connection per call (see the crate's module doc), so a bare
+    // `execute("SET LOCK_TIMEOUT ...")` followed by a separate `query()`
+    // call would land on two DIFFERENT sessions and the timeout would
+    // never take effect (the default is to wait indefinitely — exactly
+    // the hang this would otherwise cause). `query_with_session`'s
+    // prelude is what puts the SET and the SELECT on the same session.
+    // NEVER read with READUNCOMMITTED here — that would see the
+    // uncommitted row regardless of autocommit interference and prove
+    // nothing. A lock timeout under the default isolation level is an
+    // equally valid proof of non-visibility as a bare 0 count.
+    let c2 = connect();
+    let visibility = c2
+        .query_with_session(
+            &["SET LOCK_TIMEOUT 1000".to_string()],
+            &format!("SELECT COUNT(*) AS n FROM {table}"),
+            &[],
+            CancelToken::new(),
+        )
+        .await;
+    match visibility {
+        Ok(mut s) => {
+            let mut n: i64 = 0;
+            while let Some(b) = s.batches.recv().await {
+                let b = b.unwrap();
+                if b.num_rows() > 0 {
+                    let col = b
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<dbc_core::arrow::array::StringArray>()
+                        .unwrap();
+                    n = col.value(0).parse().unwrap_or(0);
+                }
+            }
+            assert_eq!(n, 0, "uncommitted row must not be visible to a second connection");
+        }
         Err(_) => {
             // Lock-timeout error: the second connection blocked trying to
             // read a row locked by the still-open transaction — also
