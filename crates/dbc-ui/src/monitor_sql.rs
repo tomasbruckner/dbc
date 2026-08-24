@@ -83,14 +83,23 @@ WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog', 'information_schema', 
 ORDER BY pg_relation_size(c.oid) + pg_indexes_size(c.oid) DESC";
 }
 
-/// Target shape for when dbc-driver-mssql lands (design §3): compiled and
-/// smoke-tested here so a T-SQL typo fails CI today, but NOT runnable — no
-/// driver exists (`connect::open_config` hard-errors Engine::Mssql), and
-/// `monitor::monitor_available` returns false for Mssql until it does.
-/// dead_code allow is PERMANENT for this module (unlike the temporary mod-
-/// declaration allows T6 removes) — nothing can call these until the
-/// driver lands.
-#[allow(dead_code)]
+/// The live MSSQL monitor refresh set (design §3), 11 statements —
+/// `runner::run_monitor_refresh`'s Mssql arm (G15 T6) drives every one of
+/// these via `drain_rows` and threads the results through
+/// `monitor::merge_mssql_connections`/`merge_mssql_locks`/
+/// `split_mssql_size`/`merge_mssql_perf` into the pg-shaped tiles
+/// `assemble_snapshot` already knows how to degrade per-tile.
+///
+/// Correction (G15 T6): this module doc used to say these constants were
+/// "NOT runnable — no driver exists" and carried a PERMANENT `dead_code`
+/// allow. Both are obsolete — `dbc-driver-mssql` landed (T2/T3) and every
+/// constant here is now called from real, complete code (this crate's
+/// `#[allow(dead_code)]` is gone). What's still gated is reachability, not
+/// code existence: `monitor::monitor_available` returns `false` for Mssql
+/// until T8's flip (gated on the XACT_ABORT matrix running green on a real
+/// machine, Global Constraints) — so `open_monitor` never dispatches a
+/// refresh against an MSSQL connection until then, but the SQL/merge code
+/// itself is exactly what will run the moment it does.
 pub mod mssql {
     pub const CONNECTIONS: &str = "\
 SELECT
@@ -153,6 +162,19 @@ OUTER APPLY sys.dm_exec_sql_text(bx.sql_handle) tb
 WHERE r.blocking_session_id <> 0";
 
     /// Set-based sp_spaceused equivalent, no per-table EXEC loop (design §3).
+    ///
+    /// G15 T6 smoke-test fix (live docker MSSQL, not just this crate's
+    /// lexical `every_mssql_monitor_query_starts_with_select` check, which
+    /// can't catch a semantic T-SQL error): the `ORDER BY` used to
+    /// reference the `data_bytes`/`index_bytes` SELECT-list ALIASES inside
+    /// an arithmetic expression (`ORDER BY data_bytes + index_bytes DESC`)
+    /// — T-SQL allows a bare alias in `ORDER BY` but NOT an alias inside a
+    /// larger expression combined with `GROUP BY`, and failed live with
+    /// "Msg 207 ... Invalid column name 'data_bytes'"/`'index_bytes'`.
+    /// Fixed by repeating the underlying aggregate expressions in
+    /// `ORDER BY` instead of referencing the aliases — verified live
+    /// against a real (dockerized) SQL Server 2022 instance, including
+    /// with an actual user table present.
     pub const TABLES: &str = "\
 SELECT OBJECT_SCHEMA_NAME(ps.object_id) AS [schema], OBJECT_NAME(ps.object_id) AS [table],
        SUM(CASE WHEN ps.index_id IN (0,1) THEN ps.in_row_data_page_count ELSE 0 END) * 8 * 1024 AS data_bytes,
@@ -162,7 +184,8 @@ SELECT OBJECT_SCHEMA_NAME(ps.object_id) AS [schema], OBJECT_NAME(ps.object_id) A
 FROM sys.dm_db_partition_stats ps
 JOIN sys.tables t ON t.object_id = ps.object_id
 GROUP BY ps.object_id
-ORDER BY data_bytes + index_bytes DESC";
+ORDER BY SUM(CASE WHEN ps.index_id IN (0,1) THEN ps.in_row_data_page_count ELSE 0 END) * 8 * 1024
+       + SUM(CASE WHEN ps.index_id > 1 THEN ps.used_page_count ELSE 0 END) * 8 * 1024 DESC";
 }
 
 /// See the Interfaces doc comment. `debug_assert` mirrors sandbox.rs's

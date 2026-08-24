@@ -2438,10 +2438,48 @@ async fn run_monitor_refresh(
             blocking: drain_rows(conn, pg::BLOCKING, &cancel).await,
             tables: drain_rows(conn, pg::TABLES, &cancel).await,
         },
-        // Unreachable today: monitor_available gates open_monitor to
-        // Postgres. When dbc-driver-mssql lands, this arm switches to the
-        // monitor_sql::mssql statement set (design §7).
-        _ => {
+        // G15 T6: complete, correct code — reachable the MOMENT
+        // `monitor::monitor_available` is updated (T8's flip, gated on the
+        // XACT_ABORT matrix, Global Constraints). 11 statements over the
+        // SAME dedicated connection (session-sharing caveat, same as pg),
+        // strictly sequential; each `drain_rows` failure is captured
+        // per-statement (never a panic — a `VIEW SERVER STATE`-denied DMV
+        // query just becomes that statement's `Err(driver message)`, same
+        // as pg's own permission-denied rows) and the `monitor::merge_*`
+        // helpers turn the 11 raw results into the 8 pg-shaped tiles
+        // `assemble_snapshot` already knows how to degrade per-tile.
+        // `RUNNING`/`BLOCKING`/`TABLES` pass through `drain_rows` directly —
+        // their column order already matches the pg parse contracts by
+        // construction (monitor_sql.rs's module doc), so
+        // `parse_blocking_edges`/`build_blocking_tree`'s iterative,
+        // `MONITOR_TREE_NODE_CAP`-bounded tree machinery applies to MSSQL
+        // blocking chains (via `blocking_session_id`) with no new code.
+        dbc_state::Engine::Mssql => {
+            use crate::monitor_sql::mssql as ms;
+            let counts = drain_rows(conn, ms::CONNECTIONS, &cancel).await;
+            let max = drain_rows(conn, ms::CONNECTIONS_MAX, &cancel).await;
+            let waiting = drain_rows(conn, ms::LOCKS_WAITING, &cancel).await;
+            let deadlocks = drain_rows(conn, ms::DEADLOCKS, &cancel).await;
+            let size = drain_rows(conn, ms::SIZE, &cancel).await;
+            let cache = drain_rows(conn, ms::CACHE_HIT, &cancel).await;
+            let uptime = drain_rows(conn, ms::UPTIME, &cancel).await;
+            let xact = drain_rows(conn, ms::XACT_TOTAL, &cancel).await;
+            let (data_size, wal_size) = monitor::split_mssql_size(size);
+            monitor::RefreshResults {
+                connections: monitor::merge_mssql_connections(counts, max),
+                locks: monitor::merge_mssql_locks(waiting, deadlocks),
+                data_size,
+                wal_size,
+                perf: monitor::merge_mssql_perf(cache, uptime, xact),
+                running: drain_rows(conn, ms::RUNNING, &cancel).await,
+                blocking: drain_rows(conn, ms::BLOCKING, &cancel).await,
+                tables: drain_rows(conn, ms::TABLES, &cancel).await,
+            }
+        }
+        // Sqlite: no monitor concept (spec) — unreachable today
+        // (`monitor_available` gates `open_monitor` to Postgres/MSSQL-once-
+        // flipped), message unchanged.
+        dbc_state::Engine::Sqlite => {
             let err = || Err("monitor není pro tento engine k dispozici".to_string());
             monitor::RefreshResults {
                 connections: err(), locks: err(), data_size: err(), wal_size: err(),
@@ -4274,6 +4312,180 @@ mod monitor_tests {
         drop(cmd_tx);
         tokio::time::timeout(Duration::from_secs(5), loop_task).await.unwrap().unwrap();
         drop(f);
+    }
+
+    /// G15 T6 REQUIRED: the kill path's engine-genericity holds for MSSQL
+    /// too — same `RecordingConnection`/`monitor_loop` seam as
+    /// `monitor_kill_executes_exact_sql_on_writable_connection` above,
+    /// just with `Engine::Mssql`, proving `MonitorCmd::Kill` still routes
+    /// through the SAME confirm-flow dispatch and its direct
+    /// (non-`guard_not_read_only`) read-only check — no MSSQL-specific
+    /// branch was needed or added in `monitor_loop`.
+    #[tokio::test]
+    async fn monitor_kill_executes_exact_sql_on_writable_mssql_connection() {
+        let (conn, calls, sqls) = RecordingConnection::new();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let loop_task = tokio::spawn(monitor_loop(
+            Box::new(conn),
+            dbc_state::Engine::Mssql,
+            /* read_only */ false,
+            cmd_rx,
+            event_tx,
+        ));
+
+        cmd_tx.send(MonitorCmd::Kill { generation: 1, pid: 55 }).await.unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(5), event_rx.recv()).await.unwrap().unwrap();
+        match ev {
+            MonitorEvent::KillResult { pid: 55, result: Ok(1), .. } => {}
+            other => panic!("expected Ok KillResult, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sqls.lock().unwrap().as_slice(), &["KILL 55".to_string()]);
+
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(5), loop_task).await.unwrap().unwrap();
+    }
+
+    /// G15 T6 REQUIRED (Global Constraints §1a): a read-only MSSQL monitor
+    /// connection refuses Kill the exact same way a read-only pg one does —
+    /// belt-and-braces, since MSSQL has no server-side kill restriction
+    /// either (design §0/§9.1).
+    #[tokio::test]
+    async fn monitor_kill_refused_on_read_only_mssql_before_reaching_driver() {
+        let (conn, calls, _sqls) = RecordingConnection::new();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let loop_task = tokio::spawn(monitor_loop(
+            Box::new(conn),
+            dbc_state::Engine::Mssql,
+            /* read_only */ true,
+            cmd_rx,
+            event_tx,
+        ));
+
+        cmd_tx.send(MonitorCmd::Kill { generation: 1, pid: 55 }).await.unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(5), event_rx.recv()).await.unwrap().unwrap();
+        match ev {
+            MonitorEvent::KillResult { result, .. } => {
+                assert_eq!(result.unwrap_err().message, MONITOR_READ_ONLY_KILL_MSG);
+            }
+            other => panic!("expected KillResult, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(5), loop_task).await.unwrap().unwrap();
+    }
+
+    /// Single-row, N-text-column `QueryStream` — the shape every MSSQL
+    /// monitor DMV query returns (one row, 1-2 columns; see
+    /// `monitor_sql::mssql`'s constants), for `MssqlDmvConnection::query`
+    /// below.
+    fn text_row_stream(cols: &[(&str, &str)]) -> dbc_core::QueryStream {
+        use dbc_core::arrow::array::{ArrayRef, RecordBatch, StringBuilder};
+        use dbc_core::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+        let schema: SchemaRef = std::sync::Arc::new(Schema::new(
+            cols.iter().map(|(name, _)| Field::new(*name, DataType::Utf8, true)).collect::<Vec<_>>(),
+        ));
+        let arrays: Vec<ArrayRef> = cols
+            .iter()
+            .map(|(_, value)| {
+                let mut builder = StringBuilder::new();
+                builder.append_value(value);
+                std::sync::Arc::new(builder.finish()) as ArrayRef
+            })
+            .collect();
+        let batch = RecordBatch::try_new(schema.clone(), arrays).expect("schema matches builders");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let _ = tx.try_send(Ok(batch));
+        dbc_core::QueryStream { columns: schema, batches: rx }
+    }
+
+    /// Schema-only `QueryStream` (zero rows) — the shape `RUNNING`/
+    /// `BLOCKING`/`TABLES` return in this test's fixture (no active
+    /// sessions/locks/tables): the `Sender` is dropped immediately, so
+    /// `drain_rows`'s receive loop sees the channel already closed and
+    /// returns `Ok(vec![])`, same as a genuinely empty result set.
+    fn empty_row_stream(col_names: &[&str]) -> dbc_core::QueryStream {
+        use dbc_core::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+        let schema: SchemaRef = std::sync::Arc::new(Schema::new(
+            col_names.iter().map(|name| Field::new(*name, DataType::Utf8, true)).collect::<Vec<_>>(),
+        ));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        dbc_core::QueryStream { columns: schema, batches: rx }
+    }
+
+    /// G15 T6 REQUIRED: end-to-end proof (no docker) that `run_monitor_refresh`'s
+    /// Mssql arm issues exactly the 11 `monitor_sql::mssql` statements and
+    /// that `RefreshResults` — after `monitor::merge_mssql_connections`/
+    /// `split_mssql_size`/`merge_mssql_locks`/`merge_mssql_perf` — reaches
+    /// `assemble_snapshot` in the SAME pg-shaped form real MSSQL wiring
+    /// would produce, including the "value_in_use = 0 -> max None"
+    /// unlimited-connections rule.
+    struct MssqlDmvConnection;
+
+    #[async_trait::async_trait]
+    impl Connection for MssqlDmvConnection {
+        async fn query(
+            &mut self,
+            sql: &str,
+            _cancel: CancelToken,
+        ) -> Result<dbc_core::QueryStream, QueryError> {
+            use crate::monitor_sql::mssql as ms;
+            Ok(match sql {
+                s if s == ms::CONNECTIONS => text_row_stream(&[("active", "5"), ("idle", "2")]),
+                s if s == ms::CONNECTIONS_MAX => text_row_stream(&[("max_conn", "0")]), // unlimited
+                s if s == ms::LOCKS_WAITING => text_row_stream(&[("waiting", "1")]),
+                s if s == ms::DEADLOCKS => text_row_stream(&[("deadlocks_since_reset", "3")]),
+                s if s == ms::SIZE => {
+                    text_row_stream(&[("data_bytes", "1048576"), ("log_bytes", "2097152")])
+                }
+                s if s == ms::CACHE_HIT => text_row_stream(&[("cache_hit_pct", "98.5")]),
+                s if s == ms::UPTIME => text_row_stream(&[("uptime_secs", "7200")]),
+                s if s == ms::XACT_TOTAL => text_row_stream(&[("xact_total", "555")]),
+                s if s == ms::RUNNING => empty_row_stream(&[
+                    "pid", "user", "application", "client", "state", "duration_secs", "query",
+                ]),
+                s if s == ms::BLOCKING => empty_row_stream(&[
+                    "waiter_pid", "blocker_pid", "wait_secs", "waiter_query", "blocker_query",
+                ]),
+                s if s == ms::TABLES => empty_row_stream(&[
+                    "schema", "table", "data_bytes", "index_bytes", "toast_bytes", "row_estimate",
+                ]),
+                other => return Err(QueryError::msg(format!("unexpected monitor query: {other}"))),
+            })
+        }
+        async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn execute(&mut self, _sql: &str, _cancel: CancelToken) -> Result<u64, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_monitor_refresh_mssql_arm_produces_pg_shaped_results() {
+        let mut conn = MssqlDmvConnection;
+        let results = run_monitor_refresh(&mut conn, dbc_state::Engine::Mssql, CancelToken::new()).await;
+        let snap = monitor::assemble_snapshot(results, Instant::now()).expect("every constituent query ok");
+
+        assert_eq!(
+            snap.connections,
+            Some(monitor::ConnectionsTile { active: 5, idle: 2, max: None }) // value_in_use=0 -> unlimited
+        );
+        assert_eq!(snap.locks, Some(monitor::LocksTile { waiting: 1, deadlocks_since_reset: 3 }));
+        assert_eq!(
+            snap.size,
+            monitor::SizeTile { data_bytes: Some(1_048_576), wal_or_log_bytes: Some(2_097_152) }
+        );
+        let perf = snap.perf.expect("perf tile present");
+        assert_eq!(perf.cache_hit_pct, Some(98.5));
+        assert_eq!(perf.uptime_secs, 7200);
+        assert_eq!(perf.xact_total, Some(555));
+        assert_eq!(snap.running, Some(vec![]));
+        assert_eq!(snap.blocking, Some(vec![]));
+        assert_eq!(snap.tables, Some(vec![]));
     }
 }
 

@@ -240,6 +240,139 @@ pub fn parse_tables(rows: &[Row]) -> Vec<TableSizeRow> {
         .collect()
 }
 
+// -- G15 T6: MSSQL merge helpers -----------------------------------------
+//
+// MSSQL's DMV-based refresh is 11 separate statements (vs pg's 8) because
+// several pg single-query tiles come from splitting the corresponding DMVs
+// into a primary + a secondary query (e.g. connections active/idle vs its
+// configured max, data vs log size) — same "split so a permission-denied
+// secondary can't take the primary down with it" rationale pg's own
+// DATA_SIZE/WAL_SIZE split already established (see that pair's doc
+// comments above). These helpers re-assemble each MSSQL statement pair/
+// triple into the exact pg-shaped `Row` layout `parse_connections`/
+// `parse_locks`/`parse_perf`/`SizeTile` already expect, so NONE of that
+// parsing code needs an MSSQL-specific branch — `run_monitor_refresh`'s
+// Mssql arm (runner.rs) calls these BEFORE building `RefreshResults`, then
+// the rest of the pipeline (`assemble_snapshot`, `build_blocking_tree`,
+// `parse_running`/`parse_blocking_edges`/`parse_tables`) is unchanged and
+// fully engine-agnostic already — MSSQL's BLOCKING/RUNNING/TABLES queries
+// are column-order-compatible with the pg parse contracts by construction
+// (monitor_sql.rs's own module doc), so the same iterative
+// `build_tree_iterative`/`MONITOR_TREE_NODE_CAP` blocking-tree machinery
+// (no recursion, hard node cap) applies to MSSQL blocking chains without
+// any new code here.
+//
+// Shared rule for every merge fn below (design §4's monitor row / this
+// plan's T6 grounding): the merged tile is `Err` ONLY when EVERY
+// constituent query failed; a failed (or empty-result) constituent alone
+// degrades to a `None` cell in the synthesized row — `parse_connections`/
+// `parse_locks`/`parse_perf`'s existing fail-soft cell readers
+// (`cell_i64`/`cell_f64`, `unwrap_or(0)`/`None`) already turn a `None` cell
+// into the same "n/a"/zero-default degrade pg's own permission-denied rows
+// produce today (see `parse_connections_garbage_and_null_degrade_not_panic`)
+// — no new degrade logic needed downstream of these helpers.
+
+/// `result`'s first row's cell at `col`, or `None` on `Err`, an empty
+/// result, or a genuine SQL NULL — the one place every merge helper below
+/// reads a constituent query's value, so "failed/absent/NULL all degrade
+/// the same way" is enforced in one spot.
+fn first_row_cell(result: &Result<Vec<Row>, String>, col: usize) -> Option<String> {
+    result.as_ref().ok()?.first()?.get(col).cloned().flatten()
+}
+
+/// `true` iff every one of `results` is `Err` — the shared "whole tile is
+/// down" trigger every merge helper below checks first.
+fn all_failed(results: &[&Result<Vec<Row>, String>]) -> bool {
+    results.iter().all(|r| r.is_err())
+}
+
+/// First error message among `results`, in argument order (design: "Err
+/// (first message)") — only ever read once `all_failed` has already fired.
+fn first_error(results: &[&Result<Vec<Row>, String>]) -> String {
+    results
+        .iter()
+        .find_map(|r| r.as_ref().err().cloned())
+        .unwrap_or_else(|| "monitor: all constituent queries failed".to_string())
+}
+
+/// `CONNECTIONS` `[active, idle]` + `CONNECTIONS_MAX` `[value_in_use]` ->
+/// one `[active, idle, max]` row matching `parse_connections`'s pg
+/// contract. `value_in_use == "0"` means "unlimited/dynamic" server-side
+/// (`monitor_sql::mssql::CONNECTIONS_MAX`'s own doc comment) -> `max` cell
+/// `None`, same as a failed/absent max query — both cases mean "no fixed
+/// ceiling to show".
+pub fn merge_mssql_connections(
+    counts: Result<Vec<Row>, String>,
+    max: Result<Vec<Row>, String>,
+) -> Result<Vec<Row>, String> {
+    if all_failed(&[&counts, &max]) {
+        return Err(first_error(&[&counts, &max]));
+    }
+    let max_cell = first_row_cell(&max, 0).filter(|v| v.trim() != "0");
+    Ok(vec![vec![first_row_cell(&counts, 0), first_row_cell(&counts, 1), max_cell]])
+}
+
+/// `LOCKS_WAITING` `[count]` + `DEADLOCKS` `[cumulative]` -> `[waiting,
+/// deadlocks]` matching `parse_locks`'s pg `LOCKS` contract.
+pub fn merge_mssql_locks(
+    waiting: Result<Vec<Row>, String>,
+    deadlocks: Result<Vec<Row>, String>,
+) -> Result<Vec<Row>, String> {
+    if all_failed(&[&waiting, &deadlocks]) {
+        return Err(first_error(&[&waiting, &deadlocks]));
+    }
+    Ok(vec![vec![first_row_cell(&waiting, 0), first_row_cell(&deadlocks, 0)]])
+}
+
+/// `SIZE` is ONE row, TWO cols `[data_bytes, log_bytes]` (`sys.database_files`,
+/// split by `type_desc`) -> `(data_size_rows, wal_size_rows)`, each a single
+/// one-row/one-col result feeding the existing `SizeTile { data_bytes,
+/// wal_or_log_bytes }` cell reads unchanged (`assemble_snapshot` already
+/// reads `data_size`/`wal_size` independently, same as pg's own split
+/// DATA_SIZE/WAL_SIZE queries). A query-level `Err` propagates to BOTH
+/// halves (there is only ONE query here, unlike the connections/locks
+/// pairs above — a failure is total, not partial by construction).
+pub fn split_mssql_size(
+    size: Result<Vec<Row>, String>,
+) -> (Result<Vec<Row>, String>, Result<Vec<Row>, String>) {
+    match size {
+        Ok(rows) => {
+            let data = rows.first().and_then(|r| r.first().cloned().flatten());
+            let log = rows.first().and_then(|r| r.get(1).cloned().flatten());
+            (Ok(vec![vec![data]]), Ok(vec![vec![log]]))
+        }
+        Err(e) => (Err(e.clone()), Err(e)),
+    }
+}
+
+/// `CACHE_HIT` + `UPTIME` + `XACT_TOTAL` -> `[cache_hit_pct, uptime_secs,
+/// xact_total]` matching `parse_perf`'s pg `PERF` contract.
+///
+/// Deviation from this task's plan text (reality/tests win — the
+/// discrepancy was in the grounding prose, not the given interface):
+/// the plan's grounding prose describes `CACHE_HIT` as raw ratio + ratio-
+/// base counters requiring a client-side `pct = ratio / base * 100.0`
+/// division. The plan's OWN interface signature already takes a single
+/// `cache` param (not `ratio`/`base`), and the actual, already-existing
+/// `monitor_sql::mssql::CACHE_HIT` constant computes
+/// `(ratio * 1.0 / NULLIF(base, 0)) * 100 AS cache_hit_pct` SERVER-SIDE —
+/// one column, already `NULL` when the base counter is 0. So there is
+/// nothing left to compute here: the cell is passed straight through,
+/// same "just plumb the value" shape as `uptime`/`xact` below. `xact_total`
+/// stays CUMULATIVE (not converted to a rate) — `monitor_view.rs`'s
+/// existing `compute_rate` client-side delta is reused untouched, exactly
+/// as it is for pg's own `xact_total`.
+pub fn merge_mssql_perf(
+    cache: Result<Vec<Row>, String>,
+    uptime: Result<Vec<Row>, String>,
+    xact: Result<Vec<Row>, String>,
+) -> Result<Vec<Row>, String> {
+    if all_failed(&[&cache, &uptime, &xact]) {
+        return Err(first_error(&[&cache, &uptime, &xact]));
+    }
+    Ok(vec![vec![first_row_cell(&cache, 0), first_row_cell(&uptime, 0), first_row_cell(&xact, 0)]])
+}
+
 /// Hard cap on MATERIALIZED tree nodes — independent of, and NOT covered
 /// by, `MONITOR_ROW_CAP` (runner.rs), which only bounds the number of
 /// EDGES/rows the driver returns. Review-mandated fix (BLOCKER 2):
@@ -507,9 +640,20 @@ pub fn assemble_snapshot(r: RefreshResults, fetched_at: std::time::Instant) -> R
 }
 
 /// Engine gating (design §7): Postgres only. Sqlite -> false (spec: no
-/// monitor tab); Mssql -> false FOR NOW — flips automatically once
-/// `connect::open_config`'s `Engine::Mssql` arm stops erroring and this
-/// one function is updated; no other monitor-side change needed.
+/// monitor tab); Mssql -> false FOR NOW.
+///
+/// Correction (G15 T6, curation item 2 — "this is a task, not a flag
+/// flip"): this used to say flipping this one function was the ONLY
+/// change needed once `connect::open_config`'s `Engine::Mssql` arm stopped
+/// erroring. That's no longer true even though `open_config` now DOES
+/// wire MSSQL (T3): `run_monitor_refresh`'s Mssql arm (runner.rs) and this
+/// module's merge helpers (`merge_mssql_connections`/`merge_mssql_locks`/
+/// `split_mssql_size`/`merge_mssql_perf`) are real, complete code as of
+/// T6 — reachable the MOMENT this function is updated — but this
+/// function's body deliberately stays Postgres-only until T8's flip,
+/// which is gated on the XACT_ABORT matrix running green on a real
+/// machine (Global Constraints), same standing discipline as every other
+/// feature-ON gate in this phase.
 pub fn monitor_available(engine: dbc_state::Engine) -> bool {
     matches!(engine, dbc_state::Engine::Postgres)
 }
@@ -887,13 +1031,133 @@ mod tests {
         assert_eq!(assemble_snapshot(r, Instant::now()), Err("connection closed".to_string()));
     }
 
+    // --- G15 T6: MSSQL merge helpers ---
+
+    fn one_row(cells: &[Option<&str>]) -> Vec<Row> {
+        vec![row(cells)]
+    }
+
+    #[test]
+    fn merge_connections_synthesizes_pg_shape() {
+        let counts = Ok(one_row(&[Some("3"), Some("7")]));
+        let max = Ok(one_row(&[Some("100")]));
+        let merged = merge_mssql_connections(counts, max).unwrap();
+        assert_eq!(parse_connections(&merged), ConnectionsTile { active: 3, idle: 7, max: Some(100) });
+    }
+
+    #[test]
+    fn merge_connections_zero_max_means_unlimited_none() {
+        let counts = Ok(one_row(&[Some("3"), Some("7")]));
+        let max = Ok(one_row(&[Some("0")]));
+        let merged = merge_mssql_connections(counts, max).unwrap();
+        assert_eq!(parse_connections(&merged).max, None);
+    }
+
+    #[test]
+    fn merge_connections_max_error_degrades_to_null_cell_not_tile_error() {
+        let counts = Ok(one_row(&[Some("3"), Some("7")]));
+        let max = Err("VIEW SERVER STATE permission denied (login lacks the permission)".to_string());
+        let merged = merge_mssql_connections(counts, max).unwrap();
+        assert_eq!(parse_connections(&merged), ConnectionsTile { active: 3, idle: 7, max: None });
+    }
+
+    #[test]
+    fn merge_connections_all_err_is_err() {
+        let counts = Err("login failed".to_string());
+        let max = Err("login failed".to_string());
+        assert!(merge_mssql_connections(counts, max).is_err());
+    }
+
+    /// `counts` is the tile's PRIMARY data source, but `ConnectionsTile`'s
+    /// `active`/`idle` are plain `i64` (not `Option`) — same fail-soft-to-0
+    /// posture pg's own "no rows at all" (permission-hidden) case already
+    /// has (`parse_connections_garbage_and_null_degrade_not_panic`), so a
+    /// LONE counts failure still degrades the row (max still shows) rather
+    /// than failing the whole tile — the shared rule ("Err ONLY when every
+    /// constituent failed") holds even for the primary/secondary pair.
+    #[test]
+    fn merge_connections_counts_error_alone_degrades_not_a_tile_error() {
+        let counts = Err("login failed".to_string());
+        let max = Ok(one_row(&[Some("100")]));
+        let merged = merge_mssql_connections(counts, max).unwrap();
+        assert_eq!(parse_connections(&merged), ConnectionsTile { active: 0, idle: 0, max: Some(100) });
+    }
+
+    #[test]
+    fn merge_locks_pairs_waiting_and_deadlocks() {
+        let waiting = Ok(one_row(&[Some("2")]));
+        let deadlocks = Ok(one_row(&[Some("9")]));
+        let merged = merge_mssql_locks(waiting, deadlocks).unwrap();
+        assert_eq!(parse_locks(&merged), LocksTile { waiting: 2, deadlocks_since_reset: 9 });
+    }
+
+    #[test]
+    fn merge_locks_all_err_is_err() {
+        assert!(merge_mssql_locks(Err("x".to_string()), Err("y".to_string())).is_err());
+    }
+
+    #[test]
+    fn split_size_two_cols_to_two_tiles() {
+        let size = Ok(one_row(&[Some("1024"), Some("2048")]));
+        let (data, wal) = split_mssql_size(size);
+        assert_eq!(cell_i64(&data.unwrap(), 0, 0), Some(1024));
+        assert_eq!(cell_i64(&wal.unwrap(), 0, 0), Some(2048));
+    }
+
+    #[test]
+    fn split_size_err_propagates_to_both_halves() {
+        let (data, wal) = split_mssql_size(Err("permission denied".to_string()));
+        assert_eq!(data, Err("permission denied".to_string()));
+        assert_eq!(wal, Err("permission denied".to_string()));
+    }
+
+    /// The server-side `NULLIF(base, 0)` in `monitor_sql::mssql::CACHE_HIT`
+    /// already turns a zero-base ratio into a SQL NULL — proves that NULL
+    /// cell survives the merge as a `None` cell (not a crash or a 0), same
+    /// fail-soft posture as every other tile. See `merge_mssql_perf`'s doc
+    /// comment for why there is no client-side ratio/base division here
+    /// (deviation from this task's plan text, documented there).
+    #[test]
+    fn merge_perf_computes_cache_pct_and_null_cache_cell_stays_null() {
+        let cache = Ok(one_row(&[Some("87.5")]));
+        let uptime = Ok(one_row(&[Some("3600")]));
+        let xact = Ok(one_row(&[Some("42")]));
+        let tile = parse_perf(&merge_mssql_perf(cache, uptime, xact).unwrap());
+        assert_eq!(tile.cache_hit_pct, Some(87.5));
+        assert_eq!(tile.uptime_secs, 3600);
+        assert_eq!(tile.xact_total, Some(42));
+
+        let cache_null = Ok(one_row(&[None]));
+        let merged_null =
+            merge_mssql_perf(cache_null, Ok(one_row(&[Some("60")])), Ok(one_row(&[Some("1")]))).unwrap();
+        assert_eq!(parse_perf(&merged_null).cache_hit_pct, None);
+    }
+
+    /// Cell passthrough only — the rate/delta computation stays in
+    /// `compute_rate` (called from `monitor_view.rs`), not here, exactly as
+    /// it does for pg's own `xact_total`.
+    #[test]
+    fn merge_perf_keeps_xact_cumulative() {
+        let cache = Ok(one_row(&[Some("50.0")]));
+        let uptime = Ok(one_row(&[Some("10")]));
+        let xact = Ok(one_row(&[Some("999999")]));
+        let merged = merge_mssql_perf(cache, uptime, xact).unwrap();
+        assert_eq!(parse_perf(&merged).xact_total, Some(999_999));
+    }
+
+    #[test]
+    fn merge_perf_all_err_is_err() {
+        let dead = || Err::<Vec<Row>, String>("x".to_string());
+        assert!(merge_mssql_perf(dead(), dead(), dead()).is_err());
+    }
+
     // --- gating + formatting ---
 
     #[test]
     fn monitor_available_postgres_only() {
         assert!(monitor_available(dbc_state::Engine::Postgres));
         assert!(!monitor_available(dbc_state::Engine::Sqlite));
-        assert!(!monitor_available(dbc_state::Engine::Mssql)); // until the driver lands (design §7)
+        assert!(!monitor_available(dbc_state::Engine::Mssql)); // until T8's flip (Global Constraints)
     }
 
     #[test]
