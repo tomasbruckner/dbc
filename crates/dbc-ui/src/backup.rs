@@ -199,28 +199,23 @@ pub fn detect_dump_format(bytes: &[u8]) -> DumpFormat {
 
 // --- MSSQL T-SQL builders --------------------------------------------------
 
-/// `BACKUP DATABASE "db" TO DISK = N'server-path' WITH FORMAT, STATS = 10`.
-/// Uses `dbc_core::quote_ident` (double-quote style) for the database name —
-/// same caveat G7's plan already documented for MSSQL bracket-quoting: the
-/// bracket-aware `admin_sql::quote_ident_for` does not exist as code
-/// anywhere in this repo yet (only as a G10 plan document), and MSSQL is
-/// entirely unwired at `connect::open_config` regardless (see this plan's
-/// Spec section), so this SQL text is built and unit-tested but never
-/// actually sent to a live MSSQL server by anything in this codebase today.
-/// Follow-up once both land: switch to `admin_sql::quote_ident_for`.
+/// `BACKUP DATABASE [db] TO DISK = N'server-path' WITH FORMAT, STATS = 10`.
+/// Uses `dbc_core::quote_ident_d(Dialect::Mssql, …)` (bracket style, `]`
+/// doubled) for the database name — these builders are MSSQL-only T-SQL, so
+/// the dialect is a fixed constant, not threaded from a caller.
 pub fn build_backup_sql(database: &str, server_path: &str) -> String {
     format!(
         "BACKUP DATABASE {} TO DISK = N{} WITH FORMAT, STATS = 10",
-        dbc_core::quote_ident(database),
+        dbc_core::quote_ident_d(dbc_core::Dialect::Mssql, database),
         sql_string_literal(server_path)
     )
 }
 
-/// `RESTORE DATABASE "db" FROM DISK = N'server-path' WITH REPLACE, STATS = 10`.
+/// `RESTORE DATABASE [db] FROM DISK = N'server-path' WITH REPLACE, STATS = 10`.
 pub fn build_restore_sql(database: &str, server_path: &str) -> String {
     format!(
         "RESTORE DATABASE {} FROM DISK = N{} WITH REPLACE, STATS = 10",
-        dbc_core::quote_ident(database),
+        dbc_core::quote_ident_d(dbc_core::Dialect::Mssql, database),
         sql_string_literal(server_path)
     )
 }
@@ -558,10 +553,22 @@ mod pure_tests {
     // --- MSSQL SQL builders ---
     #[test]
     fn backup_sql_shape_and_quoting() {
+        // Brackets don't treat `"` specially — only `]` needs doubling.
         let sql = build_backup_sql("my\"db", r"D:\Backups\mydb.bak");
         assert_eq!(
             sql,
-            "BACKUP DATABASE \"my\"\"db\" TO DISK = N'D:\\Backups\\mydb.bak' WITH FORMAT, STATS = 10"
+            "BACKUP DATABASE [my\"db] TO DISK = N'D:\\Backups\\mydb.bak' WITH FORMAT, STATS = 10"
+        );
+    }
+
+    // G15 T4 required golden string: `]` inside the database name is
+    // doubled, proving the bracket-quoting switch.
+    #[test]
+    fn backup_sql_doubles_embedded_closing_bracket() {
+        let sql = build_backup_sql("we]ird", r"D:\Backups\mydb.bak");
+        assert_eq!(
+            sql,
+            "BACKUP DATABASE [we]]ird] TO DISK = N'D:\\Backups\\mydb.bak' WITH FORMAT, STATS = 10"
         );
     }
 
@@ -570,7 +577,7 @@ mod pure_tests {
         let sql = build_restore_sql("mydb", r"D:\Backups\mydb.bak");
         assert_eq!(
             sql,
-            "RESTORE DATABASE \"mydb\" FROM DISK = N'D:\\Backups\\mydb.bak' WITH REPLACE, STATS = 10"
+            "RESTORE DATABASE [mydb] FROM DISK = N'D:\\Backups\\mydb.bak' WITH REPLACE, STATS = 10"
         );
     }
 

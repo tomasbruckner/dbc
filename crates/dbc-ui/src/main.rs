@@ -36,7 +36,7 @@ use std::rc::Rc;
 use dbc_buffer::ResultBuffer;
 use dbc_core::arrow::datatypes::SchemaRef;
 use dbc_core::{
-    apply_auto_limit, find_params, is_read_statement, quote_qualified, substitute_params,
+    apply_auto_limit_d, find_params, is_read_statement, quote_qualified_d, substitute_params,
     CancelToken, FkRef, QueryError, SchemaSnapshot, TableInfo,
 };
 use dbc_state::{
@@ -146,13 +146,19 @@ fn completion_edit(text: &str, cursor: usize, insert: &str) -> (std::ops::Range<
     (start..cursor, new_text)
 }
 
-/// G2 Task 7: SQL builder for `TreeEvent::OpenPreview`. Pure — no GPUI, no
-/// I/O — so quoting can be unit-tested directly. `quote_qualified` (shared
-/// with `synthesize_create_table`'s DDL quoting) is what makes this safe
-/// against a table literally named `we"ird`: the embedded quote is doubled,
-/// not smuggled into the query as SQL syntax.
-fn preview_sql(schema: Option<&str>, table: &str) -> String {
-    format!("SELECT * FROM {} LIMIT 1000", quote_qualified(schema, table))
+/// G2 Task 7 (G15 §2d: dialect-aware): SQL builder for `TreeEvent::
+/// OpenPreview`. Pure — no GPUI, no I/O — so quoting can be unit-tested
+/// directly. `quote_qualified_d` (shared with `synthesize_create_table_d`'s
+/// DDL quoting) is what makes this safe against a table literally named
+/// `we"ird`: the embedded quote is doubled, not smuggled into the query as
+/// SQL syntax. `LIMIT 1000` is invalid T-SQL — `TOP 1000` is the
+/// grammar-correct cap for MSSQL.
+fn preview_sql(dialect: dbc_core::Dialect, schema: Option<&str>, table: &str) -> String {
+    let target = quote_qualified_d(dialect, schema, table);
+    match dialect {
+        dbc_core::Dialect::Mssql => format!("SELECT TOP 1000 * FROM {target}"),
+        _ => format!("SELECT * FROM {target} LIMIT 1000"),
+    }
 }
 
 /// G6 Task 3: substitutes `sql_template`'s `:name` params (via
@@ -277,6 +283,34 @@ fn dialect_for_engine(engine: dbc_state::Engine) -> Option<dbc_core::Dialect> {
     }
 }
 
+/// G15 §2d: total Engine -> Dialect mapping for SQL COMPOSITION (sandbox
+/// Apply, CSV import, preview/fk-join SELECTs, admin_sql delegation).
+/// Distinct from `dialect_for_engine` (the SPLITTER gate, above), which
+/// stays `Mssql -> None` until T8's flip: composers need the dialect even
+/// while the multi-statement path is still gated — an MSSQL connection's
+/// Apply dialog must show/execute bracket-quoted, `N''`-literal SQL even
+/// though `run_query_with`'s multi-statement unlock isn't live for it yet.
+fn sql_dialect(engine: dbc_state::Engine) -> dbc_core::Dialect {
+    match engine {
+        dbc_state::Engine::Postgres => dbc_core::Dialect::Postgres,
+        dbc_state::Engine::Sqlite => dbc_core::Dialect::Sqlite,
+        dbc_state::Engine::Mssql => dbc_core::Dialect::Mssql,
+    }
+}
+
+/// G15 §2c: `SplitError` -> user-facing Czech text. Used by
+/// `count_statements_in_file` and `run_query_with`'s `split_sql` `Err(e)`
+/// arm; `runner.rs`'s script path duplicates the one Czech literal
+/// deliberately (T4/T5 stay parallel-safe, disjoint files).
+pub(crate) fn split_error_message(e: dbc_core::SplitError) -> String {
+    match e {
+        dbc_core::SplitError::UnsupportedGoCount => {
+            "GO s počtem opakování není podporováno".to_string()
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 /// G12 T5: per-statement auto-limit (design §4) — only bare `SELECT`s in
 /// the already-split statement list get a `LIMIT` appended (before the
 /// split, a multi-statement blob never got limited at all: `apply_auto_limit`
@@ -284,13 +318,18 @@ fn dialect_for_engine(engine: dbc_state::Engine) -> Option<dbc_core::Dialect> {
 /// the rewritten list plus whether ANY statement changed (drives the caller's
 /// " · auto-LIMIT {n}" status suffix, same convention as the single-statement
 /// path).
-fn auto_limit_each(statements: Vec<String>, limit: Option<u64>, bypass: bool) -> (Vec<String>, bool) {
+fn auto_limit_each(
+    statements: Vec<String>,
+    limit: Option<u64>,
+    bypass: bool,
+    dialect: dbc_core::Dialect,
+) -> (Vec<String>, bool) {
     let Some(n) = limit.filter(|_| !bypass) else { return (statements, false) };
     let mut changed_any = false;
     let out = statements
         .into_iter()
         .map(|s| {
-            let (rewritten, changed) = apply_auto_limit(&s, n);
+            let (rewritten, changed) = apply_auto_limit_d(&s, n, dialect);
             changed_any |= changed;
             rewritten
         })
@@ -320,13 +359,15 @@ fn count_statements_in_file(path: &std::path::Path, dialect: dbc_core::Dialect) 
         if n == 0 {
             break;
         }
-        let stmts = splitter.push(&buf[..n]).map_err(|e| format!("{}: {e:?}", path.display()))?;
+        let stmts = splitter
+            .push(&buf[..n])
+            .map_err(|e| format!("{}: {}", path.display(), split_error_message(e)))?;
         count += stmts.len();
     }
     match splitter.finish() {
         Ok(Some(_)) => count += 1,
         Ok(None) => {}
-        Err(e) => return Err(format!("{}: {e:?}", path.display())),
+        Err(e) => return Err(format!("{}: {}", path.display(), split_error_message(e))),
     }
     Ok(count)
 }
@@ -1417,12 +1458,14 @@ impl AppView {
             if let Some(dialect) = conn_meta.map(|(_, e)| e).and_then(dialect_for_engine) {
                 match dbc_core::split_sql(&sql, dialect) {
                     Err(e) => {
-                        self.status = format!("error: SQL nelze rozdělit na příkazy: {e:?}");
+                        self.status =
+                            format!("error: SQL nelze rozdělit na příkazy: {}", split_error_message(e));
                         cx.notify();
                         return;
                     }
                     Ok(stmts) if stmts.len() > 1 => {
-                        let (stmts, limited) = auto_limit_each(stmts, auto_limit, bypass_auto_limit);
+                        let (stmts, limited) =
+                            auto_limit_each(stmts, auto_limit, bypass_auto_limit, dialect);
                         self.run_many(spec, sql, stmts, limited, timeout_secs, cx);
                         return;
                     }
@@ -1435,7 +1478,9 @@ impl AppView {
         // (Server-side enforcement lives in connect::open_config: Postgres
         // `default_transaction_read_only=on`, SQLite `SQLITE_OPEN_READ_ONLY`
         // — this check is the fast, no-connection-needed first line, not the
-        // only line.)
+        // only line — EXCEPT MSSQL, which has no server-side read-only mode
+        // (driver integration note 5): for MSSQL this client-side check IS
+        // the only line.)
         if read_only && !is_read_statement(&sql) {
             let err = QueryError::msg("connection is read-only");
             self.status = format!("error: {err}");
@@ -1443,15 +1488,23 @@ impl AppView {
             return;
         }
 
-        // Guard 2: auto-limit.
+        // Guard 2: auto-limit (single-statement fallback — the
+        // multi-statement branch above already applied `auto_limit_each`
+        // and returned). G15 §2d: dialect-correct rewrite vocabulary — an
+        // MSSQL connection must never reach the `LIMIT`-appending form on
+        // any branch-intermediate state.
         let mut sql = sql;
         let mut limit_suffix = String::new();
         if !bypass_auto_limit {
             if let Some(n) = auto_limit {
-                let (rewritten, changed) = apply_auto_limit(&sql, n);
+                let dialect = conn_meta.map(|(_, e)| sql_dialect(e)).unwrap_or(dbc_core::Dialect::Postgres);
+                let (rewritten, changed) = apply_auto_limit_d(&sql, n, dialect);
                 if changed {
                     sql = rewritten;
-                    limit_suffix = format!(" · auto-LIMIT {n}");
+                    limit_suffix = match dialect {
+                        dbc_core::Dialect::Mssql => format!(" · auto-TOP {n}"),
+                        _ => format!(" · auto-LIMIT {n}"),
+                    };
                 }
             }
         }
@@ -1879,7 +1932,11 @@ impl AppView {
                                             .and_then(|t| AppView::grid_dirty_change_count(t, cx));
                                         match decide_retrigger_action(tab_still_open, dirty) {
                                             RetriggerAction::Run => {
+                                                let dialect = conn_meta
+                                                    .map(|(_, e)| sql_dialect(e))
+                                                    .unwrap_or(dbc_core::Dialect::Postgres);
                                                 let sql = fk_join::build_join_sql(
+                                                    dialect,
                                                     pt.schema.as_deref(),
                                                     &pt.table,
                                                     &pt.joins,
@@ -4581,7 +4638,8 @@ impl AppView {
                     cx.notify();
                     return;
                 }
-                let sql = fk_join::build_join_sql(schema.as_deref(), table, joins);
+                let dialect = self.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres);
+                let sql = fk_join::build_join_sql(dialect, schema.as_deref(), table, joins);
                 let preview = PreviewTarget {
                     title: title.clone(),
                     key: key.clone(),
@@ -4878,7 +4936,8 @@ impl AppView {
     /// silently close an EXISTING dirty tab for the same (schema, table) via
     /// `Tabs::close_by_preview_key` right before opening the fresh one.
     fn open_table_preview(&mut self, schema: Option<String>, table: String, cx: &mut Context<Self>) {
-        let sql = preview_sql(schema.as_deref(), &table);
+        let dialect = self.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres);
+        let sql = preview_sql(dialect, schema.as_deref(), &table);
         let key = format!("{}.{table}", schema.clone().unwrap_or_default());
         let preview = PreviewTarget {
             title: format!("Náhled: {table}"),
@@ -5439,6 +5498,7 @@ impl AppView {
         grid.update(cx, |g, _| {
             g.close_overlay_if_open();
         });
+        let dialect = self.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres);
         let (statements, preview_identity) = {
             let g = grid.read(cx);
             let Some(editable) = g.editable.clone() else { return };
@@ -5453,6 +5513,7 @@ impl AppView {
                 headers: &headers,
                 pk_cols: &editable.pk_cols,
                 numeric_cols: &editable.numeric_cols,
+                dialect,
             };
             let mut original = |row: usize, col: usize| -> Option<String> {
                 let mut b = buf_rc.borrow_mut();
@@ -5593,7 +5654,9 @@ impl AppView {
                                 // over next, same as every other status
                                 // transition in this file.
                                 let (schema, table) = preview_identity;
-                                let sql = preview_sql(schema.as_deref(), &table);
+                                let dialect =
+                                    view.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres);
+                                let sql = preview_sql(dialect, schema.as_deref(), &table);
                                 let key = format!("{}.{table}", schema.clone().unwrap_or_default());
                                 let title = format!("Náhled: {table}");
                                 let preview = PreviewTarget {
@@ -7917,23 +7980,53 @@ mod preview_sql_tests {
 
     #[test]
     fn quotes_schema_and_table_with_limit_1000() {
-        assert_eq!(preview_sql(Some("public"), "orders"), "SELECT * FROM \"public\".\"orders\" LIMIT 1000");
+        assert_eq!(
+            preview_sql(dbc_core::Dialect::Postgres, Some("public"), "orders"),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 1000"
+        );
     }
 
     #[test]
     fn omits_schema_qualifier_when_none() {
-        assert_eq!(preview_sql(None, "orders"), "SELECT * FROM \"orders\" LIMIT 1000");
+        assert_eq!(
+            preview_sql(dbc_core::Dialect::Postgres, None, "orders"),
+            "SELECT * FROM \"orders\" LIMIT 1000"
+        );
     }
 
     /// Brief contract #4: a table literally named `we"ird` must not break
-    /// out of the query or inject anything — `quote_qualified` doubles the
+    /// out of the query or inject anything — `quote_qualified_d` doubles the
     /// embedded quote.
     #[test]
     fn survives_a_table_name_with_an_embedded_quote() {
-        assert_eq!(preview_sql(None, "we\"ird"), "SELECT * FROM \"we\"\"ird\" LIMIT 1000");
         assert_eq!(
-            preview_sql(Some("we\"ird"), "t"),
+            preview_sql(dbc_core::Dialect::Postgres, None, "we\"ird"),
+            "SELECT * FROM \"we\"\"ird\" LIMIT 1000"
+        );
+        assert_eq!(
+            preview_sql(dbc_core::Dialect::Postgres, Some("we\"ird"), "t"),
             "SELECT * FROM \"we\"\"ird\".\"t\" LIMIT 1000"
+        );
+    }
+
+    // G15 T4 required tests.
+    #[test]
+    fn preview_sql_mssql_uses_top() {
+        assert_eq!(
+            preview_sql(dbc_core::Dialect::Mssql, Some("public"), "orders"),
+            "SELECT TOP 1000 * FROM [public].[orders]"
+        );
+        assert_eq!(
+            preview_sql(dbc_core::Dialect::Mssql, None, "we]ird"),
+            "SELECT TOP 1000 * FROM [we]]ird]"
+        );
+    }
+
+    #[test]
+    fn preview_sql_pg_unchanged() {
+        assert_eq!(
+            preview_sql(dbc_core::Dialect::Postgres, Some("public"), "orders"),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 1000"
         );
     }
 }
@@ -8125,7 +8218,7 @@ mod multi_statement_tests {
             "UPDATE t SET x = 1".to_string(),
             "SELECT * FROM b LIMIT 5".to_string(),
         ];
-        let (out, changed) = auto_limit_each(stmts, Some(100), false);
+        let (out, changed) = auto_limit_each(stmts, Some(100), false, dbc_core::Dialect::Postgres);
         assert!(changed);
         assert_eq!(out[0], "SELECT * FROM a LIMIT 100");
         assert_eq!(out[1], "UPDATE t SET x = 1");
@@ -8135,8 +8228,38 @@ mod multi_statement_tests {
     #[test]
     fn auto_limit_each_bypass_and_none_are_noops() {
         let stmts = vec!["SELECT 1".to_string()];
-        assert_eq!(auto_limit_each(stmts.clone(), Some(100), true), (stmts.clone(), false));
-        assert_eq!(auto_limit_each(stmts.clone(), None, false), (stmts, false));
+        assert_eq!(
+            auto_limit_each(stmts.clone(), Some(100), true, dbc_core::Dialect::Postgres),
+            (stmts.clone(), false)
+        );
+        assert_eq!(
+            auto_limit_each(stmts.clone(), None, false, dbc_core::Dialect::Postgres),
+            (stmts, false)
+        );
+    }
+
+    #[test]
+    fn auto_limit_each_mssql_uses_top() {
+        let stmts = vec!["SELECT * FROM a".to_string(), "UPDATE t SET x = 1".to_string()];
+        let (out, changed) = auto_limit_each(stmts, Some(100), false, dbc_core::Dialect::Mssql);
+        assert!(changed);
+        assert_eq!(out[0], "SELECT TOP 100 * FROM a");
+        assert_eq!(out[1], "UPDATE t SET x = 1");
+    }
+
+    #[test]
+    fn split_error_message_go_count_is_czech() {
+        assert_eq!(
+            split_error_message(dbc_core::SplitError::UnsupportedGoCount),
+            "GO s počtem opakování není podporováno".to_string()
+        );
+    }
+
+    #[test]
+    fn sql_dialect_is_total() {
+        assert_eq!(sql_dialect(dbc_state::Engine::Postgres), dbc_core::Dialect::Postgres);
+        assert_eq!(sql_dialect(dbc_state::Engine::Sqlite), dbc_core::Dialect::Sqlite);
+        assert_eq!(sql_dialect(dbc_state::Engine::Mssql), dbc_core::Dialect::Mssql);
     }
 
     /// CURATION item 3's mandated test: two statements each carrying `:p` —
