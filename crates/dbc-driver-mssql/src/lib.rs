@@ -86,7 +86,9 @@
 //!    ever interferes with an app-issued literal `BEGIN TRANSACTION` (e.g.
 //!    by auto-committing between statements the app believes are inside an
 //!    open transaction) is itself unverified and should be checked
-//!    alongside the `XACT_ABORT` behavior above.
+//!    alongside the `XACT_ABORT` behavior above — see
+//!    `tests/mssql_tx_matrix.rs` (G15 §3c), which characterizes both
+//!    empirically before any MSSQL write path ships.
 //! 4. **Runtime prerequisite.** This driver requires "ODBC Driver 17" or
 //!    "18 for SQL Server" to be installed on the machine running it (not
 //!    bundled — `odbc-api` links the platform's ODBC driver manager, which
@@ -125,6 +127,14 @@
 //! itself is blocked server-side (i.e. before the first batch of rows is
 //! available to fetch) does not interrupt that wait; cancellation only
 //! takes effect once row fetching begins, or before it starts.
+//! [`MssqlConnection::query_with_session`] checks the token at the same
+//! granularity as `query()`: before connect, before the main batch (after
+//! preludes), and per fetch — never inside a prelude/postlude statement
+//! itself. Unlike `query()`, though, `query_with_session` is NOT
+//! streaming: it fully materializes every result set in memory before
+//! selecting one to hand back (see its doc comment's "BOUNDED STATEMENTS
+//! ONLY" warning) — it exists for the G13 T7 Showplan-via-session-prelude
+//! path, not as a general substitute for `query()`.
 
 mod config;
 mod schema;
@@ -195,6 +205,275 @@ impl MssqlConnection {
     /// read from a config file) instead of [`MssqlConfig`].
     pub fn from_connection_string(conn_str: impl Into<String>) -> Self {
         Self { conn_str: conn_str.into(), exec_conn: None }
+    }
+
+    /// G15 §1a eager handshake: opens ONE ODBC connection with the stored
+    /// connection string and drops it. [`MssqlConnection::new`] is lazy
+    /// (connects per operation); `open_config`'s contract — relied on by
+    /// `test_connect` and the status bar's connect-vs-query error split —
+    /// is "bad host/credentials fail HERE". Blocking (no async, no
+    /// `block_on`): callers must be on a blocking-legal thread
+    /// (`open_config` only ever runs inside `spawn_blocking`).
+    pub fn probe(&self) -> Result<(), QueryError> {
+        connect(&self.conn_str).map(|_| ())
+    }
+
+    /// G15 §2e (G13 T7): one fresh connection, session preludes, main
+    /// batch, best-effort postludes — the Showplan delivery mechanism.
+    /// `SET SHOWPLAN_XML` must be the ONLY statement in its batch and is
+    /// session-scoped, which is why `query()` (fresh connection per call)
+    /// cannot deliver it (design curation item 1).
+    ///
+    /// Walks every result set the main `sql` batch produces. If exactly one
+    /// of them has a single column named `Microsoft SQL Server 2005 XML
+    /// Showplan`, that result set is returned; otherwise the LAST result
+    /// set walked is returned (fail-open on the name — the needs-
+    /// verification flag from G13 §1b, bounded by "wrong text handed to a
+    /// parser that fails closed").
+    ///
+    /// **BOUNDED STATEMENTS ONLY (execution plans, DMV probes).** Unlike
+    /// `query()`, which streams `RecordBatch`es out over a bounded mpsc
+    /// channel as they're fetched, this method fully materializes EVERY
+    /// result set of the main batch into memory (`Vec<RecordBatch>` per
+    /// result set, collected before the selection rule ever runs) — there
+    /// is no back-pressure and no early return. That's fine for Showplan
+    /// XML and other small, single/few-row diagnostic payloads, but
+    /// routing arbitrary user SQL through this function instead of
+    /// `query()` is an unbounded-memory hazard: a large result set would
+    /// be held in full before the caller ever sees the first row. Never
+    /// use this for ordinary user-issued queries.
+    pub async fn query_with_session(
+        &self,
+        prelude: &[String],
+        sql: &str,
+        postlude: &[String],
+        cancel: CancelToken,
+    ) -> Result<QueryStream, QueryError> {
+        let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let (schema_tx, schema_rx) =
+            tokio::sync::oneshot::channel::<Result<SchemaRef, QueryError>>();
+        let conn_str = self.conn_str.clone();
+        let prelude: Vec<String> = prelude.to_vec();
+        let sql = sql.to_owned();
+        let postlude: Vec<String> = postlude.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            if cancel.is_cancelled() {
+                let _ = schema_tx.send(Err(cancelled_err()));
+                return;
+            }
+            let conn = match connect(&conn_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = schema_tx.send(Err(e));
+                    return;
+                }
+            };
+            if cancel.is_cancelled() {
+                run_postludes(&conn, &postlude);
+                let _ = schema_tx.send(Err(cancelled_err()));
+                return;
+            }
+
+            // Each prelude statement is its OWN batch (design §2e step 3).
+            for p in &prelude {
+                match conn.execute(p, (), None) {
+                    Ok(Some(cursor)) => drop(cursor), // unexpected but drained-by-drop
+                    Ok(None) => {}
+                    Err(e) => {
+                        let err = odbc_err(e);
+                        run_postludes(&conn, &postlude);
+                        let _ = schema_tx.send(Err(err));
+                        return;
+                    }
+                }
+            }
+
+            let mut cursor = match conn.execute(&sql, (), None) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    run_postludes(&conn, &postlude);
+                    let _ = schema_tx
+                        .send(Err(QueryError::msg("statement produced no result set")));
+                    return;
+                }
+                Err(e) => {
+                    let err = odbc_err(e);
+                    run_postludes(&conn, &postlude);
+                    let _ = schema_tx.send(Err(err));
+                    return;
+                }
+            };
+
+            // Walk ALL result sets, materializing each fully, then apply
+            // the selection rule (design §2e) after the walk is done.
+            let mut result_sets: Vec<(bool, SchemaRef, Vec<RecordBatch>)> = Vec::new();
+            loop {
+                if cancel.is_cancelled() {
+                    run_postludes(&conn, &postlude);
+                    let _ = schema_tx.send(Err(cancelled_err()));
+                    return;
+                }
+
+                let col_names: Vec<String> = match cursor.column_names() {
+                    Ok(it) => match it.collect::<Result<Vec<_>, _>>() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let err = odbc_err(e);
+                            run_postludes(&conn, &postlude);
+                            let _ = schema_tx.send(Err(err));
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        let err = odbc_err(e);
+                        run_postludes(&conn, &postlude);
+                        let _ = schema_tx.send(Err(err));
+                        return;
+                    }
+                };
+                let ncols = col_names.len();
+                let is_showplan =
+                    ncols == 1 && col_names[0] == "Microsoft SQL Server 2005 XML Showplan";
+                let schema: SchemaRef = Arc::new(Schema::new(
+                    col_names
+                        .iter()
+                        .map(|n| Field::new(n, DataType::Utf8, true))
+                        .collect::<Vec<_>>(),
+                ));
+
+                let mut buffers = match wide::build(&mut cursor, BATCH_ROWS, QUERY_MAX_STR_LEN) {
+                    Ok((b, _ncols)) => b,
+                    Err(e) => {
+                        run_postludes(&conn, &postlude);
+                        let _ = schema_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let mut block_cursor = match cursor.bind_buffer(&mut buffers) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let err = odbc_err(e);
+                        run_postludes(&conn, &postlude);
+                        let _ = schema_tx.send(Err(err));
+                        return;
+                    }
+                };
+
+                let mut batches: Vec<RecordBatch> = Vec::new();
+                loop {
+                    if cancel.is_cancelled() {
+                        run_postludes(&conn, &postlude);
+                        let _ = schema_tx.send(Err(cancelled_err()));
+                        return;
+                    }
+                    match block_cursor.fetch() {
+                        Ok(Some(batch)) => {
+                            let mut builders: Vec<StringBuilder> =
+                                (0..ncols).map(|_| StringBuilder::new()).collect();
+                            for (col_index, b) in builders.iter_mut().enumerate() {
+                                let slice = batch.column(col_index);
+                                for row_index in 0..batch.num_rows() {
+                                    match wide::cell_text(slice, row_index) {
+                                        Some(s) => b.append_value(s),
+                                        None => b.append_null(),
+                                    }
+                                }
+                            }
+                            let arrays: Vec<ArrayRef> = builders
+                                .into_iter()
+                                .map(|mut b| Arc::new(b.finish()) as ArrayRef)
+                                .collect();
+                            match RecordBatch::try_new(schema.clone(), arrays) {
+                                Ok(rb) => batches.push(rb),
+                                Err(e) => {
+                                    run_postludes(&conn, &postlude);
+                                    let _ = schema_tx.send(Err(QueryError::msg(e.to_string())));
+                                    return;
+                                }
+                            }
+                        }
+                        Ok(None) => break, // this result set exhausted
+                        Err(e) => {
+                            let err = odbc_err(e);
+                            run_postludes(&conn, &postlude);
+                            let _ = schema_tx.send(Err(err));
+                            return;
+                        }
+                    }
+                }
+
+                let (next_cursor, _buffers) = match block_cursor.unbind() {
+                    Ok(x) => x,
+                    Err(e) => {
+                        let err = odbc_err(e);
+                        run_postludes(&conn, &postlude);
+                        let _ = schema_tx.send(Err(err));
+                        return;
+                    }
+                };
+                result_sets.push((is_showplan, schema, batches));
+
+                match next_cursor.more_results() {
+                    Ok(Some(next)) => {
+                        cursor = next;
+                        continue;
+                    }
+                    Ok(None) => break, // no more result sets
+                    Err(e) => {
+                        let err = odbc_err(e);
+                        run_postludes(&conn, &postlude);
+                        let _ = schema_tx.send(Err(err));
+                        return;
+                    }
+                }
+            }
+
+            // Postludes run best-effort, ALWAYS, after the walk completes
+            // (design §2e step 6) — the connection drop that follows is
+            // the real backstop (ODBC disconnect rolls back any still-open
+            // transaction; session settings can never leak).
+            run_postludes(&conn, &postlude);
+
+            let chosen_idx = result_sets
+                .iter()
+                .position(|(is_showplan, _, _)| *is_showplan)
+                .or(if result_sets.is_empty() { None } else { Some(result_sets.len() - 1) });
+
+            let (schema, batches) = match chosen_idx {
+                Some(idx) => {
+                    let (_, schema, batches) = result_sets.into_iter().nth(idx).unwrap();
+                    (schema, batches)
+                }
+                None => {
+                    let _ = schema_tx.send(Err(QueryError::msg("no result sets produced")));
+                    return;
+                }
+            };
+
+            let _ = schema_tx.send(Ok(schema));
+            for b in batches {
+                if tx.blocking_send(Ok(b)).is_err() {
+                    break; // consumer gone
+                }
+            }
+        });
+
+        let columns = schema_rx.await.map_err(|_| QueryError::msg("driver task died"))??;
+        Ok(QueryStream { columns, batches: rx })
+    }
+}
+
+/// Runs every postlude statement best-effort (design §2e step 6): errors
+/// (and any unexpected result-set cursor) are discarded via `let _ =` —
+/// the connection drop that follows this call in every caller is the real
+/// backstop (ODBC disconnect rolls back any still-open transaction, and
+/// session settings set by a prelude can never leak to a reused
+/// connection, since this driver never reuses connections across
+/// `query_with_session` calls).
+fn run_postludes(conn: &odbc_api::Connection<'_>, postlude: &[String]) {
+    for p in postlude {
+        let _ = conn.execute(p, (), None);
     }
 }
 
@@ -379,4 +658,47 @@ fn run_execute(conn: &odbc_api::Connection<'_>, sql: &str) -> Result<u64, QueryE
     }
     let row_count = prealloc.row_count().map_err(odbc_err)?;
     map_row_count(row_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T2 Step 1 API-shape smoke test: `probe()` must be a plain blocking
+    /// method (not `async fn`), callable from ordinary sync code with no
+    /// executor — `open_config`'s `spawn_blocking` closure (T3) calls it
+    /// this way. No live server is required: a connection string with an
+    /// unreachable host/port simply fails fast inside `connect()`, which
+    /// is itself the point — the call type-checks and returns
+    /// `Result<(), QueryError>` without `.await` or a `tokio` runtime.
+    #[test]
+    fn probe_is_callable_from_a_non_async_fn() {
+        let c = MssqlConnection::from_connection_string(
+            "Driver={ODBC Driver 18 for SQL Server};Server=tcp:127.0.0.1,1;Database=x;Uid=x;Pwd=x;",
+        );
+        let _: Result<(), QueryError> = c.probe();
+    }
+
+    /// Security invariant (Global Constraints, "passwords"): `probe()`'s
+    /// error path must never leak the password into the error text.
+    /// `odbc_err` renders only the driver's diagnostic record text — this
+    /// pins that a failed connect (unreachable host/port, same shape as
+    /// `probe_is_callable_from_a_non_async_fn` above) never echoes back a
+    /// distinctive password planted in the connection string. Non-live,
+    /// fast, deterministic enough: connecting to 127.0.0.1:1 fails via
+    /// "connection refused" (or an equivalent immediate driver error)
+    /// well before any server-side auth exchange could occur.
+    #[test]
+    fn probe_error_never_contains_the_password() {
+        let distinctive_password = "sUp3r$ecretZzz9000";
+        let c = MssqlConnection::from_connection_string(format!(
+            "Driver={{ODBC Driver 18 for SQL Server}};Server=tcp:127.0.0.1,1;Database=x;Uid=x;Pwd={distinctive_password};"
+        ));
+        let err = c.probe().expect_err("connecting to 127.0.0.1:1 must fail");
+        assert!(
+            !err.message.contains(distinctive_password),
+            "probe() error text must never contain the password, got: {}",
+            err.message
+        );
+    }
 }
