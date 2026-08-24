@@ -15,6 +15,17 @@ use futures_util::StreamExt;
 use tokio_postgres::NoTls;
 use types::{arrow_type, ColBuilder};
 
+/// Re-exported so callers outside this crate (`dbc-ui`'s `connect::open_config`)
+/// can build a config for [`PostgresConnection::connect_with_config`] without
+/// depending on `tokio-postgres` directly — G1 follow-up #5 (final-review.md):
+/// a direct `tokio-postgres` dependency in `dbc-ui` was a protocol-crate leak
+/// past the "dbc-ui sees drivers only via connect.rs dispatch" line, and a
+/// version-coupling hazard (a future tokio-postgres bump here wouldn't be
+/// forced to also bump in lockstep at the dbc-ui call site). `PgConfig` is
+/// the exact same type as `tokio_postgres::Config`, just reachable through
+/// this crate's public API instead.
+pub use tokio_postgres::Config as PgConfig;
+
 /// Every catalog query in `schema()` excludes these — internal Postgres
 /// namespaces, not user objects. This also excludes session-temp namespaces
 /// (`pg_temp_N` / `pg_toast_temp_N`): without this, a `CREATE TEMP TABLE`

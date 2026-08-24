@@ -195,6 +195,33 @@ fn masked_to_real_offset(real: &str, masked_offset: usize) -> usize {
     real.grapheme_indices(true).nth(n).map(|(i, _)| i).unwrap_or(real.len())
 }
 
+/// Whether `copy`/`cut` must refuse to touch the clipboard — security
+/// follow-up #4 (final-review.md): a masked (password) `TextField` used to
+/// write the REAL buffer text to the clipboard on Ctrl+C/Ctrl+X even though
+/// the field only ever displays `•` bullets, leaking the plaintext password
+/// onto the system clipboard (visible to any other app / clipboard
+/// history). Standard password-field behaviour is to disable copy/cut
+/// entirely rather than try to redact "some of it" — pulled out as a pure
+/// function so the decision is unit-tested without a GPUI window.
+fn blocks_clipboard_write(masked: bool) -> bool {
+    masked
+}
+
+#[cfg(test)]
+mod clipboard_guard_tests {
+    use super::*;
+
+    #[test]
+    fn masked_field_blocks_clipboard_write() {
+        assert!(blocks_clipboard_write(true));
+    }
+
+    #[test]
+    fn unmasked_field_allows_clipboard_write() {
+        assert!(!blocks_clipboard_write(false));
+    }
+}
+
 actions!(
     text_field,
     [Backspace, Delete, Left, Right, SelectLeft, SelectRight, SelectAll, Home, End, Paste, Cut, Copy]
@@ -361,6 +388,9 @@ impl TextField {
         }
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if blocks_clipboard_write(self.masked) {
+            return;
+        }
         if let Some(sel) = self.buffer.selection() {
             if !sel.is_empty() {
                 cx.write_to_clipboard(ClipboardItem::new_string(self.buffer.text()[sel].to_string()));
@@ -368,6 +398,9 @@ impl TextField {
         }
     }
     fn cut(&mut self, _: &Cut, _window: &mut Window, cx: &mut Context<Self>) {
+        if blocks_clipboard_write(self.masked) {
+            return;
+        }
         if let Some(sel) = self.buffer.selection() {
             if !sel.is_empty() {
                 cx.write_to_clipboard(ClipboardItem::new_string(self.buffer.text()[sel].to_string()));
@@ -890,6 +923,18 @@ impl ConnectionFormData {
 pub enum PendingAfterUnlock {
     Connect(String),
     SaveConnection(Box<ConnectionFormData>),
+    /// Security follow-up #6 (final-review.md): the Test button used to
+    /// test WITHOUT the stored secret when the vault was locked (a
+    /// confusing auth failure) instead of prompting for the master
+    /// password like a normal connect. Carries the in-progress dialog's
+    /// `ConnectionDialogUi` — NOT a frozen snapshot: its fields are
+    /// `Entity<TextField>` handles, the SAME live entities the dialog was
+    /// using, just cloned (cheaply — cloning an `Entity` clones the handle,
+    /// not its content). `resume_pending`/`cancel_master_password_prompt`
+    /// reopen the dialog from these handles and (on resume) re-read their
+    /// CURRENT text via `to_form_data`, so whatever the user had typed
+    /// stays intact across the detour through this prompt.
+    TestConnection(Box<ConnectionDialogUi>),
 }
 
 #[derive(Clone)]
@@ -1624,13 +1669,38 @@ impl AppView {
     /// then updates `test_result` once the result comes back over a oneshot
     /// channel — same "UI thread only ever awaits a channel via `cx.spawn`"
     /// shape as `run_query`'s `QueryEvent` drain.
-    fn on_test_clicked(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// Security follow-up #6 (final-review.md): if the password field is
+    /// empty (relying on the stored secret) and the vault is locked, this
+    /// mirrors `on_dropdown_item_click`'s gate and prompts for the master
+    /// password FIRST — same as a normal connect — instead of silently
+    /// testing without the secret and surfacing a confusing auth failure.
+    fn on_test_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ModalState::ConnectionDialog(ui)) = &self.modal else { return };
         if ui.testing {
             return;
         }
         let ui_snapshot = ui.clone();
         let data = ui_snapshot.to_form_data(cx);
+
+        if test_needs_vault_prompt(
+            data.password.is_empty(),
+            data.engine,
+            self.vault.is_some(),
+            Vault::exists(&self.vault_path),
+        ) {
+            let input = cx.new(|cx| TextField::new(cx, "Heslo", true));
+            let focus = input.focus_handle(cx);
+            self.modal = Some(ModalState::MasterPasswordPrompt {
+                input,
+                error: None,
+                pending: PendingAfterUnlock::TestConnection(Box::new(ui_snapshot)),
+            });
+            window.focus(&focus, cx);
+            cx.notify();
+            return;
+        }
+
         let secret = if !data.password.is_empty() {
             Some(data.password.clone())
         } else {
@@ -1901,21 +1971,55 @@ impl AppView {
         }
     }
 
-    fn resume_pending(&mut self, pending: PendingAfterUnlock, cx: &mut Context<Self>) {
+    fn resume_pending(&mut self, pending: PendingAfterUnlock, window: &mut Window, cx: &mut Context<Self>) {
         match pending {
             PendingAfterUnlock::Connect(id) => self.switch_to_connection(&id, cx),
             PendingAfterUnlock::SaveConnection(data) => self.finish_save(*data, cx),
+            PendingAfterUnlock::TestConnection(ui) => {
+                self.modal = Some(ModalState::ConnectionDialog(*ui));
+                self.on_test_clicked(window, cx);
+            }
         }
     }
 
-    fn on_master_password_submit(&mut self, cx: &mut Context<Self>) {
+    /// td-security fix round, MINOR M3: the master-password prompt's
+    /// "Zrušit" used to call the generic `close_modal` unconditionally,
+    /// which set `modal = None` no matter what was pending — for
+    /// `PendingAfterUnlock::TestConnection` that silently threw away the
+    /// connection dialog the user was typing into (host/port/user/password
+    /// fields all vanish). Fixed by restoring the dialog from the pending's
+    /// `ConnectionDialogUi` instead: it carries LIVE `Entity<TextField>`
+    /// handles (not a frozen snapshot — see `PendingAfterUnlock::
+    /// TestConnection`'s doc comment), so reopening it picks up exactly
+    /// whatever's still typed in those fields, untouched by the detour
+    /// through this prompt.
+    ///
+    /// `PendingAfterUnlock::SaveConnection` is deliberately NOT given the
+    /// same treatment: it carries a plain-data `ConnectionFormData`
+    /// snapshot, not live field entities, so "restoring" it would mean
+    /// reconstructing a whole new `ConnectionDialogUi` (fresh `TextField`
+    /// entities re-seeded from the snapshot) rather than a same-shaped
+    /// swap — a bigger change than this pass covers. Cancelling a save's
+    /// vault prompt still closes the dialog outright, as before.
+    pub(crate) fn cancel_master_password_prompt(&mut self, cx: &mut Context<Self>) {
+        self.cancel_active_backup_if_running();
+        match self.modal.take() {
+            Some(ModalState::MasterPasswordPrompt { pending: PendingAfterUnlock::TestConnection(ui), .. }) => {
+                self.modal = Some(ModalState::ConnectionDialog(*ui));
+            }
+            _ => self.modal = None,
+        }
+        cx.notify();
+    }
+
+    fn on_master_password_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ModalState::MasterPasswordPrompt { input, pending, .. }) = self.modal.clone() else { return };
         let pwd = input.read(cx).text();
         match Vault::unlock(&self.vault_path, &pwd) {
             Ok(vault) => {
                 self.vault = Some(vault);
                 self.modal = None;
-                self.resume_pending(pending, cx);
+                self.resume_pending(pending, window, cx);
             }
             Err(e) => {
                 input.update(cx, |f, cx| f.set_text("", cx));
@@ -1963,7 +2067,7 @@ impl AppView {
             Ok(vault) => {
                 self.vault = Some(vault);
                 self.modal = None;
-                self.resume_pending(pending, cx);
+                self.resume_pending(pending, window, cx);
             }
             Err(e) => self.set_create_master_error(&e.message, cx),
         }
@@ -2085,6 +2189,56 @@ fn test_connect_spec(cfg: ConnectionConfig, secret: Option<String>) -> Result<Co
         return Err("MSSQL driver zatím není k dispozici".into());
     }
     Ok(ConnectSpec::Config { cfg: Box::new(cfg), secret })
+}
+
+/// Whether `on_test_clicked` must prompt for the master password before
+/// dispatching the test connect — security follow-up #6 (final-review.md):
+/// editing a saved connection with an empty password field while the vault
+/// is locked used to test WITHOUT the stored secret (a confusing auth
+/// failure) instead of prompting like a normal connect. Mirrors
+/// `on_dropdown_item_click`'s gate: only relevant when the dialog's
+/// password field is empty (i.e. the secret, if any, would have to come
+/// from the vault) AND the engine actually needs one AND the vault is
+/// currently locked but exists on disk.
+fn test_needs_vault_prompt(
+    password_field_empty: bool,
+    engine: Engine,
+    vault_unlocked: bool,
+    vault_file_exists: bool,
+) -> bool {
+    password_field_empty && engine != Engine::Sqlite && !vault_unlocked && vault_file_exists
+}
+
+#[cfg(test)]
+mod test_vault_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn empty_password_locked_vault_needs_prompt() {
+        assert!(test_needs_vault_prompt(true, Engine::Postgres, false, true));
+    }
+
+    #[test]
+    fn typed_password_never_needs_prompt() {
+        // password field non-empty -> test uses the typed value, vault is irrelevant.
+        assert!(!test_needs_vault_prompt(false, Engine::Postgres, false, true));
+    }
+
+    #[test]
+    fn sqlite_never_needs_prompt() {
+        assert!(!test_needs_vault_prompt(true, Engine::Sqlite, false, true));
+    }
+
+    #[test]
+    fn unlocked_vault_never_needs_prompt() {
+        assert!(!test_needs_vault_prompt(true, Engine::Postgres, true, true));
+    }
+
+    #[test]
+    fn no_vault_file_never_needs_prompt() {
+        // no vault created yet -> nothing to unlock, secret is simply absent.
+        assert!(!test_needs_vault_prompt(true, Engine::Postgres, false, false));
+    }
 }
 
 fn field_row(label: &str, field: Entity<TextField>, theme: Theme) -> impl IntoElement {
@@ -2316,7 +2470,7 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("dlg-test", test_label, *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.on_test_clicked(cx))))
+            .child(styled_button("dlg-test", test_label, *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_test_clicked(window, cx))))
             .child(styled_button("dlg-save", "Uložit", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_save_clicked(window, cx))))
             .child(styled_button("dlg-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx)))),
     );
@@ -2348,8 +2502,8 @@ fn render_master_password_panel(input: Entity<TextField>, error: Option<String>,
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("mpp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
-            .child(styled_button("mpp-submit", "Odemknout", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.on_master_password_submit(cx)))),
+            .child(styled_button("mpp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.cancel_master_password_prompt(cx))))
+            .child(styled_button("mpp-submit", "Odemknout", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_master_password_submit(window, cx)))),
     );
     panel.into_any_element()
 }
@@ -2864,7 +3018,7 @@ fn render_compare_picker_column(
         .h(px(240.))
         .overflow_hidden()
         .border_1()
-        .border_color(cx.theme().bg_hover)
+        .border_color(cx.theme().border_subtle)
         .rounded_md();
 
     if !grouped.favourites.is_empty() {

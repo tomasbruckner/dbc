@@ -1,13 +1,13 @@
 use std::time::Duration;
 
 use dbc_core::{Connection, QueryError};
-use dbc_driver_postgres::PostgresConnection;
+use dbc_driver_postgres::{PgConfig, PostgresConnection};
 use dbc_driver_sqlite::SqliteConnection;
 use dbc_state::{ConnectionConfig, Engine};
 
 use crate::tunnel::Tunnel;
 
-/// Fallback bound for `tokio_postgres::Config::connect_timeout` when a saved
+/// Fallback bound for `PgConfig::connect_timeout` when a saved
 /// connection doesn't set `timeout_secs` (that field otherwise doubles as
 /// the query-side watchdog in `runner::connect_and_run`). Keeps the TCP
 /// handshake from hanging for the OS's own default timeout (tens of seconds
@@ -52,12 +52,15 @@ pub struct OpenConnection {
 /// Connects using a saved [`ConnectionConfig`] (Task 7's connection manager),
 /// as opposed to [`open`]'s CLI-arg connection string.
 ///
-/// - Postgres: built via `tokio_postgres::Config`'s builder API rather than
-///   formatting a `postgres://user:pass@host:port/db` URL string — a
-///   password containing `@`, `/`, or other URL-special characters would
-///   otherwise have to be percent-encoded (and a bug there would silently
-///   corrupt the URL rather than fail loudly). The builder API takes the
-///   password as a separate field, so no encoding step exists to get wrong.
+/// - Postgres: built via `dbc_driver_postgres::PgConfig`'s (a re-export of
+///   `tokio_postgres::Config` — G1 follow-up #5, final-review.md: dbc-ui
+///   must not depend on the driver protocol crate directly) builder API
+///   rather than formatting a `postgres://user:pass@host:port/db` URL
+///   string — a password containing `@`, `/`, or other URL-special
+///   characters would otherwise have to be percent-encoded (and a bug there
+///   would silently corrupt the URL rather than fail loudly). The builder
+///   API takes the password as a separate field, so no encoding step exists
+///   to get wrong.
 ///   `SET SESSION CHARACTERISTICS` isn't needed for server-side read-only
 ///   enforcement either: `options("-c default_transaction_read_only=on")`
 ///   applies it for the lifetime of the connection, before any client SQL
@@ -111,7 +114,7 @@ pub fn open_config(
                 (cfg.host.clone(), cfg.port.unwrap_or(default_port), None)
             };
 
-            let mut config = tokio_postgres::Config::new();
+            let mut config = PgConfig::new();
             config
                 .host(&target_host)
                 .port(target_port)

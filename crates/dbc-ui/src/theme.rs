@@ -41,6 +41,17 @@ pub struct Theme {
     pub bg_hover: Hsla,
     pub bg_selected: Hsla,
     pub border: Hsla,
+    /// Subtle divider/outline border for elements that used `bg_hover` as a
+    /// border color pre-G14 (a dark-mode value-faithful pun that happened to
+    /// work because `bg_hover` was already a low-contrast near-background
+    /// gray there) — light mode's `bg_hover` (0xe4e7f0) is nearly invisible
+    /// against `bg_panel`'s white, so those sites need their own field
+    /// (G14 final review NIT-1). DARK is `bg_hover`'s value VERBATIM
+    /// (pixel-identical dark mode — hard requirement); LIGHT is a
+    /// deliberately visible mid-gray, picked distinct from both `border`
+    /// (0xd3d7e3, the stronger panel-edge outline) and `bg_hover`
+    /// (0xe4e7f0, near-invisible on white).
+    pub border_subtle: Hsla,
     pub bg_find_match: Hsla,
     pub bg_joined_col: Hsla,
     pub bg_deep: Hsla,
@@ -77,6 +88,7 @@ impl Theme {
             bg_hover: rgb(0x313244).into(),
             bg_selected: rgb(0x45475a).into(),
             border: rgb(0x45475a).into(),
+            border_subtle: rgb(0x313244).into(), // = bg_hover, VERBATIM (pixel-identical dark mode)
             bg_find_match: rgb(0x585b70).into(),
             bg_joined_col: rgb(0x2a2a3d).into(),
             bg_deep: rgb(0x11111b).into(),
@@ -116,6 +128,12 @@ impl Theme {
             bg_hover: rgb(0xe4e7f0).into(),
             bg_selected: rgb(0xcfd5e6).into(),
             border: rgb(0xd3d7e3).into(),
+            // Visible subtle border (G14 final review NIT-1) — ~1.54:1
+            // luminance contrast against bg_panel's #ffffff, clearly
+            // distinguishable from it (unlike bg_hover's ~1.24:1); a
+            // decorative container-outline border, not text, so this isn't
+            // held to the WCAG AA 4.5:1 text threshold.
+            border_subtle: rgb(0xccd0da).into(),
             bg_find_match: rgb(0xffe58a).into(),
             bg_joined_col: rgb(0xeef1fb).into(),
             bg_deep: rgb(0xe4e7f1).into(),
@@ -180,7 +198,7 @@ mod tests {
     fn all_fields(t: &Theme) -> Vec<Hsla> {
         vec![
             t.bg_app, t.bg_panel, t.bg_panel_alt, t.bg_hover, t.bg_selected,
-            t.border, t.bg_find_match, t.bg_joined_col, t.bg_deep,
+            t.border, t.border_subtle, t.bg_find_match, t.bg_joined_col, t.bg_deep,
             t.bg_warn_banner, t.bg_backdrop, t.bg_selection, t.text_primary,
             t.text_muted, t.text_faint, t.text_disabled, t.accent,
             t.accent_alt, t.warn, t.danger, t.success, t.diff_staged_bg,

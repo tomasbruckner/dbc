@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::BufReader;
+use std::rc::Rc;
 
 use dbc_core::arrow::array::RecordBatch;
 use dbc_core::arrow::datatypes::SchemaRef;
@@ -30,10 +32,39 @@ impl std::fmt::Display for BufferError {
 
 impl std::error::Error for BufferError {}
 
+/// Writes one batch to a fresh Arrow IPC file at `path`. Shared by `push`
+/// (called inline) and `push_async` (called inside `spawn_blocking`) — the
+/// only difference between the two spill paths is which thread runs this.
+fn write_spill_file(
+    path: &std::path::Path,
+    schema: &SchemaRef,
+    batch: &RecordBatch,
+) -> Result<(), BufferError> {
+    let file =
+        File::create(path).map_err(|e| BufferError { message: format!("spill file: {e}") })?;
+    let mut w = FileWriter::try_new(file, schema)
+        .map_err(|e| BufferError { message: format!("spill ipc writer: {e}") })?;
+    w.write(batch).map_err(|e| BufferError { message: format!("spill write: {e}") })?;
+    w.finish().map_err(|e| BufferError { message: format!("spill finish: {e}") })
+}
+
 /// A stored batch: kept in memory, or spilled to an Arrow IPC file on disk.
 enum Slot {
     Mem(RecordBatch),
     Spilled { file_ix: usize },
+}
+
+/// Outcome of [`ResultBuffer::begin_push`] — see its doc comment and
+/// `push_async_shared`, the free function this exists to support.
+pub enum PushOutcome {
+    /// The batch fit under both caps and is already committed to memory.
+    /// Nothing further to do.
+    Committed,
+    /// The batch needs to spill. Everything the write needs was cloned out
+    /// (`schema`) or moved out (`batch`) rather than kept borrowed —
+    /// `file_ix`/`n` must be handed to [`ResultBuffer::finish_spill`] once
+    /// the write (`write_spill_file(&path, &schema, &batch)`) succeeds.
+    NeedsSpill { file_ix: usize, path: std::path::PathBuf, schema: SchemaRef, batch: RecordBatch, n: usize },
 }
 
 /// Columnar result storage. `offsets[i]` = number of rows in slots [0, i),
@@ -51,6 +82,16 @@ enum Slot {
 /// that drives both paths (phase 3 follow-up I2). Write failures propagate
 /// out of `push`; read failures degrade a single cell to a visible
 /// `"<spill read error>"` string instead of taking down the app.
+///
+/// The write half additionally has an async twin, `push_async`, that hands
+/// the actual disk write to `Handle::spawn_blocking` instead of running it
+/// inline — for callers (namely `main.rs`'s `QueryEvent`/`MultiQueryEvent`
+/// loops) that run on GPUI's foreground executor and must not block it with
+/// synchronous file I/O (phase 3 follow-up I2, second half). Reads
+/// (`cell_text`/`cell_is_null`, called synchronously from the virtualized
+/// grid's paint path) stay fully synchronous — GPUI element painting can't
+/// await, and the one-slot cache above already makes sequential-scroll reads
+/// cheap; there is no equivalent async read path, and none is planned.
 pub struct ResultBuffer {
     schema: SchemaRef,
     slots: Vec<Slot>,
@@ -95,36 +136,135 @@ impl ResultBuffer {
     pub fn push(&mut self, batch: RecordBatch) -> Result<(), BufferError> {
         let n = batch.num_rows();
         let batch_bytes = batch.get_array_memory_size();
-        let fits =
-            self.mem_rows + n <= self.cap_rows && self.mem_bytes + batch_bytes <= self.cap_bytes;
-        if fits {
-            self.mem_rows += n;
-            self.mem_bytes += batch_bytes;
-            self.slots.push(Slot::Mem(batch));
+        if self.fits(n, batch_bytes) {
+            self.commit_mem(batch);
         } else {
-            if self.spill_dir.is_none() {
-                let dir = tempfile::tempdir()
-                    .map_err(|e| BufferError { message: format!("spill dir: {e}") })?;
-                self.spill_dir = Some(dir);
-            }
-            let file_ix = self.spill_files;
-            let path =
-                self.spill_dir.as_ref().unwrap().path().join(format!("spill-{file_ix}.arrow"));
-            let file = File::create(&path)
-                .map_err(|e| BufferError { message: format!("spill file: {e}") })?;
-            let mut w = FileWriter::try_new(file, &self.schema)
-                .map_err(|e| BufferError { message: format!("spill ipc writer: {e}") })?;
-            w.write(&batch)
-                .map_err(|e| BufferError { message: format!("spill write: {e}") })?;
-            w.finish().map_err(|e| BufferError { message: format!("spill finish: {e}") })?;
-            self.slots.push(Slot::Spilled { file_ix });
-            self.spill_files += 1;
+            let file_ix = self.begin_spill()?;
+            let path = self.spill_path(file_ix);
+            write_spill_file(&path, &self.schema, &batch)?;
+            self.commit_spill(file_ix, n);
         }
-        // Only commit the row index once the slot itself was committed, so a
-        // failed push (return above) leaves `offsets.len() == slots.len() + 1`.
+        Ok(())
+    }
+
+    /// Async twin of `push` for callers that can `.await` — namely
+    /// `main.rs`'s `QueryEvent::Batch` handling, which runs on GPUI's
+    /// foreground executor (the UI thread: see `runner.rs`'s "the UI thread
+    /// only ever awaits the event channel" doc comment). That caller must
+    /// stay responsive, so the actual spill WRITE (the only slow part —
+    /// `File::create` + `FileWriter::write`/`finish`) is handed to
+    /// `handle.spawn_blocking`, which runs it on the tokio runtime's
+    /// blocking-thread pool instead of synchronously inline (phase-3
+    /// follow-up I2, second half — the write is already fallible per the
+    /// first half, this just also gets it off the UI thread).
+    ///
+    /// `handle` must be an explicit `Handle` rather than the ambient
+    /// `tokio::task::spawn_blocking` free function: the GPUI foreground
+    /// executor thread this runs on is NOT itself inside a tokio runtime
+    /// (`QueryRunner` owns a separate `Runtime`), so the ambient form would
+    /// panic ("must be called from the context of a Tokio 1.x runtime").
+    ///
+    /// The in-memory fast path (by far the common case — most batches never
+    /// spill) stays fully synchronous; there's nothing to gain by hopping
+    /// threads for a `Vec::push`.
+    pub async fn push_async(
+        &mut self,
+        batch: RecordBatch,
+        handle: &tokio::runtime::Handle,
+    ) -> Result<(), BufferError> {
+        match self.begin_push(batch)? {
+            PushOutcome::Committed => {}
+            PushOutcome::NeedsSpill { file_ix, path, schema, batch, n } => {
+                handle
+                    .spawn_blocking(move || write_spill_file(&path, &schema, &batch))
+                    .await
+                    .map_err(|e| BufferError { message: format!("spill task panicked: {e}") })??;
+                self.commit_spill(file_ix, n);
+            }
+        }
+        Ok(())
+    }
+
+    /// First half of a spill-safe push, split out so a caller that shares
+    /// `self` behind an `Rc<RefCell<_>>` (see the free function
+    /// `push_async_shared` below) can run this behind a SHORT borrow, drop
+    /// it, await the (possibly slow, possibly backgrounded) write with no
+    /// borrow held, then take a second short borrow to call `finish_spill`.
+    /// This is the only part of pushing a batch that must run before the
+    /// write: the fits/begin_spill decision, and — if the batch fits —
+    /// committing it immediately (nothing further to do for that case). If
+    /// it doesn't fit, everything the write needs (destination path, schema,
+    /// the batch itself, and its row count) is handed back in
+    /// [`PushOutcome::NeedsSpill`] rather than kept borrowed.
+    pub fn begin_push(&mut self, batch: RecordBatch) -> Result<PushOutcome, BufferError> {
+        let n = batch.num_rows();
+        let batch_bytes = batch.get_array_memory_size();
+        if self.fits(n, batch_bytes) {
+            self.commit_mem(batch);
+            Ok(PushOutcome::Committed)
+        } else {
+            let file_ix = self.begin_spill()?;
+            let path = self.spill_path(file_ix);
+            let schema = self.schema.clone();
+            Ok(PushOutcome::NeedsSpill { file_ix, path, schema, batch, n })
+        }
+    }
+
+    /// Second half of a spill-safe push: commits a spill write that already
+    /// succeeded, written by the caller off any buffer borrow (see
+    /// `push_async_shared`). Thin wrapper over the private `commit_spill` so
+    /// callers outside this module (namely `push_async_shared`) can reach
+    /// it without exposing `commit_spill` itself.
+    pub fn finish_spill(&mut self, file_ix: usize, n: usize) {
+        self.commit_spill(file_ix, n);
+    }
+
+    /// Whether a batch of `n` rows / `batch_bytes` bytes still fits under
+    /// both caps if kept in memory.
+    fn fits(&self, n: usize, batch_bytes: usize) -> bool {
+        self.mem_rows + n <= self.cap_rows && self.mem_bytes + batch_bytes <= self.cap_bytes
+    }
+
+    /// Commits a batch to the in-memory slot list and row index. Shared
+    /// tail of `push`/`push_async`'s in-memory branch.
+    fn commit_mem(&mut self, batch: RecordBatch) {
+        let n = batch.num_rows();
+        self.mem_rows += n;
+        self.mem_bytes += batch.get_array_memory_size();
+        self.slots.push(Slot::Mem(batch));
+        self.commit_offset(n);
+    }
+
+    /// Ensures the spill directory exists and reserves the next spill file
+    /// index — the only part of spilling that must run before the (possibly
+    /// backgrounded) write.
+    fn begin_spill(&mut self) -> Result<usize, BufferError> {
+        if self.spill_dir.is_none() {
+            let dir = tempfile::tempdir()
+                .map_err(|e| BufferError { message: format!("spill dir: {e}") })?;
+            self.spill_dir = Some(dir);
+        }
+        Ok(self.spill_files)
+    }
+
+    fn spill_path(&self, file_ix: usize) -> std::path::PathBuf {
+        self.spill_dir.as_ref().unwrap().path().join(format!("spill-{file_ix}.arrow"))
+    }
+
+    /// Commits a successfully-written spill file to the slot list and row
+    /// index. Only called after the write itself succeeded, so a failed
+    /// spill (write error, propagated by the caller before reaching this)
+    /// leaves `offsets.len() == slots.len() + 1`, same invariant `push` has
+    /// always kept.
+    fn commit_spill(&mut self, file_ix: usize, n: usize) {
+        self.slots.push(Slot::Spilled { file_ix });
+        self.spill_files += 1;
+        self.commit_offset(n);
+    }
+
+    fn commit_offset(&mut self, n: usize) {
         let total = self.offsets.last().copied().unwrap_or(0) + n;
         self.offsets.push(total);
-        Ok(())
     }
 
     pub fn row_count(&self) -> usize {
@@ -211,6 +351,56 @@ impl ResultBuffer {
     #[cfg(test)]
     fn spill_dir(&self) -> Option<&std::path::Path> {
         self.spill_dir.as_ref().map(|d| d.path())
+    }
+}
+
+/// Spill-safe async push for a buffer SHARED via `Rc<RefCell<ResultBuffer>>`
+/// — the shape `dbc-ui`'s `QueryEvent`/`MultiQueryEvent` loops use (the same
+/// buffer is also read by the grid's render, on the same thread).
+///
+/// BLOCKER fix (td-security fix round, B1): the call site used to be
+/// `buf.borrow_mut().push_async(batch, handle).await` — by Rust's method-call
+/// desugaring, the `RefMut` temporary produced by `borrow_mut()` lives to the
+/// end of the FULL expression, i.e. it is held ACROSS the `.await`. Because
+/// `push_async`'s spill path suspends on `spawn_blocking`, and GPUI's
+/// `cx.notify()` can schedule a paint that reads the SAME buffer through the
+/// SAME `RefCell` on the SAME thread while that task is suspended, this
+/// could — and did, once a result was large enough to force a spill — panic
+/// with `BorrowMutError`. The in-memory fast path never suspends, which is
+/// why this was invisible to every prior test (none forced a spill through
+/// this exact call path).
+///
+/// This function fixes that structurally: it never holds a borrow across an
+/// `.await`. (1) A short `borrow_mut()` runs [`ResultBuffer::begin_push`] —
+/// the fits/begin_spill decision, committing immediately if the batch fits,
+/// or cloning out exactly what the write needs — then the borrow is dropped
+/// at the end of that statement. (2) The write itself (if any) is awaited
+/// with NO borrow held. (3) A second short `borrow_mut()` calls
+/// [`ResultBuffer::finish_spill`] to commit it.
+///
+/// INVARIANT: calls to this function for a given `buf` must be
+/// single-flight — at most one `push_async_shared` call in flight per
+/// buffer at a time. (Today this already holds: exactly one
+/// `QueryEvent`/`MultiQueryEvent` loop drives each buffer, one batch at a
+/// time.) Calling it concurrently from two tasks on the same buffer is not
+/// supported — the two `begin_push` calls could each believe they're the
+/// sole writer and allocate a colliding spill file index.
+pub async fn push_async_shared(
+    buf: &Rc<RefCell<ResultBuffer>>,
+    batch: RecordBatch,
+    handle: &tokio::runtime::Handle,
+) -> Result<(), BufferError> {
+    let outcome = buf.borrow_mut().begin_push(batch)?; // short borrow, dropped here
+    match outcome {
+        PushOutcome::Committed => Ok(()),
+        PushOutcome::NeedsSpill { file_ix, path, schema, batch, n } => {
+            handle
+                .spawn_blocking(move || write_spill_file(&path, &schema, &batch))
+                .await // no borrow held across this suspension
+                .map_err(|e| BufferError { message: format!("spill task panicked: {e}") })??;
+            buf.borrow_mut().finish_spill(file_ix, n); // second short borrow
+            Ok(())
+        }
     }
 }
 
@@ -312,6 +502,53 @@ mod tests {
         assert_eq!(buf.cell_text(150, 0), "150");
     }
 
+    /// Phase-3 follow-up I2 (remaining half): `push_async`'s spill write
+    /// must go through `Handle::spawn_blocking` rather than blocking the
+    /// calling task directly, but the OBSERVABLE result (offsets, spilled
+    /// slot count, read-back values) must be identical to the sync `push`
+    /// path — this is what a caller on GPUI's foreground executor actually
+    /// cares about.
+    #[tokio::test]
+    async fn push_async_spills_past_cap_and_reads_back() {
+        let handle = tokio::runtime::Handle::current();
+        let b0 = batch(0, 100);
+        let mut buf = ResultBuffer::with_cap(b0.schema(), 150); // cap at 150 rows
+        buf.push_async(b0, &handle).await.unwrap(); // 100 mem
+        buf.push_async(batch(100, 100), &handle).await.unwrap(); // 200 total → spills
+        assert_eq!(buf.spilled_slots(), 1);
+        assert_eq!(buf.row_count(), 200);
+        assert_eq!(buf.cell_text(50, 0), "50"); // mem
+        assert_eq!(buf.cell_text(150, 0), "150"); // spilled, read back via the sync path
+        assert_eq!(buf.cell_text(150, 1), "row150");
+    }
+
+    /// `push_async`'s in-memory fast path (the common case — most batches
+    /// never spill) must behave exactly like `push`'s, with no unnecessary
+    /// thread hop.
+    #[tokio::test]
+    async fn push_async_mem_path_matches_sync_push() {
+        let handle = tokio::runtime::Handle::current();
+        let b0 = batch(0, 50);
+        let mut buf = ResultBuffer::new(b0.schema());
+        buf.push_async(b0, &handle).await.unwrap();
+        assert_eq!(buf.row_count(), 50);
+        assert_eq!(buf.spilled_slots(), 0);
+        assert_eq!(buf.cell_text(10, 0), "10");
+    }
+
+    /// Byte cap (I1) must trigger a spill through `push_async` exactly like
+    /// it does through the sync `push` path — same cap check, just a
+    /// different write mechanism once the decision to spill is made.
+    #[tokio::test]
+    async fn push_async_byte_cap_triggers_spill() {
+        let handle = tokio::runtime::Handle::current();
+        let b0 = batch(0, 100);
+        let mut buf = ResultBuffer::with_caps(b0.schema(), 1_000_000, 64);
+        buf.push_async(b0, &handle).await.unwrap();
+        assert_eq!(buf.spilled_slots(), 1);
+        assert_eq!(buf.cell_text(0, 0), "0");
+    }
+
     #[test]
     fn spill_read_error_falls_back_without_panicking() {
         let b0 = batch(0, 10);
@@ -321,5 +558,70 @@ mod tests {
         std::fs::remove_file(dir.join("spill-0.arrow")).unwrap();
         assert_eq!(buf.cell_text(0, 0), "<spill read error>");
         assert_eq!(buf.cell_text(5, 1), "<spill read error>");
+    }
+
+    /// td-security fix round, BLOCKER B1 regression test — the reviewer's
+    /// probe technique: run `push_async_shared` as a `LocalSet` task (it's
+    /// `!Send`, same as the real `Rc<RefCell<ResultBuffer>>` call site), let
+    /// it suspend AT the spill write's `.await`, then `try_borrow` the same
+    /// `RefCell` from the SAME thread while that task is still suspended
+    /// there — this MUST succeed if (and only if) `push_async_shared` drops
+    /// its borrow before awaiting the write, instead of holding a `RefMut`
+    /// across the suspension (the bug: `buf.borrow_mut().push_async(...).await`
+    /// — the `RefMut` temporary lives to the end of the full expression).
+    ///
+    /// Determinism: the runtime's blocking pool is capped to exactly one
+    /// thread, and that one thread is occupied (blocked on a channel) BEFORE
+    /// `push_async_shared` starts — so its own `spawn_blocking` call for the
+    /// spill write is FORCED to queue (stay `Pending`) rather than racing a
+    /// real, possibly-instant file write. This removes any timing flakiness:
+    /// the task is guaranteed to still be suspended at the await when the
+    /// probe runs.
+    #[test]
+    fn push_async_shared_holds_no_borrow_across_the_spill_await() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.handle().clone();
+        let local = tokio::task::LocalSet::new();
+
+        local.block_on(&rt, async move {
+            // Occupy the ONLY blocking-pool thread so `push_async_shared`'s
+            // own `spawn_blocking` call has nowhere to run yet.
+            let (occupy_tx, occupy_rx) = std::sync::mpsc::channel::<()>();
+            let occupier = handle.spawn_blocking(move || occupy_rx.recv().unwrap());
+
+            let b0 = batch(0, 10);
+            // cap at 0 -> every push spills, no in-memory fast path to race.
+            let buf = Rc::new(RefCell::new(ResultBuffer::with_caps(b0.schema(), 0, 0)));
+            let buf_task = buf.clone();
+            let handle_task = handle.clone();
+            let task = tokio::task::spawn_local(async move {
+                push_async_shared(&buf_task, b0, &handle_task).await.unwrap();
+            });
+
+            // Give the local task a couple of turns to run up to (and queue
+            // behind) its own `spawn_blocking` call.
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished(), "test setup bug: task finished before the probe");
+
+            // THE PROBE: still suspended at the spill await, on this same
+            // thread, a borrow must be free.
+            assert!(
+                buf.try_borrow().is_ok(),
+                "borrow held across the spill await — BorrowMutError waiting to happen"
+            );
+
+            occupy_tx.send(()).unwrap();
+            occupier.await.unwrap();
+            task.await.unwrap();
+
+            assert_eq!(buf.borrow().row_count(), 10);
+            assert_eq!(buf.borrow().spilled_slots(), 1);
+        });
     }
 }

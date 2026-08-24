@@ -1488,6 +1488,11 @@ impl AppView {
         // `current_conn_identity`'s doc comment.
         let conn_identity = self.current_conn_identity();
         let mut rx = self.runner.connect_and_run(spec, sql, cancel, timeout_secs);
+        // Phase-3 follow-up I2: threaded into the loop below so a spill
+        // write (see `QueryEvent::Batch` handling) can hop onto the tokio
+        // runtime's blocking pool via `push_async` instead of blocking this
+        // GPUI foreground-executor task inline.
+        let handle = self.runner.handle();
         cx.spawn(async move |this, cx| {
             let mut buffer: Option<Rc<RefCell<ResultBuffer>>> = None;
             // Set (to the buffer-push error text) once a buffer push fails;
@@ -1520,9 +1525,98 @@ impl AppView {
             // skips clobbering it, the same as it does for any other run
             // started while this one's channel-close is still pending.
             while let Some(ev) = rx.recv().await {
+                // Phase-3 follow-up I2: a batch's spill write (if any) is
+                // performed HERE, in the async loop body, before entering
+                // `this.update`'s synchronous closure — that closure can't
+                // itself `.await` a background write, and it runs on GPUI's
+                // foreground executor (the UI thread), which is exactly the
+                // thread a spill write must not block. `this.update` below
+                // then only applies this already-known outcome; every other
+                // event variant is still handled entirely inside it,
+                // unchanged. (`ev` can't be matched twice — a `Batch`'s
+                // `RecordBatch` payload is moved out here, so this arm
+                // `continue`s rather than falling through to the second
+                // match below, which stubs `Batch` as unreachable.)
+                if let QueryEvent::Batch(b) = ev {
+                    let push_result = if errored.is_some() {
+                        None // already failed and cancelled — drop the batch
+                    } else if let Some(buf) = buffer.as_ref() {
+                        // td-security fix round, BLOCKER B1: was
+                        // `buf.borrow_mut().push_async(b, &handle).await`,
+                        // which holds the `RefMut` temporary across the
+                        // `.await` (method-call desugaring keeps it alive to
+                        // the end of the full expression) — a `BorrowMutError`
+                        // panic waiting to happen the moment a spilling batch
+                        // suspended here while `cx.notify()` scheduled a grid
+                        // paint that reads the same `RefCell` on this thread.
+                        // `push_async_shared` never holds a borrow across an
+                        // await; see its doc comment (dbc-buffer/src/lib.rs).
+                        Some(dbc_buffer::push_async_shared(buf, b, &handle).await)
+                    } else {
+                        None
+                    };
+                    let stop = this
+                        .update(cx, |view, cx| {
+                            let mut stop = false;
+                            if errored.is_some() {
+                                // Already failed and cancelled this run —
+                                // drop any further in-flight batches.
+                            } else if tab_id.is_some_and(|id| view.tabs.iter().all(|t| t.id != id)) {
+                                // This run's tab was closed mid-stream —
+                                // cancel and stop consuming; nothing left
+                                // to render the remaining batches into.
+                                stop = true;
+                                if let Some(token) = view.cancel.take() {
+                                    token.cancel();
+                                }
+                                view.status = "zrušeno (tab zavřen)".into();
+                            } else if let Some(Err(e)) = push_result {
+                                let err_text = e.to_string();
+                                view.status = format!("error: {err_text}");
+                                errored = Some(err_text);
+                                if let Some(token) = view.cancel.take() {
+                                    token.cancel();
+                                }
+                            } else {
+                                let rows = buffer.as_ref().map_or(0, |b| b.borrow().row_count());
+                                let secs =
+                                    view.started_at.map_or(0.0, |t| t.elapsed().as_secs_f32());
+                                view.status = format!("{rows} rows… {secs:.1}s{limit_suffix}");
+                                // G4 Task 2: let this tab's grid know it
+                                // grew. When no sort/filter is active
+                                // this is a cheap identity-count refresh;
+                                // when one IS active it just marks dirty
+                                // rather than resorting on every batch
+                                // (see `ResultGrid::on_batch_grown`) —
+                                // the actual resort is deferred to
+                                // `Finished` below.
+                                if let Some(id) = tab_id {
+                                    if let Some(TabContent::Grid { grid, .. }) =
+                                        view.tabs.iter().find(|t| t.id == id).map(|t| &t.content)
+                                    {
+                                        grid.update(cx, |g, _| g.on_batch_grown());
+                                    }
+                                }
+                            }
+                            cx.notify();
+                            stop
+                        })
+                        .unwrap_or(false);
+                    if stop {
+                        break;
+                    }
+                    continue;
+                }
                 let stop = this
                     .update(cx, |view, cx| {
-                        let mut stop = false;
+                        // I2: `Batch` — the only arm that used to set this
+                        // to `true` (tab-closed-mid-stream) — is now handled
+                        // above, before this closure; every remaining arm
+                        // (`Started`/`Finished`/`Failed`) always continues
+                        // the loop, relying on `rx.recv()` returning `None`
+                        // once the driver's one terminal event closes the
+                        // channel.
+                        let stop = false;
                         match ev {
                             QueryEvent::Started { columns } => {
                                 let buf = Rc::new(RefCell::new(ResultBuffer::new(columns)));
@@ -1669,50 +1763,13 @@ impl AppView {
                                         "tabulka nemá primární klíč — jen pro čtení".to_string();
                                 }
                             }
-                            QueryEvent::Batch(b) => {
-                                if errored.is_some() {
-                                    // Already failed and cancelled this run —
-                                    // drop any further in-flight batches.
-                                } else if tab_id.is_some_and(|id| view.tabs.iter().all(|t| t.id != id)) {
-                                    // This run's tab was closed mid-stream —
-                                    // cancel and stop consuming; nothing left
-                                    // to render the remaining batches into.
-                                    stop = true;
-                                    if let Some(token) = view.cancel.take() {
-                                        token.cancel();
-                                    }
-                                    view.status = "zrušeno (tab zavřen)".into();
-                                } else if let Some(Err(e)) =
-                                    buffer.as_ref().map(|buf| buf.borrow_mut().push(b))
-                                {
-                                    let err_text = e.to_string();
-                                    view.status = format!("error: {err_text}");
-                                    errored = Some(err_text);
-                                    if let Some(token) = view.cancel.take() {
-                                        token.cancel();
-                                    }
-                                } else {
-                                    let rows = buffer.as_ref().map_or(0, |b| b.borrow().row_count());
-                                    let secs =
-                                        view.started_at.map_or(0.0, |t| t.elapsed().as_secs_f32());
-                                    view.status = format!("{rows} rows… {secs:.1}s{limit_suffix}");
-                                    // G4 Task 2: let this tab's grid know it
-                                    // grew. When no sort/filter is active
-                                    // this is a cheap identity-count refresh;
-                                    // when one IS active it just marks dirty
-                                    // rather than resorting on every batch
-                                    // (see `ResultGrid::on_batch_grown`) —
-                                    // the actual resort is deferred to
-                                    // `Finished` below.
-                                    if let Some(id) = tab_id {
-                                        if let Some(TabContent::Grid { grid, .. }) =
-                                            view.tabs.iter().find(|t| t.id == id).map(|t| &t.content)
-                                        {
-                                            grid.update(cx, |g, _| g.on_batch_grown());
-                                        }
-                                    }
-                                }
-                            }
+                            // I2: `Batch` is handled above, before this
+                            // `this.update` call, so its push can `.await` a
+                            // background spill write — see the `if let
+                            // QueryEvent::Batch(b) = ev { ... continue; }`
+                            // block right before this loop iteration's
+                            // `this.update`. Unreachable here.
+                            QueryEvent::Batch(_) => unreachable!("Batch handled before this match"),
                             // The driver sends exactly one terminal event
                             // per run (`Finished` xor `Failed` —
                             // `runner::stream_query`), so exactly one of
@@ -1973,6 +2030,10 @@ impl AppView {
         let conn_identity = self.current_conn_identity();
         let total_statements = statements.len();
         let mut rx = self.runner.connect_and_run_many(spec, statements.clone(), cancel, timeout_secs);
+        // Phase-3 follow-up I2: see `run_query_with`'s identical `handle`
+        // capture — lets `MultiQueryEvent::Batch` push through `push_async`
+        // below instead of blocking this foreground-executor task inline.
+        let handle = self.runner.handle();
         cx.spawn(async move |this, cx| {
             let mut buffer: Option<Rc<RefCell<ResultBuffer>>> = None;
             let mut tab_id: Option<u64> = None;
@@ -1983,9 +2044,61 @@ impl AppView {
             let mut writes: usize = 0;
 
             while let Some(ev) = rx.recv().await {
+                // I2: same "push before `this.update`, `continue`" shape as
+                // `run_query_with` — see that loop's comment for why `ev`
+                // can't be matched a second time below.
+                if let MultiQueryEvent::Batch(b) = ev {
+                    let push_result = if errored.is_some() {
+                        None // already failed — drop further batches
+                    } else if let Some(buf) = buffer.as_ref() {
+                        // td-security fix round, BLOCKER B1: see
+                        // `run_query_with`'s identical call site above for
+                        // why this must NOT be
+                        // `buf.borrow_mut().push_async(...).await`.
+                        Some(dbc_buffer::push_async_shared(buf, b, &handle).await)
+                    } else {
+                        None
+                    };
+                    let stop = this
+                        .update(cx, |view, cx| {
+                            let mut stop = false;
+                            if errored.is_some() {
+                                // Already failed — drop further batches.
+                            } else if tab_id.is_some_and(|id| view.tabs.iter().all(|t| t.id != id)) {
+                                stop = true;
+                                if let Some(token) = view.cancel.take() {
+                                    token.cancel();
+                                }
+                                view.status = "zrušeno (tab zavřen)".into();
+                            } else if let Some(Err(e)) = push_result {
+                                let err_text = e.to_string();
+                                view.status = format!("error: {err_text}");
+                                errored = Some(err_text);
+                                if let Some(token) = view.cancel.take() {
+                                    token.cancel();
+                                }
+                            } else if let Some(id) = tab_id {
+                                if let Some(TabContent::Grid { grid, .. }) =
+                                    view.tabs.iter().find(|t| t.id == id).map(|t| &t.content)
+                                {
+                                    grid.update(cx, |g, _| g.on_batch_grown());
+                                }
+                            }
+                            cx.notify();
+                            stop
+                        })
+                        .unwrap_or(false);
+                    if stop {
+                        break;
+                    }
+                    continue;
+                }
                 let stop = this
                     .update(cx, |view, cx| {
-                        let mut stop = false;
+                        // I2: same reasoning as `run_query_with`'s identical
+                        // comment — `Batch` (the only arm that used to set
+                        // this) is handled above, before this closure.
+                        let stop = false;
                         match ev {
                             MultiQueryEvent::StatementStarted { index, total, columns: Some(cols) } => {
                                 let title_sql =
@@ -2000,32 +2113,11 @@ impl AppView {
                             MultiQueryEvent::StatementStarted { index, total, columns: None } => {
                                 view.status = format!("příkaz {}/{total}…{limit_suffix}", index + 1);
                             }
-                            MultiQueryEvent::Batch(b) => {
-                                if errored.is_some() {
-                                    // Already failed — drop further batches.
-                                } else if tab_id.is_some_and(|id| view.tabs.iter().all(|t| t.id != id)) {
-                                    stop = true;
-                                    if let Some(token) = view.cancel.take() {
-                                        token.cancel();
-                                    }
-                                    view.status = "zrušeno (tab zavřen)".into();
-                                } else if let Some(Err(e)) =
-                                    buffer.as_ref().map(|buf| buf.borrow_mut().push(b))
-                                {
-                                    let err_text = e.to_string();
-                                    view.status = format!("error: {err_text}");
-                                    errored = Some(err_text);
-                                    if let Some(token) = view.cancel.take() {
-                                        token.cancel();
-                                    }
-                                } else if let Some(id) = tab_id {
-                                    if let Some(TabContent::Grid { grid, .. }) =
-                                        view.tabs.iter().find(|t| t.id == id).map(|t| &t.content)
-                                    {
-                                        grid.update(cx, |g, _| g.on_batch_grown());
-                                    }
-                                }
-                            }
+                            // I2: `Batch` handled above, before this
+                            // `this.update` call — see the `if let
+                            // MultiQueryEvent::Batch(b) = ev { ... continue;
+                            // }` block earlier in this loop iteration.
+                            MultiQueryEvent::Batch(_) => unreachable!("Batch handled before this match"),
                             MultiQueryEvent::StatementFinished { index, affected: Some(n), elapsed } => {
                                 total_affected += n;
                                 writes += 1;
@@ -3142,24 +3234,36 @@ impl AppView {
         let sql_title = format!("Plán: {}", collapse_title(&wrapped_sql));
         let conn_identity = self.current_conn_identity();
         let mut rx = self.runner.connect_and_run(spec, wrapped_sql, cancel, timeout_secs);
+        // Phase-3 follow-up I2: EXPLAIN output is always tiny (one row/JSON
+        // blob) so this buffer realistically never spills, but the push is
+        // routed through `push_async` anyway for consistency with the other
+        // two `QueryEvent`/`MultiQueryEvent` loops and to not leave a
+        // synchronous spill-write path on the foreground executor at all.
+        let handle = self.runner.handle();
         cx.spawn(async move |this, cx| {
             let mut buffer: Option<ResultBuffer> = None;
             let mut failed: Option<QueryError> = None;
             while let Some(ev) = rx.recv().await {
+                // I2: same "push before `this.update`, `continue`" shape as
+                // `run_query_with` — see that loop's comment for why `ev`
+                // can't be matched a second time below.
+                if let QueryEvent::Batch(b) = ev {
+                    if let Some(buf) = buffer.as_mut() {
+                        if let Err(e) = buf.push_async(b, &handle).await {
+                            failed = Some(QueryError::msg(e.to_string()));
+                        }
+                    }
+                    continue;
+                }
                 let stop = this
                     .update(cx, |_view, _cx| match ev {
                         QueryEvent::Started { columns } => {
                             buffer = Some(ResultBuffer::new(columns));
                             false
                         }
-                        QueryEvent::Batch(b) => {
-                            if let Some(buf) = buffer.as_mut() {
-                                if let Err(e) = buf.push(b) {
-                                    failed = Some(QueryError::msg(e.to_string()));
-                                }
-                            }
-                            false
-                        }
+                        // I2: `Batch` handled above, before this
+                        // `this.update` call.
+                        QueryEvent::Batch(_) => unreachable!("Batch handled before this match"),
                         QueryEvent::Finished { .. } => true,
                         QueryEvent::Failed(e) => {
                             failed = Some(e);
@@ -5454,6 +5558,16 @@ impl AppView {
                         // items 3/4 — `sql_text` is already '***'-redacted
                         // where it matters, built once at dialog-open time).
                         view.apply_dialog = None;
+                        // G10 N2 (final review): captured before `target` is
+                        // moved into the match below — drives which
+                        // `record_history*` call runs after it, so an admin
+                        // write shows up in the History panel tagged kind
+                        // `"admin"` (its own 🛡 badge) instead of
+                        // masquerading as a plain `"query"` entry, same
+                        // pattern as G11's `"backup"`/`"restore"` kinds
+                        // (see `record_backup_restore_history` and
+                        // `history_panel::badge_for_kind`).
+                        let is_admin = matches!(target, ApplyTarget::Admin { .. });
                         match target {
                             ApplyTarget::SandboxTab { tab_id, preview_identity } => {
                                 if let Some(tab) = view.tabs.iter().find(|t| t.id == tab_id) {
@@ -5507,15 +5621,28 @@ impl AppView {
                         // entry once ITS `Finished`/`Failed` lands, same as
                         // any other preview; the admin path has no re-run at
                         // all, just this one entry.
-                        view.record_history(
-                            &sql_text,
-                            &history_conn_name,
-                            history_started_at,
-                            Some(started.elapsed().as_millis() as i64),
-                            Some(total as i64),
-                            None,
-                            cx,
-                        );
+                        if is_admin {
+                            view.record_history_with_kind(
+                                &sql_text,
+                                &history_conn_name,
+                                history_started_at,
+                                Some(started.elapsed().as_millis() as i64),
+                                Some(total as i64),
+                                None,
+                                "admin",
+                                cx,
+                            );
+                        } else {
+                            view.record_history(
+                                &sql_text,
+                                &history_conn_name,
+                                history_started_at,
+                                Some(started.elapsed().as_millis() as i64),
+                                Some(total as i64),
+                                None,
+                                cx,
+                            );
+                        }
                     }
                     Ok(Err(e)) => {
                         if let Some(ad) = &mut view.apply_dialog {
