@@ -3418,6 +3418,21 @@ impl AppView {
                 cx.notify();
             }
             plan::AnalyzeGate::NeedsConfirm => {
+                if engine == dbc_state::Engine::Duckdb {
+                    // G16 T5 (resolved design gap): the DuckDB driver's
+                    // query() sessions are independent clones off the shared
+                    // root, invisible to execute()'s persistent exec_conn —
+                    // the same structural property runner.rs's
+                    // analyze_write_tests document for sqlite. So
+                    // run_analyze_write's BEGIN → EXPLAIN (ANALYZE …) →
+                    // ROLLBACK CANNOT actually wrap the analyzed write in a
+                    // transaction: the write would durably COMMIT while the
+                    // UI claims "změny vráceny zpět". Refuse honestly.
+                    // Pinned by runner.rs::duckdb_query_sessions_do_not_see_execute_transactions.
+                    self.status = "error: EXPLAIN ANALYZE zápisu není pro DuckDB podporováno — analyzovaný zápis nelze bezpečně vrátit".to_string();
+                    cx.notify();
+                    return;
+                }
                 self.modal = Some(connections_ui::ModalState::AnalyzeWriteConfirm {
                     sql,
                     engine,
@@ -3548,10 +3563,14 @@ impl AppView {
                         raw_text: raw_lines.join("\n"),
                     })
                 } else {
-                    let raw_text = if buf.row_count() == 0 || buf.cell_is_null(0, 0) {
+                    // G16 T5: DuckDB's EXPLAIN result set is
+                    // (explain_key, explain_value) — the payload sits in
+                    // the SECOND column (capture-pinned); pg stays 0.
+                    let payload_col = plan::plan_payload_col(engine);
+                    let raw_text = if buf.row_count() == 0 || buf.cell_is_null(0, payload_col) {
                         Err("EXPLAIN nevrátil žádný řádek".to_string())
                     } else {
-                        Ok(buf.cell_text(0, 0))
+                        Ok(buf.cell_text(0, payload_col))
                     };
                     raw_text.and_then(|t| plan::parse_plan(engine, is_analyze, &t))
                 };

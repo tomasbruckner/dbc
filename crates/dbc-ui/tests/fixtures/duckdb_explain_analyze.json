@@ -1,0 +1,79 @@
+{
+    "cumulative_cardinality": 1001,
+    "attach_load_storage_latency": 0.0,
+    "attach_replay_wal_latency": 0.0,
+    "blocked_thread_time": 0.0,
+    "checkpoint_latency": 0.0,
+    "cumulative_rows_scanned": 1000,
+    "commit_local_storage_latency": 0.0,
+    "cpu_time": 0.000023599999999999998,
+    "extra_info": {},
+    "latency": 0.0008776,
+    "query_name": "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM t",
+    "result_set_size": 0,
+    "rows_returned": 0,
+    "system_peak_buffer_memory": 1376256,
+    "system_peak_temp_dir_size": 0,
+    "total_bytes_read": 0,
+    "total_bytes_written": 0,
+    "total_memory_allocated": 0,
+    "waiting_to_attach_latency": 0.0,
+    "wal_replay_entry_count": 0,
+    "write_to_wal_latency": 0.0,
+    "children": [
+        {
+            "cumulative_cardinality": 1001,
+            "cumulative_rows_scanned": 1000,
+            "cpu_time": 0.000023599999999999998,
+            "extra_info": {},
+            "operator_cardinality": 0,
+            "operator_name": "EXPLAIN_ANALYZE",
+            "operator_rows_scanned": 0,
+            "operator_timing": 0.0000011,
+            "operator_type": "EXPLAIN_ANALYZE",
+            "result_set_size": 0,
+            "system_peak_buffer_memory": 0,
+            "system_peak_temp_dir_size": 0,
+            "children": [
+                {
+                    "cumulative_cardinality": 1001,
+                    "cumulative_rows_scanned": 1000,
+                    "cpu_time": 0.000022499999999999998,
+                    "extra_info": {
+                        "Aggregates": "count_star()"
+                    },
+                    "operator_cardinality": 1,
+                    "operator_name": "UNGROUPED_AGGREGATE",
+                    "operator_rows_scanned": 0,
+                    "operator_timing": 0.0000124,
+                    "operator_type": "UNGROUPED_AGGREGATE",
+                    "result_set_size": 8,
+                    "system_peak_buffer_memory": 0,
+                    "system_peak_temp_dir_size": 0,
+                    "children": [
+                        {
+                            "cumulative_cardinality": 1000,
+                            "cumulative_rows_scanned": 1000,
+                            "cpu_time": 0.0000101,
+                            "extra_info": {
+                                "Table": "cap.main.t",
+                                "Type": "Sequential Scan",
+                                "Projections": "",
+                                "Estimated Cardinality": "1000"
+                            },
+                            "operator_cardinality": 1000,
+                            "operator_name": "SEQ_SCAN",
+                            "operator_rows_scanned": 1000,
+                            "operator_timing": 0.0000101,
+                            "operator_type": "TABLE_SCAN",
+                            "result_set_size": 8000,
+                            "system_peak_buffer_memory": 0,
+                            "system_peak_temp_dir_size": 0,
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}

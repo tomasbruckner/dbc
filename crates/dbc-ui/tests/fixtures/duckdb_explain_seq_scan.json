@@ -1,0 +1,28 @@
+[
+    {
+        "name": "PROJECTION",
+        "children": [
+            {
+                "name": "SEQ_SCAN",
+                "children": [],
+                "extra_info": {
+                    "Table": "cap.main.t",
+                    "Type": "Sequential Scan",
+                    "Projections": [
+                        "name",
+                        "id"
+                    ],
+                    "Filters": "name='r5'",
+                    "Estimated Cardinality": "2"
+                }
+            }
+        ],
+        "extra_info": {
+            "Projections": [
+                "id",
+                "name"
+            ],
+            "Estimated Cardinality": "2"
+        }
+    }
+]
