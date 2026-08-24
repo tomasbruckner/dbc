@@ -1392,6 +1392,15 @@ mod pg_docker_tests {
                     buffer.as_mut().expect("Started before Batch").push(b).expect("push");
                 }
                 crate::runner::QueryEvent::Finished { .. } => break,
+                // G15 T8 whole-branch review B2 fix: only ever sent for an
+                // MSSQL WRITE (see `stream_query`'s doc comment) — this
+                // helper is pg-only (`pg_url`) and only ever runs
+                // EXPLAIN-shaped reads, so unreachable here; panics with a
+                // distinct message rather than being silently folded into
+                // the `Finished`/`Failed` cases.
+                crate::runner::QueryEvent::WriteFinished { .. } => {
+                    panic!("run_and_capture_single_cell: unexpected WriteFinished (pg-only, read-only helper)")
+                }
                 crate::runner::QueryEvent::Failed(e) => panic!("query failed: {e}"),
             }
         }

@@ -5,8 +5,21 @@
 //! testcontainers is the default when unset. The container is started ONCE
 //! per test process and deliberately leaked (`std::mem::forget`) — startup
 //! is 30-60s and the image ~1.5GB, so per-test containers (the pg
-//! precedent) are not viable here; testcontainers' reaper (ryuk) removes it
-//! after the process exits.
+//! precedent) are not viable here.
+//!
+//! CORRECTION (whole-branch review M2 finding): the claim that
+//! "testcontainers' reaper (ryuk) removes it after the process exits" was
+//! WRONG on this host — ryuk does not reap these containers here (Docker
+//! Desktop/Windows networking, not investigated further), so EVERY
+//! `cargo test -- --ignored` run that starts a fresh container (i.e. every
+//! run without `DBC_MSSQL_TEST_CONN` set) leaks a ~1GB SQL Server
+//! container that survives the test process. `docker ps`/`docker rm -f`
+//! it manually after a live run. For repeated local iteration, set
+//! `DBC_MSSQL_TEST_CONN` to point at ONE manually-started, long-lived
+//! container instead of leaking a new one per invocation — this is the
+//! cheap mitigation this comment recommends in lieu of a real fix (a real
+//! fix would mean either getting ryuk working on this host or adding
+//! process-exit cleanup logic neither of which this task attempted).
 
 use tokio::sync::OnceCell;
 

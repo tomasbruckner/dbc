@@ -494,7 +494,21 @@ fn select_head_insert_offset(sql: &str) -> Option<usize> {
                     depth -= 1;
                     j += 2;
                 } else {
-                    j += 1;
+                    // BLOCKER fix (whole-branch review B1): advance by one
+                    // full character, not one byte. `sql[j..]` above needs
+                    // `j` on a char boundary on every iteration; a bare
+                    // `j += 1` walks into the middle of any multi-byte
+                    // UTF-8 character (e.g. `é`, or any Czech diacritic)
+                    // and the NEXT loop iteration's `sql[j..]` slice panics
+                    // ("byte index N is not a char boundary") -- live-
+                    // reproduced with `/* é */ SELECT x FROM t` under
+                    // `Dialect::Mssql`, reachable from the GPUI main thread
+                    // via `apply_auto_limit_d` the moment a user types a
+                    // non-ASCII leading block comment on any MSSQL
+                    // connection with auto-limit on. `j < bytes.len()`
+                    // (the loop condition) guarantees a char exists here.
+                    let c = sql[j..].chars().next().expect("j < bytes.len(), so a char exists at j");
+                    j += c.len_utf8();
                 }
             }
             if depth > 0 {
@@ -688,6 +702,67 @@ mod tests {
             apply_auto_limit_d("/* hint */ SELECT x FROM t", 1000, Dialect::Mssql);
         assert!(changed);
         assert_eq!(sql, "/* hint */ SELECT TOP 1000 x FROM t");
+    }
+
+    /// BLOCKER fix regression (whole-branch review B1): the reviewer's
+    /// exact live repro — `select_head_insert_offset`'s block-comment skip
+    /// used to advance byte-wise (`j += 1`) then slice `sql[j..]`, panicking
+    /// mid-UTF-8-character. Typing this on any MSSQL connection with
+    /// auto-limit on used to abort the whole app (GPUI main thread, no
+    /// `catch_unwind` between `apply_auto_limit_d` and the UI).
+    #[test]
+    fn auto_top_after_leading_comment_with_non_ascii_does_not_panic() {
+        let (sql, changed) =
+            apply_auto_limit_d("/* é */ SELECT x FROM t", 1000, Dialect::Mssql);
+        assert!(changed);
+        assert_eq!(sql, "/* é */ SELECT TOP 1000 x FROM t");
+    }
+
+    /// Same class, Czech diacritics (multiple multi-byte characters in a
+    /// row, not just one) — the exact shape the reviewer's report describes
+    /// a real user typing.
+    #[test]
+    fn auto_top_after_leading_comment_with_czech_diacritics_does_not_panic() {
+        let (sql, changed) =
+            apply_auto_limit_d("/* Příliš žluťoučký kůň */ SELECT * FROM t", 1000, Dialect::Mssql);
+        assert!(changed);
+        assert_eq!(sql, "/* Příliš žluťoučký kůň */ SELECT TOP 1000 * FROM t");
+    }
+
+    /// Non-ASCII inside a NESTED block comment — stresses the char-boundary
+    /// fix together with the depth counter (both `/*`/`*/` re-matching and
+    /// the byte-vs-char advance must agree on where `j` lands).
+    #[test]
+    fn auto_top_after_nested_leading_comment_with_non_ascii_does_not_panic() {
+        let (sql, changed) =
+            apply_auto_limit_d("/* outer /* café */ still outer */ SELECT 1", 1000, Dialect::Mssql);
+        assert!(changed);
+        assert_eq!(sql, "/* outer /* café */ still outer */ SELECT TOP 1000 1");
+    }
+
+    /// Sibling scan (`sql[i..].find('\n')`, `str::find` on a `char`
+    /// pattern) was already char-boundary-safe before this fix — this test
+    /// pins that down explicitly rather than leaving it merely asserted in
+    /// the review response.
+    #[test]
+    fn auto_top_after_leading_line_comment_with_non_ascii_does_not_panic() {
+        let (sql, changed) =
+            apply_auto_limit_d("-- Příliš žluťoučký kůň\nSELECT * FROM t", 1000, Dialect::Mssql);
+        assert!(changed);
+        assert_eq!(sql, "-- Příliš žluťoučký kůň\nSELECT TOP 1000 * FROM t");
+    }
+
+    /// The pg/sqlite path (`apply_auto_limit_pg`) never calls
+    /// `select_head_insert_offset` at all (it appends a trailing `LIMIT`
+    /// via `trim_end`/`ends_with(';')`, not a head-insert scan) — was never
+    /// vulnerable to this class of bug, and stays byte-identical with a
+    /// non-ASCII leading comment before and after this fix.
+    #[test]
+    fn auto_limit_pg_path_unaffected_by_non_ascii_leading_comment() {
+        let (sql, changed) =
+            apply_auto_limit_d("/* Příliš žluťoučký kůň */ select * from t", 1000, Dialect::Postgres);
+        assert!(changed);
+        assert_eq!(sql, "/* Příliš žluťoučký kůň */ select * from t LIMIT 1000");
     }
 
     #[test]

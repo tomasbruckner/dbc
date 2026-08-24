@@ -401,6 +401,17 @@ pub struct ResultGrid {
     /// enough (this one owns a live `TextField`) that a shared type would
     /// need its own internal `Option` anyway.
     cell_editor: Option<CellEditor>,
+    /// G15 T8 whole-branch review M3 fix: the active connection's SQL
+    /// dialect — threads into `fk_join::build_lookup_sql`'s ad-hoc-tab
+    /// `☰` FK-lookup dispatch (`toggle_fk_column`), the one call site that
+    /// used to hard-code Postgres-only identifier/literal quoting
+    /// regardless of the actual connection. Set once by `main.rs` via
+    /// `set_dialect`, right after grid creation (same "own seam, set once,
+    /// not reset by `set_buffer`" precedent `table_name`/`csv_import_enabled`
+    /// establish — the connection's dialect doesn't change across a re-run
+    /// of the same tab). Defaults to `Dialect::Postgres` in `new()`,
+    /// matching every other "no connection yet" default in this codebase.
+    dialect: dbc_core::Dialect,
 }
 
 impl ResultGrid {
@@ -440,6 +451,7 @@ impl ResultGrid {
             editable: None,
             edit_state: EditState::default(),
             cell_editor: None,
+            dialect: dbc_core::Dialect::Postgres,
         }
     }
 
@@ -499,6 +511,13 @@ impl ResultGrid {
     /// `table_name`'s doc comment) used for ad-hoc SQL-editor results.
     pub fn set_table_name(&mut self, name: String) {
         self.table_name = name;
+    }
+
+    /// G15 T8 whole-branch review M3 fix: public seam, called by `main.rs`
+    /// once right after grid creation — see the `dialect` field's own doc
+    /// comment.
+    pub fn set_dialect(&mut self, dialect: dbc_core::Dialect) {
+        self.dialect = dialect;
     }
 
     /// G4 Task 5: marks this grid as a PREVIEW tab and records its identity
@@ -681,6 +700,7 @@ impl ResultGrid {
             return;
         }
         let sql = fk_join::build_lookup_sql(
+            self.dialect,
             fk.schema.as_deref(),
             &fk.table,
             &fk.column,

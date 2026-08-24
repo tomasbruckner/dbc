@@ -1491,7 +1491,7 @@ impl AppView {
                     Ok(stmts) if stmts.len() > 1 => {
                         let (stmts, limited) =
                             auto_limit_each(stmts, auto_limit, bypass_auto_limit, dialect);
-                        self.run_many(spec, sql, stmts, limited, timeout_secs, cx);
+                        self.run_many(spec, sql, stmts, limited, dialect, timeout_secs, cx);
                         return;
                     }
                     Ok(_) => {}
@@ -1758,6 +1758,14 @@ impl AppView {
                                 let grid = cx.new(ResultGrid::new);
                                 grid.update(cx, |g, cx| {
                                     g.set_buffer(buf.clone(), cx);
+                                    // G15 T8 whole-branch review M3 fix: set
+                                    // once, right after creation — see
+                                    // `ResultGrid::dialect`'s doc comment.
+                                    g.set_dialect(
+                                        conn_meta
+                                            .map(|(_, e)| sql_dialect(e))
+                                            .unwrap_or(dbc_core::Dialect::Postgres),
+                                    );
                                     // G4 Task 4: a preview tab knows its
                                     // source table (used as the `INSERT
                                     // INTO` target for exports) — an
@@ -1877,6 +1885,32 @@ impl AppView {
                             // status). Otherwise record the terminal
                             // event's own outcome and update the status bar
                             // as before.
+                            // G15 T8 whole-branch review B2 fix: the
+                            // WRITE-dispatch sibling of `Finished` —
+                            // `runner::stream_query`'s MSSQL-write branch
+                            // sends this INSTEAD of `Started`/`Batch`*/
+                            // `Finished` (no result set exists, so no
+                            // buffer/tab ever opens for this run — `errored`
+                            // can never be set here, since it's only latched
+                            // by a `Batch` buffer-push failure and no
+                            // `Batch` is ever sent on this path). Reports
+                            // the driver's real affected-row count (not a
+                            // buffer row_count read, since there is no
+                            // buffer) and records history exactly like a
+                            // successful read does.
+                            QueryEvent::WriteFinished { affected, elapsed } => {
+                                view.status = format!("{affected} rows affected in {elapsed:.2?}");
+                                view.record_history(
+                                    &sql_for_title,
+                                    &history_conn_name,
+                                    history_started_at,
+                                    Some(elapsed.as_millis() as i64),
+                                    Some(affected as i64),
+                                    None,
+                                    cx,
+                                );
+                                view.cancel = None;
+                            }
                             QueryEvent::Finished { elapsed } => {
                                 // G4 Task 2: if a sort/filter was active on
                                 // this tab's grid while batches streamed in,
@@ -2068,6 +2102,7 @@ impl AppView {
         columns: SchemaRef,
         title_sql: &str,
         conn_identity: &str,
+        dialect: dbc_core::Dialect,
         cx: &mut Context<Self>,
     ) -> (u64, Rc<RefCell<ResultBuffer>>) {
         let buf = Rc::new(RefCell::new(ResultBuffer::new(columns)));
@@ -2078,6 +2113,9 @@ impl AppView {
         grid.update(cx, |g, cx| {
             g.set_buffer(buf.clone(), cx);
             g.set_fk_info(fk_info, ref_cols);
+            // G15 T8 whole-branch review M3 fix: set once, right after
+            // creation — see `ResultGrid::dialect`'s doc comment.
+            g.set_dialect(dialect);
         });
         cx.subscribe(&grid, AppView::on_grid_event).detach();
         let id = self.tabs.open(ResultTab {
@@ -2105,6 +2143,7 @@ impl AppView {
         sql: String,
         statements: Vec<String>,
         limited: bool,
+        dialect: dbc_core::Dialect,
         timeout_secs: Option<u64>,
         cx: &mut Context<Self>,
     ) {
@@ -2198,8 +2237,13 @@ impl AppView {
                             MultiQueryEvent::StatementStarted { index, total, columns: Some(cols) } => {
                                 let title_sql =
                                     statements.get(index).map(String::as_str).unwrap_or("");
-                                let (id, buf) =
-                                    view.open_adhoc_result_tab(cols, title_sql, &conn_identity, cx);
+                                let (id, buf) = view.open_adhoc_result_tab(
+                                    cols,
+                                    title_sql,
+                                    &conn_identity,
+                                    dialect,
+                                    cx,
+                                );
                                 tab_id = Some(id);
                                 buffer = Some(buf);
                                 with_rows += 1;
@@ -3408,6 +3452,20 @@ impl AppView {
                         // `this.update` call.
                         QueryEvent::Batch(_) => unreachable!("Batch handled before this match"),
                         QueryEvent::Finished { .. } => true,
+                        // G15 T8 whole-branch review B2 fix: `stream_query`
+                        // only sends this for a WRITE on an MSSQL spec, and
+                        // this function is only ever reached with the
+                        // `explain_sql`/`explain_analyze_sql` output of a
+                        // READ (`run_explain`'s MSSQL arm routes to
+                        // `dispatch_mssql_plan` instead, before this
+                        // function is ever called) — defensively handled
+                        // (not `unreachable!()`) rather than assumed away.
+                        QueryEvent::WriteFinished { .. } => {
+                            failed = Some(QueryError::msg(
+                                "interní chyba: plán vrátil zápis místo výsledku",
+                            ));
+                            true
+                        }
                         QueryEvent::Failed(e) => {
                             failed = Some(e);
                             true
