@@ -3268,6 +3268,15 @@ impl AppView {
     /// routes through `plan::analyze_gate`'s three-case dispatch (Run /
     /// Blocked / NeedsConfirm) decided from the RAW pre-wrap SQL, mirroring
     /// `run_query_with`'s Guard 1 read-only check.
+    ///
+    /// G15 T7: MSSQL routes to `dispatch_mssql_plan` (session preludes via
+    /// `query_with_session`) BEFORE either the generic estimated dispatch
+    /// OR `analyze_gate`'s match — `plan::explain_sql`/`explain_analyze_sql`
+    /// no longer produce a runnable MSSQL string at all (see their doc
+    /// comments), so MSSQL must never reach `dispatch_plan_query`. Gating
+    /// itself is UNCHANGED for the analyze path: `analyze_gate`'s three
+    /// cases still decide Run/Blocked/NeedsConfirm by SQL classification,
+    /// not by engine — only WHERE the eventual "Run" lands differs.
     fn run_explain(&mut self, is_analyze: bool, cx: &mut Context<Self>) {
         if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
             return;
@@ -3285,13 +3294,31 @@ impl AppView {
         };
 
         if !is_analyze {
+            if engine == dbc_state::Engine::Mssql {
+                if !plan::mssql_plan_dispatch_available() {
+                    self.status = "plán pro MSSQL zatím není k dispozici".to_string();
+                    cx.notify();
+                    return;
+                }
+                self.dispatch_mssql_plan(spec, sql, false, timeout_secs, cx);
+                return;
+            }
             // §5: Explain is ALWAYS safe — no gate, dispatch immediately.
             self.dispatch_plan_query(spec, plan::explain_sql(engine, &sql), engine, false, timeout_secs, cx);
             return;
         }
 
-        match plan::analyze_gate(&sql, read_only) {
+        match plan::analyze_gate(&sql, read_only, sql_dialect(engine)) {
             plan::AnalyzeGate::Run => {
+                if engine == dbc_state::Engine::Mssql {
+                    if !plan::mssql_plan_dispatch_available() {
+                        self.status = "plán pro MSSQL zatím není k dispozici".to_string();
+                        cx.notify();
+                        return;
+                    }
+                    self.dispatch_mssql_plan(spec, sql, true, timeout_secs, cx);
+                    return;
+                }
                 let Some(explain_sql) = plan::explain_analyze_sql(engine, &sql) else { return }; // SQLite: button hidden, unreachable
                 self.dispatch_plan_query(spec, explain_sql, engine, true, timeout_secs, cx);
             }
@@ -3446,6 +3473,108 @@ impl AppView {
         .detach();
     }
 
+    /// G15 T7: dispatches `QueryRunner::run_mssql_plan` — the MSSQL face
+    /// of BOTH `run_explain`'s estimated/`AnalyzeGate::Run`-case dispatch
+    /// (no modal ever involved) and `on_confirm_analyze_write`'s
+    /// confirmed-write dispatch (the `AnalyzeWriteConfirm` modal stays
+    /// open, mutated in place, for the WHOLE duration — same "Escape is a
+    /// structural no-op against this modal" invariant
+    /// `on_confirm_analyze_write`'s own doc comment already documents), so
+    /// checking `self.modal`'s shape at COMPLETION time (`via_confirm_modal`
+    /// below) — not a value captured before the await — reliably tells the
+    /// two callers apart with no race. Mirrors `dispatch_plan_query`'s
+    /// status-text/tab-opening plumbing (no `ResultBuffer` streaming
+    /// needed here — `run_mssql_plan` already returns the whole plan text
+    /// as one `String`) and `on_confirm_analyze_write`'s modal-aware
+    /// completion handling.
+    fn dispatch_mssql_plan(
+        &mut self,
+        spec: ConnectSpec,
+        sql: String,
+        is_analyze: bool,
+        timeout_secs: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        self.status =
+            if is_analyze { "analyzuji plán…".to_string() } else { "vysvětluji plán…".to_string() };
+        cx.notify();
+
+        let sql_title = format!("Plán: {}", collapse_title(&sql));
+        let conn_identity = self.current_conn_identity();
+        let rx = self.runner.run_mssql_plan(spec, sql.clone(), is_analyze, timeout_secs);
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, move |view, cx| {
+                let via_confirm_modal =
+                    matches!(view.modal, Some(connections_ui::ModalState::AnalyzeWriteConfirm { .. }));
+                match result {
+                    Ok(Ok(raw_text)) => {
+                        match plan::parse_plan(dbc_state::Engine::Mssql, is_analyze, &raw_text) {
+                            Ok(parsed) => {
+                                if via_confirm_modal {
+                                    view.modal = None;
+                                }
+                                let parsed = Rc::new(parsed);
+                                let view_entity = cx.new(|cx| plan::PlanView::new(parsed, cx));
+                                view.tabs.open(ResultTab {
+                                    id: 0,
+                                    title: sql_title,
+                                    pinned: false,
+                                    preview_key: None,
+                                    conn_identity,
+                                    content: TabContent::Plan { view: view_entity },
+                                });
+                                view.status = if via_confirm_modal {
+                                    "hotovo (změny vráceny zpět)".to_string()
+                                } else {
+                                    "hotovo".to_string()
+                                };
+                            }
+                            Err(e) => {
+                                view.status = format!("error parsování plánu: {e}");
+                                if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
+                                    running,
+                                    error,
+                                    ..
+                                }) = &mut view.modal
+                                {
+                                    *running = false;
+                                    *error = Some(format!("error parsování plánu: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        view.status = format!("error: {e}");
+                        if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
+                            running,
+                            error,
+                            ..
+                        }) = &mut view.modal
+                        {
+                            *running = false;
+                            *error = Some(e.to_string());
+                        }
+                    }
+                    Err(_canceled) => {
+                        view.status = "error: plán zrušen".to_string();
+                        if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
+                            running,
+                            error,
+                            ..
+                        }) = &mut view.modal
+                        {
+                            *running = false;
+                            *error = Some("analýza zrušena".to_string());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Dispatches `QueryRunner::run_analyze_write` (the runner-owned,
     /// dedicated-connection BEGIN…ROLLBACK sequence), called from the
     /// `ModalState::AnalyzeWriteConfirm` dialog's "Analyzovat" button
@@ -3489,7 +3618,6 @@ impl AppView {
         let Some(sql) = connections_ui::analyze_write_dispatch_sql(&self.modal) else { return };
 
         let Some((_, timeout_secs, _, spec)) = self.resolve_spec_for_explain(cx) else { return };
-        let Some(explain_sql) = plan::explain_analyze_sql(engine, &sql) else { return };
 
         if let Some(connections_ui::ModalState::AnalyzeWriteConfirm { running, error, .. }) =
             &mut self.modal
@@ -3498,6 +3626,30 @@ impl AppView {
             *error = None;
         }
         cx.notify();
+
+        // G15 T7: MSSQL routes to `dispatch_mssql_plan` (session preludes)
+        // instead — `plan::explain_analyze_sql(Mssql, ..)` is `None` now
+        // (see its doc comment), so the generic path below would bail out
+        // immediately for MSSQL if reached; this check MUST come before
+        // that `let Some(explain_sql) = ...` line, after the busy-guard
+        // `running = true` flip above (so the confirm modal's spinner
+        // shows for MSSQL too, same as every other engine).
+        if engine == dbc_state::Engine::Mssql {
+            if !plan::mssql_plan_dispatch_available() {
+                if let Some(connections_ui::ModalState::AnalyzeWriteConfirm { running, error, .. }) =
+                    &mut self.modal
+                {
+                    *running = false;
+                    *error = Some("plán pro MSSQL zatím není k dispozici".to_string());
+                }
+                cx.notify();
+                return;
+            }
+            self.dispatch_mssql_plan(spec, sql, true, timeout_secs, cx);
+            return;
+        }
+
+        let Some(explain_sql) = plan::explain_analyze_sql(engine, &sql) else { return };
 
         let sql_title = format!("Plán: {}", collapse_title(&sql));
         let conn_identity = self.current_conn_identity();

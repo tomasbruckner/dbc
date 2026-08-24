@@ -242,8 +242,23 @@ impl MssqlConnection {
     /// `query()` is an unbounded-memory hazard: a large result set would
     /// be held in full before the caller ever sees the first row. Never
     /// use this for ordinary user-issued queries.
+    ///
+    /// G15 T7 integration fix (found wiring `run_mssql_plan`, "reality
+    /// wins" — not a T2 grounding-text deviation, a genuine build error):
+    /// `&self` (not `&mut self`) made this structurally impossible to call
+    /// from ANY future spawned via `tokio::spawn`/`Runtime::spawn` (which
+    /// requires `Send`), because the returned future retains `&'a Self` for
+    /// its own lifetime, and `&'a MssqlConnection: Send` requires
+    /// `MssqlConnection: Sync` — which it can never be, since `exec_conn`'s
+    /// `odbc_api::Connection` wraps a raw ODBC handle (`*mut c_void`, never
+    /// `Sync`). `&mut self` fixes this at zero behavior cost: the body only
+    /// ever READS `self.conn_str` (cloned once, up front) and never touched
+    /// `exec_conn` (this method always dials a brand-new connection,
+    /// independent of the persistent `exec_conn` `execute()`/`query()` use)
+    /// — `&mut Self: Send` requires only `Self: Send`, which already holds
+    /// (`Box<dyn Connection>` already relies on it).
     pub async fn query_with_session(
-        &self,
+        &mut self,
         prelude: &[String],
         sql: &str,
         postlude: &[String],

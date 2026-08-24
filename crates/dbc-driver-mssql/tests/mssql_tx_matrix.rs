@@ -76,7 +76,7 @@ async fn count_rows(conn: &mut MssqlConnection, table: &str) -> Result<i64, dbc_
 #[tokio::test]
 #[ignore]
 async fn probe_and_query_with_session_are_callable() {
-    let c = connect();
+    let mut c = connect();
     c.probe().expect("probe should succeed against a reachable, correctly-configured server");
     let mut s = c
         .query_with_session(&[], "SELECT 1 AS a", &[], CancelToken::new())
@@ -222,7 +222,7 @@ async fn autocommit_does_not_commit_between_execute_calls_inside_open_tx() {
     // uncommitted row regardless of autocommit interference and prove
     // nothing. A lock timeout under the default isolation level is an
     // equally valid proof of non-visibility as a bare 0 count.
-    let c2 = connect();
+    let mut c2 = connect();
     let visibility = c2
         .query_with_session(
             &["SET LOCK_TIMEOUT 1000".to_string()],

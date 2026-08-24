@@ -777,6 +777,34 @@ impl QueryRunner {
         rx
     }
 
+    /// G15 T7 (G13 T7 delivered): the MSSQL face of the plan/analyze
+    /// feature — same precedent as `run_mssql_backup`/`run_mssql_restore`
+    /// (no `Connection`-trait change, no downcasting; the runner constructs
+    /// the concrete `MssqlConnection` itself, via
+    /// `connect::mssql_connection_from_config`, no `open_spec`/`handle`
+    /// needed since that builder does no I/O). `analyze == false` is the
+    /// estimated path (`SET SHOWPLAN_XML` — never executes `sql`, always
+    /// safe on any connection); `analyze == true` is the actual path
+    /// (`SET STATISTICS XML` inside a fused-`XACT_ABORT` transaction,
+    /// rolled back ALWAYS via `query_with_session`'s postlude contract) —
+    /// see `mssql_plan_session`'s doc comment for the exact prelude/postlude
+    /// text and `run_mssql_plan_inner`'s doc comment for the read-only
+    /// belt-and-braces guard.
+    pub fn run_mssql_plan(
+        &self,
+        spec: ConnectSpec,
+        sql: String,
+        analyze: bool,
+        timeout_secs: Option<u64>,
+    ) -> tokio::sync::oneshot::Receiver<Result<String, QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let result = run_mssql_plan_inner(spec, sql, analyze, timeout_secs).await;
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
     /// G11 T4: SQLite `VACUUM INTO` via `Connection::execute` — allowed on
     /// read-only (design CURATION item 2).
     pub fn run_sqlite_backup(
@@ -1206,9 +1234,13 @@ async fn run_write_transaction_inner(
 }
 
 /// G13 T6: drains a single-row, single-column TEXT result (pg's `EXPLAIN
-/// (ANALYZE, BUFFERS, FORMAT JSON)` output shape, and MSSQL's
-/// `STATISTICS XML` result set once T7 wires it) via the same
+/// (ANALYZE, BUFFERS, FORMAT JSON)` output shape) via the same
 /// `dbc_buffer::ResultBuffer` drain `fetch_lookup_inner` already uses.
+/// MSSQL's `STATISTICS`/`SHOWPLAN XML` result set goes through the sibling
+/// `drain_stream_single_text_cell` below instead (G15 T7) — MSSQL never
+/// has a `&mut dyn Connection` to call `.query()` on here, since its plan
+/// text arrives via `MssqlConnection::query_with_session`, which isn't
+/// part of the `Connection` trait.
 async fn drain_single_text_cell(
     conn: &mut dyn Connection,
     sql: &str,
@@ -1223,6 +1255,132 @@ async fn drain_single_text_cell(
         return Err(QueryError::msg("EXPLAIN ANALYZE nevrátil žádný řádek"));
     }
     Ok(buf.cell_text(0, 0))
+}
+
+/// G15 T7: sibling of `drain_single_text_cell` that reads an
+/// ALREADY-OPEN `QueryStream` directly instead of calling `.query()`
+/// first — `query_with_session` (T2) returns a `QueryStream` on its own,
+/// with no `&mut dyn Connection` in the picture. Drains every batch (not
+/// just the first) for consistency with `drain_single_text_cell`'s own
+/// shape; this is equivalent in practice to "first batch's cell [0][0]"
+/// because `query_with_session` already fully materializes its (small,
+/// bounded — Showplan XML is always a single row) result set before this
+/// function ever runs (its own doc comment: "BOUNDED STATEMENTS ONLY").
+async fn drain_stream_single_text_cell(
+    stream: &mut dbc_core::QueryStream,
+) -> Result<String, QueryError> {
+    let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+    while let Some(item) = stream.batches.recv().await {
+        buf.push(item?).map_err(|e| QueryError::msg(e.to_string()))?;
+    }
+    if buf.row_count() == 0 || buf.cell_is_null(0, 0) {
+        return Err(QueryError::msg("plán nevrátil žádná data"));
+    }
+    Ok(buf.cell_text(0, 0))
+}
+
+/// G15 T7 (G13 T7 delivered, design §2e / curation item 1): prelude/
+/// postlude text for `run_mssql_plan`'s `query_with_session` call — pure
+/// so the exact strings are unit-tested without a connection. The G13
+/// one-string `"SET SHOWPLAN_XML ON; {sql}"` form CANNOT work (`SET
+/// SHOWPLAN_XML` must be the ONLY statement in its batch, and is
+/// session-scoped while `MssqlConnection::query()` opens a fresh
+/// connection per call) — `query_with_session`'s prelude/main-batch/
+/// postlude shape is the actual, structurally-correct delivery mechanism.
+fn mssql_plan_session(analyze: bool) -> (Vec<String>, Vec<String>) {
+    let d = dbc_core::Dialect::Mssql;
+    if analyze {
+        // T3 review attention note, confirmed here: `SET STATISTICS XML`
+        // has NO only-statement restriction (a run-time session setting,
+        // unlike `SHOWPLAN_XML`) — `{sql}` genuinely EXECUTES on this
+        // path. `tx_begin_sql` is the FUSED XACT_ABORT form (G15 T5); the
+        // postlude ROLLBACK runs ALWAYS via `query_with_session`'s own
+        // "postludes run best-effort, on every path including every error
+        // branch" contract (verified against dbc-driver-mssql/src/lib.rs —
+        // every `run_postludes(&conn, &postlude)` call site there) — the
+        // exact `drive_analyze_write` discipline (BEGIN -> query ->
+        // ROLLBACK, never COMMIT) expressed as prelude/postlude instead of
+        // three sequential `execute()` calls over one held-open connection.
+        (
+            vec!["SET STATISTICS XML ON".to_string(), dbc_core::tx_begin_sql(d).to_string()],
+            vec![dbc_core::tx_rollback_sql(d).to_string()],
+        )
+    } else {
+        // T3 review attention note, confirmed here (this is the actual
+        // safety MECHANISM, not an accident of some other bug): per
+        // Microsoft's own `SET SHOWPLAN_XML` docs, turning it ON "causes
+        // SQL Server not to execute Transact-SQL statements" — the server
+        // returns the plan XML INSTEAD of running `{sql}`, for every
+        // statement, on every connection, read-only or not. That's why
+        // this branch needs no read-only guard and no transaction wrapper
+        // at all (empty postlude) — `run_mssql_plan_inner`'s guard is
+        // gated on `analyze` for exactly this reason.
+        (vec!["SET SHOWPLAN_XML ON".to_string()], Vec::new())
+    }
+}
+
+/// G15 T7: `QueryRunner::run_mssql_plan`'s async body — the MSSQL face of
+/// the plan/analyze feature, delivered via
+/// `MssqlConnection::query_with_session` (T2) instead of the generic
+/// `Connection::query`/`execute` paths every other engine's plan flow
+/// uses (curation item 1: the one-string form is structurally
+/// impossible — see `mssql_plan_session`'s doc comment).
+async fn run_mssql_plan_inner(
+    spec: ConnectSpec,
+    sql: String,
+    analyze: bool,
+    timeout_secs: Option<u64>,
+) -> Result<String, QueryError> {
+    // Belt-and-braces (G13 parity, same posture as `run_analyze_write_inner`):
+    // an ACTUAL plan (`analyze == true`) of a WRITE statement refuses
+    // read-only independently of the UI's `analyze_gate` — the UI gate is
+    // the primary defense, this is the second, driver-independent layer.
+    // Reads — and EVERY estimated plan (`analyze == false`),
+    // unconditionally — stay allowed on read-only connections:
+    // `mssql_plan_session`'s doc comment documents WHY (SHOWPLAN_XML never
+    // executes `sql`; §5's "Explain is always safe" holds for MSSQL too).
+    // Dialect-aware (`is_read_statement_d`, `Dialect::Mssql` — batch C
+    // review carry-forward, explicitly deferred to this task): a
+    // bracket-quoted reserved word (`SELECT [Delete] FROM AuditLog`) must
+    // not false-reject a genuine read here either, same fix as
+    // `main.rs`'s Guard 1 and `analyze_gate` (plan.rs) already got.
+    if analyze && !dbc_core::is_read_statement_d(&sql, dbc_core::Dialect::Mssql) {
+        guard_not_read_only(spec_is_read_only(&spec))?;
+    }
+    let ConnectSpec::Config { cfg, secret } = spec else {
+        // No MSSQL URL form exists (main.rs::engine_from_url: postgres[ql]://
+        // or a sqlite file path only) — defensive only; unreachable via the
+        // UI (`dispatch_mssql_plan` is only ever reached for a saved MSSQL
+        // connection).
+        return Err(QueryError::msg("MSSQL plán vyžaduje uložené připojení"));
+    };
+    // Pure string building — no I/O, no `spawn_blocking` needed; the ssh /
+    // integrated-auth refusals fire here exactly like `open_config`'s arm
+    // (`mssql_connection_from_config` is the SAME builder both share).
+    let mut conn = connect::mssql_connection_from_config(&cfg, secret)?;
+    let (prelude, postlude) = mssql_plan_session(analyze);
+    let run = async {
+        let mut stream = conn
+            .query_with_session(&prelude, &sql, &postlude, CancelToken::new())
+            .await
+            .map_err(connect::mssql_im002_hint)?;
+        drain_stream_single_text_cell(&mut stream).await
+    };
+    match timeout_secs {
+        Some(t) => tokio::time::timeout(Duration::from_secs(t), run)
+            .await
+            .map_err(|_| QueryError::msg(format!("[timeout] analýza překročila {t}s")))?,
+        None => run.await,
+    }
+    // On timeout the blocking session is orphaned (its `spawn_blocking`
+    // task isn't cancelled by dropping this future) — its ODBC connection
+    // drops with that task once it finishes, which is the SAME
+    // "disconnect rolls back any still-open transaction, session settings
+    // can never leak" backstop `query_with_session`'s own doc comment
+    // already documents (confirmed against `dbc-driver-mssql/src/lib.rs`:
+    // one fresh `connect()` per `query_with_session` call, `run_postludes`
+    // called on every path including every error branch, before that
+    // connection is ever dropped).
 }
 
 /// G13 T6: BEGIN -> query -> ROLLBACK, ALWAYS (never COMMIT — see
@@ -5743,6 +5901,122 @@ mod backup_runner_tests {
             }
             assert!(saw_env_value, "expected the redacted PGPASSWORD echo in the log");
         });
+    }
+}
+
+/// G15 T7: `mssql_plan_session`'s exact prelude/postlude strings (pure) and
+/// `run_mssql_plan_inner`'s belt-and-braces read-only guard (no docker/live
+/// server needed — the guard, and the SSH/no-user refusals shared with
+/// `open_config`, all fire before `query_with_session` is ever called).
+#[cfg(test)]
+mod mssql_plan_tests {
+    use super::*;
+
+    fn cfg(read_only: bool) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "x".into(),
+            name: "x".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Mssql,
+            host: "localhost".into(),
+            port: Some(1433),
+            database: "db".into(),
+            user: "sa".into(),
+            read_only,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: None,
+        }
+    }
+
+    #[test]
+    fn mssql_plan_session_estimated_is_lone_showplan_batch() {
+        let (prelude, postlude) = mssql_plan_session(false);
+        assert_eq!(prelude, vec!["SET SHOWPLAN_XML ON".to_string()]);
+        assert!(postlude.is_empty());
+    }
+
+    #[test]
+    fn mssql_plan_session_actual_is_statistics_then_fused_begin_with_rollback_postlude() {
+        let (prelude, postlude) = mssql_plan_session(true);
+        assert_eq!(
+            prelude,
+            vec!["SET STATISTICS XML ON".to_string(), "SET XACT_ABORT ON; BEGIN TRANSACTION".to_string()]
+        );
+        assert_eq!(postlude, vec!["ROLLBACK".to_string()]);
+    }
+
+    /// REQUIRED per this task's plan: an ACTUAL plan (`analyze = true`) of
+    /// a WRITE statement on a read-only MSSQL connection refuses before
+    /// any connection is attempted — `guard_not_read_only` fires before
+    /// `connect::mssql_connection_from_config` is even reached.
+    #[tokio::test]
+    async fn run_mssql_plan_refuses_read_only_write_analyze_without_connecting() {
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg(true)), secret: None };
+        let err = run_mssql_plan_inner(spec, "UPDATE t SET a=1".to_string(), true, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "připojení je jen pro čtení");
+    }
+
+    /// REQUIRED per this task's plan: a READ under `analyze = true` on a
+    /// read-only connection passes the guard (no read-only refusal) — proven
+    /// deterministically, without any live server, by giving the config an
+    /// `ssh` tunnel: `mssql_connection_from_config`'s SSH refusal only fires
+    /// AFTER the guard, so seeing THAT specific error (not the read-only
+    /// one) proves the guard was passed and no connection was attempted.
+    #[tokio::test]
+    async fn run_mssql_plan_read_analyze_passes_the_guard() {
+        let mut c = cfg(true);
+        c.ssh = Some(dbc_state::SshTunnelConfig {
+            host: "bastion".into(),
+            port: 22,
+            user: "u".into(),
+            key_path: None,
+        });
+        let spec = ConnectSpec::Config { cfg: Box::new(c), secret: None };
+        let err = run_mssql_plan_inner(spec, "SELECT 1".to_string(), true, None).await.unwrap_err();
+        assert!(
+            err.message.contains("SSH tunel pro MSSQL zatím není podporován"),
+            "expected the SSH refusal (proving the read-only guard was passed for a read), got: {}",
+            err.message
+        );
+    }
+
+    /// Companion case: the ESTIMATED path (`analyze = false`) never guards
+    /// on read-only at all, for a WRITE statement either — same proof
+    /// technique (SSH refusal reached means the guard step, which doesn't
+    /// even exist on this path, was skipped as designed).
+    #[tokio::test]
+    async fn run_mssql_plan_estimated_write_never_guards_on_read_only() {
+        let mut c = cfg(true);
+        c.ssh = Some(dbc_state::SshTunnelConfig {
+            host: "bastion".into(),
+            port: 22,
+            user: "u".into(),
+            key_path: None,
+        });
+        let spec = ConnectSpec::Config { cfg: Box::new(c), secret: None };
+        let err = run_mssql_plan_inner(spec, "UPDATE t SET a=1".to_string(), false, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("SSH tunel pro MSSQL zatím není podporován"),
+            "estimated plan of a write must never hit the read-only guard: {}",
+            err.message
+        );
+    }
+
+    /// Defensive-only branch: no MSSQL URL form exists
+    /// (`main.rs::engine_from_url`), so `ConnectSpec::Url` must be refused
+    /// with a clear message rather than panicking on the `let ... else`.
+    #[tokio::test]
+    async fn run_mssql_plan_refuses_a_cli_url_spec() {
+        let spec = ConnectSpec::Url("postgres://localhost/db".to_string());
+        let err = run_mssql_plan_inner(spec, "SELECT 1".to_string(), false, None).await.unwrap_err();
+        assert!(err.message.contains("uložené připojení"), "got: {}", err.message);
     }
 }
 
