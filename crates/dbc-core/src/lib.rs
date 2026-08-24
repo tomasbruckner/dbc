@@ -17,7 +17,7 @@ pub use ddl::{
     synthesize_create_table_d,
 };
 pub use error::QueryError;
-pub use guards::{apply_auto_limit, apply_auto_limit_d, is_read_statement};
+pub use guards::{apply_auto_limit, apply_auto_limit_d, is_read_statement, is_read_statement_d};
 pub use params::{find_params, substitute_params};
 pub use schema::{
     ColumnInfo, ConstraintInfo, FkRef, IndexInfo, RoutineInfo, RoutineKind, SchemaSnapshot,

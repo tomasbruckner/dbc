@@ -77,17 +77,37 @@ const READ_PRAGMAS: &[&str] = &[
     "PAGE_COUNT",
 ];
 
+/// Pg/sqlite-convention tokenizer -- thin wrapper over [`tokenize_d`]
+/// (G15 T1 review fix), byte-identical to the pre-G15 behavior: `[`/`]`
+/// stay ordinary dropped punctuation, so e.g. an array subscript
+/// `arr[1]` tokenizes exactly as before (`1` still surfaces as
+/// `Item::Word("1")`).
+fn tokenize(sql: &str) -> Option<Vec<Item>> {
+    tokenize_d(sql, Dialect::Postgres)
+}
+
 /// Tokenizes `sql` into a flat sequence of [`Item`]s, tracking:
 /// - single-quoted string literals (`''` is an escaped quote),
 /// - double-quoted identifiers (`""` is an escaped quote),
+/// - Mssql only: `[...]` bracket-quoted identifiers (`]]` is an escaped
+///   `]`, mirroring `split.rs`'s `InBracketIdent`/`BracketIdentMaybeEnd`
+///   states) -- G15 T1 review fix: a bracket-quoted reserved word (e.g.
+///   `[Delete]`, `[Top]`, `[Order]`) must NEVER surface as a bare
+///   `Item::Word` and match a keyword, closing both the false-reject-as-
+///   write bug in `is_read_statement_d` and the missed-`TOP`-insertion bug
+///   in `apply_auto_limit_d`. Postgres/Sqlite: `[`/`]` are never
+///   bracket-quoting syntax (Postgres uses them for array subscripts, e.g.
+///   `arr[1]`) -- dialect-gated exactly like `split.rs`'s own `'['`
+///   handling, so `tokenize(sql)` (== `tokenize_d(sql, Dialect::Postgres)`)
+///   stays byte-identical to the pre-fix behavior.
 /// - `--` line comments (run to end of line),
 /// - `/* ... */` block comments, which **nest** (matches PostgreSQL's actual
 ///   nesting semantics -- tracked via a depth counter, not a bool, which is
 ///   the root cause fix for the `/* /* */ SELECT 1 */ UPDATE ...` bypass).
 ///
 /// Returns `None` if the input ends inside any of the above open constructs
-/// (unterminated string/quoted-ident/comment). Callers must treat `None` as
-/// "cannot determine safety" and fail closed.
+/// (unterminated string/quoted-ident/bracket-ident/comment). Callers must
+/// treat `None` as "cannot determine safety" and fail closed.
 ///
 /// Known limitation (non-blocking, see Task 6 security review Issue 5):
 /// PostgreSQL dollar-quoted strings (`$$...$$`) are not recognized. This can
@@ -96,11 +116,12 @@ const READ_PRAGMAS: &[&str] = &[
 /// `is_read_statement` to *reject* a statement it could have allowed (a
 /// write keyword inside a `$$...$$` body false-positives as a bare token) --
 /// both fail in the safe direction.
-fn tokenize(sql: &str) -> Option<Vec<Item>> {
+fn tokenize_d(sql: &str, dialect: Dialect) -> Option<Vec<Item>> {
     let mut items = Vec::new();
     let mut chars = sql.chars().peekable();
     let mut in_single_string = false;
     let mut in_double_ident = false;
+    let mut in_bracket_ident = false;
     let mut in_line_comment = false;
     let mut block_comment_depth: u32 = 0;
 
@@ -122,6 +143,17 @@ fn tokenize(sql: &str) -> Option<Vec<Item>> {
                     chars.next();
                 } else {
                     in_double_ident = false;
+                }
+            }
+            continue;
+        }
+
+        if in_bracket_ident {
+            if c == ']' {
+                if chars.peek() == Some(&']') {
+                    chars.next();
+                } else {
+                    in_bracket_ident = false;
                 }
             }
             continue;
@@ -167,6 +199,11 @@ fn tokenize(sql: &str) -> Option<Vec<Item>> {
             continue;
         }
 
+        if c == '[' && dialect == Dialect::Mssql {
+            in_bracket_ident = true;
+            continue;
+        }
+
         if c == ';' {
             items.push(Item::Semi);
             continue;
@@ -196,7 +233,12 @@ fn tokenize(sql: &str) -> Option<Vec<Item>> {
         // significant to any guard here and is dropped.
     }
 
-    if in_single_string || in_double_ident || in_line_comment || block_comment_depth > 0 {
+    if in_single_string
+        || in_double_ident
+        || in_bracket_ident
+        || in_line_comment
+        || block_comment_depth > 0
+    {
         None
     } else {
         Some(items)
@@ -294,8 +336,25 @@ fn is_single_statement_read(stmt: &[Item]) -> bool {
 /// fail closed on multi-statement text at the protocol layer), but
 /// future-proofs the guard for drivers -- e.g. MSSQL/odbc-api -- that may
 /// execute semicolon-separated batches.
+///
+/// Thin pg-convention wrapper over [`is_read_statement_d`] (G15 T1 review
+/// fix) -- byte-identical to the pre-G15 behavior for every existing
+/// call site (none of them thread a dialect through yet; that's later
+/// tasks' job).
 pub fn is_read_statement(sql: &str) -> bool {
-    let items = match tokenize(sql) {
+    is_read_statement_d(sql, Dialect::Postgres)
+}
+
+/// Dialect-aware sibling of [`is_read_statement`] (G15 T1 review fix).
+/// Not wired into any call site yet -- added now so the Layer-1 read guard
+/// is bracket-correct in `dbc-core` *before* MSSQL SQL text can ever reach
+/// it (a bracket-quoted reserved word like `[Delete]`, `[Order]`, `[Top]`
+/// must never be mistaken for the bare keyword and false-reject a genuine
+/// read, e.g. `SELECT [Delete], [Update] FROM AuditLog`). Postgres/Sqlite
+/// callers are unaffected (`[`/`]` aren't quoting syntax for those
+/// dialects -- see [`tokenize_d`]).
+pub fn is_read_statement_d(sql: &str, dialect: Dialect) -> bool {
+    let items = match tokenize_d(sql, dialect) {
         Some(items) => items,
         None => return false,
     };
@@ -323,14 +382,29 @@ pub fn apply_auto_limit(sql: &str, limit: u64) -> (String, bool) {
 /// renamed from the pre-G15 `apply_auto_limit` body, byte-identical).
 /// Mssql inserts `TOP {n}` immediately after the leading `SELECT [ALL |
 /// DISTINCT]` head instead -- T-SQL has no trailing `LIMIT`.
+///
+/// **Documented decision (G15 T1 review, MINOR finding): `WITH cte AS
+/// (...) SELECT ...` is intentionally left a no-op (under-applies, never
+/// over-applies -- same posture as every other gap this function
+/// documents).** Correctly finding the top-level `SELECT` after a
+/// (possibly multi-CTE, possibly nested-parens-in-string-literals) `WITH`
+/// clause needs depth-aware scanning that also respects string/comment/
+/// bracket-ident boundaries -- effectively a second tokenizer -- which
+/// isn't worth the risk of a subtly wrong paren-matcher (e.g. an unbalanced
+/// `(` inside a CTE body's string literal) for what is purely a query-size
+/// optimization: the runner's row-cap still bounds result-set size even
+/// when the auto-`TOP` doesn't fire. Revisit only if this proves a real
+/// pain point in practice (T8-noted limitation).
 pub fn apply_auto_limit_d(sql: &str, limit: u64, dialect: Dialect) -> (String, bool) {
     match dialect {
         Dialect::Postgres | Dialect::Sqlite => apply_auto_limit_pg(sql, limit),
         Dialect::Mssql => {
-            let items = match tokenize(sql) {
+            let items = match tokenize_d(sql, Dialect::Mssql) {
                 Some(items) => items,
                 None => return (sql.to_string(), false),
             };
+            // Only a bare leading SELECT is handled -- see the doc comment
+            // above for the WITH/CTE no-op decision.
             if first_word(&items) != Some("SELECT") {
                 return (sql.to_string(), false);
             }
@@ -632,5 +706,109 @@ mod tests {
             apply_auto_limit("select * from big", 1000),
             apply_auto_limit_d("select * from big", 1000, Dialect::Postgres)
         );
+    }
+
+    // ---------- Mssql bracket-ident awareness in tokenize (G15 T1 review fix) ----------
+
+    #[test]
+    fn mssql_bracket_reserved_word_is_not_mistaken_for_a_write_keyword() {
+        // Review probe case 1: a pure SELECT over bracket-quoted
+        // reserved-word column names must not be misclassified as a write.
+        assert!(is_read_statement_d("SELECT [Delete], [Update] FROM AuditLog", Dialect::Mssql));
+    }
+
+    #[test]
+    fn mssql_bracket_order_and_user_variants_are_read() {
+        assert!(is_read_statement_d("SELECT [Order], [User] FROM t", Dialect::Mssql));
+    }
+
+    #[test]
+    fn mssql_bracket_escaped_close_bracket_does_not_break_tokenizing() {
+        assert!(is_read_statement_d("SELECT [we]]ird] FROM t", Dialect::Mssql));
+    }
+
+    #[test]
+    fn mssql_bracket_does_not_hide_a_bare_write_keyword_elsewhere() {
+        // A bracket only protects its OWN contents -- a genuine bare write
+        // keyword elsewhere in the batch must still be rejected.
+        assert!(!is_read_statement_d("SELECT [Order] FROM t; DELETE FROM t", Dialect::Mssql));
+    }
+
+    #[test]
+    fn mssql_unterminated_bracket_fails_closed_in_guards_too() {
+        assert!(!is_read_statement_d("SELECT [oops", Dialect::Mssql));
+        assert!(!apply_auto_limit_d("SELECT [oops", 1000, Dialect::Mssql).1);
+    }
+
+    #[test]
+    fn mssql_bracket_reserved_word_gets_auto_top() {
+        // Review probe case 2: `[Top]` as a bracket-quoted column name must
+        // not be mistaken for the TOP auto-limit blocker.
+        let (sql, changed) =
+            apply_auto_limit_d("SELECT [Top] FROM Rankings", 1000, Dialect::Mssql);
+        assert!(changed);
+        assert_eq!(sql, "SELECT TOP 1000 [Top] FROM Rankings");
+    }
+
+    #[test]
+    fn is_read_statement_wrapper_is_byte_identical_pg() {
+        assert_eq!(
+            is_read_statement("select * from t"),
+            is_read_statement_d("select * from t", Dialect::Postgres)
+        );
+    }
+
+    #[test]
+    fn pg_array_subscript_bracket_handling_is_unchanged() {
+        // Postgres/Sqlite: `[`/`]` are never quoting syntax (Postgres uses
+        // them for array subscripts) -- tokenize_d(_, Postgres) must stay
+        // byte-identical to the pre-fix behavior: content inside brackets
+        // still tokenizes as ordinary words.
+        assert_eq!(
+            apply_auto_limit("select arr[1] from t", 1000),
+            ("select arr[1] from t LIMIT 1000".to_string(), true)
+        );
+        assert!(is_read_statement("select arr[1] from t"));
+        // Pins that bracket-skipping is NOT applied outside Mssql: a bare
+        // WRITE_KEYWORDS token inside brackets still poisons the pg read
+        // guard exactly as before this fix (dialect-scoping regression
+        // guard).
+        assert!(!is_read_statement("select arr[delete] from t"));
+    }
+
+    // ---------- Mssql CTE/WITH auto-limit: documented no-op (G15 T1 review, MINOR) ----------
+
+    #[test]
+    fn auto_top_leaves_single_cte_alone_documented_no_op() {
+        let sql = "WITH cte AS (SELECT * FROM t) SELECT * FROM cte";
+        assert!(!apply_auto_limit_d(sql, 1000, Dialect::Mssql).1);
+    }
+
+    #[test]
+    fn auto_top_leaves_multiple_ctes_alone_documented_no_op() {
+        let sql = "WITH a AS (SELECT * FROM t1), b AS (SELECT * FROM t2) \
+                   SELECT * FROM a JOIN b ON a.id = b.id";
+        assert!(!apply_auto_limit_d(sql, 1000, Dialect::Mssql).1);
+    }
+
+    #[test]
+    fn auto_top_leaves_nested_cte_alone_documented_no_op() {
+        let sql = "WITH outer_cte AS (WITH inner_cte AS (SELECT 1 AS x) SELECT x FROM inner_cte) \
+                   SELECT * FROM outer_cte";
+        assert!(!apply_auto_limit_d(sql, 1000, Dialect::Mssql).1);
+    }
+
+    #[test]
+    fn auto_top_with_inside_a_string_literal_is_still_safely_a_no_op() {
+        // A genuine SELECT (no real WITH clause) whose string literal
+        // happens to contain the text "WITH" must NOT be confused with a
+        // real WITH-headed statement -- the flat first-word check only
+        // ever looks at items[0], and tokenize discards string content, so
+        // auto-TOP correctly still fires here (the mirror of the CTE
+        // no-op tests above: proves the two cases aren't conflated).
+        let (sql, changed) =
+            apply_auto_limit_d("SELECT 'WITH cte AS (x)' FROM t", 1000, Dialect::Mssql);
+        assert!(changed);
+        assert_eq!(sql, "SELECT TOP 1000 'WITH cte AS (x)' FROM t");
     }
 }
