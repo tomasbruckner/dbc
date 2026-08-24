@@ -29,10 +29,9 @@ const TITLE_MAX_CHARS: usize = 30;
 pub enum TabContent {
     Grid { grid: Entity<ResultGrid>, buffer: Rc<RefCell<ResultBuffer>> },
     /// Read-only DDL/source view (schema browser previews, G3+). Rendering
-    /// support (`AppView::render_tab_content`) and scroll handling exist
-    /// already; no producer constructs this variant yet outside unit tests
-    /// — the schema browser that will is a later task.
-    #[allow(dead_code)]
+    /// support (`AppView::render_tab_content`) and scroll handling live in
+    /// `AppView`; constructed by the DDL viewer (`on_tree_event`'s/
+    /// `on_er_diagram_event`'s `OpenDdl` arms in main.rs).
     Text { text: String, scroll_lines: usize },
     /// G9: server-monitor dashboard tab (one per connection at a time —
     /// keyed via `preview_key = "monitor:{conn_identity}"`, activated
