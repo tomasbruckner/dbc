@@ -187,6 +187,37 @@ pub struct CsvImportJob {
     pub mapping: crate::csv_import::ColumnMapping,
 }
 
+/// Design §6: the DB-list cap. The listing SQL carries a `2001`-row cap in
+/// its own dialect (`LIMIT` / `TOP`) and `drain_all_rows` is capped at
+/// `DB_LIST_CAP + 1` as a second belt — the sentinel 2001st row is how
+/// `truncate_db_list` detects "there were more" without a COUNT round-trip.
+pub const DB_LIST_CAP: usize = 2000;
+
+/// Design §3.2: excludes templates AND `datallowconn = false` —
+/// deliberately stricter than `admin_sql`'s sizes query (templates only):
+/// a database you cannot connect to must not render as an expandable row.
+pub const PG_DB_LIST_SQL: &str = "SELECT datname FROM pg_catalog.pg_database \
+     WHERE NOT datistemplate AND datallowconn ORDER BY datname LIMIT 2001";
+
+/// Design §3.2: ONLINE databases only (state = 0). System DBs
+/// (master/msdb/model/tempdb) are INCLUDED — DataGrip precedent; hiding
+/// them would surprise admins, and they are just rows until expanded.
+/// `TOP (2001)`, not `LIMIT` — resolved deviation 2.
+pub const MSSQL_DB_LIST_SQL: &str =
+    "SELECT TOP (2001) name FROM sys.databases WHERE state = 0 ORDER BY name";
+
+/// Pure half of the truncation contract: keep at most `DB_LIST_CAP` names,
+/// flag whether anything was dropped (the caller renders the disclosure
+/// Notice row, design §6).
+pub fn truncate_db_list(mut names: Vec<String>) -> (Vec<String>, bool) {
+    if names.len() > DB_LIST_CAP {
+        names.truncate(DB_LIST_CAP);
+        (names, true)
+    } else {
+        (names, false)
+    }
+}
+
 /// Owns the tokio runtime. All DB I/O lives here; the UI thread only ever
 /// awaits the event channel from inside `cx.spawn`.
 pub struct QueryRunner {
@@ -344,6 +375,65 @@ impl QueryRunner {
                 Ok(mut opened) => opened.conn.schema().await,
                 Err(e) => Err(e),
             };
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
+    /// Sidebar rework (design §3.2): one-shot list of the server's
+    /// databases, over a short-lived connection to the spec's own database
+    /// (the caller passes the DEFAULT-database spec), under the
+    /// connection's own privileges and read-only session — zero privilege
+    /// escalation; a denied catalog read degrades to the caller's error
+    /// row, never a retry loop or a privilege prompt (design §4.5).
+    ///
+    /// File engines (Sqlite/Duckdb) resolve IMMEDIATELY from
+    /// `cfg.database` without opening a connection — one file, one
+    /// database (resolved deviations 3–5). `Url` specs are refused: the
+    /// CLI root never lists (design §3.4).
+    ///
+    /// Ok((database names, truncated)) — truncated = server had more than
+    /// `DB_LIST_CAP` databases.
+    ///
+    /// Allow dead_code: T2 lands ahead of T5's UI consumer (the sidebar's
+    /// `LoadDatabases` handler in `main.rs`) — exercised directly by this
+    /// file's `db_list_tests` until then. Remove once T5 wires it in.
+    #[allow(dead_code)]
+    pub fn fetch_database_list(
+        &self,
+        spec: ConnectSpec,
+    ) -> tokio::sync::oneshot::Receiver<Result<(Vec<String>, bool), QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let engine = match &spec {
+            ConnectSpec::Config { cfg, .. } => cfg.engine,
+            ConnectSpec::Url(_) => {
+                let _ = tx.send(Err(QueryError::msg(
+                    "výpis databází není pro CLI připojení k dispozici",
+                )));
+                return rx;
+            }
+        };
+        // Exhaustive over Engine — house rule, no `_ =>`.
+        let sql = match engine {
+            dbc_state::Engine::Sqlite | dbc_state::Engine::Duckdb => {
+                let ConnectSpec::Config { cfg, .. } = &spec else { unreachable!("matched above") };
+                let _ = tx.send(Ok((vec![cfg.database.clone()], false)));
+                return rx;
+            }
+            dbc_state::Engine::Postgres => PG_DB_LIST_SQL,
+            dbc_state::Engine::Mssql => MSSQL_DB_LIST_SQL,
+        };
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            let result = async {
+                let mut opened = open_spec(spec, handle).await?;
+                let (_cols, rows) =
+                    drain_all_rows(&mut *opened.conn, sql, DB_LIST_CAP + 1).await?;
+                let names: Vec<String> =
+                    rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect();
+                Ok(truncate_db_list(names))
+            }
+            .await;
             let _ = tx.send(result);
         });
         rx
@@ -2859,6 +2949,99 @@ async fn stream_query(
                 let _ = tx.send(QueryEvent::Finished { elapsed: started.elapsed() }).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod db_list_tests {
+    use super::*;
+
+    /// The two catalog queries are saved-behaviour contracts (design §3.2):
+    /// pg excludes templates AND `datallowconn = false` (deliberately
+    /// stricter than admin_sql's sizes query — a db you cannot connect to
+    /// must not render as expandable); MSSQL takes ONLINE only (state = 0)
+    /// and deliberately INCLUDES system DBs (DataGrip precedent). Each cap
+    /// is dialect-native: `LIMIT` is not T-SQL, `TOP` is not Postgres —
+    /// resolved deviation 2.
+    #[test]
+    fn db_list_sql_texts_are_pinned() {
+        assert_eq!(
+            PG_DB_LIST_SQL,
+            "SELECT datname FROM pg_catalog.pg_database \
+             WHERE NOT datistemplate AND datallowconn ORDER BY datname LIMIT 2001"
+        );
+        assert_eq!(
+            MSSQL_DB_LIST_SQL,
+            "SELECT TOP (2001) name FROM sys.databases WHERE state = 0 ORDER BY name"
+        );
+    }
+
+    #[test]
+    fn truncate_db_list_caps_at_2000_and_flags() {
+        let names: Vec<String> = (0..2001).map(|i| format!("db{i:04}")).collect();
+        let (kept, truncated) = truncate_db_list(names);
+        assert_eq!(kept.len(), DB_LIST_CAP);
+        assert!(truncated);
+        let (kept, truncated) = truncate_db_list(vec!["a".into(), "b".into()]);
+        assert_eq!(kept.len(), 2);
+        assert!(!truncated);
+        // Exactly at the cap: NOT truncated (the +1 sentinel row is the signal).
+        let names: Vec<String> = (0..2000).map(|i| format!("db{i:04}")).collect();
+        assert!(!truncate_db_list(names).1);
+    }
+
+    fn file_cfg(engine: dbc_state::Engine, path: &str) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "f1".into(),
+            name: "file".into(),
+            folder: vec![],
+            engine,
+            host: String::new(),
+            port: None,
+            database: path.into(),
+            user: String::new(),
+            read_only: false,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: None,
+        }
+    }
+
+    /// Resolved deviation 3/5: file engines answer from `cfg.database`
+    /// (the SPEC-LEVEL string — full path, not the display stem) without
+    /// opening a connection; the oneshot resolves immediately.
+    #[test]
+    fn file_engines_resolve_immediately_from_the_config_path() {
+        let runner = QueryRunner::new();
+        for engine in [dbc_state::Engine::Sqlite, dbc_state::Engine::Duckdb] {
+            let spec = ConnectSpec::Config {
+                cfg: Box::new(file_cfg(engine, r"D:\data\analytics.duckdb")),
+                secret: None,
+            };
+            let (dbs, truncated) = runner
+                .fetch_database_list(spec)
+                .blocking_recv()
+                .expect("sender must not drop")
+                .expect("file engines never error here");
+            assert_eq!(dbs, vec![r"D:\data\analytics.duckdb".to_string()]);
+            assert!(!truncated);
+        }
+    }
+
+    /// CLI/URL specs never reach the tree's listing path (the CLI root has
+    /// no db list, design §3.4) — the defensive arm refuses honestly
+    /// rather than guessing an engine.
+    #[test]
+    fn url_spec_is_refused() {
+        let runner = QueryRunner::new();
+        let err = runner
+            .fetch_database_list(ConnectSpec::Url("postgres://x/y".into()))
+            .blocking_recv()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.message, "výpis databází není pro CLI připojení k dispozici");
     }
 }
 
