@@ -1541,7 +1541,17 @@ impl AppView {
                     let push_result = if errored.is_some() {
                         None // already failed and cancelled — drop the batch
                     } else if let Some(buf) = buffer.as_ref() {
-                        Some(buf.borrow_mut().push_async(b, &handle).await)
+                        // td-security fix round, BLOCKER B1: was
+                        // `buf.borrow_mut().push_async(b, &handle).await`,
+                        // which holds the `RefMut` temporary across the
+                        // `.await` (method-call desugaring keeps it alive to
+                        // the end of the full expression) — a `BorrowMutError`
+                        // panic waiting to happen the moment a spilling batch
+                        // suspended here while `cx.notify()` scheduled a grid
+                        // paint that reads the same `RefCell` on this thread.
+                        // `push_async_shared` never holds a borrow across an
+                        // await; see its doc comment (dbc-buffer/src/lib.rs).
+                        Some(dbc_buffer::push_async_shared(buf, b, &handle).await)
                     } else {
                         None
                     };
@@ -2041,7 +2051,11 @@ impl AppView {
                     let push_result = if errored.is_some() {
                         None // already failed — drop further batches
                     } else if let Some(buf) = buffer.as_ref() {
-                        Some(buf.borrow_mut().push_async(b, &handle).await)
+                        // td-security fix round, BLOCKER B1: see
+                        // `run_query_with`'s identical call site above for
+                        // why this must NOT be
+                        // `buf.borrow_mut().push_async(...).await`.
+                        Some(dbc_buffer::push_async_shared(buf, b, &handle).await)
                     } else {
                         None
                     };
