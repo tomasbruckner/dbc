@@ -48,23 +48,47 @@ const WRITE_KEYWORDS: &[&str] = &[
     "EXEC", "EXECUTE", "INTO",
 ];
 
-/// Leading keywords that may start a read-only statement. G16 §5 widened
-/// the list with DuckDB's idiomatic read forms (`FROM t`, `DESCRIBE t`,
-/// `SUMMARIZE t`, `PIVOT`/`UNPIVOT`): without them these statements were
-/// not "provably read", so the G12 dispatch matrix routed them to
-/// `execute()` — a row-less run and an empty grid, a wrong-result bug for
-/// DuckDB's most idiomatic query form. Engine-safe without an engine
-/// parameter: on pg/sqlite a leading FROM/DESCRIBE/... is a syntax error
-/// the server refuses — a fail-closed guard passing it is harmless. The
-/// every-token WRITE_KEYWORDS scan below is the unchanged second layer.
+/// Leading keywords that may start a read-only statement — the base list,
+/// valid for EVERY dialect (pre-G16 behavior, unchanged).
+const READ_LEADING_KEYWORDS: &[&str] = &["SELECT", "WITH", "EXPLAIN", "SHOW", "VALUES", "PRAGMA"];
+
+/// G16 §5: DuckDB's idiomatic read forms (`FROM t`, `DESCRIBE t`,
+/// `SUMMARIZE t`, `PIVOT`/`UNPIVOT`), allow-listed for every dialect
+/// EXCEPT `Dialect::Mssql` (see [`is_single_statement_read`]'s gate).
+/// Without them these statements were not "provably read", so the G12
+/// dispatch matrix routed them to `execute()` — a row-less run and an
+/// empty grid, a wrong-result bug for DuckDB's most idiomatic query form.
+///
+/// Why the widening MUST be dialect-gated (T2 review round 1, BLOCKER):
+/// T-SQL executes the first statement of a batch as an implicit
+/// stored-procedure call with no EXEC keyword (the `sp_help t`
+/// convention), and DESCRIBE/SUMMARIZE are NOT T-SQL reserved words —
+/// `CREATE PROCEDURE DESCRIBE ...` is legal, so the batch `DESCRIBE t`
+/// would EXECUTE procedure [DESCRIBE] with 't' as an argument. On MSSQL
+/// this client-side guard is the ONLY read-only enforcement (no
+/// server-side read-only session backstop exists there), so a dialect-
+/// blind widening would have weakened the MSSQL read-only guard for
+/// existing connections. FROM/PIVOT/UNPIVOT ARE T-SQL reserved words
+/// (cannot lead a batch or name an unbracketed procedure) and would be
+/// harmless, but the gate excludes ALL FIVE for Mssql — byte-identical
+/// pre-G16 classification, no per-keyword reserved-word reasoning to
+/// maintain.
+///
+/// Why pg/sqlite intentionally share DuckDB's widened list: neither has
+/// any statement (read OR write) that starts with one of the five words —
+/// a leading FROM/DESCRIBE/... is a syntax error the server refuses, so a
+/// fail-closed guard passing it is harmless — and Postgres additionally
+/// has the server-side `default_transaction_read_only=on` backstop. The
+/// every-token WRITE_KEYWORDS scan above is the unchanged second layer
+/// for all dialects.
 ///
 /// UNPIVOT caveat: DuckDB's simplified `UNPIVOT … INTO NAME … VALUE …`
 /// form still fails closed on the `INTO` blacklist entry (see
 /// `duckdb_unpivot_into_form_still_fails_closed_on_the_into_blacklist` —
 /// deliberate; the SQL-standard `FROM t UNPIVOT (…)` form is the
 /// read-classified spelling).
-const READ_LEADING_KEYWORDS: &[&str] =
-    &["SELECT", "WITH", "EXPLAIN", "SHOW", "VALUES", "PRAGMA", "FROM", "DESCRIBE", "SUMMARIZE", "PIVOT", "UNPIVOT"];
+const DUCKDB_READ_LEADING_KEYWORDS: &[&str] =
+    &["FROM", "DESCRIBE", "SUMMARIZE", "PIVOT", "UNPIVOT"];
 
 /// SQLite pragmas that are pure getters. `PRAGMA name = value` and
 /// `PRAGMA name(value)` are *both* setter syntaxes ("yield identical
@@ -295,13 +319,20 @@ fn split_statements(items: &[Item]) -> Vec<&[Item]> {
 /// batch) is read-only: its leading keyword is on the read allowlist, no
 /// write keyword appears anywhere in it, and -- for `PRAGMA` -- it contains
 /// no `=` (setter form).
-fn is_single_statement_read(stmt: &[Item]) -> bool {
+///
+/// The allowlist is dialect-aware (G16 §5 / T2 review): the base
+/// [`READ_LEADING_KEYWORDS`] applies everywhere; the DuckDB widening
+/// ([`DUCKDB_READ_LEADING_KEYWORDS`]) is excluded under `Dialect::Mssql`
+/// — see that const's doc comment for the implicit-proc-call hazard.
+fn is_single_statement_read(stmt: &[Item], dialect: Dialect) -> bool {
     let first = match first_word(stmt) {
         Some(w) => w,
         None => return false,
     };
 
-    if !READ_LEADING_KEYWORDS.contains(&first) {
+    let leading_ok = READ_LEADING_KEYWORDS.contains(&first)
+        || (dialect != Dialect::Mssql && DUCKDB_READ_LEADING_KEYWORDS.contains(&first));
+    if !leading_ok {
         return false;
     }
 
@@ -379,7 +410,7 @@ pub fn is_read_statement_d(sql: &str, dialect: Dialect) -> bool {
         return false;
     }
 
-    statements.iter().all(|stmt| is_single_statement_read(stmt))
+    statements.iter().all(|stmt| is_single_statement_read(stmt, dialect))
 }
 
 /// Applies an automatic LIMIT clause to SELECT statements if safe.
@@ -459,9 +490,12 @@ fn apply_auto_limit_pg(sql: &str, limit: u64) -> (String, bool) {
 
     // G16 §5: `FROM t LIMIT n` is valid DuckDB and DuckDB maps to this
     // dialect path; a leading-FROM statement can't reach pg/sqlite (syntax
-    // error before the limit would matter), so the widening needs no
-    // engine parameter. DESCRIBE/SUMMARIZE/PIVOT stay un-limited
-    // (under-apply, never over-apply).
+    // error before the limit would matter), and this body serves ONLY the
+    // Postgres|Sqlite dialects — the Dialect::Mssql arm of
+    // apply_auto_limit_d keeps its own SELECT-only first-word check and
+    // never sees this widening (pinned by
+    // mssql_auto_top_never_fires_for_leading_from). DESCRIBE/SUMMARIZE/
+    // PIVOT stay un-limited (under-apply, never over-apply).
     let fw = first_word(&items);
     if fw != Some("SELECT") && fw != Some("FROM") {
         return (sql.to_string(), false);
@@ -933,6 +967,47 @@ mod tests {
     #[test]
     fn mssql_auto_top_never_fires_for_leading_from() {
         assert!(!apply_auto_limit_d("FROM t", 1000, Dialect::Mssql).1);
+    }
+
+    /// BLOCKER fix pin (T2 review round 1): the G16 allowlist widening is
+    /// DIALECT-GATED — under `Dialect::Mssql` read classification is
+    /// byte-identical to pre-G16. T-SQL executes the first statement of a
+    /// batch as an implicit stored-procedure call with no EXEC keyword (the
+    /// `sp_help t` convention), and DESCRIBE/SUMMARIZE are NOT T-SQL
+    /// reserved words — `CREATE PROCEDURE DESCRIBE ...` is legal, so the
+    /// batch `DESCRIBE t` would EXECUTE procedure [DESCRIBE] with 't' as an
+    /// argument. On MSSQL this client-side guard is the ONLY read-only
+    /// enforcement (no server-side read-only session backstop) — the
+    /// pre-G16 refusal must be preserved.
+    #[test]
+    fn mssql_describe_and_summarize_stay_refused_implicit_proc_call_hazard() {
+        assert!(!is_read_statement_d("DESCRIBE t", Dialect::Mssql));
+        assert!(!is_read_statement_d("SUMMARIZE t", Dialect::Mssql));
+    }
+
+    /// FROM/PIVOT/UNPIVOT are T-SQL reserved words (cannot lead a batch or
+    /// name an unbracketed procedure), so allowing them would be harmless —
+    /// but the gate excludes ALL FIVE new keywords for Mssql, keeping its
+    /// classification byte-identical to pre-G16 for every input (simplest
+    /// robust shape; no per-keyword reserved-word reasoning to maintain).
+    #[test]
+    fn mssql_from_pivot_unpivot_stay_refused_byte_identical_pre_g16() {
+        assert!(!is_read_statement_d("FROM t", Dialect::Mssql));
+        assert!(!is_read_statement_d(
+            "PIVOT cities ON year USING sum(population)",
+            Dialect::Mssql
+        ));
+        assert!(!is_read_statement_d("UNPIVOT monthly ON jan, feb", Dialect::Mssql));
+    }
+
+    /// Positive control for the dialect gate: genuine Mssql reads still
+    /// classify as reads after the exclusion (the gate only removes the
+    /// five G16 keywords, never the base allowlist).
+    #[test]
+    fn mssql_reads_still_classify_after_the_dialect_gate() {
+        assert!(is_read_statement_d("SELECT 1", Dialect::Mssql));
+        assert!(is_read_statement_d("WITH x AS (SELECT 1) SELECT * FROM x", Dialect::Mssql));
+        assert!(!is_read_statement_d("DELETE FROM t", Dialect::Mssql));
     }
 
     #[test]
