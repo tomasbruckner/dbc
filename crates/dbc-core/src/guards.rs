@@ -48,8 +48,23 @@ const WRITE_KEYWORDS: &[&str] = &[
     "EXEC", "EXECUTE", "INTO",
 ];
 
-/// Leading keywords that may start a read-only statement.
-const READ_LEADING_KEYWORDS: &[&str] = &["SELECT", "WITH", "EXPLAIN", "SHOW", "VALUES", "PRAGMA"];
+/// Leading keywords that may start a read-only statement. G16 §5 widened
+/// the list with DuckDB's idiomatic read forms (`FROM t`, `DESCRIBE t`,
+/// `SUMMARIZE t`, `PIVOT`/`UNPIVOT`): without them these statements were
+/// not "provably read", so the G12 dispatch matrix routed them to
+/// `execute()` — a row-less run and an empty grid, a wrong-result bug for
+/// DuckDB's most idiomatic query form. Engine-safe without an engine
+/// parameter: on pg/sqlite a leading FROM/DESCRIBE/... is a syntax error
+/// the server refuses — a fail-closed guard passing it is harmless. The
+/// every-token WRITE_KEYWORDS scan below is the unchanged second layer.
+///
+/// UNPIVOT caveat: DuckDB's simplified `UNPIVOT … INTO NAME … VALUE …`
+/// form still fails closed on the `INTO` blacklist entry (see
+/// `duckdb_unpivot_into_form_still_fails_closed_on_the_into_blacklist` —
+/// deliberate; the SQL-standard `FROM t UNPIVOT (…)` form is the
+/// read-classified spelling).
+const READ_LEADING_KEYWORDS: &[&str] =
+    &["SELECT", "WITH", "EXPLAIN", "SHOW", "VALUES", "PRAGMA", "FROM", "DESCRIBE", "SUMMARIZE", "PIVOT", "UNPIVOT"];
 
 /// SQLite pragmas that are pure getters. `PRAGMA name = value` and
 /// `PRAGMA name(value)` are *both* setter syntaxes ("yield identical
@@ -425,7 +440,9 @@ pub fn apply_auto_limit_d(sql: &str, limit: u64, dialect: Dialect) -> (String, b
 }
 
 /// This is a heuristic that:
-/// - Only applies to statements starting with SELECT (not WITH)
+/// - Only applies to statements starting with SELECT or FROM (not WITH;
+///   the leading-FROM form is DuckDB's, widened in G16 §5 — see the
+///   comment at the first-word check below)
 /// - Does not apply if the statement contains a LIMIT, OFFSET, FETCH, or INTO
 ///   token (flat scan, not paren/subquery-depth aware -- see Task 6 security
 ///   review Issue 5: this can only under-apply the limit, e.g. a subquery's
@@ -440,8 +457,13 @@ fn apply_auto_limit_pg(sql: &str, limit: u64) -> (String, bool) {
         None => return (sql.to_string(), false),
     };
 
-    // Only apply to SELECT statements (not WITH)
-    if first_word(&items) != Some("SELECT") {
+    // G16 §5: `FROM t LIMIT n` is valid DuckDB and DuckDB maps to this
+    // dialect path; a leading-FROM statement can't reach pg/sqlite (syntax
+    // error before the limit would matter), so the widening needs no
+    // engine parameter. DESCRIBE/SUMMARIZE/PIVOT stay un-limited
+    // (under-apply, never over-apply).
+    let fw = first_word(&items);
+    if fw != Some("SELECT") && fw != Some("FROM") {
         return (sql.to_string(), false);
     }
 
@@ -849,6 +871,78 @@ mod tests {
         // guard exactly as before this fix (dialect-scoping regression
         // guard).
         assert!(!is_read_statement("select arr[delete] from t"));
+    }
+
+    // ---------- G16 §5: DuckDB's leading-FROM family ----------
+
+    #[test]
+    fn duckdb_bare_from_describe_summarize_pivot_are_reads() {
+        for sql in [
+            "FROM t",
+            "from big_table where x > 1 order by 1",
+            "DESCRIBE t",
+            "SUMMARIZE t",
+            "PIVOT cities ON year USING sum(population)",
+        ] {
+            assert!(is_read_statement(sql), "{sql} must classify as a read");
+        }
+    }
+
+    /// KNOWN, SAFE limitation (pinned, resolved against the design's §5
+    /// list): DuckDB's simplified UNPIVOT syntax REQUIRES an `INTO NAME …
+    /// VALUE …` clause, and `INTO` sits on the WRITE_KEYWORDS blacklist
+    /// (SELECT-INTO protection, layer 2) — so the statement still
+    /// classifies as "not provably read" and fails CLOSED (routed to
+    /// execute on a writable connection, rejected on read-only). The
+    /// leading keyword stays on the allowlist (costless, and the
+    /// SQL-standard `FROM t UNPIVOT (…)` form works via `FROM`); lifting
+    /// the INTO collision would mean weakening the blacklist — the wrong
+    /// trade.
+    #[test]
+    fn duckdb_unpivot_into_form_still_fails_closed_on_the_into_blacklist() {
+        assert!(!is_read_statement("UNPIVOT monthly ON jan, feb INTO NAME month VALUE amount"));
+        // The SQL-standard rewrite IS a read (leading FROM, no INTO):
+        assert!(is_read_statement("FROM monthly UNPIVOT (amount FOR month IN (jan, feb))"));
+    }
+
+    #[test]
+    fn from_leading_statement_with_a_write_keyword_anywhere_is_still_rejected() {
+        // Layer 2 (the every-token WRITE_KEYWORDS scan) is untouched by the
+        // allowlist widening — fail-closed posture preserved.
+        assert!(!is_read_statement("FROM t SELECT * INTO backup_t"));
+        assert!(!is_read_statement("FROM t, (UPDATE u SET x = 1) s"));
+        assert!(!is_read_statement("FROM t; DROP TABLE t"));
+    }
+
+    #[test]
+    fn auto_limit_fires_for_leading_from() {
+        assert_eq!(apply_auto_limit("FROM t", 1000), ("FROM t LIMIT 1000".to_string(), true));
+        assert_eq!(apply_auto_limit("from t;", 1000), ("from t LIMIT 1000;".to_string(), true));
+        // unchanged skip conditions:
+        assert!(!apply_auto_limit("FROM t LIMIT 5", 1000).1);
+        assert!(!apply_auto_limit("FROM t OFFSET 2", 1000).1);
+        // DESCRIBE/SUMMARIZE do NOT get a limit (first word is neither
+        // SELECT nor FROM — under-apply, never over-apply):
+        assert!(!apply_auto_limit("DESCRIBE t", 1000).1);
+    }
+
+    /// Poison probe for the CRITICAL invariant: the `Dialect::Mssql` arm of
+    /// `apply_auto_limit_d` is untouched by the G16 widening — its own
+    /// `first_word == SELECT` check keeps a leading `FROM` un-limited there
+    /// (leading FROM is not T-SQL), byte-identical to pre-G16.
+    #[test]
+    fn mssql_auto_top_never_fires_for_leading_from() {
+        assert!(!apply_auto_limit_d("FROM t", 1000, Dialect::Mssql).1);
+    }
+
+    #[test]
+    fn select_auto_limit_behavior_is_byte_identical_to_pre_g16() {
+        // The SELECT path through apply_auto_limit_pg is untouched.
+        assert_eq!(
+            apply_auto_limit("select * from big", 1000),
+            ("select * from big LIMIT 1000".to_string(), true)
+        );
+        assert!(!apply_auto_limit("select * from t limit 5", 1000).1);
     }
 
     // ---------- Mssql CTE/WITH auto-limit: documented no-op (G15 T1 review, MINOR) ----------
