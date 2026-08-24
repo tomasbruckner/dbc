@@ -48,8 +48,47 @@ const WRITE_KEYWORDS: &[&str] = &[
     "EXEC", "EXECUTE", "INTO",
 ];
 
-/// Leading keywords that may start a read-only statement.
+/// Leading keywords that may start a read-only statement — the base list,
+/// valid for EVERY dialect (pre-G16 behavior, unchanged).
 const READ_LEADING_KEYWORDS: &[&str] = &["SELECT", "WITH", "EXPLAIN", "SHOW", "VALUES", "PRAGMA"];
+
+/// G16 §5: DuckDB's idiomatic read forms (`FROM t`, `DESCRIBE t`,
+/// `SUMMARIZE t`, `PIVOT`/`UNPIVOT`), allow-listed for every dialect
+/// EXCEPT `Dialect::Mssql` (see [`is_single_statement_read`]'s gate).
+/// Without them these statements were not "provably read", so the G12
+/// dispatch matrix routed them to `execute()` — a row-less run and an
+/// empty grid, a wrong-result bug for DuckDB's most idiomatic query form.
+///
+/// Why the widening MUST be dialect-gated (T2 review round 1, BLOCKER):
+/// T-SQL executes the first statement of a batch as an implicit
+/// stored-procedure call with no EXEC keyword (the `sp_help t`
+/// convention), and DESCRIBE/SUMMARIZE are NOT T-SQL reserved words —
+/// `CREATE PROCEDURE DESCRIBE ...` is legal, so the batch `DESCRIBE t`
+/// would EXECUTE procedure [DESCRIBE] with 't' as an argument. On MSSQL
+/// this client-side guard is the ONLY read-only enforcement (no
+/// server-side read-only session backstop exists there), so a dialect-
+/// blind widening would have weakened the MSSQL read-only guard for
+/// existing connections. FROM/PIVOT/UNPIVOT ARE T-SQL reserved words
+/// (cannot lead a batch or name an unbracketed procedure) and would be
+/// harmless, but the gate excludes ALL FIVE for Mssql — byte-identical
+/// pre-G16 classification, no per-keyword reserved-word reasoning to
+/// maintain.
+///
+/// Why pg/sqlite intentionally share DuckDB's widened list: neither has
+/// any statement (read OR write) that starts with one of the five words —
+/// a leading FROM/DESCRIBE/... is a syntax error the server refuses, so a
+/// fail-closed guard passing it is harmless — and Postgres additionally
+/// has the server-side `default_transaction_read_only=on` backstop. The
+/// every-token WRITE_KEYWORDS scan above is the unchanged second layer
+/// for all dialects.
+///
+/// UNPIVOT caveat: DuckDB's simplified `UNPIVOT … INTO NAME … VALUE …`
+/// form still fails closed on the `INTO` blacklist entry (see
+/// `duckdb_unpivot_into_form_still_fails_closed_on_the_into_blacklist` —
+/// deliberate; the SQL-standard `FROM t UNPIVOT (…)` form is the
+/// read-classified spelling).
+const DUCKDB_READ_LEADING_KEYWORDS: &[&str] =
+    &["FROM", "DESCRIBE", "SUMMARIZE", "PIVOT", "UNPIVOT"];
 
 /// SQLite pragmas that are pure getters. `PRAGMA name = value` and
 /// `PRAGMA name(value)` are *both* setter syntaxes ("yield identical
@@ -280,13 +319,20 @@ fn split_statements(items: &[Item]) -> Vec<&[Item]> {
 /// batch) is read-only: its leading keyword is on the read allowlist, no
 /// write keyword appears anywhere in it, and -- for `PRAGMA` -- it contains
 /// no `=` (setter form).
-fn is_single_statement_read(stmt: &[Item]) -> bool {
+///
+/// The allowlist is dialect-aware (G16 §5 / T2 review): the base
+/// [`READ_LEADING_KEYWORDS`] applies everywhere; the DuckDB widening
+/// ([`DUCKDB_READ_LEADING_KEYWORDS`]) is excluded under `Dialect::Mssql`
+/// — see that const's doc comment for the implicit-proc-call hazard.
+fn is_single_statement_read(stmt: &[Item], dialect: Dialect) -> bool {
     let first = match first_word(stmt) {
         Some(w) => w,
         None => return false,
     };
 
-    if !READ_LEADING_KEYWORDS.contains(&first) {
+    let leading_ok = READ_LEADING_KEYWORDS.contains(&first)
+        || (dialect != Dialect::Mssql && DUCKDB_READ_LEADING_KEYWORDS.contains(&first));
+    if !leading_ok {
         return false;
     }
 
@@ -364,7 +410,7 @@ pub fn is_read_statement_d(sql: &str, dialect: Dialect) -> bool {
         return false;
     }
 
-    statements.iter().all(|stmt| is_single_statement_read(stmt))
+    statements.iter().all(|stmt| is_single_statement_read(stmt, dialect))
 }
 
 /// Applies an automatic LIMIT clause to SELECT statements if safe.
@@ -425,7 +471,9 @@ pub fn apply_auto_limit_d(sql: &str, limit: u64, dialect: Dialect) -> (String, b
 }
 
 /// This is a heuristic that:
-/// - Only applies to statements starting with SELECT (not WITH)
+/// - Only applies to statements starting with SELECT or FROM (not WITH;
+///   the leading-FROM form is DuckDB's, widened in G16 §5 — see the
+///   comment at the first-word check below)
 /// - Does not apply if the statement contains a LIMIT, OFFSET, FETCH, or INTO
 ///   token (flat scan, not paren/subquery-depth aware -- see Task 6 security
 ///   review Issue 5: this can only under-apply the limit, e.g. a subquery's
@@ -440,8 +488,16 @@ fn apply_auto_limit_pg(sql: &str, limit: u64) -> (String, bool) {
         None => return (sql.to_string(), false),
     };
 
-    // Only apply to SELECT statements (not WITH)
-    if first_word(&items) != Some("SELECT") {
+    // G16 §5: `FROM t LIMIT n` is valid DuckDB and DuckDB maps to this
+    // dialect path; a leading-FROM statement can't reach pg/sqlite (syntax
+    // error before the limit would matter), and this body serves ONLY the
+    // Postgres|Sqlite dialects — the Dialect::Mssql arm of
+    // apply_auto_limit_d keeps its own SELECT-only first-word check and
+    // never sees this widening (pinned by
+    // mssql_auto_top_never_fires_for_leading_from). DESCRIBE/SUMMARIZE/
+    // PIVOT stay un-limited (under-apply, never over-apply).
+    let fw = first_word(&items);
+    if fw != Some("SELECT") && fw != Some("FROM") {
         return (sql.to_string(), false);
     }
 
@@ -849,6 +905,119 @@ mod tests {
         // guard exactly as before this fix (dialect-scoping regression
         // guard).
         assert!(!is_read_statement("select arr[delete] from t"));
+    }
+
+    // ---------- G16 §5: DuckDB's leading-FROM family ----------
+
+    #[test]
+    fn duckdb_bare_from_describe_summarize_pivot_are_reads() {
+        for sql in [
+            "FROM t",
+            "from big_table where x > 1 order by 1",
+            "DESCRIBE t",
+            "SUMMARIZE t",
+            "PIVOT cities ON year USING sum(population)",
+        ] {
+            assert!(is_read_statement(sql), "{sql} must classify as a read");
+        }
+    }
+
+    /// KNOWN, SAFE limitation (pinned, resolved against the design's §5
+    /// list): DuckDB's simplified UNPIVOT syntax REQUIRES an `INTO NAME …
+    /// VALUE …` clause, and `INTO` sits on the WRITE_KEYWORDS blacklist
+    /// (SELECT-INTO protection, layer 2) — so the statement still
+    /// classifies as "not provably read" and fails CLOSED (routed to
+    /// execute on a writable connection, rejected on read-only). The
+    /// leading keyword stays on the allowlist (costless, and the
+    /// SQL-standard `FROM t UNPIVOT (…)` form works via `FROM`); lifting
+    /// the INTO collision would mean weakening the blacklist — the wrong
+    /// trade.
+    #[test]
+    fn duckdb_unpivot_into_form_still_fails_closed_on_the_into_blacklist() {
+        assert!(!is_read_statement("UNPIVOT monthly ON jan, feb INTO NAME month VALUE amount"));
+        // The SQL-standard rewrite IS a read (leading FROM, no INTO):
+        assert!(is_read_statement("FROM monthly UNPIVOT (amount FOR month IN (jan, feb))"));
+    }
+
+    #[test]
+    fn from_leading_statement_with_a_write_keyword_anywhere_is_still_rejected() {
+        // Layer 2 (the every-token WRITE_KEYWORDS scan) is untouched by the
+        // allowlist widening — fail-closed posture preserved.
+        assert!(!is_read_statement("FROM t SELECT * INTO backup_t"));
+        assert!(!is_read_statement("FROM t, (UPDATE u SET x = 1) s"));
+        assert!(!is_read_statement("FROM t; DROP TABLE t"));
+    }
+
+    #[test]
+    fn auto_limit_fires_for_leading_from() {
+        assert_eq!(apply_auto_limit("FROM t", 1000), ("FROM t LIMIT 1000".to_string(), true));
+        assert_eq!(apply_auto_limit("from t;", 1000), ("from t LIMIT 1000;".to_string(), true));
+        // unchanged skip conditions:
+        assert!(!apply_auto_limit("FROM t LIMIT 5", 1000).1);
+        assert!(!apply_auto_limit("FROM t OFFSET 2", 1000).1);
+        // DESCRIBE/SUMMARIZE do NOT get a limit (first word is neither
+        // SELECT nor FROM — under-apply, never over-apply):
+        assert!(!apply_auto_limit("DESCRIBE t", 1000).1);
+    }
+
+    /// Poison probe for the CRITICAL invariant: the `Dialect::Mssql` arm of
+    /// `apply_auto_limit_d` is untouched by the G16 widening — its own
+    /// `first_word == SELECT` check keeps a leading `FROM` un-limited there
+    /// (leading FROM is not T-SQL), byte-identical to pre-G16.
+    #[test]
+    fn mssql_auto_top_never_fires_for_leading_from() {
+        assert!(!apply_auto_limit_d("FROM t", 1000, Dialect::Mssql).1);
+    }
+
+    /// BLOCKER fix pin (T2 review round 1): the G16 allowlist widening is
+    /// DIALECT-GATED — under `Dialect::Mssql` read classification is
+    /// byte-identical to pre-G16. T-SQL executes the first statement of a
+    /// batch as an implicit stored-procedure call with no EXEC keyword (the
+    /// `sp_help t` convention), and DESCRIBE/SUMMARIZE are NOT T-SQL
+    /// reserved words — `CREATE PROCEDURE DESCRIBE ...` is legal, so the
+    /// batch `DESCRIBE t` would EXECUTE procedure [DESCRIBE] with 't' as an
+    /// argument. On MSSQL this client-side guard is the ONLY read-only
+    /// enforcement (no server-side read-only session backstop) — the
+    /// pre-G16 refusal must be preserved.
+    #[test]
+    fn mssql_describe_and_summarize_stay_refused_implicit_proc_call_hazard() {
+        assert!(!is_read_statement_d("DESCRIBE t", Dialect::Mssql));
+        assert!(!is_read_statement_d("SUMMARIZE t", Dialect::Mssql));
+    }
+
+    /// FROM/PIVOT/UNPIVOT are T-SQL reserved words (cannot lead a batch or
+    /// name an unbracketed procedure), so allowing them would be harmless —
+    /// but the gate excludes ALL FIVE new keywords for Mssql, keeping its
+    /// classification byte-identical to pre-G16 for every input (simplest
+    /// robust shape; no per-keyword reserved-word reasoning to maintain).
+    #[test]
+    fn mssql_from_pivot_unpivot_stay_refused_byte_identical_pre_g16() {
+        assert!(!is_read_statement_d("FROM t", Dialect::Mssql));
+        assert!(!is_read_statement_d(
+            "PIVOT cities ON year USING sum(population)",
+            Dialect::Mssql
+        ));
+        assert!(!is_read_statement_d("UNPIVOT monthly ON jan, feb", Dialect::Mssql));
+    }
+
+    /// Positive control for the dialect gate: genuine Mssql reads still
+    /// classify as reads after the exclusion (the gate only removes the
+    /// five G16 keywords, never the base allowlist).
+    #[test]
+    fn mssql_reads_still_classify_after_the_dialect_gate() {
+        assert!(is_read_statement_d("SELECT 1", Dialect::Mssql));
+        assert!(is_read_statement_d("WITH x AS (SELECT 1) SELECT * FROM x", Dialect::Mssql));
+        assert!(!is_read_statement_d("DELETE FROM t", Dialect::Mssql));
+    }
+
+    #[test]
+    fn select_auto_limit_behavior_is_byte_identical_to_pre_g16() {
+        // The SELECT path through apply_auto_limit_pg is untouched.
+        assert_eq!(
+            apply_auto_limit("select * from big", 1000),
+            ("select * from big LIMIT 1000".to_string(), true)
+        );
+        assert!(!apply_auto_limit("select * from t limit 5", 1000).1);
     }
 
     // ---------- Mssql CTE/WITH auto-limit: documented no-op (G15 T1 review, MINOR) ----------

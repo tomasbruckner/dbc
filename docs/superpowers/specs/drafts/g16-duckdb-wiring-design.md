@@ -274,20 +274,38 @@ route out and nothing here reopens it.
   the engine's most idiomatic query form. Safety argument for widening a
   security allowlist: the guard's second layer is untouched — the
   whole-statement `WRITE_KEYWORDS` blacklist scan still rejects any
-  statement containing `INSERT`/`COPY`/`ATTACH`/`INTO`/… anywhere, and no
-  engine in this app has a write statement that LEADS with any of the
-  five new words (on pg/sqlite they're syntax errors at worst — a
-  fail-closed guard passing a statement the server then refuses is
-  harmless). Fail-closed posture preserved. REQUIRED tests: each new
-  keyword accepted bare; `FROM t` + write keyword later in the statement
+  statement containing `INSERT`/`COPY`/`ATTACH`/`INTO`/… anywhere.
+  **CORRECTION (G16 T2 review round 1, BLOCKER — the widening is
+  dialect-gated, NOT engine-blind as this doc originally claimed:** the
+  original "no engine in this app has a write statement that LEADS with
+  any of the five new words" was WRONG for MSSQL. T-SQL executes the
+  first statement of a batch as an implicit stored-procedure call with no
+  EXEC keyword (the `sp_help t` convention), and DESCRIBE/SUMMARIZE are
+  not T-SQL reserved words — `CREATE PROCEDURE DESCRIBE ...` is legal, so
+  the batch `DESCRIBE t` would execute procedure [DESCRIBE] with 't' as
+  an argument; on MSSQL the client-side guard is the ONLY read-only
+  enforcement. FROM/PIVOT/UNPIVOT are T-SQL reserved words and are safe,
+  but the implementation excludes ALL FIVE new keywords under
+  `Dialect::Mssql` — byte-identical pre-G16 Mssql classification, pinned
+  by test. Pg/sqlite keep the widened list: neither has any statement
+  starting with one of the five (syntax errors the server refuses —
+  fail-closed guard passing them is harmless) and Postgres has the
+  server-side read-only backstop.) Fail-closed posture preserved.
+  REQUIRED tests: each new keyword accepted bare (pg path); each refused
+  under `Dialect::Mssql`; `FROM t` + write keyword later in the statement
   still rejected; existing suite untouched.
 - **`apply_auto_limit` widened symmetrically:** fires when the first word
   is `SELECT` **or `FROM`** (unchanged skip conditions: any
   `LIMIT`/`OFFSET`/`FETCH`/`INTO` token). `FROM t LIMIT n` is valid
   DuckDB; a leading-FROM statement can't reach pg/sqlite (syntax error
-  before the limit would matter), so the widening is engine-safe without
-  an engine parameter. REQUIRED tests: `FROM t` gains a limit; `FROM t
-  LIMIT 5` untouched; `SELECT` behavior byte-identical to today.
+  before the limit would matter). (Corrected per T2 review: "engine-safe
+  without an engine parameter" holds here only because the widening lives
+  in the pg/sqlite body `apply_auto_limit_pg` — the `Dialect::Mssql` arm
+  of `apply_auto_limit_d` keeps its own `first_word == SELECT` check and
+  never sees the widening, pinned by test.) REQUIRED tests: `FROM t`
+  gains a limit; `FROM t LIMIT 5` untouched; `SELECT` behavior
+  byte-identical to today; leading `FROM` never gains a `TOP` under
+  `Dialect::Mssql`.
 
 ## 6. Transactional semantics — nothing to build, one thing to prove
 

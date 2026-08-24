@@ -1006,6 +1006,18 @@ mod tests {
         );
     }
 
+    /// G16 (G12 curation item 2): DuckDB-bound scripts run under
+    /// Dialect::Postgres — a $tag$ dollar-quoted body's interior `;` must
+    /// stay opaque, exactly the pg rule (would mis-split under
+    /// Dialect::Sqlite, which has no dollar quoting).
+    #[test]
+    fn duckdb_bound_script_splits_dollar_quotes_under_pg_dialect() {
+        let sql = "CREATE MACRO half(x) AS $body$ x ; 2 $body$;\nSELECT half(4)";
+        let stmts = split_sql(sql, Dialect::Postgres).unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("$body$ x ; 2 $body$"));
+    }
+
     #[test]
     fn unterminated_dollar_quote_at_eof() {
         let mut s = StatementSplitter::new(Dialect::Postgres);
