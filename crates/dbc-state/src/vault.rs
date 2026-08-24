@@ -7,7 +7,7 @@ use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::StateError;
 
@@ -28,9 +28,9 @@ struct Envelope {
 
 pub struct Vault {
     path: PathBuf,
-    key: Key, // derived once per unlock; lives only in memory
+    key: [u8; 32], // derived once per unlock; lives only in memory; zeroized on drop
     salt: [u8; 16],
-    secrets: BTreeMap<String, String>,
+    secrets: BTreeMap<String, String>, // plaintext secrets; zeroized on drop
 }
 
 // Hand-written: the derived impl would print the raw key and every secret.
@@ -43,15 +43,34 @@ impl std::fmt::Debug for Vault {
     }
 }
 
+/// Security follow-up (final-review.md #14 / task-2-review.md #2): the
+/// derived Argon2id key and the decrypted secret strings used to sit in
+/// freed-but-unzeroed heap/stack memory after `Vault` was dropped, which a
+/// coredump or an unrelated memory-disclosure bug could expose. `key` is a
+/// plain `[u8; 32]` (rather than `chacha20poly1305::Key`/`GenericArray`)
+/// specifically so it implements `Zeroize` directly without pulling in the
+/// `generic-array` crate's own zeroize feature; it's converted to `Key` only
+/// at the point of use (`persist`). Does NOT cover values already handed out
+/// by `get_secret` (those are ordinary owned `String`s the caller controls)
+/// or `export_key`'s copy (already `Zeroizing`, see its doc comment).
+impl Drop for Vault {
+    fn drop(&mut self) {
+        self.key.zeroize();
+        for secret in self.secrets.values_mut() {
+            secret.zeroize();
+        }
+    }
+}
+
 fn err(m: impl Into<String>) -> StateError { StateError { message: m.into() } }
 
-fn derive_key(master: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<Key, StateError> {
+fn derive_key(master: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<[u8; 32], StateError> {
     let params = Params::new(m, t, p, Some(32)).map_err(|e| err(e.to_string()))?;
     let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = [0u8; 32];
     a2.hash_password_into(master.as_bytes(), salt, &mut out)
         .map_err(|e| err(e.to_string()))?;
-    Ok(Key::from(out))
+    Ok(out)
 }
 
 impl Vault {
@@ -85,7 +104,7 @@ impl Vault {
         let ct = B64.decode(&env.ciphertext).map_err(|_| err("vault unlock failed: bad ciphertext"))?;
         let nonce_arr: [u8; 12] = nonce_bytes.as_slice().try_into()
             .map_err(|_| err("vault unlock failed: bad nonce"))?;
-        let cipher = ChaCha20Poly1305::new(&key);
+        let cipher = ChaCha20Poly1305::new(&Key::from(key));
         let nonce = Nonce::from(nonce_arr);
         let plain = cipher
             .decrypt(&nonce, ct.as_ref())
@@ -113,12 +132,12 @@ impl Vault {
         let salt: [u8; 16] = B64.decode(&env.salt)
             .ok().and_then(|v| v.try_into().ok())
             .ok_or_else(|| err("vault unlock failed: bad salt"))?;
-        let key = Key::from(*key);
+        let key = *key;
         let nonce_bytes = B64.decode(&env.nonce).map_err(|_| err("vault unlock failed: bad nonce"))?;
         let ct = B64.decode(&env.ciphertext).map_err(|_| err("vault unlock failed: bad ciphertext"))?;
         let nonce_arr: [u8; 12] = nonce_bytes.as_slice().try_into()
             .map_err(|_| err("vault unlock failed: bad nonce"))?;
-        let cipher = ChaCha20Poly1305::new(&key);
+        let cipher = ChaCha20Poly1305::new(&Key::from(key));
         let nonce = Nonce::from(nonce_arr);
         let plain = cipher
             .decrypt(&nonce, ct.as_ref())
@@ -138,15 +157,11 @@ impl Vault {
     /// with zeros the moment the caller drops it (review round 1 finding
     /// #3: the previous wording here — "zeroize after storing, where
     /// practical" — overclaimed; nothing actually zeroized anything before
-    /// this). Scope note, stated honestly rather than silently: this only
-    /// covers the copy handed out by *this* call. `Vault`'s own internal
-    /// `key` field is deliberately left as plain `chacha20poly1305::Key`,
-    /// NOT zeroized on `Vault::drop` — doing that would mean either
-    /// wrapping every internal use site or a bigger `chacha20poly1305`
-    /// interop change, out of scope for this pass. The export path and the
-    /// `setup`-side local are what matter for dbc-mcp's threat model, since
-    /// that's the only place the key transiently exists outside the vault
-    /// before landing in an OS credential store.
+    /// this). `Vault`'s own internal `key` field is ALSO zeroized on
+    /// `Vault::drop` (security follow-up, final-review.md #14 /
+    /// task-2-review.md #2) — the two coverages are independent, so the
+    /// exported copy and the vault's own copy are each scrubbed the moment
+    /// their respective owner drops them.
     ///
     /// SECURITY (review round 1 finding #4): this method is intentionally
     /// `pub` so `dbc-mcp setup` can call it from outside this crate, which
@@ -156,11 +171,11 @@ impl Vault {
     /// store (Windows Credential Manager / macOS Keychain / Secret
     /// Service) — never to a plain file, a log line, or a config file.
     pub fn export_key(&self) -> Zeroizing<[u8; 32]> {
-        Zeroizing::new(self.key.into())
+        Zeroizing::new(self.key)
     }
 
     fn persist(&mut self) -> Result<(), StateError> {
-        let cipher = ChaCha20Poly1305::new(&self.key);
+        let cipher = ChaCha20Poly1305::new(&Key::from(self.key));
         let mut nonce_arr = [0u8; 12];
         use rand::RngCore as _;
         let mut rng = rand::rng();
@@ -215,6 +230,49 @@ mod tests {
         let v2 = Vault::unlock(&p, "correct horse").unwrap();
         assert_eq!(v2.get_secret("c1").as_deref(), Some("tajne-heslo"));
         assert_eq!(v2.get_secret("missing"), None);
+    }
+
+    /// Security follow-up (final-review.md #14 / task-2-review.md #2): the
+    /// derived key and decrypted secrets must be scrubbed, not just freed,
+    /// on `Vault::drop`. Captures raw pointers into the key array and a
+    /// secret `String`'s heap buffer BEFORE drop, then reads through them
+    /// AFTER drop — reading freed memory is technically UB, but nothing
+    /// else allocates between the two reads in this single-threaded test,
+    /// so it reliably observes whatever `Drop::drop` wrote just before the
+    /// (now-zeroed) buffers were deallocated. Same technique the `zeroize`
+    /// crate's own test suite uses to prove a `Drop` impl actually
+    /// scrubbed memory rather than merely freeing it.
+    #[test]
+    fn key_and_secrets_are_zeroized_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("vault.bin");
+
+        let key_ptr;
+        let key_len;
+        let secret_ptr;
+        let secret_len;
+        {
+            // Scope-exit drop (as opposed to calling `drop(v)`, which moves
+            // `v` by value into `mem::drop`'s own stack frame and runs the
+            // destructor on THAT copy, leaving the original slot's bytes
+            // untouched and making this test observe stale data) runs
+            // `Drop::drop` in place on this binding's own address, so the
+            // captured pointers below still point at the memory the
+            // destructor actually wrote to.
+            let mut v = Vault::create(&p, "correct horse").unwrap();
+            v.set_secret("c1", "super-secret-plaintext").unwrap();
+            key_ptr = v.key.as_ptr();
+            key_len = v.key.len();
+            let secret = v.secrets.get("c1").unwrap();
+            secret_ptr = secret.as_ptr();
+            secret_len = secret.len();
+        }
+
+        let key_after = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
+        assert!(key_after.iter().all(|&b| b == 0), "vault key was not zeroized on drop");
+
+        let secret_after = unsafe { std::slice::from_raw_parts(secret_ptr, secret_len) };
+        assert!(secret_after.iter().all(|&b| b == 0), "secret was not zeroized on drop");
     }
 
     #[test]
