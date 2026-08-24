@@ -61,10 +61,12 @@ pub const ADMIN_PREVIEW_KEY: &str = "__admin__";
 /// OTHER half, unchanged, still the sole write choke point).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminEntry {
-    /// SQLite (feature-exempt, design §0), no active connection at all, or
-    /// (G15 T3 review) MSSQL — the admin write path has never run live
-    /// against MSSQL, so it stays Hidden (not merely Disabled) until T8's
-    /// live validation flips it, same ON-flip discipline as
+    /// SQLite (feature-exempt, design §0), or no active connection at all.
+    /// MSSQL was Hidden here through G15 T3-T7 (the admin write path had
+    /// never run live) — T8's live validation
+    /// (`mssql_admin_catalogs_round_trip`/
+    /// `mssql_admin_builder_mutation_round_trip`) flipped it to the normal
+    /// read_only-gated Disabled/Enabled logic, same ON-flip discipline as
     /// `dialect_for_engine`/`detect_editable_pk`. In every Hidden case the
     /// tree row and palette action are both absent entirely.
     Hidden,
@@ -84,14 +86,16 @@ pub fn admin_entry_state(engine: Option<Engine>, read_only: bool) -> AdminEntry 
     match engine {
         None => AdminEntry::Hidden,
         Some(Engine::Sqlite) => AdminEntry::Hidden,
-        // G15 T3 review (MAJOR): MSSQL connections are real now
-        // (connect::open_config wires them for real), but the admin
-        // GRANT/REVOKE/DENY write path against MSSQL has never run live —
-        // T8 flips this after live MSSQL admin validation (G15 plan
-        // ON-flip discipline). Hidden, not Disabled: Disabled would still
-        // advertise the feature as "exists, just read-only right now",
-        // which isn't true yet for MSSQL.
-        Some(Engine::Mssql) => AdminEntry::Hidden,
+        // G15 T8 ON-flip: the admin GRANT/REVOKE/DENY write path against
+        // MSSQL is now live-validated —
+        // `mssql_admin_catalogs_round_trip`/`mssql_admin_builder_mutation_round_trip`
+        // (runner.rs's `mssql_docker_tests`) ran `roles_catalog`/
+        // `privileges_catalog`/`sizes_catalog` (incl. the flagged
+        // `schema_sizes` empty-schema LEFT JOIN shape) and a full
+        // CREATE LOGIN/USER -> GRANT/DENY/REVOKE -> membership -> DROP
+        // round-trip live, so MSSQL now falls through to the same
+        // read_only-gated Disabled/Enabled logic every other writable
+        // engine already uses — no longer Hidden.
         Some(_) if read_only => AdminEntry::Disabled,
         Some(_) => AdminEntry::Enabled,
     }
@@ -2331,11 +2335,11 @@ mod tests {
         assert_eq!(admin_entry_state(None, false), AdminEntry::Hidden);
         assert_eq!(admin_entry_state(Some(Engine::Postgres), true), AdminEntry::Disabled);
         assert_eq!(admin_entry_state(Some(Engine::Postgres), false), AdminEntry::Enabled);
-        // G15 T3 review: MSSQL admin is Hidden regardless of read_only —
-        // gated until T8's live validation, not merely Disabled (see
-        // admin_entry_state's doc comment).
-        assert_eq!(admin_entry_state(Some(Engine::Mssql), true), AdminEntry::Hidden);
-        assert_eq!(admin_entry_state(Some(Engine::Mssql), false), AdminEntry::Hidden);
+        // G15 T8 ON-flip: MSSQL admin follows the same read_only-gated
+        // Disabled/Enabled logic as every other writable engine now — see
+        // admin_entry_state's doc comment for the live evidence.
+        assert_eq!(admin_entry_state(Some(Engine::Mssql), true), AdminEntry::Disabled);
+        assert_eq!(admin_entry_state(Some(Engine::Mssql), false), AdminEntry::Enabled);
     }
 
     fn rows(cols: &[&str], data: &[&[Option<&str>]]) -> AdminCatalogRows {

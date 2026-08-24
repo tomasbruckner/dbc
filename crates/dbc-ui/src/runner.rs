@@ -1358,7 +1358,7 @@ fn mssql_plan_session(analyze: bool) -> (Vec<String>, Vec<String>) {
 /// doc comment) is only safe because a `max_rows` cap is threaded all the
 /// way through; without one, "Analyze" on `SELECT * FROM big_table` (a
 /// read — `AnalyzeGate::Run`, no confirm modal, no chance to say no) would
-/// be an OOM/freeze the instant T8 flips `mssql_plan_dispatch_available`.
+/// be an OOM/freeze now that T8 has flipped `mssql_plan_dispatch_available`.
 /// The plan/statistics XML result set itself is always exactly one row —
 /// 10,000 is generously above that, so this only ever fires on genuinely
 /// pathological/large user SQL, never on the plan payload itself.
@@ -7555,9 +7555,9 @@ mod mssql_docker_tests {
     /// `quote_ident_d`'s MSSQL rule) and a Czech-diacritics `N''` value,
     /// staged -> `generate_statements` -> executed live -> re-read. Built
     /// via `TableMeta`/`EditState` DIRECTLY (not through `main.rs`'s
-    /// `detect_editable_pk`, which still excludes MSSQL until this task's
-    /// Section C ON-flip) — this test is what makes that flip
-    /// evidence-backed rather than a guess.
+    /// `detect_editable_pk`, which excluded MSSQL until this test's own
+    /// result backed the Section C ON-flip) — this test IS the evidence
+    /// behind that flip, not a guess.
     #[test]
     #[ignore]
     fn mssql_sandbox_apply_bracket_quoted_weird_column_and_czech_diacritics_live() {

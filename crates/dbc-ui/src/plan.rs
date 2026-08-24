@@ -180,27 +180,22 @@ pub fn analyze_button_visible(engine: dbc_state::Engine) -> bool {
     !matches!(engine, dbc_state::Engine::Sqlite)
 }
 
-/// G15 T7 dispatch gate — same "complete, correct code; reachable the
-/// MOMENT this flips" discipline `monitor::monitor_available` established
-/// for T6, applied here because it wasn't explicit in this task's own
-/// plan/design text: `main.rs::run_explain`/`on_confirm_analyze_write`
-/// check this BEFORE routing to `dispatch_mssql_plan`/`run_mssql_plan`,
-/// so the whole feature (`mssql_plan_session`, `query_with_session`
-/// wiring, `run_mssql_plan_inner`'s belt-and-braces guard — all of it) is
-/// real, tested code that simply isn't reached yet. The ESTIMATED path
-/// alone would be safe to flip unconditionally (`SET SHOWPLAN_XML` never
-/// executes `sql` — no XACT_ABORT dependency at all), but the ACTUAL/
-/// analyze path's "ROLLBACK always truly undoes the write" guarantee is
-/// exactly what T8's XACT_ABORT matrix (case 4, autocommit interference)
-/// verifies — not yet run on a real machine as of this task — so BOTH
-/// paths stay gated together behind one flag for simplicity and safety,
-/// matching Global Constraints' standing "ALL feature ON-flips land only
-/// in T8, gated on the matrix passing" rule. `analyze_button_visible`
-/// stays `true` regardless (the plan explicitly calls for this) — a
-/// click while this gate is `false` surfaces an honest Czech "not yet
-/// available" status instead of silently doing nothing.
+/// G15 T8 ON-flip — same "complete, correct code; reachable the MOMENT
+/// this flips" discipline `monitor::monitor_available` established for T6.
+/// `main.rs::run_explain`/`on_confirm_analyze_write` check this BEFORE
+/// routing to `dispatch_mssql_plan`/`run_mssql_plan`. Both the ESTIMATED
+/// (`SET SHOWPLAN_XML`) and ACTUAL (`SET STATISTICS XML` + fused
+/// XACT_ABORT BEGIN/ROLLBACK) paths are now live-verified end-to-end by
+/// `mssql_plan_capture_live_estimated_and_actual_with_rollback_proof`
+/// (runner.rs's `mssql_docker_tests`) — including the ACTUAL path's core
+/// safety guarantee, that the ROLLBACK its session wrapper always issues
+/// truly undoes the write (verified with a live `SELECT` after, not just
+/// "no error"). `analyze_button_visible` was already `true` regardless of
+/// this flag; a click while this gate was `false` surfaced an honest Czech
+/// "not yet available" status instead of silently doing nothing — that
+/// status path is now simply unreached for MSSQL.
 pub fn mssql_plan_dispatch_available() -> bool {
-    false
+    true
 }
 
 /// SQLite's `EXPLAIN QUERY PLAN` row shape: `(id, parent, detail)` —
@@ -956,11 +951,11 @@ mod model_tests {
         assert!(!analyze_button_visible(dbc_state::Engine::Sqlite));
     }
 
-    /// G15 T7: the dispatch gate stays OFF until T8's XACT_ABORT-matrix-
-    /// gated flip, independent of `analyze_button_visible` staying `true`.
+    /// G15 T8 ON-flip — see mssql_plan_dispatch_available's doc comment
+    /// for the live evidence.
     #[test]
-    fn mssql_plan_dispatch_stays_gated_until_t8() {
-        assert!(!mssql_plan_dispatch_available());
+    fn mssql_plan_dispatch_is_available() {
+        assert!(mssql_plan_dispatch_available());
     }
 
     // --- parse_sqlite_rows ---

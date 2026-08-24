@@ -269,27 +269,30 @@ fn engine_from_url(url: &str) -> dbc_state::Engine {
 }
 
 /// G12 T5: engine -> splitter dialect for the editor's multi-statement
-/// unlock. `Mssql` (and any future engine without a dialect) returns `None`
-/// -> today's single-statement path, unchanged (CURATION item 2: the `GO`
-/// pre-pass is an explicit non-goal for this phase — when DuckDB wiring
-/// lands, map `Duckdb -> Dialect::Postgres` + one test, not now; no
-/// `Duckdb` variant exists on this branch's `dbc_state::Engine` to map
-/// anyway).
+/// unlock / script runner. `Mssql -> Some(Dialect::Mssql)` since G15 T8's
+/// ON-flip (live-verified: `mssql_go_script_with_procedure_and_top_auto_limit_live`
+/// runs a real GO-batched script — incl. a `CREATE PROCEDURE` body with
+/// interior semicolons — against a live server through this exact
+/// dispatch). A future engine without a dialect at all would still map to
+/// `None` here (today's single-statement fallback); no such engine exists
+/// on this branch's `dbc_state::Engine`.
 fn dialect_for_engine(engine: dbc_state::Engine) -> Option<dbc_core::Dialect> {
     match engine {
         dbc_state::Engine::Postgres => Some(dbc_core::Dialect::Postgres),
         dbc_state::Engine::Sqlite => Some(dbc_core::Dialect::Sqlite),
-        dbc_state::Engine::Mssql => None,
+        dbc_state::Engine::Mssql => Some(dbc_core::Dialect::Mssql),
     }
 }
 
 /// G15 §2d: total Engine -> Dialect mapping for SQL COMPOSITION (sandbox
 /// Apply, CSV import, preview/fk-join SELECTs, admin_sql delegation).
-/// Distinct from `dialect_for_engine` (the SPLITTER gate, above), which
-/// stays `Mssql -> None` until T8's flip: composers need the dialect even
-/// while the multi-statement path is still gated — an MSSQL connection's
-/// Apply dialog must show/execute bracket-quoted, `N''`-literal SQL even
-/// though `run_query_with`'s multi-statement unlock isn't live for it yet.
+/// Distinct from `dialect_for_engine` (the SPLITTER gate, above) — both
+/// return `Some(Dialect::Mssql)`/`Dialect::Mssql` for MSSQL since G15 T8's
+/// ON-flip, but this one existed independently before that flip too:
+/// composers needed the dialect even while the multi-statement path was
+/// still gated — an MSSQL connection's Apply dialog had to show/execute
+/// bracket-quoted, `N''`-literal SQL before `run_query_with`'s
+/// multi-statement unlock went live for it.
 fn sql_dialect(engine: dbc_state::Engine) -> dbc_core::Dialect {
     match engine {
         dbc_state::Engine::Postgres => dbc_core::Dialect::Postgres,
@@ -662,8 +665,16 @@ fn detect_editable_pk(
     if pk_cols.is_empty() {
         return EditableDecision::NoPrimaryKey;
     }
-    let Some((read_only, engine)) = conn_meta else { return EditableDecision::NotEditable };
-    if read_only || engine == dbc_state::Engine::Mssql {
+    // G15 T8 ON-flip: MSSQL sandbox editing — live-verified
+    // (mssql_sandbox_apply_bracket_quoted_weird_column_and_czech_diacritics_live
+    // in runner.rs's mssql_docker_tests: bracket-quoted UPDATE/INSERT with a
+    // `we]ird` column name and a Czech-diacritics N'' value staged, applied,
+    // and re-read correctly against a live server). `read_only` still
+    // excludes any engine, MSSQL included — client-side is the ONLY
+    // read-only enforcement for MSSQL (no server-side mode exists), same
+    // posture `is_read_statement`/the runner choke point already document.
+    let Some((read_only, _engine)) = conn_meta else { return EditableDecision::NotEditable };
+    if read_only {
         return EditableDecision::NotEditable;
     }
     EditableDecision::Editable(pk_cols)
@@ -8363,12 +8374,25 @@ mod editable_detection_tests {
         );
     }
 
+    // G15 T8 ON-flip: MSSQL sandbox editing — see detect_editable_pk's doc
+    // comment for the live evidence. read_only still excludes it, same as
+    // every other engine (separate test below).
     #[test]
-    fn mssql_engine_is_not_editable_even_with_a_mapped_pk() {
+    fn mssql_engine_with_mapped_pk_is_editable() {
         let t = table(vec![col("id", true)]);
         let h = headers(&["id"]);
         assert_eq!(
             detect_editable_pk(rw_engine(dbc_state::Engine::Mssql), Some(&t), &h),
+            EditableDecision::Editable(vec![0])
+        );
+    }
+
+    #[test]
+    fn mssql_read_only_connection_is_not_editable_even_with_a_mapped_pk() {
+        let t = table(vec![col("id", true)]);
+        let h = headers(&["id"]);
+        assert_eq!(
+            detect_editable_pk(Some((true, dbc_state::Engine::Mssql)), Some(&t), &h),
             EditableDecision::NotEditable
         );
     }
@@ -8423,11 +8447,13 @@ mod engine_from_url_tests {
 mod multi_statement_tests {
     use super::*;
 
+    // G15 T8 ON-flip: Mssql now maps to Some(Dialect::Mssql) — see
+    // dialect_for_engine's doc comment for the live evidence.
     #[test]
-    fn dialect_for_engine_maps_pg_sqlite_and_refuses_mssql() {
+    fn dialect_for_engine_maps_every_engine_including_mssql() {
         assert_eq!(dialect_for_engine(dbc_state::Engine::Postgres), Some(dbc_core::Dialect::Postgres));
         assert_eq!(dialect_for_engine(dbc_state::Engine::Sqlite), Some(dbc_core::Dialect::Sqlite));
-        assert_eq!(dialect_for_engine(dbc_state::Engine::Mssql), None);
+        assert_eq!(dialect_for_engine(dbc_state::Engine::Mssql), Some(dbc_core::Dialect::Mssql));
     }
 
     #[test]

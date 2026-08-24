@@ -94,12 +94,12 @@ ORDER BY pg_relation_size(c.oid) + pg_indexes_size(c.oid) DESC";
 /// "NOT runnable — no driver exists" and carried a PERMANENT `dead_code`
 /// allow. Both are obsolete — `dbc-driver-mssql` landed (T2/T3) and every
 /// constant here is now called from real, complete code (this crate's
-/// `#[allow(dead_code)]` is gone). What's still gated is reachability, not
-/// code existence: `monitor::monitor_available` returns `false` for Mssql
-/// until T8's flip (gated on the XACT_ABORT matrix running green on a real
-/// machine, Global Constraints) — so `open_monitor` never dispatches a
-/// refresh against an MSSQL connection until then, but the SQL/merge code
-/// itself is exactly what will run the moment it does.
+/// `#[allow(dead_code)]` is gone). G15 T8 flipped `monitor::monitor_available`
+/// to `true` for Mssql after `mssql_monitor_live_dmvs_blocking_chain_and_kill`
+/// (runner.rs's `mssql_docker_tests`) proved all 11 of these queries, the
+/// merge helpers, and a real blocking-chain + `KILL` round-trip all work
+/// live — `open_monitor` now dispatches refreshes against MSSQL
+/// connections same as Postgres.
 pub mod mssql {
     pub const CONNECTIONS: &str = "\
 SELECT

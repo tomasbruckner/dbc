@@ -639,23 +639,18 @@ pub fn assemble_snapshot(r: RefreshResults, fetched_at: std::time::Instant) -> R
     })
 }
 
-/// Engine gating (design §7): Postgres only. Sqlite -> false (spec: no
-/// monitor tab); Mssql -> false FOR NOW.
+/// Engine gating (design §7): Postgres and, since G15 T8's ON-flip, MSSQL.
+/// Sqlite -> false (spec: no monitor tab).
 ///
-/// Correction (G15 T6, curation item 2 — "this is a task, not a flag
-/// flip"): this used to say flipping this one function was the ONLY
-/// change needed once `connect::open_config`'s `Engine::Mssql` arm stopped
-/// erroring. That's no longer true even though `open_config` now DOES
-/// wire MSSQL (T3): `run_monitor_refresh`'s Mssql arm (runner.rs) and this
-/// module's merge helpers (`merge_mssql_connections`/`merge_mssql_locks`/
-/// `split_mssql_size`/`merge_mssql_perf`) are real, complete code as of
-/// T6 — reachable the MOMENT this function is updated — but this
-/// function's body deliberately stays Postgres-only until T8's flip,
-/// which is gated on the XACT_ABORT matrix running green on a real
-/// machine (Global Constraints), same standing discipline as every other
-/// feature-ON gate in this phase.
+/// G15 T8: flipped after `mssql_monitor_live_dmvs_blocking_chain_and_kill`
+/// (runner.rs's `mssql_docker_tests`) proved all 11 `monitor_sql::mssql`
+/// DMV queries, `run_monitor_refresh`'s Mssql arm, `assemble_snapshot`,
+/// AND a genuine blocking chain + `KILL` round-trip (through the real
+/// `monitor_loop`/`MonitorCmd::Kill` dispatch, not a mock) all work live
+/// against a real server — the exact bar this function's prior doc comment
+/// (superseded here) said the flip was gated on.
 pub fn monitor_available(engine: dbc_state::Engine) -> bool {
-    matches!(engine, dbc_state::Engine::Postgres)
+    matches!(engine, dbc_state::Engine::Postgres | dbc_state::Engine::Mssql)
 }
 
 /// "1.5 GB" / "512 B" — tile + table-size labels.
@@ -1153,11 +1148,13 @@ mod tests {
 
     // --- gating + formatting ---
 
+    // G15 T8 ON-flip: MSSQL joins Postgres — see monitor_available's doc
+    // comment for the live evidence.
     #[test]
-    fn monitor_available_postgres_only() {
+    fn monitor_available_postgres_and_mssql_not_sqlite() {
         assert!(monitor_available(dbc_state::Engine::Postgres));
         assert!(!monitor_available(dbc_state::Engine::Sqlite));
-        assert!(!monitor_available(dbc_state::Engine::Mssql)); // until T8's flip (Global Constraints)
+        assert!(monitor_available(dbc_state::Engine::Mssql));
     }
 
     #[test]

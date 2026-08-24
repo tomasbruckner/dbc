@@ -143,8 +143,9 @@ pub struct TableMeta<'a> {
     /// G15 §2b: threads through to every `quote_ident_d`/`quote_qualified_d`/
     /// `sql_value_d` call this module makes — `main.rs::on_open_apply_dialog`
     /// (the one production constructor) supplies `sql_dialect(engine)`.
-    /// Unreachable for `Dialect::Mssql` until T8's `detect_editable_pk`
-    /// Mssql-exclusion flip lands (by design — see that fn's doc comment).
+    /// `Dialect::Mssql` is live and reachable since G15 T8's
+    /// `detect_editable_pk` ON-flip — see that fn's doc comment for the
+    /// live evidence (`mssql_sandbox_apply_bracket_quoted_weird_column_and_czech_diacritics_live`).
     pub dialect: dbc_core::Dialect,
 }
 
