@@ -195,6 +195,33 @@ fn masked_to_real_offset(real: &str, masked_offset: usize) -> usize {
     real.grapheme_indices(true).nth(n).map(|(i, _)| i).unwrap_or(real.len())
 }
 
+/// Whether `copy`/`cut` must refuse to touch the clipboard — security
+/// follow-up #4 (final-review.md): a masked (password) `TextField` used to
+/// write the REAL buffer text to the clipboard on Ctrl+C/Ctrl+X even though
+/// the field only ever displays `•` bullets, leaking the plaintext password
+/// onto the system clipboard (visible to any other app / clipboard
+/// history). Standard password-field behaviour is to disable copy/cut
+/// entirely rather than try to redact "some of it" — pulled out as a pure
+/// function so the decision is unit-tested without a GPUI window.
+fn blocks_clipboard_write(masked: bool) -> bool {
+    masked
+}
+
+#[cfg(test)]
+mod clipboard_guard_tests {
+    use super::*;
+
+    #[test]
+    fn masked_field_blocks_clipboard_write() {
+        assert!(blocks_clipboard_write(true));
+    }
+
+    #[test]
+    fn unmasked_field_allows_clipboard_write() {
+        assert!(!blocks_clipboard_write(false));
+    }
+}
+
 actions!(
     text_field,
     [Backspace, Delete, Left, Right, SelectLeft, SelectRight, SelectAll, Home, End, Paste, Cut, Copy]
@@ -361,6 +388,9 @@ impl TextField {
         }
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if blocks_clipboard_write(self.masked) {
+            return;
+        }
         if let Some(sel) = self.buffer.selection() {
             if !sel.is_empty() {
                 cx.write_to_clipboard(ClipboardItem::new_string(self.buffer.text()[sel].to_string()));
@@ -368,6 +398,9 @@ impl TextField {
         }
     }
     fn cut(&mut self, _: &Cut, _window: &mut Window, cx: &mut Context<Self>) {
+        if blocks_clipboard_write(self.masked) {
+            return;
+        }
         if let Some(sel) = self.buffer.selection() {
             if !sel.is_empty() {
                 cx.write_to_clipboard(ClipboardItem::new_string(self.buffer.text()[sel].to_string()));
