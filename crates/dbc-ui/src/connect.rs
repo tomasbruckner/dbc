@@ -196,9 +196,12 @@ pub fn open_config(
 /// dispatch's last connection drops: an empty database on every single
 /// query, a data-eating trap rather than a feature. Revisit only if the
 /// app ever grows a held-connection mode.
+///
+/// Prefix match, not equality (T3 review finding 1): DuckDB also accepts
+/// the NAMED in-memory form `:memory:name` — same trap, same refusal.
 pub(crate) fn is_in_memory_duckdb_path(path: &str) -> bool {
     let trimmed = path.trim();
-    trimmed.is_empty() || trimmed == ":memory:"
+    trimmed.is_empty() || trimmed.starts_with(":memory:")
 }
 
 /// G15 T8 HARD GATE ITEM 2: the two `mssql_connection_from_config`
@@ -224,8 +227,20 @@ pub fn mssql_connect_refusal(cfg: &ConnectionConfig) -> bool {
 /// `vault.and_then(|v| v.get_secret(&cfg.id))` pattern it replaces (same
 /// `None`-on-no-vault/no-entry semantics for every non-refused config,
 /// MSSQL or not).
+///
+/// G16 (T3 review finding 2): file-based engines (Sqlite/Duckdb — the
+/// `connections_ui::engine_is_file_based` predicate is the authority)
+/// short-circuit to `None` too. No password exists for these engines and
+/// `open_config` ignores whatever secret it's handed, so pulling a
+/// plaintext secret out of the vault and holding it in memory (possible
+/// when a config's id has a stale vault entry, e.g. a pg config
+/// hand-switched to duckdb) would be a needless exposure — the same G15
+/// hard-gate-item-2 hygiene the MSSQL refusal branch above exists for.
 pub fn resolve_secret_for_connect(vault: Option<&Vault>, cfg: &ConnectionConfig) -> Option<String> {
     if mssql_connect_refusal(cfg) {
+        return None;
+    }
+    if crate::connections_ui::engine_is_file_based(cfg.engine) {
         return None;
     }
     vault.and_then(|v| v.get_secret(&cfg.id))
@@ -346,7 +361,39 @@ mod duckdb_connect_tests {
         assert!(is_in_memory_duckdb_path("  :memory:  "));
         assert!(is_in_memory_duckdb_path(""));
         assert!(is_in_memory_duckdb_path("   "));
+        // T3 review finding 1: DuckDB's NAMED in-memory form is the same
+        // data-eating trap — refused too.
+        assert!(is_in_memory_duckdb_path(":memory:analytics"));
+        assert!(is_in_memory_duckdb_path("  :memory:analytics  "));
         assert!(!is_in_memory_duckdb_path(r"D:\data\analytics.duckdb"));
+    }
+
+    /// T3 review finding 2: a file-based config whose id has a (stale)
+    /// vault entry must never have that plaintext secret pulled out of
+    /// the vault — no password exists for these engines and open_config
+    /// ignores the secret anyway. Behavioral proof with a REAL vault
+    /// holding a planted entry: the same id yields the secret for a pg
+    /// config (sanity: the entry is really there and reachable) and None
+    /// for the duckdb/sqlite spellings.
+    #[test]
+    fn resolve_secret_for_connect_never_fetches_for_file_based_engines() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_path = dir.path().join("vault.bin");
+        let mut vault = Vault::create(&vault_path, "master").unwrap();
+        vault.set_secret("d1", "stale-secret").unwrap();
+
+        let mut cfg = duckdb_cfg(r"D:\data\analytics.duckdb", false);
+        assert_eq!(resolve_secret_for_connect(Some(&vault), &cfg), None);
+        cfg.engine = Engine::Sqlite;
+        assert_eq!(resolve_secret_for_connect(Some(&vault), &cfg), None);
+        // Sanity: the planted entry IS reachable for an engine that uses
+        // secrets — proves the None above is the short-circuit, not a
+        // missing entry.
+        cfg.engine = Engine::Postgres;
+        assert_eq!(
+            resolve_secret_for_connect(Some(&vault), &cfg),
+            Some("stale-secret".to_string())
+        );
     }
 
     #[test]

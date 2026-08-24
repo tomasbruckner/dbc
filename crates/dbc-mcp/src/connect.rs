@@ -36,9 +36,12 @@ const DEFAULT_PG_PORT: u16 = 5432;
 /// Twin of `dbc-ui`'s `connect::is_in_memory_duckdb_path` — deliberately
 /// duplicated, not shared (this file's module doc: near-duplicate of the
 /// GUI connect path, a fix to one should prompt checking the twin).
+///
+/// Prefix match, not equality (T3 review finding 1): DuckDB also accepts
+/// the NAMED in-memory form `:memory:name` — same trap, same refusal.
 fn is_in_memory_duckdb_path(path: &str) -> bool {
     let trimmed = path.trim();
-    trimmed.is_empty() || trimmed == ":memory:"
+    trimmed.is_empty() || trimmed.starts_with(":memory:")
 }
 
 /// Opens a saved connection for MCP use: always read-only at the driver
@@ -217,6 +220,9 @@ mod tests {
         assert!(saw_error, "MCP DuckDB connection must refuse the write");
 
         cfg.database = ":memory:".into();
+        assert!(open_for_mcp(&cfg, None).await.is_err());
+        // T3 review finding 1: the NAMED in-memory form is refused too.
+        cfg.database = ":memory:analytics".into();
         assert!(open_for_mcp(&cfg, None).await.is_err());
     }
 
