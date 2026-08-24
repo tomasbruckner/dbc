@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use dbc_core::{quote_ident, quote_qualified};
+use dbc_core::{quote_ident, quote_ident_d, quote_qualified, quote_qualified_d, Dialect};
 
 /// One FK column's requested joined columns — one `JoinSpec` per FK column
 /// with at least one checked ref-column; `build_join_sql` turns each into
@@ -39,12 +39,13 @@ pub struct JoinSpec {
 /// Joins whose `cols` is empty are skipped entirely (nothing to select,
 /// nothing worth joining for — this is what lets a checkbox-toggle-to-zero
 /// silently drop a join rather than emitting a pointless `LEFT JOIN` with no
-/// selected columns). All identifiers go through `dbc_core::quote_ident`/
-/// `quote_qualified` — a table/column literally named `we"ird` can't break
+/// selected columns). All identifiers go through `dbc_core::quote_ident_d`/
+/// `quote_qualified_d` — a table/column literally named `we"ird` can't break
 /// out of the query, same guarantee `preview_sql` (main.rs) already gives
-/// the un-joined preview path.
-pub fn build_join_sql(schema: Option<&str>, table: &str, joins: &[JoinSpec]) -> String {
-    let base = quote_qualified(schema, table);
+/// the un-joined preview path. G15 §2d: MSSQL has no trailing `LIMIT` —
+/// `TOP 1000` is inserted right after `SELECT` instead.
+pub fn build_join_sql(dialect: Dialect, schema: Option<&str>, table: &str, joins: &[JoinSpec]) -> String {
+    let base = quote_qualified_d(dialect, schema, table);
     let mut select_extra = String::new();
     let mut from_extra = String::new();
     let mut alias_ix = 0usize;
@@ -57,18 +58,23 @@ pub fn build_join_sql(schema: Option<&str>, table: &str, joins: &[JoinSpec]) -> 
         for c in &j.cols {
             select_extra.push_str(&format!(
                 ", {alias}.{col} AS {label}",
-                col = quote_ident(c),
-                label = quote_ident(&format!("{}.{}", j.ref_table, c)),
+                col = quote_ident_d(dialect, c),
+                label = quote_ident_d(dialect, &format!("{}.{}", j.ref_table, c)),
             ));
         }
-        let ref_q = quote_qualified(j.ref_schema.as_deref(), &j.ref_table);
+        let ref_q = quote_qualified_d(dialect, j.ref_schema.as_deref(), &j.ref_table);
         from_extra.push_str(&format!(
             " LEFT JOIN {ref_q} {alias} ON t.{fk} = {alias}.{key}",
-            fk = quote_ident(&j.fk_col),
-            key = quote_ident(&j.ref_key),
+            fk = quote_ident_d(dialect, &j.fk_col),
+            key = quote_ident_d(dialect, &j.ref_key),
         ));
     }
-    format!("SELECT t.*{select_extra} FROM {base} t{from_extra} LIMIT 1000")
+    match dialect {
+        Dialect::Mssql => {
+            format!("SELECT TOP 1000 t.*{select_extra} FROM {base} t{from_extra}")
+        }
+        _ => format!("SELECT t.*{select_extra} FROM {base} t{from_extra} LIMIT 1000"),
+    }
 }
 
 /// `SELECT "key", "col1", ... FROM {qualified ref} WHERE "key" IN ('v1',
@@ -203,7 +209,7 @@ mod tests {
             ref_key: "id".into(),
             cols: vec!["name".into()],
         }];
-        let sql = build_join_sql(Some("public"), "orders", &joins);
+        let sql = build_join_sql(Dialect::Postgres, Some("public"), "orders", &joins);
         assert_eq!(
             sql,
             "SELECT t.*, j1.\"name\" AS \"customers.name\" FROM \"public\".\"orders\" t \
@@ -220,7 +226,7 @@ mod tests {
             ref_key: "id".into(),
             cols: vec!["name".into()],
         }];
-        let sql = build_join_sql(None, "orders", &joins);
+        let sql = build_join_sql(Dialect::Postgres, None, "orders", &joins);
         assert_eq!(
             sql,
             "SELECT t.*, j1.\"name\" AS \"customers.name\" FROM \"orders\" t \
@@ -246,7 +252,7 @@ mod tests {
                 cols: vec!["sku".into(), "title".into()],
             },
         ];
-        let sql = build_join_sql(None, "orders", &joins);
+        let sql = build_join_sql(Dialect::Postgres, None, "orders", &joins);
         assert_eq!(
             sql,
             "SELECT t.*, j1.\"name\" AS \"customers.name\", j2.\"sku\" AS \"products.sku\", \
@@ -274,7 +280,7 @@ mod tests {
                 cols: vec!["sku".into()],
             },
         ];
-        let sql = build_join_sql(None, "orders", &joins);
+        let sql = build_join_sql(Dialect::Postgres, None, "orders", &joins);
         // The empty join is skipped, so the surviving join is still
         // aliased j1 (not j2) — alias numbering only counts EMITTED joins.
         assert_eq!(
@@ -286,7 +292,7 @@ mod tests {
 
     #[test]
     fn no_joins_at_all_is_a_plain_select_star() {
-        let sql = build_join_sql(Some("public"), "orders", &[]);
+        let sql = build_join_sql(Dialect::Postgres, Some("public"), "orders", &[]);
         assert_eq!(sql, "SELECT t.* FROM \"public\".\"orders\" t LIMIT 1000");
     }
 
@@ -299,12 +305,37 @@ mod tests {
             ref_key: "id".into(),
             cols: vec!["na\"me".into()],
         }];
-        let sql = build_join_sql(None, "t", &joins);
+        let sql = build_join_sql(Dialect::Postgres, None, "t", &joins);
         assert_eq!(
             sql,
             "SELECT t.*, j1.\"na\"\"me\" AS \"we\"\"ird.na\"\"me\" FROM \"t\" t \
              LEFT JOIN \"we\"\"ird\" j1 ON t.\"we\"\"ird_fk\" = j1.\"id\" LIMIT 1000"
         );
+    }
+
+    // G15 T4: golden-string mirror of `single_join_one_column` for MSSQL —
+    // TOP instead of LIMIT, brackets instead of double quotes.
+    #[test]
+    fn build_join_sql_mssql_top_and_brackets() {
+        let joins = vec![JoinSpec {
+            fk_col: "customer_id".into(),
+            ref_schema: Some("public".into()),
+            ref_table: "customers".into(),
+            ref_key: "id".into(),
+            cols: vec!["name".into()],
+        }];
+        let sql = build_join_sql(Dialect::Mssql, Some("public"), "orders", &joins);
+        assert_eq!(
+            sql,
+            "SELECT TOP 1000 t.*, j1.[name] AS [customers.name] FROM [public].[orders] t \
+             LEFT JOIN [public].[customers] j1 ON t.[customer_id] = j1.[id]"
+        );
+    }
+
+    #[test]
+    fn build_join_sql_pg_unchanged() {
+        let sql = build_join_sql(Dialect::Postgres, Some("public"), "orders", &[]);
+        assert_eq!(sql, "SELECT t.* FROM \"public\".\"orders\" t LIMIT 1000");
     }
 
     // --- build_lookup_sql ---

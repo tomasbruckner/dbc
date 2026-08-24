@@ -21,7 +21,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use dbc_core::{quote_ident, quote_qualified};
+use dbc_core::{quote_ident_d, quote_qualified_d, Dialect};
 
 /// G5 Task 3: editability facts for one PREVIEW tab's grid — computed once
 /// per `Started` event by `main.rs`'s `detect_editable_pk` (mapping the
@@ -140,6 +140,12 @@ pub struct TableMeta<'a> {
     pub headers: &'a [String],
     pub pk_cols: &'a [usize],
     pub numeric_cols: &'a [bool],
+    /// G15 §2b: threads through to every `quote_ident_d`/`quote_qualified_d`/
+    /// `sql_value_d` call this module makes — `main.rs::on_open_apply_dialog`
+    /// (the one production constructor) supplies `sql_dialect(engine)`.
+    /// Unreachable for `Dialect::Mssql` until T8's `detect_editable_pk`
+    /// Mssql-exclusion flip lands (by design — see that fn's doc comment).
+    pub dialect: dbc_core::Dialect,
 }
 
 /// G5 Task 3: display text for a staged CELL edit (`EditState::cells`
@@ -171,8 +177,19 @@ pub fn insert_cell_display(cell: &Option<Option<String>>) -> String {
 
 /// Value emitter: staged None -> "NULL"; Some(s) with numeric col AND s
 /// parses (after trimming) strictly as f64/i128 -> bare trimmed s;
-/// otherwise a single-quoted string with `'` doubled.
+/// otherwise a single-quoted string with `'` doubled. Thin pg-convention
+/// wrapper over [`sql_value_d`] — byte-identical pre-G15 behavior.
 pub fn sql_value(v: Option<&str>, numeric: bool) -> String {
+    sql_value_d(v, numeric, Dialect::Postgres)
+}
+
+/// Dialect-aware sibling of [`sql_value`] (G15 §2b). Apply is the app's
+/// ONLY user-data write path — quoting here is CRITICAL: a bare `'…'`
+/// literal is `varchar` in T-SQL and transcodes through the database
+/// collation's code page — Czech diacritics staged in the grid would
+/// corrupt exactly the way `wide.rs` exists to prevent on the read side.
+/// `N''` is harmless for ASCII and correct for everything else.
+pub fn sql_value_d(v: Option<&str>, numeric: bool, dialect: Dialect) -> String {
     match v {
         None => "NULL".to_string(),
         Some(s) => {
@@ -187,17 +204,25 @@ pub fn sql_value(v: Option<&str>, numeric: bool) -> String {
                     return trimmed.to_string();
                 }
             }
-            format!("'{}'", s.replace('\'', "''"))
+            let quoted = s.replace('\'', "''");
+            match dialect {
+                // §2b: non-finite floats keep the existing
+                // quote-and-let-the-server-decide posture; MSSQL rejects
+                // N'NaN' for a float column server-side, error surfaces
+                // verbatim (documented, not special-cased).
+                Dialect::Mssql => format!("N'{quoted}'"),
+                _ => format!("'{quoted}'"),
+            }
         }
     }
 }
 
 /// Builds a `pk = original` (or `pk IS NULL`) fragment for one pk column.
 fn pk_where_fragment(meta: &TableMeta, row: usize, pk_col: usize, original: &mut dyn FnMut(usize, usize) -> Option<String>) -> String {
-    let ident = quote_ident(&meta.headers[pk_col]);
+    let ident = quote_ident_d(meta.dialect, &meta.headers[pk_col]);
     match original(row, pk_col) {
         None => format!("{ident} IS NULL"),
-        Some(v) => format!("{ident} = {}", sql_value(Some(&v), meta.numeric_cols[pk_col])),
+        Some(v) => format!("{ident} = {}", sql_value_d(Some(&v), meta.numeric_cols[pk_col], meta.dialect)),
     }
 }
 
@@ -228,7 +253,7 @@ pub fn generate_statements(
         "generate_statements requires a non-empty pk_cols"
     );
     let mut out = Vec::new();
-    let table = quote_qualified(meta.schema, meta.table);
+    let table = quote_qualified_d(meta.dialect, meta.schema, meta.table);
 
     // UPDATEs: rows with staged cells, excluding deleted rows, ascending.
     let mut rows: Vec<usize> = edits
@@ -252,8 +277,8 @@ pub fn generate_statements(
                 let v = edits.cells.get(&(row, c)).unwrap();
                 format!(
                     "{} = {}",
-                    quote_ident(&meta.headers[c]),
-                    sql_value(v.as_deref(), meta.numeric_cols[c])
+                    quote_ident_d(meta.dialect, &meta.headers[c]),
+                    sql_value_d(v.as_deref(), meta.numeric_cols[c], meta.dialect)
                 )
             })
             .collect::<Vec<_>>()
@@ -279,13 +304,16 @@ pub fn generate_statements(
         if touched.is_empty() {
             out.push((format!("INSERT INTO {table} DEFAULT VALUES"), None));
         } else {
-            let cols_sql =
-                touched.iter().map(|&c| quote_ident(&meta.headers[c])).collect::<Vec<_>>().join(", ");
+            let cols_sql = touched
+                .iter()
+                .map(|&c| quote_ident_d(meta.dialect, &meta.headers[c]))
+                .collect::<Vec<_>>()
+                .join(", ");
             let vals_sql = touched
                 .iter()
                 .map(|&c| {
                     let v = ins_row[c].as_ref().unwrap();
-                    sql_value(v.as_deref(), meta.numeric_cols[c])
+                    sql_value_d(v.as_deref(), meta.numeric_cols[c], meta.dialect)
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -307,7 +335,7 @@ mod tests {
         pk_cols: &'a [usize],
         numeric_cols: &'a [bool],
     ) -> TableMeta<'a> {
-        TableMeta { schema, table, headers, pk_cols, numeric_cols }
+        TableMeta { schema, table, headers, pk_cols, numeric_cols, dialect: Dialect::Postgres }
     }
 
     fn headers(names: &[&str]) -> Vec<String> {
@@ -705,6 +733,62 @@ mod tests {
         assert_eq!(
             insert_cell_display(&Some(Some("y".to_string()))),
             "y".to_string()
+        );
+    }
+
+    // -- G15 T4: dialect-aware value/statement emission --------------------
+
+    #[test]
+    fn sql_value_d_mssql_uses_nchar_literals() {
+        assert_eq!(
+            sql_value_d(Some("Příliš žluťoučký"), false, Dialect::Mssql),
+            "N'Příliš žluťoučký'".to_string()
+        );
+        // `'` doubling inside N''.
+        assert_eq!(sql_value_d(Some("O'Reilly"), false, Dialect::Mssql), "N'O''Reilly'".to_string());
+        // Numeric passthrough unchanged — no N prefix on a bare numeral.
+        assert_eq!(sql_value_d(Some(" 42 "), true, Dialect::Mssql), "42".to_string());
+        // None -> NULL regardless of dialect.
+        assert_eq!(sql_value_d(None, false, Dialect::Mssql), "NULL".to_string());
+        // pg/sqlite unaffected.
+        assert_eq!(sql_value_d(Some("x"), false, Dialect::Postgres), "'x'".to_string());
+    }
+
+    #[test]
+    fn generate_statements_mssql_brackets_and_nchar() {
+        let h = headers(&["id", "we]ird"]);
+        let m = TableMeta {
+            schema: Some("s"),
+            table: "t",
+            headers: &h,
+            pk_cols: &[0],
+            numeric_cols: &[true, false],
+            dialect: Dialect::Mssql,
+        };
+        let mut edits = EditState::default();
+        edits.stage_cell(0, 1, Some("Příliš".into()));
+        let mut original = |row: usize, col: usize| if row == 0 && col == 0 { Some("1".into()) } else { None };
+        let stmts = generate_statements(&m, &edits, &mut original);
+        assert_eq!(
+            stmts[0].0,
+            "UPDATE [s].[t] SET [we]]ird] = N'Příliš' WHERE [id] = 1"
+        );
+    }
+
+    #[test]
+    fn generate_statements_pg_output_is_byte_identical_to_before() {
+        // Same fixture as `update_single_cell_quoted_string_pk_where` —
+        // proves the default `Dialect::Postgres` `TableMeta` produces
+        // exactly the pre-G15 string.
+        let h = headers(&["id", "name"]);
+        let m = meta(Some("public"), "users", &h, &[0], &[true, false]);
+        let mut edits = EditState::default();
+        edits.stage_cell(0, 1, Some("Alice".into()));
+        let mut original = |row: usize, col: usize| if row == 0 && col == 0 { Some("1".into()) } else { None };
+        let stmts = generate_statements(&m, &edits, &mut original);
+        assert_eq!(
+            stmts[0].0,
+            "UPDATE \"public\".\"users\" SET \"name\" = 'Alice' WHERE \"id\" = 1"
         );
     }
 }

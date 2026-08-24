@@ -11,16 +11,12 @@
 
 use dbc_state::Engine;
 
-/// Engine-aware identifier quoting (design §4): pg/sqlite delegate to
-/// dbc_core::quote_ident (double quotes, `"` doubled); MSSQL brackets
-/// (`[name]`, `]` doubled) — MSSQL must NEVER route through
-/// dbc_core::quote_ident (CURATION item 2). Scoped to this module only;
-/// ddl.rs/sandbox.rs are unchanged.
+/// DEPRECATED-IN-COMMENT (G15 §2a): delegating wrapper over
+/// `dbc_core::quote_ident_d` — dbc-core is the single bracket authority now;
+/// remove this pair once all admin call sites take a `Dialect` directly.
+/// Tests below stay as the contract proving delegation preserved behavior.
 pub fn quote_ident_for(engine: Engine, name: &str) -> String {
-    match engine {
-        Engine::Mssql => format!("[{}]", name.replace(']', "]]")),
-        Engine::Postgres | Engine::Sqlite => dbc_core::quote_ident(name),
-    }
+    dbc_core::quote_ident_d(crate::sql_dialect(engine), name)
 }
 
 /// `schema.object`, both parts through quote_ident_for.
