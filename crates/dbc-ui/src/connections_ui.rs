@@ -923,6 +923,13 @@ impl ConnectionFormData {
 pub enum PendingAfterUnlock {
     Connect(String),
     SaveConnection(Box<ConnectionFormData>),
+    /// Security follow-up #6 (final-review.md): the Test button used to
+    /// test WITHOUT the stored secret when the vault was locked (a
+    /// confusing auth failure) instead of prompting for the master
+    /// password like a normal connect. Carries the in-progress dialog's
+    /// field snapshot so `resume_pending` can reopen it and re-run the
+    /// test once the vault is unlocked.
+    TestConnection(Box<ConnectionDialogUi>),
 }
 
 #[derive(Clone)]
@@ -1657,13 +1664,38 @@ impl AppView {
     /// then updates `test_result` once the result comes back over a oneshot
     /// channel — same "UI thread only ever awaits a channel via `cx.spawn`"
     /// shape as `run_query`'s `QueryEvent` drain.
-    fn on_test_clicked(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// Security follow-up #6 (final-review.md): if the password field is
+    /// empty (relying on the stored secret) and the vault is locked, this
+    /// mirrors `on_dropdown_item_click`'s gate and prompts for the master
+    /// password FIRST — same as a normal connect — instead of silently
+    /// testing without the secret and surfacing a confusing auth failure.
+    fn on_test_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ModalState::ConnectionDialog(ui)) = &self.modal else { return };
         if ui.testing {
             return;
         }
         let ui_snapshot = ui.clone();
         let data = ui_snapshot.to_form_data(cx);
+
+        if test_needs_vault_prompt(
+            data.password.is_empty(),
+            data.engine,
+            self.vault.is_some(),
+            Vault::exists(&self.vault_path),
+        ) {
+            let input = cx.new(|cx| TextField::new(cx, "Heslo", true));
+            let focus = input.focus_handle(cx);
+            self.modal = Some(ModalState::MasterPasswordPrompt {
+                input,
+                error: None,
+                pending: PendingAfterUnlock::TestConnection(Box::new(ui_snapshot)),
+            });
+            window.focus(&focus, cx);
+            cx.notify();
+            return;
+        }
+
         let secret = if !data.password.is_empty() {
             Some(data.password.clone())
         } else {
@@ -1934,21 +1966,25 @@ impl AppView {
         }
     }
 
-    fn resume_pending(&mut self, pending: PendingAfterUnlock, cx: &mut Context<Self>) {
+    fn resume_pending(&mut self, pending: PendingAfterUnlock, window: &mut Window, cx: &mut Context<Self>) {
         match pending {
             PendingAfterUnlock::Connect(id) => self.switch_to_connection(&id, cx),
             PendingAfterUnlock::SaveConnection(data) => self.finish_save(*data, cx),
+            PendingAfterUnlock::TestConnection(ui) => {
+                self.modal = Some(ModalState::ConnectionDialog(*ui));
+                self.on_test_clicked(window, cx);
+            }
         }
     }
 
-    fn on_master_password_submit(&mut self, cx: &mut Context<Self>) {
+    fn on_master_password_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ModalState::MasterPasswordPrompt { input, pending, .. }) = self.modal.clone() else { return };
         let pwd = input.read(cx).text();
         match Vault::unlock(&self.vault_path, &pwd) {
             Ok(vault) => {
                 self.vault = Some(vault);
                 self.modal = None;
-                self.resume_pending(pending, cx);
+                self.resume_pending(pending, window, cx);
             }
             Err(e) => {
                 input.update(cx, |f, cx| f.set_text("", cx));
@@ -1996,7 +2032,7 @@ impl AppView {
             Ok(vault) => {
                 self.vault = Some(vault);
                 self.modal = None;
-                self.resume_pending(pending, cx);
+                self.resume_pending(pending, window, cx);
             }
             Err(e) => self.set_create_master_error(&e.message, cx),
         }
@@ -2118,6 +2154,56 @@ fn test_connect_spec(cfg: ConnectionConfig, secret: Option<String>) -> Result<Co
         return Err("MSSQL driver zatím není k dispozici".into());
     }
     Ok(ConnectSpec::Config { cfg: Box::new(cfg), secret })
+}
+
+/// Whether `on_test_clicked` must prompt for the master password before
+/// dispatching the test connect — security follow-up #6 (final-review.md):
+/// editing a saved connection with an empty password field while the vault
+/// is locked used to test WITHOUT the stored secret (a confusing auth
+/// failure) instead of prompting like a normal connect. Mirrors
+/// `on_dropdown_item_click`'s gate: only relevant when the dialog's
+/// password field is empty (i.e. the secret, if any, would have to come
+/// from the vault) AND the engine actually needs one AND the vault is
+/// currently locked but exists on disk.
+fn test_needs_vault_prompt(
+    password_field_empty: bool,
+    engine: Engine,
+    vault_unlocked: bool,
+    vault_file_exists: bool,
+) -> bool {
+    password_field_empty && engine != Engine::Sqlite && !vault_unlocked && vault_file_exists
+}
+
+#[cfg(test)]
+mod test_vault_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn empty_password_locked_vault_needs_prompt() {
+        assert!(test_needs_vault_prompt(true, Engine::Postgres, false, true));
+    }
+
+    #[test]
+    fn typed_password_never_needs_prompt() {
+        // password field non-empty -> test uses the typed value, vault is irrelevant.
+        assert!(!test_needs_vault_prompt(false, Engine::Postgres, false, true));
+    }
+
+    #[test]
+    fn sqlite_never_needs_prompt() {
+        assert!(!test_needs_vault_prompt(true, Engine::Sqlite, false, true));
+    }
+
+    #[test]
+    fn unlocked_vault_never_needs_prompt() {
+        assert!(!test_needs_vault_prompt(true, Engine::Postgres, true, true));
+    }
+
+    #[test]
+    fn no_vault_file_never_needs_prompt() {
+        // no vault created yet -> nothing to unlock, secret is simply absent.
+        assert!(!test_needs_vault_prompt(true, Engine::Postgres, false, false));
+    }
 }
 
 fn field_row(label: &str, field: Entity<TextField>, theme: Theme) -> impl IntoElement {
@@ -2349,7 +2435,7 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("dlg-test", test_label, *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.on_test_clicked(cx))))
+            .child(styled_button("dlg-test", test_label, *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_test_clicked(window, cx))))
             .child(styled_button("dlg-save", "Uložit", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_save_clicked(window, cx))))
             .child(styled_button("dlg-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx)))),
     );
@@ -2382,7 +2468,7 @@ fn render_master_password_panel(input: Entity<TextField>, error: Option<String>,
             .justify_end()
             .mt_2()
             .child(styled_button("mpp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
-            .child(styled_button("mpp-submit", "Odemknout", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.on_master_password_submit(cx)))),
+            .child(styled_button("mpp-submit", "Odemknout", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_master_password_submit(window, cx)))),
     );
     panel.into_any_element()
 }
