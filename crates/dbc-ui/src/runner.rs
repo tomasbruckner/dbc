@@ -994,6 +994,9 @@ fn spec_dialect(spec: &ConnectSpec) -> dbc_core::Dialect {
             dbc_state::Engine::Postgres => dbc_core::Dialect::Postgres,
             dbc_state::Engine::Sqlite => dbc_core::Dialect::Sqlite,
             dbc_state::Engine::Mssql => dbc_core::Dialect::Mssql,
+            // G16: DuckDB composes/tx-controls under the pg dialect (G12
+            // curation item 2 — same mapping as main.rs::sql_dialect).
+            dbc_state::Engine::Duckdb => dbc_core::Dialect::Postgres,
         },
         // CLI-arg URLs have no MSSQL form (main.rs::engine_from_url: a
         // postgres[ql]:// scheme or a sqlite file path only) — mirrors that
@@ -3084,10 +3087,11 @@ async fn run_monitor_refresh(
                 tables: drain_rows(conn, ms::TABLES, &cancel).await,
             }
         }
-        // Sqlite: no monitor concept (spec) — unreachable today
-        // (`monitor_available` gates `open_monitor` to Postgres/MSSQL-once-
-        // flipped), message unchanged.
-        dbc_state::Engine::Sqlite => {
+        // Sqlite/Duckdb: no monitor concept (spec; G16 for Duckdb — an
+        // embedded engine has no server sessions, locks, or DMVs) —
+        // unreachable today (`monitor_available` gates `open_monitor` to
+        // Postgres/MSSQL-once-flipped), message unchanged.
+        dbc_state::Engine::Sqlite | dbc_state::Engine::Duckdb => {
             let err = || Err("monitor není pro tento engine k dispozici".to_string());
             monitor::RefreshResults {
                 connections: err(), locks: err(), data_size: err(), wal_size: err(),

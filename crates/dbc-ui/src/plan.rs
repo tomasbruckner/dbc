@@ -144,6 +144,8 @@ pub fn explain_sql(engine: dbc_state::Engine, sql: &str) -> String {
                 .to_string()
         }
         dbc_state::Engine::Sqlite => format!("EXPLAIN QUERY PLAN {sql}"),
+        // G16: DuckDB's JSON explain form — final text (design §8).
+        dbc_state::Engine::Duckdb => format!("EXPLAIN (FORMAT JSON) {sql}"),
     }
 }
 
@@ -169,13 +171,18 @@ pub fn explain_analyze_sql(engine: dbc_state::Engine, sql: &str) -> Option<Strin
         dbc_state::Engine::Postgres => Some(format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}")),
         dbc_state::Engine::Mssql => None,
         dbc_state::Engine::Sqlite => None,
+        // G16: final text (design §8); the analyze-of-a-WRITE refusal for
+        // DuckDB is T5's, in `run_explain` (resolved deviation 3).
+        dbc_state::Engine::Duckdb => Some(format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}")),
     }
 }
 
 /// Whether the "Analyze" button should render at all for `engine`. Stays
 /// `true` for Mssql (G15 T7) — the button itself is not what's gated; see
 /// `mssql_plan_dispatch_available` for the actual ON/OFF switch clicking
-/// it goes through.
+/// it goes through. `Duckdb -> true` (G16, intended): DuckDB HAS an
+/// analyze mode (`EXPLAIN (ANALYZE, FORMAT JSON)`); the write-analyze
+/// refusal lands in T5's `run_explain`, not here.
 pub fn analyze_button_visible(engine: dbc_state::Engine) -> bool {
     !matches!(engine, dbc_state::Engine::Sqlite)
 }
@@ -818,6 +825,40 @@ pub fn parse_plan(engine: dbc_state::Engine, is_analyze: bool, raw_text: &str) -
         dbc_state::Engine::Sqlite => Err(
             "parse_plan: SQLite plans are row-shaped — call parse_sqlite_rows directly (see plan.rs's parser entry point doc)".to_string(),
         ),
+        // G16 T3: never an Err — see parse_duckdb_raw's doc comment. T5
+        // upgrades this arm to the capture-gated JSON parser, keeping the
+        // raw single-root form as its malformed-JSON fallback.
+        dbc_state::Engine::Duckdb => Ok(parse_duckdb_raw(is_analyze, raw_text)),
+    }
+}
+
+/// G16 T3 (design §8, fallback branch pre-landed): a single-root
+/// `PlanResult` whose `raw_text` carries DuckDB's EXPLAIN output verbatim —
+/// the plan tab's raw-text surface is the primary view until T5's
+/// capture-gated JSON parser lands, and remains the fail-open path for
+/// output that parser doesn't recognize afterwards. Never an `Err`: a
+/// wired engine must not have a dead "Plán" button (design §8).
+pub fn parse_duckdb_raw(is_analyze: bool, raw_text: &str) -> PlanResult {
+    PlanResult {
+        root: PlanNode {
+            operation: "DuckDB plán".to_string(),
+            target: None,
+            est_cost: None,
+            est_rows: None,
+            actual_rows: None,
+            actual_time_ms: None,
+            loops: None,
+            rows_removed_by_filter: None,
+            buffers: None,
+            extra: Vec::new(),
+            children: Vec::new(),
+        },
+        is_analyze,
+        engine: dbc_state::Engine::Duckdb,
+        total_planning_time_ms: None,
+        total_execution_time_ms: None,
+        top_level_hints: Vec::new(),
+        raw_text: raw_text.to_string(),
     }
 }
 
@@ -911,6 +952,11 @@ mod model_tests {
             explain_sql(dbc_state::Engine::Sqlite, "SELECT 1"),
             "EXPLAIN QUERY PLAN SELECT 1"
         );
+        // G16: DuckDB's final estimated-plan text (design §8).
+        assert_eq!(
+            explain_sql(dbc_state::Engine::Duckdb, "SELECT 1"),
+            "EXPLAIN (FORMAT JSON) SELECT 1"
+        );
         // G15 T7 review MINOR fix REQUIRED test (the "routing pin" —
         // `main.rs::run_explain`'s Mssql dispatch itself has no direct
         // test seam per GPUI convention, so this is the safety net): even
@@ -942,6 +988,12 @@ mod model_tests {
         // here makes the generic wrap-and-run path structurally unable to
         // ever emit the broken one-string form again (fail closed).
         assert_eq!(explain_analyze_sql(dbc_state::Engine::Mssql, "SELECT 1"), None);
+        // G16: DuckDB HAS an analyze mode — final text (design §8); the
+        // write-analyze refusal is T5's, in run_explain.
+        assert_eq!(
+            explain_analyze_sql(dbc_state::Engine::Duckdb, "SELECT 1"),
+            Some("EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1".to_string())
+        );
     }
 
     #[test]
@@ -949,6 +1001,27 @@ mod model_tests {
         assert!(analyze_button_visible(dbc_state::Engine::Postgres));
         assert!(analyze_button_visible(dbc_state::Engine::Mssql));
         assert!(!analyze_button_visible(dbc_state::Engine::Sqlite));
+        // G16: visible for DuckDB — it has a real analyze mode.
+        assert!(analyze_button_visible(dbc_state::Engine::Duckdb));
+    }
+
+    /// G16 T3: the pre-decided raw fallback (design §8) — single root,
+    /// verbatim text, never an Err (a wired engine must not have a dead
+    /// "Plán" button).
+    #[test]
+    fn parse_duckdb_raw_single_root_preserves_text() {
+        let raw = "┌───────────────────────────┐\n│ SEQ_SCAN t │\n└───────────┘";
+        for is_analyze in [false, true] {
+            let result = parse_duckdb_raw(is_analyze, raw);
+            assert_eq!(result.root.operation, "DuckDB plán");
+            assert!(result.root.children.is_empty());
+            assert_eq!(result.raw_text, raw);
+            assert_eq!(result.engine, dbc_state::Engine::Duckdb);
+            assert_eq!(result.is_analyze, is_analyze);
+            // parse_plan's Duckdb arm routes here and never errors.
+            let via_dispatch = parse_plan(dbc_state::Engine::Duckdb, is_analyze, raw).unwrap();
+            assert_eq!(via_dispatch.raw_text, raw);
+        }
     }
 
     /// G15 T8 ON-flip — see mssql_plan_dispatch_available's doc comment

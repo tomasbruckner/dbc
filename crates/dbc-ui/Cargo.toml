@@ -13,6 +13,9 @@ dbc-state = { path = "../dbc-state" }
 dbc-driver-sqlite = { path = "../dbc-driver-sqlite" }
 dbc-driver-postgres = { path = "../dbc-driver-postgres" }
 dbc-driver-mssql = { path = "../dbc-driver-mssql" }
+# G16 T3: embedded DuckDB (bundled engine — joining this graph makes the
+# first clean build noticeably longer; one-time cost, no action).
+dbc-driver-duckdb = { path = "../dbc-driver-duckdb" }
 unicode-segmentation = "1"
 tokio.workspace = true
 dirs.workspace = true

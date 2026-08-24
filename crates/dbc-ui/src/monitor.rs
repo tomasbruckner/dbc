@@ -649,6 +649,10 @@ pub fn assemble_snapshot(r: RefreshResults, fetched_at: std::time::Instant) -> R
 /// `monitor_loop`/`MonitorCmd::Kill` dispatch, not a mock) all work live
 /// against a real server — the exact bar this function's prior doc comment
 /// (superseded here) said the flip was gated on.
+///
+/// Duckdb -> false (G16): embedded engine — no server sessions, locks, or
+/// DMVs to monitor; kill_sql is None (protocol interrupt is not a
+/// server-side kill). Same posture as sqlite.
 pub fn monitor_available(engine: dbc_state::Engine) -> bool {
     matches!(engine, dbc_state::Engine::Postgres | dbc_state::Engine::Mssql)
 }
@@ -1151,10 +1155,12 @@ mod tests {
     // G15 T8 ON-flip: MSSQL joins Postgres — see monitor_available's doc
     // comment for the live evidence.
     #[test]
-    fn monitor_available_postgres_and_mssql_not_sqlite() {
+    fn monitor_available_postgres_and_mssql_not_sqlite_or_duckdb() {
         assert!(monitor_available(dbc_state::Engine::Postgres));
         assert!(!monitor_available(dbc_state::Engine::Sqlite));
         assert!(monitor_available(dbc_state::Engine::Mssql));
+        // G16: embedded engine, no monitor surface — see the doc comment.
+        assert!(!monitor_available(dbc_state::Engine::Duckdb));
     }
 
     #[test]

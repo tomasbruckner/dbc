@@ -262,6 +262,24 @@ mod tests {
         }
     }
 
+    /// G16 (design §4): DuckDB's own type-name spellings classify without
+    /// any code change — the fragment matcher already covers them.
+    #[test]
+    fn duckdb_type_names_classify_numeric_vs_quoted() {
+        for numeric in ["HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT",
+                        "BIGINT", "DOUBLE", "FLOAT", "REAL", "DECIMAL(18,3)"] {
+            assert!(is_numeric_type_name(numeric), "{numeric} must classify numeric");
+        }
+        for quoted in ["VARCHAR", "BLOB", "DATE", "TIMESTAMP",
+                       "TIMESTAMP WITH TIME ZONE", "BOOLEAN", "UUID"] {
+            assert!(!is_numeric_type_name(quoted), "{quoted} must fall to the quoted path");
+        }
+        // "INTERVAL" contains the "int" fragment — a known, SAFE false
+        // positive: sql_value's parse gate quotes any value that isn't a
+        // bare numeral anyway (this classifier's own doc comment).
+        assert!(is_numeric_type_name("INTERVAL"));
+    }
+
     // -- ColumnMapping -----------------------------------------------------
 
     #[test]

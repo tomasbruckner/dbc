@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use dbc_core::{Connection, QueryError};
+use dbc_driver_duckdb::DuckdbConnection;
 use dbc_driver_mssql::{MssqlConfig, MssqlConnection};
 use dbc_driver_postgres::{PgConfig, PostgresConnection};
 use dbc_driver_sqlite::SqliteConnection;
@@ -127,6 +128,30 @@ pub fn open_config(
             let conn = SqliteConnection::new_with_options(cfg.database.clone(), cfg.read_only);
             Ok(OpenConnection { conn: Box::new(conn), _tunnel: None })
         }
+        Engine::Duckdb => {
+            // File-based engine: `database` is the file path; host/port/
+            // user/password and `cfg.ssh` are ignored, byte-for-byte the
+            // Sqlite arm's posture (no new divergence, no new error). No
+            // vault secret is ever fetched for this engine
+            // (`connections_ui::engine_is_file_based` keeps the prompt
+            // away at every call site).
+            if is_in_memory_duckdb_path(&cfg.database) {
+                return Err(QueryError::msg(
+                    "in-memory DuckDB databáze není podporována — zadejte cestu k souboru",
+                ));
+            }
+            // Dual read-only enforcement, same as sqlite: engine-side
+            // AccessMode::ReadOnly here (driver-proven by its
+            // read_only_connection_rejects_writes tests), plus the SHARED
+            // client-side guards at the runner choke point. Registry
+            // semantics the UI inherits (all driver-implemented): same
+            // file+mode roots are shared and fine; opposite-mode opens
+            // fail with the driver's Czech mixed-mode error; another
+            // PROCESS holding the file fails with the translated `locked`
+            // error (PID-scrubbed). All surfaced VERBATIM.
+            let conn = DuckdbConnection::new_with_options(cfg.database.clone(), cfg.read_only);
+            Ok(OpenConnection { conn: Box::new(conn), _tunnel: None })
+        }
         Engine::Postgres => {
             let default_port = 5432u16;
             let (target_host, target_port, tunnel) = if let Some(ssh) = &cfg.ssh {
@@ -162,6 +187,18 @@ pub fn open_config(
             Ok(OpenConnection { conn: Box::new(conn), _tunnel: tunnel })
         }
     }
+}
+
+/// G16 §3: `:memory:` (and an empty path) is refused for DuckDB BEFORE the
+/// driver is ever constructed — this app opens a fresh connection per
+/// dispatch and the driver's per-path registry holds only a `Weak`, so an
+/// in-memory database's entire contents would be torn down the moment each
+/// dispatch's last connection drops: an empty database on every single
+/// query, a data-eating trap rather than a feature. Revisit only if the
+/// app ever grows a held-connection mode.
+pub(crate) fn is_in_memory_duckdb_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    trimmed.is_empty() || trimmed == ":memory:"
 }
 
 /// G15 T8 HARD GATE ITEM 2: the two `mssql_connection_from_config`
@@ -269,6 +306,124 @@ pub(crate) fn mssql_im002_hint(e: QueryError) -> QueryError {
             e.message
         ),
         position: e.position,
+    }
+}
+
+#[cfg(test)]
+mod duckdb_connect_tests {
+    use super::*;
+    use dbc_core::CancelToken;
+
+    fn duckdb_cfg(path: &str, read_only: bool) -> ConnectionConfig {
+        ConnectionConfig {
+            id: "d1".into(),
+            name: "duck".into(),
+            folder: vec![],
+            engine: Engine::Duckdb,
+            host: String::new(),
+            port: None,
+            database: path.into(),
+            user: String::new(),
+            read_only,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: None,
+        }
+    }
+
+    /// Driver fixture quirk (its own test suite's convention): give DuckDB
+    /// a path where NO file exists yet — it must create the database
+    /// itself; a pre-existing empty temp file is not a valid database.
+    fn fresh_db_path(dir: &tempfile::TempDir) -> String {
+        dir.path().join("t.duckdb").to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn in_memory_duckdb_path_matcher() {
+        assert!(is_in_memory_duckdb_path(":memory:"));
+        assert!(is_in_memory_duckdb_path("  :memory:  "));
+        assert!(is_in_memory_duckdb_path(""));
+        assert!(is_in_memory_duckdb_path("   "));
+        assert!(!is_in_memory_duckdb_path(r"D:\data\analytics.duckdb"));
+    }
+
+    #[test]
+    fn duckdb_memory_path_is_refused_before_driver_construction() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = match open_config(&duckdb_cfg(":memory:", false), None, rt.handle()) {
+            Err(e) => e,
+            Ok(_) => panic!("expected the :memory: refusal"),
+        };
+        assert_eq!(
+            err.message,
+            "in-memory DuckDB databáze není podporována — zadejte cestu k souboru"
+        );
+    }
+
+    #[test]
+    fn duckdb_open_config_round_trips_a_select() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_db_path(&dir);
+        let mut opened = open_config(&duckdb_cfg(&path, false), None, rt.handle()).unwrap();
+        rt.block_on(async {
+            let mut stream =
+                opened.conn.query("SELECT 1 AS one", CancelToken::new()).await.unwrap();
+            let mut rows = 0usize;
+            while let Some(item) = stream.batches.recv().await {
+                rows += item.unwrap().num_rows();
+            }
+            assert_eq!(rows, 1);
+        });
+    }
+
+    /// Proves the arm passes cfg.read_only through to the ENGINE
+    /// (AccessMode::ReadOnly), not just the client-side guard.
+    #[test]
+    fn duckdb_read_only_config_refuses_writes_at_the_engine() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_db_path(&dir);
+        {
+            // Create the database read-write first (read-only can't create
+            // a missing file), then drop it so the path's root is free.
+            let mut rw = open_config(&duckdb_cfg(&path, false), None, rt.handle()).unwrap();
+            rt.block_on(async {
+                rw.conn.execute("CREATE TABLE t(id INTEGER)", CancelToken::new()).await.unwrap();
+            });
+        }
+        let mut ro = open_config(&duckdb_cfg(&path, true), None, rt.handle()).unwrap();
+        rt.block_on(async {
+            let err = ro.conn.execute("INSERT INTO t VALUES (1)", CancelToken::new()).await;
+            assert!(err.is_err(), "AccessMode::ReadOnly must refuse the write engine-side");
+        });
+    }
+
+    /// The driver's mixed-mode policy surfaces VERBATIM through
+    /// open_config's arm — same path+opposite mode while any instance of
+    /// the first is alive (design §3 registry semantics).
+    #[test]
+    fn duckdb_mixed_mode_same_path_surfaces_the_driver_error() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_db_path(&dir);
+        let mut rw = open_config(&duckdb_cfg(&path, false), None, rt.handle()).unwrap();
+        rt.block_on(async {
+            // Bind the rw root (roots bind lazily on first use).
+            rw.conn.execute("CREATE TABLE t(id INTEGER)", CancelToken::new()).await.unwrap();
+            let handle = tokio::runtime::Handle::current();
+            // Construction succeeds — the refusal fires on first use.
+            let mut ro = open_config(&duckdb_cfg(&path, true), None, &handle).unwrap();
+            let err = match ro.conn.query("SELECT 1", CancelToken::new()).await {
+                Err(e) => e,
+                Ok(_) => panic!("expected the mixed-mode refusal"),
+            };
+            assert_eq!(err.code.as_deref(), Some("mixed-access-mode"));
+            assert!(err.message.contains("již otevřena v jiném režimu"), "got: {}", err.message);
+        });
+        drop(rw);
     }
 }
 

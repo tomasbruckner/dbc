@@ -14,7 +14,9 @@ dbc-buffer = { path = "../dbc-buffer" }
 dbc-state = { path = "../dbc-state" }
 dbc-driver-sqlite = { path = "../dbc-driver-sqlite" }
 dbc-driver-postgres = { path = "../dbc-driver-postgres" }
-rmcp = { version = "3.1.4", features = ["transport-io"] }
+# G16 T3: embedded DuckDB — always opened read-only by open_for_mcp.
+dbc-driver-duckdb = { path = "../dbc-driver-duckdb" }
+rmcp ={ version = "3.1.4", features = ["transport-io"] }
 tokio = { workspace = true, features = ["io-std"] }
 tokio-postgres = "0.7"
 serde.workspace = true

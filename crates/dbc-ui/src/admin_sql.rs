@@ -93,7 +93,7 @@ pub fn roles_catalog(engine: Engine) -> Vec<(&'static str, String)> {
                  JOIN sys.server_principals mp ON mp.principal_id = srm.member_principal_id \
                  ORDER BY rl.name, mp.name".to_string()),
         ],
-        Engine::Sqlite => Vec::new(),
+        Engine::Sqlite | Engine::Duckdb => Vec::new(),
     }
 }
 
@@ -160,7 +160,7 @@ pub fn privileges_catalog(engine: Engine, schema: &str) -> Vec<(&'static str, St
                 )),
             ]
         }
-        Engine::Sqlite => Vec::new(),
+        Engine::Sqlite | Engine::Duckdb => Vec::new(),
     }
 }
 
@@ -229,7 +229,7 @@ pub fn sizes_catalog(engine: Engine) -> Vec<(&'static str, String)> {
                  'db_denydatareader', 'db_denydatawriter') \
                  GROUP BY s.name ORDER BY s.name".to_string()),
         ],
-        Engine::Sqlite => Vec::new(),
+        Engine::Sqlite | Engine::Duckdb => Vec::new(),
     }
 }
 
@@ -488,7 +488,7 @@ pub fn create_role(engine: Engine, name: &str, password: &str, flags: &RoleFlags
             },
             (format!("CREATE USER {ident} FOR LOGIN {ident}"), None).into(),
         ],
-        Engine::Sqlite => Vec::new(),
+        Engine::Sqlite | Engine::Duckdb => Vec::new(),
     }
 }
 
@@ -508,7 +508,7 @@ pub fn alter_password(engine: Engine, name: &str, password: &str) -> Vec<WriteSt
             display_sql: format!("ALTER LOGIN {ident} WITH PASSWORD = {REDACTED}"),
             expected_affected: None,
         }],
-        Engine::Sqlite => Vec::new(),
+        Engine::Sqlite | Engine::Duckdb => Vec::new(),
     }
 }
 
@@ -521,7 +521,7 @@ pub fn drop_role(engine: Engine, name: &str) -> Vec<WriteStatement> {
             (format!("DROP USER {ident}"), None).into(),
             (format!("DROP LOGIN {ident}"), None).into(),
         ],
-        Engine::Sqlite => Vec::new(),
+        Engine::Sqlite | Engine::Duckdb => Vec::new(),
     }
 }
 
@@ -539,7 +539,7 @@ pub fn add_membership(engine: Engine, role: &str, member: &str, admin_option: bo
             let verb = if server_role { "ALTER SERVER ROLE" } else { "ALTER ROLE" };
             vec![(format!("{verb} {r} ADD MEMBER {m}"), None).into()]
         }
-        Engine::Sqlite => Vec::new(),
+        Engine::Sqlite | Engine::Duckdb => Vec::new(),
     }
 }
 
@@ -552,7 +552,7 @@ pub fn remove_membership(engine: Engine, role: &str, member: &str, server_role: 
             let verb = if server_role { "ALTER SERVER ROLE" } else { "ALTER ROLE" };
             vec![(format!("{verb} {r} DROP MEMBER {m}"), None).into()]
         }
-        Engine::Sqlite => Vec::new(),
+        Engine::Sqlite | Engine::Duckdb => Vec::new(),
     }
 }
 
@@ -598,6 +598,11 @@ pub fn object_privilege(
     if engine == Engine::Sqlite {
         return Err("SQLite nemá serverová oprávnění".to_string());
     }
+    // G16: own message rather than widening the sqlite `if` — the existing
+    // tests pin the sqlite text exactly.
+    if engine == Engine::Duckdb {
+        return Err("DuckDB nemá serverová oprávnění".to_string());
+    }
     if engine == Engine::Postgres && target == CellState::Denied {
         return Err("DENY na PostgreSQL neexistuje".to_string());
     }
@@ -616,6 +621,11 @@ pub fn object_privilege(
 pub fn schema_privilege(engine: Engine, schema: &str, priv_name: &str, grantee: &str, target: CellState) -> Result<WriteStatement, String> {
     if engine == Engine::Sqlite {
         return Err("SQLite nemá serverová oprávnění".to_string());
+    }
+    // G16: own message rather than widening the sqlite `if` — the existing
+    // tests pin the sqlite text exactly.
+    if engine == Engine::Duckdb {
+        return Err("DuckDB nemá serverová oprávnění".to_string());
     }
     if engine == Engine::Postgres && target == CellState::Denied {
         return Err("DENY na PostgreSQL neexistuje".to_string());
@@ -638,7 +648,7 @@ pub fn schema_privilege(engine: Engine, schema: &str, priv_name: &str, grantee: 
                 CellState::NotSet => format!("REVOKE {priv_name} ON SCHEMA {ident} FROM {g}"),
             }
         }
-        Engine::Sqlite => unreachable!("Sqlite refused above"),
+        Engine::Sqlite | Engine::Duckdb => unreachable!("refused above"),
     };
     Ok((sql, None).into())
 }
@@ -662,7 +672,7 @@ pub fn create_schema(engine: Engine, name: &str) -> Vec<WriteStatement> {
     let ident = quote_ident_for(engine, name);
     match engine {
         Engine::Postgres | Engine::Mssql => vec![(format!("CREATE SCHEMA {ident}"), None).into()],
-        Engine::Sqlite => Vec::new(),
+        Engine::Sqlite | Engine::Duckdb => Vec::new(),
     }
 }
 
@@ -677,7 +687,7 @@ pub fn drop_schema(engine: Engine, name: &str, cascade: bool) -> Vec<WriteStatem
             vec![(format!("DROP SCHEMA {ident}{suffix}"), None).into()]
         }
         Engine::Mssql => vec![(format!("DROP SCHEMA {ident}"), None).into()],
-        Engine::Sqlite => Vec::new(),
+        Engine::Sqlite | Engine::Duckdb => Vec::new(),
     }
 }
 
@@ -827,6 +837,22 @@ mod mutation_tests {
             "GRANT CONNECT ON DATABASE \"appdb\" TO \"bob\""
         );
         assert!(database_privilege_pg("appdb", "CONNECT", "bob", CellState::Denied).is_err());
+    }
+
+    /// G16: DuckDB has no server-side privilege concept — both privilege
+    /// builders refuse with the exact Czech message (own message, not the
+    /// sqlite one, which existing tests pin separately).
+    #[test]
+    fn duckdb_privileges_are_refused_with_exact_message() {
+        assert_eq!(
+            object_privilege(Engine::Duckdb, "s", "t", &["SELECT"], "b", CellState::Granted)
+                .unwrap_err(),
+            "DuckDB nemá serverová oprávnění"
+        );
+        assert_eq!(
+            schema_privilege(Engine::Duckdb, "s", "USAGE", "b", CellState::Granted).unwrap_err(),
+            "DuckDB nemá serverová oprávnění"
+        );
     }
 
     #[test]

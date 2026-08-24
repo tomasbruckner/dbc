@@ -259,7 +259,9 @@ enum EditableDecision {
 /// the engine inferred from the URL itself, via the SAME postgres-vs-sqlite
 /// dispatch `connect::open` uses to pick a driver (`postgres[ql]://` ->
 /// Postgres, anything else -> a SQLite file path — MSSQL has no CLI-arg URL
-/// form at all in this app, so it never needs a branch here).
+/// form at all in this app, so it never needs a branch here). G16: a
+/// `.duckdb` CLI arg is an explicit non-goal (design §3) — saved
+/// connections are the only DuckDB entry point, so no branch here either.
 fn engine_from_url(url: &str) -> dbc_state::Engine {
     if url.starts_with("postgres://") || url.starts_with("postgresql://") {
         dbc_state::Engine::Postgres
@@ -281,6 +283,10 @@ fn dialect_for_engine(engine: dbc_state::Engine) -> Option<dbc_core::Dialect> {
         dbc_state::Engine::Postgres => Some(dbc_core::Dialect::Postgres),
         dbc_state::Engine::Sqlite => Some(dbc_core::Dialect::Sqlite),
         dbc_state::Engine::Mssql => Some(dbc_core::Dialect::Mssql),
+        // G16: DuckDB maps to the pg dialect — `"…"`-doubling ident
+        // quoting, trailing `LIMIT n`, `$tag$` dollar-quote splitting are
+        // all exactly DuckDB's rules (G12 curation item 2 delivered).
+        dbc_state::Engine::Duckdb => Some(dbc_core::Dialect::Postgres),
     }
 }
 
@@ -298,6 +304,9 @@ fn sql_dialect(engine: dbc_state::Engine) -> dbc_core::Dialect {
         dbc_state::Engine::Postgres => dbc_core::Dialect::Postgres,
         dbc_state::Engine::Sqlite => dbc_core::Dialect::Sqlite,
         dbc_state::Engine::Mssql => dbc_core::Dialect::Mssql,
+        // G16: pg-dialect composition is exactly DuckDB's SQL (G12
+        // curation item 2) — see `dialect_for_engine`'s arm.
+        dbc_state::Engine::Duckdb => dbc_core::Dialect::Postgres,
     }
 }
 
@@ -7302,6 +7311,15 @@ impl AppView {
                 })
                 .detach();
             }
+            dbc_state::Engine::Duckdb => {
+                // G16 T3 interim honest refusal — replaced by T4's real
+                // backup dispatch. Unreachable from the UI anyway
+                // (`backup::backup_restore_available(Duckdb)` gates the
+                // dialog OFF until T6's flip), but the arm must be real,
+                // honest code, never a wildcard.
+                self.status = "error: záloha pro DuckDB zatím není k dispozici".to_string();
+                cx.notify();
+            }
         }
     }
 
@@ -8021,6 +8039,7 @@ fn backup_file_ext(engine: dbc_state::Engine) -> &'static str {
         dbc_state::Engine::Postgres => "backup", // pg_dump -Fc (default format here)
         dbc_state::Engine::Mssql => "bak",
         dbc_state::Engine::Sqlite => "sqlite",
+        dbc_state::Engine::Duckdb => "duckdb",
     }
 }
 
@@ -8092,6 +8111,9 @@ fn plan_restore(cfg: &dbc_state::ConnectionConfig, source_path: &str) -> Result<
         }
         dbc_state::Engine::Mssql => Ok(RestorePlan::Mssql),
         dbc_state::Engine::Sqlite => Ok(RestorePlan::Sqlite),
+        // G16 T3 interim fail-closed refusal — T4 replaces this with
+        // `Ok(RestorePlan::Duckdb)` once the restore mechanics exist.
+        dbc_state::Engine::Duckdb => Err("obnova pro DuckDB zatím není k dispozici".to_string()),
     }
 }
 
@@ -8182,6 +8204,22 @@ mod plan_restore_tests {
         let mut sqlite = pg_cfg();
         sqlite.engine = dbc_state::Engine::Sqlite;
         assert!(matches!(plan_restore(&sqlite, r"D:\nope.sqlite"), Ok(RestorePlan::Sqlite)));
+    }
+
+    /// G16 T3 interim: DuckDB restore is fail-closed refused until T4
+    /// lands the mechanics (T4 replaces this assertion with
+    /// `Ok(RestorePlan::Duckdb)`).
+    #[test]
+    fn plan_restore_duckdb_interim_refusal() {
+        let mut duckdb = pg_cfg();
+        duckdb.engine = dbc_state::Engine::Duckdb;
+        // No `unwrap_err` — `RestorePlan` doesn't implement `Debug` (same
+        // reason `open_for_mcp`'s tests match instead of unwrapping).
+        let err = match plan_restore(&duckdb, r"D:\nope.duckdb") {
+            Err(e) => e,
+            Ok(_) => panic!("expected the interim DuckDB restore refusal"),
+        };
+        assert_eq!(err, "obnova pro DuckDB zatím není k dispozici");
     }
 }
 
@@ -8560,6 +8598,26 @@ mod editable_detection_tests {
         );
     }
 
+    /// G16 (design §4 REQUIRED matrix rows): DuckDB is sandbox-editable by
+    /// construction — no engine arm exists in detect_editable_pk since
+    /// G15's flip; `dbc_core::quote_ident` pg-style `"…"`-doubling is
+    /// exactly DuckDB's identifier quoting, `sql_value_d` emission is
+    /// engine-neutral, the driver populates `is_pk`. read_only still
+    /// blocks, same as every engine.
+    #[test]
+    fn duckdb_engine_is_editable_with_a_mapped_pk_and_read_only_still_blocks() {
+        let t = table(vec![col("id", true)]);
+        let h = headers(&["id"]);
+        assert!(matches!(
+            detect_editable_pk(rw_engine(dbc_state::Engine::Duckdb), Some(&t), &h),
+            EditableDecision::Editable(_)
+        ));
+        assert_eq!(
+            detect_editable_pk(Some((true, dbc_state::Engine::Duckdb)), Some(&t), &h),
+            EditableDecision::NotEditable
+        );
+    }
+
     #[test]
     fn no_conn_meta_at_all_is_not_editable_even_with_a_mapped_pk() {
         // Defensive-only today (`run_query_with` always builds `Some(..)`
@@ -8603,10 +8661,14 @@ mod multi_statement_tests {
     // G15 T8 ON-flip: Mssql now maps to Some(Dialect::Mssql) — see
     // dialect_for_engine's doc comment for the live evidence.
     #[test]
-    fn dialect_for_engine_maps_every_engine_including_mssql() {
+    fn dialect_for_engine_maps_every_engine_including_mssql_and_duckdb() {
         assert_eq!(dialect_for_engine(dbc_state::Engine::Postgres), Some(dbc_core::Dialect::Postgres));
         assert_eq!(dialect_for_engine(dbc_state::Engine::Sqlite), Some(dbc_core::Dialect::Sqlite));
         assert_eq!(dialect_for_engine(dbc_state::Engine::Mssql), Some(dbc_core::Dialect::Mssql));
+        // G16: DuckDB splits under the pg dialect — G12 curation item 2
+        // (`"…"` ident quoting, LIMIT n, $tag$ dollar quoting are DuckDB's
+        // own rules).
+        assert_eq!(dialect_for_engine(dbc_state::Engine::Duckdb), Some(dbc_core::Dialect::Postgres));
     }
 
     #[test]
@@ -8658,6 +8720,7 @@ mod multi_statement_tests {
         assert_eq!(sql_dialect(dbc_state::Engine::Postgres), dbc_core::Dialect::Postgres);
         assert_eq!(sql_dialect(dbc_state::Engine::Sqlite), dbc_core::Dialect::Sqlite);
         assert_eq!(sql_dialect(dbc_state::Engine::Mssql), dbc_core::Dialect::Mssql);
+        assert_eq!(sql_dialect(dbc_state::Engine::Duckdb), dbc_core::Dialect::Postgres);
     }
 
     /// Batch C review BLOCKER 2 regression: on a read-only MSSQL connection

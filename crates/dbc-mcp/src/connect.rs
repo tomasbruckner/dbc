@@ -15,10 +15,17 @@
 //!   is itself an async `#[tool]` method already running on the MCP
 //!   server's own tokio runtime, unlike `dbc-ui` which calls the twin from
 //!   a blocking context and needs `block_on`.
+//! - DuckDB PROCESS-CONCURRENCY limitation (G16): the MCP server is a
+//!   separate process, and DuckDB allows two processes on one file only
+//!   when BOTH are read-only — the app holding a read-write root means the
+//!   MCP open fails with the driver's translated `locked` error (and vice
+//!   versa); that error already names the situation in human terms, no
+//!   additional handling here.
 
 use std::time::Duration;
 
 use dbc_core::{Connection, QueryError};
+use dbc_driver_duckdb::DuckdbConnection;
 use dbc_driver_postgres::PostgresConnection;
 use dbc_driver_sqlite::SqliteConnection;
 use dbc_state::{ConnectionConfig, Engine};
@@ -26,8 +33,16 @@ use dbc_state::{ConnectionConfig, Engine};
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_PG_PORT: u16 = 5432;
 
+/// Twin of `dbc-ui`'s `connect::is_in_memory_duckdb_path` — deliberately
+/// duplicated, not shared (this file's module doc: near-duplicate of the
+/// GUI connect path, a fix to one should prompt checking the twin).
+fn is_in_memory_duckdb_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    trimmed.is_empty() || trimmed == ":memory:"
+}
+
 /// Opens a saved connection for MCP use: always read-only at the driver
-/// layer, never SSH-tunneled, never MSSQL.
+/// layer, never SSH-tunneled, never MSSQL; DuckDB always read-only.
 ///
 /// SECURITY: `secret` is never logged and never appears in an error
 /// message — same discipline as `dbc-ui`'s `open_config`.
@@ -59,6 +74,21 @@ pub async fn open_for_mcp(
             // `true` unconditionally: MCP has no write path, so it is
             // always at least as restrictive as `cfg.read_only`.
             let conn = SqliteConnection::new_with_options(cfg.database.clone(), true);
+            Ok(Box::new(conn))
+        }
+        Engine::Duckdb => {
+            if is_in_memory_duckdb_path(&cfg.database) {
+                return Err(QueryError::msg(
+                    "in-memory DuckDB databáze není podporována — zadejte cestu k souboru",
+                ));
+            }
+            // `true` unconditionally: MCP has no write path, so it is
+            // always at least as restrictive as `cfg.read_only` — same
+            // posture as the Sqlite arm above. PROCESS-CONCURRENCY
+            // limitation: see this module's doc comment (DuckDB allows two
+            // processes on one file only when BOTH are read-only; the
+            // driver's translated `locked` error surfaces verbatim).
+            let conn = DuckdbConnection::new_with_options(cfg.database.clone(), true);
             Ok(Box::new(conn))
         }
         Engine::Postgres => {
@@ -135,6 +165,59 @@ mod tests {
             Err(_) => saw_error = true,
         }
         assert!(saw_error, "expected the INSERT to be rejected by the forced read-only connection");
+    }
+
+    /// G16 T3: DuckDB over MCP is forced read-only regardless of
+    /// `cfg.read_only`, and a `:memory:` path is refused outright.
+    #[tokio::test]
+    async fn duckdb_forced_read_only_and_memory_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        // Driver fixture quirk: no pre-existing file — DuckDB creates the
+        // database itself (a pre-existing empty file is not a valid db).
+        let db = dir.path().join("m.duckdb");
+        {
+            // Seeded via query(), NOT the write entry point: the
+            // no_write_path_regression lint (tools.rs) forbids that call
+            // shape anywhere in this crate's source, test code included —
+            // and the driver happily runs DDL/DML through query() on a
+            // read-write root (auto-commit), which is all the seeding
+            // needs (the sqlite twin above seeds via rusqlite for the
+            // same reason).
+            let mut seed = dbc_driver_duckdb::DuckdbConnection::new(&db);
+            for sql in ["CREATE TABLE t(id INTEGER)", "INSERT INTO t VALUES (1)"] {
+                let mut s = seed.query(sql, CancelToken::new()).await.unwrap();
+                while let Some(item) = s.batches.recv().await {
+                    item.unwrap();
+                }
+            }
+        } // seed's root drops here — frees the path for the read-only open
+        let mut cfg = sqlite_cfg(&db, false); // reuse the fixture, flip engine:
+        cfg.engine = Engine::Duckdb;
+        let mut conn = open_for_mcp(&cfg, None).await.unwrap();
+
+        let mut stream = conn.query("SELECT id FROM t", CancelToken::new()).await.unwrap();
+        let mut rows = 0usize;
+        while let Some(item) = stream.batches.recv().await {
+            rows += item.unwrap().num_rows();
+        }
+        assert_eq!(rows, 1);
+
+        // Write refused — read-only forced regardless of cfg.read_only=false.
+        let mut saw_error = false;
+        match conn.query("INSERT INTO t VALUES (2)", CancelToken::new()).await {
+            Ok(mut s) => {
+                while let Some(item) = s.batches.recv().await {
+                    if item.is_err() {
+                        saw_error = true;
+                    }
+                }
+            }
+            Err(_) => saw_error = true,
+        }
+        assert!(saw_error, "MCP DuckDB connection must refuse the write");
+
+        cfg.database = ":memory:".into();
+        assert!(open_for_mcp(&cfg, None).await.is_err());
     }
 
     #[tokio::test]

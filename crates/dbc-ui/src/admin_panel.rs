@@ -86,6 +86,9 @@ pub fn admin_entry_state(engine: Option<Engine>, read_only: bool) -> AdminEntry 
     match engine {
         None => AdminEntry::Hidden,
         Some(Engine::Sqlite) => AdminEntry::Hidden,
+        // G16: embedded engine — no roles/privileges/logins to administer;
+        // same posture as Sqlite.
+        Some(Engine::Duckdb) => AdminEntry::Hidden,
         // G15 T8 ON-flip: the admin GRANT/REVOKE/DENY write path against
         // MSSQL is now live-validated —
         // `mssql_admin_catalogs_round_trip`/`mssql_admin_builder_mutation_round_trip`
@@ -503,7 +506,9 @@ impl MatrixState {
         let priv_columns: &[&str] = match engine {
             Engine::Postgres => admin_sql::PG_TABLE_PRIVS,
             Engine::Mssql => admin_sql::MSSQL_TABLE_PRIVS,
-            Engine::Sqlite => &[],
+            // G16: Duckdb joins Sqlite — admin is Hidden for both, no
+            // privilege columns exist (admin_entry_state).
+            Engine::Sqlite | Engine::Duckdb => &[],
         };
         let mut out = Vec::new();
 
@@ -637,7 +642,9 @@ pub fn parse_db_sizes(engine: Engine, rows: &AdminCatalogRows) -> Vec<(String, O
                 })
                 .collect()
         }
-        Engine::Mssql | Engine::Sqlite => {
+        // G16: Duckdb defensive — never called (admin Hidden), same
+        // no-per-db-size posture as MSSQL/Sqlite.
+        Engine::Mssql | Engine::Sqlite | Engine::Duckdb => {
             let name_ix = cols.iter().position(|c| c == "name").unwrap_or(0);
             data.iter()
                 .map(|row| (row.get(name_ix).cloned().flatten().unwrap_or_default(), None))
@@ -669,7 +676,7 @@ pub fn parse_schema_sizes(engine: Engine, rows: &AdminCatalogRows) -> Vec<(Strin
                 })
                 .collect()
         }
-        Engine::Mssql | Engine::Sqlite => {
+        Engine::Mssql | Engine::Sqlite | Engine::Duckdb => {
             let schema_ix = cols.iter().position(|c| c == "schema_name").unwrap_or(0);
             let kb_ix = cols.iter().position(|c| c == "reserved_kb");
             data.iter()
@@ -713,7 +720,7 @@ pub fn current_db_size_label(engine: Engine, rows: &AdminCatalogRows) -> Option<
             let bytes = ((data_mb + log_mb) * 1024.0 * 1024.0).round() as u64;
             Some(format_bytes(bytes))
         }
-        Engine::Sqlite => None,
+        Engine::Sqlite | Engine::Duckdb => None,
     }
 }
 
@@ -1770,7 +1777,8 @@ impl AdminPanel {
         let priv_columns: &'static [&'static str] = match self.engine {
             Engine::Postgres => admin_sql::PG_TABLE_PRIVS,
             Engine::Mssql => admin_sql::MSSQL_TABLE_PRIVS,
-            Engine::Sqlite => &[],
+            // G16: Duckdb joins Sqlite — admin Hidden, no columns.
+            Engine::Sqlite | Engine::Duckdb => &[],
         };
 
         if n_objects == 0 {
@@ -2432,6 +2440,11 @@ mod tests {
         // admin_entry_state's doc comment for the live evidence.
         assert_eq!(admin_entry_state(Some(Engine::Mssql), true), AdminEntry::Disabled);
         assert_eq!(admin_entry_state(Some(Engine::Mssql), false), AdminEntry::Enabled);
+        // G16: embedded engine — Hidden regardless of read_only, same
+        // posture as Sqlite (explicit arm above the pre-existing Some(_)
+        // wildcards, house rule).
+        assert_eq!(admin_entry_state(Some(Engine::Duckdb), false), AdminEntry::Hidden);
+        assert_eq!(admin_entry_state(Some(Engine::Duckdb), true), AdminEntry::Hidden);
     }
 
     // UX-polish sweep #9: the M6 password rule mirrored onto admin modals —

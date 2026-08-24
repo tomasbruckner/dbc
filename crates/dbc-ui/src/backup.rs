@@ -57,8 +57,13 @@ fn sql_string_literal(s: &str) -> String {
 /// `mssql_backup_restore_round_trip_live` (runner.rs) is the promotion
 /// contract: it must go green RELIABLY, across repeated runs, before this
 /// function's `Mssql` arm flips.
+///
+/// G16 T3: Duckdb joins the gated set until T6's flip — the DuckDB
+/// backup/restore mechanics land in T4 and the gate flips ONLY after the
+/// embedded suite is green (ON-flip discipline; same shape as the Mssql
+/// gate above).
 pub fn backup_restore_available(engine: Engine) -> bool {
-    !matches!(engine, Engine::Mssql)
+    !matches!(engine, Engine::Mssql | Engine::Duckdb)
 }
 
 // --- Postgres argument builders -------------------------------------------
@@ -446,10 +451,12 @@ mod pure_tests {
     // G15 T8 HARD GATE ITEM 1: gated off for Mssql pending a real fix — see
     // `backup_restore_available`'s doc comment.
     #[test]
-    fn backup_restore_available_gates_mssql_only() {
+    fn backup_restore_available_gates_mssql_and_duckdb_pre_flip() {
         assert!(backup_restore_available(Engine::Postgres));
         assert!(backup_restore_available(Engine::Sqlite));
         assert!(!backup_restore_available(Engine::Mssql));
+        // G16 T3: OFF until T6's flip (mechanics land in T4).
+        assert!(!backup_restore_available(Engine::Duckdb));
     }
 
     fn cfg() -> ConnectionConfig {
