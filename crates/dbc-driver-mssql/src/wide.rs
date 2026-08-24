@@ -90,7 +90,39 @@ pub fn build(
                 Some(len) => Some(len),
                 None => cursor.col_display_size(col_number).map_err(odbc_err)?,
             };
-        let max_str_len = reported.map(NonZeroUsize::get).unwrap_or(max_str_limit).min(max_str_limit);
+        // G15 T8 live-verified fix (HARD GATE ITEM 4 — schema.rs view-kind
+        // misclassification, found via `mssql_integration.rs::schema_snapshot_smoke`
+        // failing live): when the buffer is sized from the DRIVER-REPORTED
+        // display size (the `Some(_)` arm — not the `max_str_limit` fallback
+        // for a size-less type), add a ONE-code-unit safety margin before
+        // capping. Without it, a column whose reported size EXACTLY equals
+        // its real maximum content width (the common case for fixed-shape
+        // types, not an edge case) triggers `cell_text`'s "len >= max_len"
+        // truncation heuristic on every single value, 100% of the time —
+        // confirmed live for `DataType::Bit` (`display_size() == 1`, and a
+        // bit value is always exactly the 1-character text "0"/"1"): every
+        // `bit` column read through this driver's catalog queries
+        // (`sys.tables`/`sys.views`'s synthesized `is_view`, `sys.columns
+        // .is_nullable`, ...) was silently replaced by the truncation
+        // marker string, which `cell_bool`'s `== "1"` check then always
+        // reads as `false` — `schema.rs`'s view/table classification (and
+        // every other live bit-flag read) was wrong for EVERY row, not a
+        // rare boundary case. The margin costs one extra `u16` per
+        // buffered row for reported-size columns (negligible) and cannot
+        // cause a genuine over-length value to be missed: content beyond
+        // `reported + 1` still exceeds the buffer and is still correctly
+        // flagged truncated (see `cell_text`'s doc comment — this module's
+        // "over-flag rather than silently truncate" posture is preserved,
+        // just no longer OFF BY ONE for the exact-width case). The
+        // `max_str_limit` fallback path (`None` arm, used when the driver
+        // reports no size at all, e.g. `nvarchar(max)`) is UNCHANGED — that
+        // cap is a deliberate hard ceiling, not a display-size estimate,
+        // and `query_reports_truncation_marker_for_oversized_nvarchar_max`
+        // already proves genuine over-cap truncation still triggers there.
+        let max_str_len = match reported {
+            Some(len) => (len.get() + 1).min(max_str_limit),
+            None => max_str_limit,
+        };
         columns.push((col_number, WCharColumn::new(batch_size, max_str_len)));
     }
 

@@ -1,7 +1,7 @@
 mod config;
 pub use config::{
-    default_config_path, AppConfig, ConnectionConfig, Engine, FavouriteObject, SshTunnelConfig, StateError,
-    ThemeMode,
+    default_config_path, AppConfig, ConnectionConfig, Engine, FavouriteObject, MssqlOptions,
+    SshTunnelConfig, StateError, ThemeMode,
 };
 
 mod vault;

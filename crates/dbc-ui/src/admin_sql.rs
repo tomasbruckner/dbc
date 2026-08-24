@@ -11,16 +11,12 @@
 
 use dbc_state::Engine;
 
-/// Engine-aware identifier quoting (design §4): pg/sqlite delegate to
-/// dbc_core::quote_ident (double quotes, `"` doubled); MSSQL brackets
-/// (`[name]`, `]` doubled) — MSSQL must NEVER route through
-/// dbc_core::quote_ident (CURATION item 2). Scoped to this module only;
-/// ddl.rs/sandbox.rs are unchanged.
+/// DEPRECATED-IN-COMMENT (G15 §2a): delegating wrapper over
+/// `dbc_core::quote_ident_d` — dbc-core is the single bracket authority now;
+/// remove this pair once all admin call sites take a `Dialect` directly.
+/// Tests below stay as the contract proving delegation preserved behavior.
 pub fn quote_ident_for(engine: Engine, name: &str) -> String {
-    match engine {
-        Engine::Mssql => format!("[{}]", name.replace(']', "]]")),
-        Engine::Postgres | Engine::Sqlite => dbc_core::quote_ident(name),
-    }
+    dbc_core::quote_ident_d(crate::sql_dialect(engine), name)
 }
 
 /// `schema.object`, both parts through quote_ident_for.
@@ -35,9 +31,31 @@ pub fn quote_qualified_for(engine: Engine, schema: &str, object: &str) -> String
 /// Single-quoted SQL string literal, `'` doubled — the same escaping
 /// sandbox::sql_value applies on its quoted path, extracted here because
 /// catalog filters and passwords need the literal WITHOUT the numeric
-/// bare-path heuristic.
+/// bare-path heuristic. Postgres-convention wrapper (byte-identical
+/// pre-G15 behavior) over [`sql_string_literal_d`] — see that fn's doc
+/// comment for the MSSQL `N''` story this used to be missing.
 pub fn sql_string_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    sql_string_literal_d(s, dbc_core::Dialect::Postgres)
+}
+
+/// G15 T8 fix (batch-C MINOR, flagged as a KNOWN GAP by that review and
+/// left inert until live MSSQL admin validation existed to prove it):
+/// dialect-aware sibling of [`sql_string_literal`] — MSSQL gets the `N''`
+/// prefix, same as `sandbox::sql_value_d`/
+/// `csv_import::generate_insert_batches_d` already use for MSSQL text.
+/// Every admin_sql call site that builds a password literal or a catalog
+/// filter literal now goes through this instead of the dialect-agnostic
+/// plain form — a bare `'...'` is `varchar` in T-SQL and transcodes
+/// through the database collation's code page, corrupting non-ASCII text
+/// (Czech diacritics, the primary case this driver exists to get right)
+/// exactly the way `wide.rs`/`sandbox::sql_value_d` already document for
+/// the read/sandbox-write paths.
+pub fn sql_string_literal_d(s: &str, dialect: dbc_core::Dialect) -> String {
+    let quoted = s.replace('\'', "''");
+    match dialect {
+        dbc_core::Dialect::Mssql => format!("N'{quoted}'"),
+        _ => format!("'{quoted}'"),
+    }
 }
 
 /// Labeled catalog SELECTs (label, sql) for the "Role a členství"
@@ -120,7 +138,7 @@ pub fn privileges_catalog(engine: Engine, schema: &str) -> Vec<(&'static str, St
             ]
         }
         Engine::Mssql => {
-            let lit = sql_string_literal(schema);
+            let lit = sql_string_literal_d(schema, dbc_core::Dialect::Mssql);
             vec![
                 ("object_perms", format!(
                     "SELECT s.name AS schema_name, o.name AS object_name, dp.name AS grantee, \
@@ -240,6 +258,18 @@ mod catalog_tests {
         assert_eq!(sql_string_literal(""), "''");
     }
 
+    /// G15 T8 fix (batch-C MINOR): MSSQL gets the `N''` prefix; every other
+    /// dialect (and the `sql_string_literal` Postgres-convention wrapper)
+    /// stays byte-identical to before.
+    #[test]
+    fn sql_string_literal_d_prefixes_n_for_mssql_only() {
+        assert_eq!(sql_string_literal_d("O'Brien", dbc_core::Dialect::Postgres), "'O''Brien'");
+        assert_eq!(sql_string_literal_d("O'Brien", dbc_core::Dialect::Sqlite), "'O''Brien'");
+        assert_eq!(sql_string_literal_d("O'Brien", dbc_core::Dialect::Mssql), "N'O''Brien'");
+        assert_eq!(sql_string_literal_d("Příliš žluťoučký kůň", dbc_core::Dialect::Mssql), "N'Příliš žluťoučký kůň'");
+        assert_eq!(sql_string_literal_d("", dbc_core::Dialect::Mssql), "N''");
+    }
+
     #[test]
     fn sqlite_is_feature_exempt_every_catalog_is_empty() {
         assert!(roles_catalog(Engine::Sqlite).is_empty());
@@ -291,7 +321,8 @@ mod catalog_tests {
     fn mssql_privileges_catalog_escapes_schema_literal() {
         let qs = privileges_catalog(Engine::Mssql, "we]ird'schema");
         assert_eq!(qs.iter().map(|(l, _)| *l).collect::<Vec<_>>(), vec!["object_perms", "schema_perms"]);
-        assert!(qs[0].1.contains("s.name = 'we]ird''schema'"));
+        // G15 T8 fix: MSSQL catalog filter literals get the N'' prefix now.
+        assert!(qs[0].1.contains("s.name = N'we]ird''schema'"));
         assert!(qs[0].1.contains("perm.class = 1"));
         assert!(qs[1].1.contains("perm.class = 3"));
     }
@@ -448,7 +479,10 @@ pub fn create_role(engine: Engine, name: &str, password: &str, flags: &RoleFlags
         }
         Engine::Mssql => vec![
             WriteStatement {
-                exec_sql: format!("CREATE LOGIN {ident} WITH PASSWORD = {}", sql_string_literal(password)),
+                exec_sql: format!(
+                    "CREATE LOGIN {ident} WITH PASSWORD = {}",
+                    sql_string_literal_d(password, dbc_core::Dialect::Mssql)
+                ),
                 display_sql: format!("CREATE LOGIN {ident} WITH PASSWORD = {REDACTED}"),
                 expected_affected: None,
             },
@@ -467,7 +501,10 @@ pub fn alter_password(engine: Engine, name: &str, password: &str) -> Vec<WriteSt
             expected_affected: None,
         }],
         Engine::Mssql => vec![WriteStatement {
-            exec_sql: format!("ALTER LOGIN {ident} WITH PASSWORD = {}", sql_string_literal(password)),
+            exec_sql: format!(
+                "ALTER LOGIN {ident} WITH PASSWORD = {}",
+                sql_string_literal_d(password, dbc_core::Dialect::Mssql)
+            ),
             display_sql: format!("ALTER LOGIN {ident} WITH PASSWORD = {REDACTED}"),
             expected_affected: None,
         }],
@@ -680,7 +717,8 @@ mod mutation_tests {
     fn create_role_mssql_is_login_plus_user() {
         let stmts = create_role(Engine::Mssql, "app_user", "pw", &RoleFlags::default());
         assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0].exec_sql, "CREATE LOGIN [app_user] WITH PASSWORD = 'pw'");
+        // G15 T8 fix: MSSQL password literals get the N'' prefix now.
+        assert_eq!(stmts[0].exec_sql, "CREATE LOGIN [app_user] WITH PASSWORD = N'pw'");
         assert_eq!(stmts[0].display_sql, "CREATE LOGIN [app_user] WITH PASSWORD = '***'");
         assert_eq!(stmts[1].exec_sql, "CREATE USER [app_user] FOR LOGIN [app_user]");
         assert_eq!(stmts[1].exec_sql, stmts[1].display_sql);
@@ -692,7 +730,8 @@ mod mutation_tests {
         assert_eq!(pg[0].exec_sql, "ALTER ROLE \"bob\" PASSWORD 'tajne'");
         assert_eq!(pg[0].display_sql, "ALTER ROLE \"bob\" PASSWORD '***'");
         let ms = alter_password(Engine::Mssql, "bob", "tajne");
-        assert_eq!(ms[0].exec_sql, "ALTER LOGIN [bob] WITH PASSWORD = 'tajne'");
+        // G15 T8 fix: MSSQL password literals get the N'' prefix now.
+        assert_eq!(ms[0].exec_sql, "ALTER LOGIN [bob] WITH PASSWORD = N'tajne'");
         assert_eq!(ms[0].display_sql, "ALTER LOGIN [bob] WITH PASSWORD = '***'");
     }
 

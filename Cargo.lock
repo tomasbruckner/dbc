@@ -2288,6 +2288,7 @@ dependencies = [
  "async-trait",
  "dbc-core",
  "odbc-api",
+ "testcontainers-modules",
  "tokio",
 ]
 
@@ -2363,13 +2364,14 @@ dependencies = [
 
 [[package]]
 name = "dbc-ui"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "async-trait",
  "csv",
  "dbc-buffer",
  "dbc-core",
  "dbc-diff",
+ "dbc-driver-mssql",
  "dbc-driver-postgres",
  "dbc-driver-sqlite",
  "dbc-state",

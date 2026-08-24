@@ -5,20 +5,32 @@
 //! dependency (kept dependency-free per §6's T6 scope -- the UI task that
 //! wires this in owns the actual CSV parsing and its quote-awareness).
 //!
-//! Value emission reuses `sandbox::sql_value` UNCHANGED (per the design
-//! doc's binding constraint) and identifiers reuse `dbc_core::{quote_ident,
-//! quote_qualified}` -- both already `pub`, so no visibility changes were
-//! needed here.
+//! Value emission reuses `sandbox::sql_value_d` and identifiers reuse
+//! `dbc_core::{quote_ident_d, quote_qualified_d}` -- both already `pub`, so
+//! no visibility changes were needed here.
 //!
 //! T7 (CSV import UI) is what actually calls into this module (file picker,
 //! header peek, mapping modal, row pre-count, the runner method that drives
-//! `generate_insert_batches` against a real connection) -- wired in by
+//! `generate_insert_batches_d` against a real connection) -- wired in by
 //! `runner::run_csv_import`/`main.rs`'s CSV import UI.
+//!
+//! G15 T4: `generate_insert_batches_d` is the dialect-aware sibling
+//! (bracket-quoted identifiers, `N''` literals for MSSQL). G15 batch C
+//! review (BLOCKER 1): `main.rs`'s two preview/sample-SQL call sites
+//! (`start_csv_import`, `recompute_csv_sample`) and
+//! `runner.rs::run_csv_import_drive`'s execution call now ALL thread a real
+//! resolved dialect through `generate_insert_batches_d` together, in the
+//! same change -- display/exec parity holds because both resolve dialect
+//! from the same connection (`main.rs::sql_dialect`/`runner.rs::spec_dialect`
+//! agree by construction, both mapping `dbc_state::Engine` 1:1 onto
+//! `dbc_core::Dialect`). `generate_insert_batches` (no `_d`) stays the
+//! pg-convention wrapper, now used only by this module's own pg-shaped
+//! tests.
 
 use std::collections::HashSet;
 
-use crate::sandbox::sql_value;
-use dbc_core::{quote_ident, quote_qualified};
+use crate::sandbox::sql_value_d;
+use dbc_core::{quote_ident_d, quote_qualified_d, Dialect};
 
 /// Fixed batch size for generated multi-row `INSERT`s -- not user-tunable in
 /// v1, same posture as `TAB_CAP`/`LOOKUP_ROW_CAP` elsewhere in this
@@ -141,7 +153,33 @@ pub type CsvRow = Vec<Option<String>>;
 /// rejects "column specified more than once" on every batch, rolling back
 /// the whole import) -- caught here, before any SQL is built, with a
 /// message identifying the offending column.
+///
+/// Thin pg-convention wrapper over [`generate_insert_batches_d`] --
+/// byte-identical pre-G15 behavior. **G15 batch C review (BLOCKER 1) closed
+/// the T4 deviation this doc comment used to flag:** every real call site
+/// (`main.rs`'s two preview/sample-SQL sites, `runner.rs::run_csv_import_drive`'s
+/// execution call) now goes through `generate_insert_batches_d` with a real
+/// resolved dialect, switched together in one change to preserve
+/// display/exec parity -- none of them call this wrapper anymore, so it's
+/// `#[cfg(test)]`-only now (this module's own pg-shaped tests + the
+/// pg-byte-identity golden test) rather than dead production code.
+#[cfg(test)]
 pub fn generate_insert_batches(
+    schema: Option<&str>,
+    table: &str,
+    columns: &[TargetColumn],
+    mapping: &ColumnMapping,
+    rows: &[CsvRow],
+) -> Result<Vec<String>, String> {
+    generate_insert_batches_d(Dialect::Postgres, schema, table, columns, mapping, rows)
+}
+
+/// Dialect-aware sibling of [`generate_insert_batches`] (G15 §2b/§2c —
+/// bracket-quoted identifiers, `N''` string literals for MSSQL). Wired into
+/// every real call site as of the batch C review fix -- see
+/// `generate_insert_batches`'s doc comment.
+pub fn generate_insert_batches_d(
+    dialect: Dialect,
     schema: Option<&str>,
     table: &str,
     columns: &[TargetColumn],
@@ -161,10 +199,10 @@ pub fn generate_insert_batches(
         }
     }
 
-    let table_sql = quote_qualified(schema, table);
+    let table_sql = quote_qualified_d(dialect, schema, table);
     let cols_sql = pairs
         .iter()
-        .map(|&(_, target_ix)| quote_ident(&columns[target_ix].name))
+        .map(|&(_, target_ix)| quote_ident_d(dialect, &columns[target_ix].name))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -178,7 +216,7 @@ pub fn generate_insert_batches(
                         .iter()
                         .map(|&(csv_ix, target_ix)| {
                             let v = row.get(csv_ix).and_then(|v| v.as_deref());
-                            sql_value(v, columns[target_ix].numeric)
+                            sql_value_d(v, columns[target_ix].numeric, dialect)
                         })
                         .collect::<Vec<_>>()
                         .join(", ");
@@ -411,5 +449,46 @@ mod tests {
 
         let result = generate_insert_batches(None, "t", &columns, &mapping, &rows);
         assert_eq!(result, Err("sloupec id je namapován vícekrát".to_string()));
+    }
+
+    // -- G15 T4: dialect-aware generation -----------------------------------
+
+    #[test]
+    fn generate_insert_batches_mssql_brackets_and_nchar() {
+        let columns = vec![
+            TargetColumn { name: "id".into(), numeric: true },
+            TargetColumn { name: "we]ird".into(), numeric: false },
+        ];
+        let mapping = ColumnMapping { targets: vec![Some(0), Some(1)] };
+        let rows: Vec<CsvRow> = vec![vec![Some("1".into()), Some("Příliš".into())]];
+
+        let stmts =
+            generate_insert_batches_d(Dialect::Mssql, Some("s"), "t", &columns, &mapping, &rows)
+                .unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(
+            stmts[0],
+            "INSERT INTO [s].[t] ([id], [we]]ird]) VALUES (1, N'Příliš');"
+        );
+    }
+
+    #[test]
+    fn generate_insert_batches_d_pg_output_is_byte_identical_to_wrapper() {
+        let columns = vec![TargetColumn { name: "id".into(), numeric: true }];
+        let mapping = ColumnMapping { targets: vec![Some(0)] };
+        let rows: Vec<CsvRow> = vec![vec![Some("1".into())]];
+        let via_wrapper = generate_insert_batches(None, "t", &columns, &mapping, &rows).unwrap();
+        let via_d =
+            generate_insert_batches_d(Dialect::Postgres, None, "t", &columns, &mapping, &rows)
+                .unwrap();
+        assert_eq!(via_wrapper, via_d);
+    }
+
+    #[test]
+    fn csv_import_batch_size_is_under_the_tsql_values_row_cap() {
+        // T-SQL: a VALUES clause may contain at most 1000 row
+        // constructors -- a future bump past that would silently break
+        // MSSQL imports at runtime.
+        assert!(CSV_IMPORT_BATCH_SIZE <= 1000);
     }
 }

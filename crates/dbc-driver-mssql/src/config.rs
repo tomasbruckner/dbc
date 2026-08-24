@@ -16,7 +16,14 @@
 /// or leading/trailing whitespace, so a password or database name
 /// containing those characters round-trips correctly instead of truncating
 /// the string or corrupting a later key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written (G15 T3 review, NIT) rather than derived —
+/// `password` is redacted, same pattern as `dbc-ui`'s
+/// `admin_sql::WriteStatement`/`connections_ui::ConnectionFormData` — so a
+/// stray `dbg!`/`tracing::debug!`/log line on this struct can never leak
+/// the plaintext password. `to_connection_string()` is the only place the
+/// password is ever rendered as text, and its output is never logged.
+#[derive(Clone, PartialEq, Eq)]
 pub struct MssqlConfig {
     pub host: String,
     pub port: u16,
@@ -103,6 +110,24 @@ impl MssqlConfig {
             push_kv(&mut out, "Connection Timeout", &t.to_string());
         }
         out
+    }
+}
+
+/// Hand-written (see the struct's doc comment): every field printed as-is
+/// except `password`, which is always `"<redacted>"`.
+impl std::fmt::Debug for MssqlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MssqlConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("encrypt", &self.encrypt)
+            .field("trust_server_certificate", &self.trust_server_certificate)
+            .field("connect_timeout_sec", &self.connect_timeout_sec)
+            .field("driver", &self.driver)
+            .finish()
     }
 }
 
@@ -241,5 +266,20 @@ mod tests {
         let cfg = MssqlConfig::new("h", 1433, "db", "u", "p;w{ird}pw");
         let s = cfg.to_connection_string();
         assert!(s.contains("Pwd={p;w{ird}}pw};"));
+    }
+
+    // G15 T3 review (NIT): `Debug` is hand-written specifically so a stray
+    // `dbg!`/log line can never leak the password — both the compact and
+    // pretty-printed forms must stay redacted.
+    #[test]
+    fn debug_never_contains_the_password() {
+        const SECRET: &str = "sUpEr-s3cr3t;{password}";
+        let cfg = MssqlConfig::new("h", 1433, "db", "u", SECRET);
+        let compact = format!("{cfg:?}");
+        let pretty = format!("{cfg:#?}");
+        assert!(!compact.contains(SECRET), "compact Debug leaked the password: {compact}");
+        assert!(!pretty.contains(SECRET), "pretty Debug leaked the password: {pretty}");
+        assert!(compact.contains("<redacted>"));
+        assert!(pretty.contains("<redacted>"));
     }
 }

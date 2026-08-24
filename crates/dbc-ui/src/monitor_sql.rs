@@ -83,14 +83,23 @@ WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog', 'information_schema', 
 ORDER BY pg_relation_size(c.oid) + pg_indexes_size(c.oid) DESC";
 }
 
-/// Target shape for when dbc-driver-mssql lands (design §3): compiled and
-/// smoke-tested here so a T-SQL typo fails CI today, but NOT runnable — no
-/// driver exists (`connect::open_config` hard-errors Engine::Mssql), and
-/// `monitor::monitor_available` returns false for Mssql until it does.
-/// dead_code allow is PERMANENT for this module (unlike the temporary mod-
-/// declaration allows T6 removes) — nothing can call these until the
-/// driver lands.
-#[allow(dead_code)]
+/// The live MSSQL monitor refresh set (design §3), 11 statements —
+/// `runner::run_monitor_refresh`'s Mssql arm (G15 T6) drives every one of
+/// these via `drain_rows` and threads the results through
+/// `monitor::merge_mssql_connections`/`merge_mssql_locks`/
+/// `split_mssql_size`/`merge_mssql_perf` into the pg-shaped tiles
+/// `assemble_snapshot` already knows how to degrade per-tile.
+///
+/// Correction (G15 T6): this module doc used to say these constants were
+/// "NOT runnable — no driver exists" and carried a PERMANENT `dead_code`
+/// allow. Both are obsolete — `dbc-driver-mssql` landed (T2/T3) and every
+/// constant here is now called from real, complete code (this crate's
+/// `#[allow(dead_code)]` is gone). G15 T8 flipped `monitor::monitor_available`
+/// to `true` for Mssql after `mssql_monitor_live_dmvs_blocking_chain_and_kill`
+/// (runner.rs's `mssql_docker_tests`) proved all 11 of these queries, the
+/// merge helpers, and a real blocking-chain + `KILL` round-trip all work
+/// live — `open_monitor` now dispatches refreshes against MSSQL
+/// connections same as Postgres.
 pub mod mssql {
     pub const CONNECTIONS: &str = "\
 SELECT
@@ -111,10 +120,25 @@ SELECT cntr_value AS deadlocks_since_reset FROM sys.dm_os_performance_counters
 WHERE counter_name = 'Number of Deadlocks/sec' AND instance_name = '_Total'";
 
     /// Data vs log split — the sp_spaceused equivalent (design §3).
+    ///
+    /// G15 T6 review fix (MAJOR): `sys.database_files.size` is `int` (8KB
+    /// pages); `SUM(int)` returns `int` in T-SQL, so the un-cast
+    /// `SUM(size) * 8 * 1024` overflows ("Arithmetic overflow error
+    /// converting expression to data type int") once a file's total page
+    /// count reaches 262,144 pages (~2 GiB of ROWS or LOG data) — i.e. on
+    /// any real, non-toy database, not a pathological edge case. Both
+    /// halves then degrade to "n/a" on EVERY refresh. Fixed by casting to
+    /// `bigint` before the sum, same pattern T-SQL's own `sp_spaceused`
+    /// uses internally. NOT live-verified this round (no server available)
+    /// — the smoke test that caught the T6 `TABLES` bug was docker-based
+    /// and this fix landed after that container was already torn down;
+    /// `size_sums_are_cast_to_bigint_before_multiply_int_overflow_guard`
+    /// below (this module's test) is a static
+    /// assertion that the fixed text is present, not a live proof.
     pub const SIZE: &str = "\
 SELECT
-  SUM(CASE WHEN type_desc = 'ROWS' THEN size ELSE 0 END) * 8 * 1024 AS data_bytes,
-  SUM(CASE WHEN type_desc = 'LOG'  THEN size ELSE 0 END) * 8 * 1024 AS log_bytes
+  SUM(CASE WHEN type_desc = 'ROWS' THEN CAST(size AS bigint) ELSE 0 END) * 8 * 1024 AS data_bytes,
+  SUM(CASE WHEN type_desc = 'LOG'  THEN CAST(size AS bigint) ELSE 0 END) * 8 * 1024 AS log_bytes
 FROM sys.database_files";
 
     pub const CACHE_HIT: &str = "\
@@ -143,16 +167,53 @@ ORDER BY duration_secs DESC";
 
     /// blocker_query is NULL when the blocker is idle-in-transaction (no
     /// active request row) — inherent to the DMV, not a bug (design §3).
+    ///
+    /// G15 T6 review fixes:
+    /// - MINOR: `blocking_session_id` can be NEGATIVE for special
+    ///   system "blockers" (`-2` orphaned DTC transaction, `-3`/`-4`
+    ///   recovery/latch waits per Microsoft's own DMV docs) — these aren't
+    ///   real, killable session ids. The filter used to be `<> 0`, which
+    ///   let negatives through: `parse_blocking_edges`/`build_blocking_tree`
+    ///   would then materialize a `BlockingNode { pid: -2, .. }`, and
+    ///   confirming Kill on it would trip `kill_sql`'s
+    ///   `debug_assert!(pid > 0)` in a debug build (and send a nonsensical
+    ///   `KILL -2` in release). Changed to `> 0` so only genuine killable
+    ///   session ids are ever surfaced as a blocker — the SQL-side filter
+    ///   alone isn't trusted, see `monitor_loop`'s `MonitorCmd::Kill` arm
+    ///   in runner.rs, which has its own `pid > 0` gate (defense in depth,
+    ///   same "don't rely on one layer" posture as every other guard in
+    ///   this codebase).
+    /// - NIT: the waiter side used `CROSS APPLY sys.dm_exec_sql_text` while
+    ///   the blocker side already used `OUTER APPLY` — a waiter whose
+    ///   handle yields no text would have its WHOLE row silently dropped
+    ///   (`CROSS APPLY` on zero rows = no output row), instead of
+    ///   `waiter_query` degrading to NULL like the blocker side already
+    ///   does. `parse_blocking_edges`'s `col_str` already treats a NULL
+    ///   cell as `None` (no code change needed downstream), so switching to
+    ///   `OUTER APPLY` here is a safe, consistent fix.
     pub const BLOCKING: &str = "\
 SELECT r.session_id AS waiter_pid, r.blocking_session_id AS blocker_pid,
        r.wait_time / 1000.0 AS wait_secs, tw.text AS waiter_query, tb.text AS blocker_query
 FROM sys.dm_exec_requests r
-CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) tw
+OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) tw
 OUTER APPLY (SELECT sql_handle FROM sys.dm_exec_requests br WHERE br.session_id = r.blocking_session_id) bx
 OUTER APPLY sys.dm_exec_sql_text(bx.sql_handle) tb
-WHERE r.blocking_session_id <> 0";
+WHERE r.blocking_session_id > 0";
 
     /// Set-based sp_spaceused equivalent, no per-table EXEC loop (design §3).
+    ///
+    /// G15 T6 smoke-test fix (live docker MSSQL, not just this crate's
+    /// lexical `every_mssql_monitor_query_starts_with_select` check, which
+    /// can't catch a semantic T-SQL error): the `ORDER BY` used to
+    /// reference the `data_bytes`/`index_bytes` SELECT-list ALIASES inside
+    /// an arithmetic expression (`ORDER BY data_bytes + index_bytes DESC`)
+    /// — T-SQL allows a bare alias in `ORDER BY` but NOT an alias inside a
+    /// larger expression combined with `GROUP BY`, and failed live with
+    /// "Msg 207 ... Invalid column name 'data_bytes'"/`'index_bytes'`.
+    /// Fixed by repeating the underlying aggregate expressions in
+    /// `ORDER BY` instead of referencing the aliases — verified live
+    /// against a real (dockerized) SQL Server 2022 instance, including
+    /// with an actual user table present.
     pub const TABLES: &str = "\
 SELECT OBJECT_SCHEMA_NAME(ps.object_id) AS [schema], OBJECT_NAME(ps.object_id) AS [table],
        SUM(CASE WHEN ps.index_id IN (0,1) THEN ps.in_row_data_page_count ELSE 0 END) * 8 * 1024 AS data_bytes,
@@ -162,7 +223,8 @@ SELECT OBJECT_SCHEMA_NAME(ps.object_id) AS [schema], OBJECT_NAME(ps.object_id) A
 FROM sys.dm_db_partition_stats ps
 JOIN sys.tables t ON t.object_id = ps.object_id
 GROUP BY ps.object_id
-ORDER BY data_bytes + index_bytes DESC";
+ORDER BY SUM(CASE WHEN ps.index_id IN (0,1) THEN ps.in_row_data_page_count ELSE 0 END) * 8 * 1024
+       + SUM(CASE WHEN ps.index_id > 1 THEN ps.used_page_count ELSE 0 END) * 8 * 1024 DESC";
 }
 
 /// See the Interfaces doc comment. `debug_assert` mirrors sandbox.rs's
@@ -223,6 +285,49 @@ mod tests {
                 "mssql::{name} must lead with SELECT"
             );
         }
+    }
+
+    /// G15 T6 review REQUIRED (MAJOR): regression guard for the int-overflow
+    /// fix — `sys.database_files.size` is `int`, and `SUM(int)` stays `int`
+    /// in T-SQL, so summing it un-cast overflows ("Arithmetic overflow
+    /// error converting expression to data type int") once a database's
+    /// ROWS or LOG files reach ~2 GiB, degrading BOTH size halves to "n/a"
+    /// on every refresh of any real database. A static substring check is
+    /// the honest tier here — there is no live server in this fix round
+    /// (the docker container this task's own commit smoke-tested `TABLES`
+    /// against was already torn down before this fix landed), so this
+    /// pins the CAST's presence/shape, not a live-verified overflow-free
+    /// execution. Both branches (ROWS and LOG) must cast, not just one.
+    #[test]
+    fn size_sums_are_cast_to_bigint_before_multiply_int_overflow_guard() {
+        let occurrences = mssql::SIZE.matches("CAST(size AS bigint)").count();
+        assert_eq!(
+            occurrences, 2,
+            "both the ROWS and LOG SUM(...) branches must CAST(size AS bigint) before summing \
+             (un-cast SUM(int) overflows on any real, non-toy database): {}",
+            mssql::SIZE
+        );
+    }
+
+    /// G15 T6 review REQUIRED (MINOR): regression guard for the negative-
+    /// blocker fix — `sys.dm_exec_requests.blocking_session_id` can be
+    /// negative for system pseudo-blockers (`-2` orphaned DTC, `-3`/`-4`
+    /// recovery/latch waits), which are not real, killable sessions. The
+    /// filter must be a strict `> 0`, not `<> 0` (which would let
+    /// negatives through and let a `BlockingNode { pid: -2, .. }` reach
+    /// the kill-confirm flow).
+    #[test]
+    fn blocking_filters_out_negative_pseudo_blockers() {
+        assert!(
+            mssql::BLOCKING.contains("blocking_session_id > 0"),
+            "BLOCKING must filter blocking_session_id > 0 (not <> 0, which admits negative \
+             system pseudo-blockers): {}",
+            mssql::BLOCKING
+        );
+        assert!(
+            !mssql::BLOCKING.contains("blocking_session_id <> 0"),
+            "the old, negative-admitting filter must be gone"
+        );
     }
 
     #[test]

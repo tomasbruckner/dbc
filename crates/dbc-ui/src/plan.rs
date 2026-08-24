@@ -111,31 +111,91 @@ pub fn hot_fraction(
 
 /// `EXPLAIN ...` text for the ALWAYS-SAFE estimated path (§5: never
 /// executes the statement on any engine — no gating needed, ever).
+///
+/// G15 T7 (curation item 1): MSSQL's broken one-string
+/// `"SET SHOWPLAN_XML ON; {sql}"` form is GONE — `SET SHOWPLAN_XML` must
+/// be the ONLY statement in its batch (Microsoft's own docs) and is
+/// session-scoped, while `MssqlConnection::query()` opens a fresh
+/// connection per call, so that string could never have worked. MSSQL
+/// never routes through this builder at all any more:
+/// `main.rs::run_explain` dispatches `Engine::Mssql` to
+/// `dispatch_mssql_plan`/`QueryRunner::run_mssql_plan` (session preludes
+/// via `query_with_session`, see `runner.rs::mssql_plan_session`) BEFORE
+/// ever calling this function.
+///
+/// G15 T7 review MINOR fix: the `Mssql` arm used to be a bare passthrough
+/// (`sql.to_string()`) — kept the match total, but if `main.rs`'s routing
+/// ever regressed (the reviewer confirmed deleting it still compiles and
+/// passes the whole suite — GPUI view methods have no direct test seam,
+/// see `run_explain`'s own doc comment), `dispatch_plan_query` would hand
+/// the RAW user SQL straight to `connect_and_run` and EXECUTE it for
+/// real — including an unconfirmed write, with no confirm modal, since
+/// the estimated path is specifically the one §5 promises never executes
+/// anything. Replaced with an INERT marker — a `SELECT` of a static
+/// string literal, no user SQL embedded anywhere — so even if this arm
+/// IS ever reached by a routing regression, the worst case is a harmless
+/// read-only `SELECT` followed by a "couldn't parse this as a plan" error
+/// (`parse_plan` fails closed on non-XML text), never a side effect.
 pub fn explain_sql(engine: dbc_state::Engine, sql: &str) -> String {
     match engine {
         dbc_state::Engine::Postgres => format!("EXPLAIN (FORMAT JSON) {sql}"),
-        // T7 (deferred): unreachable until the MSSQL driver phase wires
-        // `connect::open_config`'s Engine::Mssql arm.
-        dbc_state::Engine::Mssql => format!("SET SHOWPLAN_XML ON; {sql}"),
+        dbc_state::Engine::Mssql => {
+            "SELECT 'MSSQL EXPLAIN routing bug — see plan::explain_sql doc comment' AS error"
+                .to_string()
+        }
         dbc_state::Engine::Sqlite => format!("EXPLAIN QUERY PLAN {sql}"),
     }
 }
 
 /// `EXPLAIN ANALYZE ...`-family text, or `None` when the engine has no
 /// such mode (SQLite — §1c, the "Analyze" button is hidden entirely).
+///
+/// G15 T7 (curation item 1): MSSQL's broken `"SET STATISTICS XML ON;
+/// {sql}; SET STATISTICS XML OFF;"` form is GONE (same "one string can't
+/// carry session state across `query()`'s fresh-connection-per-call"
+/// problem as `explain_sql`'s old Mssql arm) — `None` here, same as
+/// SQLite, but for a DIFFERENT reason: SQLite is `None` because it has no
+/// ANALYZE mode at all; MSSQL is `None` because its analyze text is
+/// delivered entirely through `runner.rs::mssql_plan_session`'s prelude/
+/// postlude instead of a single wrapped string. This makes the generic
+/// wrap-and-run path (`main.rs::dispatch_plan_query`, used by
+/// pg/sqlite) structurally unable to ever emit the broken form again
+/// (fail closed) — `main.rs::run_explain`/`on_confirm_analyze_write`
+/// dispatch `Engine::Mssql` to `dispatch_mssql_plan` before this function
+/// is ever consulted for that engine. `analyze_button_visible(Mssql)`
+/// stays `true` — the button still renders, it just routes elsewhere.
 pub fn explain_analyze_sql(engine: dbc_state::Engine, sql: &str) -> Option<String> {
     match engine {
         dbc_state::Engine::Postgres => Some(format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}")),
-        dbc_state::Engine::Mssql => {
-            Some(format!("SET STATISTICS XML ON; {sql}; SET STATISTICS XML OFF;"))
-        }
+        dbc_state::Engine::Mssql => None,
         dbc_state::Engine::Sqlite => None,
     }
 }
 
-/// Whether the "Analyze" button should render at all for `engine`.
+/// Whether the "Analyze" button should render at all for `engine`. Stays
+/// `true` for Mssql (G15 T7) — the button itself is not what's gated; see
+/// `mssql_plan_dispatch_available` for the actual ON/OFF switch clicking
+/// it goes through.
 pub fn analyze_button_visible(engine: dbc_state::Engine) -> bool {
     !matches!(engine, dbc_state::Engine::Sqlite)
+}
+
+/// G15 T8 ON-flip — same "complete, correct code; reachable the MOMENT
+/// this flips" discipline `monitor::monitor_available` established for T6.
+/// `main.rs::run_explain`/`on_confirm_analyze_write` check this BEFORE
+/// routing to `dispatch_mssql_plan`/`run_mssql_plan`. Both the ESTIMATED
+/// (`SET SHOWPLAN_XML`) and ACTUAL (`SET STATISTICS XML` + fused
+/// XACT_ABORT BEGIN/ROLLBACK) paths are now live-verified end-to-end by
+/// `mssql_plan_capture_live_estimated_and_actual_with_rollback_proof`
+/// (runner.rs's `mssql_docker_tests`) — including the ACTUAL path's core
+/// safety guarantee, that the ROLLBACK its session wrapper always issues
+/// truly undoes the write (verified with a live `SELECT` after, not just
+/// "no error"). `analyze_button_visible` was already `true` regardless of
+/// this flag; a click while this gate was `false` surfaced an honest Czech
+/// "not yet available" status instead of silently doing nothing — that
+/// status path is now simply unreached for MSSQL.
+pub fn mssql_plan_dispatch_available() -> bool {
+    true
 }
 
 /// SQLite's `EXPLAIN QUERY PLAN` row shape: `(id, parent, detail)` —
@@ -280,12 +340,34 @@ pub enum AnalyzeGate {
 }
 
 /// §5's three-case dispatch, decided purely from the RAW (pre-`EXPLAIN`-
-/// wrap) editor SQL — the exact same `dbc_core::is_read_statement` call
-/// `run_query_with`'s Guard 1 already makes on the pre-wrap text; "Explain"
-/// (estimated) never calls this at all (§5: always safe, unconditionally,
-/// on every engine).
-pub fn analyze_gate(sql: &str, read_only: bool) -> AnalyzeGate {
-    if dbc_core::is_read_statement(sql) {
+/// wrap) editor SQL — the exact same dialect-aware read classification
+/// `run_query_with`'s Guard 1 uses on the pre-wrap text (batch C review
+/// BLOCKER 2, main.rs); "Explain" (estimated) never calls this at all
+/// (§5: always safe, unconditionally, on every engine).
+///
+/// G15 T7: closes the KNOWN GAP the batch C review flagged and explicitly
+/// deferred here — `dialect` is now threaded through to
+/// `is_read_statement_d` (was the pg-only `is_read_statement`), so a
+/// bracket-quoted reserved word (e.g. `SELECT [Delete] FROM AuditLog`) on
+/// a read-only MSSQL connection no longer wrongly hits `Blocked` instead
+/// of `Run`. `main.rs::run_explain` calls this with `sql_dialect(engine)`,
+/// same resolution as every other dialect-aware call site.
+///
+/// DEFENSE-IN-DEPTH, MSSQL HONESTY NOTE (design §2e/§5, G13's original
+/// layering): on Postgres, `read_only` here backstops a SERVER-side
+/// enforcement too (`default_transaction_read_only=on`, set for the whole
+/// session at connect time — `connect.rs`'s pg arm) — a write would be
+/// refused by the server even if this gate somehow let it through. MSSQL
+/// has NO server-side read-only mode at all (driver integration note 5,
+/// restated for this feature): this client-side gate, plus
+/// `runner.rs::run_mssql_plan_inner`'s own belt-and-braces
+/// `guard_not_read_only` check on the ACTUAL (`analyze == true`) path, are
+/// the WHOLE defense for MSSQL. The estimated path needs no such gate on
+/// EITHER engine — it's safe by a different, stronger mechanism (`EXPLAIN`
+/// never executes on pg; `SET SHOWPLAN_XML ON` never executes on MSSQL —
+/// see `runner.rs::mssql_plan_session`'s doc comment).
+pub fn analyze_gate(sql: &str, read_only: bool, dialect: dbc_core::Dialect) -> AnalyzeGate {
+    if dbc_core::is_read_statement_d(sql, dialect) {
         AnalyzeGate::Run
     } else if read_only {
         AnalyzeGate::Blocked
@@ -829,14 +911,37 @@ mod model_tests {
             explain_sql(dbc_state::Engine::Sqlite, "SELECT 1"),
             "EXPLAIN QUERY PLAN SELECT 1"
         );
-        assert!(explain_sql(dbc_state::Engine::Mssql, "SELECT 1").starts_with("SET SHOWPLAN_XML ON"));
+        // G15 T7 review MINOR fix REQUIRED test (the "routing pin" —
+        // `main.rs::run_explain`'s Mssql dispatch itself has no direct
+        // test seam per GPUI convention, so this is the safety net): even
+        // if that routing ever regressed and this function WAS reached
+        // with a real write statement, it must NEVER echo the user's SQL
+        // back as something `dispatch_plan_query` would execute — proven
+        // here by feeding it an actual write and asserting the output
+        // contains neither that text nor ANY of the raw input, only the
+        // inert static marker.
+        let raw_write = "UPDATE accounts SET balance = 0 WHERE 1=1";
+        let mssql_out = explain_sql(dbc_state::Engine::Mssql, raw_write);
+        assert!(
+            !mssql_out.contains(raw_write),
+            "explain_sql(Mssql, ..) must never echo the input SQL back verbatim: {mssql_out}"
+        );
+        assert!(
+            mssql_out.trim_start().to_ascii_uppercase().starts_with("SELECT"),
+            "even if main.rs's routing ever regressed, this must stay a harmless read-only \
+             SELECT of a static marker, never user SQL: {mssql_out}"
+        );
     }
 
     #[test]
-    fn explain_analyze_sql_sqlite_is_none() {
+    fn explain_analyze_sql_sqlite_and_mssql_are_both_none() {
         assert_eq!(explain_analyze_sql(dbc_state::Engine::Sqlite, "SELECT 1"), None);
         assert!(explain_analyze_sql(dbc_state::Engine::Postgres, "SELECT 1").unwrap().contains("ANALYZE, BUFFERS"));
-        assert!(explain_analyze_sql(dbc_state::Engine::Mssql, "SELECT 1").unwrap().contains("STATISTICS XML ON"));
+        // G15 T7: MSSQL's analyze text is delivered entirely through
+        // runner.rs::mssql_plan_session's prelude/postlude instead — None
+        // here makes the generic wrap-and-run path structurally unable to
+        // ever emit the broken one-string form again (fail closed).
+        assert_eq!(explain_analyze_sql(dbc_state::Engine::Mssql, "SELECT 1"), None);
     }
 
     #[test]
@@ -844,6 +949,13 @@ mod model_tests {
         assert!(analyze_button_visible(dbc_state::Engine::Postgres));
         assert!(analyze_button_visible(dbc_state::Engine::Mssql));
         assert!(!analyze_button_visible(dbc_state::Engine::Sqlite));
+    }
+
+    /// G15 T8 ON-flip — see mssql_plan_dispatch_available's doc comment
+    /// for the live evidence.
+    #[test]
+    fn mssql_plan_dispatch_is_available() {
+        assert!(mssql_plan_dispatch_available());
     }
 
     // --- parse_sqlite_rows ---
@@ -943,57 +1055,102 @@ mod model_tests {
 mod analyze_gate_tests {
     use super::*;
 
+    use dbc_core::Dialect;
+
     #[test]
     fn read_statement_always_runs_regardless_of_read_only() {
-        assert_eq!(analyze_gate("SELECT 1", false), AnalyzeGate::Run);
-        assert_eq!(analyze_gate("SELECT 1", true), AnalyzeGate::Run);
-        assert_eq!(analyze_gate("WITH x AS (SELECT 1) SELECT * FROM x", true), AnalyzeGate::Run);
+        assert_eq!(analyze_gate("SELECT 1", false, Dialect::Postgres), AnalyzeGate::Run);
+        assert_eq!(analyze_gate("SELECT 1", true, Dialect::Postgres), AnalyzeGate::Run);
+        assert_eq!(
+            analyze_gate("WITH x AS (SELECT 1) SELECT * FROM x", true, Dialect::Postgres),
+            AnalyzeGate::Run
+        );
     }
 
     #[test]
     fn write_statement_on_read_only_is_blocked() {
-        assert_eq!(analyze_gate("UPDATE t SET a = 1", true), AnalyzeGate::Blocked);
-        assert_eq!(analyze_gate("DELETE FROM t", true), AnalyzeGate::Blocked);
-        assert_eq!(analyze_gate("INSERT INTO t VALUES (1)", true), AnalyzeGate::Blocked);
+        assert_eq!(analyze_gate("UPDATE t SET a = 1", true, Dialect::Postgres), AnalyzeGate::Blocked);
+        assert_eq!(analyze_gate("DELETE FROM t", true, Dialect::Postgres), AnalyzeGate::Blocked);
+        assert_eq!(
+            analyze_gate("INSERT INTO t VALUES (1)", true, Dialect::Postgres),
+            AnalyzeGate::Blocked
+        );
     }
 
     #[test]
     fn write_statement_on_writable_needs_confirm() {
-        assert_eq!(analyze_gate("UPDATE t SET a = 1", false), AnalyzeGate::NeedsConfirm);
-        assert_eq!(analyze_gate("INSERT INTO t VALUES (1)", false), AnalyzeGate::NeedsConfirm);
+        assert_eq!(
+            analyze_gate("UPDATE t SET a = 1", false, Dialect::Postgres),
+            AnalyzeGate::NeedsConfirm
+        );
+        assert_eq!(
+            analyze_gate("INSERT INTO t VALUES (1)", false, Dialect::Postgres),
+            AnalyzeGate::NeedsConfirm
+        );
     }
 
     /// REQUIRED per CURATION item 3: the same bypass edges `guards.rs`
-    /// already proves for `is_read_statement` must gate the same way here
-    /// — this function is a thin wrapper, not a parallel implementation.
+    /// already proves for `is_read_statement`/`is_read_statement_d` must
+    /// gate the same way here — this function is a thin wrapper, not a
+    /// parallel implementation.
     #[test]
     fn cte_and_comment_bypass_edges_fail_closed_to_needs_confirm_or_blocked() {
         // Data-modifying CTE: lexically starts with WITH/SELECT-shaped but
-        // contains an UPDATE token -> is_read_statement is false -> a write.
+        // contains an UPDATE token -> is_read_statement_d is false -> a write.
         let cte_write = "WITH x AS (UPDATE t SET a=1 RETURNING *) SELECT * FROM x";
-        assert_eq!(analyze_gate(cte_write, false), AnalyzeGate::NeedsConfirm);
-        assert_eq!(analyze_gate(cte_write, true), AnalyzeGate::Blocked);
+        assert_eq!(analyze_gate(cte_write, false, Dialect::Postgres), AnalyzeGate::NeedsConfirm);
+        assert_eq!(analyze_gate(cte_write, true, Dialect::Postgres), AnalyzeGate::Blocked);
 
         // Nested-block-comment bypass: real leading statement is the UPDATE.
         let nested_comment = "/* /* */ SELECT 1 */ UPDATE t SET a=1";
-        assert_eq!(analyze_gate(nested_comment, false), AnalyzeGate::NeedsConfirm);
+        assert_eq!(analyze_gate(nested_comment, false, Dialect::Postgres), AnalyzeGate::NeedsConfirm);
 
         // EXPLAIN ANALYZE UPDATE ... wrapped by the USER themselves (not by
         // this feature) still correctly classifies as a write on the
         // UNWRAPPED text this function receives.
-        assert_eq!(analyze_gate("EXPLAIN ANALYZE UPDATE t SET a=1", false), AnalyzeGate::NeedsConfirm);
+        assert_eq!(
+            analyze_gate("EXPLAIN ANALYZE UPDATE t SET a=1", false, Dialect::Postgres),
+            AnalyzeGate::NeedsConfirm
+        );
 
         // SELECT ... INTO (legacy CREATE TABLE AS spelling) is a write.
-        assert_eq!(analyze_gate("SELECT * INTO new_tbl FROM t", true), AnalyzeGate::Blocked);
+        assert_eq!(
+            analyze_gate("SELECT * INTO new_tbl FROM t", true, Dialect::Postgres),
+            AnalyzeGate::Blocked
+        );
 
         // Unterminated comment/string fails closed -> not a read -> a write.
-        assert_eq!(analyze_gate("SELECT 1 /* unterminated", true), AnalyzeGate::Blocked);
+        assert_eq!(analyze_gate("SELECT 1 /* unterminated", true, Dialect::Postgres), AnalyzeGate::Blocked);
     }
 
     #[test]
     fn multi_statement_batch_any_write_anywhere_is_a_write() {
-        assert_eq!(analyze_gate("SELECT 1; DROP TABLE t", false), AnalyzeGate::NeedsConfirm);
-        assert_eq!(analyze_gate("SELECT 1; SELECT 2", true), AnalyzeGate::Run);
+        assert_eq!(
+            analyze_gate("SELECT 1; DROP TABLE t", false, Dialect::Postgres),
+            AnalyzeGate::NeedsConfirm
+        );
+        assert_eq!(analyze_gate("SELECT 1; SELECT 2", true, Dialect::Postgres), AnalyzeGate::Run);
+    }
+
+    /// G15 T7 REQUIRED (closes the batch C review's KNOWN GAP): on Mssql,
+    /// a bracket-quoted reserved word must classify as a read (not
+    /// wrongly `Blocked`) — the exact false-reject `is_read_statement`
+    /// (pg-only) used to produce, now fixed by `is_read_statement_d`. A
+    /// real write on Mssql still gates exactly like every other engine.
+    #[test]
+    fn mssql_bracket_quoted_reserved_word_is_a_read_not_a_false_block() {
+        assert_eq!(
+            analyze_gate("SELECT [Delete] FROM AuditLog", true, Dialect::Mssql),
+            AnalyzeGate::Run
+        );
+        assert_eq!(
+            analyze_gate("UPDATE t SET x = 1", true, Dialect::Mssql),
+            AnalyzeGate::Blocked
+        );
+        assert_eq!(
+            analyze_gate("UPDATE t SET x = 1", false, Dialect::Mssql),
+            AnalyzeGate::NeedsConfirm
+        );
     }
 }
 
@@ -1235,6 +1392,15 @@ mod pg_docker_tests {
                     buffer.as_mut().expect("Started before Batch").push(b).expect("push");
                 }
                 crate::runner::QueryEvent::Finished { .. } => break,
+                // G15 T8 whole-branch review B2 fix: only ever sent for an
+                // MSSQL WRITE (see `stream_query`'s doc comment) — this
+                // helper is pg-only (`pg_url`) and only ever runs
+                // EXPLAIN-shaped reads, so unreachable here; panics with a
+                // distinct message rather than being silently folded into
+                // the `Finished`/`Failed` cases.
+                crate::runner::QueryEvent::WriteFinished { .. } => {
+                    panic!("run_and_capture_single_cell: unexpected WriteFinished (pg-only, read-only helper)")
+                }
                 crate::runner::QueryEvent::Failed(e) => panic!("query failed: {e}"),
             }
         }

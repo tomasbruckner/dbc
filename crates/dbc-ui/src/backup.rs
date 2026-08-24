@@ -2,10 +2,63 @@
 //! orchestration (T3, appended below). Pure half has zero I/O — no
 //! `std::process`, no `std::fs` reads beyond what's handed in as `&[u8]`.
 
-use dbc_state::ConnectionConfig;
+use dbc_state::{ConnectionConfig, Engine};
 
 fn sql_string_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// G15 T8 HARD GATE ITEM 1 — THE authoritative account of this gate's
+/// status; `build_backup_sql`/`build_verify_backup_file_exists_sql`/
+/// `build_verify_database_online_sql` (below) and
+/// `runner.rs::mssql_backup_restore_round_trip_live`'s doc comment all
+/// summarize and point back here rather than each re-deriving their own
+/// theory — keep them in sync with THIS text if the story changes again.
+///
+/// Whether the 🗄/♻ backup/restore affordances are shown at all for a
+/// given engine. `true` for Postgres/Sqlite (the G11 baseline, live and
+/// validated for a long time). `false` for MSSQL — NOT because the
+/// `BACKUP DATABASE`/`RESTORE DATABASE` T-SQL is wrong (both commands were
+/// confirmed correct, live, via `sqlcmd`), but because the round trip is
+/// UNRELIABLE through this driver's ODBC execution path specifically, and
+/// — important, read this before trusting any ONE run — the exact failure
+/// mode is NOT fully characterized:
+/// - `BACKUP DATABASE WITH ... STATS = n` reliably aborted server-side
+///   (SQL Server error 3041) while `Connection::execute` still reported
+///   `Ok`, isolated by a controlled A/B comparison over the SAME
+///   connection (identical statement, `STATS` present vs. absent) —
+///   `build_backup_sql`'s `STATS` clause was removed as a result. This
+///   part IS solid: a confirmed, reproducible, controlled finding, not a
+///   guess.
+/// - That fix alone did NOT make the round trip reliably green. Live runs
+///   AFTER removing `STATS` still intermittently failed — sometimes at the
+///   `BACKUP` step (the file never gets written despite `execute()`
+///   reporting `Ok`, same class of lie `STATS` caused, apparently not
+///   `STATS`-exclusive after all), sometimes at the `RESTORE` step (the
+///   database gets stuck in `RESTORING` and never reaches `ONLINE` even
+///   after a bounded poll — see `build_verify_database_online_sql`). A
+///   run can ALSO fully pass — this was observed too, more than once —
+///   which is exactly why "it passed this run" is not evidence of
+///   reliability on its own.
+/// - `run_mssql_backup_inner`/`run_mssql_restore_inner` both gained
+///   verification steps this task (`xp_fileexist`, an `ONLINE` poll) so a
+///   failure is reported LOUDLY rather than silently lied about — real,
+///   permanent value regardless of the gate's state — but neither is a fix
+///   for the underlying intermittency.
+///
+/// Decision: the gate stays OFF for 0.18.0 — the exact "if not feasible
+/// cleanly, GATE it" contingency this task's instructions called for.
+/// Un-gating needs BOTH a real root cause (most likely in `run_execute`'s
+/// diagnostic-record handling around `SQL_SUCCESS_WITH_INFO`, or a
+/// msodbcsql18-Linux/odbc-api interaction — not yet found) AND a follow-up
+/// soak test (the round trip run enough times in a row, on fresh
+/// containers, to actually measure a failure rate instead of eyeballing
+/// one run) — a future task, not something to paper over here.
+/// `mssql_backup_restore_round_trip_live` (runner.rs) is the promotion
+/// contract: it must go green RELIABLY, across repeated runs, before this
+/// function's `Mssql` arm flips.
+pub fn backup_restore_available(engine: Engine) -> bool {
+    !matches!(engine, Engine::Mssql)
 }
 
 // --- Postgres argument builders -------------------------------------------
@@ -199,41 +252,102 @@ pub fn detect_dump_format(bytes: &[u8]) -> DumpFormat {
 
 // --- MSSQL T-SQL builders --------------------------------------------------
 
-/// `BACKUP DATABASE "db" TO DISK = N'server-path' WITH FORMAT, STATS = 10`.
-/// Uses `dbc_core::quote_ident` (double-quote style) for the database name —
-/// same caveat G7's plan already documented for MSSQL bracket-quoting: the
-/// bracket-aware `admin_sql::quote_ident_for` does not exist as code
-/// anywhere in this repo yet (only as a G10 plan document), and MSSQL is
-/// entirely unwired at `connect::open_config` regardless (see this plan's
-/// Spec section), so this SQL text is built and unit-tested but never
-/// actually sent to a live MSSQL server by anything in this codebase today.
-/// Follow-up once both land: switch to `admin_sql::quote_ident_for`.
+/// `BACKUP DATABASE [db] TO DISK = N'server-path' WITH FORMAT`. Uses
+/// `dbc_core::quote_ident_d(Dialect::Mssql, …)` (bracket style, `]`
+/// doubled) for the database name — these builders are MSSQL-only T-SQL, so
+/// the dialect is a fixed constant, not threaded from a caller.
+///
+/// G15 T8 live-found fix: NO `STATS = n` clause (a prior version of this
+/// builder had `WITH FORMAT, STATS = 10`, matched by
+/// `run_mssql_backup_inner`'s own review-era comment). `STATS` makes SQL
+/// Server emit periodic "N percent processed" informational TDS messages
+/// while the backup runs; in a controlled A/B comparison (the IDENTICAL
+/// `BACKUP DATABASE` issued over the SAME connection, `STATS = 10` present
+/// vs. absent) dropping it reliably fixed the failure `Connection::execute`
+/// still reported `Ok` for. This is a real, confirmed contributing cause —
+/// **not the whole story**: the round trip still intermittently fails even
+/// without `STATS` (both at this BACKUP step and at RESTORE) — see
+/// `backup::backup_restore_available`'s doc comment, the authoritative
+/// account of what is and isn't understood about this, and why the
+/// backup/restore feature gate stays off for 0.18.0 regardless of this
+/// fix. Kept anyway: it's a genuine improvement (removes one confirmed
+/// failure trigger) and has no functional cost — nothing in this codebase
+/// parses/displays the STATS progress messages.
 pub fn build_backup_sql(database: &str, server_path: &str) -> String {
     format!(
-        "BACKUP DATABASE {} TO DISK = N{} WITH FORMAT, STATS = 10",
-        dbc_core::quote_ident(database),
+        "BACKUP DATABASE {} TO DISK = N{} WITH FORMAT",
+        dbc_core::quote_ident_d(dbc_core::Dialect::Mssql, database),
         sql_string_literal(server_path)
     )
 }
 
-/// `RESTORE DATABASE "db" FROM DISK = N'server-path' WITH REPLACE, STATS = 10`.
+/// `RESTORE DATABASE [db] FROM DISK = N'server-path' WITH REPLACE`. No
+/// `STATS` clause — same live-found reason as `build_backup_sql` (not
+/// independently re-verified broken for RESTORE specifically, but dropped
+/// for consistency and to not carry the same risk into the restore path).
 pub fn build_restore_sql(database: &str, server_path: &str) -> String {
     format!(
-        "RESTORE DATABASE {} FROM DISK = N{} WITH REPLACE, STATS = 10",
-        dbc_core::quote_ident(database),
+        "RESTORE DATABASE {} FROM DISK = N{} WITH REPLACE",
+        dbc_core::quote_ident_d(dbc_core::Dialect::Mssql, database),
         sql_string_literal(server_path)
     )
 }
 
-/// `ALTER DATABASE "db" SET SINGLE_USER WITH ROLLBACK IMMEDIATE` (`multi:
+/// G15 T8 HARD GATE ITEM 1 fix: `EXEC master.dbo.xp_fileexist N'server-path'`
+/// — a dedicated extended stored proc that returns a `(File Exists, File is
+/// a Directory, Parent Directory Exists)` result set. Used by
+/// `run_mssql_backup_inner` to VERIFY a `BACKUP DATABASE` call actually
+/// wrote a file, rather than trusting `Connection::execute`'s `Ok` alone —
+/// `execute()` reporting `Ok` for a `BACKUP DATABASE` that did NOT
+/// actually write a file is a real, live-observed failure mode (see
+/// `backup::backup_restore_available`'s doc comment for the full,
+/// honestly-still-not-fully-characterized story — an earlier version of
+/// THIS comment blamed a "database not yet ready" timing race specific to
+/// backing up a just-created database, which turned out to be wrong: the
+/// same silent-`Ok`-but-no-file failure was later observed live against
+/// databases that had existed for a while too). A silently-failed backup
+/// reported as success is worse than a loud failure, so the backup path
+/// gets this belt-and-braces file-existence check regardless of whether
+/// the underlying cause is ever fully root-caused; generalizing
+/// diagnostic-record inspection to every `execute()` call site was judged
+/// out of scope/too risky to rush.
+pub fn build_verify_backup_file_exists_sql(server_path: &str) -> String {
+    format!("EXEC master.dbo.xp_fileexist N{}", sql_string_literal(server_path))
+}
+
+/// G15 T8: post-`RESTORE` sanity check — `sys.databases.state_desc` for
+/// `database` must read back `ONLINE`. Belt-and-braces alongside
+/// `build_verify_backup_file_exists_sql`: a `RESTORE DATABASE` that
+/// reports `Ok` via `Connection::execute` can still leave the database
+/// stuck in `RESTORING` (never reaching `ONLINE`, even after a bounded
+/// wait — see `run_mssql_restore_inner`'s doc comment) — the SAME class of
+/// "execute() lied" risk `build_verify_backup_file_exists_sql` guards on
+/// the backup side, not merely a defensive "just in case" addition. See
+/// `backup::backup_restore_available`'s doc comment for the full account
+/// of why this alone doesn't make the round trip reliable.
+pub fn build_verify_database_online_sql(database: &str) -> String {
+    format!(
+        "SELECT state_desc FROM sys.databases WHERE name = N{}",
+        sql_string_literal(database)
+    )
+}
+
+/// `ALTER DATABASE [db] SET SINGLE_USER WITH ROLLBACK IMMEDIATE` (`multi:
 /// false`) or `... SET MULTI_USER` (`multi: true`) — design §3.
+///
+/// G15 T8 whole-branch review NIT fix: this is MSSQL-only T-SQL (same as
+/// every other builder in this section) but used to quote the database
+/// name with the pg-only `dbc_core::quote_ident` (double quotes) instead
+/// of `quote_ident_d(Dialect::Mssql, ...)` (brackets) — every sibling
+/// builder here (`build_backup_sql`/`build_restore_sql`/
+/// `build_verify_database_online_sql`) already gets this right.
 pub fn build_single_user_sql(database: &str, multi: bool) -> String {
     let mode = if multi {
         "MULTI_USER"
     } else {
         "SINGLE_USER WITH ROLLBACK IMMEDIATE"
     };
-    format!("ALTER DATABASE {} SET {mode}", dbc_core::quote_ident(database))
+    format!("ALTER DATABASE {} SET {mode}", dbc_core::quote_ident_d(dbc_core::Dialect::Mssql, database))
 }
 
 // --- SQLite -----------------------------------------------------------------
@@ -329,6 +443,15 @@ pub fn backup_dispatch_allowed(captured_id: &str, current_ids: &[String]) -> boo
 mod pure_tests {
     use super::*;
 
+    // G15 T8 HARD GATE ITEM 1: gated off for Mssql pending a real fix — see
+    // `backup_restore_available`'s doc comment.
+    #[test]
+    fn backup_restore_available_gates_mssql_only() {
+        assert!(backup_restore_available(Engine::Postgres));
+        assert!(backup_restore_available(Engine::Sqlite));
+        assert!(!backup_restore_available(Engine::Mssql));
+    }
+
     fn cfg() -> ConnectionConfig {
         ConnectionConfig {
             id: "c1".into(),
@@ -344,6 +467,7 @@ mod pure_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         }
     }
 
@@ -557,11 +681,32 @@ mod pure_tests {
     // --- MSSQL SQL builders ---
     #[test]
     fn backup_sql_shape_and_quoting() {
+        // Brackets don't treat `"` specially — only `]` needs doubling.
         let sql = build_backup_sql("my\"db", r"D:\Backups\mydb.bak");
         assert_eq!(
             sql,
-            "BACKUP DATABASE \"my\"\"db\" TO DISK = N'D:\\Backups\\mydb.bak' WITH FORMAT, STATS = 10"
+            "BACKUP DATABASE [my\"db] TO DISK = N'D:\\Backups\\mydb.bak' WITH FORMAT"
         );
+    }
+
+    // G15 T4 required golden string: `]` inside the database name is
+    // doubled, proving the bracket-quoting switch.
+    #[test]
+    fn backup_sql_doubles_embedded_closing_bracket() {
+        let sql = build_backup_sql("we]ird", r"D:\Backups\mydb.bak");
+        assert_eq!(
+            sql,
+            "BACKUP DATABASE [we]]ird] TO DISK = N'D:\\Backups\\mydb.bak' WITH FORMAT"
+        );
+    }
+
+    // G15 T8 live-found fix: no `STATS` clause — see `build_backup_sql`'s
+    // doc comment for the full root-cause writeup (STATS's progress
+    // messages reliably made live BACKUP DATABASE abort through this
+    // driver's execution path).
+    #[test]
+    fn backup_sql_has_no_stats_clause() {
+        assert!(!build_backup_sql("db", "path").contains("STATS"));
     }
 
     #[test]
@@ -569,23 +714,64 @@ mod pure_tests {
         let sql = build_restore_sql("mydb", r"D:\Backups\mydb.bak");
         assert_eq!(
             sql,
-            "RESTORE DATABASE \"mydb\" FROM DISK = N'D:\\Backups\\mydb.bak' WITH REPLACE, STATS = 10"
+            "RESTORE DATABASE [mydb] FROM DISK = N'D:\\Backups\\mydb.bak' WITH REPLACE"
         );
     }
 
     #[test]
     fn single_user_sql_both_directions() {
+        // G15 T8 whole-branch review NIT fix: brackets, not double quotes —
+        // this is MSSQL-only T-SQL.
         assert_eq!(
             build_single_user_sql("mydb", false),
-            "ALTER DATABASE \"mydb\" SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
+            "ALTER DATABASE [mydb] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
         );
-        assert_eq!(build_single_user_sql("mydb", true), "ALTER DATABASE \"mydb\" SET MULTI_USER");
+        assert_eq!(build_single_user_sql("mydb", true), "ALTER DATABASE [mydb] SET MULTI_USER");
+    }
+
+    /// Golden bracket-doubling case, same convention `backup_sql_doubles_
+    /// embedded_closing_bracket` already pins for `build_backup_sql`.
+    #[test]
+    fn single_user_sql_doubles_embedded_closing_bracket() {
+        assert_eq!(
+            build_single_user_sql("we]ird", false),
+            "ALTER DATABASE [we]]ird] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
+        );
     }
 
     #[test]
     fn path_quote_doubling_for_embedded_single_quote() {
         let sql = build_backup_sql("db", r"D:\o'brien\mydb.bak");
         assert!(sql.contains("D:\\o''brien\\mydb.bak"));
+    }
+
+    // G15 T8 HARD GATE ITEM 1 fix: verification-query builders.
+    #[test]
+    fn verify_backup_file_exists_sql_shape() {
+        assert_eq!(
+            build_verify_backup_file_exists_sql("/var/opt/mssql/data/db.bak"),
+            "EXEC master.dbo.xp_fileexist N'/var/opt/mssql/data/db.bak'"
+        );
+    }
+
+    #[test]
+    fn verify_backup_file_exists_sql_escapes_embedded_quote() {
+        let sql = build_verify_backup_file_exists_sql(r"D:\o'brien\mydb.bak");
+        assert!(sql.contains("D:\\o''brien\\mydb.bak"));
+    }
+
+    #[test]
+    fn verify_database_online_sql_shape() {
+        assert_eq!(
+            build_verify_database_online_sql("mydb"),
+            "SELECT state_desc FROM sys.databases WHERE name = N'mydb'"
+        );
+    }
+
+    #[test]
+    fn verify_database_online_sql_escapes_embedded_quote() {
+        let sql = build_verify_database_online_sql("o'brien");
+        assert!(sql.contains("N'o''brien'"));
     }
 
     // --- SQLite magic header ---

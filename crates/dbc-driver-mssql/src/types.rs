@@ -9,16 +9,25 @@ use dbc_core::QueryError;
 /// odbc-api's `row_count()` already folds the raw ODBC `SQLRowCount` "-1 =
 /// unknown" sentinel into `None` (see its doc: "May return `None` if row
 /// count is not available") — so by the time a value reaches here, `-1` can
-/// no longer surface as a bogus `usize`/`u64`. This function's job is to
-/// refuse to paper over that `None` with a silent `0`: an unknown row count
-/// is surfaced as an error, never blindly cast, per the "errors are values"
-/// contract on `Connection::execute`.
+/// no longer surface as a bogus `usize`/`u64`.
+///
+/// `None` maps to `Ok(0)` — the "0 affected" convention the pg/sqlite
+/// drivers already use for statements that don't count rows — rather than
+/// an error. **G15 §3c Appendix F2 grounding find:** every T-SQL
+/// transaction-control batch this driver's write path sends (`SET
+/// XACT_ABORT ON; BEGIN TRANSACTION`, bare `COMMIT`/`ROLLBACK`, plain `SET
+/// ...` statements) reports `SQL_NO_ROW_COUNT` — they are not DML, so there
+/// is nothing to count. Mapping that to an error (this function's behavior
+/// before G15) would fail every sanctioned write sequence's very first
+/// statement on MSSQL (`tests/mssql_tx_matrix.rs` case 0 characterizes this
+/// live). Genuine DML (`INSERT`/`UPDATE`/`DELETE`) always reports a real
+/// count on SQL Server, so `drive_write_sequence`'s affected-row-mismatch
+/// check keeps its meaning — this relaxation only affects statements that
+/// were never counting rows to begin with.
 pub fn map_row_count(row_count: Option<usize>) -> Result<u64, QueryError> {
     match row_count {
         Some(n) => Ok(n as u64),
-        None => Err(QueryError::msg(
-            "row count not available for this statement (driver reported SQL_NO_ROW_COUNT / -1)",
-        )),
+        None => Ok(0),
     }
 }
 
@@ -90,9 +99,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_row_count_is_an_error_not_a_silent_zero() {
-        let err = map_row_count(None).unwrap_err();
-        assert!(err.message.contains("not available"));
+    fn unknown_row_count_maps_to_zero_not_an_error() {
+        // G15 §3c Appendix F2: SET/BEGIN/COMMIT/ROLLBACK batches report
+        // SQL_NO_ROW_COUNT — this is the "0 affected" convention, not a
+        // failure (see the doc comment on `map_row_count`).
+        assert_eq!(map_row_count(None).unwrap(), 0);
     }
 
     #[test]

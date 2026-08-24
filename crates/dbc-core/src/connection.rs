@@ -54,6 +54,19 @@ pub trait Connection: Send {
     /// magic-header-checked `fs::copy` instead. No other code may call
     /// this method.
     ///
+    /// `run_mssql_plan` (G15 §2e, T7) is the MSSQL face of the
+    /// already-sanctioned analyze-write pattern above, but is deliberately
+    /// NOT added to the caller list itself: its tx control (the fused
+    /// `XACT_ABORT`+`BEGIN TRANSACTION`, and the `ROLLBACK` that runs
+    /// ALWAYS) travels as `MssqlConnection::query_with_session`'s
+    /// prelude/postlude strings over a dedicated, driver-owned ODBC
+    /// connection — never through this trait's `execute()` at all. Its
+    /// discipline is the same (never commits, rollback best-effort on
+    /// every path including every error branch, one dedicated connection
+    /// per call), just delivered by a different mechanism because `SET
+    /// SHOWPLAN_XML`/`SET STATISTICS XML` are session-scoped settings this
+    /// trait's `query()` (fresh connection per call) cannot carry.
+    ///
     /// Transactions are per-connection: a caller driving `BEGIN` … `COMMIT`/
     /// `ROLLBACK` MUST issue every statement in that sequence over the SAME
     /// `Connection` instance, sequentially. Implementations must never

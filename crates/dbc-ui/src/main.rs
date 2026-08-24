@@ -36,7 +36,7 @@ use std::rc::Rc;
 use dbc_buffer::ResultBuffer;
 use dbc_core::arrow::datatypes::SchemaRef;
 use dbc_core::{
-    apply_auto_limit, find_params, is_read_statement, quote_qualified, substitute_params,
+    apply_auto_limit_d, find_params, is_read_statement_d, quote_qualified_d, substitute_params,
     CancelToken, FkRef, QueryError, SchemaSnapshot, TableInfo,
 };
 use dbc_state::{
@@ -146,13 +146,19 @@ fn completion_edit(text: &str, cursor: usize, insert: &str) -> (std::ops::Range<
     (start..cursor, new_text)
 }
 
-/// G2 Task 7: SQL builder for `TreeEvent::OpenPreview`. Pure — no GPUI, no
-/// I/O — so quoting can be unit-tested directly. `quote_qualified` (shared
-/// with `synthesize_create_table`'s DDL quoting) is what makes this safe
-/// against a table literally named `we"ird`: the embedded quote is doubled,
-/// not smuggled into the query as SQL syntax.
-fn preview_sql(schema: Option<&str>, table: &str) -> String {
-    format!("SELECT * FROM {} LIMIT 1000", quote_qualified(schema, table))
+/// G2 Task 7 (G15 §2d: dialect-aware): SQL builder for `TreeEvent::
+/// OpenPreview`. Pure — no GPUI, no I/O — so quoting can be unit-tested
+/// directly. `quote_qualified_d` (shared with `synthesize_create_table_d`'s
+/// DDL quoting) is what makes this safe against a table literally named
+/// `we"ird`: the embedded quote is doubled, not smuggled into the query as
+/// SQL syntax. `LIMIT 1000` is invalid T-SQL — `TOP 1000` is the
+/// grammar-correct cap for MSSQL.
+fn preview_sql(dialect: dbc_core::Dialect, schema: Option<&str>, table: &str) -> String {
+    let target = quote_qualified_d(dialect, schema, table);
+    match dialect {
+        dbc_core::Dialect::Mssql => format!("SELECT TOP 1000 * FROM {target}"),
+        _ => format!("SELECT * FROM {target} LIMIT 1000"),
+    }
 }
 
 /// G6 Task 3: substitutes `sql_template`'s `:name` params (via
@@ -263,17 +269,58 @@ fn engine_from_url(url: &str) -> dbc_state::Engine {
 }
 
 /// G12 T5: engine -> splitter dialect for the editor's multi-statement
-/// unlock. `Mssql` (and any future engine without a dialect) returns `None`
-/// -> today's single-statement path, unchanged (CURATION item 2: the `GO`
-/// pre-pass is an explicit non-goal for this phase — when DuckDB wiring
-/// lands, map `Duckdb -> Dialect::Postgres` + one test, not now; no
-/// `Duckdb` variant exists on this branch's `dbc_state::Engine` to map
-/// anyway).
+/// unlock / script runner. `Mssql -> Some(Dialect::Mssql)` since G15 T8's
+/// ON-flip (live-verified: `mssql_go_script_with_procedure_and_top_auto_limit_live`
+/// runs a real GO-batched script — incl. a `CREATE PROCEDURE` body with
+/// interior semicolons — against a live server through this exact
+/// dispatch). A future engine without a dialect at all would still map to
+/// `None` here (today's single-statement fallback); no such engine exists
+/// on this branch's `dbc_state::Engine`.
 fn dialect_for_engine(engine: dbc_state::Engine) -> Option<dbc_core::Dialect> {
     match engine {
         dbc_state::Engine::Postgres => Some(dbc_core::Dialect::Postgres),
         dbc_state::Engine::Sqlite => Some(dbc_core::Dialect::Sqlite),
-        dbc_state::Engine::Mssql => None,
+        dbc_state::Engine::Mssql => Some(dbc_core::Dialect::Mssql),
+    }
+}
+
+/// G15 §2d: total Engine -> Dialect mapping for SQL COMPOSITION (sandbox
+/// Apply, CSV import, preview/fk-join SELECTs, admin_sql delegation).
+/// Distinct from `dialect_for_engine` (the SPLITTER gate, above) — both
+/// return `Some(Dialect::Mssql)`/`Dialect::Mssql` for MSSQL since G15 T8's
+/// ON-flip, but this one existed independently before that flip too:
+/// composers needed the dialect even while the multi-statement path was
+/// still gated — an MSSQL connection's Apply dialog had to show/execute
+/// bracket-quoted, `N''`-literal SQL before `run_query_with`'s
+/// multi-statement unlock went live for it.
+fn sql_dialect(engine: dbc_state::Engine) -> dbc_core::Dialect {
+    match engine {
+        dbc_state::Engine::Postgres => dbc_core::Dialect::Postgres,
+        dbc_state::Engine::Sqlite => dbc_core::Dialect::Sqlite,
+        dbc_state::Engine::Mssql => dbc_core::Dialect::Mssql,
+    }
+}
+
+/// `run_query_with`'s Guard 1 pure decision (batch C review BLOCKER 2):
+/// `true` means refuse. Dialect-aware via `is_read_statement_d` — for MSSQL
+/// this client-side check is the ONLY read-only enforcement (no server-side
+/// backstop, driver integration note 5), so it must not false-reject a
+/// bracket-quoted reserved word like `SELECT [Delete] FROM AuditLog`.
+/// Extracted so this is directly unit-testable without a GPUI `Context`.
+fn read_only_guard_rejects(sql: &str, read_only: bool, dialect: dbc_core::Dialect) -> bool {
+    read_only && !is_read_statement_d(sql, dialect)
+}
+
+/// G15 §2c: `SplitError` -> user-facing Czech text. Used by
+/// `count_statements_in_file` and `run_query_with`'s `split_sql` `Err(e)`
+/// arm; `runner.rs`'s script path duplicates the one Czech literal
+/// deliberately (T4/T5 stay parallel-safe, disjoint files).
+pub(crate) fn split_error_message(e: dbc_core::SplitError) -> String {
+    match e {
+        dbc_core::SplitError::UnsupportedGoCount => {
+            "GO s počtem opakování není podporováno".to_string()
+        }
+        other => format!("{other:?}"),
     }
 }
 
@@ -284,13 +331,18 @@ fn dialect_for_engine(engine: dbc_state::Engine) -> Option<dbc_core::Dialect> {
 /// the rewritten list plus whether ANY statement changed (drives the caller's
 /// " · auto-LIMIT {n}" status suffix, same convention as the single-statement
 /// path).
-fn auto_limit_each(statements: Vec<String>, limit: Option<u64>, bypass: bool) -> (Vec<String>, bool) {
+fn auto_limit_each(
+    statements: Vec<String>,
+    limit: Option<u64>,
+    bypass: bool,
+    dialect: dbc_core::Dialect,
+) -> (Vec<String>, bool) {
     let Some(n) = limit.filter(|_| !bypass) else { return (statements, false) };
     let mut changed_any = false;
     let out = statements
         .into_iter()
         .map(|s| {
-            let (rewritten, changed) = apply_auto_limit(&s, n);
+            let (rewritten, changed) = apply_auto_limit_d(&s, n, dialect);
             changed_any |= changed;
             rewritten
         })
@@ -320,13 +372,15 @@ fn count_statements_in_file(path: &std::path::Path, dialect: dbc_core::Dialect) 
         if n == 0 {
             break;
         }
-        let stmts = splitter.push(&buf[..n]).map_err(|e| format!("{}: {e:?}", path.display()))?;
+        let stmts = splitter
+            .push(&buf[..n])
+            .map_err(|e| format!("{}: {}", path.display(), split_error_message(e)))?;
         count += stmts.len();
     }
     match splitter.finish() {
         Ok(Some(_)) => count += 1,
         Ok(None) => {}
-        Err(e) => return Err(format!("{}: {e:?}", path.display())),
+        Err(e) => return Err(format!("{}: {}", path.display(), split_error_message(e))),
     }
     Ok(count)
 }
@@ -611,8 +665,16 @@ fn detect_editable_pk(
     if pk_cols.is_empty() {
         return EditableDecision::NoPrimaryKey;
     }
-    let Some((read_only, engine)) = conn_meta else { return EditableDecision::NotEditable };
-    if read_only || engine == dbc_state::Engine::Mssql {
+    // G15 T8 ON-flip: MSSQL sandbox editing — live-verified
+    // (mssql_sandbox_apply_bracket_quoted_weird_column_and_czech_diacritics_live
+    // in runner.rs's mssql_docker_tests: bracket-quoted UPDATE/INSERT with a
+    // `we]ird` column name and a Czech-diacritics N'' value staged, applied,
+    // and re-read correctly against a live server). `read_only` still
+    // excludes any engine, MSSQL included — client-side is the ONLY
+    // read-only enforcement for MSSQL (no server-side mode exists), same
+    // posture `is_read_statement`/the runner choke point already document.
+    let Some((read_only, _engine)) = conn_meta else { return EditableDecision::NotEditable };
+    if read_only {
         return EditableDecision::NotEditable;
     }
     EditableDecision::Editable(pk_cols)
@@ -1398,7 +1460,11 @@ impl AppView {
                 cx.notify();
                 return;
             };
-            let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+            // G15 T8 HARD GATE ITEM 2: `connect::resolve_secret_for_connect`
+            // (not a raw `vault.get_secret`) — skips the vault lookup
+            // entirely for an MSSQL config that's refused before any secret
+            // is ever used (SSH tunnel / empty user), see its doc comment.
+            let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
             // G5 Task 3: captured before `cfg` moves into `ConnectSpec::Config`
             // below — `Started`'s `Editable` detection needs both facts (see
             // `detect_editable_pk`), and `cfg` itself won't survive past this
@@ -1434,13 +1500,15 @@ impl AppView {
             if let Some(dialect) = conn_meta.map(|(_, e)| e).and_then(dialect_for_engine) {
                 match dbc_core::split_sql(&sql, dialect) {
                     Err(e) => {
-                        self.status = format!("error: SQL nelze rozdělit na příkazy: {e:?}");
+                        self.status =
+                            format!("error: SQL nelze rozdělit na příkazy: {}", split_error_message(e));
                         cx.notify();
                         return;
                     }
                     Ok(stmts) if stmts.len() > 1 => {
-                        let (stmts, limited) = auto_limit_each(stmts, auto_limit, bypass_auto_limit);
-                        self.run_many(spec, sql, stmts, limited, timeout_secs, cx);
+                        let (stmts, limited) =
+                            auto_limit_each(stmts, auto_limit, bypass_auto_limit, dialect);
+                        self.run_many(spec, sql, stmts, limited, dialect, timeout_secs, cx);
                         return;
                     }
                     Ok(_) => {}
@@ -1448,27 +1516,50 @@ impl AppView {
             }
         }
 
+        // Resolved once, above every guard that needs it (batch C review
+        // BLOCKER 2): `conn_meta`'s engine -> `dbc_core::Dialect`, same
+        // expression Guard 2 used to compute separately (now hoisted so
+        // Guard 1 can use it too, and both guards agree on the SAME
+        // resolution — no risk of the two guards seeing different dialects
+        // for the same run).
+        let dialect = conn_meta.map(|(_, e)| sql_dialect(e)).unwrap_or(dbc_core::Dialect::Postgres);
+
         // Guard 1: read-only — rejected client-side without connecting.
         // (Server-side enforcement lives in connect::open_config: Postgres
         // `default_transaction_read_only=on`, SQLite `SQLITE_OPEN_READ_ONLY`
         // — this check is the fast, no-connection-needed first line, not the
-        // only line.)
-        if read_only && !is_read_statement(&sql) {
+        // only line — EXCEPT MSSQL, which has no server-side read-only mode
+        // (driver integration note 5): for MSSQL this client-side check IS
+        // the only line, so it MUST be dialect-aware — a bracket-quoted
+        // reserved word like `[Delete]` must not false-reject a genuine
+        // read via `is_read_statement_d` (batch C review BLOCKER 2; was
+        // the plain pg-only `is_read_statement` here, falsifying this exact
+        // comment's own stated invariant). Decision extracted to
+        // `read_only_guard_rejects` so it's directly unit-testable without a
+        // GPUI `Context`.
+        if read_only_guard_rejects(&sql, read_only, dialect) {
             let err = QueryError::msg("connection is read-only");
             self.status = format!("error: {err}");
             cx.notify();
             return;
         }
 
-        // Guard 2: auto-limit.
+        // Guard 2: auto-limit (single-statement fallback — the
+        // multi-statement branch above already applied `auto_limit_each`
+        // and returned). G15 §2d: dialect-correct rewrite vocabulary — an
+        // MSSQL connection must never reach the `LIMIT`-appending form on
+        // any branch-intermediate state.
         let mut sql = sql;
         let mut limit_suffix = String::new();
         if !bypass_auto_limit {
             if let Some(n) = auto_limit {
-                let (rewritten, changed) = apply_auto_limit(&sql, n);
+                let (rewritten, changed) = apply_auto_limit_d(&sql, n, dialect);
                 if changed {
                     sql = rewritten;
-                    limit_suffix = format!(" · auto-LIMIT {n}");
+                    limit_suffix = match dialect {
+                        dbc_core::Dialect::Mssql => format!(" · auto-TOP {n}"),
+                        _ => format!(" · auto-LIMIT {n}"),
+                    };
                 }
             }
         }
@@ -1684,6 +1775,14 @@ impl AppView {
                                 let grid = cx.new(ResultGrid::new);
                                 grid.update(cx, |g, cx| {
                                     g.set_buffer(buf.clone(), cx);
+                                    // G15 T8 whole-branch review M3 fix: set
+                                    // once, right after creation — see
+                                    // `ResultGrid::dialect`'s doc comment.
+                                    g.set_dialect(
+                                        conn_meta
+                                            .map(|(_, e)| sql_dialect(e))
+                                            .unwrap_or(dbc_core::Dialect::Postgres),
+                                    );
                                     // G4 Task 4: a preview tab knows its
                                     // source table (used as the `INSERT
                                     // INTO` target for exports) — an
@@ -1803,6 +1902,32 @@ impl AppView {
                             // status). Otherwise record the terminal
                             // event's own outcome and update the status bar
                             // as before.
+                            // G15 T8 whole-branch review B2 fix: the
+                            // WRITE-dispatch sibling of `Finished` —
+                            // `runner::stream_query`'s MSSQL-write branch
+                            // sends this INSTEAD of `Started`/`Batch`*/
+                            // `Finished` (no result set exists, so no
+                            // buffer/tab ever opens for this run — `errored`
+                            // can never be set here, since it's only latched
+                            // by a `Batch` buffer-push failure and no
+                            // `Batch` is ever sent on this path). Reports
+                            // the driver's real affected-row count (not a
+                            // buffer row_count read, since there is no
+                            // buffer) and records history exactly like a
+                            // successful read does.
+                            QueryEvent::WriteFinished { affected, elapsed } => {
+                                view.status = format!("{affected} rows affected in {elapsed:.2?}");
+                                view.record_history(
+                                    &sql_for_title,
+                                    &history_conn_name,
+                                    history_started_at,
+                                    Some(elapsed.as_millis() as i64),
+                                    Some(affected as i64),
+                                    None,
+                                    cx,
+                                );
+                                view.cancel = None;
+                            }
                             QueryEvent::Finished { elapsed } => {
                                 // G4 Task 2: if a sort/filter was active on
                                 // this tab's grid while batches streamed in,
@@ -1896,7 +2021,11 @@ impl AppView {
                                             .and_then(|t| AppView::grid_dirty_change_count(t, cx));
                                         match decide_retrigger_action(tab_still_open, dirty) {
                                             RetriggerAction::Run => {
+                                                let dialect = conn_meta
+                                                    .map(|(_, e)| sql_dialect(e))
+                                                    .unwrap_or(dbc_core::Dialect::Postgres);
                                                 let sql = fk_join::build_join_sql(
+                                                    dialect,
                                                     pt.schema.as_deref(),
                                                     &pt.table,
                                                     &pt.joins,
@@ -1990,6 +2119,7 @@ impl AppView {
         columns: SchemaRef,
         title_sql: &str,
         conn_identity: &str,
+        dialect: dbc_core::Dialect,
         cx: &mut Context<Self>,
     ) -> (u64, Rc<RefCell<ResultBuffer>>) {
         let buf = Rc::new(RefCell::new(ResultBuffer::new(columns)));
@@ -2000,6 +2130,9 @@ impl AppView {
         grid.update(cx, |g, cx| {
             g.set_buffer(buf.clone(), cx);
             g.set_fk_info(fk_info, ref_cols);
+            // G15 T8 whole-branch review M3 fix: set once, right after
+            // creation — see `ResultGrid::dialect`'s doc comment.
+            g.set_dialect(dialect);
         });
         cx.subscribe(&grid, AppView::on_grid_event).detach();
         let id = self.tabs.open(ResultTab {
@@ -2027,6 +2160,7 @@ impl AppView {
         sql: String,
         statements: Vec<String>,
         limited: bool,
+        dialect: dbc_core::Dialect,
         timeout_secs: Option<u64>,
         cx: &mut Context<Self>,
     ) {
@@ -2120,8 +2254,13 @@ impl AppView {
                             MultiQueryEvent::StatementStarted { index, total, columns: Some(cols) } => {
                                 let title_sql =
                                     statements.get(index).map(String::as_str).unwrap_or("");
-                                let (id, buf) =
-                                    view.open_adhoc_result_tab(cols, title_sql, &conn_identity, cx);
+                                let (id, buf) = view.open_adhoc_result_tab(
+                                    cols,
+                                    title_sql,
+                                    &conn_identity,
+                                    dialect,
+                                    cx,
+                                );
                                 tab_id = Some(id);
                                 buffer = Some(buf);
                                 with_rows += 1;
@@ -2768,6 +2907,14 @@ impl AppView {
         // actually compares; `conn_label` is display-only.
         let conn_identity = self.current_conn_identity();
         let conn_label = self.current_connection_label();
+        // Batch C review BLOCKER 1: captured alongside `conn_identity` (same
+        // rationale — the connection dropdown stays clickable through the
+        // picker/pre-count pass) so the sample SQL shown below is built for
+        // the SAME connection `conn_identity` refers to; `confirm_csv_import`
+        // re-resolves the engine itself for the actual execution, but only
+        // ever proceeds when `conn_identity` still matches — display/exec
+        // parity holds because both resolve from the same connection.
+        let dialect = self.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres);
 
         self.status = "výběr CSV souboru…".to_string();
         cx.notify();
@@ -2841,7 +2988,11 @@ impl AppView {
             let _ = this.update(cx, |view, cx| match peek {
                 Ok((headers, row_count, first_rows)) => {
                     let mapping = default_csv_mapping(&headers, &columns);
-                    let sample_sql = csv_import::generate_insert_batches(
+                    // Batch C review BLOCKER 1: dialect-aware sibling —
+                    // `dialect` resolved above alongside `conn_identity`, the
+                    // same connection the actual import will run against.
+                    let sample_sql = csv_import::generate_insert_batches_d(
+                        dialect,
                         schema.as_deref(),
                         &table,
                         &columns,
@@ -2926,6 +3077,14 @@ impl AppView {
     /// target) fills `error` and disables "Spustit import" (see
     /// `render_csv_import_panel`'s `can_run` gate).
     fn recompute_csv_sample(&mut self, cx: &mut Context<Self>) {
+        // Batch C review BLOCKER 1: resolved BEFORE the `&mut self.modal`
+        // borrow below (needs `&self`) — same resolution
+        // (`active_engine` -> `sql_dialect`) `start_csv_import` captured for
+        // the initial sample; execution only ever proceeds when the active
+        // connection still matches the modal's `conn_identity`
+        // (`confirm_csv_import`'s guard), so this stays in parity with what
+        // will actually run.
+        let dialect = self.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres);
         if let Some(connections_ui::ModalState::CsvImport {
             schema,
             table,
@@ -2938,7 +3097,8 @@ impl AppView {
         }) = &mut self.modal
         {
             let mapping = csv_import::ColumnMapping { targets: targets.clone() };
-            match csv_import::generate_insert_batches(
+            match csv_import::generate_insert_batches_d(
+                dialect,
                 schema.as_deref(),
                 table,
                 columns.as_slice(),
@@ -3173,7 +3333,7 @@ impl AppView {
                 cx.notify();
                 return None;
             };
-            let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+            let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
             let (read_only, timeout_secs, engine) = (cfg.read_only, cfg.timeout_secs, cfg.engine);
             Some((read_only, timeout_secs, engine, ConnectSpec::Config { cfg: Box::new(cfg), secret }))
         } else if let Some(url) = self.conn_url.clone() {
@@ -3190,6 +3350,15 @@ impl AppView {
     /// routes through `plan::analyze_gate`'s three-case dispatch (Run /
     /// Blocked / NeedsConfirm) decided from the RAW pre-wrap SQL, mirroring
     /// `run_query_with`'s Guard 1 read-only check.
+    ///
+    /// G15 T7: MSSQL routes to `dispatch_mssql_plan` (session preludes via
+    /// `query_with_session`) BEFORE either the generic estimated dispatch
+    /// OR `analyze_gate`'s match — `plan::explain_sql`/`explain_analyze_sql`
+    /// no longer produce a runnable MSSQL string at all (see their doc
+    /// comments), so MSSQL must never reach `dispatch_plan_query`. Gating
+    /// itself is UNCHANGED for the analyze path: `analyze_gate`'s three
+    /// cases still decide Run/Blocked/NeedsConfirm by SQL classification,
+    /// not by engine — only WHERE the eventual "Run" lands differs.
     fn run_explain(&mut self, is_analyze: bool, cx: &mut Context<Self>) {
         if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
             return;
@@ -3207,13 +3376,31 @@ impl AppView {
         };
 
         if !is_analyze {
+            if engine == dbc_state::Engine::Mssql {
+                if !plan::mssql_plan_dispatch_available() {
+                    self.status = "plán pro MSSQL zatím není k dispozici".to_string();
+                    cx.notify();
+                    return;
+                }
+                self.dispatch_mssql_plan(spec, sql, false, timeout_secs, cx);
+                return;
+            }
             // §5: Explain is ALWAYS safe — no gate, dispatch immediately.
             self.dispatch_plan_query(spec, plan::explain_sql(engine, &sql), engine, false, timeout_secs, cx);
             return;
         }
 
-        match plan::analyze_gate(&sql, read_only) {
+        match plan::analyze_gate(&sql, read_only, sql_dialect(engine)) {
             plan::AnalyzeGate::Run => {
+                if engine == dbc_state::Engine::Mssql {
+                    if !plan::mssql_plan_dispatch_available() {
+                        self.status = "plán pro MSSQL zatím není k dispozici".to_string();
+                        cx.notify();
+                        return;
+                    }
+                    self.dispatch_mssql_plan(spec, sql, true, timeout_secs, cx);
+                    return;
+                }
                 let Some(explain_sql) = plan::explain_analyze_sql(engine, &sql) else { return }; // SQLite: button hidden, unreachable
                 self.dispatch_plan_query(spec, explain_sql, engine, true, timeout_secs, cx);
             }
@@ -3291,6 +3478,20 @@ impl AppView {
                         // `this.update` call.
                         QueryEvent::Batch(_) => unreachable!("Batch handled before this match"),
                         QueryEvent::Finished { .. } => true,
+                        // G15 T8 whole-branch review B2 fix: `stream_query`
+                        // only sends this for a WRITE on an MSSQL spec, and
+                        // this function is only ever reached with the
+                        // `explain_sql`/`explain_analyze_sql` output of a
+                        // READ (`run_explain`'s MSSQL arm routes to
+                        // `dispatch_mssql_plan` instead, before this
+                        // function is ever called) — defensively handled
+                        // (not `unreachable!()`) rather than assumed away.
+                        QueryEvent::WriteFinished { .. } => {
+                            failed = Some(QueryError::msg(
+                                "interní chyba: plán vrátil zápis místo výsledku",
+                            ));
+                            true
+                        }
                         QueryEvent::Failed(e) => {
                             failed = Some(e);
                             true
@@ -3371,6 +3572,108 @@ impl AppView {
         .detach();
     }
 
+    /// G15 T7: dispatches `QueryRunner::run_mssql_plan` — the MSSQL face
+    /// of BOTH `run_explain`'s estimated/`AnalyzeGate::Run`-case dispatch
+    /// (no modal ever involved) and `on_confirm_analyze_write`'s
+    /// confirmed-write dispatch (the `AnalyzeWriteConfirm` modal stays
+    /// open, mutated in place, for the WHOLE duration — same "Escape is a
+    /// structural no-op against this modal" invariant
+    /// `on_confirm_analyze_write`'s own doc comment already documents), so
+    /// checking `self.modal`'s shape at COMPLETION time (`via_confirm_modal`
+    /// below) — not a value captured before the await — reliably tells the
+    /// two callers apart with no race. Mirrors `dispatch_plan_query`'s
+    /// status-text/tab-opening plumbing (no `ResultBuffer` streaming
+    /// needed here — `run_mssql_plan` already returns the whole plan text
+    /// as one `String`) and `on_confirm_analyze_write`'s modal-aware
+    /// completion handling.
+    fn dispatch_mssql_plan(
+        &mut self,
+        spec: ConnectSpec,
+        sql: String,
+        is_analyze: bool,
+        timeout_secs: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        self.status =
+            if is_analyze { "analyzuji plán…".to_string() } else { "vysvětluji plán…".to_string() };
+        cx.notify();
+
+        let sql_title = format!("Plán: {}", collapse_title(&sql));
+        let conn_identity = self.current_conn_identity();
+        let rx = self.runner.run_mssql_plan(spec, sql.clone(), is_analyze, timeout_secs);
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, move |view, cx| {
+                let via_confirm_modal =
+                    matches!(view.modal, Some(connections_ui::ModalState::AnalyzeWriteConfirm { .. }));
+                match result {
+                    Ok(Ok(raw_text)) => {
+                        match plan::parse_plan(dbc_state::Engine::Mssql, is_analyze, &raw_text) {
+                            Ok(parsed) => {
+                                if via_confirm_modal {
+                                    view.modal = None;
+                                }
+                                let parsed = Rc::new(parsed);
+                                let view_entity = cx.new(|cx| plan::PlanView::new(parsed, cx));
+                                view.tabs.open(ResultTab {
+                                    id: 0,
+                                    title: sql_title,
+                                    pinned: false,
+                                    preview_key: None,
+                                    conn_identity,
+                                    content: TabContent::Plan { view: view_entity },
+                                });
+                                view.status = if via_confirm_modal {
+                                    "hotovo (změny vráceny zpět)".to_string()
+                                } else {
+                                    "hotovo".to_string()
+                                };
+                            }
+                            Err(e) => {
+                                view.status = format!("error parsování plánu: {e}");
+                                if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
+                                    running,
+                                    error,
+                                    ..
+                                }) = &mut view.modal
+                                {
+                                    *running = false;
+                                    *error = Some(format!("error parsování plánu: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        view.status = format!("error: {e}");
+                        if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
+                            running,
+                            error,
+                            ..
+                        }) = &mut view.modal
+                        {
+                            *running = false;
+                            *error = Some(e.to_string());
+                        }
+                    }
+                    Err(_canceled) => {
+                        view.status = "error: plán zrušen".to_string();
+                        if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
+                            running,
+                            error,
+                            ..
+                        }) = &mut view.modal
+                        {
+                            *running = false;
+                            *error = Some("analýza zrušena".to_string());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Dispatches `QueryRunner::run_analyze_write` (the runner-owned,
     /// dedicated-connection BEGIN…ROLLBACK sequence), called from the
     /// `ModalState::AnalyzeWriteConfirm` dialog's "Analyzovat" button
@@ -3414,7 +3717,6 @@ impl AppView {
         let Some(sql) = connections_ui::analyze_write_dispatch_sql(&self.modal) else { return };
 
         let Some((_, timeout_secs, _, spec)) = self.resolve_spec_for_explain(cx) else { return };
-        let Some(explain_sql) = plan::explain_analyze_sql(engine, &sql) else { return };
 
         if let Some(connections_ui::ModalState::AnalyzeWriteConfirm { running, error, .. }) =
             &mut self.modal
@@ -3423,6 +3725,30 @@ impl AppView {
             *error = None;
         }
         cx.notify();
+
+        // G15 T7: MSSQL routes to `dispatch_mssql_plan` (session preludes)
+        // instead — `plan::explain_analyze_sql(Mssql, ..)` is `None` now
+        // (see its doc comment), so the generic path below would bail out
+        // immediately for MSSQL if reached; this check MUST come before
+        // that `let Some(explain_sql) = ...` line, after the busy-guard
+        // `running = true` flip above (so the confirm modal's spinner
+        // shows for MSSQL too, same as every other engine).
+        if engine == dbc_state::Engine::Mssql {
+            if !plan::mssql_plan_dispatch_available() {
+                if let Some(connections_ui::ModalState::AnalyzeWriteConfirm { running, error, .. }) =
+                    &mut self.modal
+                {
+                    *running = false;
+                    *error = Some("plán pro MSSQL zatím není k dispozici".to_string());
+                }
+                cx.notify();
+                return;
+            }
+            self.dispatch_mssql_plan(spec, sql, true, timeout_secs, cx);
+            return;
+        }
+
+        let Some(explain_sql) = plan::explain_analyze_sql(engine, &sql) else { return };
 
         let sql_title = format!("Plán: {}", collapse_title(&sql));
         let conn_identity = self.current_conn_identity();
@@ -4263,7 +4589,7 @@ impl AppView {
     fn active_conn_spec(&self) -> Option<ConnectSpec> {
         if let Some(id) = self.active_connection_id.clone() {
             let cfg = self.config.connections.iter().find(|c| c.id == id)?.clone();
-            let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+            let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
             Some(ConnectSpec::Config { cfg: Box::new(cfg), secret })
         } else {
             self.conn_url.clone().map(ConnectSpec::Url)
@@ -4630,7 +4956,8 @@ impl AppView {
                     cx.notify();
                     return;
                 }
-                let sql = fk_join::build_join_sql(schema.as_deref(), table, joins);
+                let dialect = self.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres);
+                let sql = fk_join::build_join_sql(dialect, schema.as_deref(), table, joins);
                 let preview = PreviewTarget {
                     title: title.clone(),
                     key: key.clone(),
@@ -4936,7 +5263,8 @@ impl AppView {
     /// silently close an EXISTING dirty tab for the same (schema, table) via
     /// `Tabs::close_by_preview_key` right before opening the fresh one.
     fn open_table_preview(&mut self, schema: Option<String>, table: String, cx: &mut Context<Self>) {
-        let sql = preview_sql(schema.as_deref(), &table);
+        let dialect = self.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres);
+        let sql = preview_sql(dialect, schema.as_deref(), &table);
         let key = format!("{}.{table}", schema.clone().unwrap_or_default());
         let preview = PreviewTarget {
             title: format!("Náhled: {table}"),
@@ -5448,7 +5776,7 @@ impl AppView {
     fn apply_conn_spec(&self) -> Option<(ConnectSpec, Option<u64>)> {
         if let Some(id) = self.active_connection_id.clone() {
             let cfg = self.config.connections.iter().find(|c| c.id == id)?.clone();
-            let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+            let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
             let timeout_secs = cfg.timeout_secs;
             Some((ConnectSpec::Config { cfg: Box::new(cfg), secret }, timeout_secs))
         } else {
@@ -5503,6 +5831,7 @@ impl AppView {
         grid.update(cx, |g, _| {
             g.close_overlay_if_open();
         });
+        let dialect = self.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres);
         let (statements, preview_identity) = {
             let g = grid.read(cx);
             let Some(editable) = g.editable.clone() else { return };
@@ -5517,6 +5846,7 @@ impl AppView {
                 headers: &headers,
                 pk_cols: &editable.pk_cols,
                 numeric_cols: &editable.numeric_cols,
+                dialect,
             };
             let mut original = |row: usize, col: usize| -> Option<String> {
                 let mut b = buf_rc.borrow_mut();
@@ -5657,7 +5987,9 @@ impl AppView {
                                 // over next, same as every other status
                                 // transition in this file.
                                 let (schema, table) = preview_identity;
-                                let sql = preview_sql(schema.as_deref(), &table);
+                                let dialect =
+                                    view.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres);
+                                let sql = preview_sql(dialect, schema.as_deref(), &table);
                                 let key = format!("{}.{table}", schema.clone().unwrap_or_default());
                                 let title = format!("Náhled: {table}");
                                 let preview = PreviewTarget {
@@ -6542,7 +6874,7 @@ impl AppView {
     /// connection has since been deleted.
     fn resolve_conn_for_backup(&self, id: &str) -> Option<(dbc_state::ConnectionConfig, Option<String>)> {
         let cfg = self.config.connections.iter().find(|c| c.id == id)?.clone();
-        let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+        let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
         Some((cfg, secret))
     }
 
@@ -6701,6 +7033,17 @@ impl AppView {
             cx.notify();
             return;
         };
+        // G15 T8 HARD GATE ITEM 1: the dropdown icon is already hidden for
+        // MSSQL (`connections_ui::dropdown_item`'s `.when` guard), but the
+        // command palette's `PaletteAction::BackupDatabase` dispatches here
+        // directly for whatever connection is active — this is the single
+        // source of truth both paths must respect. See
+        // `backup::backup_restore_available`'s doc comment for why.
+        if !backup::backup_restore_available(cfg.engine) {
+            self.status = "zálohování pro MSSQL zatím není k dispozici".to_string();
+            cx.notify();
+            return;
+        }
         let ext = backup_file_ext(cfg.engine);
         let suggested_name = format!("{}-{}.{ext}", cfg.database, backup_timestamp());
         self.status = "volím cíl zálohy…".to_string();
@@ -6982,6 +7325,14 @@ impl AppView {
         };
         if cfg.read_only {
             self.status = "error: připojení je pouze pro čtení — obnovu nelze spustit".to_string();
+            cx.notify();
+            return;
+        }
+        // G15 T8 HARD GATE ITEM 1: same single source of truth
+        // `open_backup_dialog` checks — see `backup::backup_restore_available`'s
+        // doc comment.
+        if !backup::backup_restore_available(cfg.engine) {
+            self.status = "obnova pro MSSQL zatím není k dispozici".to_string();
             cx.notify();
             return;
         }
@@ -7763,6 +8114,7 @@ mod plan_restore_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         }
     }
 
@@ -8011,23 +8363,53 @@ mod preview_sql_tests {
 
     #[test]
     fn quotes_schema_and_table_with_limit_1000() {
-        assert_eq!(preview_sql(Some("public"), "orders"), "SELECT * FROM \"public\".\"orders\" LIMIT 1000");
+        assert_eq!(
+            preview_sql(dbc_core::Dialect::Postgres, Some("public"), "orders"),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 1000"
+        );
     }
 
     #[test]
     fn omits_schema_qualifier_when_none() {
-        assert_eq!(preview_sql(None, "orders"), "SELECT * FROM \"orders\" LIMIT 1000");
+        assert_eq!(
+            preview_sql(dbc_core::Dialect::Postgres, None, "orders"),
+            "SELECT * FROM \"orders\" LIMIT 1000"
+        );
     }
 
     /// Brief contract #4: a table literally named `we"ird` must not break
-    /// out of the query or inject anything — `quote_qualified` doubles the
+    /// out of the query or inject anything — `quote_qualified_d` doubles the
     /// embedded quote.
     #[test]
     fn survives_a_table_name_with_an_embedded_quote() {
-        assert_eq!(preview_sql(None, "we\"ird"), "SELECT * FROM \"we\"\"ird\" LIMIT 1000");
         assert_eq!(
-            preview_sql(Some("we\"ird"), "t"),
+            preview_sql(dbc_core::Dialect::Postgres, None, "we\"ird"),
+            "SELECT * FROM \"we\"\"ird\" LIMIT 1000"
+        );
+        assert_eq!(
+            preview_sql(dbc_core::Dialect::Postgres, Some("we\"ird"), "t"),
             "SELECT * FROM \"we\"\"ird\".\"t\" LIMIT 1000"
+        );
+    }
+
+    // G15 T4 required tests.
+    #[test]
+    fn preview_sql_mssql_uses_top() {
+        assert_eq!(
+            preview_sql(dbc_core::Dialect::Mssql, Some("public"), "orders"),
+            "SELECT TOP 1000 * FROM [public].[orders]"
+        );
+        assert_eq!(
+            preview_sql(dbc_core::Dialect::Mssql, None, "we]ird"),
+            "SELECT TOP 1000 * FROM [we]]ird]"
+        );
+    }
+
+    #[test]
+    fn preview_sql_pg_unchanged() {
+        assert_eq!(
+            preview_sql(dbc_core::Dialect::Postgres, Some("public"), "orders"),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 1000"
         );
     }
 }
@@ -8145,12 +8527,25 @@ mod editable_detection_tests {
         );
     }
 
+    // G15 T8 ON-flip: MSSQL sandbox editing — see detect_editable_pk's doc
+    // comment for the live evidence. read_only still excludes it, same as
+    // every other engine (separate test below).
     #[test]
-    fn mssql_engine_is_not_editable_even_with_a_mapped_pk() {
+    fn mssql_engine_with_mapped_pk_is_editable() {
         let t = table(vec![col("id", true)]);
         let h = headers(&["id"]);
         assert_eq!(
             detect_editable_pk(rw_engine(dbc_state::Engine::Mssql), Some(&t), &h),
+            EditableDecision::Editable(vec![0])
+        );
+    }
+
+    #[test]
+    fn mssql_read_only_connection_is_not_editable_even_with_a_mapped_pk() {
+        let t = table(vec![col("id", true)]);
+        let h = headers(&["id"]);
+        assert_eq!(
+            detect_editable_pk(Some((true, dbc_state::Engine::Mssql)), Some(&t), &h),
             EditableDecision::NotEditable
         );
     }
@@ -8205,11 +8600,13 @@ mod engine_from_url_tests {
 mod multi_statement_tests {
     use super::*;
 
+    // G15 T8 ON-flip: Mssql now maps to Some(Dialect::Mssql) — see
+    // dialect_for_engine's doc comment for the live evidence.
     #[test]
-    fn dialect_for_engine_maps_pg_sqlite_and_refuses_mssql() {
+    fn dialect_for_engine_maps_every_engine_including_mssql() {
         assert_eq!(dialect_for_engine(dbc_state::Engine::Postgres), Some(dbc_core::Dialect::Postgres));
         assert_eq!(dialect_for_engine(dbc_state::Engine::Sqlite), Some(dbc_core::Dialect::Sqlite));
-        assert_eq!(dialect_for_engine(dbc_state::Engine::Mssql), None);
+        assert_eq!(dialect_for_engine(dbc_state::Engine::Mssql), Some(dbc_core::Dialect::Mssql));
     }
 
     #[test]
@@ -8219,7 +8616,7 @@ mod multi_statement_tests {
             "UPDATE t SET x = 1".to_string(),
             "SELECT * FROM b LIMIT 5".to_string(),
         ];
-        let (out, changed) = auto_limit_each(stmts, Some(100), false);
+        let (out, changed) = auto_limit_each(stmts, Some(100), false, dbc_core::Dialect::Postgres);
         assert!(changed);
         assert_eq!(out[0], "SELECT * FROM a LIMIT 100");
         assert_eq!(out[1], "UPDATE t SET x = 1");
@@ -8229,8 +8626,68 @@ mod multi_statement_tests {
     #[test]
     fn auto_limit_each_bypass_and_none_are_noops() {
         let stmts = vec!["SELECT 1".to_string()];
-        assert_eq!(auto_limit_each(stmts.clone(), Some(100), true), (stmts.clone(), false));
-        assert_eq!(auto_limit_each(stmts.clone(), None, false), (stmts, false));
+        assert_eq!(
+            auto_limit_each(stmts.clone(), Some(100), true, dbc_core::Dialect::Postgres),
+            (stmts.clone(), false)
+        );
+        assert_eq!(
+            auto_limit_each(stmts.clone(), None, false, dbc_core::Dialect::Postgres),
+            (stmts, false)
+        );
+    }
+
+    #[test]
+    fn auto_limit_each_mssql_uses_top() {
+        let stmts = vec!["SELECT * FROM a".to_string(), "UPDATE t SET x = 1".to_string()];
+        let (out, changed) = auto_limit_each(stmts, Some(100), false, dbc_core::Dialect::Mssql);
+        assert!(changed);
+        assert_eq!(out[0], "SELECT TOP 100 * FROM a");
+        assert_eq!(out[1], "UPDATE t SET x = 1");
+    }
+
+    #[test]
+    fn split_error_message_go_count_is_czech() {
+        assert_eq!(
+            split_error_message(dbc_core::SplitError::UnsupportedGoCount),
+            "GO s počtem opakování není podporováno".to_string()
+        );
+    }
+
+    #[test]
+    fn sql_dialect_is_total() {
+        assert_eq!(sql_dialect(dbc_state::Engine::Postgres), dbc_core::Dialect::Postgres);
+        assert_eq!(sql_dialect(dbc_state::Engine::Sqlite), dbc_core::Dialect::Sqlite);
+        assert_eq!(sql_dialect(dbc_state::Engine::Mssql), dbc_core::Dialect::Mssql);
+    }
+
+    /// Batch C review BLOCKER 2 regression: on a read-only MSSQL connection
+    /// (where this client-side check is the ONLY read-only enforcement — no
+    /// server-side backstop), a bracket-quoted reserved word must not
+    /// false-reject a genuine read. Also proves pg behavior is unchanged —
+    /// `arr[1]` (an array subscript, not MSSQL bracket-quoting) still reads
+    /// fine and a real write is still rejected on both dialects.
+    #[test]
+    fn read_only_guard_rejects_is_dialect_aware() {
+        // MSSQL: bracket-quoted reserved word reads fine on a read-only
+        // connection — this is exactly the probe-proven false-reject the
+        // plain pg-only `is_read_statement` used to produce.
+        assert!(!read_only_guard_rejects(
+            "SELECT [Delete] FROM AuditLog",
+            true,
+            dbc_core::Dialect::Mssql
+        ));
+        // MSSQL: a real write is still rejected on a read-only connection.
+        assert!(read_only_guard_rejects("UPDATE t SET x = 1", true, dbc_core::Dialect::Mssql));
+        // MSSQL: writable connection never refuses regardless of statement.
+        assert!(!read_only_guard_rejects("UPDATE t SET x = 1", false, dbc_core::Dialect::Mssql));
+        // pg regression: `[1]` is an array subscript, not bracket-quoting —
+        // behavior must stay exactly as before this fix.
+        assert!(!read_only_guard_rejects(
+            "SELECT arr[1] FROM t",
+            true,
+            dbc_core::Dialect::Postgres
+        ));
+        assert!(read_only_guard_rejects("UPDATE t SET x = 1", true, dbc_core::Dialect::Postgres));
     }
 
     /// CURATION item 3's mandated test: two statements each carrying `:p` —

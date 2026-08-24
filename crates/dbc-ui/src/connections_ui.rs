@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use dbc_buffer::ResultBuffer;
-use dbc_state::{ConnectionConfig, Engine, SshTunnelConfig, Vault};
+use dbc_state::{ConnectionConfig, Engine, MssqlOptions, SshTunnelConfig, Vault};
 use gpui::{
     actions, div, fill, hsla, point, prelude::*, px, relative, size, App, AnyElement,
     Bounds, ClipboardItem, Context, CursorStyle, Div, ElementId, ElementInputHandler, Entity,
@@ -46,6 +46,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::backup;
 use crate::chart_data::ChartKind;
 use crate::runner::ConnectSpec;
 use crate::text_model::MultilineBuffer;
@@ -110,6 +111,7 @@ mod grouping_tests {
             auto_limit: None,
             ssh: None,
             favourite,
+            mssql: None,
         }
     }
 
@@ -854,10 +856,13 @@ pub struct ConnectionDialogUi {
     pub ssh_port: Entity<TextField>,
     pub ssh_user: Entity<TextField>,
     pub ssh_key_path: Entity<TextField>,
+    pub mssql_driver: Entity<TextField>,
     pub engine: Engine,
     pub read_only: bool,
     pub favourite: bool,
     pub ssh_enabled: bool,
+    pub mssql_encrypt: bool,
+    pub mssql_trust_cert: bool,
     pub test_result: Option<Result<String, String>>,
     /// `true` while a Test-button connect dispatched via
     /// `QueryRunner::test_connect` is in flight (Task 8 review issue #1) —
@@ -880,6 +885,19 @@ impl ConnectionDialogUi {
         } else {
             None
         };
+        // G15 T3: only carried for the Mssql engine — matches
+        // `ConnectionConfig.mssql`'s "None means non-MSSQL or all
+        // defaults" contract.
+        let mssql = if self.engine == Engine::Mssql {
+            let driver = self.mssql_driver.read(cx).text();
+            Some(MssqlOptions {
+                encrypt: self.mssql_encrypt,
+                trust_server_certificate: self.mssql_trust_cert,
+                driver: if driver.trim().is_empty() { None } else { Some(driver) },
+            })
+        } else {
+            None
+        };
         ConnectionFormData {
             id,
             name: self.name.read(cx).text(),
@@ -895,6 +913,7 @@ impl ConnectionDialogUi {
             timeout_secs: parse_u64(&self.timeout_secs.read(cx).text()),
             auto_limit: parse_u64(&self.auto_limit.read(cx).text()),
             ssh,
+            mssql,
         }
     }
 }
@@ -920,6 +939,7 @@ pub struct ConnectionFormData {
     pub timeout_secs: Option<u64>,
     pub auto_limit: Option<u64>,
     pub ssh: Option<SshTunnelConfig>,
+    pub mssql: Option<MssqlOptions>,
 }
 
 /// Hand-written `Debug` (instead of `#[derive(Debug)]`) so `password` is
@@ -944,6 +964,7 @@ impl std::fmt::Debug for ConnectionFormData {
             .field("timeout_secs", &self.timeout_secs)
             .field("auto_limit", &self.auto_limit)
             .field("ssh", &self.ssh)
+            .field("mssql", &self.mssql)
             .finish()
     }
 }
@@ -964,7 +985,54 @@ impl ConnectionFormData {
             auto_limit: self.auto_limit,
             ssh: self.ssh.clone(),
             favourite: self.favourite,
+            mssql: self.mssql.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod form_data_mssql_tests {
+    use super::*;
+
+    fn base_form_data(engine: Engine) -> ConnectionFormData {
+        ConnectionFormData {
+            id: "c1".into(),
+            name: "demo".into(),
+            engine,
+            host: "localhost".into(),
+            port: None,
+            database: "db".into(),
+            user: "u".into(),
+            password: String::new(),
+            folder: vec![],
+            read_only: false,
+            favourite: false,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            mssql: if engine == Engine::Mssql {
+                Some(MssqlOptions { encrypt: false, trust_server_certificate: true, driver: Some("ODBC Driver 17 for SQL Server".into()) })
+            } else {
+                None
+            },
+        }
+    }
+
+    #[test]
+    fn form_data_maps_mssql_options_only_for_mssql_engine() {
+        let pg_cfg = base_form_data(Engine::Postgres).to_connection_config();
+        assert_eq!(pg_cfg.mssql, None);
+
+        let mssql_data = base_form_data(Engine::Mssql);
+        let mssql_cfg = mssql_data.to_connection_config();
+        assert_eq!(
+            mssql_cfg.mssql,
+            Some(MssqlOptions {
+                encrypt: false,
+                trust_server_certificate: true,
+                driver: Some("ODBC Driver 17 for SQL Server".into()),
+            })
+        );
     }
 }
 
@@ -1537,8 +1605,9 @@ impl AppView {
         let ssh_port = cx.new(|cx| TextField::form_field(cx, "22", false));
         let ssh_user = cx.new(|cx| TextField::form_field(cx, "", false));
         let ssh_key_path = cx.new(|cx| TextField::form_field(cx, "~/.ssh/id_ed25519", false));
+        let mssql_driver = cx.new(|cx| TextField::form_field(cx, "ODBC Driver 18 for SQL Server", false));
 
-        let (editing_id, engine, read_only, favourite, ssh_enabled) = if let Some(c) = &editing {
+        let (editing_id, engine, read_only, favourite, ssh_enabled, mssql_encrypt, mssql_trust_cert) = if let Some(c) = &editing {
             name.update(cx, |f, cx| f.set_text(&c.name, cx));
             host.update(cx, |f, cx| f.set_text(&c.host, cx));
             port.update(cx, |f, cx| f.set_text(&c.port.map(|p| p.to_string()).unwrap_or_default(), cx));
@@ -1554,9 +1623,22 @@ impl AppView {
                 ssh_user.update(cx, |f, cx| f.set_text(&ssh.user, cx));
                 ssh_key_path.update(cx, |f, cx| f.set_text(ssh.key_path.as_deref().unwrap_or(""), cx));
             }
-            (Some(c.id.clone()), c.engine, c.read_only, c.favourite, ssh_enabled)
+            let mssql_opts = c.mssql.clone().unwrap_or_default();
+            if let Some(driver) = &mssql_opts.driver {
+                mssql_driver.update(cx, |f, cx| f.set_text(driver, cx));
+            }
+            (
+                Some(c.id.clone()),
+                c.engine,
+                c.read_only,
+                c.favourite,
+                ssh_enabled,
+                mssql_opts.encrypt,
+                mssql_opts.trust_server_certificate,
+            )
         } else {
-            (None, Engine::Postgres, false, false, false)
+            let defaults = MssqlOptions::default();
+            (None, Engine::Postgres, false, false, false, defaults.encrypt, defaults.trust_server_certificate)
         };
 
         let name_focus = name.focus_handle(cx);
@@ -1575,10 +1657,13 @@ impl AppView {
             ssh_port,
             ssh_user,
             ssh_key_path,
+            mssql_driver,
             engine,
             read_only,
             favourite,
             ssh_enabled,
+            mssql_encrypt,
+            mssql_trust_cert,
             test_result: None,
             testing: false,
         };
@@ -1732,8 +1817,10 @@ impl AppView {
         let Some(cfg_b) = self.config.connections.iter().find(|c| c.id == id_b).cloned() else {
             return;
         };
-        let secret_a = self.vault.as_ref().and_then(|v| v.get_secret(&cfg_a.id));
-        let secret_b = self.vault.as_ref().and_then(|v| v.get_secret(&cfg_b.id));
+        // G15 T8 HARD GATE ITEM 2: see `connect::resolve_secret_for_connect`'s
+        // doc comment — skips the vault lookup for a refused MSSQL config.
+        let secret_a = crate::connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg_a);
+        let secret_b = crate::connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg_b);
 
         self.modal = None; // design §3: closes as soon as the request is dispatched
         self.compare_fetch_generation += 1;
@@ -1811,6 +1898,18 @@ impl AppView {
         }
         cx.notify();
     }
+    fn toggle_mssql_encrypt(&mut self, cx: &mut Context<Self>) {
+        if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
+            ui.mssql_encrypt = !ui.mssql_encrypt;
+        }
+        cx.notify();
+    }
+    fn toggle_mssql_trust(&mut self, cx: &mut Context<Self>) {
+        if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
+            ui.mssql_trust_cert = !ui.mssql_trust_cert;
+        }
+        cx.notify();
+    }
 
     /// Dispatches the Test button's connect off the UI thread via
     /// `QueryRunner::test_connect` (Task 8 review issue #1: this used to
@@ -1853,14 +1952,18 @@ impl AppView {
             return;
         }
 
+        // G15 T8 HARD GATE ITEM 2: `cfg` computed BEFORE the vault fallback
+        // branch so `resolve_secret_for_connect` can skip the vault lookup
+        // for a refused MSSQL config — see its doc comment. The typed-
+        // password branch is unaffected (never touches the vault at all).
+        let cfg = data.to_connection_config();
         let secret = if !data.password.is_empty() {
             Some(data.password.clone())
         } else {
-            self.vault.as_ref().and_then(|v| v.get_secret(&data.id))
+            crate::connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg)
         };
         let engine_lbl = engine_label(data.engine);
         let editing_id = ui_snapshot.editing_id.clone();
-        let cfg = data.to_connection_config();
 
         match test_connect_spec(cfg, secret) {
             Err(msg) => {
@@ -2099,7 +2202,7 @@ impl AppView {
         // today, and why the call stays here anyway.
         self.cancel_active_backup_if_running();
         let Some(cfg) = self.config.connections.iter().find(|c| c.id == id).cloned() else { return };
-        let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+        let secret = crate::connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
         let engine_lbl = engine_label(cfg.engine);
         let target_id = cfg.id.clone();
         self.dropdown_open = false;
@@ -2366,13 +2469,11 @@ fn generate_connection_id() -> String {
     format!("conn-{nanos:x}")
 }
 
-/// Builds the `ConnectSpec` for a Test/switch validation, short-circuiting
-/// the permanent MSSQL-unsupported case client-side (rather than letting it
-/// fall through to `open_config`'s own MSSQL rejection) so it doesn't need
-/// to bounce through the runner's async plumbing for a case with zero I/O.
-/// This is a permanent behaviour per the brief (the MSSQL driver is a
-/// separate roadmap item), not a placeholder this function is expected to
-/// eventually replace.
+/// Builds the `ConnectSpec` for a Test/switch validation. Every engine —
+/// including MSSQL since G15 T3 — goes through the runner to
+/// `connect::open_config` → `probe()`/handshake the same way; there is no
+/// more client-side short-circuit for MSSQL (it used to hard-refuse here
+/// before the driver was wired in).
 ///
 /// Used by both `on_test_clicked` and `switch_to_connection` — Task 8's
 /// review found the synchronous `pending_connect` this replaces froze the
@@ -2381,9 +2482,6 @@ fn generate_connection_id() -> String {
 /// spec through `QueryRunner::test_connect`, which runs entirely off the UI
 /// thread and is bounded by `connect::open_config`'s `connect_timeout`.
 fn test_connect_spec(cfg: ConnectionConfig, secret: Option<String>) -> Result<ConnectSpec, String> {
-    if cfg.engine == Engine::Mssql {
-        return Err("MSSQL driver zatím není k dispozici".into());
-    }
     Ok(ConnectSpec::Config { cfg: Box::new(cfg), secret })
 }
 
@@ -2600,6 +2698,7 @@ mod test_vault_prompt_tests {
                 timeout_secs: None,
                 auto_limit: None,
                 ssh: None,
+                mssql: None,
             }
         ))));
     }
@@ -2701,44 +2800,49 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
                     view.open_connection_dialog(Some(editing.clone()), window, cx);
                 })),
         )
-        .child(
-            // G11 T6: backup affordance — allowed on every connection
-            // (backup is the one documented read-only exemption, design
-            // CURATION item 2), same `cx.stop_propagation()` pattern as ★/✎
-            // above so this click doesn't also bubble to the row's connect
-            // handler.
-            div()
-                .id(SharedString::from(format!("dropdown-item-backup-{}", c.id)))
-                .px_1()
-                .cursor_pointer()
-                .text_color(cx.theme().text_muted)
-                .hover(|s| s.bg(cx.theme().bg_selected))
-                .child("🗄")
-                .on_click(cx.listener(move |view, _, window, cx| {
-                    cx.stop_propagation();
-                    view.open_backup_dialog(backup_target.clone(), window, cx);
-                })),
-        )
-        .child(
-            // G11 T6: restore affordance — dimmed (still clickable; the
-            // click itself surfaces the read-only refusal as a status line,
-            // same "no tooltip component exists in this codebase" posture
-            // this plan's Grounding documents) for a read-only connection.
-            // Restore is NEVER exempt from the read-only gate (design
-            // CURATION item 2) — `open_restore_dialog` enforces this for
-            // real; the dim here is a visual hint only, not the guard.
-            div()
-                .id(SharedString::from(format!("dropdown-item-restore-{}", c.id)))
-                .px_1()
-                .cursor_pointer()
-                .text_color(if restore_read_only { cx.theme().text_disabled } else { cx.theme().text_muted })
-                .hover(|s| s.bg(cx.theme().bg_selected))
-                .child("♻")
-                .on_click(cx.listener(move |view, _, window, cx| {
-                    cx.stop_propagation();
-                    view.open_restore_dialog(restore_target.clone(), window, cx);
-                })),
-        )
+        // G15 T8 HARD GATE ITEM 1: backup/restore icons hidden entirely for
+        // MSSQL — see `backup::backup_restore_available`'s doc comment for
+        // the live-found reliability bug this gates on.
+        .when(backup::backup_restore_available(c.engine), |row| {
+            row.child(
+                // G11 T6: backup affordance — allowed on every connection
+                // (backup is the one documented read-only exemption, design
+                // CURATION item 2), same `cx.stop_propagation()` pattern as ★/✎
+                // above so this click doesn't also bubble to the row's connect
+                // handler.
+                div()
+                    .id(SharedString::from(format!("dropdown-item-backup-{}", c.id)))
+                    .px_1()
+                    .cursor_pointer()
+                    .text_color(cx.theme().text_muted)
+                    .hover(|s| s.bg(cx.theme().bg_selected))
+                    .child("🗄")
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        cx.stop_propagation();
+                        view.open_backup_dialog(backup_target.clone(), window, cx);
+                    })),
+            )
+            .child(
+                // G11 T6: restore affordance — dimmed (still clickable; the
+                // click itself surfaces the read-only refusal as a status line,
+                // same "no tooltip component exists in this codebase" posture
+                // this plan's Grounding documents) for a read-only connection.
+                // Restore is NEVER exempt from the read-only gate (design
+                // CURATION item 2) — `open_restore_dialog` enforces this for
+                // real; the dim here is a visual hint only, not the guard.
+                div()
+                    .id(SharedString::from(format!("dropdown-item-restore-{}", c.id)))
+                    .px_1()
+                    .cursor_pointer()
+                    .text_color(if restore_read_only { cx.theme().text_disabled } else { cx.theme().text_muted })
+                    .hover(|s| s.bg(cx.theme().bg_selected))
+                    .child("♻")
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        cx.stop_propagation();
+                        view.open_restore_dialog(restore_target.clone(), window, cx);
+                    })),
+            )
+        })
 }
 
 fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppView>) -> AnyElement {
@@ -2815,6 +2919,35 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
             .child(field_row("SSH port", ui.ssh_port.clone(), *cx.theme()))
             .child(field_row("SSH uživatel", ui.ssh_user.clone(), *cx.theme()))
             .child(field_row("SSH klíč (cesta)", ui.ssh_key_path.clone(), *cx.theme()));
+    }
+
+    if ui.engine == Engine::Mssql {
+        panel = panel
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_4()
+                    .child(
+                        checkbox("chk-mssql-encrypt", "Šifrovat připojení (Encrypt)", ui.mssql_encrypt)
+                            .on_click(cx.listener(|v, _, _, cx| v.toggle_mssql_encrypt(cx))),
+                    )
+                    .child(
+                        checkbox(
+                            "chk-mssql-trust",
+                            "Důvěřovat certifikátu serveru (TrustServerCertificate)",
+                            ui.mssql_trust_cert,
+                        )
+                        .on_click(cx.listener(|v, _, _, cx| v.toggle_mssql_trust(cx))),
+                    ),
+            )
+            .child(field_row("ODBC driver (volitelné)", ui.mssql_driver.clone(), *cx.theme()))
+            // Read-only honesty, UI half (§1a): rendered only for MSSQL.
+            .child(
+                div()
+                    .text_color(cx.theme().text_muted)
+                    .child("Pouze pro čtení: u MSSQL vynuceno pouze na straně klienta"),
+            );
     }
 
     if let Some((text, ok)) = test_line {

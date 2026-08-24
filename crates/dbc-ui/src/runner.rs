@@ -9,10 +9,24 @@ use crate::backup;
 use crate::connect;
 use crate::monitor;
 
+/// G15 T8 whole-branch review B2 fix: `Debug` added so the new
+/// `stream_query` regression tests (`stream_query_write_dispatch_tests`)
+/// can assert on the exact event received with a readable panic message —
+/// no other caller needed it before.
+#[derive(Debug)]
 pub enum QueryEvent {
     Started { columns: SchemaRef },
     Batch(RecordBatch),
     Finished { elapsed: Duration },
+    /// G15 T8 whole-branch review B2 fix: the single-statement editor
+    /// path's WRITE outcome, dispatched through `Connection::execute`
+    /// (never `Connection::query`) — see `stream_query`'s doc comment for
+    /// why this exists as its own variant rather than reusing `Finished`.
+    /// Carries the driver-reported affected-row count, unlike `Finished`
+    /// (whose "N rows" status text today reads it off the drained
+    /// `ResultBuffer` instead — there is no buffer here, nothing was
+    /// queried).
+    WriteFinished { affected: u64, elapsed: Duration },
     Failed(QueryError),
 }
 
@@ -80,6 +94,18 @@ pub const MONITOR_READ_ONLY_KILL_MSG: &str =
 /// file; `WholeRun` = one BEGIN…COMMIT spanning every file in the run.
 /// Wired into `main.rs` by Task 3's script-runner UI
 /// (`AppView::confirm_script_run`).
+///
+/// G15 T5: `PerFile`/`WholeRun` issue `dbc_core::tx_begin_sql`/`tx_commit_sql`/
+/// `tx_rollback_sql` for the connection's dialect — on MSSQL that is the
+/// fused `"SET XACT_ABORT ON; BEGIN TRANSACTION"` (fixes G12's bare-`BEGIN`
+/// bug). T-SQL transactions legally span batches (unlike a client library
+/// with per-batch autocommit assumptions), so a multi-file/multi-statement
+/// script's `BEGIN … COMMIT` bracket is valid T-SQL as written. Some T-SQL
+/// statements refuse to run inside an explicit user transaction at all
+/// (`BACKUP DATABASE`, `ALTER DATABASE`, full-text catalog DDL, among
+/// others) — this is NOT detected ahead of time; such a statement simply
+/// errors verbatim from the server and is handled like any other
+/// statement failure by `opts.error_policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxScope {
     None,
@@ -218,6 +244,13 @@ impl QueryRunner {
     ) -> tokio::sync::mpsc::Receiver<QueryEvent> {
         let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
         let handle = self.handle();
+        // G15 T8 whole-branch review B2 fix: captured BEFORE `spec` moves
+        // into `open_spec` below — `stream_query` needs both to classify
+        // the statement via `dispatch_statement`, same "capture before
+        // move" convention every other dialect/read_only-aware call site
+        // in this file already follows.
+        let read_only = spec_is_read_only(&spec);
+        let dialect = spec_dialect(&spec);
         self.runtime.spawn(async move {
             if cancel.is_cancelled() {
                 let _ = tx.send(QueryEvent::Failed(QueryError::msg("cancelled"))).await;
@@ -244,7 +277,7 @@ impl QueryRunner {
             let started = Instant::now();
             let query_cancel = cancel.clone();
 
-            let run = stream_query(&mut conn, &sql, query_cancel, &tx, started);
+            let run = stream_query(&mut conn, &sql, query_cancel, &tx, started, dialect, read_only);
 
             match timeout_secs {
                 Some(t) => {
@@ -608,7 +641,7 @@ impl QueryRunner {
     /// G12 T7: runs a CSV import (design T7) — a SANCTIONED runner-owned
     /// write path (§3-novela): ONE transaction for the WHOLE import (not
     /// configurable, unlike `run_script`'s `tx_scope`), streaming batched
-    /// `INSERT`s via `csv_import::generate_insert_batches`. FIRST action,
+    /// `INSERT`s via `csv_import::generate_insert_batches_d`. FIRST action,
     /// before any file or DB touch: the SHARED `guard_not_read_only` guard
     /// (CURATION items 1(c)/4(b)'s runtime half). Cancellation is checked
     /// BETWEEN batches only (bounded by the 500-row cap); `timeout_secs`
@@ -721,12 +754,12 @@ impl QueryRunner {
     /// G11 T4: MSSQL `BACKUP DATABASE` — allowed on read-only (design
     /// CURATION item 2, `backup::BackupOp::Backup` is exempt). Runs over ONE
     /// fresh connection (`open_spec`, dropped at the end), same one-shot
-    /// shape `fetch_schema`/`test_connect` already use. Against a saved
-    /// MSSQL connection this fails fast at `open_spec` with the exact,
-    /// already-existing "MSSQL driver zatím není k dispozici" error every
-    /// other MSSQL feature in this app produces today (`connect::open_config`'s
-    /// permanent `Engine::Mssql` arm) — no MSSQL-specific handling is added
-    /// around that error here.
+    /// shape `fetch_schema`/`test_connect` already use. `open_spec`'s
+    /// `Engine::Mssql` arm is real since G15 T3 (`connect::open_config`
+    /// dials out via `MssqlConnection::probe()`) — whatever `open_spec`
+    /// returns (a real connect failure, or success) is what this sees; no
+    /// MSSQL-specific handling is added around it here. `build_backup_sql`
+    /// itself stays pg-bracket-quoted until G15 T4 dialectizes it.
     pub fn run_mssql_backup(
         &self,
         spec: ConnectSpec,
@@ -760,6 +793,34 @@ impl QueryRunner {
         let handle = self.handle();
         self.runtime.spawn(async move {
             let result = run_mssql_restore_inner(spec, database, server_path, handle).await;
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
+    /// G15 T7 (G13 T7 delivered): the MSSQL face of the plan/analyze
+    /// feature — same precedent as `run_mssql_backup`/`run_mssql_restore`
+    /// (no `Connection`-trait change, no downcasting; the runner constructs
+    /// the concrete `MssqlConnection` itself, via
+    /// `connect::mssql_connection_from_config`, no `open_spec`/`handle`
+    /// needed since that builder does no I/O). `analyze == false` is the
+    /// estimated path (`SET SHOWPLAN_XML` — never executes `sql`, always
+    /// safe on any connection); `analyze == true` is the actual path
+    /// (`SET STATISTICS XML` inside a fused-`XACT_ABORT` transaction,
+    /// rolled back ALWAYS via `query_with_session`'s postlude contract) —
+    /// see `mssql_plan_session`'s doc comment for the exact prelude/postlude
+    /// text and `run_mssql_plan_inner`'s doc comment for the read-only
+    /// belt-and-braces guard.
+    pub fn run_mssql_plan(
+        &self,
+        spec: ConnectSpec,
+        sql: String,
+        analyze: bool,
+        timeout_secs: Option<u64>,
+    ) -> tokio::sync::oneshot::Receiver<Result<String, QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let result = run_mssql_plan_inner(spec, sql, analyze, timeout_secs).await;
             let _ = tx.send(result);
         });
         rx
@@ -821,22 +882,24 @@ impl QueryRunner {
 /// specifically so the CURATION-REQUIRED test can prove the WHERE-box guard
 /// fires BEFORE `open_spec` is ever called (design CURATION §0.2: "REQUIRED
 /// test: `fetch_diff_side` with a WHERE-box payload failing
-/// `is_read_statement` is refused client-side"). `dbc_core::quote_qualified`
+/// `is_read_statement` is refused client-side"). `dbc_core::quote_qualified_d`
 /// is the SAME quoting function `sandbox.rs` already uses for its own
-/// write-path SQL (Global Constraints' quoting note — MSSQL bracket
-/// quoting via `admin_sql::quote_ident_for` is out of scope here since
-/// MSSQL is unwired in `connect::open_config` today).
+/// write-path SQL (Global Constraints' quoting note). G15 T5: gained
+/// `dialect` — MSSQL bracket quoting via `quote_qualified_d` is no longer
+/// out of scope now that `connect::open_config` wires MSSQL (T3); the
+/// read-only guard below is bracket-aware too (`is_read_statement_d`).
 fn compose_diff_select(
+    dialect: dbc_core::Dialect,
     schema: Option<&str>,
     table: &str,
     where_clause: Option<&str>,
 ) -> Result<String, QueryError> {
-    let base = format!("SELECT * FROM {}", dbc_core::quote_qualified(schema, table));
+    let base = format!("SELECT * FROM {}", dbc_core::quote_qualified_d(dialect, schema, table));
     let sql = match where_clause {
         Some(w) if !w.trim().is_empty() => format!("{base} WHERE {w}"),
         _ => base,
     };
-    if !dbc_core::is_read_statement(&sql) {
+    if !dbc_core::is_read_statement_d(&sql, dialect) {
         return Err(QueryError::msg(
             "WHERE výraz nelze spustit — musí jít o čistě čtecí SQL (žádné oddělené příkazy)"
                 .to_string(),
@@ -859,9 +922,11 @@ async fn fetch_diff_side_inner(
     where_clause: Option<String>,
     handle: tokio::runtime::Handle,
 ) -> Result<(String, SchemaRef, dbc_buffer::ResultBuffer), QueryError> {
+    // Dialect captured BEFORE `spec` moves into `open_spec` (G15 T5).
+    let dialect = spec_dialect(&spec);
     // Composed + guarded BEFORE `open_spec` — a failing WHERE box never
     // reaches a connection attempt (CURATION binding requirement).
-    let sql = compose_diff_select(schema.as_deref(), &table, where_clause.as_deref())?;
+    let sql = compose_diff_select(dialect, schema.as_deref(), &table, where_clause.as_deref())?;
     let mut opened = open_spec(spec, handle).await?;
     let mut stream = opened.conn.query(&sql, CancelToken::new()).await?;
     let columns = stream.columns.clone();
@@ -913,11 +978,41 @@ fn spec_is_read_only(spec: &ConnectSpec) -> bool {
     }
 }
 
+/// G15 T5: `ConnectSpec` -> `dbc_core::Dialect` for every transaction-control
+/// sequence in this file (`drive_write_sequence`, `drive_analyze_write`,
+/// `run_csv_import_inner`, `connect_and_run_many_inner`) and for
+/// `compose_diff_select`'s quoting/read-guard — the single spot that maps
+/// `dbc_state::Engine` to `dbc_core::Dialect` for the tx-control call sites
+/// (the SEPARATE `main.rs::dialect_for_engine` mapping — T8-gated, currently
+/// `Mssql => None` — governs the splitter/auto-limit call sites and is out
+/// of scope for this task's single-writer boundary). Captured BEFORE `spec`
+/// moves into `open_spec`, mirroring `spec_is_read_only`'s own "capture up
+/// front" convention.
+fn spec_dialect(spec: &ConnectSpec) -> dbc_core::Dialect {
+    match spec {
+        ConnectSpec::Config { cfg, .. } => match cfg.engine {
+            dbc_state::Engine::Postgres => dbc_core::Dialect::Postgres,
+            dbc_state::Engine::Sqlite => dbc_core::Dialect::Sqlite,
+            dbc_state::Engine::Mssql => dbc_core::Dialect::Mssql,
+        },
+        // CLI-arg URLs have no MSSQL form (main.rs::engine_from_url: a
+        // postgres[ql]:// scheme or a sqlite file path only) — mirrors that
+        // exact dispatch.
+        ConnectSpec::Url(url) => {
+            if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+                dbc_core::Dialect::Postgres
+            } else {
+                dbc_core::Dialect::Sqlite
+            }
+        }
+    }
+}
+
 /// G12 T2: dispatch decision behind `run_script_statement`'s per-statement
 /// read-only matrix — pure so the whole matrix is unit tested without any
-/// connection. Fail-closed inputs (`is_read_statement` returning `false` for
-/// an unterminated/unrecognized construct) are treated as writes, not
-/// reads — same posture `is_read_statement`'s own doc comment mandates, so
+/// connection. Fail-closed inputs (`is_read_statement_d` returning `false`
+/// for an unterminated/unrecognized construct) are treated as writes, not
+/// reads — same posture `is_read_statement_d`'s own doc comment mandates, so
 /// an ambiguous statement on a read-only connection is rejected rather than
 /// risked.
 /// Consumed by both `run_script` (Task 1, wired into `main.rs` by Task 3)
@@ -929,8 +1024,12 @@ pub enum StmtDispatch {
     RejectReadOnly,
 }
 
-pub fn dispatch_statement(sql: &str, read_only: bool) -> StmtDispatch {
-    if dbc_core::is_read_statement(sql) {
+/// G15 T5: gained `dialect` (was pg-only `is_read_statement`) — a
+/// bracket-quoted reserved word (`[Delete]`, `[Order]`, `[Top]`) must never
+/// be mistaken for the bare keyword on an MSSQL connection (`is_read_statement_d`'s
+/// own doc comment). Postgres/Sqlite callers are unaffected.
+pub fn dispatch_statement(sql: &str, read_only: bool, dialect: dbc_core::Dialect) -> StmtDispatch {
+    if dbc_core::is_read_statement_d(sql, dialect) {
         StmtDispatch::RunAsRead
     } else if read_only {
         StmtDispatch::RejectReadOnly
@@ -1012,13 +1111,25 @@ pub fn affected_mismatch(expected: Option<u64>, reported: u64) -> bool {
 /// live network/docker dependency, and no `dbc-driver-sqlite` import
 /// outside `connect.rs` (the whole point of routing through `connect::open`
 /// rather than constructing `SqliteConnection` here).
+///
+/// G15 T5: `dialect` selects the tx-control TEXT via `dbc_core::tx_begin_sql`/
+/// `tx_commit_sql`/`tx_rollback_sql` — pg/sqlite get the historic
+/// byte-identical `"BEGIN"`/`"COMMIT"`/`"ROLLBACK"` literals (zero behavior
+/// change), MSSQL gets the fused `"SET XACT_ABORT ON; BEGIN TRANSACTION"`
+/// (fixes G12's bare-`BEGIN` bug — bare `BEGIN` is invalid T-SQL). §3b: on
+/// MSSQL, once `XACT_ABORT` aborts the transaction after a runtime error,
+/// the explicit ROLLBACK below fails with "no corresponding BEGIN
+/// TRANSACTION" — exactly the case this function's existing `let _ =`
+/// discard posture already tolerates (verified by the driver's §3c matrix,
+/// case 3).
 async fn drive_write_sequence(
     conn: &mut dyn Connection,
     statements: &[crate::admin_sql::WriteStatement],
     cancel: CancelToken,
+    dialect: dbc_core::Dialect,
 ) -> Result<u64, QueryError> {
-    if let Err(e) = conn.execute("BEGIN", cancel.clone()).await {
-        let _ = conn.execute("ROLLBACK", cancel.clone()).await;
+    if let Err(e) = conn.execute(dbc_core::tx_begin_sql(dialect), cancel.clone()).await {
+        let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.clone()).await;
         return Err(e);
     }
     let mut total: u64 = 0;
@@ -1026,13 +1137,13 @@ async fn drive_write_sequence(
         match conn.execute(&st.exec_sql, cancel.clone()).await {
             Ok(affected) => {
                 if affected_mismatch(st.expected_affected, affected) {
-                    let _ = conn.execute("ROLLBACK", cancel.clone()).await;
+                    let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.clone()).await;
                     return Err(QueryError::msg(AFFECTED_MISMATCH_MSG));
                 }
                 total += affected;
             }
             Err(e) => {
-                let _ = conn.execute("ROLLBACK", cancel.clone()).await;
+                let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.clone()).await;
                 // G10 CURATION item 3 (redaction hardening): the surfaced
                 // error is paired with `display_sql` ONLY — `exec_sql` is
                 // used exactly once, in the `execute()` call above, and
@@ -1046,8 +1157,8 @@ async fn drive_write_sequence(
             }
         }
     }
-    if let Err(e) = conn.execute("COMMIT", cancel.clone()).await {
-        let _ = conn.execute("ROLLBACK", cancel.clone()).await;
+    if let Err(e) = conn.execute(dbc_core::tx_commit_sql(dialect), cancel.clone()).await {
+        let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.clone()).await;
         return Err(e);
     }
     Ok(total)
@@ -1094,11 +1205,12 @@ async fn drive_write_sequence_bounded(
     conn: &mut dyn Connection,
     statements: &[crate::admin_sql::WriteStatement],
     cancel: CancelToken,
+    dialect: dbc_core::Dialect,
     timeout_secs: Option<u64>,
 ) -> Result<u64, QueryError> {
     match timeout_secs {
         Some(t) => {
-            let sequence = drive_write_sequence(conn, statements, cancel.clone());
+            let sequence = drive_write_sequence(conn, statements, cancel.clone(), dialect);
             match tokio::time::timeout(Duration::from_secs(t), sequence).await {
                 Ok(result) => result,
                 Err(_elapsed) => {
@@ -1109,7 +1221,7 @@ async fn drive_write_sequence_bounded(
                     // (a): bounded best-effort rollback — see this
                     // function's doc comment for why this must NOT be
                     // allowed to hang the whole function.
-                    let rollback = conn.execute("ROLLBACK", CancelToken::new());
+                    let rollback = conn.execute(dbc_core::tx_rollback_sql(dialect), CancelToken::new());
                     let _ =
                         tokio::time::timeout(Duration::from_secs(ROLLBACK_GRACE_SECS), rollback)
                             .await;
@@ -1117,7 +1229,7 @@ async fn drive_write_sequence_bounded(
                 }
             }
         }
-        None => drive_write_sequence(conn, statements, cancel).await,
+        None => drive_write_sequence(conn, statements, cancel, dialect).await,
     }
 }
 
@@ -1132,18 +1244,24 @@ async fn run_write_transaction_inner(
     handle: tokio::runtime::Handle,
 ) -> Result<u64, QueryError> {
     guard_not_read_only(spec_is_read_only(&spec))?;
+    // Captured BEFORE `spec` moves into `open_spec` (G15 T5).
+    let dialect = spec_dialect(&spec);
     let mut opened = open_spec(spec, handle).await?;
     let cancel = CancelToken::new();
-    drive_write_sequence_bounded(&mut *opened.conn, &statements, cancel, timeout_secs).await
+    drive_write_sequence_bounded(&mut *opened.conn, &statements, cancel, dialect, timeout_secs).await
     // `opened` (connection + tunnel) drops here unconditionally, tearing the
     // connection down — the ultimate backstop regardless of how the write
     // sequence above resolved.
 }
 
 /// G13 T6: drains a single-row, single-column TEXT result (pg's `EXPLAIN
-/// (ANALYZE, BUFFERS, FORMAT JSON)` output shape, and MSSQL's
-/// `STATISTICS XML` result set once T7 wires it) via the same
+/// (ANALYZE, BUFFERS, FORMAT JSON)` output shape) via the same
 /// `dbc_buffer::ResultBuffer` drain `fetch_lookup_inner` already uses.
+/// MSSQL's `STATISTICS`/`SHOWPLAN XML` result set goes through the sibling
+/// `drain_stream_single_text_cell` below instead (G15 T7) — MSSQL never
+/// has a `&mut dyn Connection` to call `.query()` on here, since its plan
+/// text arrives via `MssqlConnection::query_with_session`, which isn't
+/// part of the `Connection` trait.
 async fn drain_single_text_cell(
     conn: &mut dyn Connection,
     sql: &str,
@@ -1160,22 +1278,210 @@ async fn drain_single_text_cell(
     Ok(buf.cell_text(0, 0))
 }
 
+/// G15 T7: sibling of `drain_single_text_cell` that reads an
+/// ALREADY-OPEN `QueryStream` directly instead of calling `.query()`
+/// first — `query_with_session` (T2) returns a `QueryStream` on its own,
+/// with no `&mut dyn Connection` in the picture. Drains every batch (not
+/// just the first) for consistency with `drain_single_text_cell`'s own
+/// shape; this is equivalent in practice to "first batch's cell [0][0]"
+/// because `query_with_session` already fully materializes its (small,
+/// bounded — Showplan XML is always a single row) result set before this
+/// function ever runs (its own doc comment: "BOUNDED STATEMENTS ONLY").
+async fn drain_stream_single_text_cell(
+    stream: &mut dbc_core::QueryStream,
+) -> Result<String, QueryError> {
+    let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+    while let Some(item) = stream.batches.recv().await {
+        buf.push(item?).map_err(|e| QueryError::msg(e.to_string()))?;
+    }
+    if buf.row_count() == 0 || buf.cell_is_null(0, 0) {
+        return Err(QueryError::msg("plán nevrátil žádná data"));
+    }
+    Ok(buf.cell_text(0, 0))
+}
+
+/// G15 T7 (G13 T7 delivered, design §2e / curation item 1): prelude/
+/// postlude text for `run_mssql_plan`'s `query_with_session` call — pure
+/// so the exact strings are unit-tested without a connection. The G13
+/// one-string `"SET SHOWPLAN_XML ON; {sql}"` form CANNOT work (`SET
+/// SHOWPLAN_XML` must be the ONLY statement in its batch, and is
+/// session-scoped while `MssqlConnection::query()` opens a fresh
+/// connection per call) — `query_with_session`'s prelude/main-batch/
+/// postlude shape is the actual, structurally-correct delivery mechanism.
+fn mssql_plan_session(analyze: bool) -> (Vec<String>, Vec<String>) {
+    let d = dbc_core::Dialect::Mssql;
+    if analyze {
+        // T3 review attention note, confirmed here: `SET STATISTICS XML`
+        // has NO only-statement restriction (a run-time session setting,
+        // unlike `SHOWPLAN_XML`) — `{sql}` genuinely EXECUTES on this
+        // path. `tx_begin_sql` is the FUSED XACT_ABORT form (G15 T5); the
+        // postlude ROLLBACK runs ALWAYS via `query_with_session`'s own
+        // "postludes run best-effort, on every path including every error
+        // branch" contract (verified against dbc-driver-mssql/src/lib.rs —
+        // every `run_postludes(&conn, &postlude)` call site there) — the
+        // exact `drive_analyze_write` discipline (BEGIN -> query ->
+        // ROLLBACK, never COMMIT) expressed as prelude/postlude instead of
+        // three sequential `execute()` calls over one held-open connection.
+        (
+            vec![
+                // G15 T8 live-found fix: for a non-`SELECT` write (the
+                // common analyze target — a genuine `UPDATE`/`INSERT`/
+                // `DELETE`), STATISTICS XML's plan result set is NOT
+                // necessarily the FIRST thing the server returns — a plain
+                // rowcount completion ("N rows affected", a DONE token
+                // with ZERO columns) can arrive first, and `Connection
+                // ::execute`'s safe wrapper (odbc-api) treats "the first
+                // thing has no columns" as `Ok(None)` ("no result set")
+                // and gives up the statement handle entirely — there is no
+                // safe way to advance past that with a `Connection
+                // ::execute()`-shaped call once it's returned `None`
+                // (confirmed against odbc-api 29.0.0's `execute_with_
+                // parameters`: a zero-column first result frees the
+                // statement before a caller could ever reach
+                // `SQLMoreResults`). Reproduced live: `run_mssql_plan_inner`
+                // failed with "statement produced no result set" for
+                // `UPDATE ... WHERE id = 1` under `SET STATISTICS XML ON`
+                // even though `sqlcmd` against the SAME statement clearly
+                // shows the XML result set arriving (just not first).
+                // `SET NOCOUNT ON` suppresses the rowcount completion
+                // message entirely, so the XML result set becomes the
+                // FIRST (and only) tabular result — verified live this
+                // makes the exact same statement succeed. Harmless for a
+                // `SELECT` analyze target (SELECT never emitted a rowcount
+                // message to begin with) and for every other prelude/
+                // postlude statement in this session (none of them are
+                // row-producing DML).
+                "SET NOCOUNT ON".to_string(),
+                "SET STATISTICS XML ON".to_string(),
+                dbc_core::tx_begin_sql(d).to_string(),
+            ],
+            vec![dbc_core::tx_rollback_sql(d).to_string()],
+        )
+    } else {
+        // T3 review attention note, confirmed here (this is the actual
+        // safety MECHANISM, not an accident of some other bug): per
+        // Microsoft's own `SET SHOWPLAN_XML` docs, turning it ON "causes
+        // SQL Server not to execute Transact-SQL statements" — the server
+        // returns the plan XML INSTEAD of running `{sql}`, for every
+        // statement, on every connection, read-only or not. That's why
+        // this branch needs no read-only guard and no transaction wrapper
+        // at all (empty postlude) — `run_mssql_plan_inner`'s guard is
+        // gated on `analyze` for exactly this reason.
+        (vec!["SET SHOWPLAN_XML ON".to_string()], Vec::new())
+    }
+}
+
+/// G15 T7 review MAJOR fix: hard cap on rows `run_mssql_plan_inner` will
+/// ever let `query_with_session` materialize for ONE result set. The
+/// ACTUAL (`analyze = true`) path genuinely EXECUTES the user's SQL under
+/// `SET STATISTICS XML ON` — routing arbitrary user SQL through
+/// `query_with_session` (which has no streaming back-pressure, see its own
+/// doc comment) is only safe because a `max_rows` cap is threaded all the
+/// way through; without one, "Analyze" on `SELECT * FROM big_table` (a
+/// read — `AnalyzeGate::Run`, no confirm modal, no chance to say no) would
+/// be an OOM/freeze now that T8 has flipped `mssql_plan_dispatch_available`.
+/// The plan/statistics XML result set itself is always exactly one row —
+/// 10,000 is generously above that, so this only ever fires on genuinely
+/// pathological/large user SQL, never on the plan payload itself.
+const PLAN_ROW_CAP: usize = 10_000;
+
+/// G15 T7: `QueryRunner::run_mssql_plan`'s async body — the MSSQL face of
+/// the plan/analyze feature, delivered via
+/// `MssqlConnection::query_with_session` (T2) instead of the generic
+/// `Connection::query`/`execute` paths every other engine's plan flow
+/// uses (curation item 1: the one-string form is structurally
+/// impossible — see `mssql_plan_session`'s doc comment).
+async fn run_mssql_plan_inner(
+    spec: ConnectSpec,
+    sql: String,
+    analyze: bool,
+    timeout_secs: Option<u64>,
+) -> Result<String, QueryError> {
+    // G15 T7 review NIT fix: single-authority dialect resolution
+    // (`spec_dialect`), not a hard-coded `Dialect::Mssql` literal — same
+    // convention every other dialect-aware call site in this file follows,
+    // even though this function is only ever reached for a genuinely-MSSQL
+    // spec in practice (`dispatch_mssql_plan` never calls it otherwise).
+    let dialect = spec_dialect(&spec);
+    // Belt-and-braces (G13 parity, same posture as `run_analyze_write_inner`):
+    // an ACTUAL plan (`analyze == true`) of a WRITE statement refuses
+    // read-only independently of the UI's `analyze_gate` — the UI gate is
+    // the primary defense, this is the second, driver-independent layer.
+    // Reads — and EVERY estimated plan (`analyze == false`),
+    // unconditionally — stay allowed on read-only connections:
+    // `mssql_plan_session`'s doc comment documents WHY (SHOWPLAN_XML never
+    // executes `sql`; §5's "Explain is always safe" holds for MSSQL too).
+    // Dialect-aware (`is_read_statement_d` — batch C review carry-forward,
+    // explicitly deferred to this task): a bracket-quoted reserved word
+    // (`SELECT [Delete] FROM AuditLog`) must not false-reject a genuine
+    // read here either, same fix as `main.rs`'s Guard 1 and `analyze_gate`
+    // (plan.rs) already got.
+    if analyze && !dbc_core::is_read_statement_d(&sql, dialect) {
+        guard_not_read_only(spec_is_read_only(&spec))?;
+    }
+    let ConnectSpec::Config { cfg, secret } = spec else {
+        // No MSSQL URL form exists (main.rs::engine_from_url: postgres[ql]://
+        // or a sqlite file path only) — defensive only; unreachable via the
+        // UI (`dispatch_mssql_plan` is only ever reached for a saved MSSQL
+        // connection).
+        return Err(QueryError::msg("MSSQL plán vyžaduje uložené připojení"));
+    };
+    // Pure string building — no I/O, no `spawn_blocking` needed; the ssh /
+    // integrated-auth refusals fire here exactly like `open_config`'s arm
+    // (`mssql_connection_from_config` is the SAME builder both share).
+    let mut conn = connect::mssql_connection_from_config(&cfg, secret)?;
+    let (prelude, postlude) = mssql_plan_session(analyze);
+    let run = async {
+        let mut stream = conn
+            .query_with_session(&prelude, &sql, &postlude, Some(PLAN_ROW_CAP), CancelToken::new())
+            .await
+            .map_err(connect::mssql_im002_hint)?;
+        drain_stream_single_text_cell(&mut stream).await
+    };
+    match timeout_secs {
+        Some(t) => tokio::time::timeout(Duration::from_secs(t), run).await.map_err(|_| {
+            // G15 T7 review NIT fix: mode-appropriate timeout wording —
+            // this used to always say "analýza překročila" (analysis
+            // exceeded), even on the estimated (non-analyze) path, which
+            // never runs an analysis at all.
+            QueryError::msg(if analyze {
+                format!("[timeout] analýza překročila {t}s")
+            } else {
+                format!("[timeout] vysvětlení plánu překročilo {t}s")
+            })
+        })?,
+        None => run.await,
+    }
+    // On timeout the blocking session is orphaned (its `spawn_blocking`
+    // task isn't cancelled by dropping this future) — its ODBC connection
+    // drops with that task once it finishes, which is the SAME
+    // "disconnect rolls back any still-open transaction, session settings
+    // can never leak" backstop `query_with_session`'s own doc comment
+    // already documents (confirmed against `dbc-driver-mssql/src/lib.rs`:
+    // one fresh `connect()` per `query_with_session` call, `run_postludes`
+    // called on every path including every error branch, before that
+    // connection is ever dropped).
+}
+
 /// G13 T6: BEGIN -> query -> ROLLBACK, ALWAYS (never COMMIT — see
 /// `QueryRunner::run_analyze_write`'s doc comment). Stops nothing early on
 /// the query step's own error; the ROLLBACK still runs either way, same
 /// "tolerate ROLLBACK itself failing" posture `drive_write_sequence`
 /// already documents.
+/// G15 T5: `dialect` selects the tx-control text — see `drive_write_sequence`'s
+/// doc comment for the fused-MSSQL-begin/§3b rationale (identical here).
 async fn drive_analyze_write(
     conn: &mut dyn Connection,
     explain_analyze_sql: &str,
     cancel: CancelToken,
+    dialect: dbc_core::Dialect,
 ) -> Result<String, QueryError> {
-    if let Err(e) = conn.execute("BEGIN", cancel.clone()).await {
-        let _ = conn.execute("ROLLBACK", cancel.clone()).await;
+    if let Err(e) = conn.execute(dbc_core::tx_begin_sql(dialect), cancel.clone()).await {
+        let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.clone()).await;
         return Err(e);
     }
     let plan_result = drain_single_text_cell(conn, explain_analyze_sql, cancel.clone()).await;
-    let _ = conn.execute("ROLLBACK", cancel.clone()).await; // ALWAYS — see doc comment.
+    let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.clone()).await; // ALWAYS — see doc comment.
     plan_result
 }
 
@@ -1187,16 +1493,17 @@ async fn drive_analyze_write_bounded(
     conn: &mut dyn Connection,
     explain_analyze_sql: &str,
     cancel: CancelToken,
+    dialect: dbc_core::Dialect,
     timeout_secs: Option<u64>,
 ) -> Result<String, QueryError> {
     match timeout_secs {
         Some(t) => {
-            let sequence = drive_analyze_write(conn, explain_analyze_sql, cancel.clone());
+            let sequence = drive_analyze_write(conn, explain_analyze_sql, cancel.clone(), dialect);
             match tokio::time::timeout(Duration::from_secs(t), sequence).await {
                 Ok(result) => result,
                 Err(_elapsed) => {
                     cancel.cancel();
-                    let rollback = conn.execute("ROLLBACK", CancelToken::new());
+                    let rollback = conn.execute(dbc_core::tx_rollback_sql(dialect), CancelToken::new());
                     let _ =
                         tokio::time::timeout(Duration::from_secs(ROLLBACK_GRACE_SECS), rollback)
                             .await;
@@ -1204,7 +1511,7 @@ async fn drive_analyze_write_bounded(
                 }
             }
         }
-        None => drive_analyze_write(conn, explain_analyze_sql, cancel).await,
+        None => drive_analyze_write(conn, explain_analyze_sql, cancel, dialect).await,
     }
 }
 
@@ -1220,9 +1527,11 @@ async fn run_analyze_write_inner(
     handle: tokio::runtime::Handle,
 ) -> Result<String, QueryError> {
     guard_not_read_only(spec_is_read_only(&spec))?; // belt-and-braces — see doc comment.
+    // Captured BEFORE `spec` moves into `open_spec` (G15 T5).
+    let dialect = spec_dialect(&spec);
     let mut opened = open_spec(spec, handle).await?;
     let cancel = CancelToken::new();
-    drive_analyze_write_bounded(&mut *opened.conn, &explain_analyze_sql, cancel, timeout_secs).await
+    drive_analyze_write_bounded(&mut *opened.conn, &explain_analyze_sql, cancel, dialect, timeout_secs).await
     // `opened` drops here unconditionally — the ultimate backstop, same as run_write_transaction_inner.
 }
 
@@ -1325,21 +1634,58 @@ async fn run_mssql_backup_inner(
     let mut opened = open_spec(spec, handle).await?;
     let sql = backup::build_backup_sql(&database, &server_path);
     opened.conn.execute(&sql, CancelToken::new()).await?;
+    // G15 T8 HARD GATE ITEM 1 fix: `execute()`'s `Ok` alone is NOT proof the
+    // backup file actually got written — see `backup::backup_restore_available`
+    // 's doc comment for the full, honestly-still-not-fully-characterized
+    // account of why (a `WITH STATS` clause was A confirmed contributing
+    // cause and has been removed from `build_backup_sql`, but the failure
+    // still recurs intermittently even without it). Verify via
+    // `xp_fileexist` instead of trusting the write path's own report of
+    // itself — this stays in place regardless of whether the underlying
+    // cause is ever fully root-caused.
+    let exists = drain_single_text_cell(
+        &mut *opened.conn,
+        &backup::build_verify_backup_file_exists_sql(&server_path),
+        CancelToken::new(),
+    )
+    .await?;
+    if exists.trim() != "1" {
+        return Err(QueryError::msg(
+            "BACKUP DATABASE nahlásilo úspěch, ale soubor zálohy se na serveru nenašel \
+             (ověřeno přes xp_fileexist) — zkuste zálohu spustit znovu",
+        ));
+    }
     Ok(())
 }
 
 /// G11 T4: `QueryRunner::run_mssql_restore`'s async body — hard-blocked on
 /// read-only, no override (`BackupOp::Restore` is never exempt). Opens ONE
 /// dedicated connection and issues `SET SINGLE_USER` -> `RESTORE DATABASE`
-/// -> `SET MULTI_USER` over that SAME connection, in order
-/// (`Connection::execute`'s transaction-per-connection invariant). The
-/// closing `SET MULTI_USER` is attempted even if `RESTORE` failed
-/// (best-effort, mirrors `drive_write_sequence`'s own "the ROLLBACK
-/// attempt's result is discarded" posture) — the FIRST failure among the
-/// three statements (i.e. `RESTORE`'s, since `SINGLE_USER` failing returns
-/// immediately via `?` before `RESTORE` is even attempted) is what's
-/// returned to the caller; a subsequent `MULTI_USER` failure never
-/// overrides it.
+/// -> (poll for ONLINE) -> `SET MULTI_USER` over that SAME connection, in
+/// order (`Connection::execute`'s transaction-per-connection invariant).
+///
+/// G15 T8 live-found fix: `RESTORE DATABASE`'s own `execute()` call can
+/// return `Ok` before the server has actually finished bringing the
+/// database online — reproduced live, consistently, with fresh
+/// per-statement connections too (ruling out connection reuse as the
+/// cause): immediately after a `Ok`-reporting `RESTORE`, `sys.databases
+/// .state_desc` still read `RESTORING`, and issuing `SET MULTI_USER` right
+/// away failed outright ("ALTER DATABASE is not permitted while a database
+/// is in the Restoring state") — while the SAME SQL text run manually via
+/// `sqlcmd` (a different ODBC client) transitioned to `ONLINE` immediately,
+/// confirming this is a driver-execution-path timing gap, not a T-SQL
+/// authoring bug. Mitigated (NOT fully fixed — the poll can still time out;
+/// see `backup::backup_restore_available`'s doc comment) by POLLING for
+/// `ONLINE` (bounded, matching `PLAN_ROW_CAP`-style "never unbounded"
+/// discipline elsewhere in this file) between `RESTORE` and `MULTI_USER`,
+/// instead of assuming `execute()`'s `Ok` means the restore is actually
+/// finished.
+///
+/// The closing `SET MULTI_USER` is attempted even if `RESTORE` failed or
+/// the database never reached `ONLINE` (best-effort, mirrors
+/// `drive_write_sequence`'s own "the ROLLBACK attempt's result is
+/// discarded" posture — a `MULTI_USER` failure never overrides
+/// `restore_result`/the online-poll outcome, both checked AFTER it runs).
 async fn run_mssql_restore_inner(
     spec: ConnectSpec,
     database: String,
@@ -1359,13 +1705,45 @@ async fn run_mssql_restore_inner(
         .conn
         .execute(&backup::build_restore_sql(&database, &server_path), cancel.clone())
         .await;
-    // Best-effort MULTI_USER regardless of RESTORE's outcome — its own
-    // result never overrides `restore_result` (see doc comment above).
+
+    // Poll for ONLINE (bounded: 15 x 1s) BEFORE touching MULTI_USER, which
+    // SQL Server refuses outright while still RESTORING — only when
+    // RESTORE's own execute() reported success; a genuine RESTORE failure
+    // skips straight to the best-effort MULTI_USER below.
+    let mut online = false;
+    if restore_result.is_ok() {
+        for _ in 0..15 {
+            if let Ok(state) = drain_single_text_cell(
+                &mut *opened.conn,
+                &backup::build_verify_database_online_sql(&database),
+                cancel.clone(),
+            )
+            .await
+            {
+                if state.trim() == "ONLINE" {
+                    online = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    // Best-effort MULTI_USER regardless — a "not permitted while
+    // Restoring" error here (the database never reached ONLINE within the
+    // poll bound) is expected and discarded; see doc comment above.
     let _ = opened
         .conn
         .execute(&backup::build_single_user_sql(&database, true), cancel)
         .await;
-    restore_result.map(|_| ())
+    restore_result?;
+    if !online {
+        return Err(QueryError::msg(
+            "RESTORE DATABASE nahlásilo úspěch, ale databáze nepřešla do stavu ONLINE \
+             (zůstala RESTORING) ani po 15s čekání",
+        ));
+    }
+    Ok(())
 }
 
 /// G11 T4: `QueryRunner::run_sqlite_backup`'s async body — belt-and-braces
@@ -1421,10 +1799,11 @@ async fn run_script_statement(
     conn: &mut dyn Connection,
     sql: &str,
     read_only: bool,
+    dialect: dbc_core::Dialect,
     timeout_secs: Option<u64>,
     run_cancel: &CancelToken,
 ) -> Result<Option<u64>, QueryError> {
-    let action = dispatch_statement(sql, read_only);
+    let action = dispatch_statement(sql, read_only, dialect);
     if action == StmtDispatch::RejectReadOnly {
         return Err(guard_not_read_only(true).unwrap_err());
     }
@@ -1490,6 +1869,22 @@ async fn run_script_statement(
 /// `spawn_blocking` over `std::fs`/`std::io::Read` — the same "blocking
 /// work never runs on a runtime worker thread" dispatch `open_spec` already
 /// uses for the driver connect step.
+/// G15 T5 (design §2c iv): `SplitError::UnsupportedGoCount` (an MSSQL `GO
+/// <n>` repeat count, refused fail-closed by the splitter) gets a dedicated
+/// Czech message instead of the generic Debug-formatted text every other
+/// variant still gets. Deliberately duplicated in T4's own SQL-composer
+/// call sites (`split_error_message` there too) rather than shared — T4/T5
+/// are parallel, disjoint-file tasks (Global Constraints' single-writer
+/// rule), and this keeps both independently compilable/testable.
+fn split_error_message(e: &dbc_core::SplitError) -> String {
+    match e {
+        dbc_core::SplitError::UnsupportedGoCount => {
+            "GO s počtem opakování není podporováno".to_string()
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 async fn read_and_split_file(
     path: &std::path::Path,
     dialect: dbc_core::Dialect,
@@ -1512,7 +1907,8 @@ async fn read_and_split_file(
                     Ok(None) => {}
                     Err(e) => {
                         return Err(QueryError::msg(format!(
-                            "[skript] neúplný SQL konstrukt na konci souboru: {e:?}"
+                            "[skript] neúplný SQL konstrukt na konci souboru: {}",
+                            split_error_message(&e)
                         )));
                     }
                 }
@@ -1520,7 +1916,13 @@ async fn read_and_split_file(
             }
             match splitter.push(&chunk[..n]) {
                 Ok(mut more) => stmts.append(&mut more),
-                Err(e) => return Err(QueryError::msg(format!("[soubor] {}: {e:?}", path.display()))),
+                Err(e) => {
+                    return Err(QueryError::msg(format!(
+                        "[soubor] {}: {}",
+                        path.display(),
+                        split_error_message(&e)
+                    )))
+                }
             }
         }
     })
@@ -1584,7 +1986,7 @@ async fn drive_script(
     }
 
     if opts.tx_scope == TxScope::WholeRun {
-        if conn.execute("BEGIN", cancel.child_token()).await.is_err() {
+        if conn.execute(dbc_core::tx_begin_sql(opts.dialect), cancel.child_token()).await.is_err() {
             // A BEGIN failure aborts the run immediately — no tx opened,
             // nothing to roll back.
             let _ = tx
@@ -1617,7 +2019,7 @@ async fn drive_script(
         let mut stop_action: Option<FailureAction> = None;
 
         if opts.tx_scope == TxScope::PerFile {
-            if let Err(e) = conn.execute("BEGIN", cancel.child_token()).await {
+            if let Err(e) = conn.execute(dbc_core::tx_begin_sql(opts.dialect), cancel.child_token()).await {
                 let _ = tx.send(ScriptEvent::StatementFailed { stmt_index, error: e }).await;
                 statements_failed += 1;
                 file_stmts_failed += 1;
@@ -1645,6 +2047,7 @@ async fn drive_script(
                             conn,
                             stmt,
                             read_only,
+                            opts.dialect,
                             opts.statement_timeout_secs,
                             &cancel,
                         )
@@ -1690,8 +2093,8 @@ async fn drive_script(
 
         // Clean end of file: commit a per-file tx if nothing failed.
         if stop_action.is_none() && opts.tx_scope == TxScope::PerFile {
-            if let Err(e) = conn.execute("COMMIT", cancel.child_token()).await {
-                let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+            if let Err(e) = conn.execute(dbc_core::tx_commit_sql(opts.dialect), cancel.child_token()).await {
+                let _ = conn.execute(dbc_core::tx_rollback_sql(opts.dialect), cancel.child_token()).await;
                 let _ = tx.send(ScriptEvent::StatementFailed { stmt_index, error: e }).await;
                 statements_failed += 1;
                 file_stmts_failed += 1;
@@ -1704,13 +2107,13 @@ async fn drive_script(
             match action {
                 FailureAction::AbortRun => {
                     if opts.tx_scope != TxScope::None {
-                        let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                        let _ = conn.execute(dbc_core::tx_rollback_sql(opts.dialect), cancel.child_token()).await;
                     }
                     aborted = true;
                 }
                 FailureAction::NextFile => {
                     if opts.tx_scope == TxScope::PerFile {
-                        let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                        let _ = conn.execute(dbc_core::tx_rollback_sql(opts.dialect), cancel.child_token()).await;
                     }
                     // WholeRun: the run-level tx stays open — a broken file
                     // is skipped, not the whole accumulated run.
@@ -1735,8 +2138,8 @@ async fn drive_script(
     }
 
     if !aborted && opts.tx_scope == TxScope::WholeRun {
-        if conn.execute("COMMIT", cancel.child_token()).await.is_err() {
-            let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+        if conn.execute(dbc_core::tx_commit_sql(opts.dialect), cancel.child_token()).await.is_err() {
+            let _ = conn.execute(dbc_core::tx_rollback_sql(opts.dialect), cancel.child_token()).await;
             aborted = true;
         }
     }
@@ -1766,11 +2169,12 @@ async fn run_one_multi_statement(
     total: usize,
     sql: &str,
     read_only: bool,
+    dialect: dbc_core::Dialect,
     timeout_secs: Option<u64>,
     run_cancel: &CancelToken,
     tx: &tokio::sync::mpsc::Sender<MultiQueryEvent>,
 ) -> Result<(), ()> {
-    let action = dispatch_statement(sql, read_only);
+    let action = dispatch_statement(sql, read_only, dialect);
     if action == StmtDispatch::RejectReadOnly {
         let _ = tx
             .send(MultiQueryEvent::StatementFailed { index, error: guard_not_read_only(true).unwrap_err() })
@@ -1849,6 +2253,10 @@ async fn connect_and_run_many_inner(
     // Captured BEFORE `spec` moves into `open_spec` — same convention
     // `run_script`/`open_monitor` use.
     let read_only = spec_is_read_only(&spec);
+    // G15 T5: dialect for `dispatch_statement`'s bracket-aware read
+    // classification (`is_read_statement_d`) — also captured before `spec`
+    // moves.
+    let dialect = spec_dialect(&spec);
     let mut opened = match open_spec(spec, handle).await {
         Ok(o) => o,
         Err(e) => {
@@ -1865,7 +2273,7 @@ async fn connect_and_run_many_inner(
         if cancel.is_cancelled() {
             return;
         }
-        if run_one_multi_statement(conn, index, total, sql, read_only, timeout_secs, &cancel, &tx)
+        if run_one_multi_statement(conn, index, total, sql, read_only, dialect, timeout_secs, &cancel, &tx)
             .await
             .is_err()
         {
@@ -1882,15 +2290,9 @@ async fn connect_and_run_many_inner(
 /// rows are ever buffered in memory at once).
 const CSV_IMPORT_PRODUCER_DEPTH: usize = 4;
 
-/// G12 T7: the run driver — SHARED guard first, then BEGIN, then streams
-/// `job.path` through a `spawn_blocking` producer (the `csv` crate's
-/// `Reader` is synchronous; this is the same "blocking work never runs on a
-/// runtime worker thread" dispatch `open_spec`/`read_and_split_file`
-/// already use) that chunks rows into `CSV_IMPORT_BATCH_SIZE`-row pieces
-/// over a bounded channel, executing one `INSERT` per chunk via
-/// `csv_import::generate_insert_batches`. ANY failure (guard refusal, open
-/// error, producer parse/IO error, a chunk's generated statement erroring)
-/// ROLLBACKs and reports zero rows imported — never partial.
+/// G12 T7: the run driver — SHARED guard first, then open, then delegates to
+/// `run_csv_import_drive` for everything from BEGIN onward. `dialect` is
+/// captured BEFORE `spec` moves into `open_spec` (G15 T5).
 async fn run_csv_import_inner(
     spec: ConnectSpec,
     job: CsvImportJob,
@@ -1911,6 +2313,7 @@ async fn run_csv_import_inner(
         let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg("cancelled") }).await;
         return;
     }
+    let dialect = spec_dialect(&spec);
     let mut opened = match open_spec(spec, handle).await {
         Ok(o) => o,
         Err(e) => {
@@ -1923,7 +2326,35 @@ async fn run_csv_import_inner(
         return;
     }
     let conn = &mut *opened.conn;
-    if let Err(e) = conn.execute("BEGIN", cancel.child_token()).await {
+    run_csv_import_drive(conn, dialect, &job, &cancel, timeout_secs, &tx, started).await;
+    // `opened` (connection + tunnel) drops here unconditionally.
+}
+
+/// G15 T5 (deviation, "reality/tests win" — a live MSSQL server isn't
+/// available in a unit test, since `open_config`'s eager `probe()` requires
+/// one, so the dialect-correct BEGIN/COMMIT/ROLLBACK text needs a seam that
+/// doesn't require a live connection): the post-connect body of
+/// `run_csv_import_inner`, extracted so it's kept generic over
+/// `&mut dyn Connection` — same "testable via a mock `Connection`, no
+/// `ConnectSpec`/`open_spec` needed" precedent `drive_write_sequence`/
+/// `drive_script` already establish. BEGIN, then streams `job.path` through
+/// a `spawn_blocking` producer (the `csv` crate's `Reader` is synchronous;
+/// this is the same "blocking work never runs on a runtime worker thread"
+/// dispatch `open_spec`/`read_and_split_file` already use) that chunks rows
+/// into `CSV_IMPORT_BATCH_SIZE`-row pieces over a bounded channel, executing
+/// one `INSERT` per chunk via `csv_import::generate_insert_batches_d`. ANY
+/// failure (BEGIN, producer parse/IO error, a chunk's generated statement
+/// erroring) ROLLBACKs and reports zero rows imported — never partial.
+async fn run_csv_import_drive(
+    conn: &mut dyn Connection,
+    dialect: dbc_core::Dialect,
+    job: &CsvImportJob,
+    cancel: &CancelToken,
+    timeout_secs: Option<u64>,
+    tx: &tokio::sync::mpsc::Sender<CsvImportEvent>,
+    started: Instant,
+) {
+    if let Err(e) = conn.execute(dbc_core::tx_begin_sql(dialect), cancel.child_token()).await {
         let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
         return;
     }
@@ -1972,14 +2403,14 @@ async fn run_csv_import_inner(
     let mut batch_index: usize = 0;
     while let Some(chunk_result) = chunk_rx.recv().await {
         if cancel.is_cancelled() {
-            let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+            let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.child_token()).await;
             let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg("cancelled") }).await;
             return;
         }
         let rows = match chunk_result {
             Ok(rows) => rows,
             Err(msg) => {
-                let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.child_token()).await;
                 let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg(msg) }).await;
                 return;
             }
@@ -1987,7 +2418,14 @@ async fn run_csv_import_inner(
         let _ = tx
             .send(CsvImportEvent::BatchStarted { batch_index, rows_in_batch: rows.len() })
             .await;
-        let stmts = crate::csv_import::generate_insert_batches(
+        // Batch C review BLOCKER 1: dialect-aware sibling, threading the
+        // SAME `dialect` this function's BEGIN/COMMIT/ROLLBACK already use
+        // (`spec_dialect`, resolved once by the caller) — an MSSQL CSV
+        // import must bracket-quote idents and `N''`-prefix string literals,
+        // not silently double-quote/plain-`''` (collation corruption class,
+        // probe-proven before this fix).
+        let stmts = crate::csv_import::generate_insert_batches_d(
+            dialect,
             job.schema.as_deref(),
             &job.table,
             &job.columns,
@@ -2012,7 +2450,7 @@ async fn run_csv_import_inner(
                 stmts.into_iter().next()
             }
             Err(msg) => {
-                let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.child_token()).await;
                 let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg(msg) }).await;
                 return;
             }
@@ -2038,7 +2476,7 @@ async fn run_csv_import_inner(
                 None => fut.await,
             };
             if let Err(e) = result {
-                let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.child_token()).await;
                 let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
                 return;
             }
@@ -2050,15 +2488,16 @@ async fn run_csv_import_inner(
             .await;
     }
 
-    if let Err(e) = conn.execute("COMMIT", cancel.child_token()).await {
-        let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+    if let Err(e) = conn.execute(dbc_core::tx_commit_sql(dialect), cancel.child_token()).await {
+        let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.child_token()).await;
         let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
         return;
     }
     let _ = tx
         .send(CsvImportEvent::Finished { rows_imported: rows_committed, elapsed: started.elapsed() })
         .await;
-    // `opened` (connection + tunnel) drops here unconditionally.
+    // caller (`run_csv_import_inner`) drops `opened` (connection + tunnel)
+    // unconditionally once this function returns.
 }
 
 /// Defensive cap on materialized lookup rows — see `QueryRunner::fetch_lookup`.
@@ -2170,13 +2609,69 @@ async fn open_spec(
 /// arrow batch, then `Finished` — or `Failed` at whichever step errors.
 /// Factored out of `connect_and_run` so the timeout watchdog above can race
 /// the whole thing with `tokio::select!`.
+///
+/// G15 T8 whole-branch review B2 fix: `Connection::query` is a READ
+/// mechanism — `dbc-driver-mssql`'s implementation opens a fresh,
+/// autocommit connection and calls the ODBC-level `execute` on it, and for
+/// any statement that produces no result set (any write, or DDL) returns
+/// `Err("statement produced no result set")` — AFTER the statement has
+/// already committed on that fresh connection (autocommit ON, nothing to
+/// roll back). Before this fix, the single-statement editor path called
+/// `query()` unconditionally for every dialect, so a bare MSSQL `UPDATE`
+/// silently committed while the UI reported an error — and retrying (a
+/// natural reaction to a shown error) double-applied it. Reviewer-proved
+/// live.
+///
+/// Fix: classify the statement with the SAME `dispatch_statement` the
+/// multi-statement path (`run_one_multi_statement`) already uses, and for
+/// a WRITE **on MSSQL specifically**, run it through `Connection::execute`
+/// (the sanctioned write entry point, correct affected-rows, no
+/// query()-for-writes gap) and report `QueryEvent::WriteFinished` instead
+/// of streaming a — nonexistent — result. Every other case (reads on all
+/// three engines, AND writes on Postgres/Sqlite, whose own `query()` has
+/// no such gap — a write there returns `Ok` with a zero-column, zero-row
+/// stream today) still takes the unchanged `conn.query()` branch below,
+/// byte-identical to before this fix: this is a narrower, MSSQL-only
+/// change, not a blanket "route every write through execute()" rewrite,
+/// specifically so Postgres/Sqlite's existing single-statement write
+/// behavior (and its exact `QueryEvent`/status-text shape) is untouched.
 async fn stream_query(
     conn: &mut Box<dyn Connection>,
     sql: &str,
     cancel: CancelToken,
     tx: &tokio::sync::mpsc::Sender<QueryEvent>,
     started: Instant,
+    dialect: dbc_core::Dialect,
+    read_only: bool,
 ) {
+    if dialect == dbc_core::Dialect::Mssql {
+        match dispatch_statement(sql, read_only, dialect) {
+            StmtDispatch::RunAsWrite => {
+                match conn.execute(sql, cancel).await {
+                    Ok(affected) => {
+                        let _ = tx
+                            .send(QueryEvent::WriteFinished { affected, elapsed: started.elapsed() })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(QueryEvent::Failed(e)).await;
+                    }
+                }
+                return;
+            }
+            // Guard 1 (`read_only_guard_rejects`, main.rs) already blocks
+            // this before `connect_and_run` is ever dispatched — same
+            // `is_read_statement_d` primitive `dispatch_statement` itself
+            // uses, so this arm is defensively unreachable in practice.
+            // Handled explicitly (not `unreachable!()`) so a future caller
+            // that skips Guard 1 fails loud instead of panicking.
+            StmtDispatch::RejectReadOnly => {
+                let _ = tx.send(QueryEvent::Failed(guard_not_read_only(true).unwrap_err())).await;
+                return;
+            }
+            StmtDispatch::RunAsRead => {}
+        }
+    }
     match conn.query(sql, cancel).await {
         Err(e) => {
             let _ = tx.send(QueryEvent::Failed(e)).await;
@@ -2204,6 +2699,236 @@ async fn stream_query(
             if !failed {
                 let _ = tx.send(QueryEvent::Finished { elapsed: started.elapsed() }).await;
             }
+        }
+    }
+}
+
+/// G15 T8 whole-branch review B2 REQUIRED regression test: `stream_query`'s
+/// MSSQL-write routing, over a mock `Connection` — no docker needed (the
+/// live docker counterpart lives in `mssql_docker_tests`, below). Proves
+/// the exact shape of the fix: `query()` (whose real MSSQL implementation
+/// errors AFTER committing, the root cause) is never called for a WRITE on
+/// an MSSQL dialect, `execute()` is called exactly once with the write's
+/// own SQL, the resulting event is `WriteFinished` (never `Failed`), and —
+/// critically — pg/sqlite and MSSQL-reads are UNCHANGED: still routed
+/// through `query()`, never `execute()`.
+#[cfg(test)]
+mod stream_query_write_dispatch_tests {
+    use super::*;
+    use dbc_core::arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// `query_calls`/`execute_calls`/`executed_sql` are independently
+    /// observable — a test asserts on whichever of the two paths it
+    /// expects taken, and that the OTHER was never touched.
+    struct RecordingConnection {
+        query_calls: Arc<AtomicUsize>,
+        execute_calls: Arc<AtomicUsize>,
+        executed_sql: Arc<Mutex<Vec<String>>>,
+        affected: u64,
+    }
+
+    impl RecordingConnection {
+        fn new(affected: u64) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+            let query_calls = Arc::new(AtomicUsize::new(0));
+            let execute_calls = Arc::new(AtomicUsize::new(0));
+            let executed_sql = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    query_calls: query_calls.clone(),
+                    execute_calls: execute_calls.clone(),
+                    executed_sql: executed_sql.clone(),
+                    affected,
+                },
+                query_calls,
+                execute_calls,
+                executed_sql,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for RecordingConnection {
+        async fn query(
+            &mut self,
+            _sql: &str,
+            _cancel: CancelToken,
+        ) -> Result<dbc_core::QueryStream, QueryError> {
+            self.query_calls.fetch_add(1, Ordering::SeqCst);
+            // Mirrors dbc-driver-mssql's REAL query() behavior for a
+            // statement that produces no result set — the exact bug B2
+            // proves stream_query no longer routes a write through.
+            let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+            let (_tx, rx) = tokio::sync::mpsc::channel(4); // immediately closed -> zero batches
+            Ok(dbc_core::QueryStream { columns: schema, batches: rx })
+        }
+        async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn execute(&mut self, sql: &str, _cancel: CancelToken) -> Result<u64, QueryError> {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            self.executed_sql.lock().unwrap().push(sql.to_string());
+            Ok(self.affected)
+        }
+    }
+
+    async fn drain(mut rx: tokio::sync::mpsc::Receiver<QueryEvent>) -> Vec<QueryEvent> {
+        let mut out = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// THE regression: an MSSQL UPDATE goes through `execute()`, never
+    /// `query()` — the pre-fix bug (`query()` erroring AFTER the write had
+    /// already committed via its own fresh autocommit connection) can no
+    /// longer happen because `query()` is never called at all for this
+    /// case.
+    #[tokio::test]
+    async fn mssql_write_routes_through_execute_not_query() {
+        let (conn, query_calls, execute_calls, executed_sql) = RecordingConnection::new(3);
+        let mut conn: Box<dyn Connection> = Box::new(conn);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        stream_query(
+            &mut conn,
+            "UPDATE t SET x = 1",
+            CancelToken::new(),
+            &tx,
+            Instant::now(),
+            dbc_core::Dialect::Mssql,
+            false,
+        )
+        .await;
+        drop(tx);
+        let events = drain(rx).await;
+
+        assert_eq!(query_calls.load(Ordering::SeqCst), 0, "a write must never call query()");
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(executed_sql.lock().unwrap().as_slice(), &["UPDATE t SET x = 1".to_string()]);
+        assert_eq!(events.len(), 1, "exactly one terminal event, no Started/Batch: {events:?}");
+        match &events[0] {
+            QueryEvent::WriteFinished { affected, .. } => assert_eq!(*affected, 3),
+            other => panic!("expected WriteFinished, got {other:?}"),
+        }
+    }
+
+    /// A read on an MSSQL connection is completely unaffected by this fix
+    /// — still routed through `query()`, still streams.
+    #[tokio::test]
+    async fn mssql_read_still_routes_through_query_and_streams() {
+        let (conn, query_calls, execute_calls, _sql) = RecordingConnection::new(0);
+        let mut conn: Box<dyn Connection> = Box::new(conn);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        stream_query(
+            &mut conn,
+            "SELECT 1",
+            CancelToken::new(),
+            &tx,
+            Instant::now(),
+            dbc_core::Dialect::Mssql,
+            false,
+        )
+        .await;
+        drop(tx);
+        let events = drain(rx).await;
+
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 0, "a read must never call execute()");
+        assert_eq!(query_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(events.as_slice(), [QueryEvent::Started { .. }, QueryEvent::Finished { .. }]),
+            "expected Started then Finished (zero batches), got: {events:?}"
+        );
+    }
+
+    /// pg/sqlite REQUIRED regression: a write on a non-MSSQL dialect keeps
+    /// going through `query()`, byte-identical to before this fix —
+    /// `execute()` must never be reached for them (this codebase's
+    /// existing pg/sqlite `query()` already handles a zero-result-set
+    /// write correctly; the bug was MSSQL-only, so the fix must be too).
+    #[tokio::test]
+    async fn postgres_write_still_routes_through_query_unchanged() {
+        let (conn, query_calls, execute_calls, _sql) = RecordingConnection::new(9);
+        let mut conn: Box<dyn Connection> = Box::new(conn);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        stream_query(
+            &mut conn,
+            "UPDATE t SET x = 1",
+            CancelToken::new(),
+            &tx,
+            Instant::now(),
+            dbc_core::Dialect::Postgres,
+            false,
+        )
+        .await;
+        drop(tx);
+        let events = drain(rx).await;
+
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 0, "pg writes must stay on the query() path");
+        assert_eq!(query_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(events.as_slice(), [QueryEvent::Started { .. }, QueryEvent::Finished { .. }]),
+            "pg write shape must stay exactly what it was pre-fix: {events:?}"
+        );
+    }
+
+    /// Same for sqlite — both non-MSSQL dialects covered explicitly rather
+    /// than assuming Sqlite behaves like Postgres from one shared code
+    /// path (it does, but the test says so).
+    #[tokio::test]
+    async fn sqlite_write_still_routes_through_query_unchanged() {
+        let (conn, query_calls, execute_calls, _sql) = RecordingConnection::new(9);
+        let mut conn: Box<dyn Connection> = Box::new(conn);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        stream_query(
+            &mut conn,
+            "UPDATE t SET x = 1",
+            CancelToken::new(),
+            &tx,
+            Instant::now(),
+            dbc_core::Dialect::Sqlite,
+            false,
+        )
+        .await;
+        drop(tx);
+        let events = drain(rx).await;
+
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 0, "sqlite writes must stay on the query() path");
+        assert_eq!(query_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(events.as_slice(), [QueryEvent::Started { .. }, QueryEvent::Finished { .. }]),
+            "sqlite write shape must stay exactly what it was pre-fix: {events:?}"
+        );
+    }
+
+    /// Defensive arm coverage (main.rs's Guard 1 already blocks this
+    /// before `connect_and_run` is ever reached in practice) — a read-only
+    /// MSSQL connection asked to run a write fails loud via the SAME
+    /// `guard_not_read_only` message, never silently executes it.
+    #[tokio::test]
+    async fn mssql_write_on_read_only_connection_is_refused_without_executing() {
+        let (conn, _query_calls, execute_calls, _sql) = RecordingConnection::new(0);
+        let mut conn: Box<dyn Connection> = Box::new(conn);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        stream_query(
+            &mut conn,
+            "UPDATE t SET x = 1",
+            CancelToken::new(),
+            &tx,
+            Instant::now(),
+            dbc_core::Dialect::Mssql,
+            true, // read_only
+        )
+        .await;
+        drop(tx);
+        let events = drain(rx).await;
+
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            QueryEvent::Failed(e) => assert_eq!(e.message, "připojení je jen pro čtení"),
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 }
@@ -2270,7 +2995,22 @@ async fn monitor_loop(
                 // conn.execute call. Deliberately a direct check rather
                 // than guard_not_read_only() so the design's mandated
                 // message text is exact.
-                let result = if read_only {
+                //
+                // G15 T6 review fix (MINOR, defense in depth): `pid > 0` is
+                // checked HERE too, not just in `monitor_sql::mssql::BLOCKING`'s
+                // own `blocking_session_id > 0` filter — MSSQL's DMVs can
+                // surface negative "blocker" ids for system pseudo-sessions
+                // (`-2` orphaned DTC, `-3`/`-4` recovery/latch), and this
+                // dispatch point must not trust the SQL-side filter alone
+                // (same "every layer holds on its own" posture as every
+                // other guard in this codebase). A non-positive pid is
+                // refused before any driver call, independent of
+                // `read_only` — it's a structurally invalid target, not a
+                // permission question. `kill_sql`'s own `debug_assert!(pid
+                // > 0)` stays as the last-resort backstop.
+                let result = if pid <= 0 {
+                    Err(QueryError::msg("neplatné PID procesu"))
+                } else if read_only {
                     Err(QueryError::msg(MONITOR_READ_ONLY_KILL_MSG))
                 } else {
                     match crate::monitor_sql::kill_sql(engine, pid) {
@@ -2306,10 +3046,48 @@ async fn run_monitor_refresh(
             blocking: drain_rows(conn, pg::BLOCKING, &cancel).await,
             tables: drain_rows(conn, pg::TABLES, &cancel).await,
         },
-        // Unreachable today: monitor_available gates open_monitor to
-        // Postgres. When dbc-driver-mssql lands, this arm switches to the
-        // monitor_sql::mssql statement set (design §7).
-        _ => {
+        // G15 T6: complete, correct code — reachable the MOMENT
+        // `monitor::monitor_available` is updated (T8's flip, gated on the
+        // XACT_ABORT matrix, Global Constraints). 11 statements over the
+        // SAME dedicated connection (session-sharing caveat, same as pg),
+        // strictly sequential; each `drain_rows` failure is captured
+        // per-statement (never a panic — a `VIEW SERVER STATE`-denied DMV
+        // query just becomes that statement's `Err(driver message)`, same
+        // as pg's own permission-denied rows) and the `monitor::merge_*`
+        // helpers turn the 11 raw results into the 8 pg-shaped tiles
+        // `assemble_snapshot` already knows how to degrade per-tile.
+        // `RUNNING`/`BLOCKING`/`TABLES` pass through `drain_rows` directly —
+        // their column order already matches the pg parse contracts by
+        // construction (monitor_sql.rs's module doc), so
+        // `parse_blocking_edges`/`build_blocking_tree`'s iterative,
+        // `MONITOR_TREE_NODE_CAP`-bounded tree machinery applies to MSSQL
+        // blocking chains (via `blocking_session_id`) with no new code.
+        dbc_state::Engine::Mssql => {
+            use crate::monitor_sql::mssql as ms;
+            let counts = drain_rows(conn, ms::CONNECTIONS, &cancel).await;
+            let max = drain_rows(conn, ms::CONNECTIONS_MAX, &cancel).await;
+            let waiting = drain_rows(conn, ms::LOCKS_WAITING, &cancel).await;
+            let deadlocks = drain_rows(conn, ms::DEADLOCKS, &cancel).await;
+            let size = drain_rows(conn, ms::SIZE, &cancel).await;
+            let cache = drain_rows(conn, ms::CACHE_HIT, &cancel).await;
+            let uptime = drain_rows(conn, ms::UPTIME, &cancel).await;
+            let xact = drain_rows(conn, ms::XACT_TOTAL, &cancel).await;
+            let (data_size, wal_size) = monitor::split_mssql_size(size);
+            monitor::RefreshResults {
+                connections: monitor::merge_mssql_connections(counts, max),
+                locks: monitor::merge_mssql_locks(waiting, deadlocks),
+                data_size,
+                wal_size,
+                perf: monitor::merge_mssql_perf(cache, uptime, xact),
+                running: drain_rows(conn, ms::RUNNING, &cancel).await,
+                blocking: drain_rows(conn, ms::BLOCKING, &cancel).await,
+                tables: drain_rows(conn, ms::TABLES, &cancel).await,
+            }
+        }
+        // Sqlite: no monitor concept (spec) — unreachable today
+        // (`monitor_available` gates `open_monitor` to Postgres/MSSQL-once-
+        // flipped), message unchanged.
+        dbc_state::Engine::Sqlite => {
             let err = || Err("monitor není pro tento engine k dispozici".to_string());
             monitor::RefreshResults {
                 connections: err(), locks: err(), data_size: err(), wal_size: err(),
@@ -2413,12 +3191,60 @@ mod write_transaction_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         };
         assert!(spec_is_read_only(&ConnectSpec::Config { cfg: Box::new(cfg.clone()), secret: None }));
         let mut cfg2 = cfg;
         cfg2.read_only = false;
         assert!(!spec_is_read_only(&ConnectSpec::Config { cfg: Box::new(cfg2), secret: None }));
         assert!(!spec_is_read_only(&ConnectSpec::Url("irrelevant".into())));
+    }
+
+    /// G15 T5: `spec_dialect` maps every `Engine` (Config path) and every
+    /// CLI-arg URL scheme (`Url` path) exactly like `main.rs::engine_from_url`'s
+    /// own postgres-vs-sqlite dispatch.
+    #[test]
+    fn spec_dialect_maps_engines_and_url_schemes() {
+        fn cfg_with_engine(engine: dbc_state::Engine) -> dbc_state::ConnectionConfig {
+            dbc_state::ConnectionConfig {
+                id: "x".into(),
+                name: "x".into(),
+                folder: Vec::new(),
+                engine,
+                host: String::new(),
+                port: None,
+                database: String::new(),
+                user: String::new(),
+                read_only: false,
+                timeout_secs: None,
+                auto_limit: None,
+                ssh: None,
+                favourite: false,
+                mssql: None,
+            }
+        }
+        assert_eq!(
+            spec_dialect(&ConnectSpec::Config { cfg: Box::new(cfg_with_engine(dbc_state::Engine::Postgres)), secret: None }),
+            dbc_core::Dialect::Postgres
+        );
+        assert_eq!(
+            spec_dialect(&ConnectSpec::Config { cfg: Box::new(cfg_with_engine(dbc_state::Engine::Sqlite)), secret: None }),
+            dbc_core::Dialect::Sqlite
+        );
+        assert_eq!(
+            spec_dialect(&ConnectSpec::Config { cfg: Box::new(cfg_with_engine(dbc_state::Engine::Mssql)), secret: None }),
+            dbc_core::Dialect::Mssql
+        );
+        assert_eq!(
+            spec_dialect(&ConnectSpec::Url("postgres://localhost/db".into())),
+            dbc_core::Dialect::Postgres
+        );
+        assert_eq!(
+            spec_dialect(&ConnectSpec::Url("postgresql://localhost/db".into())),
+            dbc_core::Dialect::Postgres
+        );
+        assert_eq!(spec_dialect(&ConnectSpec::Url("C:/data/app.db".into())), dbc_core::Dialect::Sqlite);
+        assert_eq!(spec_dialect(&ConnectSpec::Url(":memory:".into())), dbc_core::Dialect::Sqlite);
     }
 
     /// Opens a fresh temp-file sqlite connection via `crate::connect::open`
@@ -2464,7 +3290,7 @@ mod write_transaction_tests {
             ws("UPDATE t SET name = 'b' WHERE id = 1", Some(1)),
             ws("INSERT INTO t(id, name) VALUES (2, 'c')", None),
         ];
-        let total = drive_write_sequence(&mut *conn, &stmts, CancelToken::new()).await.unwrap();
+        let total = drive_write_sequence(&mut *conn, &stmts, CancelToken::new(), dbc_core::Dialect::Sqlite).await.unwrap();
         // 1 (the UPDATE's reported affected rows) + 1 (the INSERT's, even
         // though INSERT carries no expectation — the driver still reports
         // it, and it still counts toward the total).
@@ -2489,7 +3315,7 @@ mod write_transaction_tests {
             ws("UPDATE t SET name = 'b' WHERE id = 1", Some(1)),
             ws("UPDATE t SET name = 'z' WHERE id = 1", Some(2)),
         ];
-        let err = drive_write_sequence(&mut *conn, &stmts, CancelToken::new()).await.unwrap_err();
+        let err = drive_write_sequence(&mut *conn, &stmts, CancelToken::new(), dbc_core::Dialect::Sqlite).await.unwrap_err();
         assert_eq!(err.message, AFFECTED_MISMATCH_MSG);
 
         assert_eq!(read_one(&mut *conn, "SELECT name FROM t WHERE id = 1").await, Some("a".to_string()));
@@ -2509,7 +3335,7 @@ mod write_transaction_tests {
             ws("UPDATE t SET name = 'b' WHERE id = 1", Some(1)),
             ws("UPDATE no_such_table SET name = 'x'", None),
         ];
-        let err = drive_write_sequence(&mut *conn, &stmts, CancelToken::new()).await.unwrap_err();
+        let err = drive_write_sequence(&mut *conn, &stmts, CancelToken::new(), dbc_core::Dialect::Sqlite).await.unwrap_err();
         assert_ne!(err.message, AFFECTED_MISMATCH_MSG);
 
         assert_eq!(read_one(&mut *conn, "SELECT name FROM t WHERE id = 1").await, Some("a".to_string()));
@@ -2519,7 +3345,7 @@ mod write_transaction_tests {
     async fn drive_write_sequence_empty_statements_still_begins_and_commits() {
         let (_f, mut conn) = open_sqlite_test_conn().await;
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", CancelToken::new()).await.unwrap();
-        let total = drive_write_sequence(&mut *conn, &[], CancelToken::new()).await.unwrap();
+        let total = drive_write_sequence(&mut *conn, &[], CancelToken::new(), dbc_core::Dialect::Sqlite).await.unwrap();
         assert_eq!(total, 0);
     }
 
@@ -2545,6 +3371,7 @@ mod write_transaction_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         };
         let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
         // Exercises `run_write_transaction_inner` (the same body
@@ -2556,6 +3383,84 @@ mod write_transaction_tests {
         let handle = tokio::runtime::Handle::current();
         let err = run_write_transaction_inner(spec, Vec::new(), None, handle).await.unwrap_err();
         assert!(!err.message.is_empty());
+    }
+
+    /// G15 T5 REQUIRED (Global Constraints §1a): the shared guard fires
+    /// before `open_spec` for a read-only MSSQL connection too — no driver
+    /// call, no `MssqlConfig`/`MssqlConnection` ever built. Clone of
+    /// `run_write_transaction_refuses_read_only_connection_without_connecting`
+    /// with `engine: Engine::Mssql`.
+    #[tokio::test]
+    async fn run_write_transaction_refuses_read_only_mssql_without_connecting() {
+        let cfg = dbc_state::ConnectionConfig {
+            id: "x".into(),
+            name: "x".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Mssql,
+            database: "\0invalid".into(),
+            host: String::new(),
+            port: None,
+            user: String::new(),
+            read_only: true,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: None,
+        };
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let handle = tokio::runtime::Handle::current();
+        let err = run_write_transaction_inner(spec, Vec::new(), None, handle).await.unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    /// G15 T5: mock `Connection` recording every `execute()`d statement, so
+    /// the FIRST statement a transactional sequence sends is directly
+    /// assertable — used by the pg/MSSQL tx-begin-text regression tests
+    /// below.
+    struct CapturingConnection {
+        statements: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for CapturingConnection {
+        async fn query(
+            &mut self,
+            _sql: &str,
+            _cancel: CancelToken,
+        ) -> Result<dbc_core::QueryStream, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn execute(&mut self, sql: &str, _cancel: CancelToken) -> Result<u64, QueryError> {
+            self.statements.push(sql.to_string());
+            Ok(0)
+        }
+    }
+
+    /// G15 T5 REQUIRED: zero behavior change for pg — `drive_write_sequence`'s
+    /// first statement over a Postgres dialect is byte-equal to the historic
+    /// `"BEGIN"` literal.
+    #[tokio::test]
+    async fn pg_sequences_still_send_the_literal_begin() {
+        let mut conn = CapturingConnection { statements: Vec::new() };
+        let _ = drive_write_sequence(&mut conn, &[], CancelToken::new(), dbc_core::Dialect::Postgres).await;
+        assert_eq!(conn.statements.first().map(String::as_str), Some("BEGIN"));
+    }
+
+    /// G15 T5 REQUIRED (regression for G12's bare-`BEGIN`-on-MSSQL bug):
+    /// `drive_write_sequence`'s first statement over an Mssql dialect is the
+    /// fused `SET XACT_ABORT ON; BEGIN TRANSACTION`.
+    #[tokio::test]
+    async fn mssql_write_sequence_opens_with_fused_xact_abort_begin() {
+        let mut conn = CapturingConnection { statements: Vec::new() };
+        let _ = drive_write_sequence(&mut conn, &[], CancelToken::new(), dbc_core::Dialect::Mssql).await;
+        assert_eq!(
+            conn.statements.first().map(String::as_str),
+            Some(dbc_core::tx_begin_sql(dbc_core::Dialect::Mssql))
+        );
     }
 
     /// G10 CURATION item 3's REQUIRED test: a mock `Connection` that fails
@@ -2591,7 +3496,7 @@ mod write_transaction_tests {
     async fn statement_failure_pairs_display_sql_never_exec_sql() {
         let mut conn = FailsOnAlter;
         let stmts = admin_sql::alter_password(dbc_state::Engine::Postgres, "app_user", "s3cr'et");
-        let err = drive_write_sequence(&mut conn, &stmts, CancelToken::new()).await.unwrap_err();
+        let err = drive_write_sequence(&mut conn, &stmts, CancelToken::new(), dbc_core::Dialect::Sqlite).await.unwrap_err();
         assert!(err.message.contains("'***'"), "error must carry the redacted display_sql: {}", err.message);
         assert!(err.message.contains("ALTER ROLE \"app_user\""));
         assert!(!err.message.contains("s3cr"), "real password leaked into surfaced error: {}", err.message);
@@ -2618,6 +3523,7 @@ mod write_transaction_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         };
         let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
         let stmts = admin_sql::drop_role(dbc_state::Engine::Postgres, "bob");
@@ -2650,7 +3556,10 @@ mod write_transaction_tests {
             Err(QueryError::msg("not exercised by this test"))
         }
         async fn execute(&mut self, sql: &str, _cancel: CancelToken) -> Result<u64, QueryError> {
-            if sql == "BEGIN" {
+            // G15 T5: also recognizes the fused MSSQL begin so this mock
+            // stays assertable for every dialect, not just pg/sqlite's
+            // literal `"BEGIN"`.
+            if sql == "BEGIN" || sql == dbc_core::tx_begin_sql(dbc_core::Dialect::Mssql) {
                 return Ok(0);
             }
             if sql == "ROLLBACK" {
@@ -2684,7 +3593,8 @@ mod write_transaction_tests {
 
         let start = tokio::time::Instant::now();
         let result =
-            drive_write_sequence_bounded(&mut conn, &stmts, cancel.clone(), Some(1)).await;
+            drive_write_sequence_bounded(&mut conn, &stmts, cancel.clone(), dbc_core::Dialect::Sqlite, Some(1))
+                .await;
         let elapsed = start.elapsed();
 
         let err = result.unwrap_err();
@@ -2843,24 +3753,26 @@ mod analyze_write_tests {
             Err(QueryError::msg("not exercised by this test"))
         }
         async fn execute(&mut self, sql: &str, _cancel: CancelToken) -> Result<u64, QueryError> {
-            match sql {
-                "BEGIN" => {
-                    self.in_txn = true;
-                    Ok(0)
+            // G15 T5: `tx_begin_sql` isn't a `const fn`, so the MSSQL-fused
+            // literal can't be a match-arm pattern — an if/else-if chain
+            // (still one dispatch, no functional change) recognizes it
+            // alongside pg/sqlite's literal `"BEGIN"`, keeping this mock
+            // assertable for every dialect.
+            if sql == "BEGIN" || sql == dbc_core::tx_begin_sql(dbc_core::Dialect::Mssql) {
+                self.in_txn = true;
+                Ok(0)
+            } else if sql == "ROLLBACK" {
+                self.in_txn = false;
+                self.pending_insert = false; // discarded — never committed
+                Ok(0)
+            } else if sql == "COMMIT" {
+                if self.pending_insert {
+                    self.committed.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
-                "ROLLBACK" => {
-                    self.in_txn = false;
-                    self.pending_insert = false; // discarded — never committed
-                    Ok(0)
-                }
-                "COMMIT" => {
-                    if self.pending_insert {
-                        self.committed.store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    self.in_txn = false;
-                    Ok(0)
-                }
-                other => Err(QueryError::msg(format!("unexpected statement: {other}"))),
+                self.in_txn = false;
+                Ok(0)
+            } else {
+                Err(QueryError::msg(format!("unexpected statement: {sql}")))
             }
         }
     }
@@ -2900,6 +3812,7 @@ mod analyze_write_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         };
         let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
         let handle = tokio::runtime::Handle::current();
@@ -2920,7 +3833,7 @@ mod analyze_write_tests {
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new()).await.unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'a')", CancelToken::new()).await.unwrap();
 
-        let out = drive_analyze_write(&mut *conn, "SELECT 'plan-text'", CancelToken::new()).await.unwrap();
+        let out = drive_analyze_write(&mut *conn, "SELECT 'plan-text'", CancelToken::new(), dbc_core::Dialect::Sqlite).await.unwrap();
         assert_eq!(out, "plan-text");
         // Sanity: this connection is still usable afterward (ROLLBACK, not
         // a leaked open transaction) — a fresh statement succeeds.
@@ -2966,6 +3879,7 @@ mod analyze_write_tests {
             &mut conn,
             "INSERT INTO t VALUES (99, 'ghost') RETURNING n",
             CancelToken::new(),
+            dbc_core::Dialect::Postgres,
         )
         .await
         .unwrap();
@@ -2980,7 +3894,7 @@ mod analyze_write_tests {
     async fn drive_analyze_write_still_rolls_back_when_the_query_step_errors() {
         let (_f, mut conn) = open_sqlite_test_conn().await;
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", CancelToken::new()).await.unwrap();
-        let err = drive_analyze_write(&mut *conn, "SELECT * FROM no_such_table", CancelToken::new())
+        let err = drive_analyze_write(&mut *conn, "SELECT * FROM no_such_table", CancelToken::new(), dbc_core::Dialect::Sqlite)
             .await
             .unwrap_err();
         assert!(!err.message.is_empty());
@@ -3002,12 +3916,33 @@ mod script_run_tests {
 
     #[test]
     fn dispatch_statement_matrix() {
-        assert_eq!(dispatch_statement("SELECT 1", false), StmtDispatch::RunAsRead);
-        assert_eq!(dispatch_statement("SELECT 1", true), StmtDispatch::RunAsRead);
-        assert_eq!(dispatch_statement("UPDATE t SET x = 1", false), StmtDispatch::RunAsWrite);
-        assert_eq!(dispatch_statement("UPDATE t SET x = 1", true), StmtDispatch::RejectReadOnly);
+        use dbc_core::Dialect;
+        assert_eq!(dispatch_statement("SELECT 1", false, Dialect::Postgres), StmtDispatch::RunAsRead);
+        assert_eq!(dispatch_statement("SELECT 1", true, Dialect::Postgres), StmtDispatch::RunAsRead);
+        assert_eq!(dispatch_statement("UPDATE t SET x = 1", false, Dialect::Postgres), StmtDispatch::RunAsWrite);
+        assert_eq!(dispatch_statement("UPDATE t SET x = 1", true, Dialect::Postgres), StmtDispatch::RejectReadOnly);
         // fail-closed inputs are writes, not reads (guards.rs contract):
-        assert_eq!(dispatch_statement("SELECT 1 /* unterminated", true), StmtDispatch::RejectReadOnly);
+        assert_eq!(dispatch_statement("SELECT 1 /* unterminated", true, Dialect::Postgres), StmtDispatch::RejectReadOnly);
+    }
+
+    /// G15 T5: MSSQL dialect — a bracket-quoted reserved word must not
+    /// false-reject a genuine read, and the guard is still bracket-aware for
+    /// writes.
+    #[test]
+    fn dispatch_statement_matrix_mssql_bracket_aware() {
+        use dbc_core::Dialect;
+        assert_eq!(
+            dispatch_statement("SELECT [Delete], [Update] FROM AuditLog", true, Dialect::Mssql),
+            StmtDispatch::RunAsRead
+        );
+        assert_eq!(
+            dispatch_statement("UPDATE t SET x = 1", true, Dialect::Mssql),
+            StmtDispatch::RejectReadOnly
+        );
+        assert_eq!(
+            dispatch_statement("UPDATE t SET x = 1", false, Dialect::Mssql),
+            StmtDispatch::RunAsWrite
+        );
     }
 
     #[test]
@@ -3267,6 +4202,31 @@ mod script_run_tests {
         assert!(matches!(events.last(), Some(ScriptEvent::RunFinished { aborted: true, .. })));
     }
 
+    /// G15 T5: an MSSQL `GO <n>` repeat count is refused fail-closed by the
+    /// splitter (`SplitError::UnsupportedGoCount`) and surfaces the
+    /// dedicated Czech message via `split_error_message`, not a generic
+    /// Debug dump.
+    #[tokio::test]
+    async fn mssql_go_repeat_count_surfaces_czech_message_in_script_run() {
+        let (_f, mut conn) = open_sqlite_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", CancelToken::new()).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("01.sql");
+        std::fs::write(&f1, "SELECT 1\nGO 5\n").unwrap();
+
+        let opts = ScriptRunOptions {
+            tx_scope: TxScope::None,
+            error_policy: ErrorPolicy::Stop,
+            dialect: dbc_core::Dialect::Mssql,
+            statement_timeout_secs: None,
+        };
+        let events = drive_collect(&mut *conn, false, &[f1], &opts).await;
+        assert!(events.iter().any(|e| matches!(e,
+            ScriptEvent::StatementFailed { error, .. } if error.message.contains("GO s počtem opakování není podporováno"))));
+        assert!(matches!(events.last(), Some(ScriptEvent::RunFinished { aborted: true, .. })));
+    }
+
     #[tokio::test]
     async fn precancelled_token_aborts_before_any_statement() {
         let (_f, mut conn) = open_sqlite_test_conn().await;
@@ -3355,6 +4315,7 @@ mod run_many_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         }
     }
 
@@ -3515,6 +4476,7 @@ mod csv_import_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         }
     }
 
@@ -3529,6 +4491,83 @@ mod csv_import_tests {
         }
         task.await.unwrap();
         events
+    }
+
+    /// G15 T5: mock `Connection` recording every `execute()`d statement —
+    /// used by the MSSQL-BEGIN regression test below, driven directly via
+    /// `run_csv_import_drive` (no `ConnectSpec`/`open_spec`/live MSSQL
+    /// server needed — `open_config`'s eager `probe()` would otherwise
+    /// require one).
+    struct CapturingConnection {
+        statements: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for CapturingConnection {
+        async fn query(
+            &mut self,
+            _sql: &str,
+            _cancel: CancelToken,
+        ) -> Result<dbc_core::QueryStream, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn execute(&mut self, sql: &str, _cancel: CancelToken) -> Result<u64, QueryError> {
+            self.statements.push(sql.to_string());
+            Ok(0)
+        }
+    }
+
+    /// G15 T5 REQUIRED (regression for G12's bare-`BEGIN`-on-MSSQL bug —
+    /// bare `BEGIN` is invalid T-SQL), EXTENDED by batch C review BLOCKER 1
+    /// (probe-proven: `run_csv_import_drive` was calling the pg-only
+    /// `generate_insert_batches`, ignoring its own `dialect` param — fused
+    /// MSSQL BEGIN but double-quoted idents + a bare `'Příliš'` literal, a
+    /// collation-corruption class bug). Drives a REAL temp CSV file (not a
+    /// missing path) so an actual INSERT is captured, and asserts the WHOLE
+    /// statement sequence is dialect-correct: fused `XACT_ABORT` BEGIN,
+    /// bracket-quoted/`N''`-literal INSERT, plain `COMMIT`.
+    #[tokio::test]
+    async fn csv_import_mssql_begin_is_dialect_correct() {
+        let mut conn = CapturingConnection { statements: Vec::new() };
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("rows.csv");
+        std::fs::write(&csv_path, "id,note\n1,Příliš\n").unwrap();
+        let job = CsvImportJob {
+            path: csv_path,
+            schema: None,
+            table: "t".to_string(),
+            columns: vec![
+                TargetColumn { name: "id".into(), numeric: true },
+                TargetColumn { name: "note".into(), numeric: false },
+            ],
+            mapping: ColumnMapping { targets: vec![Some(0), Some(1)] },
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let cancel = CancelToken::new();
+        let drive = async {
+            run_csv_import_drive(&mut conn, dbc_core::Dialect::Mssql, &job, &cancel, None, &tx, Instant::now())
+                .await;
+            drop(tx);
+        };
+        let collect = async { while rx.recv().await.is_some() {} };
+        tokio::join!(drive, collect);
+
+        assert_eq!(
+            conn.statements.first().map(String::as_str),
+            Some(dbc_core::tx_begin_sql(dbc_core::Dialect::Mssql)),
+            "csv import must open with the fused XACT_ABORT begin on MSSQL"
+        );
+        let insert = conn.statements.get(1).expect("an INSERT statement must have been captured");
+        assert!(insert.starts_with("INSERT INTO [t]"), "expected bracket-quoted table, got: {insert}");
+        assert!(insert.contains("N'Příliš'"), "expected an N''-prefixed literal, got: {insert}");
+        assert!(!insert.contains('"'), "must not double-quote identifiers on MSSQL: {insert}");
+        assert_eq!(
+            conn.statements.last().map(String::as_str),
+            Some(dbc_core::tx_commit_sql(dbc_core::Dialect::Mssql))
+        );
     }
 
     /// CURATION item 4(b), runtime half: a read-only spec is refused by the
@@ -3845,6 +4884,56 @@ mod monitor_tests {
         tokio::time::timeout(Duration::from_secs(5), loop_task).await.unwrap().unwrap();
     }
 
+    /// G15 T6 review REQUIRED (MINOR, defense in depth): a non-positive pid
+    /// is refused BEFORE any driver call — `conn.execute` is never reached
+    /// — independent of `read_only`. Guards against `kill_sql`'s
+    /// `debug_assert!(pid > 0)` (a negative MSSQL `blocking_session_id`
+    /// like `-2`/`-3`/`-4` for a system pseudo-blocker must never reach
+    /// this far, even if `monitor_sql::mssql::BLOCKING`'s own `> 0` filter
+    /// were ever loosened again — this dispatch point doesn't trust that
+    /// filter alone).
+    #[tokio::test]
+    async fn monitor_kill_refuses_non_positive_pid_before_reaching_driver() {
+        let (conn, calls, _sqls) = RecordingConnection::new();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let loop_task = tokio::spawn(monitor_loop(
+            Box::new(conn),
+            dbc_state::Engine::Mssql,
+            /* read_only */ false, // a writable connection — proves the
+            // refusal is about the pid, not read-only.
+            cmd_rx,
+            event_tx,
+        ));
+
+        for bad_pid in [-2_i64, -3, -4, 0] {
+            cmd_tx.send(MonitorCmd::Kill { generation: 1, pid: bad_pid }).await.unwrap();
+            let ev = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match ev {
+                MonitorEvent::KillResult { pid, result: Err(e), .. } => {
+                    assert_eq!(pid, bad_pid);
+                    assert_ne!(
+                        e.message, MONITOR_READ_ONLY_KILL_MSG,
+                        "pid {bad_pid} must be refused for being invalid, not mistaken for the \
+                         read-only refusal"
+                    );
+                }
+                other => panic!("expected an Err KillResult for pid {bad_pid}, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a non-positive pid must never reach Connection::execute"
+        );
+
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(5), loop_task).await.unwrap().unwrap();
+    }
+
     /// End-to-end all-failed path without docker: a real sqlite connection
     /// can't run any pg catalog query, so every drain fails and the loop
     /// must send Error (with the dispatched generation), not Data and not
@@ -3881,6 +4970,187 @@ mod monitor_tests {
         drop(cmd_tx);
         tokio::time::timeout(Duration::from_secs(5), loop_task).await.unwrap().unwrap();
         drop(f);
+    }
+
+    /// G15 T6 REQUIRED: the kill path's engine-genericity holds for MSSQL
+    /// too — same `RecordingConnection`/`monitor_loop` seam as
+    /// `monitor_kill_executes_exact_sql_on_writable_connection` above,
+    /// just with `Engine::Mssql`, proving `MonitorCmd::Kill` still routes
+    /// through the SAME confirm-flow dispatch and its direct
+    /// (non-`guard_not_read_only`) read-only check — no MSSQL-specific
+    /// branch was needed or added in `monitor_loop`.
+    #[tokio::test]
+    async fn monitor_kill_executes_exact_sql_on_writable_mssql_connection() {
+        let (conn, calls, sqls) = RecordingConnection::new();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let loop_task = tokio::spawn(monitor_loop(
+            Box::new(conn),
+            dbc_state::Engine::Mssql,
+            /* read_only */ false,
+            cmd_rx,
+            event_tx,
+        ));
+
+        cmd_tx.send(MonitorCmd::Kill { generation: 1, pid: 55 }).await.unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(5), event_rx.recv()).await.unwrap().unwrap();
+        match ev {
+            MonitorEvent::KillResult { pid: 55, result: Ok(1), .. } => {}
+            other => panic!("expected Ok KillResult, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sqls.lock().unwrap().as_slice(), &["KILL 55".to_string()]);
+
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(5), loop_task).await.unwrap().unwrap();
+    }
+
+    /// G15 T6 REQUIRED (Global Constraints §1a): a read-only MSSQL monitor
+    /// connection refuses Kill the exact same way a read-only pg one does —
+    /// belt-and-braces, since MSSQL has no server-side kill restriction
+    /// either (design §0/§9.1).
+    #[tokio::test]
+    async fn monitor_kill_refused_on_read_only_mssql_before_reaching_driver() {
+        let (conn, calls, _sqls) = RecordingConnection::new();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let loop_task = tokio::spawn(monitor_loop(
+            Box::new(conn),
+            dbc_state::Engine::Mssql,
+            /* read_only */ true,
+            cmd_rx,
+            event_tx,
+        ));
+
+        cmd_tx.send(MonitorCmd::Kill { generation: 1, pid: 55 }).await.unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(5), event_rx.recv()).await.unwrap().unwrap();
+        match ev {
+            MonitorEvent::KillResult { result, .. } => {
+                assert_eq!(result.unwrap_err().message, MONITOR_READ_ONLY_KILL_MSG);
+            }
+            other => panic!("expected KillResult, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(5), loop_task).await.unwrap().unwrap();
+    }
+
+    /// Single-row, N-text-column `QueryStream` — the shape every MSSQL
+    /// monitor DMV query returns (one row, 1-2 columns; see
+    /// `monitor_sql::mssql`'s constants), for `MssqlDmvConnection::query`
+    /// below.
+    fn text_row_stream(cols: &[(&str, &str)]) -> dbc_core::QueryStream {
+        use dbc_core::arrow::array::{ArrayRef, RecordBatch, StringBuilder};
+        use dbc_core::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+        let schema: SchemaRef = std::sync::Arc::new(Schema::new(
+            cols.iter().map(|(name, _)| Field::new(*name, DataType::Utf8, true)).collect::<Vec<_>>(),
+        ));
+        let arrays: Vec<ArrayRef> = cols
+            .iter()
+            .map(|(_, value)| {
+                let mut builder = StringBuilder::new();
+                builder.append_value(value);
+                std::sync::Arc::new(builder.finish()) as ArrayRef
+            })
+            .collect();
+        let batch = RecordBatch::try_new(schema.clone(), arrays).expect("schema matches builders");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let _ = tx.try_send(Ok(batch));
+        dbc_core::QueryStream { columns: schema, batches: rx }
+    }
+
+    /// Schema-only `QueryStream` (zero rows) — the shape `RUNNING`/
+    /// `BLOCKING`/`TABLES` return in this test's fixture (no active
+    /// sessions/locks/tables): the `Sender` is dropped immediately, so
+    /// `drain_rows`'s receive loop sees the channel already closed and
+    /// returns `Ok(vec![])`, same as a genuinely empty result set.
+    fn empty_row_stream(col_names: &[&str]) -> dbc_core::QueryStream {
+        use dbc_core::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+        let schema: SchemaRef = std::sync::Arc::new(Schema::new(
+            col_names.iter().map(|name| Field::new(*name, DataType::Utf8, true)).collect::<Vec<_>>(),
+        ));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        dbc_core::QueryStream { columns: schema, batches: rx }
+    }
+
+    /// G15 T6 REQUIRED: end-to-end proof (no docker) that `run_monitor_refresh`'s
+    /// Mssql arm issues exactly the 11 `monitor_sql::mssql` statements and
+    /// that `RefreshResults` — after `monitor::merge_mssql_connections`/
+    /// `split_mssql_size`/`merge_mssql_locks`/`merge_mssql_perf` — reaches
+    /// `assemble_snapshot` in the SAME pg-shaped form real MSSQL wiring
+    /// would produce, including the "value_in_use = 0 -> max None"
+    /// unlimited-connections rule.
+    struct MssqlDmvConnection;
+
+    #[async_trait::async_trait]
+    impl Connection for MssqlDmvConnection {
+        async fn query(
+            &mut self,
+            sql: &str,
+            _cancel: CancelToken,
+        ) -> Result<dbc_core::QueryStream, QueryError> {
+            use crate::monitor_sql::mssql as ms;
+            Ok(match sql {
+                s if s == ms::CONNECTIONS => text_row_stream(&[("active", "5"), ("idle", "2")]),
+                s if s == ms::CONNECTIONS_MAX => text_row_stream(&[("max_conn", "100")]),
+                s if s == ms::LOCKS_WAITING => text_row_stream(&[("waiting", "1")]),
+                s if s == ms::DEADLOCKS => text_row_stream(&[("deadlocks_since_reset", "3")]),
+                s if s == ms::SIZE => {
+                    text_row_stream(&[("data_bytes", "1048576"), ("log_bytes", "2097152")])
+                }
+                s if s == ms::CACHE_HIT => text_row_stream(&[("cache_hit_pct", "98.5")]),
+                s if s == ms::UPTIME => text_row_stream(&[("uptime_secs", "7200")]),
+                s if s == ms::XACT_TOTAL => text_row_stream(&[("xact_total", "555")]),
+                s if s == ms::RUNNING => empty_row_stream(&[
+                    "pid", "user", "application", "client", "state", "duration_secs", "query",
+                ]),
+                s if s == ms::BLOCKING => empty_row_stream(&[
+                    "waiter_pid", "blocker_pid", "wait_secs", "waiter_query", "blocker_query",
+                ]),
+                s if s == ms::TABLES => empty_row_stream(&[
+                    "schema", "table", "data_bytes", "index_bytes", "toast_bytes", "row_estimate",
+                ]),
+                other => return Err(QueryError::msg(format!("unexpected monitor query: {other}"))),
+            })
+        }
+        async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn execute(&mut self, _sql: &str, _cancel: CancelToken) -> Result<u64, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_monitor_refresh_mssql_arm_produces_pg_shaped_results() {
+        let mut conn = MssqlDmvConnection;
+        let results = run_monitor_refresh(&mut conn, dbc_state::Engine::Mssql, CancelToken::new()).await;
+        let snap = monitor::assemble_snapshot(results, Instant::now()).expect("every constituent query ok");
+
+        // G15 T6 review fix (MINOR): a real, non-zero fixture value proves
+        // this end-to-end path actually DISPATCHES and reads
+        // CONNECTIONS_MAX — a "0" fixture (the old version of this test)
+        // asserting `max: None` is indistinguishable from the arm never
+        // issuing that query at all. The "value_in_use = 0 -> None"
+        // unlimited rule itself stays covered by
+        // `monitor::tests::merge_connections_zero_max_means_unlimited_none`.
+        assert_eq!(
+            snap.connections,
+            Some(monitor::ConnectionsTile { active: 5, idle: 2, max: Some(100) })
+        );
+        assert_eq!(snap.locks, Some(monitor::LocksTile { waiting: 1, deadlocks_since_reset: 3 }));
+        assert_eq!(
+            snap.size,
+            monitor::SizeTile { data_bytes: Some(1_048_576), wal_or_log_bytes: Some(2_097_152) }
+        );
+        let perf = snap.perf.expect("perf tile present");
+        assert_eq!(perf.cache_hit_pct, Some(98.5));
+        assert_eq!(perf.uptime_secs, 7200);
+        assert_eq!(perf.xact_total, Some(555));
+        assert_eq!(snap.running, Some(vec![]));
+        assert_eq!(snap.blocking, Some(vec![]));
+        assert_eq!(snap.tables, Some(vec![]));
     }
 }
 
@@ -4253,12 +5523,21 @@ mod diff_fetch_tests {
     #[test]
     fn compose_diff_select_quotes_table_and_appends_where() {
         assert_eq!(
-            compose_diff_select(Some("public"), "orders", None).unwrap(),
+            compose_diff_select(dbc_core::Dialect::Postgres, Some("public"), "orders", None).unwrap(),
             "SELECT * FROM \"public\".\"orders\""
         );
         assert_eq!(
-            compose_diff_select(None, "orders", Some("id > 10")).unwrap(),
+            compose_diff_select(dbc_core::Dialect::Postgres, None, "orders", Some("id > 10")).unwrap(),
             "SELECT * FROM \"orders\" WHERE id > 10"
+        );
+    }
+
+    /// G15 T5: MSSQL gets bracket quoting from the same composer.
+    #[test]
+    fn compose_diff_select_mssql_uses_bracket_quoting() {
+        assert_eq!(
+            compose_diff_select(dbc_core::Dialect::Mssql, Some("dbo"), "orders", None).unwrap(),
+            "SELECT * FROM [dbo].[orders]"
         );
     }
 
@@ -4271,18 +5550,21 @@ mod diff_fetch_tests {
     /// place).
     #[test]
     fn compose_diff_select_refuses_multi_statement_injection_client_side() {
-        let err = compose_diff_select(None, "orders", Some("1=1; DROP TABLE orders")).unwrap_err();
+        let err = compose_diff_select(dbc_core::Dialect::Postgres, None, "orders", Some("1=1; DROP TABLE orders")).unwrap_err();
         assert!(err.message.contains("WHERE"));
     }
 
     #[test]
     fn compose_diff_select_allows_a_read_only_subquery_in_where() {
-        assert!(compose_diff_select(None, "t", Some("id IN (SELECT id FROM other)")).is_ok());
+        assert!(compose_diff_select(dbc_core::Dialect::Postgres, None, "t", Some("id IN (SELECT id FROM other)")).is_ok());
     }
 
     #[test]
     fn compose_diff_select_empty_where_is_treated_as_absent() {
-        assert_eq!(compose_diff_select(None, "t", Some("   ")).unwrap(), "SELECT * FROM \"t\"");
+        assert_eq!(
+            compose_diff_select(dbc_core::Dialect::Postgres, None, "t", Some("   ")).unwrap(),
+            "SELECT * FROM \"t\""
+        );
     }
 
     /// End-to-end proof over a REAL (writable) sqlite connection: the guard
@@ -4708,6 +5990,7 @@ mod backup_runner_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         }
     }
 
@@ -4794,22 +6077,34 @@ mod backup_runner_tests {
         assert!(err.message.contains("nenalezen"));
     }
 
-    // --- MSSQL: fails fast at open_spec, exactly like every other MSSQL
-    // feature in this app today (Spec section grounding) — REQUIRED. ---
+    // --- MSSQL: fails fast at open_spec, no I/O — G15 T3 wired the
+    // Engine::Mssql arm for real, so the `cfg()` test helper's empty `user`
+    // field (never set for these engine-agnostic fixtures) now hits
+    // `connect::mssql_connection_from_config`'s integrated-auth refusal
+    // instead of the old permanent "driver zatím není k dispozici" stub —
+    // REQUIRED, still zero I/O, still fails before any connection. ---
     #[tokio::test]
-    async fn run_mssql_backup_against_mssql_engine_fails_with_the_standard_unwired_message() {
+    async fn run_mssql_backup_against_mssql_engine_without_user_fails_before_connecting() {
         let spec = ConnectSpec::Config { cfg: Box::new(cfg(dbc_state::Engine::Mssql, false)), secret: None };
         let handle = tokio::runtime::Handle::current();
         let err = run_mssql_backup_inner(spec, "db".into(), r"D:\x.bak".into(), handle).await.unwrap_err();
-        assert!(err.message.contains("MSSQL driver zatím není k dispozici"));
+        assert!(
+            err.message.contains("ověření přes Windows účet zatím není podporováno"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
-    async fn run_mssql_restore_against_mssql_engine_fails_with_the_standard_unwired_message() {
+    async fn run_mssql_restore_against_mssql_engine_without_user_fails_before_connecting() {
         let spec = ConnectSpec::Config { cfg: Box::new(cfg(dbc_state::Engine::Mssql, false)), secret: None };
         let handle = tokio::runtime::Handle::current();
         let err = run_mssql_restore_inner(spec, "db".into(), r"D:\x.bak".into(), handle).await.unwrap_err();
-        assert!(err.message.contains("MSSQL driver zatím není k dispozici"));
+        assert!(
+            err.message.contains("ověření přes Windows účet zatím není podporováno"),
+            "got: {}",
+            err.message
+        );
     }
 
     // --- read-only gates, REQUIRED, no I/O attempted in the refusing path ---
@@ -4827,12 +6122,17 @@ mod backup_runner_tests {
     #[tokio::test]
     async fn mssql_backup_allowed_even_when_read_only_reaches_open_spec_not_the_guard() {
         // read_only=true + Backup must NOT be refused by the guard — the
-        // MSSQL-unwired error proves the guard passed and open_spec was
-        // actually reached.
+        // integrated-auth refusal (from inside open_spec's
+        // mssql_connection_from_config, not the read-only guard) proves the
+        // guard passed and open_spec was actually reached.
         let spec = ConnectSpec::Config { cfg: Box::new(cfg(dbc_state::Engine::Mssql, true)), secret: None };
         let handle = tokio::runtime::Handle::current();
         let err = run_mssql_backup_inner(spec, "db".into(), r"D:\x.bak".into(), handle).await.unwrap_err();
-        assert!(err.message.contains("MSSQL driver zatím není k dispozici"), "got: {}", err.message);
+        assert!(
+            err.message.contains("ověření přes Windows účet zatím není podporováno"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -4858,11 +6158,15 @@ mod backup_runner_tests {
     async fn mssql_backup_refuses_read_only_when_actually_read_only_is_false_check_control() {
         // Control for the two "allowed even when read_only" tests above:
         // Restore on a NON-read-only connection must not be refused by the
-        // guard either — it should reach the same MSSQL-unwired error.
+        // guard either — it should reach the same integrated-auth refusal.
         let spec = ConnectSpec::Config { cfg: Box::new(cfg(dbc_state::Engine::Mssql, false)), secret: None };
         let handle = tokio::runtime::Handle::current();
         let err = run_mssql_restore_inner(spec, "db".into(), r"D:\x.bak".into(), handle).await.unwrap_err();
-        assert!(err.message.contains("MSSQL driver zatím není k dispozici"), "got: {}", err.message);
+        assert!(
+            err.message.contains("ověření přes Windows účet zatím není podporováno"),
+            "got: {}",
+            err.message
+        );
     }
 
     // --- SQLite restore: magic header + real copy, temp files, no docker ---
@@ -5035,6 +6339,131 @@ mod backup_runner_tests {
     }
 }
 
+/// G15 T7: `mssql_plan_session`'s exact prelude/postlude strings (pure) and
+/// `run_mssql_plan_inner`'s belt-and-braces read-only guard (no docker/live
+/// server needed — the guard, and the SSH/no-user refusals shared with
+/// `open_config`, all fire before `query_with_session` is ever called).
+#[cfg(test)]
+mod mssql_plan_tests {
+    use super::*;
+
+    fn cfg(read_only: bool) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "x".into(),
+            name: "x".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Mssql,
+            host: "localhost".into(),
+            port: Some(1433),
+            database: "db".into(),
+            user: "sa".into(),
+            read_only,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: None,
+        }
+    }
+
+    #[test]
+    fn mssql_plan_session_estimated_is_lone_showplan_batch() {
+        let (prelude, postlude) = mssql_plan_session(false);
+        assert_eq!(prelude, vec!["SET SHOWPLAN_XML ON".to_string()]);
+        assert!(postlude.is_empty());
+    }
+
+    /// G15 T8 live-found fix: `SET NOCOUNT ON` leads the prelude — see
+    /// `mssql_plan_session`'s doc comment for the full root-cause writeup
+    /// (a rowcount-only completion arriving before the XML result set for
+    /// a non-`SELECT` write made `run_mssql_plan_inner` fail live with
+    /// "statement produced no result set" before this fix).
+    #[test]
+    fn mssql_plan_session_actual_is_nocount_statistics_then_fused_begin_with_rollback_postlude() {
+        let (prelude, postlude) = mssql_plan_session(true);
+        assert_eq!(
+            prelude,
+            vec![
+                "SET NOCOUNT ON".to_string(),
+                "SET STATISTICS XML ON".to_string(),
+                "SET XACT_ABORT ON; BEGIN TRANSACTION".to_string(),
+            ]
+        );
+        assert_eq!(postlude, vec!["ROLLBACK".to_string()]);
+    }
+
+    /// REQUIRED per this task's plan: an ACTUAL plan (`analyze = true`) of
+    /// a WRITE statement on a read-only MSSQL connection refuses before
+    /// any connection is attempted — `guard_not_read_only` fires before
+    /// `connect::mssql_connection_from_config` is even reached.
+    #[tokio::test]
+    async fn run_mssql_plan_refuses_read_only_write_analyze_without_connecting() {
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg(true)), secret: None };
+        let err = run_mssql_plan_inner(spec, "UPDATE t SET a=1".to_string(), true, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "připojení je jen pro čtení");
+    }
+
+    /// REQUIRED per this task's plan: a READ under `analyze = true` on a
+    /// read-only connection passes the guard (no read-only refusal) — proven
+    /// deterministically, without any live server, by giving the config an
+    /// `ssh` tunnel: `mssql_connection_from_config`'s SSH refusal only fires
+    /// AFTER the guard, so seeing THAT specific error (not the read-only
+    /// one) proves the guard was passed and no connection was attempted.
+    #[tokio::test]
+    async fn run_mssql_plan_read_analyze_passes_the_guard() {
+        let mut c = cfg(true);
+        c.ssh = Some(dbc_state::SshTunnelConfig {
+            host: "bastion".into(),
+            port: 22,
+            user: "u".into(),
+            key_path: None,
+        });
+        let spec = ConnectSpec::Config { cfg: Box::new(c), secret: None };
+        let err = run_mssql_plan_inner(spec, "SELECT 1".to_string(), true, None).await.unwrap_err();
+        assert!(
+            err.message.contains("SSH tunel pro MSSQL zatím není podporován"),
+            "expected the SSH refusal (proving the read-only guard was passed for a read), got: {}",
+            err.message
+        );
+    }
+
+    /// Companion case: the ESTIMATED path (`analyze = false`) never guards
+    /// on read-only at all, for a WRITE statement either — same proof
+    /// technique (SSH refusal reached means the guard step, which doesn't
+    /// even exist on this path, was skipped as designed).
+    #[tokio::test]
+    async fn run_mssql_plan_estimated_write_never_guards_on_read_only() {
+        let mut c = cfg(true);
+        c.ssh = Some(dbc_state::SshTunnelConfig {
+            host: "bastion".into(),
+            port: 22,
+            user: "u".into(),
+            key_path: None,
+        });
+        let spec = ConnectSpec::Config { cfg: Box::new(c), secret: None };
+        let err = run_mssql_plan_inner(spec, "UPDATE t SET a=1".to_string(), false, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("SSH tunel pro MSSQL zatím není podporován"),
+            "estimated plan of a write must never hit the read-only guard: {}",
+            err.message
+        );
+    }
+
+    /// Defensive-only branch: no MSSQL URL form exists
+    /// (`main.rs::engine_from_url`), so `ConnectSpec::Url` must be refused
+    /// with a clear message rather than panicking on the `let ... else`.
+    #[tokio::test]
+    async fn run_mssql_plan_refuses_a_cli_url_spec() {
+        let spec = ConnectSpec::Url("postgres://localhost/db".to_string());
+        let err = run_mssql_plan_inner(spec, "SELECT 1".to_string(), false, None).await.unwrap_err();
+        assert!(err.message.contains("uložené připojení"), "got: {}", err.message);
+    }
+}
+
 /// G11 T5: docker + a real, locally-installed `pg_dump`/`pg_restore`
 /// required — validates T4's `run_external_tool`/`resolve_tool_path` against
 /// a live `postgres:16.13` container, end to end (tool resolution, real
@@ -5098,6 +6527,7 @@ mod backup_docker_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         }
     }
 
@@ -5699,6 +7129,1219 @@ mod admin_pg_tests {
                 !schema_sizes_after_drop.iter().any(|(s, _)| s == schema),
                 "the schema must be gone after CASCADE drop: {schema_sizes_after_drop:?}"
             );
+        });
+    }
+}
+
+/// G15 T8: docker-gated proof of the MSSQL app-level never-live backlog
+/// (design §5 items 3-8, plus the redaction negative test and the T6/T7
+/// review carry-forwards) against a live SQL Server 2022 container. Same
+/// "plain `#[test]` + `runner.handle().block_on(...)`, NEVER
+/// `#[tokio::test]`" discipline as `monitor_pg_tests`/`admin_pg_tests`
+/// above (see either module's doc comment for the full nested-runtime-panic
+/// rationale) — `open_spec` is used for every connection (never
+/// `connect::open`/driver types directly). Run with:
+///   %USERPROFILE%\.cargo\bin\cargo.exe test -p dbc-ui -- --ignored mssql_docker_tests::
+///
+/// The container is started ONCE per test-binary run (`std::sync::OnceLock`,
+/// `handle.block_on`'d from SYNC context — never from inside an outer
+/// `block_on`, which would panic) and deliberately leaked
+/// (`std::mem::forget`) — same rationale, and same CORRECTION,
+/// `dbc-driver-mssql/tests/common/mod.rs` documents (30-60s startup,
+/// ~1.5GB image; testcontainers' reaper (ryuk) does NOT reap these on this
+/// host, confirmed by the whole-branch review — every `--ignored` run that
+/// starts a fresh container leaks it; `docker rm -f` manually after a live
+/// run). `DBC_MSSQL_TEST_HOST_PORT="host:port"` is both the iteration
+/// convenience AND the cheap mitigation for the leak: point it at ONE
+/// manually-started, long-lived container instead of leaking a new one per
+/// invocation, mirroring the driver crate's `DBC_MSSQL_TEST_CONN`
+/// convention.
+#[cfg(test)]
+mod mssql_docker_tests {
+    use super::*;
+    use crate::admin_sql;
+    use crate::plan;
+    use crate::sandbox;
+    use testcontainers_modules::{mssql_server::MssqlServer, testcontainers::runners::AsyncRunner};
+
+    const SA_PASSWORD: &str = "yourStrong(!)Password";
+
+    /// Starts (or reuses) the container; `None` only if docker itself is
+    /// unavailable — callers turn that into an honest SKIP, never a
+    /// silent pass.
+    fn host_port(handle: &tokio::runtime::Handle) -> Option<(String, u16)> {
+        static HOST_PORT: std::sync::OnceLock<Option<(String, u16)>> = std::sync::OnceLock::new();
+        HOST_PORT
+            .get_or_init(|| {
+                if let Ok(hp) = std::env::var("DBC_MSSQL_TEST_HOST_PORT") {
+                    if let Some((h, p)) = hp.rsplit_once(':') {
+                        if let Ok(port) = p.parse::<u16>() {
+                            return Some((h.to_string(), port));
+                        }
+                    }
+                }
+                handle.block_on(async {
+                    let container = MssqlServer::default().with_accept_eula().start().await.ok()?;
+                    let host = container.get_host().await.ok()?.to_string();
+                    let port = container.get_host_port_ipv4(1433).await.ok()?;
+                    std::mem::forget(container);
+                    Some((host, port))
+                })
+            })
+            .clone()
+    }
+
+    /// Honest SKIP for the one prerequisite docker cannot provide: no host
+    /// ODBC Driver 17/18. IM002-probe based — dbc-ui has no odbc-api dep, so
+    /// detection is via the error text the missing driver actually
+    /// produces, same convention `dbc-driver-mssql/tests/common` uses.
+    fn is_missing_driver_error(e: &QueryError) -> bool {
+        e.code.as_deref() == Some("IM002") || e.message.contains("IM002") || e.message.contains("msodbcsql18")
+    }
+
+    fn mssql_cfg(database: &str, read_only: bool, host: &str, port: u16) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "mssql-docker-test".into(),
+            name: "mssql-docker-test".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Mssql,
+            host: host.to_string(),
+            port: Some(port),
+            database: database.to_string(),
+            user: "sa".into(),
+            read_only,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: Some(dbc_state::MssqlOptions {
+                encrypt: true,
+                trust_server_certificate: true,
+                driver: None,
+            }),
+        }
+    }
+
+    fn mssql_spec(database: &str, read_only: bool, host: &str, port: u16) -> ConnectSpec {
+        mssql_spec_as(database, read_only, host, port, "sa", SA_PASSWORD)
+    }
+
+    fn mssql_spec_as(
+        database: &str,
+        read_only: bool,
+        host: &str,
+        port: u16,
+        user: &str,
+        password: &str,
+    ) -> ConnectSpec {
+        let mut cfg = mssql_cfg(database, read_only, host, port);
+        cfg.user = user.to_string();
+        ConnectSpec::Config { cfg: Box::new(cfg), secret: Some(password.to_string()) }
+    }
+
+    /// Opens a connection or SKIPs (returns `None`) when the host has no
+    /// ODBC Driver 17/18.
+    async fn open_mssql_or_skip(
+        test: &str,
+        spec: ConnectSpec,
+        handle: tokio::runtime::Handle,
+    ) -> Option<connect::OpenConnection> {
+        match open_spec(spec, handle).await {
+            Ok(o) => Some(o),
+            Err(e) => {
+                if is_missing_driver_error(&e) {
+                    eprintln!("SKIP {test}: ODBC Driver 18 for SQL Server není nainstalován (IM002)");
+                    None
+                } else {
+                    panic!("{test}: connect failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Backlog item 3 (G10 admin): `roles_catalog`/`privileges_catalog`/
+    /// `sizes_catalog` run live; REQUIRED: `schema_sizes` against a
+    /// freshly created EMPTY schema returns a `(name, 0)` row (the
+    /// `sys.schemas` LEFT JOIN shape its own comment admits was never
+    /// verified). Feeds results through `parse_db_sizes`/
+    /// `parse_schema_sizes`/`parse_roles`.
+    #[test]
+    #[ignore]
+    fn mssql_admin_catalogs_round_trip() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        let Some((host, port)) = host_port(&handle) else {
+            eprintln!("SKIP mssql_admin_catalogs_round_trip: docker unavailable");
+            return;
+        };
+        handle.block_on(async move {
+            let spec = mssql_spec("master", false, &host, port);
+            let Some(mut opened) =
+                open_mssql_or_skip("mssql_admin_catalogs_round_trip", spec, tokio::runtime::Handle::current())
+                    .await
+            else {
+                return;
+            };
+            let suffix = std::process::id();
+            let schema = format!("g15_empty_schema_{suffix}");
+            opened
+                .conn
+                .execute(&format!("CREATE SCHEMA [{schema}]"), CancelToken::new())
+                .await
+                .expect("CREATE SCHEMA must succeed");
+            drop(opened);
+
+            let engine = dbc_state::Engine::Mssql;
+            let sizes = admin_sql::sizes_catalog(engine);
+            let result = fetch_admin_catalog_inner(
+                mssql_spec("master", false, &host, port),
+                sizes,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("sizes_catalog must run cleanly against live MSSQL");
+            assert_eq!(
+                result.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+                vec!["current_db_size", "databases", "schema_sizes"]
+            );
+            let schema_sizes_rows = &result.iter().find(|(l, _)| *l == "schema_sizes").unwrap().1;
+            let parsed = crate::admin_panel::parse_schema_sizes(engine, schema_sizes_rows);
+            let empty = parsed.iter().find(|(s, _)| s == &schema);
+            assert_eq!(
+                empty.map(|(_, b)| *b),
+                Some(0),
+                "a freshly created empty schema must appear with 0 bytes (LEFT JOIN, not INNER \
+                 JOIN, from sys.schemas), got: {parsed:?}"
+            );
+            let db_sizes_rows = &result.iter().find(|(l, _)| *l == "current_db_size").unwrap().1;
+            let db_sizes = crate::admin_panel::parse_db_sizes(engine, db_sizes_rows);
+            assert!(!db_sizes.is_empty(), "current_db_size must yield at least one row");
+
+            let roles = admin_sql::roles_catalog(engine);
+            let roles_result = fetch_admin_catalog_inner(
+                mssql_spec("master", false, &host, port),
+                roles,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("roles_catalog must run cleanly against live MSSQL");
+            assert_eq!(
+                roles_result.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+                vec!["server_principals", "db_principals", "db_role_members", "server_role_members"]
+            );
+            let sa_rows = &roles_result.iter().find(|(l, _)| *l == "server_principals").unwrap().1;
+            let sa_roles = crate::admin_panel::parse_roles(sa_rows);
+            assert!(
+                sa_roles.iter().any(|r| r.name == "sa"),
+                "the sa login must appear in server_principals: {sa_roles:?}"
+            );
+
+            let privs = admin_sql::privileges_catalog(engine, "dbo");
+            let privs_result = fetch_admin_catalog_inner(
+                mssql_spec("master", false, &host, port),
+                privs,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("privileges_catalog must run cleanly against live MSSQL (no seeded grant, just proving the SQL shape)");
+            assert_eq!(
+                privs_result.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+                vec!["object_perms", "schema_perms"]
+            );
+
+            // Cleanup.
+            let mut cleanup = open_spec(mssql_spec("master", false, &host, port), tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+            let _ = cleanup.conn.execute(&format!("DROP SCHEMA [{schema}]"), CancelToken::new()).await;
+        });
+    }
+
+    /// Backlog item 3 continued: one mutation round-trip per builder family
+    /// — CREATE LOGIN/USER -> GRANT (ALTER ROLE ADD MEMBER) -> DENY/REVOKE
+    /// on a table -> DROP — through the SAME sanctioned
+    /// `run_write_transaction_inner` every admin Apply click will use.
+    #[test]
+    #[ignore]
+    fn mssql_admin_builder_mutation_round_trip() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        let Some((host, port)) = host_port(&handle) else {
+            eprintln!("SKIP mssql_admin_builder_mutation_round_trip: docker unavailable");
+            return;
+        };
+        handle.block_on(async move {
+            let engine = dbc_state::Engine::Mssql;
+            let spec0 = mssql_spec("master", false, &host, port);
+            let Some(mut opened) = open_mssql_or_skip(
+                "mssql_admin_builder_mutation_round_trip",
+                spec0,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            else {
+                return;
+            };
+            let suffix = std::process::id();
+            let login = format!("g15_admin_login_{suffix}");
+            let table = format!("g15_admin_priv_t_{suffix}");
+            opened
+                .conn
+                .execute(&format!("CREATE TABLE dbo.[{table}] (id INT PRIMARY KEY)"), CancelToken::new())
+                .await
+                .unwrap();
+            drop(opened);
+
+            // CREATE LOGIN + CREATE USER FOR LOGIN. Password carries a
+            // Czech diacritic (G15 T8 admin_sql::sql_string_literal_d live
+            // smoke, batch-C MINOR fix) — proves the CREATE LOGIN N''
+            // literal round-trips correctly live, not just ASCII.
+            let create = admin_sql::create_role(
+                engine,
+                &login,
+                "Tajně$Heslo123ěš",
+                &admin_sql::RoleFlags::default(),
+            );
+            run_write_transaction_inner(
+                mssql_spec("master", false, &host, port),
+                create,
+                None,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("CREATE LOGIN + CREATE USER must commit against live MSSQL");
+
+            // GRANT SELECT ON the table TO the new user (object_privilege).
+            let grant = admin_sql::object_privilege(
+                engine,
+                "dbo",
+                &table,
+                &["SELECT"],
+                &login,
+                admin_sql::CellState::Granted,
+            )
+            .expect("GRANT builder must not error");
+            run_write_transaction_inner(
+                mssql_spec("master", false, &host, port),
+                vec![grant],
+                None,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("GRANT must commit against live MSSQL");
+
+            // Verify the grant is visible in privileges_catalog.
+            let privs = admin_sql::privileges_catalog(engine, "dbo");
+            let privs_result = fetch_admin_catalog_inner(
+                mssql_spec("master", false, &host, port),
+                privs,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .unwrap();
+            let (cols, rows) = &privs_result.iter().find(|(l, _)| *l == "object_perms").unwrap().1;
+            let grantee_ix = cols.iter().position(|c| c == "grantee").unwrap();
+            let perm_ix = cols.iter().position(|c| c == "permission_name").unwrap();
+            assert!(
+                rows.iter().any(|r| {
+                    r[grantee_ix].as_deref() == Some(login.as_str())
+                        && r[perm_ix].as_deref() == Some("SELECT")
+                }),
+                "seeded GRANT SELECT must appear in object_perms rows: {rows:?}"
+            );
+
+            // DENY the same privilege (MSSQL tri-state) — must ALSO commit.
+            let deny = admin_sql::object_privilege(
+                engine,
+                "dbo",
+                &table,
+                &["SELECT"],
+                &login,
+                admin_sql::CellState::Denied,
+            )
+            .expect("DENY builder must not error on MSSQL");
+            run_write_transaction_inner(
+                mssql_spec("master", false, &host, port),
+                vec![deny],
+                None,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("DENY must commit against live MSSQL");
+
+            // REVOKE clears both GRANT and DENY.
+            let revoke = admin_sql::object_privilege(
+                engine,
+                "dbo",
+                &table,
+                &["SELECT"],
+                &login,
+                admin_sql::CellState::NotSet,
+            )
+            .expect("REVOKE builder must not error");
+            run_write_transaction_inner(
+                mssql_spec("master", false, &host, port),
+                vec![revoke],
+                None,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("REVOKE must commit against live MSSQL");
+
+            // sp_addrolemember path: ALTER ROLE ... ADD MEMBER against a
+            // fixed db role.
+            let add_member = admin_sql::add_membership(engine, "db_datareader", &login, false, false);
+            run_write_transaction_inner(
+                mssql_spec("master", false, &host, port),
+                add_member,
+                None,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("ALTER ROLE db_datareader ADD MEMBER must commit against live MSSQL");
+
+            let roles = admin_sql::roles_catalog(engine);
+            let roles_result = fetch_admin_catalog_inner(
+                mssql_spec("master", false, &host, port),
+                roles,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .unwrap();
+            let members_rows = &roles_result.iter().find(|(l, _)| *l == "db_role_members").unwrap().1;
+            let memberships = crate::admin_panel::parse_memberships(members_rows, false);
+            assert!(
+                memberships.iter().any(|m| m.role == "db_datareader" && m.member == login),
+                "seeded db_datareader membership must appear: {memberships:?}"
+            );
+
+            let remove_member = admin_sql::remove_membership(engine, "db_datareader", &login, false);
+            run_write_transaction_inner(
+                mssql_spec("master", false, &host, port),
+                remove_member,
+                None,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("ALTER ROLE db_datareader DROP MEMBER must commit against live MSSQL");
+
+            // DROP USER + DROP LOGIN.
+            let drop = admin_sql::drop_role(engine, &login);
+            run_write_transaction_inner(
+                mssql_spec("master", false, &host, port),
+                drop,
+                None,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("DROP USER + DROP LOGIN must commit against live MSSQL");
+
+            // Cleanup table.
+            let mut cleanup = open_spec(mssql_spec("master", false, &host, port), tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+            let _ = cleanup.conn.execute(&format!("DROP TABLE dbo.[{table}]"), CancelToken::new()).await;
+        });
+    }
+
+    /// Backlog item 4 (G9 monitor): all 11 `monitor_sql::mssql` DMV
+    /// queries run through the REAL `run_monitor_refresh`/`assemble_snapshot`
+    /// path against a live server, PLUS a genuine blocking chain (a held
+    /// open transaction really blocks a concurrent writer) and a `KILL`
+    /// round-trip through the actual `monitor_loop`/`MonitorCmd::Kill`
+    /// dispatch — mirrors `monitor_kill_executes_exact_sql_on_writable_mssql_connection`'s
+    /// shape but against a REAL server instead of a `RecordingConnection`.
+    #[test]
+    #[ignore]
+    fn mssql_monitor_live_dmvs_blocking_chain_and_kill() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        let Some((host, port)) = host_port(&handle) else {
+            eprintln!("SKIP mssql_monitor_live_dmvs_blocking_chain_and_kill: docker unavailable");
+            return;
+        };
+        handle.block_on(async move {
+            let engine = dbc_state::Engine::Mssql;
+            let suffix = std::process::id();
+            let table = format!("g15_mon_lock_t_{suffix}");
+
+            let Some(mut setup) = open_mssql_or_skip(
+                "mssql_monitor_live_dmvs_blocking_chain_and_kill",
+                mssql_spec("master", false, &host, port),
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            else {
+                return;
+            };
+            setup
+                .conn
+                .execute(
+                    &format!("CREATE TABLE dbo.[{table}] (id INT PRIMARY KEY, v INT NOT NULL)"),
+                    CancelToken::new(),
+                )
+                .await
+                .unwrap();
+            setup
+                .conn
+                .execute(&format!("INSERT INTO dbo.[{table}] (id, v) VALUES (1, 0)"), CancelToken::new())
+                .await
+                .unwrap();
+            drop(setup);
+
+            let mut monitor_conn = open_spec(mssql_spec("master", false, &host, port), tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+
+            let mut blocker = open_spec(mssql_spec("master", false, &host, port), tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+            let spid_text =
+                drain_single_text_cell(&mut *blocker.conn, "SELECT CAST(@@SPID AS VARCHAR(10))", CancelToken::new())
+                    .await
+                    .unwrap();
+            let blocker_spid: i64 = spid_text.trim().parse().expect("numeric @@SPID");
+            blocker
+                .conn
+                .execute(
+                    &format!("BEGIN TRAN; UPDATE dbo.[{table}] SET v = v + 1 WHERE id = 1;"),
+                    CancelToken::new(),
+                )
+                .await
+                .unwrap();
+
+            let waiter_spec = mssql_spec("master", false, &host, port);
+            let waiter_table = table.clone();
+            let waiter_task = tokio::spawn(async move {
+                let mut waiter = open_spec(waiter_spec, tokio::runtime::Handle::current()).await.unwrap();
+                waiter
+                    .conn
+                    .execute(&format!("UPDATE dbo.[{waiter_table}] SET v = v + 1 WHERE id = 1"), CancelToken::new())
+                    .await
+            });
+
+            // Bounded poll (~8s max) until the blocking DMV shows the
+            // waiter — never an unbounded loop.
+            let mut confirmed = false;
+            for _ in 0..40 {
+                let refresh = run_monitor_refresh(&mut *monitor_conn.conn, engine, CancelToken::new()).await;
+                if let Ok(rows) = &refresh.blocking {
+                    let edges = monitor::parse_blocking_edges(rows);
+                    if edges.iter().any(|e| e.blocker_pid == blocker_spid) {
+                        // All 11 DMVs sanity-checked on THIS successful round.
+                        assert!(refresh.connections.is_ok(), "CONNECTIONS/CONNECTIONS_MAX: {:?}", refresh.connections);
+                        assert!(refresh.locks.is_ok(), "LOCKS_WAITING/DEADLOCKS: {:?}", refresh.locks);
+                        assert!(refresh.data_size.is_ok(), "SIZE (data, bigint CAST fix): {:?}", refresh.data_size);
+                        assert!(refresh.wal_size.is_ok(), "SIZE (log, bigint CAST fix): {:?}", refresh.wal_size);
+                        assert!(refresh.perf.is_ok(), "CACHE_HIT/UPTIME/XACT_TOTAL: {:?}", refresh.perf);
+                        assert!(refresh.running.is_ok(), "RUNNING: {:?}", refresh.running);
+                        assert!(refresh.tables.is_ok(), "TABLES: {:?}", refresh.tables);
+                        let tables = monitor::parse_tables(refresh.tables.as_ref().unwrap());
+                        assert!(
+                            tables.iter().any(|t| t.table == table),
+                            "TABLES must include the freshly created table: {tables:?}"
+                        );
+                        let snapshot = monitor::assemble_snapshot(refresh, Instant::now())
+                            .expect("assemble_snapshot must succeed once every tile is Ok");
+                        let conns = snapshot
+                            .connections
+                            .expect("connections tile must be Some given the raw query succeeded");
+                        assert!(conns.active >= 1, "at least our own monitor session must show as active: {conns:?}");
+                        confirmed = true;
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            assert!(confirmed, "blocking chain never appeared in the live BLOCKING DMV within the bound");
+
+            // KILL round-trip through the REAL monitor_loop/MonitorCmd
+            // dispatch (not a raw `KILL` execute) — proves the T-SQL
+            // `KILL {pid}` text is valid live AND that the command reaches
+            // the server.
+            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+            let loop_task = tokio::spawn(monitor_loop(monitor_conn.conn, engine, false, cmd_rx, event_tx));
+            cmd_tx.send(MonitorCmd::Kill { generation: 1, pid: blocker_spid }).await.unwrap();
+            let ev = tokio::time::timeout(Duration::from_secs(15), event_rx.recv())
+                .await
+                .expect("KillResult must arrive within 15s")
+                .expect("event channel must not close before KillResult");
+            match ev {
+                MonitorEvent::KillResult { pid, result: Ok(_), .. } if pid == blocker_spid => {}
+                other => panic!("expected Ok KillResult for spid {blocker_spid}, got {other:?}"),
+            }
+            drop(cmd_tx);
+            tokio::time::timeout(Duration::from_secs(5), loop_task).await.unwrap().unwrap();
+
+            // The KILL must have released the lock: the waiter's UPDATE now
+            // completes (bounded wait, proves this was a REAL block, not a
+            // coincidence).
+            let waiter_result = tokio::time::timeout(Duration::from_secs(15), waiter_task)
+                .await
+                .expect("waiter must finish shortly after the blocker is killed")
+                .expect("waiter task must not panic");
+            assert!(waiter_result.is_ok(), "waiter UPDATE must succeed once unblocked: {waiter_result:?}");
+
+            // Cleanup.
+            let mut cleanup = open_spec(mssql_spec("master", false, &host, port), tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+            let _ = cleanup.conn.execute(&format!("DROP TABLE dbo.[{table}]"), CancelToken::new()).await;
+        });
+    }
+
+    /// REQUIRED negative test (§1b/§6): a wrong-password connect attempt's
+    /// error — and its `{:?}` Debug rendering, the shape that would land in
+    /// a log line — must never contain the actual password substring, live
+    /// against the real ODBC driver's own diagnostic text (not a synthetic
+    /// error this crate constructs itself).
+    #[test]
+    #[ignore]
+    fn mssql_redaction_wrong_password_never_leaks_into_the_error() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        let Some((host, port)) = host_port(&handle) else {
+            eprintln!("SKIP mssql_redaction_wrong_password_never_leaks_into_the_error: docker unavailable");
+            return;
+        };
+        handle.block_on(async move {
+            let wrong_password = "Definitely-Wrong-Passw0rd!7788";
+            let spec = mssql_spec_as("master", false, &host, port, "sa", wrong_password);
+            let err = match open_spec(spec, tokio::runtime::Handle::current()).await {
+                Ok(_) => panic!("expected the wrong-password connect to fail"),
+                Err(e) => e,
+            };
+            if is_missing_driver_error(&err) {
+                eprintln!(
+                    "SKIP mssql_redaction_wrong_password_never_leaks_into_the_error: ODBC Driver 18 for SQL \
+                     Server není nainstalován (IM002)"
+                );
+                return;
+            }
+            let message = err.message.clone();
+            let debug_text = format!("{err:?}");
+            assert!(!message.contains(wrong_password), "error message must never contain the password: {message}");
+            assert!(
+                !debug_text.contains(wrong_password),
+                "Debug-formatted error must never contain the password: {debug_text}"
+            );
+            assert!(
+                !message.to_ascii_lowercase().contains("pwd="),
+                "error message must never echo the connection string: {message}"
+            );
+            assert!(
+                !debug_text.to_ascii_lowercase().contains("pwd="),
+                "Debug-formatted error must never echo the connection string: {debug_text}"
+            );
+        });
+    }
+
+    /// HARD GATE ITEM 1 / backlog item 5: `BACKUP DATABASE` -> mutate ->
+    /// `RESTORE DATABASE` (SINGLE_USER -> RESTORE -> MULTI_USER bracketing)
+    /// through the REAL `run_mssql_backup_inner`/`run_mssql_restore_inner`
+    /// bodies, live.
+    ///
+    /// STATUS (T8 conclusion — read before "fixing" this test to pass, and
+    /// before treating either a green OR a red run as the whole story): the
+    /// full authoritative account lives in `backup::backup_restore_available`
+    /// 's doc comment — summary: this round trip is INTERMITTENT, not
+    /// reliably reproducible as either a pure pass or a pure fail. `BACKUP
+    /// DATABASE` (and, separately, `RESTORE DATABASE`) can both fail
+    /// live-observed ways where `Connection::execute` reports `Ok` even
+    /// though the operation did not actually complete, and the SAME SQL
+    /// text run via `sqlcmd` (a different ODBC client) does not exhibit
+    /// this — so it's specific to this crate's odbc-api execution path,
+    /// not a T-SQL authoring error (both statements were independently
+    /// confirmed correct live). A `WITH STATS` clause was one CONFIRMED
+    /// contributing cause for the backup side (removed from
+    /// `build_backup_sql`) but not the whole story — failures still recur
+    /// intermittently without it, at either step, root cause not fully
+    /// characterized. `run_mssql_backup_inner`/`run_mssql_restore_inner`
+    /// gained verification steps (`xp_fileexist`, an `ONLINE` poll) so a
+    /// failure surfaces LOUDLY here rather than silently, which is why THIS
+    /// test can fail cleanly instead of hanging or false-passing — a run of
+    /// this test failing (or passing) is one data point, not proof either
+    /// way; that's the whole reason the gate isn't flipped on one green
+    /// run. Left `#[ignore]`d + intact (not deleted, not weakened to
+    /// tolerate a failure) as the promotion contract: a future root-cause
+    /// fix, followed by a soak test (many repeated runs, not one), is what
+    /// should precede ever flipping `backup_restore_available` for MSSQL —
+    /// not a single lucky pass.
+    #[test]
+    #[ignore]
+    fn mssql_backup_restore_round_trip_live() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        let Some((host, port)) = host_port(&handle) else {
+            eprintln!("SKIP mssql_backup_restore_round_trip_live: docker unavailable");
+            return;
+        };
+        handle.block_on(async move {
+            let suffix = std::process::id();
+            let db = format!("g15_backup_test_{suffix}");
+            let backup_path = format!("/var/opt/mssql/data/{db}.bak");
+
+            let Some(mut master) = open_mssql_or_skip(
+                "mssql_backup_restore_round_trip_live",
+                mssql_spec("master", false, &host, port),
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            else {
+                return;
+            };
+            master.conn.execute(&format!("CREATE DATABASE [{db}]"), CancelToken::new()).await.unwrap();
+            master
+                .conn
+                .execute(&format!("CREATE TABLE [{db}].dbo.t (id INT PRIMARY KEY, v INT NOT NULL)"), CancelToken::new())
+                .await
+                .unwrap();
+            master
+                .conn
+                .execute(&format!("INSERT INTO [{db}].dbo.t (id, v) VALUES (1, 111)"), CancelToken::new())
+                .await
+                .unwrap();
+            // G15 T8 live-found bug (see backup::build_backup_sql's doc
+            // comment for the full root-cause writeup): the OLD
+            // `WITH FORMAT, STATS = 10` text reliably made a live BACKUP
+            // abort server-side through this driver's ODBC path while
+            // `Connection::execute` still reported `Ok` — root-caused to
+            // the `STATS` clause specifically (isolated by a direct A/B
+            // comparison over the SAME connection) and fixed by dropping
+            // it from `build_backup_sql`/`build_restore_sql`, with
+            // `run_mssql_backup_inner`'s `xp_fileexist` check kept as a
+            // permanent belt-and-braces guard against this whole CLASS of
+            // "execute() lied" bug, not just this one instance of it.
+            let backup_result = run_mssql_backup_inner(
+                mssql_spec("master", false, &host, port),
+                db.clone(),
+                backup_path.clone(),
+                tokio::runtime::Handle::current(),
+            )
+            .await;
+            assert!(backup_result.is_ok(), "BACKUP DATABASE must succeed live: {backup_result:?}");
+
+            // Mutate — RESTORE must undo this.
+            master
+                .conn
+                .execute(&format!("UPDATE [{db}].dbo.t SET v = 999 WHERE id = 1"), CancelToken::new())
+                .await
+                .unwrap();
+            let mutated = drain_single_text_cell(
+                &mut *master.conn,
+                &format!("SELECT CAST(v AS VARCHAR(10)) FROM [{db}].dbo.t WHERE id = 1"),
+                CancelToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(mutated.trim(), "999", "sanity: the mutation must have taken effect before restore");
+            drop(master); // must not hold a connection USEing the target db while RESTORE runs
+
+            let restore_result = run_mssql_restore_inner(
+                mssql_spec("master", false, &host, port),
+                db.clone(),
+                backup_path.clone(),
+                tokio::runtime::Handle::current(),
+            )
+            .await;
+            assert!(
+                restore_result.is_ok(),
+                "RESTORE DATABASE must succeed live (SINGLE_USER -> RESTORE -> MULTI_USER): {restore_result:?}"
+            );
+
+            let mut verify = open_spec(mssql_spec("master", false, &host, port), tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+            let restored = drain_single_text_cell(
+                &mut *verify.conn,
+                &format!("SELECT CAST(v AS VARCHAR(10)) FROM [{db}].dbo.t WHERE id = 1"),
+                CancelToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(restored.trim(), "111", "RESTORE must roll the mutation back to the backed-up value");
+
+            let _ = verify.conn.execute(&format!("DROP DATABASE [{db}]"), CancelToken::new()).await;
+        });
+    }
+
+    /// Backlog item 6: Sandbox Apply end-to-end against a live server —
+    /// bracket-quoted UPDATE/INSERT with a `we]ird` column name (a literal
+    /// `]` inside a bracket-quoted identifier, doubled per
+    /// `quote_ident_d`'s MSSQL rule) and a Czech-diacritics `N''` value,
+    /// staged -> `generate_statements` -> executed live -> re-read. Built
+    /// via `TableMeta`/`EditState` DIRECTLY (not through `main.rs`'s
+    /// `detect_editable_pk`, which excluded MSSQL until this test's own
+    /// result backed the Section C ON-flip) — this test IS the evidence
+    /// behind that flip, not a guess.
+    #[test]
+    #[ignore]
+    fn mssql_sandbox_apply_bracket_quoted_weird_column_and_czech_diacritics_live() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        let Some((host, port)) = host_port(&handle) else {
+            eprintln!("SKIP mssql_sandbox_apply_bracket_quoted_weird_column_and_czech_diacritics_live: docker unavailable");
+            return;
+        };
+        handle.block_on(async move {
+            let suffix = std::process::id();
+            let table = format!("g15_sandbox_t_{suffix}");
+            let Some(mut setup) = open_mssql_or_skip(
+                "mssql_sandbox_apply_bracket_quoted_weird_column_and_czech_diacritics_live",
+                mssql_spec("master", false, &host, port),
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            else {
+                return;
+            };
+            setup
+                .conn
+                .execute(
+                    &format!("CREATE TABLE dbo.[{table}] (id INT PRIMARY KEY, [we]]ird] NVARCHAR(100) NULL)"),
+                    CancelToken::new(),
+                )
+                .await
+                .unwrap();
+            setup
+                .conn
+                .execute(&format!("INSERT INTO dbo.[{table}] (id, [we]]ird]) VALUES (1, N'orig')"), CancelToken::new())
+                .await
+                .unwrap();
+
+            let headers = vec!["id".to_string(), "we]ird".to_string()];
+            let meta = sandbox::TableMeta {
+                schema: Some("dbo"),
+                table: &table,
+                headers: &headers,
+                pk_cols: &[0],
+                numeric_cols: &[true, false],
+                dialect: dbc_core::Dialect::Mssql,
+            };
+            let mut edits = sandbox::EditState::default();
+            let czech_value = "Příliš žluťoučký kůň úpěl ďábelské ódy";
+            edits.stage_cell(0, 1, Some(czech_value.to_string()));
+            let ins_ix = edits.add_insert_row(2);
+            edits.stage_insert_cell(ins_ix, 0, Some("2".to_string()));
+            edits.stage_insert_cell(ins_ix, 1, Some("nový řádek".to_string()));
+
+            let mut original = |row: usize, col: usize| -> Option<String> {
+                match (row, col) {
+                    (0, 0) => Some("1".to_string()),
+                    (0, 1) => Some("orig".to_string()),
+                    _ => None,
+                }
+            };
+            let statements = sandbox::generate_statements(&meta, &edits, &mut original);
+            assert_eq!(statements.len(), 2, "1 UPDATE + 1 INSERT: {statements:?}");
+            assert!(statements[0].0.contains("N'"), "MSSQL text values must use N'' literals: {}", statements[0].0);
+
+            for (sql, expected_affected) in &statements {
+                let affected = setup
+                    .conn
+                    .execute(sql, CancelToken::new())
+                    .await
+                    .unwrap_or_else(|e| panic!("staged statement must execute live: {sql}\n{e}"));
+                if let Some(exp) = expected_affected {
+                    assert_eq!(affected, *exp, "affected-rows mismatch for: {sql}");
+                }
+            }
+
+            let reread = drain_all_rows(
+                &mut *setup.conn,
+                &format!("SELECT id, [we]]ird] FROM dbo.[{table}] ORDER BY id"),
+                10,
+            )
+            .await
+            .unwrap();
+            assert_eq!(reread.1.len(), 2, "one updated row + one inserted row: {reread:?}");
+            assert_eq!(
+                reread.1[0][1].as_deref(),
+                Some(czech_value),
+                "Czech diacritics must round-trip losslessly through N'' + wide reads"
+            );
+            assert_eq!(reread.1[1][1].as_deref(), Some("nový řádek"));
+
+            let _ = setup.conn.execute(&format!("DROP TABLE dbo.[{table}]"), CancelToken::new()).await;
+        });
+    }
+
+    /// Backlog item 7: a GO-batched script (a `CREATE PROCEDURE` body with
+    /// interior semicolons — GO must NOT treat those as batch separators)
+    /// through the REAL `QueryRunner::run_script` with `TxScope::PerFile`,
+    /// live; plus TOP auto-limit visible in a real, row-bounded result
+    /// (`apply_auto_limit_d`'s MSSQL arm, already unit-tested — this proves
+    /// the generated `SELECT TOP n ...` is valid T-SQL AND actually caps
+    /// the row count against a real server).
+    #[test]
+    #[ignore]
+    fn mssql_go_script_with_procedure_and_top_auto_limit_live() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        let Some((host, port)) = host_port(&handle) else {
+            eprintln!("SKIP mssql_go_script_with_procedure_and_top_auto_limit_live: docker unavailable");
+            return;
+        };
+        handle.block_on(async move {
+            let suffix = std::process::id();
+            let table = format!("g15_script_t_{suffix}");
+            let proc = format!("g15_script_proc_{suffix}");
+            let Some(mut setup) = open_mssql_or_skip(
+                "mssql_go_script_with_procedure_and_top_auto_limit_live",
+                mssql_spec("master", false, &host, port),
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            else {
+                return;
+            };
+            // Defensive: leftovers from a prior aborted run.
+            let _ = setup.conn.execute(&format!("DROP TABLE IF EXISTS dbo.[{table}]"), CancelToken::new()).await;
+            let _ = setup.conn.execute(&format!("DROP PROCEDURE IF EXISTS dbo.[{proc}]"), CancelToken::new()).await;
+            drop(setup);
+
+            let script = [
+                format!("CREATE TABLE dbo.[{table}] (id INT PRIMARY KEY, v NVARCHAR(50));"),
+                "GO".to_string(),
+                format!("CREATE PROCEDURE dbo.[{proc}] AS"),
+                "BEGIN".to_string(),
+                "    DECLARE @x INT;".to_string(),
+                "    SET @x = 1;".to_string(),
+                format!("    INSERT INTO dbo.[{table}] (id, v) VALUES (@x, N'a');"),
+                format!("    INSERT INTO dbo.[{table}] (id, v) VALUES (@x + 1, N'b');"),
+                "END".to_string(),
+                "GO".to_string(),
+                format!("EXEC dbo.[{proc}];"),
+                "GO".to_string(),
+                format!("INSERT INTO dbo.[{table}] (id, v) VALUES (100, N'c');"),
+                "GO".to_string(),
+            ]
+            .join("\n");
+            let tmp = tempfile::NamedTempFile::new().expect("temp script file");
+            std::fs::write(tmp.path(), &script).expect("write temp script");
+
+            let opts = ScriptRunOptions {
+                tx_scope: TxScope::PerFile,
+                error_policy: ErrorPolicy::Stop,
+                dialect: dbc_core::Dialect::Mssql,
+                statement_timeout_secs: None,
+            };
+            // NOTE: `drive_script` is driven directly here (spawned, with
+            // our own channel) rather than via `runner.run_script(...)` —
+            // `run_script` takes `&self` on the OUTER `runner`, and this
+            // whole test body already runs inside `runner.handle().block_on
+            // (async move { ... })`; an `async move` block that references
+            // `runner` moves it in, so `runner` (and the `tokio::runtime
+            // ::Runtime` it owns) would get DROPPED when this future
+            // completes — from a thread that IS that very runtime's own
+            // worker, which tokio detects and panics on ("Cannot drop a
+            // runtime in a context where blocking is not allowed"). Every
+            // other test in this module sidesteps this by calling free
+            // `_inner`/`drive_*` functions instead of a `QueryRunner`
+            // method from inside its own `block_on` — this is that same
+            // fix applied to the one test that used the public wrapper.
+            let files = vec![tmp.path().to_path_buf()];
+            let script_spec = mssql_spec("master", false, &host, port);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+            let script_task = tokio::spawn(async move {
+                let read_only = spec_is_read_only(&script_spec);
+                let mut opened = open_spec(script_spec, tokio::runtime::Handle::current()).await.unwrap();
+                drive_script(&mut *opened.conn, read_only, &files, &opts, CancelToken::new(), &tx).await;
+            });
+            let mut statements_failed = 0usize;
+            let mut aborted = false;
+            let mut run_finished = false;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    ScriptEvent::StatementFailed { error, .. } => {
+                        eprintln!("script statement failed: {error}");
+                    }
+                    ScriptEvent::RunFinished { statements_failed: f, aborted: a, .. } => {
+                        statements_failed = f;
+                        aborted = a;
+                        run_finished = true;
+                    }
+                    _ => {}
+                }
+            }
+            script_task.await.expect("the script-driving task must not panic");
+            assert!(run_finished, "the script run must send RunFinished");
+            assert_eq!(
+                statements_failed, 0,
+                "every GO batch must run cleanly, including the CREATE PROCEDURE body's interior semicolons"
+            );
+            assert!(!aborted, "the run must not abort");
+
+            let mut verify = open_spec(mssql_spec("master", false, &host, port), tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+            let rows = drain_all_rows(&mut *verify.conn, &format!("SELECT id FROM dbo.[{table}] ORDER BY id"), 50)
+                .await
+                .unwrap();
+            assert_eq!(rows.1.len(), 3, "the proc's 2 rows + the explicit INSERT's 1 row: {rows:?}");
+
+            // TOP auto-limit: apply_auto_limit_d's MSSQL arm live against
+            // the same table (3 rows present), capped to 2.
+            let (limited_sql, changed) =
+                dbc_core::apply_auto_limit_d(&format!("SELECT id FROM dbo.[{table}]"), 2, dbc_core::Dialect::Mssql);
+            assert!(changed, "auto-limit must rewrite a bare SELECT");
+            assert!(limited_sql.contains("TOP"), "MSSQL auto-limit uses TOP, not LIMIT: {limited_sql}");
+            let capped = drain_all_rows(&mut *verify.conn, &limited_sql, 50).await.unwrap();
+            assert_eq!(capped.1.len(), 2, "TOP 2 must actually cap the live result to 2 rows: {capped:?}");
+
+            let _ = verify.conn.execute(&format!("DROP PROCEDURE dbo.[{proc}]"), CancelToken::new()).await;
+            let _ = verify.conn.execute(&format!("DROP TABLE dbo.[{table}]"), CancelToken::new()).await;
+        });
+    }
+
+    /// Backlog item 8: `SHOWPLAN_XML` (estimated) and `STATISTICS XML`
+    /// (actual) captured live via `run_mssql_plan_inner` and parsed by
+    /// `plan::parse_mssql_xml` — plus the actual-plan path's own documented
+    /// invariant (`mssql_plan_session`'s doc comment): the ROLLBACK it
+    /// wraps every analyze run in truly undoes the write, verified here
+    /// with a SELECT after (not just "no error"). NOTE (honest scope
+    /// limit): this proves the live XML round-trips through
+    /// `parse_mssql_xml` without error for a scan and a join shape; it does
+    /// NOT re-audit G13's static pg fixture files against MSSQL output —
+    /// that would be a separate fixture-correctness pass, out of scope for
+    /// this task's remaining budget.
+    #[test]
+    #[ignore]
+    fn mssql_plan_capture_live_estimated_and_actual_with_rollback_proof() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        let Some((host, port)) = host_port(&handle) else {
+            eprintln!("SKIP mssql_plan_capture_live_estimated_and_actual_with_rollback_proof: docker unavailable");
+            return;
+        };
+        handle.block_on(async move {
+            let suffix = std::process::id();
+            let table = format!("g15_plan_t_{suffix}");
+            let Some(mut setup) = open_mssql_or_skip(
+                "mssql_plan_capture_live_estimated_and_actual_with_rollback_proof",
+                mssql_spec("master", false, &host, port),
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            else {
+                return;
+            };
+            setup
+                .conn
+                .execute(&format!("CREATE TABLE dbo.[{table}] (id INT PRIMARY KEY, v INT NOT NULL)"), CancelToken::new())
+                .await
+                .unwrap();
+            setup
+                .conn
+                .execute(&format!("INSERT INTO dbo.[{table}] (id, v) VALUES (1, 0)"), CancelToken::new())
+                .await
+                .unwrap();
+            drop(setup);
+
+            // Estimated plan (SHOWPLAN_XML) — a JOIN so the fixture set's
+            // "join" shape is represented, not just a single scan.
+            let estimated_sql =
+                format!("SELECT a.id, b.v FROM dbo.[{table}] a JOIN dbo.[{table}] b ON a.id = b.id");
+            let estimated_xml =
+                run_mssql_plan_inner(mssql_spec("master", false, &host, port), estimated_sql, false, None)
+                    .await
+                    .expect("SHOWPLAN_XML must return a plan live");
+            let estimated_parsed = plan::parse_mssql_xml(false, &estimated_xml);
+            assert!(
+                estimated_parsed.is_ok(),
+                "parse_mssql_xml must parse a real live SHOWPLAN_XML document: {estimated_parsed:?}\n{estimated_xml}"
+            );
+
+            // Actual plan (STATISTICS XML) of a WRITE — genuinely executes
+            // under BEGIN TRAN, then ALWAYS rolls back (never commits).
+            let write_sql = format!("UPDATE dbo.[{table}] SET v = 999 WHERE id = 1");
+            let actual_xml = run_mssql_plan_inner(mssql_spec("master", false, &host, port), write_sql, true, None)
+                .await
+                .expect("STATISTICS XML must return a plan live for an actual write");
+            let actual_parsed = plan::parse_mssql_xml(true, &actual_xml);
+            assert!(
+                actual_parsed.is_ok(),
+                "parse_mssql_xml must parse a real live STATISTICS XML document: {actual_parsed:?}\n{actual_xml}"
+            );
+
+            let mut verify = open_spec(mssql_spec("master", false, &host, port), tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+            let v = drain_single_text_cell(
+                &mut *verify.conn,
+                &format!("SELECT CAST(v AS VARCHAR(10)) FROM dbo.[{table}] WHERE id = 1"),
+                CancelToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                v.trim(),
+                "0",
+                "the analyze path's ROLLBACK must truly undo the write — v must still be 0, not 999"
+            );
+
+            let _ = verify.conn.execute(&format!("DROP TABLE dbo.[{table}]"), CancelToken::new()).await;
+        });
+    }
+
+    /// HARD GATE ITEM 5 (decision: keep `apply_auto_limit_d`'s documented
+    /// CTE/WITH no-op — see its doc comment in `dbc-core/src/guards.rs` for
+    /// the full risk-vs-benefit rationale; implementing paren-aware TOP
+    /// injection for WITH-leading statements was judged not worth the
+    /// added parsing risk for what is only a query-size optimization, not
+    /// a safety mechanism — the row cap in `drain_all_rows`/`LOOKUP_ROW_CAP`
+    /// bounds results regardless of whether TOP got injected). Live proof:
+    /// a WITH-leading MSSQL statement is NOT rewritten (no TOP appears) but
+    /// still executes correctly and returns its full (small) result — the
+    /// no-op is inert, not a live breakage.
+    #[test]
+    #[ignore]
+    fn mssql_cte_top_no_op_documented_limitation_still_executes_live() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        let Some((host, port)) = host_port(&handle) else {
+            eprintln!("SKIP mssql_cte_top_no_op_documented_limitation_still_executes_live: docker unavailable");
+            return;
+        };
+        handle.block_on(async move {
+            let Some(mut conn) = open_mssql_or_skip(
+                "mssql_cte_top_no_op_documented_limitation_still_executes_live",
+                mssql_spec("master", false, &host, port),
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            else {
+                return;
+            };
+            let sql = "WITH nums AS (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3) SELECT n FROM nums";
+            let (rewritten, changed) = dbc_core::apply_auto_limit_d(sql, 1, dbc_core::Dialect::Mssql);
+            assert!(!changed, "documented limitation: a WITH-leading statement must NOT be rewritten");
+            assert_eq!(rewritten, sql, "the no-op must return the input unchanged, byte for byte");
+
+            let rows = drain_all_rows(&mut *conn.conn, &rewritten, 100)
+                .await
+                .expect("the un-limited CTE statement must still execute correctly live");
+            assert_eq!(rows.1.len(), 3, "no TOP was injected, so all 3 rows come back: {rows:?}");
+        });
+    }
+
+    /// G15 T8 whole-branch review B2 REQUIRED live regression: a single
+    /// UPDATE run through the EXACT single-statement editor dispatch path
+    /// (`QueryRunner::connect_and_run`, the same public method
+    /// `main.rs::run_query_with` calls — not a driver-level shortcut, not
+    /// `run_write_transaction_inner`) must report success
+    /// (`QueryEvent::WriteFinished`, never `Failed`), apply EXACTLY ONCE,
+    /// and carry the correct affected-row count. Before the fix this
+    /// silently committed via `Connection::query`'s fresh autocommit
+    /// connection and then reported `Err("statement produced no result
+    /// set")` — a naive UI retry after seeing that error would double-
+    /// apply it, which this test also guards against (checks `v` went
+    /// from 0 to EXACTLY 1, not 2). A single SELECT through the identical
+    /// path must still stream `Started` -> `Batch` -> `Finished`,
+    /// unchanged.
+    ///
+    /// Uses `runner.connect_and_run(...)` directly inside a plain (NOT
+    /// `move`) `async` block, borrowing `runner` rather than moving it —
+    /// same fix `plan.rs`'s `live_parallel_explain_analyze_round_trips_
+    /// through_parser` already documents for why `QueryRunner`-owning
+    /// methods can't be called from inside an `async move` block driven by
+    /// that SAME `QueryRunner`'s own `handle().block_on(...)` (moving
+    /// `runner` in means its owned `Runtime` gets dropped from inside its
+    /// own worker context when the future completes — "Cannot drop a
+    /// runtime in a context where blocking is not allowed").
+    #[test]
+    #[ignore]
+    fn mssql_single_statement_editor_write_and_read_live_b2_regression() {
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        let Some((host, port)) = host_port(&handle) else {
+            eprintln!("SKIP mssql_single_statement_editor_write_and_read_live_b2_regression: docker unavailable");
+            return;
+        };
+        handle.block_on(async {
+            let Some(mut setup) = open_mssql_or_skip(
+                "mssql_single_statement_editor_write_and_read_live_b2_regression",
+                mssql_spec("master", false, &host, port),
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            else {
+                return;
+            };
+            let suffix = std::process::id();
+            let table = format!("g15_b2_regression_t_{suffix}");
+            setup
+                .conn
+                .execute(
+                    &format!("CREATE TABLE dbo.[{table}] (id INT PRIMARY KEY, v INT NOT NULL)"),
+                    CancelToken::new(),
+                )
+                .await
+                .unwrap();
+            setup
+                .conn
+                .execute(&format!("INSERT INTO dbo.[{table}] (id, v) VALUES (1, 0)"), CancelToken::new())
+                .await
+                .unwrap();
+            drop(setup);
+
+            // The regression: a single UPDATE through connect_and_run.
+            let mut rx = runner.connect_and_run(
+                mssql_spec("master", false, &host, port),
+                format!("UPDATE dbo.[{table}] SET v = v + 1 WHERE id = 1"),
+                CancelToken::new(),
+                None,
+            );
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            assert_eq!(events.len(), 1, "exactly one terminal event, no Started/Batch: {events:?}");
+            match &events[0] {
+                QueryEvent::WriteFinished { affected, .. } => assert_eq!(*affected, 1),
+                other => panic!(
+                    "expected WriteFinished, got {other:?} — the B2 regression: a write must \
+                     never surface as Failed after it already committed"
+                ),
+            }
+
+            // Applied EXACTLY ONCE: v went 0 -> 1, not 0 -> 2 (which would
+            // mean something retried after a fake error — the review's
+            // exact "double-applies" failure mode).
+            let mut verify = open_spec(mssql_spec("master", false, &host, port), tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+            let v = drain_single_text_cell(
+                &mut *verify.conn,
+                &format!("SELECT CAST(v AS VARCHAR(10)) FROM dbo.[{table}] WHERE id = 1"),
+                CancelToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(v.trim(), "1", "the UPDATE must have applied exactly once, got v = {v}");
+
+            // A single SELECT through the SAME path must still stream,
+            // unchanged.
+            let mut rx2 = runner.connect_and_run(
+                mssql_spec("master", false, &host, port),
+                format!("SELECT v FROM dbo.[{table}] WHERE id = 1"),
+                CancelToken::new(),
+                None,
+            );
+            let mut events2 = Vec::new();
+            while let Some(ev) = rx2.recv().await {
+                events2.push(ev);
+            }
+            assert!(
+                matches!(
+                    events2.as_slice(),
+                    [QueryEvent::Started { .. }, QueryEvent::Batch(_), QueryEvent::Finished { .. }]
+                ),
+                "SELECT through connect_and_run must still stream Started -> Batch -> Finished: {events2:?}"
+            );
+
+            let _ = verify.conn.execute(&format!("DROP TABLE dbo.[{table}]"), CancelToken::new()).await;
         });
     }
 }

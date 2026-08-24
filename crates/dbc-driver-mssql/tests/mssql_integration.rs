@@ -1,38 +1,47 @@
 //! Server-dependent integration tests, all `#[ignore]`d — mirrors
-//! `dbc-driver-postgres`'s docker-gated test style, except there is no
-//! docker/testcontainers setup here (no SQL Server test image is pulled
-//! automatically): the environment this crate was authored in had neither a
-//! reachable SQL Server nor a confirmed ODBC Driver 17/18 install, so these
-//! are written against the documented `odbc-api`/T-SQL surface but have NOT
-//! been run for real. They are the first thing to run against a live server
-//! before trusting this driver in the sandbox Apply flow.
+//! `dbc-driver-postgres`'s docker-gated test style. G15 T8: now runs live
+//! by default (testcontainers `mssql_server`, see `common::conn_str_or_skip`)
+//! — "the first thing to run against a live server before trusting this
+//! driver in the sandbox Apply flow" is no longer aspirational.
 //!
-//! Point `DBC_MSSQL_TEST_CONN` at a full ODBC connection string (see
-//! `dbc_driver_mssql::MssqlConfig::to_connection_string` for the shape) to
-//! run them, e.g.:
+//! `DBC_MSSQL_TEST_CONN` stays the escape hatch (point it at a full ODBC
+//! connection string to skip the container spin-up while iterating), e.g.:
 //!
 //! ```text
 //! DBC_MSSQL_TEST_CONN="Driver={ODBC Driver 18 for SQL Server};Server=tcp:localhost,1433;\
 //!   Database=tempdb;Uid=sa;Pwd=yourStrong(!)Password;Encrypt=yes;TrustServerCertificate=yes;"
 //! cargo test -p dbc-driver-mssql -- --ignored
 //! ```
+//!
+//! Every test SKIPs honestly (never silently green) if the host has no
+//! ODBC Driver 17/18 installed — the one prerequisite docker itself can't
+//! provide — via a `probe()`-first prologue.
+
+mod common;
 
 use dbc_core::{CancelToken, Connection};
 use dbc_driver_mssql::MssqlConnection;
 
-fn conn_str() -> Option<String> {
-    std::env::var("DBC_MSSQL_TEST_CONN").ok()
-}
-
-fn connect() -> MssqlConnection {
-    MssqlConnection::from_connection_string(conn_str().expect("DBC_MSSQL_TEST_CONN not set"))
+/// Connects (or returns `None` to SKIP): `common::conn_str_or_skip` first
+/// (docker/env unavailable), then `probe()` (missing host ODBC driver) —
+/// no test ever panics on a missing environment fact.
+async fn connect_or_skip(test: &str) -> Option<MssqlConnection> {
+    let cs = common::conn_str_or_skip(test).await?;
+    let c = MssqlConnection::from_connection_string(cs);
+    if let Err(e) = c.probe() {
+        if common::skip_if_no_odbc_driver(test, &e) {
+            return None;
+        }
+        panic!("{test}: connect failed: {e}");
+    }
+    Some(c)
 }
 
 /// Basic round trip: connect, run a trivial SELECT, drain the stream.
 #[tokio::test]
 #[ignore]
 async fn query_stream_smoke() {
-    let mut c = connect();
+    let Some(mut c) = connect_or_skip("query_stream_smoke").await else { return };
     let mut s = c.query("SELECT 1 AS a, 'x' AS b", CancelToken::new()).await.unwrap();
     assert_eq!(s.columns.fields().len(), 2);
     let mut rows = 0usize;
@@ -48,7 +57,7 @@ async fn query_stream_smoke() {
 #[tokio::test]
 #[ignore]
 async fn query_handles_nulls() {
-    let mut c = connect();
+    let Some(mut c) = connect_or_skip("query_handles_nulls").await else { return };
     let mut s = c
         .query("SELECT CAST(NULL AS int) AS a, CAST(NULL AS nvarchar(10)) AS b", CancelToken::new())
         .await
@@ -74,7 +83,7 @@ async fn query_handles_nulls() {
 #[tokio::test]
 #[ignore]
 async fn query_roundtrips_czech_diacritics() {
-    let mut c = connect();
+    let Some(mut c) = connect_or_skip("query_roundtrips_czech_diacritics").await else { return };
     let text = "Příliš žluťoučký kůň úpěl ďábelské ódy";
     let mut s = c
         .query(&format!("SELECT N'{text}' AS greeting"), CancelToken::new())
@@ -99,7 +108,7 @@ async fn query_roundtrips_czech_diacritics() {
 #[tokio::test]
 #[ignore]
 async fn query_reports_truncation_marker_for_oversized_nvarchar_max() {
-    let mut c = connect();
+    let Some(mut c) = connect_or_skip("query_reports_truncation_marker_for_oversized_nvarchar_max").await else { return };
     let mut s = c
         .query(
             "SELECT REPLICATE(CAST(N'x' AS nvarchar(max)), 100000) AS big",
@@ -128,7 +137,7 @@ async fn query_reports_truncation_marker_for_oversized_nvarchar_max() {
 #[tokio::test]
 #[ignore]
 async fn query_error_is_a_value() {
-    let mut c = connect();
+    let Some(mut c) = connect_or_skip("query_error_is_a_value").await else { return };
     let err = match c.query("SELECT * FROM no_such_table_xyz", CancelToken::new()).await {
         Ok(_) => panic!("expected an error querying a missing table"),
         Err(e) => e,
@@ -142,7 +151,7 @@ async fn query_error_is_a_value() {
 #[tokio::test]
 #[ignore]
 async fn schema_snapshot_smoke() {
-    let mut c = connect();
+    let Some(mut c) = connect_or_skip("schema_snapshot_smoke").await else { return };
     let suffix = std::process::id();
     let customers = format!("mssql_it_customers_{suffix}");
     let orders = format!("mssql_it_orders_{suffix}");
@@ -203,7 +212,7 @@ async fn schema_snapshot_smoke() {
 #[tokio::test]
 #[ignore]
 async fn execute_reports_affected_rows() {
-    let mut c = connect();
+    let Some(mut c) = connect_or_skip("execute_reports_affected_rows").await else { return };
     let table = format!("mssql_it_rows_{}", std::process::id());
     c.execute(&format!("CREATE TABLE {table} (id INT, name NVARCHAR(50))"), CancelToken::new())
         .await
@@ -236,7 +245,7 @@ async fn execute_reports_affected_rows() {
 #[tokio::test]
 #[ignore]
 async fn execute_transaction_commit_and_rollback() {
-    let mut c = connect();
+    let Some(mut c) = connect_or_skip("execute_transaction_commit_and_rollback").await else { return };
     let table = format!("mssql_it_tx_{}", std::process::id());
     c.execute(&format!("CREATE TABLE {table} (id INT)"), CancelToken::new()).await.unwrap();
 
@@ -276,7 +285,7 @@ async fn execute_transaction_commit_and_rollback() {
 #[tokio::test]
 #[ignore]
 async fn mid_tx_error_behavior_probe_xact_abort_off() {
-    let mut c = connect();
+    let Some(mut c) = connect_or_skip("mid_tx_error_behavior_probe_xact_abort_off").await else { return };
     let table = format!("mssql_it_probe_{}", std::process::id());
     c.execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY)"), CancelToken::new())
         .await

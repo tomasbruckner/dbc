@@ -27,7 +27,7 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_PG_PORT: u16 = 5432;
 
 /// Opens a saved connection for MCP use: always read-only at the driver
-/// layer, never SSH-tunneled, never MSSQL (not shipped yet).
+/// layer, never SSH-tunneled, never MSSQL.
 ///
 /// SECURITY: `secret` is never logged and never appears in an error
 /// message — same discipline as `dbc-ui`'s `open_config`.
@@ -42,9 +42,18 @@ pub async fn open_for_mcp(
     }
     match cfg.engine {
         Engine::Mssql => {
-            // Same message dbc-ui's open_config uses for the same case —
-            // the MSSQL driver isn't merged on main yet.
-            Err(QueryError::msg("MSSQL driver zatím není k dispozici"))
+            // G15 T8 whole-branch review NIT fix: this comment used to say
+            // "the MSSQL driver isn't merged on main yet", which went stale
+            // the moment G15 landed dbc-driver-mssql and wired it into
+            // dbc-ui's own open_config. MCP intentionally refuses MSSQL —
+            // this crate's own connect path (this file's module doc: "a
+            // near-duplicate of dbc-ui's open_config, not a shared
+            // abstraction") has simply never been extended to build an
+            // MSSQL connection string/config, independent of whatever
+            // dbc-ui's own MSSQL feature gates are doing. Not a stale
+            // placeholder to "catch up" passively — a deliberate scope
+            // decision for a future task to lift on purpose.
+            Err(QueryError::msg("MSSQL zatím není přes MCP podporován"))
         }
         Engine::Sqlite => {
             // `true` unconditionally: MCP has no write path, so it is
@@ -94,6 +103,7 @@ mod tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         }
     }
 
