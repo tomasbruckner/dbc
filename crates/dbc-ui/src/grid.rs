@@ -157,6 +157,17 @@ fn delete_targets(
     (real, ins)
 }
 
+/// UX-polish §4: first SOURCE column not hidden via „Sloupce ▾" — the cell
+/// the editor auto-opens on after „+ řádek". Virtual FK columns sit past
+/// `ncols` and are never editable, so they're structurally out of range
+/// here. `None` when every source column is hidden (possible via the
+/// columns menu) — caller then scrolls only. Total over a short
+/// `hidden_cols` (same defensive `.get().unwrap_or(false)` idiom the rest
+/// of grid.rs uses).
+fn first_visible_col(ncols: usize, hidden_cols: &[bool]) -> Option<usize> {
+    (0..ncols).find(|&c| !hidden_cols.get(c).copied().unwrap_or(false))
+}
+
 /// Bind ResultGrid's own keys. Scoped to the `"ResultGrid"` key context so
 /// ctrl-c only fires `CopySelection` while the grid (not `SqlInput`) is
 /// focused — SqlInput binds its own `Copy` action under context `None`, and
@@ -1682,8 +1693,8 @@ impl ResultGrid {
                     .rounded_md()
                     .bg(theme.bg_hover)
                     .child("+ řádek")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.add_insert_row(cx);
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.add_insert_row(window, cx);
                     })),
             );
         }
@@ -2067,11 +2078,37 @@ impl ResultGrid {
 
     /// "+ řádek" toolbar click (editable tabs only, brief contract #4) —
     /// appends one blank insert row sized to the CURRENT result's column
-    /// count (every column starts untouched, i.e. "(výchozí)" — see
-    /// `sandbox::insert_cell_display`).
-    fn add_insert_row(&mut self, cx: &mut Context<Self>) {
+    /// count, scrolls it into view, and opens the cell editor on its first
+    /// visible column (UX-polish §4). Inserted rows always render appended
+    /// AFTER the filtered `view` (see the uniform_list count in `render`),
+    /// so `view.len() + ins_ix` is always a valid display index — the
+    /// visually-last row regardless of active filters/sort/cap.
+    /// ScrollStrategy::Center clamps "at the closest possible position"
+    /// for a last item (uniform_list.rs) — if the visual pass shows an odd
+    /// resting position, switch to `Bottom` (one enum change, design §8).
+    fn add_insert_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ncols = self.buffer.as_ref().map_or(0, |b| b.borrow().column_count());
-        self.edit_state.add_insert_row(ncols);
+        let ins_ix = self.edit_state.add_insert_row(ncols);
+        let display_ix = self.view.len() + ins_ix;
+        self.scroll_handle.scroll_to_item(display_ix, ScrollStrategy::Center);
+        // §4: auto-open the editor on the first visible column — skipped
+        // (scroll only) when „Sloupce ▾" hid every source column. Risk that
+        // auto-opening annoys rapid multi-row adding is a §8 flag: the
+        // fallback is deleting exactly this if-block, scroll stays.
+        if let Some(col) = first_visible_col(ncols, &self.hidden_cols) {
+            let column_name = self
+                .buffer
+                .as_ref()
+                .and_then(|b| b.borrow().schema().fields().get(col).map(|f| f.name().clone()))
+                .unwrap_or_default();
+            self.open_cell_editor(
+                EditTarget::Insert { ins_ix, col },
+                column_name,
+                String::new(),
+                window,
+                cx,
+            );
+        }
         cx.notify();
     }
 
@@ -3171,5 +3208,30 @@ mod delete_targets_tests {
         // fresh add on view_len 4 -> display 4; second add -> display 5.
         assert_eq!(4 + 0, 4usize);
         assert_eq!(4 + 1, 5usize);
+    }
+}
+
+#[cfg(test)]
+mod first_visible_col_tests {
+    use super::first_visible_col;
+
+    #[test]
+    fn none_hidden_returns_col_zero() {
+        assert_eq!(first_visible_col(3, &[false, false, false]), Some(0));
+    }
+
+    #[test]
+    fn leading_hidden_cols_are_skipped() {
+        assert_eq!(first_visible_col(3, &[true, true, false]), Some(2));
+    }
+
+    #[test]
+    fn all_hidden_returns_none() {
+        assert_eq!(first_visible_col(2, &[true, true]), None);
+    }
+
+    #[test]
+    fn zero_cols_returns_none() {
+        assert_eq!(first_visible_col(0, &[]), None);
     }
 }
