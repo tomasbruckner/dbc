@@ -137,6 +137,16 @@ pub enum PaletteAction {
     /// G14 T11: opens `ModalState::ChartPicker` — the axis picker for the
     /// active Grid tab's `ResultBuffer` snapshot.
     OpenChart,
+    /// App-wide master password UX design §2: the proactive unlock — opens
+    /// `MasterPasswordPrompt` with `PendingAfterUnlock::Nothing` (no
+    /// interrupted action to resume). Listed only while a vault file exists
+    /// and is currently locked (`fixed_actions`'s `vault_unlockable`).
+    UnlockVault,
+    /// App-wide master password UX design §3: `self.vault = None` — the
+    /// `Drop` impl zeroizes the derived key + decrypted secrets. Listed
+    /// only while the vault is currently unlocked (`fixed_actions`'s
+    /// `vault_lockable`).
+    LockVault,
 }
 
 /// One table/view from the current schema snapshot, plus whether it's
@@ -180,11 +190,21 @@ const FAVOURITE_BONUS: i64 = 1000;
 /// posture as `monitor_available` — listed only while the active tab is a
 /// Grid with results to chart. Placed BEFORE the backup/restore block so
 /// those two stay the literal last two rows (existing test invariant).
+/// `vault_unlockable`/`vault_lockable` (app-wide master password UX design
+/// §2/§3/§7): "Odemknout trezor" listed only while a vault file exists AND
+/// is currently locked; "Zamknout trezor" listed only while unlocked —
+/// mutually exclusive in practice (the vault is never both), each gated
+/// independently rather than as one three-state action so a future state
+/// (e.g. "no vault file yet") simply hides both without a match arm to
+/// update. Placed BEFORE the backup/restore block, same reason as
+/// `chart_available` — those two stay the literal last two rows.
 pub fn fixed_actions(
     monitor_available: bool,
     admin: crate::admin_panel::AdminEntry,
     connection_active: bool,
     chart_available: bool,
+    vault_unlockable: bool,
+    vault_lockable: bool,
 ) -> Vec<(String, PaletteAction)> {
     let mut actions = vec![
         ("Spustit dotaz".to_string(), PaletteAction::RunQuery),
@@ -212,6 +232,12 @@ pub fn fixed_actions(
     }
     if chart_available {
         actions.push(("Graf z výsledku".to_string(), PaletteAction::OpenChart));
+    }
+    if vault_unlockable {
+        actions.push(("Odemknout trezor".to_string(), PaletteAction::UnlockVault));
+    }
+    if vault_lockable {
+        actions.push(("Zamknout trezor".to_string(), PaletteAction::LockVault));
     }
     if connection_active {
         actions.push(("Zálohovat databázi…".to_string(), PaletteAction::BackupDatabase));
@@ -252,6 +278,8 @@ pub fn rank_items(
     cap: usize,
     connection_active: bool,
     chart_available: bool,
+    vault_unlockable: bool,
+    vault_lockable: bool,
 ) -> Vec<PaletteItem> {
     if query.trim().is_empty() {
         let mut out = Vec::new();
@@ -267,7 +295,14 @@ pub fn rank_items(
         for c in connections {
             out.push(PaletteItem::Connection { id: c.id.clone(), name: c.name.clone() });
         }
-        for (label, action) in fixed_actions(monitor_available, admin, connection_active, chart_available) {
+        for (label, action) in fixed_actions(
+            monitor_available,
+            admin,
+            connection_active,
+            chart_available,
+            vault_unlockable,
+            vault_lockable,
+        ) {
             out.push(PaletteItem::Action { label, action });
         }
 
@@ -298,7 +333,14 @@ pub fn rank_items(
             scored.push((score, PaletteItem::Connection { id: c.id.clone(), name: c.name.clone() }));
         }
     }
-    for (label, action) in fixed_actions(monitor_available, admin, connection_active, chart_available) {
+    for (label, action) in fixed_actions(
+        monitor_available,
+        admin,
+        connection_active,
+        chart_available,
+        vault_unlockable,
+        vault_lockable,
+    ) {
         if let Some(score) = fuzzy_score(query, &label) {
             scored.push((score, PaletteItem::Action { label, action }));
         }
@@ -446,7 +488,7 @@ mod rank_items_tests {
         let connections = vec![conn("c1", "prod", false)];
 
         let items =
-            rank_items("", &tables, &history, &connections, false, AdminEntry::Hidden, 30, false, false);
+            rank_items("", &tables, &history, &connections, false, AdminEntry::Hidden, 30, false, false, false, false);
 
         // Favourites (alphabetical) first, then history (as given), then
         // connections, then the fixed actions (5 base + ER diagram +
@@ -475,14 +517,14 @@ mod rank_items_tests {
         // query (brief contract #3 lists favourites/history/connections/
         // actions — not the whole unfiltered table list).
         let tables: Vec<TableSource> = (0..50).map(|i| table(None, &format!("t{i}"), true)).collect();
-        let items = rank_items("", &tables, &[], &[], false, AdminEntry::Hidden, 30, false, false);
+        let items = rank_items("", &tables, &[], &[], false, AdminEntry::Hidden, 30, false, false, false, false);
         assert_eq!(items.len(), 30);
     }
 
     #[test]
     fn non_matching_query_drops_items_that_dont_subsequence_match() {
         let tables = vec![table(None, "orders", false)];
-        let items = rank_items("zzz", &tables, &[], &[], false, AdminEntry::Hidden, 30, false, false);
+        let items = rank_items("zzz", &tables, &[], &[], false, AdminEntry::Hidden, 30, false, false, false, false);
         assert!(items.is_empty());
     }
 
@@ -498,7 +540,7 @@ mod rank_items_tests {
             fuzzy_score("orders", &table_search_text(&tables[1])),
             "test setup must produce a genuine base-score tie"
         );
-        let items = rank_items("orders", &tables, &[], &[], false, AdminEntry::Hidden, 30, false, false);
+        let items = rank_items("orders", &tables, &[], &[], false, AdminEntry::Hidden, 30, false, false, false, false);
         assert_eq!(
             items[0],
             PaletteItem::Table { schema: Some("bbbbb".into()), name: "orders".into() }
@@ -521,17 +563,17 @@ mod rank_items_tests {
         weak_match.push_str(&"z".repeat(30)); // long target: length penalty on top
 
         let tables = vec![table(None, &weak_match, true), table(None, "orders", false)];
-        let items = rank_items("orders", &tables, &[], &[], false, AdminEntry::Hidden, 30, false, false);
+        let items = rank_items("orders", &tables, &[], &[], false, AdminEntry::Hidden, 30, false, false, false, false);
         assert_eq!(items[0], PaletteItem::Table { schema: None, name: "orders".into() });
     }
 
     #[test]
     fn monitor_entry_present_only_when_available() {
-        let items = rank_items("", &[], &[], &[], true, AdminEntry::Hidden, 30, false, false);
+        let items = rank_items("", &[], &[], &[], true, AdminEntry::Hidden, 30, false, false, false, false);
         assert!(items
             .iter()
             .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::OpenMonitor, .. })));
-        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false, false);
+        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false, false, false, false);
         assert!(items
             .iter()
             .all(|i| !matches!(i, PaletteItem::Action { action: PaletteAction::OpenMonitor, .. })));
@@ -542,12 +584,12 @@ mod rank_items_tests {
     // disabled-row idiom (the schema-tree row explains the disabled state).
     #[test]
     fn admin_entry_present_only_when_enabled() {
-        let items = rank_items("", &[], &[], &[], false, AdminEntry::Enabled, 30, false, false);
+        let items = rank_items("", &[], &[], &[], false, AdminEntry::Enabled, 30, false, false, false, false);
         assert!(items
             .iter()
             .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::OpenServerAdmin, .. })));
         for admin in [AdminEntry::Hidden, AdminEntry::Disabled] {
-            let items = rank_items("", &[], &[], &[], false, admin, 30, false, false);
+            let items = rank_items("", &[], &[], &[], false, admin, 30, false, false, false, false);
             assert!(items
                 .iter()
                 .all(|i| !matches!(i, PaletteItem::Action { action: PaletteAction::OpenServerAdmin, .. })));
@@ -557,18 +599,18 @@ mod rank_items_tests {
     #[test]
     fn results_are_capped_at_30() {
         let tables: Vec<TableSource> = (0..50).map(|i| table(None, &format!("orders_{i}"), false)).collect();
-        let items = rank_items("orders", &tables, &[], &[], false, AdminEntry::Hidden, 30, false, false);
+        let items = rank_items("orders", &tables, &[], &[], false, AdminEntry::Hidden, 30, false, false, false, false);
         assert_eq!(items.len(), 30);
     }
 
     // --- G11 T6: backup/restore actions gated on connection_active ---
     #[test]
     fn backup_restore_actions_hidden_without_active_connection() {
-        let actions = fixed_actions(false, AdminEntry::Hidden, false, false);
+        let actions = fixed_actions(false, AdminEntry::Hidden, false, false, false, false);
         assert!(!actions.iter().any(|(_, a)| matches!(a, PaletteAction::BackupDatabase)));
         assert!(!actions.iter().any(|(_, a)| matches!(a, PaletteAction::RestoreDatabase)));
 
-        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false, false);
+        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false, false, false, false);
         assert!(items
             .iter()
             .all(|i| !matches!(i, PaletteItem::Action { action: PaletteAction::BackupDatabase, .. })
@@ -577,11 +619,11 @@ mod rank_items_tests {
 
     #[test]
     fn backup_restore_actions_present_and_last_when_connection_active() {
-        let actions = fixed_actions(false, AdminEntry::Hidden, true, false);
+        let actions = fixed_actions(false, AdminEntry::Hidden, true, false, false, false);
         assert_eq!(actions.last().unwrap().1, PaletteAction::RestoreDatabase);
         assert_eq!(actions[actions.len() - 2].1, PaletteAction::BackupDatabase);
 
-        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, true, false);
+        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, true, false, false, false);
         assert!(items
             .iter()
             .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::BackupDatabase, .. })));
@@ -593,13 +635,13 @@ mod rank_items_tests {
     // --- G14 T10: theme toggle is an unconditional fixed action ---
     #[test]
     fn theme_toggle_action_is_always_present() {
-        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false, false);
+        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false, false, false, false);
         assert!(items.iter().any(|i| matches!(
             i,
             PaletteItem::Action { action: PaletteAction::ToggleTheme, .. }
         )));
         // and it fuzzy-matches by its Czech label:
-        let items = rank_items("motiv", &[], &[], &[], false, AdminEntry::Hidden, 30, false, false);
+        let items = rank_items("motiv", &[], &[], &[], false, AdminEntry::Hidden, 30, false, false, false, false);
         assert!(items.iter().any(|i| matches!(
             i,
             PaletteItem::Action { action: PaletteAction::ToggleTheme, .. }
@@ -609,15 +651,76 @@ mod rank_items_tests {
     // --- G14 T11: chart entry gated on chart_available (active Grid tab) ---
     #[test]
     fn chart_entry_present_only_when_a_grid_tab_is_active() {
-        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false, true);
+        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false, true, false, false);
         assert!(items.iter().any(|i| matches!(
             i,
             PaletteItem::Action { action: PaletteAction::OpenChart, .. }
         )));
-        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false, false);
+        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false, false, false, false);
         assert!(items.iter().all(|i| !matches!(
             i,
             PaletteItem::Action { action: PaletteAction::OpenChart, .. }
         )));
+    }
+
+    // --- App-wide master password UX design §2/§3/§7: the two vault
+    // actions, each gated independently on its own boolean. ---
+
+    #[test]
+    fn unlock_vault_action_present_only_when_unlockable() {
+        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false, false, true, false);
+        assert!(items
+            .iter()
+            .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::UnlockVault, .. })));
+
+        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false, false, false, false);
+        assert!(items
+            .iter()
+            .all(|i| !matches!(i, PaletteItem::Action { action: PaletteAction::UnlockVault, .. })));
+    }
+
+    #[test]
+    fn lock_vault_action_present_only_when_lockable() {
+        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false, false, false, true);
+        assert!(items
+            .iter()
+            .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::LockVault, .. })));
+
+        let items = rank_items("", &[], &[], &[], false, AdminEntry::Hidden, 30, false, false, false, false);
+        assert!(items
+            .iter()
+            .all(|i| !matches!(i, PaletteItem::Action { action: PaletteAction::LockVault, .. })));
+    }
+
+    #[test]
+    fn vault_actions_never_both_absent_or_present_when_only_one_gate_is_set() {
+        // Not a structural guarantee (the two params are independent bools,
+        // deliberately — see `fixed_actions`'s doc comment on why this
+        // isn't one three-state action) — just pins that each row's
+        // presence tracks its OWN gate, not the other one's.
+        let unlockable_only = fixed_actions(false, AdminEntry::Hidden, false, false, true, false);
+        assert!(unlockable_only.iter().any(|(_, a)| matches!(a, PaletteAction::UnlockVault)));
+        assert!(!unlockable_only.iter().any(|(_, a)| matches!(a, PaletteAction::LockVault)));
+
+        let lockable_only = fixed_actions(false, AdminEntry::Hidden, false, false, false, true);
+        assert!(!lockable_only.iter().any(|(_, a)| matches!(a, PaletteAction::UnlockVault)));
+        assert!(lockable_only.iter().any(|(_, a)| matches!(a, PaletteAction::LockVault)));
+    }
+
+    // Extends `backup_restore_actions_present_and_last_when_connection_active`:
+    // the design requires the vault rows to be inserted BEFORE the
+    // backup/restore block (like `OpenChart`), so backup/restore must stay
+    // the literal last two rows even when a vault row is also present.
+    #[test]
+    fn backup_restore_stay_last_two_rows_alongside_a_vault_action() {
+        let actions = fixed_actions(false, AdminEntry::Hidden, true, false, true, false);
+        assert_eq!(actions.last().unwrap().1, PaletteAction::RestoreDatabase);
+        assert_eq!(actions[actions.len() - 2].1, PaletteAction::BackupDatabase);
+        assert!(actions.iter().any(|(_, a)| matches!(a, PaletteAction::UnlockVault)));
+
+        let actions = fixed_actions(false, AdminEntry::Hidden, true, false, false, true);
+        assert_eq!(actions.last().unwrap().1, PaletteAction::RestoreDatabase);
+        assert_eq!(actions[actions.len() - 2].1, PaletteAction::BackupDatabase);
+        assert!(actions.iter().any(|(_, a)| matches!(a, PaletteAction::LockVault)));
     }
 }
