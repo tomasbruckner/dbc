@@ -8786,3 +8786,291 @@ mod duckdb_backup_restore_tests {
         assert_eq!(buf.cell_text(0, 0), "analytics");
     }
 }
+
+/// G16 §6/§10: the embedded live tier for DuckDB's pg-style transactional
+/// semantics — the same shapes the sqlite-backed tests above have, existing
+/// because sqlite's mid-tx TOLERANCE would mask the pg-style abort
+/// divergence these pin. (The session-property pin behind T5's
+/// analyze-write refusal — duckdb_query_sessions_do_not_see_execute_transactions
+/// — lives in duckdb_backup_restore_tests above, landed with T5.)
+#[cfg(test)]
+mod duckdb_runner_tests {
+    use super::*;
+    use crate::csv_import::{ColumnMapping, TargetColumn};
+
+    /// Driver fixture quirk: DuckDB must create the file itself.
+    async fn open_duckdb_test_conn() -> (tempfile::TempPath, Box<dyn Connection>) {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let path = f.into_temp_path();
+        std::fs::remove_file(&path).ok();
+        let conn: Box<dyn Connection> =
+            Box::new(dbc_driver_duckdb::DuckdbConnection::new(&path));
+        (path, conn)
+    }
+
+    /// Reads back a single text cell — same body as
+    /// `write_transaction_tests::read_one` (sibling-module duplication
+    /// convention this file already uses).
+    async fn read_one(conn: &mut dyn Connection, sql: &str) -> Option<String> {
+        let mut stream = conn.query(sql, CancelToken::new()).await.expect("query");
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.expect("batch")).expect("push");
+        }
+        if buf.row_count() == 0 {
+            None
+        } else if buf.cell_is_null(0, 0) {
+            Some("<NULL>".to_string())
+        } else {
+            Some(buf.cell_text(0, 0))
+        }
+    }
+
+    fn duckdb_cfg(path: &str, read_only: bool) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "d1".into(),
+            name: "duck".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Duckdb,
+            host: String::new(),
+            port: None,
+            database: path.into(),
+            user: String::new(),
+            read_only,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: None,
+        }
+    }
+
+    /// §6: drive_write_sequence commit happy path over a real .duckdb.
+    #[tokio::test]
+    async fn duckdb_write_sequence_commits() {
+        let (_p, mut conn) = open_duckdb_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new())
+            .await
+            .unwrap();
+        let statements = vec![
+            crate::admin_sql::WriteStatement::from(("INSERT INTO t VALUES (1, 'a')".to_string(), None)),
+            crate::admin_sql::WriteStatement::from((
+                "UPDATE t SET n = 'b' WHERE id = 1".to_string(),
+                Some(1),
+            )),
+        ];
+        drive_write_sequence(&mut *conn, &statements, CancelToken::new(), dbc_core::Dialect::Postgres)
+            .await
+            .unwrap();
+        assert_eq!(read_one(&mut *conn, "SELECT n FROM t WHERE id = 1").await, Some("b".to_string()));
+    }
+
+    /// §6 KEYSTONE: statement 2 fails mid-sequence → the whole tx rolls
+    /// back (DuckDB aborts like pg — the driver's own
+    /// mid_transaction_error_aborts_like_postgres proof, now exercised
+    /// through the app's sanctioned sequence), the best-effort ROLLBACK's
+    /// `let _ =` discard is safe, and the connection stays usable after.
+    #[tokio::test]
+    async fn duckdb_write_sequence_mid_failure_rolls_back_everything() {
+        let (_p, mut conn) = open_duckdb_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", CancelToken::new()).await.unwrap();
+        let statements = vec![
+            crate::admin_sql::WriteStatement::from(("INSERT INTO t VALUES (1)".to_string(), None)),
+            crate::admin_sql::WriteStatement::from(("INSERT INTO t VALUES (1)".to_string(), None)), // dup PK
+        ];
+        let err =
+            drive_write_sequence(&mut *conn, &statements, CancelToken::new(), dbc_core::Dialect::Postgres)
+                .await;
+        assert!(err.is_err());
+        assert_eq!(read_one(&mut *conn, "SELECT count(*) FROM t").await, Some("0".to_string()));
+        // Usable after the abort+rollback:
+        conn.execute("INSERT INTO t VALUES (2)", CancelToken::new()).await.unwrap();
+        assert_eq!(read_one(&mut *conn, "SELECT count(*) FROM t").await, Some("1".to_string()));
+    }
+
+    /// G12 curation item 4 shape, DuckDB variant: a read-only script
+    /// rejects the write CLIENT-SIDE via the SHARED guard — same message,
+    /// no fresh read-only logic, nothing written.
+    #[tokio::test]
+    async fn duckdb_read_only_script_rejects_write_via_shared_guard() {
+        let (_p, mut conn) = open_duckdb_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER)", CancelToken::new()).await.unwrap();
+        let err = run_script_statement(
+            &mut *conn,
+            "INSERT INTO t VALUES (1)",
+            true,
+            dbc_core::Dialect::Postgres,
+            None,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.message, "připojení je jen pro čtení");
+        assert_eq!(read_one(&mut *conn, "SELECT count(*) FROM t").await, Some("0".to_string()));
+    }
+
+    /// §5 through the dispatch matrix: the idiomatic `FROM t` runs AS A
+    /// READ on DuckDB (rows drained, not a row-less execute) — the
+    /// wrong-result bug T2 exists to prevent, proven end to end.
+    #[tokio::test]
+    async fn duckdb_leading_from_statement_runs_as_read() {
+        let (_p, mut conn) = open_duckdb_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER)", CancelToken::new()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2), (3)", CancelToken::new()).await.unwrap();
+        let n = run_script_statement(
+            &mut *conn,
+            "FROM t",
+            true,
+            dbc_core::Dialect::Postgres,
+            None,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, Some(3)); // drained ROW count — the read path, even on read-only
+    }
+
+    /// §4 sandbox Apply end-to-end: generate_statements under
+    /// sql_dialect(Duckdb)=Postgres (pg-style "…" quoting) through the
+    /// sanctioned write sequence — quoted weird column name + Czech
+    /// diacritics survive byte-exact.
+    #[tokio::test]
+    async fn duckdb_sandbox_apply_quoted_column_and_diacritics_round_trip() {
+        let (_p, mut conn) = open_duckdb_test_conn().await;
+        conn.execute(r#"CREATE TABLE t(id INTEGER PRIMARY KEY, "we""ird" TEXT)"#, CancelToken::new())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'old')", CancelToken::new()).await.unwrap();
+        let sql = format!(
+            "UPDATE {} SET {} = {} WHERE {} = 1",
+            dbc_core::quote_qualified(None, "t"),
+            dbc_core::quote_ident("we\"ird"),
+            crate::sandbox::sql_value_d(Some("Příliš žluťoučký kůň"), false, dbc_core::Dialect::Postgres),
+            dbc_core::quote_ident("id"),
+        );
+        let statements = vec![crate::admin_sql::WriteStatement::from((sql, Some(1)))];
+        drive_write_sequence(&mut *conn, &statements, CancelToken::new(), dbc_core::Dialect::Postgres)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_one(&mut *conn, r#"SELECT "we""ird" FROM t WHERE id = 1"#).await,
+            Some("Příliš žluťoučký kůň".to_string())
+        );
+    }
+
+    /// Collects a full drive_script run — same body as script_run_tests'
+    /// drive_collect (sibling-module duplication convention).
+    async fn drive_collect(
+        conn: &mut dyn Connection,
+        read_only: bool,
+        files: &[std::path::PathBuf],
+        opts: &ScriptRunOptions,
+    ) -> Vec<ScriptEvent> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let cancel = CancelToken::new();
+        let drive = async {
+            drive_script(conn, read_only, files, opts, cancel, &tx).await;
+            drop(tx);
+        };
+        let collect = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let ((), events) = tokio::join!(drive, collect);
+        events
+    }
+
+    /// Mirror of `per_file_scope_continue_policy_skips_failed_file_commits_next`
+    /// (sqlite, script_run_tests) — DuckDB per-file scope: file 1's dup-PK
+    /// failure rolls the FILE tx back, Continue moves on, file 2 commits.
+    #[tokio::test]
+    async fn duckdb_script_per_file_continue_rolls_back_failed_file_and_commits_next() {
+        let (_p, mut conn) = open_duckdb_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new())
+            .await
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("01.sql");
+        std::fs::write(&f1, "INSERT INTO t VALUES (1, 'a');\nINSERT INTO t VALUES (1, 'dup');")
+            .unwrap();
+        let f2 = dir.path().join("02.sql");
+        std::fs::write(&f2, "INSERT INTO t VALUES (2, 'b');").unwrap();
+
+        let opts = ScriptRunOptions {
+            tx_scope: TxScope::PerFile,
+            error_policy: ErrorPolicy::Continue,
+            dialect: dbc_core::Dialect::Postgres,
+            statement_timeout_secs: None,
+        };
+        let events = drive_collect(&mut *conn, false, &[f1, f2], &opts).await;
+
+        let file_finished: Vec<_> =
+            events.iter().filter(|e| matches!(e, ScriptEvent::FileFinished { .. })).collect();
+        assert_eq!(file_finished.len(), 2);
+        assert!(matches!(events.last(), Some(ScriptEvent::RunFinished { aborted: false, .. })));
+        // file 1's first INSERT rolled back with the file tx; file 2's committed.
+        assert_eq!(read_one(&mut *conn, "SELECT n FROM t WHERE id = 1").await, None);
+        assert_eq!(read_one(&mut *conn, "SELECT n FROM t WHERE id = 2").await, Some("b".to_string()));
+        assert_eq!(read_one(&mut *conn, "SELECT count(*) FROM t").await, Some("1".to_string()));
+    }
+
+    /// Same body as csv_import_tests' drive_csv_import (sibling-module
+    /// duplication convention).
+    async fn drive_csv_import(spec: ConnectSpec, job: CsvImportJob) -> Vec<CsvImportEvent> {
+        let handle = tokio::runtime::Handle::current();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let task =
+            tokio::spawn(run_csv_import_inner(spec, job, CancelToken::new(), None, handle, tx));
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        task.await.unwrap();
+        events
+    }
+
+    /// Mirror of `csv_import_rolls_back_everything_on_batch_failure`
+    /// (sqlite, csv_import_tests) — DuckDB: the LAST CSV row violates the
+    /// PK, the ONE whole-import transaction rolls back, zero rows land.
+    #[tokio::test]
+    async fn duckdb_csv_import_is_all_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csv.duckdb");
+        {
+            // Seed the target table via the driver; root drops before the
+            // import opens its own connection.
+            let mut seed = dbc_driver_duckdb::DuckdbConnection::new(&db);
+            seed.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)", CancelToken::new())
+                .await
+                .unwrap();
+        }
+        let csv_path = dir.path().join("rows.csv");
+        // Last row repeats id=1 -> PK violation inside the import tx.
+        std::fs::write(&csv_path, "id,name\n1,alice\n2,bob\n1,dup\n").unwrap();
+
+        let spec = ConnectSpec::Config {
+            cfg: Box::new(duckdb_cfg(db.to_str().unwrap(), false)),
+            secret: None,
+        };
+        let job = CsvImportJob {
+            path: csv_path,
+            schema: None,
+            table: "t".to_string(),
+            columns: vec![
+                TargetColumn { name: "id".into(), numeric: true },
+                TargetColumn { name: "name".into(), numeric: false },
+            ],
+            mapping: ColumnMapping { targets: vec![Some(0), Some(1)] },
+        };
+        let events = drive_csv_import(spec, job).await;
+        assert!(matches!(events.last(), Some(CsvImportEvent::Failed { .. })));
+
+        // Re-open via the driver: nothing partial — zero rows.
+        let mut verify = dbc_driver_duckdb::DuckdbConnection::new(&db);
+        assert_eq!(read_one(&mut verify, "SELECT count(*) FROM t").await, Some("0".to_string()));
+    }
+}

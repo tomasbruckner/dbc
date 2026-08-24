@@ -58,12 +58,11 @@ fn sql_string_literal(s: &str) -> String {
 /// contract: it must go green RELIABLY, across repeated runs, before this
 /// function's `Mssql` arm flips.
 ///
-/// G16 T3: Duckdb joins the gated set until T6's flip — the DuckDB
-/// backup/restore mechanics land in T4 and the gate flips ONLY after the
-/// embedded suite is green (ON-flip discipline; same shape as the Mssql
-/// gate above).
+/// G16 T6 ON-flip: Duckdb un-gated after the T4 embedded suite (round
+/// trip, magic pin, read-only matrix) went green. Mssql stays gated per
+/// its own note above.
 pub fn backup_restore_available(engine: Engine) -> bool {
-    !matches!(engine, Engine::Mssql | Engine::Duckdb)
+    !matches!(engine, Engine::Mssql)
 }
 
 // --- Postgres argument builders -------------------------------------------
@@ -491,12 +490,12 @@ mod pure_tests {
     // G15 T8 HARD GATE ITEM 1: gated off for Mssql pending a real fix — see
     // `backup_restore_available`'s doc comment.
     #[test]
-    fn backup_restore_available_gates_mssql_and_duckdb_pre_flip() {
+    fn backup_restore_available_gates_mssql_only() {
         assert!(backup_restore_available(Engine::Postgres));
         assert!(backup_restore_available(Engine::Sqlite));
         assert!(!backup_restore_available(Engine::Mssql));
-        // G16 T3: OFF until T6's flip (mechanics land in T4).
-        assert!(!backup_restore_available(Engine::Duckdb));
+        // G16 T6 ON-flip: un-gated after the T4 embedded suite went green.
+        assert!(backup_restore_available(Engine::Duckdb));
     }
 
     fn cfg() -> ConnectionConfig {

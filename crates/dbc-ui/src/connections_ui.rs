@@ -2447,10 +2447,12 @@ fn next_engine(e: Engine) -> Engine {
     match e {
         Engine::Postgres => Engine::Mssql,
         Engine::Mssql => Engine::Sqlite,
-        Engine::Sqlite => Engine::Postgres,
-        // T6 flips the cycle to actually produce Duckdb (ON-flip
-        // discipline) — until then the arm is input-exhaustive only; no
-        // arm PRODUCES Duckdb, so the picker cannot create one.
+        // G16 T6 ON-flip: Duckdb enters the picker cycle only after the
+        // embedded live tier (runner.rs duckdb_runner_tests +
+        // duckdb_backup_restore_tests, plan.rs duckdb fixtures/capture,
+        // connect.rs duckdb_connect_tests, dbc-mcp duckdb test) went green
+        // on this branch — the G15 flip discipline, embedded edition.
+        Engine::Sqlite => Engine::Duckdb,
         Engine::Duckdb => Engine::Postgres,
     }
 }
@@ -2581,16 +2583,20 @@ mod test_vault_prompt_tests {
         assert!(!test_needs_vault_prompt(true, Engine::Duckdb, false, true));
     }
 
-    /// G16 T3 gate-honesty pin (resolved deviation 9): until T6's ON-flip,
-    /// NO input to the dialog's engine cycle may produce Duckdb — the
-    /// picker cannot create a DuckDB connection; hand-edited config.toml
-    /// is the only entry point on this branch. T6 rewrites this test when
-    /// it flips the cycle.
+    /// G16 T6 ON-flip (rewrites the T3 pre-flip pin): the dialog's engine
+    /// cycle visits all four engines exactly once and returns to start —
+    /// Duckdb is now creatable from the picker.
     #[test]
-    fn next_engine_cycle_does_not_produce_duckdb_pre_flip() {
-        for e in [Engine::Postgres, Engine::Mssql, Engine::Sqlite, Engine::Duckdb] {
-            assert_ne!(next_engine(e), Engine::Duckdb, "cycle from {e:?} must skip Duckdb");
+    fn next_engine_cycles_through_all_four() {
+        let mut seen = vec![Engine::Postgres];
+        let mut e = Engine::Postgres;
+        for _ in 0..3 {
+            e = next_engine(e);
+            assert!(!seen.contains(&e), "cycle revisited {e:?} early");
+            seen.push(e);
         }
+        assert!(seen.contains(&Engine::Duckdb), "Duckdb must be reachable from the picker");
+        assert_eq!(next_engine(e), Engine::Postgres, "cycle must close back to the start");
     }
 
     /// G16: the shared file-based predicate itself, all four engines.

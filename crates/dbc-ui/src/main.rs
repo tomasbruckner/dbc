@@ -7331,7 +7331,7 @@ impl AppView {
                 .detach();
             }
             dbc_state::Engine::Duckdb => {
-                // G16 T4 (still unreachable from the UI until T6 flips
+                // G16 T4 (live since T6 flipped
                 // `backup::backup_restore_available(Duckdb)`). Display-only
                 // preview of the source db name: DuckDB names a file
                 // database after its file stem; execution re-derives it
