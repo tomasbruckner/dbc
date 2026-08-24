@@ -927,8 +927,13 @@ pub enum PendingAfterUnlock {
     /// test WITHOUT the stored secret when the vault was locked (a
     /// confusing auth failure) instead of prompting for the master
     /// password like a normal connect. Carries the in-progress dialog's
-    /// field snapshot so `resume_pending` can reopen it and re-run the
-    /// test once the vault is unlocked.
+    /// `ConnectionDialogUi` — NOT a frozen snapshot: its fields are
+    /// `Entity<TextField>` handles, the SAME live entities the dialog was
+    /// using, just cloned (cheaply — cloning an `Entity` clones the handle,
+    /// not its content). `resume_pending`/`cancel_master_password_prompt`
+    /// reopen the dialog from these handles and (on resume) re-read their
+    /// CURRENT text via `to_form_data`, so whatever the user had typed
+    /// stays intact across the detour through this prompt.
     TestConnection(Box<ConnectionDialogUi>),
 }
 
@@ -1977,6 +1982,36 @@ impl AppView {
         }
     }
 
+    /// td-security fix round, MINOR M3: the master-password prompt's
+    /// "Zrušit" used to call the generic `close_modal` unconditionally,
+    /// which set `modal = None` no matter what was pending — for
+    /// `PendingAfterUnlock::TestConnection` that silently threw away the
+    /// connection dialog the user was typing into (host/port/user/password
+    /// fields all vanish). Fixed by restoring the dialog from the pending's
+    /// `ConnectionDialogUi` instead: it carries LIVE `Entity<TextField>`
+    /// handles (not a frozen snapshot — see `PendingAfterUnlock::
+    /// TestConnection`'s doc comment), so reopening it picks up exactly
+    /// whatever's still typed in those fields, untouched by the detour
+    /// through this prompt.
+    ///
+    /// `PendingAfterUnlock::SaveConnection` is deliberately NOT given the
+    /// same treatment: it carries a plain-data `ConnectionFormData`
+    /// snapshot, not live field entities, so "restoring" it would mean
+    /// reconstructing a whole new `ConnectionDialogUi` (fresh `TextField`
+    /// entities re-seeded from the snapshot) rather than a same-shaped
+    /// swap — a bigger change than this pass covers. Cancelling a save's
+    /// vault prompt still closes the dialog outright, as before.
+    pub(crate) fn cancel_master_password_prompt(&mut self, cx: &mut Context<Self>) {
+        self.cancel_active_backup_if_running();
+        match self.modal.take() {
+            Some(ModalState::MasterPasswordPrompt { pending: PendingAfterUnlock::TestConnection(ui), .. }) => {
+                self.modal = Some(ModalState::ConnectionDialog(*ui));
+            }
+            _ => self.modal = None,
+        }
+        cx.notify();
+    }
+
     fn on_master_password_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ModalState::MasterPasswordPrompt { input, pending, .. }) = self.modal.clone() else { return };
         let pwd = input.read(cx).text();
@@ -2467,7 +2502,7 @@ fn render_master_password_panel(input: Entity<TextField>, error: Option<String>,
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("mpp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+            .child(styled_button("mpp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.cancel_master_password_prompt(cx))))
             .child(styled_button("mpp-submit", "Odemknout", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_master_password_submit(window, cx)))),
     );
     panel.into_any_element()

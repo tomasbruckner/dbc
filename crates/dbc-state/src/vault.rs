@@ -55,6 +55,17 @@ impl std::fmt::Debug for Vault {
 /// or `export_key`'s copy (already `Zeroizing`, see its doc comment).
 impl Drop for Vault {
     fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+impl Vault {
+    /// The actual scrub, factored out of `Drop::drop` so tests can invoke it
+    /// on a still-LIVE `Vault` and assert the fields directly (`key ==
+    /// [0; 32]`, secrets empty of their plaintext) instead of reading memory
+    /// after `drop` — reading post-drop memory is technically UB even when
+    /// it happens to pass; see `key_and_secrets_are_scrubbed_by_wipe` below.
+    fn wipe(&mut self) {
         self.key.zeroize();
         for secret in self.secrets.values_mut() {
             secret.zeroize();
@@ -106,9 +117,14 @@ impl Vault {
             .map_err(|_| err("vault unlock failed: bad nonce"))?;
         let cipher = ChaCha20Poly1305::new(&Key::from(key));
         let nonce = Nonce::from(nonce_arr);
-        let plain = cipher
-            .decrypt(&nonce, ct.as_ref())
-            .map_err(|_| err("vault unlock failed: wrong master password or tampered file"))?;
+        // M2(a): the decrypted plaintext (the whole secrets map, serialized)
+        // is scrubbed the moment it's dropped rather than left as an
+        // unzeroed intermediate `Vec<u8>` between decrypt and deserialize.
+        let plain: Zeroizing<Vec<u8>> = Zeroizing::new(
+            cipher
+                .decrypt(&nonce, ct.as_ref())
+                .map_err(|_| err("vault unlock failed: wrong master password or tampered file"))?,
+        );
         let secrets: BTreeMap<String, String> =
             serde_json::from_slice(&plain).map_err(|_| err("vault unlock failed: bad payload"))?;
         Ok(Vault { path: path.to_path_buf(), key, salt, secrets })
@@ -139,9 +155,12 @@ impl Vault {
             .map_err(|_| err("vault unlock failed: bad nonce"))?;
         let cipher = ChaCha20Poly1305::new(&Key::from(key));
         let nonce = Nonce::from(nonce_arr);
-        let plain = cipher
-            .decrypt(&nonce, ct.as_ref())
-            .map_err(|_| err("vault unlock failed: wrong key or tampered file"))?;
+        // M2(a): see `unlock`'s identical comment.
+        let plain: Zeroizing<Vec<u8>> = Zeroizing::new(
+            cipher
+                .decrypt(&nonce, ct.as_ref())
+                .map_err(|_| err("vault unlock failed: wrong key or tampered file"))?,
+        );
         let secrets: BTreeMap<String, String> =
             serde_json::from_slice(&plain).map_err(|_| err("vault unlock failed: bad payload"))?;
         Ok(Vault { path: path.to_path_buf(), key, salt, secrets })
@@ -181,8 +200,12 @@ impl Vault {
         let mut rng = rand::rng();
         rng.fill_bytes(&mut nonce_arr);
         let nonce = Nonce::from(nonce_arr);
-        let plain = serde_json::to_vec(&self.secrets).map_err(|e| err(e.to_string()))?;
-        let ct = cipher.encrypt(&nonce, plain.as_ref()).map_err(|e| err(e.to_string()))?;
+        // M2(b): same reasoning as `unlock`'s decrypted `plain` — the
+        // serialized secrets map is plaintext until `encrypt` below, so it's
+        // scrubbed on drop instead of left as an unzeroed `Vec<u8>`.
+        let plain: Zeroizing<Vec<u8>> =
+            Zeroizing::new(serde_json::to_vec(&self.secrets).map_err(|e| err(e.to_string()))?);
+        let ct = cipher.encrypt(&nonce, plain.as_slice()).map_err(|e| err(e.to_string()))?;
         let env = Envelope {
             kdf: "argon2id".into(),
             m_cost: M_COST, t_cost: T_COST, p_cost: P_COST,
@@ -198,7 +221,13 @@ impl Vault {
     }
 
     pub fn set_secret(&mut self, key: &str, value: &str) -> Result<(), StateError> {
-        self.secrets.insert(key.into(), value.into());
+        // M2(c): `BTreeMap::insert` returns the REPLACED value (the old
+        // plaintext secret, when overwriting an existing key) — previously
+        // dropped unzeroed as an anonymous temporary. Scrub it before it
+        // drops.
+        if let Some(mut old) = self.secrets.insert(key.into(), value.into()) {
+            old.zeroize();
+        }
         self.persist()
     }
 
@@ -232,47 +261,32 @@ mod tests {
         assert_eq!(v2.get_secret("missing"), None);
     }
 
-    /// Security follow-up (final-review.md #14 / task-2-review.md #2): the
-    /// derived key and decrypted secrets must be scrubbed, not just freed,
-    /// on `Vault::drop`. Captures raw pointers into the key array and a
-    /// secret `String`'s heap buffer BEFORE drop, then reads through them
-    /// AFTER drop — reading freed memory is technically UB, but nothing
-    /// else allocates between the two reads in this single-threaded test,
-    /// so it reliably observes whatever `Drop::drop` wrote just before the
-    /// (now-zeroed) buffers were deallocated. Same technique the `zeroize`
-    /// crate's own test suite uses to prove a `Drop` impl actually
-    /// scrubbed memory rather than merely freeing it.
+    /// Security follow-up (final-review.md #14 / task-2-review.md #2), fixed
+    /// per MAJOR M1 of the td-security fix round: the original version of
+    /// this test read memory THROUGH raw pointers AFTER `drop` — reading
+    /// freed memory is UB regardless of whether it happens to read back
+    /// zeros in practice; it is NOT the technique the `zeroize` crate's own
+    /// tests use (they assert in place on live values). This version calls
+    /// the scrub (`wipe`, the same private method `Drop::drop` calls) on a
+    /// still-LIVE `Vault` and asserts the fields directly — no unsafe, and
+    /// no dependence on drop/dealloc ordering or allocator behaviour.
     #[test]
-    fn key_and_secrets_are_zeroized_on_drop() {
+    fn key_and_secrets_are_scrubbed_by_wipe() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("vault.bin");
+        let mut v = Vault::create(&p, "correct horse").unwrap();
+        v.set_secret("c1", "super-secret-plaintext").unwrap();
+        assert_ne!(v.key, [0u8; 32], "test setup bug: key was already all-zero");
+        assert_eq!(v.secrets.get("c1").map(String::as_str), Some("super-secret-plaintext"));
 
-        let key_ptr;
-        let key_len;
-        let secret_ptr;
-        let secret_len;
-        {
-            // Scope-exit drop (as opposed to calling `drop(v)`, which moves
-            // `v` by value into `mem::drop`'s own stack frame and runs the
-            // destructor on THAT copy, leaving the original slot's bytes
-            // untouched and making this test observe stale data) runs
-            // `Drop::drop` in place on this binding's own address, so the
-            // captured pointers below still point at the memory the
-            // destructor actually wrote to.
-            let mut v = Vault::create(&p, "correct horse").unwrap();
-            v.set_secret("c1", "super-secret-plaintext").unwrap();
-            key_ptr = v.key.as_ptr();
-            key_len = v.key.len();
-            let secret = v.secrets.get("c1").unwrap();
-            secret_ptr = secret.as_ptr();
-            secret_len = secret.len();
-        }
+        v.wipe();
 
-        let key_after = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
-        assert!(key_after.iter().all(|&b| b == 0), "vault key was not zeroized on drop");
-
-        let secret_after = unsafe { std::slice::from_raw_parts(secret_ptr, secret_len) };
-        assert!(secret_after.iter().all(|&b| b == 0), "secret was not zeroized on drop");
+        assert_eq!(v.key, [0u8; 32], "vault key was not scrubbed by wipe()");
+        assert_eq!(
+            v.secrets.get("c1").map(String::as_str),
+            Some(""),
+            "secret was not scrubbed by wipe()"
+        );
     }
 
     #[test]
