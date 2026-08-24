@@ -227,6 +227,15 @@ actions!(
     [Backspace, Delete, Left, Right, SelectLeft, SelectRight, SelectAll, Home, End, Paste, Cut, Copy]
 );
 
+// UX-polish §1/§2: dialog-scoped keyboard actions, module-owned like
+// palette.rs's "Palette" set. Bound under key context "ModalForm", carried
+// by the two modal backdrop wrappers (this file's `render_modal_overlay`
+// and admin_panel.rs's) — nowhere else, and DELIBERATELY not by the apply
+// dialog or discard-confirm overlays (§1.3: with no "ModalForm" on their
+// focus path, `enter` resolves to `Newline` only, which has no handler
+// there, so Enter is dead by construction — the §3-novela list).
+actions!(modal_form, [ModalConfirm, ModalFocusNext, ModalFocusPrev]);
+
 /// Bind TextField's editing keys, scoped to key context "TextField" so they
 /// never contend with SqlInput's (unscoped) or ResultGrid's bindings — same
 /// reasoning as grid.rs's scoped `ctrl-c` binding.
@@ -248,6 +257,27 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-x", Cut, Some("TextField")),
         KeyBinding::new("home", Home, Some("TextField")),
         KeyBinding::new("end", End, Some("TextField")),
+        // UX-polish §1: Enter-confirm. FALL-THROUGH DEPENDENCY (design §8,
+        // same discipline as grid.rs's FindNext note): with focus inside a
+        // modal TextField, `bindings_for_input` returns [Newline (unscoped),
+        // ModalConfirm ("ModalForm" ancestor)]; Newline dispatches first,
+        // finds no handler on the modal focus path (SqlInput is a sibling
+        // subtree), and dispatch falls through to ModalConfirm. If a future
+        // modal embeds a multiline SqlInput, its Newline handler IS on the
+        // path and consumes Enter — the multiline exemption is structural,
+        // not special-cased. Do not "fix" that.
+        KeyBinding::new("enter", ModalConfirm, Some("ModalForm")),
+        // UX-polish §2: Tab order IS paint order (all tab_index 0 →
+        // TabStopMap falls back to insertion order): ConnectionDialog runs
+        // Název → Host → Port → Databáze → Uživatel → Heslo → Složka →
+        // Timeout → Auto-limit → (SSH host → port → uživatel → klíč, only
+        // while ssh_enabled — unpainted fields drop out of the cycle
+        // automatically). No unscoped `tab` exists and "SqlInput"'s scoped
+        // one is never on a modal's focus path, so these match directly —
+        // no fall-through needed. Dialogs with no stops: focus_next
+        // returns None → safe no-op.
+        KeyBinding::new("tab", ModalFocusNext, Some("ModalForm")),
+        KeyBinding::new("shift-tab", ModalFocusPrev, Some("ModalForm")),
     ]);
 }
 
@@ -274,6 +304,26 @@ impl TextField {
             last_shaped: None,
             is_selecting: false,
         }
+    }
+
+    /// UX-polish §2: constructor for MODAL FORM fields ONLY — identical to
+    /// `new` except the focus handle is flagged `tab_stop(true)`, entering
+    /// the window-global `TabStopMap` so `Window::focus_next/focus_prev`
+    /// (the "ModalForm" Tab/Shift+Tab bindings) traverse it in paint order
+    /// with wrap-around. GREP INVARIANT (merge gate, design §8): every
+    /// `form_field` call site must be a modal dialog opener. The app
+    /// underneath a modal keeps painting, so a `form_field` on a non-modal
+    /// input (grid filter row, find bar, history search, palette, cell
+    /// editor — all deliberately `new`) would leak that background field
+    /// into an open dialog's Tab cycle.
+    pub fn form_field(
+        cx: &mut Context<Self>,
+        placeholder: impl Into<SharedString>,
+        masked: bool,
+    ) -> Self {
+        let mut field = Self::new(cx, placeholder, masked);
+        field.focus_handle = field.focus_handle.clone().tab_stop(true);
+        field
     }
 
     pub fn text(&self) -> String {
@@ -1138,6 +1188,48 @@ pub enum ModalState {
     },
 }
 
+/// UX-polish §1.2: what Enter does per open modal — THE policy table as
+/// code, unit-tested table-style like `kill_confirm_tests`. The rule, so
+/// future dialogs don't re-litigate: Enter is allowed where confirm (a)
+/// runs nothing against the database, or (b) resumes an already-expressed
+/// run intent (QueryParams interrupted a Ctrl+Enter), or (c) leads only
+/// into a further explicit confirmation gate. Enter is `Ignore` where the
+/// button is the LAST gate before an immediate write/kill/restore/batch
+/// dispatch (§3-novela): KillConfirm, AnalyzeWriteConfirm, BackupRestore
+/// (all states), ScriptRun, CsvImport. `Ignore` is a HANDLED no-op — the
+/// listener consumes the keystroke so it cannot fall through elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModalConfirmKind {
+    SaveConnection,
+    UnlockVault,
+    CreateVault,
+    RunParams,
+    Compare,
+    CloseSettings,
+    ChartConfirm,
+    Ignore,
+}
+
+pub(crate) fn modal_confirm_kind(modal: &ModalState) -> ModalConfirmKind {
+    match modal {
+        ModalState::ConnectionDialog(_) => ModalConfirmKind::SaveConnection,
+        ModalState::MasterPasswordPrompt { .. } => ModalConfirmKind::UnlockVault,
+        ModalState::CreateMasterPassword { .. } => ModalConfirmKind::CreateVault,
+        ModalState::QueryParams { .. } => ModalConfirmKind::RunParams,
+        ModalState::CompareDialog { .. } => ModalConfirmKind::Compare,
+        ModalState::Settings => ModalConfirmKind::CloseSettings,
+        ModalState::ChartPicker { .. } => ModalConfirmKind::ChartConfirm,
+        // §3-novela Ignore arms — kept as explicit variants (not a `_`
+        // catch-all) so a NEW ModalState variant is a compile error here
+        // and must consciously pick a side of the policy table.
+        ModalState::KillConfirm { .. }
+        | ModalState::AnalyzeWriteConfirm { .. }
+        | ModalState::BackupRestore(_)
+        | ModalState::ScriptRun { .. }
+        | ModalState::CsvImport { .. } => ModalConfirmKind::Ignore,
+    }
+}
+
 // ---------------------------------------------------------------------
 // 4. AppView handlers + render helpers.
 // ---------------------------------------------------------------------
@@ -1337,6 +1429,16 @@ impl AppView {
                 .items_center()
                 .justify_center()
                 .bg(cx.theme().bg_backdrop)
+                // UX-polish §1.4: hold keyboard focus while a modal is open
+                // so stray typing can't reach the SQL editor underneath
+                // (sweep item 8). Input-owning modals still focus their own
+                // first field at open time; this is the shared fallback
+                // target for the no-input dialogs (see `modal_needs_focus`).
+                .track_focus(&self.modal_focus_handle)
+                .key_context("ModalForm")
+                .on_action(cx.listener(AppView::on_modal_confirm))
+                .on_action(cx.listener(AppView::on_modal_focus_next))
+                .on_action(cx.listener(AppView::on_modal_focus_prev))
                 .occlude()
                 .child(panel)
                 .into_any_element(),
@@ -1416,19 +1518,19 @@ impl AppView {
         if self.modal.is_some() {
             return;
         }
-        let name = cx.new(|cx| TextField::new(cx, "např. Produkce", false));
-        let host = cx.new(|cx| TextField::new(cx, "localhost", false));
-        let port = cx.new(|cx| TextField::new(cx, "5432", false));
-        let database = cx.new(|cx| TextField::new(cx, "", false));
-        let user = cx.new(|cx| TextField::new(cx, "", false));
-        let password = cx.new(|cx| TextField::new(cx, "", true));
-        let folder = cx.new(|cx| TextField::new(cx, "a/b", false));
-        let timeout_secs = cx.new(|cx| TextField::new(cx, "30", false));
-        let auto_limit = cx.new(|cx| TextField::new(cx, "1000", false));
-        let ssh_host = cx.new(|cx| TextField::new(cx, "", false));
-        let ssh_port = cx.new(|cx| TextField::new(cx, "22", false));
-        let ssh_user = cx.new(|cx| TextField::new(cx, "", false));
-        let ssh_key_path = cx.new(|cx| TextField::new(cx, "~/.ssh/id_ed25519", false));
+        let name = cx.new(|cx| TextField::form_field(cx, "např. Produkce", false));
+        let host = cx.new(|cx| TextField::form_field(cx, "localhost", false));
+        let port = cx.new(|cx| TextField::form_field(cx, "5432", false));
+        let database = cx.new(|cx| TextField::form_field(cx, "", false));
+        let user = cx.new(|cx| TextField::form_field(cx, "", false));
+        let password = cx.new(|cx| TextField::form_field(cx, "", true));
+        let folder = cx.new(|cx| TextField::form_field(cx, "a/b", false));
+        let timeout_secs = cx.new(|cx| TextField::form_field(cx, "30", false));
+        let auto_limit = cx.new(|cx| TextField::form_field(cx, "1000", false));
+        let ssh_host = cx.new(|cx| TextField::form_field(cx, "", false));
+        let ssh_port = cx.new(|cx| TextField::form_field(cx, "22", false));
+        let ssh_user = cx.new(|cx| TextField::form_field(cx, "", false));
+        let ssh_key_path = cx.new(|cx| TextField::form_field(cx, "~/.ssh/id_ed25519", false));
 
         let (editing_id, engine, read_only, favourite, ssh_enabled) = if let Some(c) = &editing {
             name.update(cx, |f, cx| f.set_text(&c.name, cx));
@@ -1490,6 +1592,44 @@ impl AppView {
         cx.notify();
     }
 
+    /// UX-polish §1: Enter on an open modal — dispatches the IDENTICAL fn
+    /// the dialog's primary button calls. Every target is self-guarding at
+    /// the top of its own body (design §6: `confirm_query_params` re-runs
+    /// `build_param_sql`'s rescan and stays open on error;
+    /// `confirm_compare_dialog` no-ops until both sides are picked;
+    /// `confirm_chart_picker` validates `y_selected`; `on_save_clicked`
+    /// routes through the vault flow + corrupt-config guard) — this fn
+    /// adds ZERO new authority and must never pre-check or duplicate
+    /// those guards.
+    fn on_modal_confirm(&mut self, _: &ModalConfirm, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(modal) = &self.modal else { return };
+        match modal_confirm_kind(modal) {
+            ModalConfirmKind::SaveConnection => self.on_save_clicked(window, cx),
+            ModalConfirmKind::UnlockVault => self.on_master_password_submit(window, cx),
+            ModalConfirmKind::CreateVault => self.on_create_master_password_submit(window, cx),
+            ModalConfirmKind::RunParams => self.confirm_query_params(cx),
+            ModalConfirmKind::Compare => self.confirm_compare_dialog(cx),
+            ModalConfirmKind::CloseSettings => self.close_modal(cx),
+            ModalConfirmKind::ChartConfirm => self.confirm_chart_picker(cx),
+            // Handled no-op: propagation already stopped, Enter dies here.
+            ModalConfirmKind::Ignore => {}
+        }
+    }
+
+    /// UX-polish §2: Tab inside a modal — `TabStopMap` supplies ordering,
+    /// wrap-around, and skips non-stops; only `form_field` handles are
+    /// stops, and the single-modal invariant guarantees at most one
+    /// dialog's fields are painted, so the map contains exactly the open
+    /// dialog's inputs. Buttons/checkboxes are plain divs and stay out of
+    /// the cycle in v1 (design §2.1).
+    fn on_modal_focus_next(&mut self, _: &ModalFocusNext, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus_next(cx);
+    }
+
+    fn on_modal_focus_prev(&mut self, _: &ModalFocusPrev, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus_prev(cx);
+    }
+
     /// G14 T10: topbar gear entry point. Same single-modal invariant every
     /// other opener in this file applies (see `open_connection_dialog`'s
     /// identical guard) — a no-op while any other modal is already open.
@@ -1498,6 +1638,9 @@ impl AppView {
             return;
         }
         self.modal = Some(ModalState::Settings);
+        // UX-polish §1.4: no-input modal, cx-only opener — defer focus to
+        // `AppView::render` via `modal_needs_focus` (grounding correction 2).
+        self.modal_needs_focus = true;
         cx.notify();
     }
 
@@ -1515,6 +1658,9 @@ impl AppView {
         }
         self.refresh_grouped_cache();
         self.modal = Some(ModalState::CompareDialog { conn_a: None, conn_b: None, error: None });
+        // UX-polish §1.4: no-input modal, cx-only opener — defer focus to
+        // `AppView::render` via `modal_needs_focus` (grounding correction 2).
+        self.modal_needs_focus = true;
         cx.notify();
     }
 
@@ -1689,7 +1835,7 @@ impl AppView {
             self.vault.is_some(),
             Vault::exists(&self.vault_path),
         ) {
-            let input = cx.new(|cx| TextField::new(cx, "Heslo", true));
+            let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
             let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt {
                 input,
@@ -1758,7 +1904,7 @@ impl AppView {
             return;
         }
         if Vault::exists(&self.vault_path) {
-            let input = cx.new(|cx| TextField::new(cx, "Heslo", true));
+            let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
             let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt {
                 input,
@@ -1767,8 +1913,8 @@ impl AppView {
             });
             window.focus(&focus, cx);
         } else {
-            let input1 = cx.new(|cx| TextField::new(cx, "Nové heslo", true));
-            let input2 = cx.new(|cx| TextField::new(cx, "Zopakujte heslo", true));
+            let input1 = cx.new(|cx| TextField::form_field(cx, "Nové heslo", true));
+            let input2 = cx.new(|cx| TextField::form_field(cx, "Zopakujte heslo", true));
             let focus = input1.focus_handle(cx);
             self.modal = Some(ModalState::CreateMasterPassword {
                 input1,
@@ -1878,7 +2024,7 @@ impl AppView {
             .find(|c| c.id == id)
             .map_or(false, |c| c.engine != Engine::Sqlite);
         if needs_secret && self.vault.is_none() && Vault::exists(&self.vault_path) {
-            let input = cx.new(|cx| TextField::new(cx, "Heslo", true));
+            let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
             let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt {
                 input,
@@ -2056,7 +2202,7 @@ impl AppView {
         // of the app created one), fall back to unlocking it instead of
         // clobbering it.
         if Vault::exists(&self.vault_path) {
-            let input = cx.new(|cx| TextField::new(cx, "Heslo", true));
+            let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
             let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt { input, error: None, pending });
             window.focus(&focus, cx);
@@ -3765,6 +3911,169 @@ mod kill_confirm_tests {
         assert_eq!(*pid, 2);
         assert_eq!(*error, None);
         assert!(*dispatched, "unrelated dialog's in-flight state must be untouched");
+    }
+}
+
+#[cfg(test)]
+mod modal_confirm_kind_tests {
+    use super::*;
+    use crate::backup;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    // ConnectionDialog / MasterPasswordPrompt / CreateMasterPassword embed
+    // Entity<TextField> handles and cannot be constructed in a plain
+    // #[test] (no GPUI context; grounding correction 4). Their arms are
+    // pinned by `modal_confirm_kind`'s match being total (a new/changed
+    // variant is a compile error) and Enter is spot-checked per family in
+    // the manual visual checklist. Every other variant — including EVERY
+    // §3-novela Ignore arm — is asserted here.
+
+    fn query_params() -> ModalState {
+        ModalState::QueryParams {
+            names: Vec::new(),
+            inputs: Vec::new(),
+            null_flags: Vec::new(),
+            sql_template: String::new(),
+            bypass_auto_limit: false,
+            error: None,
+        }
+    }
+
+    fn kill_confirm() -> ModalState {
+        ModalState::KillConfirm {
+            pid: 1,
+            label: "u · app · běží 1s".into(),
+            sql: "SELECT pg_terminate_backend(1)".into(),
+            tab_id: 1,
+            error: None,
+            dispatched: false,
+        }
+    }
+
+    fn analyze_write() -> ModalState {
+        ModalState::AnalyzeWriteConfirm {
+            sql: "UPDATE t SET a = 1".into(),
+            engine: Engine::Postgres,
+            running: false,
+            error: None,
+        }
+    }
+
+    fn backup_restore(status: backup::BackupStatus) -> ModalState {
+        ModalState::BackupRestore(backup::BackupSession {
+            kind: backup::BackupKind::Backup,
+            engine: Engine::Postgres,
+            connection_id: "c".into(),
+            connection_name: "c".into(),
+            database: "db".into(),
+            log: Rc::new(RefCell::new(backup::BackupLogState::default())),
+            status: Rc::new(RefCell::new(status)),
+            started_at: std::time::Instant::now(),
+            cancel: Rc::new(RefCell::new(None)),
+            confirm_input: None,
+            expected_name: "db".into(),
+            command_line: String::new(),
+            target_path: String::new(),
+        })
+    }
+
+    fn script_run() -> ModalState {
+        ModalState::ScriptRun {
+            files: Vec::new(),
+            file_counts: Vec::new(),
+            tx_scope: crate::runner::TxScope::PerFile,
+            error_policy: crate::runner::ErrorPolicy::Stop,
+            source_label: String::new(),
+            conn_label: String::new(),
+            read_only: false,
+            timeout_secs: None,
+            conn_identity: "cfg:x".into(),
+        }
+    }
+
+    fn csv_import() -> ModalState {
+        ModalState::CsvImport {
+            path: std::path::PathBuf::new(),
+            schema: None,
+            table: "t".into(),
+            headers: Vec::new(),
+            columns: Vec::new(),
+            targets: Vec::new(),
+            row_count: 0,
+            first_rows: Vec::new(),
+            sample_sql: None,
+            error: None,
+            conn_identity: "cfg:x".into(),
+            conn_label: String::new(),
+        }
+    }
+
+    fn chart_picker() -> ModalState {
+        let schema = std::sync::Arc::new(dbc_core::arrow::datatypes::Schema::empty());
+        ModalState::ChartPicker {
+            source_title: String::new(),
+            buffer: Rc::new(RefCell::new(ResultBuffer::new(schema))),
+            columns: Vec::new(),
+            kind: ChartKind::Bar,
+            x_col: 0,
+            y_selected: Vec::new(),
+            edit_tab: None,
+        }
+    }
+
+    #[test]
+    fn query_params_runs_params() {
+        assert!(matches!(modal_confirm_kind(&query_params()), ModalConfirmKind::RunParams));
+    }
+
+    #[test]
+    fn compare_dialog_confirms_compare() {
+        let m = ModalState::CompareDialog { conn_a: None, conn_b: None, error: None };
+        assert!(matches!(modal_confirm_kind(&m), ModalConfirmKind::Compare));
+    }
+
+    #[test]
+    fn settings_closes() {
+        assert!(matches!(modal_confirm_kind(&ModalState::Settings), ModalConfirmKind::CloseSettings));
+    }
+
+    #[test]
+    fn chart_picker_confirms_chart() {
+        assert!(matches!(modal_confirm_kind(&chart_picker()), ModalConfirmKind::ChartConfirm));
+    }
+
+    // --- §3-novela: the last-gate-before-write dialogs are ALL Ignore ---
+
+    #[test]
+    fn kill_confirm_is_ignored() {
+        assert!(matches!(modal_confirm_kind(&kill_confirm()), ModalConfirmKind::Ignore));
+    }
+
+    #[test]
+    fn analyze_write_confirm_is_ignored() {
+        assert!(matches!(modal_confirm_kind(&analyze_write()), ModalConfirmKind::Ignore));
+    }
+
+    #[test]
+    fn backup_restore_is_ignored_in_every_state() {
+        for status in [
+            backup::BackupStatus::Confirming,
+            backup::BackupStatus::Running,
+            backup::BackupStatus::Succeeded,
+        ] {
+            assert!(matches!(modal_confirm_kind(&backup_restore(status)), ModalConfirmKind::Ignore));
+        }
+    }
+
+    #[test]
+    fn script_run_is_ignored() {
+        assert!(matches!(modal_confirm_kind(&script_run()), ModalConfirmKind::Ignore));
+    }
+
+    #[test]
+    fn csv_import_is_ignored() {
+        assert!(matches!(modal_confirm_kind(&csv_import()), ModalConfirmKind::Ignore));
     }
 }
 
