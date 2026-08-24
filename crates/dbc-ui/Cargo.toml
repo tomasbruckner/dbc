@@ -44,7 +44,8 @@ async-trait.workspace = true
 # paused/auto-advancing virtual clock (`#[tokio::test(start_paused = true)]`)
 # instead of actually sleeping for real wall-clock seconds.
 tokio = { version = "1", features = ["test-util"] }
-# docker-gated integration tests (G9 T7 monitor, G13 T2 pg EXPLAIN fixtures)
-# — same crate+version dbc-driver-postgres's own integration tests pin, so
-# no version skew.
-testcontainers-modules = { version = "0.13", features = ["postgres"] }
+# docker-gated integration tests (G9 T7 monitor, G13 T2 pg EXPLAIN fixtures,
+# G15 T8 MSSQL live tier) — same crate+version dbc-driver-postgres's own
+# integration tests pin, so no version skew; "mssql_server" feature unions
+# with "postgres" in the same dependency line.
+testcontainers-modules = { version = "0.13", features = ["postgres", "mssql_server"] }

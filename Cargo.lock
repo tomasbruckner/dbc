@@ -2288,6 +2288,7 @@ dependencies = [
  "async-trait",
  "dbc-core",
  "odbc-api",
+ "testcontainers-modules",
  "tokio",
 ]
 

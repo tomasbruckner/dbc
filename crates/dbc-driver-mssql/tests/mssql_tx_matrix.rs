@@ -5,10 +5,10 @@
 //! empirical proof that doing so gives MSSQL a pg-like "stop at first error,
 //! roll back everything" contract before any feature-ON flip merges (T8).
 //!
-//! Docker required, `#[ignore]`d — mirrors `mssql_integration.rs`'s
-//! convention (no testcontainers wiring here yet; T8 rewires both files
-//! onto the shared testcontainers `mssql_server` helper). Point
-//! `DBC_MSSQL_TEST_CONN` at a full ODBC connection string, e.g.:
+//! Docker required, `#[ignore]`d — G15 T8: now wired onto the shared
+//! testcontainers `mssql_server` helper (`common::conn_str_or_skip`), same
+//! as `mssql_integration.rs`. `DBC_MSSQL_TEST_CONN` stays the escape
+//! hatch, e.g.:
 //!
 //! ```text
 //! DBC_MSSQL_TEST_CONN="Driver={ODBC Driver 18 for SQL Server};Server=tcp:localhost,1433;\
@@ -21,15 +21,32 @@
 //! calls — never a single multi-statement batch, since that's not how the
 //! runner issues transaction control.
 
+mod common;
+
 use dbc_core::{CancelToken, Connection};
 use dbc_driver_mssql::MssqlConnection;
 
-fn conn_str() -> Option<String> {
-    std::env::var("DBC_MSSQL_TEST_CONN").ok()
+/// Connects (or returns `None` to SKIP) — `common::conn_str_or_skip` first
+/// (docker/env unavailable), then `probe()` (missing host ODBC driver).
+/// Returns the connection string alongside the first connection so a case
+/// needing a SECOND/THIRD connection (data-visibility assertions, design
+/// §3c) can build one cheaply via `connect_second` without re-probing.
+async fn connect_or_skip(test: &str) -> Option<(MssqlConnection, String)> {
+    let cs = common::conn_str_or_skip(test).await?;
+    let c = MssqlConnection::from_connection_string(cs.clone());
+    if let Err(e) = c.probe() {
+        if common::skip_if_no_odbc_driver(test, &e) {
+            return None;
+        }
+        panic!("{test}: connect failed: {e}");
+    }
+    Some((c, cs))
 }
 
-fn connect() -> MssqlConnection {
-    MssqlConnection::from_connection_string(conn_str().expect("DBC_MSSQL_TEST_CONN not set"))
+/// A second/third connection within a test that already confirmed
+/// liveness via `connect_or_skip` — no re-probing needed.
+fn connect_second(cs: &str) -> MssqlConnection {
+    MssqlConnection::from_connection_string(cs.to_string())
 }
 
 async fn exec(conn: &mut MssqlConnection, sql: &str) -> Result<u64, dbc_core::QueryError> {
@@ -76,7 +93,7 @@ async fn count_rows(conn: &mut MssqlConnection, table: &str) -> Result<i64, dbc_
 #[tokio::test]
 #[ignore]
 async fn probe_and_query_with_session_are_callable() {
-    let mut c = connect();
+    let Some((mut c, _cs)) = connect_or_skip("probe_and_query_with_session_are_callable").await else { return };
     c.probe().expect("probe should succeed against a reachable, correctly-configured server");
     let mut s = c
         .query_with_session(&[], "SELECT 1 AS a", &[], None, CancelToken::new())
@@ -100,7 +117,7 @@ async fn probe_and_query_with_session_are_callable() {
 #[tokio::test]
 #[ignore]
 async fn query_with_session_row_cap_aborts_cleanly_on_oversized_result_set() {
-    let mut c = connect();
+    let Some((mut c, _cs)) = connect_or_skip("query_with_session_row_cap_aborts_cleanly_on_oversized_result_set").await else { return };
     // `sys.objects` cross-joined with itself reliably yields far more than
     // 50 rows in any real database (including a bare `tempdb`), no user
     // table needed.
@@ -139,7 +156,7 @@ async fn query_with_session_row_cap_aborts_cleanly_on_oversized_result_set() {
 #[tokio::test]
 #[ignore]
 async fn tx_control_batches_report_a_row_count() {
-    let mut c = connect();
+    let Some((mut c, _cs)) = connect_or_skip("tx_control_batches_report_a_row_count").await else { return };
     exec(&mut c, TX_BEGIN).await.expect("BEGIN batch must report a row count, not error");
     exec(&mut c, "COMMIT").await.expect("COMMIT must report a row count, not error");
 }
@@ -149,7 +166,7 @@ async fn tx_control_batches_report_a_row_count() {
 #[tokio::test]
 #[ignore]
 async fn xact_abort_pk_violation_aborts_and_rolls_back_whole_tx() {
-    let mut c = connect();
+    let Some((mut c, cs)) = connect_or_skip("xact_abort_pk_violation_aborts_and_rolls_back_whole_tx").await else { return };
     let table = format!("mssql_tx_case1_{}", std::process::id());
     exec(&mut c, &format!("CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)")).await.unwrap();
 
@@ -164,7 +181,7 @@ async fn xact_abort_pk_violation_aborts_and_rolls_back_whole_tx() {
     // Second connection, fresh by construction: the first INSERT's row
     // must be GONE — the whole transaction rolled back, not just the
     // failed statement.
-    let mut c2 = connect();
+    let mut c2 = connect_second(&cs);
     let n = count_rows(&mut c2, &table).await.unwrap();
     assert_eq!(n, 0, "row inserted before the PK violation must be rolled back with the whole tx");
 
@@ -178,7 +195,7 @@ async fn xact_abort_pk_violation_aborts_and_rolls_back_whole_tx() {
 #[tokio::test]
 #[ignore]
 async fn conversion_and_arithmetic_errors_behave_like_constraint_errors() {
-    let mut c = connect();
+    let Some((mut c, cs)) = connect_or_skip("conversion_and_arithmetic_errors_behave_like_constraint_errors").await else { return };
     let table = format!("mssql_tx_case2_{}", std::process::id());
     exec(&mut c, &format!("CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)")).await.unwrap();
 
@@ -188,7 +205,7 @@ async fn conversion_and_arithmetic_errors_behave_like_constraint_errors() {
     let conv_err = exec(&mut c, &format!("INSERT INTO {table} (id) SELECT CAST('x' AS int)")).await;
     assert!(conv_err.is_err(), "conversion error must fail the statement");
     exec(&mut c, &trancount_probe(0)).await.expect("conversion error must doom the tx to trancount 0, same as a constraint violation");
-    let mut c2 = connect();
+    let mut c2 = connect_second(&cs);
     assert_eq!(count_rows(&mut c2, &table).await.unwrap(), 0, "conversion error must roll back the whole tx");
 
     // Arithmetic error (divide by zero).
@@ -209,7 +226,7 @@ async fn conversion_and_arithmetic_errors_behave_like_constraint_errors() {
 #[tokio::test]
 #[ignore]
 async fn best_effort_rollback_after_abort_errors_but_session_stays_usable() {
-    let mut c = connect();
+    let Some((mut c, _cs)) = connect_or_skip("best_effort_rollback_after_abort_errors_but_session_stays_usable").await else { return };
     let table = format!("mssql_tx_case3_{}", std::process::id());
     exec(&mut c, &format!("CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)")).await.unwrap();
 
@@ -242,7 +259,7 @@ async fn best_effort_rollback_after_abort_errors_but_session_stays_usable() {
 #[tokio::test]
 #[ignore]
 async fn autocommit_does_not_commit_between_execute_calls_inside_open_tx() {
-    let mut c = connect();
+    let Some((mut c, cs)) = connect_or_skip("autocommit_does_not_commit_between_execute_calls_inside_open_tx").await else { return };
     let table = format!("mssql_tx_case4_{}", std::process::id());
     exec(&mut c, &format!("CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)")).await.unwrap();
 
@@ -261,7 +278,7 @@ async fn autocommit_does_not_commit_between_execute_calls_inside_open_tx() {
     // uncommitted row regardless of autocommit interference and prove
     // nothing. A lock timeout under the default isolation level is an
     // equally valid proof of non-visibility as a bare 0 count.
-    let mut c2 = connect();
+    let mut c2 = connect_second(&cs);
     let visibility = c2
         .query_with_session(
             &["SET LOCK_TIMEOUT 1000".to_string()],
@@ -314,7 +331,7 @@ async fn autocommit_does_not_commit_between_execute_calls_inside_open_tx() {
 
     exec(&mut c, "COMMIT").await.unwrap();
 
-    let mut c3 = connect();
+    let mut c3 = connect_second(&cs);
     let n = count_rows(&mut c3, &table).await.unwrap();
     assert_eq!(n, 1, "row must be visible to a fresh connection once COMMIT has run");
 
@@ -329,7 +346,7 @@ async fn autocommit_does_not_commit_between_execute_calls_inside_open_tx() {
 #[tokio::test]
 #[ignore]
 async fn xact_abort_persists_across_tx_begins_on_same_exec_conn() {
-    let mut c = connect();
+    let Some((mut c, _cs)) = connect_or_skip("xact_abort_persists_across_tx_begins_on_same_exec_conn").await else { return };
     let table = format!("mssql_tx_case5_{}", std::process::id());
     exec(&mut c, &format!("CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)")).await.unwrap();
 
