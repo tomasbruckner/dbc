@@ -130,7 +130,11 @@
 //! [`MssqlConnection::query_with_session`] checks the token at the same
 //! granularity as `query()`: before connect, before the main batch (after
 //! preludes), and per fetch — never inside a prelude/postlude statement
-//! itself.
+//! itself. Unlike `query()`, though, `query_with_session` is NOT
+//! streaming: it fully materializes every result set in memory before
+//! selecting one to hand back (see its doc comment's "BOUNDED STATEMENTS
+//! ONLY" warning) — it exists for the G13 T7 Showplan-via-session-prelude
+//! path, not as a general substitute for `query()`.
 
 mod config;
 mod schema;
@@ -226,6 +230,18 @@ impl MssqlConnection {
     /// set walked is returned (fail-open on the name — the needs-
     /// verification flag from G13 §1b, bounded by "wrong text handed to a
     /// parser that fails closed").
+    ///
+    /// **BOUNDED STATEMENTS ONLY (execution plans, DMV probes).** Unlike
+    /// `query()`, which streams `RecordBatch`es out over a bounded mpsc
+    /// channel as they're fetched, this method fully materializes EVERY
+    /// result set of the main batch into memory (`Vec<RecordBatch>` per
+    /// result set, collected before the selection rule ever runs) — there
+    /// is no back-pressure and no early return. That's fine for Showplan
+    /// XML and other small, single/few-row diagnostic payloads, but
+    /// routing arbitrary user SQL through this function instead of
+    /// `query()` is an unbounded-memory hazard: a large result set would
+    /// be held in full before the caller ever sees the first row. Never
+    /// use this for ordinary user-issued queries.
     pub async fn query_with_session(
         &self,
         prelude: &[String],
@@ -661,5 +677,28 @@ mod tests {
             "Driver={ODBC Driver 18 for SQL Server};Server=tcp:127.0.0.1,1;Database=x;Uid=x;Pwd=x;",
         );
         let _: Result<(), QueryError> = c.probe();
+    }
+
+    /// Security invariant (Global Constraints, "passwords"): `probe()`'s
+    /// error path must never leak the password into the error text.
+    /// `odbc_err` renders only the driver's diagnostic record text — this
+    /// pins that a failed connect (unreachable host/port, same shape as
+    /// `probe_is_callable_from_a_non_async_fn` above) never echoes back a
+    /// distinctive password planted in the connection string. Non-live,
+    /// fast, deterministic enough: connecting to 127.0.0.1:1 fails via
+    /// "connection refused" (or an equivalent immediate driver error)
+    /// well before any server-side auth exchange could occur.
+    #[test]
+    fn probe_error_never_contains_the_password() {
+        let distinctive_password = "sUp3r$ecretZzz9000";
+        let c = MssqlConnection::from_connection_string(format!(
+            "Driver={{ODBC Driver 18 for SQL Server}};Server=tcp:127.0.0.1,1;Database=x;Uid=x;Pwd={distinctive_password};"
+        ));
+        let err = c.probe().expect_err("connecting to 127.0.0.1:1 must fail");
+        assert!(
+            !err.message.contains(distinctive_password),
+            "probe() error text must never contain the password, got: {}",
+            err.message
+        );
     }
 }

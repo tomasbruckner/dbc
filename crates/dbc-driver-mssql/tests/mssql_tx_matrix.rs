@@ -247,10 +247,28 @@ async fn autocommit_does_not_commit_between_execute_calls_inside_open_tx() {
             }
             assert_eq!(n, 0, "uncommitted row must not be visible to a second connection");
         }
-        Err(_) => {
+        Err(e) => {
             // Lock-timeout error: the second connection blocked trying to
             // read a row locked by the still-open transaction — also
-            // proves the row is not committed/visible yet.
+            // proves the row is not committed/visible yet. This is the
+            // KEYSTONE case, so accepting ANY error here (as an earlier
+            // version of this test did) would make it spuriously green
+            // under a `query_with_session` regression that broke the
+            // second connection for unrelated reasons — a real proof
+            // requires the SPECIFIC lock-timeout error, not just "some
+            // error". Live-characterized shape (odbc-api 29 / ODBC Driver
+            // 18 / SQL Server 2022): SQLSTATE `42000`, native error 1222,
+            // message "...Lock request time out period exceeded." SQLSTATE
+            // alone isn't a reliable discriminator here (`42000` is a
+            // generic access-violation class shared with unrelated
+            // errors), so match on the message text instead.
+            let msg_lower = e.message.to_lowercase();
+            assert!(
+                msg_lower.contains("time out") || msg_lower.contains("timeout"),
+                "case 4 KEYSTONE: expected a lock-timeout error proving the row is not yet \
+                 visible, got a DIFFERENT error instead — this would make the keystone \
+                 spuriously green on a real regression. Got: {e:?}"
+            );
         }
     }
 
