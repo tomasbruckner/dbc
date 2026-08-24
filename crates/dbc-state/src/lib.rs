@@ -4,6 +4,9 @@ pub use config::{
     SshTunnelConfig, StateError, ThemeMode,
 };
 
+mod scope;
+pub use scope::connection_scope_key;
+
 mod vault;
 pub use vault::{default_vault_path, Vault};
 

@@ -706,19 +706,19 @@ impl SchemaTree {
                         TableKind::Table => "table",
                         TableKind::View | TableKind::MaterializedView => "view",
                     })?;
-                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: kind.to_string() })
+                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: kind.to_string(), database: None })
             }
             NodeId::Routine(schema, name) => {
-                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: "routine".into() })
+                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: "routine".into(), database: None })
             }
             NodeId::Trigger(schema, name) => {
-                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: "trigger".into() })
+                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: "trigger".into(), database: None })
             }
             NodeId::Sequence(schema, name) => {
-                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: "sequence".into() })
+                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: "sequence".into(), database: None })
             }
             NodeId::Favourite(kind, schema, name) => {
-                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: kind.clone() })
+                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: kind.clone(), database: None })
             }
             _ => None,
         }
@@ -1508,6 +1508,7 @@ mod flatten_tests {
             schema: schema.map(str::to_string),
             name: name.into(),
             kind: kind.into(),
+            database: None,
         }
     }
 
