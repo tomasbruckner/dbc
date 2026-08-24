@@ -556,6 +556,24 @@ enforcement `csv_import_dispatch_allowed` (3006);
    legacy-for-default rule as view_prefs instead of blindly embedding
    the composite identity — preserves existing stored values and keeps
    `encode_key` two-component for default dbs.
+   **CORRECTION (sidebar T1 review round 1, MINOR — the "database names
+   cannot contain control chars" claim here/§2.3/§10 is overbroad):**
+   Postgres identifiers may contain ANY character except NUL, so a
+   database literally named `x\u{1F}y` CAN exist, and an unescaped key
+   would let one scope's prefs/params bucket alias another's (preference
+   bleed only, not a security hole — identities are compared atomically
+   by `conn_identity_matches`, never split for authorization). Closure:
+   `connection_scope_key` (dbc-state scope.rs, T1) ESCAPES the database
+   component before joining — `\` → `\\` first, then U+001F → the
+   literal 6-char sequence backslash + "u001F". The escape is injective
+   (a legitimate name already containing that backslash + "u001F" text
+   gains a doubled backslash and stays distinct), so the emitted key
+   contains exactly one raw
+   U+001F — the separator. Connection ids are app-generated `conn-{hex}`
+   and genuinely cannot contain the separator, so that half of the claim
+   stands. Pinned by scope.rs tests
+   (`hostile_database_name_cannot_smuggle_a_separator`,
+   `escape_sequence_in_a_real_name_stays_distinct_from_escaped_separator`).
 6. `active_connection_name_for_history` (history_panel.rs:173) — §5
    row 8.
 7. `emit_favourites_section` / `favourite_object_for`
