@@ -1103,6 +1103,23 @@ struct AppView {
     /// is pending; see `DiscardConfirmState`'s doc comment for the three
     /// trigger sites.
     discard_confirm: Option<DiscardConfirmState>,
+    // --- UX-polish §1.4: modal keyboard-focus plumbing ---
+    /// Shared focus target for every overlay that owns no TextField of its
+    /// own (KillConfirm, AnalyzeWriteConfirm, CompareDialog, ScriptRun,
+    /// CsvImport, Settings, ChartPicker, Backup-kind/Running BackupRestore,
+    /// and the discard-confirm prompt) — the `ApplyDialogState.focus_handle`
+    /// G5 precedent generalized. `.occlude()` blocks clicks, not keys:
+    /// without this, keyboard focus stays on the SQL editor underneath an
+    /// open modal and stray typing mutates it invisibly (sweep item 8).
+    /// Always `.track_focus`ed by `render_modal_overlay`'s backdrop wrapper
+    /// and by `render_discard_confirm_overlay`.
+    modal_focus_handle: gpui::FocusHandle,
+    /// Set by modal/discard openers (all of which lack `&mut Window` —
+    /// subscribe callbacks and cx-only helpers); consumed at the top of
+    /// `AppView::render`, the first post-open point with Window access,
+    /// which focuses `modal_focus_handle`. Input-owning modals never set
+    /// it — they keep focusing their own first field at open time.
+    modal_needs_focus: bool,
     // --- G6 Task 7: schema autocomplete popup ---
     /// `None` when the popup is closed — see `AutocompleteState`'s doc
     /// comment for the lazy-diff recompute idiom.
@@ -2386,6 +2403,9 @@ impl AppView {
                         timeout_secs,
                         conn_identity,
                     });
+                    // UX-polish §1.4: no-input modal, cx-only continuation —
+                    // defer focus to `AppView::render` via `modal_needs_focus`.
+                    view.modal_needs_focus = true;
                     cx.notify();
                 }
                 Err(e) => {
@@ -2870,6 +2890,9 @@ impl AppView {
                         conn_identity,
                         conn_label,
                     });
+                    // UX-polish §1.4: no-input modal, cx-only continuation —
+                    // defer focus to `AppView::render` via `modal_needs_focus`.
+                    view.modal_needs_focus = true;
                     cx.notify();
                 }
                 Err(e) => {
@@ -3205,6 +3228,9 @@ impl AppView {
                     running: false,
                     error: None,
                 });
+                // UX-polish §1.4: no-input modal, cx-only opener — defer
+                // focus to `AppView::render` via `modal_needs_focus`.
+                self.modal_needs_focus = true;
                 cx.notify();
             }
         }
@@ -4611,6 +4637,9 @@ impl AppView {
                             revert: Some((emitter.clone(), *col, ref_col.clone())),
                         },
                     });
+                    // UX-polish §1.4: no-input prompt, cx-only site — defer
+                    // focus to `AppView::render` via `modal_needs_focus`.
+                    self.modal_needs_focus = true;
                     cx.notify();
                     return;
                 }
@@ -4716,6 +4745,9 @@ impl AppView {
             y_selected,
             edit_tab: None,
         });
+        // UX-polish §1.4: no-input modal, cx-only opener — defer focus to
+        // `AppView::render` via `modal_needs_focus`.
+        self.modal_needs_focus = true;
         cx.notify();
     }
 
@@ -4829,6 +4861,9 @@ impl AppView {
             y_selected,
             edit_tab: Some(tab_id),
         });
+        // UX-polish §1.4: no-input modal, cx-only opener — defer focus to
+        // `AppView::render` via `modal_needs_focus`.
+        self.modal_needs_focus = true;
         cx.notify();
     }
 
@@ -4893,6 +4928,9 @@ impl AppView {
                 change_count: n,
                 action: PendingDiscard::RunPreview { sql, preview: Box::new(preview), revert: None },
             });
+            // UX-polish §1.4: no-input prompt, cx-only site — defer focus
+            // to `AppView::render` via `modal_needs_focus`.
+            self.modal_needs_focus = true;
             cx.notify();
             return;
         }
@@ -5337,6 +5375,9 @@ impl AppView {
                     error: None,
                     dispatched: false,
                 });
+                // UX-polish §1.4: no-input modal, cx-only opener — defer
+                // focus to `AppView::render` via `modal_needs_focus`.
+                self.modal_needs_focus = true;
                 cx.notify();
             }
             monitor_view::MonitorViewEvent::KillFinished { pid, result } => {
@@ -6037,6 +6078,10 @@ impl AppView {
                                         change_count: n,
                                         action: PendingDiscard::CloseTab { id },
                                     });
+                                    // UX-polish §1.4: no-input prompt,
+                                    // cx-only site — defer focus to
+                                    // `AppView::render` via `modal_needs_focus`.
+                                    view.modal_needs_focus = true;
                                     cx.notify();
                                     return;
                                 }
@@ -6301,6 +6346,12 @@ impl AppView {
                 .items_center()
                 .justify_center()
                 .bg(theme.bg_backdrop)
+                // UX-polish §1.4: same shared focus target as
+                // `render_modal_overlay` — holds keyboard focus so stray
+                // typing can't reach the SQL editor underneath. NO key
+                // context here or ever: Enter must stay structurally inert
+                // on discard-confirm (§3-novela / Global Constraints).
+                .track_focus(&self.modal_focus_handle)
                 .occlude()
                 .child(panel)
                 .into_any_element(),
@@ -6494,6 +6545,13 @@ impl AppView {
         let log: backup::BackupLog = Rc::new(RefCell::new(backup::BackupLogState::default()));
         let status_cell = Rc::new(RefCell::new(status));
         let cancel_slot: backup::CancelSlot = Rc::new(RefCell::new(None));
+        // UX-polish §1.4: computed BEFORE the session struct consumes
+        // `confirm_input` below. Backup-kind (and the Restore Running
+        // re-session) has no input field, so it needs the shared
+        // `modal_focus_handle` fallback; a Restore Confirming session
+        // carries its own typed-name field and is focused directly by
+        // `begin_restore_confirm` instead (unchanged).
+        let needs_focus = confirm_input.is_none();
         let session = backup::BackupSession {
             kind,
             engine: cfg.engine,
@@ -6510,6 +6568,9 @@ impl AppView {
             target_path: target_path.to_string(),
         };
         self.modal = Some(connections_ui::ModalState::BackupRestore(session));
+        if needs_focus {
+            self.modal_needs_focus = true;
+        }
         cx.notify();
         (log, status_cell, cancel_slot)
     }
@@ -7353,6 +7414,15 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // UX-polish §1.4: deferred focus for overlay openers without a
+        // `&mut Window` (see `modal_needs_focus`). Guarded: if the overlay
+        // already closed again before this frame, just clear the flag.
+        if self.modal_needs_focus {
+            self.modal_needs_focus = false;
+            if self.modal.is_some() || self.discard_confirm.is_some() {
+                window.focus(&self.modal_focus_handle, cx);
+            }
+        }
         // G6 T7: lazy-diff typing-trigger recompute, BEFORE the popup is
         // drawn below (design §2 grounding) — then sync the flag T5's
         // `SqlInput::up`/`down`/`newline` check to decide whether to
@@ -7884,6 +7954,8 @@ fn main() {
                             param_values,
                             apply_dialog: None,
                             discard_confirm: None,
+                            modal_focus_handle: cx.focus_handle(),
+                            modal_needs_focus: false,
                             autocomplete: None,
                             last_ac_text: String::new(),
                             last_ac_cursor: 0,

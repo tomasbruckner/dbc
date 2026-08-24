@@ -276,6 +276,33 @@ impl TextField {
         }
     }
 
+    /// UX-polish §2: constructor for MODAL FORM fields ONLY — identical to
+    /// `new` except the focus handle is flagged `tab_stop(true)`, entering
+    /// the window-global `TabStopMap` so `Window::focus_next/focus_prev`
+    /// (the "ModalForm" Tab/Shift+Tab bindings) traverse it in paint order
+    /// with wrap-around. GREP INVARIANT (merge gate, design §8): every
+    /// `form_field` call site must be a modal dialog opener. The app
+    /// underneath a modal keeps painting, so a `form_field` on a non-modal
+    /// input (grid filter row, find bar, history search, palette, cell
+    /// editor — all deliberately `new`) would leak that background field
+    /// into an open dialog's Tab cycle.
+    ///
+    /// Deviation from plan: the plan's Task 3 assumed a `pub fn` on a `pub`
+    /// type wouldn't trigger `dead_code` before Task 5 wires up call sites —
+    /// but `dbc-ui` builds as a bin crate (no external consumers), so
+    /// unused `pub` items ARE linted. `#[allow(dead_code)]` here is removed
+    /// in Task 5 once real call sites exist.
+    #[allow(dead_code)]
+    pub fn form_field(
+        cx: &mut Context<Self>,
+        placeholder: impl Into<SharedString>,
+        masked: bool,
+    ) -> Self {
+        let mut field = Self::new(cx, placeholder, masked);
+        field.focus_handle = field.focus_handle.clone().tab_stop(true);
+        field
+    }
+
     pub fn text(&self) -> String {
         self.buffer.text().to_string()
     }
@@ -1337,6 +1364,12 @@ impl AppView {
                 .items_center()
                 .justify_center()
                 .bg(cx.theme().bg_backdrop)
+                // UX-polish §1.4: hold keyboard focus while a modal is open
+                // so stray typing can't reach the SQL editor underneath
+                // (sweep item 8). Input-owning modals still focus their own
+                // first field at open time; this is the shared fallback
+                // target for the no-input dialogs (see `modal_needs_focus`).
+                .track_focus(&self.modal_focus_handle)
                 .occlude()
                 .child(panel)
                 .into_any_element(),
@@ -1498,6 +1531,9 @@ impl AppView {
             return;
         }
         self.modal = Some(ModalState::Settings);
+        // UX-polish §1.4: no-input modal, cx-only opener — defer focus to
+        // `AppView::render` via `modal_needs_focus` (grounding correction 2).
+        self.modal_needs_focus = true;
         cx.notify();
     }
 
@@ -1515,6 +1551,9 @@ impl AppView {
         }
         self.refresh_grouped_cache();
         self.modal = Some(ModalState::CompareDialog { conn_a: None, conn_b: None, error: None });
+        // UX-polish §1.4: no-input modal, cx-only opener — defer focus to
+        // `AppView::render` via `modal_needs_focus` (grounding correction 2).
+        self.modal_needs_focus = true;
         cx.notify();
     }
 
