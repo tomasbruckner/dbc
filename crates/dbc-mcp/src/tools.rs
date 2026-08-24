@@ -504,6 +504,8 @@ mod tests {
                 cfg("c2", &path, false, true), // ssh: must be excluded
             ],
             favourite_objects: vec![],
+            theme: Default::default(),
+            tool_paths: Default::default(),
         };
         let server = McpServer::new(config, test_vault());
         let result = server.list_connections(Parameters(ListConnectionsParams {})).await.unwrap();
@@ -525,7 +527,7 @@ mod tests {
     #[tokio::test]
     async fn get_schema_round_trips_known_tables_and_strips_ddl_by_default() {
         let (_f, path) = sqlite_fixture();
-        let config = AppConfig { connections: vec![cfg("c1", &path, false, false)], favourite_objects: vec![] };
+        let config = AppConfig { connections: vec![cfg("c1", &path, false, false)], favourite_objects: vec![], theme: Default::default(), tool_paths: Default::default() };
         let server = McpServer::new(config, test_vault());
 
         let result = server
@@ -553,7 +555,7 @@ mod tests {
     #[tokio::test]
     async fn run_query_returns_correct_rows_columns_and_nulls() {
         let (_f, path) = sqlite_fixture();
-        let config = AppConfig { connections: vec![cfg("c1", &path, false, false)], favourite_objects: vec![] };
+        let config = AppConfig { connections: vec![cfg("c1", &path, false, false)], favourite_objects: vec![], theme: Default::default(), tool_paths: Default::default() };
         let server = McpServer::new(config, test_vault());
 
         let result = server
@@ -586,7 +588,7 @@ mod tests {
             perms.set_readonly(true);
             std::fs::set_permissions(&path, perms).unwrap();
         }
-        let config = AppConfig { connections: vec![cfg("c1", &path, false, false)], favourite_objects: vec![] };
+        let config = AppConfig { connections: vec![cfg("c1", &path, false, false)], favourite_objects: vec![], theme: Default::default(), tool_paths: Default::default() };
         let server = McpServer::new(config, test_vault());
 
         let result = server
@@ -617,7 +619,7 @@ mod tests {
             conn.execute_batch(&sql).unwrap();
         }
         let path = f.path().to_string_lossy().into_owned();
-        let config = AppConfig { connections: vec![cfg("c1", &path, false, false)], favourite_objects: vec![] };
+        let config = AppConfig { connections: vec![cfg("c1", &path, false, false)], favourite_objects: vec![], theme: Default::default(), tool_paths: Default::default() };
         let server = McpServer::new(config, test_vault());
 
         let result = server
@@ -637,7 +639,7 @@ mod tests {
     #[tokio::test]
     async fn run_query_row_limit_above_ceiling_is_clamped_and_reported() {
         let (_f, path) = sqlite_fixture();
-        let config = AppConfig { connections: vec![cfg("c1", &path, false, false)], favourite_objects: vec![] };
+        let config = AppConfig { connections: vec![cfg("c1", &path, false, false)], favourite_objects: vec![], theme: Default::default(), tool_paths: Default::default() };
         let server = McpServer::new(config, test_vault());
 
         let result = server
@@ -711,7 +713,7 @@ mod tests {
     #[tokio::test]
     async fn run_query_syntax_error_surfaces_as_tool_error_not_a_panic() {
         let (_f, path) = sqlite_fixture();
-        let config = AppConfig { connections: vec![cfg("c1", &path, false, false)], favourite_objects: vec![] };
+        let config = AppConfig { connections: vec![cfg("c1", &path, false, false)], favourite_objects: vec![], theme: Default::default(), tool_paths: Default::default() };
         let server = McpServer::new(config, test_vault());
 
         let result = server
@@ -733,7 +735,7 @@ mod tests {
         // anyway — the exhaustive version of this lives in connect.rs's own
         // tests; this just checks the tool layer doesn't undo it.
         let (_f, path) = sqlite_fixture();
-        let config = AppConfig { connections: vec![cfg("c1", &path, false, false)], favourite_objects: vec![] };
+        let config = AppConfig { connections: vec![cfg("c1", &path, false, false)], favourite_objects: vec![], theme: Default::default(), tool_paths: Default::default() };
         let server = McpServer::new(config, test_vault());
 
         let result = server
