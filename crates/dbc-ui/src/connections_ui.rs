@@ -46,6 +46,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::backup;
 use crate::chart_data::ChartKind;
 use crate::runner::ConnectSpec;
 use crate::text_model::MultilineBuffer;
@@ -1664,8 +1665,10 @@ impl AppView {
         let Some(cfg_b) = self.config.connections.iter().find(|c| c.id == id_b).cloned() else {
             return;
         };
-        let secret_a = self.vault.as_ref().and_then(|v| v.get_secret(&cfg_a.id));
-        let secret_b = self.vault.as_ref().and_then(|v| v.get_secret(&cfg_b.id));
+        // G15 T8 HARD GATE ITEM 2: see `connect::resolve_secret_for_connect`'s
+        // doc comment — skips the vault lookup for a refused MSSQL config.
+        let secret_a = crate::connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg_a);
+        let secret_b = crate::connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg_b);
 
         self.modal = None; // design §3: closes as soon as the request is dispatched
         self.compare_fetch_generation += 1;
@@ -1797,14 +1800,18 @@ impl AppView {
             return;
         }
 
+        // G15 T8 HARD GATE ITEM 2: `cfg` computed BEFORE the vault fallback
+        // branch so `resolve_secret_for_connect` can skip the vault lookup
+        // for a refused MSSQL config — see its doc comment. The typed-
+        // password branch is unaffected (never touches the vault at all).
+        let cfg = data.to_connection_config();
         let secret = if !data.password.is_empty() {
             Some(data.password.clone())
         } else {
-            self.vault.as_ref().and_then(|v| v.get_secret(&data.id))
+            crate::connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg)
         };
         let engine_lbl = engine_label(data.engine);
         let editing_id = ui_snapshot.editing_id.clone();
-        let cfg = data.to_connection_config();
 
         match test_connect_spec(cfg, secret) {
             Err(msg) => {
@@ -2005,7 +2012,7 @@ impl AppView {
         // today, and why the call stays here anyway.
         self.cancel_active_backup_if_running();
         let Some(cfg) = self.config.connections.iter().find(|c| c.id == id).cloned() else { return };
-        let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+        let secret = crate::connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
         let engine_lbl = engine_label(cfg.engine);
         let target_id = cfg.id.clone();
         self.dropdown_open = false;
@@ -2428,44 +2435,49 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
                     view.open_connection_dialog(Some(editing.clone()), window, cx);
                 })),
         )
-        .child(
-            // G11 T6: backup affordance — allowed on every connection
-            // (backup is the one documented read-only exemption, design
-            // CURATION item 2), same `cx.stop_propagation()` pattern as ★/✎
-            // above so this click doesn't also bubble to the row's connect
-            // handler.
-            div()
-                .id(SharedString::from(format!("dropdown-item-backup-{}", c.id)))
-                .px_1()
-                .cursor_pointer()
-                .text_color(cx.theme().text_muted)
-                .hover(|s| s.bg(cx.theme().bg_selected))
-                .child("🗄")
-                .on_click(cx.listener(move |view, _, window, cx| {
-                    cx.stop_propagation();
-                    view.open_backup_dialog(backup_target.clone(), window, cx);
-                })),
-        )
-        .child(
-            // G11 T6: restore affordance — dimmed (still clickable; the
-            // click itself surfaces the read-only refusal as a status line,
-            // same "no tooltip component exists in this codebase" posture
-            // this plan's Grounding documents) for a read-only connection.
-            // Restore is NEVER exempt from the read-only gate (design
-            // CURATION item 2) — `open_restore_dialog` enforces this for
-            // real; the dim here is a visual hint only, not the guard.
-            div()
-                .id(SharedString::from(format!("dropdown-item-restore-{}", c.id)))
-                .px_1()
-                .cursor_pointer()
-                .text_color(if restore_read_only { cx.theme().text_disabled } else { cx.theme().text_muted })
-                .hover(|s| s.bg(cx.theme().bg_selected))
-                .child("♻")
-                .on_click(cx.listener(move |view, _, window, cx| {
-                    cx.stop_propagation();
-                    view.open_restore_dialog(restore_target.clone(), window, cx);
-                })),
-        )
+        // G15 T8 HARD GATE ITEM 1: backup/restore icons hidden entirely for
+        // MSSQL — see `backup::backup_restore_available`'s doc comment for
+        // the live-found reliability bug this gates on.
+        .when(backup::backup_restore_available(c.engine), |row| {
+            row.child(
+                // G11 T6: backup affordance — allowed on every connection
+                // (backup is the one documented read-only exemption, design
+                // CURATION item 2), same `cx.stop_propagation()` pattern as ★/✎
+                // above so this click doesn't also bubble to the row's connect
+                // handler.
+                div()
+                    .id(SharedString::from(format!("dropdown-item-backup-{}", c.id)))
+                    .px_1()
+                    .cursor_pointer()
+                    .text_color(cx.theme().text_muted)
+                    .hover(|s| s.bg(cx.theme().bg_selected))
+                    .child("🗄")
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        cx.stop_propagation();
+                        view.open_backup_dialog(backup_target.clone(), window, cx);
+                    })),
+            )
+            .child(
+                // G11 T6: restore affordance — dimmed (still clickable; the
+                // click itself surfaces the read-only refusal as a status line,
+                // same "no tooltip component exists in this codebase" posture
+                // this plan's Grounding documents) for a read-only connection.
+                // Restore is NEVER exempt from the read-only gate (design
+                // CURATION item 2) — `open_restore_dialog` enforces this for
+                // real; the dim here is a visual hint only, not the guard.
+                div()
+                    .id(SharedString::from(format!("dropdown-item-restore-{}", c.id)))
+                    .px_1()
+                    .cursor_pointer()
+                    .text_color(if restore_read_only { cx.theme().text_disabled } else { cx.theme().text_muted })
+                    .hover(|s| s.bg(cx.theme().bg_selected))
+                    .child("♻")
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        cx.stop_propagation();
+                        view.open_restore_dialog(restore_target.clone(), window, cx);
+                    })),
+            )
+        })
 }
 
 fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppView>) -> AnyElement {

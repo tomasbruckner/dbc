@@ -4,7 +4,7 @@ use dbc_core::{Connection, QueryError};
 use dbc_driver_mssql::{MssqlConfig, MssqlConnection};
 use dbc_driver_postgres::{PgConfig, PostgresConnection};
 use dbc_driver_sqlite::SqliteConnection;
-use dbc_state::{ConnectionConfig, Engine};
+use dbc_state::{ConnectionConfig, Engine, Vault};
 
 use crate::tunnel::Tunnel;
 
@@ -164,11 +164,49 @@ pub fn open_config(
     }
 }
 
+/// G15 T8 HARD GATE ITEM 2: the two `mssql_connection_from_config`
+/// refusals below (SSH tunnel, empty/integrated-auth user) need no secret
+/// at all to decide — `true` here means that function will refuse `cfg`
+/// before ever looking at whatever secret it's handed. Extracted as its
+/// own predicate so callers can check it BEFORE fetching the vault secret,
+/// not just before USING it: the review finding was that every call site
+/// (`main.rs`/`connections_ui.rs`, ~8 of them) unconditionally called
+/// `vault.get_secret(&cfg.id)` first and only afterward built the
+/// `ConnectSpec`/called this function, so a config that was always going
+/// to be refused still had its plaintext secret pulled out of the vault
+/// and held in memory for no reason — see [`resolve_secret_for_connect`].
+pub fn mssql_connect_refusal(cfg: &ConnectionConfig) -> bool {
+    cfg.engine == Engine::Mssql && (cfg.ssh.is_some() || cfg.user.trim().is_empty())
+}
+
+/// The get_secret call every "resolve a saved connection's secret to
+/// attempt a connect" call site should use instead of reaching into
+/// `vault` directly — skips the vault lookup entirely when
+/// [`mssql_connect_refusal`] already knows `cfg` will be refused before
+/// any secret is used, otherwise behaves exactly like the
+/// `vault.and_then(|v| v.get_secret(&cfg.id))` pattern it replaces (same
+/// `None`-on-no-vault/no-entry semantics for every non-refused config,
+/// MSSQL or not).
+pub fn resolve_secret_for_connect(vault: Option<&Vault>, cfg: &ConnectionConfig) -> Option<String> {
+    if mssql_connect_refusal(cfg) {
+        return None;
+    }
+    vault.and_then(|v| v.get_secret(&cfg.id))
+}
+
 /// Shared MSSQL builder — used by `open_config`'s arm AND (T7)
 /// `runner::run_mssql_plan`. Refusals first, before touching the
 /// vault-provided secret's destination string. NO probe here — callers
 /// decide (open_config probes eagerly; run_mssql_plan lets
 /// query_with_session's own connect fail naturally).
+///
+/// These same two checks are ALSO exposed standalone as
+/// [`mssql_connect_refusal`] — kept duplicated rather than calling it from
+/// here, because inlined `if`s that construct and return the exact,
+/// caller-facing `QueryError` text are clearer to read at THIS call site
+/// than routing through a boolean predicate would be; `mssql_connect_refusal`
+/// exists for callers that need the yes/no answer before they even have a
+/// secret to pass in here, per its own doc comment.
 pub(crate) fn mssql_connection_from_config(
     cfg: &ConnectionConfig,
     secret: Option<String>,
@@ -256,6 +294,59 @@ mod mssql_connect_tests {
             favourite: false,
             mssql: None,
         }
+    }
+
+    /// G15 T8 HARD GATE ITEM 2: `mssql_connect_refusal` must agree with
+    /// `mssql_connection_from_config`'s own two refusal `if`s exactly — a
+    /// mismatch either direction would be wrong (either the vault gets
+    /// skipped for a config that would actually connect, or a config that
+    /// will be refused still triggers a needless secret fetch at the call
+    /// site, defeating the point).
+    #[test]
+    fn mssql_connect_refusal_matches_mssql_connection_from_config_ssh_and_empty_user_checks() {
+        let mut ssh_cfg = base_cfg();
+        ssh_cfg.ssh = Some(SshTunnelConfig { host: "bastion".into(), port: 22, user: "tomas".into(), key_path: None });
+        assert!(mssql_connect_refusal(&ssh_cfg));
+        assert!(mssql_connection_from_config(&ssh_cfg, Some("pw".into())).is_err());
+
+        let mut empty_user_cfg = base_cfg();
+        empty_user_cfg.user = "   ".into();
+        assert!(mssql_connect_refusal(&empty_user_cfg));
+        assert!(mssql_connection_from_config(&empty_user_cfg, Some("pw".into())).is_err());
+
+        let ok_cfg = base_cfg();
+        assert!(!mssql_connect_refusal(&ok_cfg));
+        assert!(mssql_connection_from_config(&ok_cfg, Some("pw".into())).is_ok());
+    }
+
+    /// A non-MSSQL config is NEVER refused by `mssql_connect_refusal` —
+    /// the SSH/empty-user checks are MSSQL-specific (pg supports SSH
+    /// tunnels and its own auth story; this predicate must not
+    /// accidentally start gating them).
+    #[test]
+    fn mssql_connect_refusal_is_false_for_non_mssql_engines() {
+        let mut pg_cfg = base_cfg();
+        pg_cfg.engine = Engine::Postgres;
+        pg_cfg.user = String::new();
+        pg_cfg.ssh = Some(SshTunnelConfig { host: "bastion".into(), port: 22, user: "tomas".into(), key_path: None });
+        assert!(!mssql_connect_refusal(&pg_cfg));
+    }
+
+    /// `resolve_secret_for_connect` with `vault: None` — the "no vault
+    /// unlocked" case every call site already handles via
+    /// `self.vault.as_ref()` on an `Option::None`. Refused configs still
+    /// short-circuit to `None` the same way; non-refused configs also get
+    /// `None` here since there's no vault to consult, same end result as
+    /// today's `self.vault.as_ref().and_then(...)` on `None`, just without
+    /// ever attempting the lookup for the refused case.
+    #[test]
+    fn resolve_secret_for_connect_short_circuits_refused_mssql_config_without_a_vault() {
+        let mut ssh_cfg = base_cfg();
+        ssh_cfg.ssh = Some(SshTunnelConfig { host: "bastion".into(), port: 22, user: "tomas".into(), key_path: None });
+        assert_eq!(resolve_secret_for_connect(None, &ssh_cfg), None);
+
+        let ok_cfg = base_cfg();
+        assert_eq!(resolve_secret_for_connect(None, &ok_cfg), None);
     }
 
     #[test]

@@ -1432,7 +1432,11 @@ impl AppView {
                 cx.notify();
                 return;
             };
-            let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+            // G15 T8 HARD GATE ITEM 2: `connect::resolve_secret_for_connect`
+            // (not a raw `vault.get_secret`) — skips the vault lookup
+            // entirely for an MSSQL config that's refused before any secret
+            // is ever used (SSH tunnel / empty user), see its doc comment.
+            let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
             // G5 Task 3: captured before `cfg` moves into `ConnectSpec::Config`
             // below — `Started`'s `Editable` detection needs both facts (see
             // `detect_editable_pk`), and `cfg` itself won't survive past this
@@ -3251,7 +3255,7 @@ impl AppView {
                 cx.notify();
                 return None;
             };
-            let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+            let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
             let (read_only, timeout_secs, engine) = (cfg.read_only, cfg.timeout_secs, cfg.engine);
             Some((read_only, timeout_secs, engine, ConnectSpec::Config { cfg: Box::new(cfg), secret }))
         } else if let Some(url) = self.conn_url.clone() {
@@ -4467,7 +4471,7 @@ impl AppView {
     fn active_conn_spec(&self) -> Option<ConnectSpec> {
         if let Some(id) = self.active_connection_id.clone() {
             let cfg = self.config.connections.iter().find(|c| c.id == id)?.clone();
-            let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+            let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
             Some(ConnectSpec::Config { cfg: Box::new(cfg), secret })
         } else {
             self.conn_url.clone().map(ConnectSpec::Url)
@@ -5639,7 +5643,7 @@ impl AppView {
     fn apply_conn_spec(&self) -> Option<(ConnectSpec, Option<u64>)> {
         if let Some(id) = self.active_connection_id.clone() {
             let cfg = self.config.connections.iter().find(|c| c.id == id)?.clone();
-            let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+            let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
             let timeout_secs = cfg.timeout_secs;
             Some((ConnectSpec::Config { cfg: Box::new(cfg), secret }, timeout_secs))
         } else {
@@ -6727,7 +6731,7 @@ impl AppView {
     /// connection has since been deleted.
     fn resolve_conn_for_backup(&self, id: &str) -> Option<(dbc_state::ConnectionConfig, Option<String>)> {
         let cfg = self.config.connections.iter().find(|c| c.id == id)?.clone();
-        let secret = self.vault.as_ref().and_then(|v| v.get_secret(&cfg.id));
+        let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
         Some((cfg, secret))
     }
 
@@ -6876,6 +6880,17 @@ impl AppView {
             cx.notify();
             return;
         };
+        // G15 T8 HARD GATE ITEM 1: the dropdown icon is already hidden for
+        // MSSQL (`connections_ui::dropdown_item`'s `.when` guard), but the
+        // command palette's `PaletteAction::BackupDatabase` dispatches here
+        // directly for whatever connection is active — this is the single
+        // source of truth both paths must respect. See
+        // `backup::backup_restore_available`'s doc comment for why.
+        if !backup::backup_restore_available(cfg.engine) {
+            self.status = "zálohování pro MSSQL zatím není k dispozici".to_string();
+            cx.notify();
+            return;
+        }
         let ext = backup_file_ext(cfg.engine);
         let suggested_name = format!("{}-{}.{ext}", cfg.database, backup_timestamp());
         self.status = "volím cíl zálohy…".to_string();
@@ -7157,6 +7172,14 @@ impl AppView {
         };
         if cfg.read_only {
             self.status = "error: připojení je pouze pro čtení — obnovu nelze spustit".to_string();
+            cx.notify();
+            return;
+        }
+        // G15 T8 HARD GATE ITEM 1: same single source of truth
+        // `open_backup_dialog` checks — see `backup::backup_restore_available`'s
+        // doc comment.
+        if !backup::backup_restore_available(cfg.engine) {
+            self.status = "obnova pro MSSQL zatím není k dispozici".to_string();
             cx.notify();
             return;
         }
