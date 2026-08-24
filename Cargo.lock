@@ -2243,6 +2243,7 @@ dependencies = [
  "criterion",
  "dbc-core",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

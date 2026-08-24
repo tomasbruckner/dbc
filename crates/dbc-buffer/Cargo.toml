@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 dbc-core = { path = "../dbc-core" }
 tempfile = "3"
+tokio.workspace = true
 
 [dev-dependencies]
 criterion = "0.5"
