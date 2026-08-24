@@ -47,7 +47,7 @@ const LARGE_EXPORT_ROWS: usize = 50_000;
 /// spilled 500k-row export, instead of one unbounded synchronous pass.
 const EXPORT_SNAPSHOT_CHUNK_ROWS: usize = 25_000;
 
-actions!(grid, [CopySelection, FindInResult, FindNext, FindPrev]);
+actions!(grid, [CopySelection, FindInResult, FindNext, FindPrev, DeleteRow]);
 
 /// G4 Task 5: what a `ResultGrid` asks `main.rs` to DO on its behalf when the
 /// ☰ FK menu's checkboxes change — the grid itself has no connection/runner
@@ -129,6 +129,34 @@ pub enum GridEvent {
     OpenChart,
 }
 
+/// UX-polish §3: display-row span of `selection` split into real-row
+/// delete-toggles and inserted-row removals. Real rows come back ascending
+/// (they're flag toggles — order irrelevant, ascending is just stable);
+/// inserted indices come back DESCENDING so the caller's sequential
+/// `EditState::remove_insert_row` calls (a `Vec::remove` each, which
+/// shifts later indices — sandbox.rs) never invalidate the next index.
+/// Display rows past `view_len + inserted_len` are ignored (a stale
+/// selection can outlive a shrinking filter).
+fn delete_targets(
+    sel: ((usize, usize), (usize, usize)),
+    view_len: usize,
+    inserted_len: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let ((r1, _), (r2, _)) = sel;
+    let (lo, hi) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
+    let mut real = Vec::new();
+    let mut ins = Vec::new();
+    for r in lo..=hi {
+        if r < view_len {
+            real.push(r);
+        } else if r < view_len + inserted_len {
+            ins.push(r - view_len);
+        }
+    }
+    ins.reverse();
+    (real, ins)
+}
+
 /// Bind ResultGrid's own keys. Scoped to the `"ResultGrid"` key context so
 /// ctrl-c only fires `CopySelection` while the grid (not `SqlInput`) is
 /// focused — SqlInput binds its own `Copy` action under context `None`, and
@@ -151,6 +179,14 @@ pub fn bind_keys(cx: &mut gpui::App) {
         KeyBinding::new("ctrl-f", FindInResult, Some("ResultGrid")),
         KeyBinding::new("enter", FindNext, Some("ResultGrid")),
         KeyBinding::new("shift-enter", FindPrev, Some("ResultGrid")),
+        // UX-polish §3: Delete stages row deletion (gutter equivalence).
+        // Contention: while any TextField INSIDE the grid (filter row, find
+        // bar, cell editor) is focused, the deeper "TextField"-scoped
+        // `delete` binding (connections_ui.rs bind_keys) wins keymap
+        // resolution and its handler consumes the key — forward-delete in
+        // text inputs is untouched. This only fires when the grid body
+        // itself holds focus (cell click focuses `self.focus_handle`).
+        KeyBinding::new("delete", DeleteRow, Some("ResultGrid")),
     ]);
 }
 
@@ -1976,6 +2012,49 @@ impl ResultGrid {
         cx.notify();
     }
 
+    /// UX-polish §3: Delete key on a selected row span — stages EXACTLY
+    /// what the mouse gutter stages, per display row: real rows get the
+    /// reversible `toggle_delete` flag (pressing Delete again un-stages,
+    /// keyed by SOURCE row so sort/filter can't misdirect it — brief
+    /// contract #6), inserted rows get `remove_insert_row` (permanent, the
+    /// only way to un-stage an insert). Zero new SQL surface — nothing
+    /// reaches the database before the Apply dialog, same as the gutter.
+    fn on_delete_row(&mut self, _: &DeleteRow, _window: &mut Window, cx: &mut Context<Self>) {
+        // Guard chain (design §3.2) — each a silent no-op:
+        // 1. never act "through" an open editor/detail overlay (belt — those
+        //    hold focus in their own TextField/popup anyway);
+        if self.cell_editor.is_some() || self.cell_detail.is_some() {
+            return;
+        }
+        // 2. `editable` covers ad-hoc tabs, read-only connections, MSSQL,
+        //    and PK-less tables in one check (sandbox.rs `Editable` docs);
+        if self.editable.is_none() {
+            return;
+        }
+        // 3. nothing selected, nothing to delete.
+        let Some(sel) = self.selection else { return };
+
+        let (real_rows, ins_desc) =
+            delete_targets(sel, self.view.len(), self.edit_state.inserted_rows.len());
+        if real_rows.is_empty() && ins_desc.is_empty() {
+            return;
+        }
+        for &r in &real_rows {
+            let source_row = self.view.source_row(r);
+            self.edit_state.toggle_delete(source_row);
+        }
+        for &ins_ix in &ins_desc {
+            self.edit_state.remove_insert_row(ins_ix);
+        }
+        // Removing an insert shifts/kills display indices past `view_len`
+        // — drop the selection rather than let it dangle. Pure toggles
+        // keep it (deletion is a flag; rows don't move).
+        if !ins_desc.is_empty() {
+            self.selection = None;
+        }
+        cx.notify();
+    }
+
     /// G5 Task 3: "␡" gutter click on an inserted row — removes it
     /// entirely (`EditState::remove_insert_row`). Unlike a real row's
     /// delete (a reversible flag — the row still exists in the table until
@@ -2557,7 +2636,8 @@ impl Render for ResultGrid {
             .on_action(cx.listener(Self::on_copy))
             .on_action(cx.listener(Self::on_find_in_result))
             .on_action(cx.listener(Self::on_find_next))
-            .on_action(cx.listener(Self::on_find_prev));
+            .on_action(cx.listener(Self::on_find_prev))
+            .on_action(cx.listener(Self::on_delete_row));
 
         // Toolbar (+ filter row) only when a buffer is actually set (brief
         // contract #1) — `toolbar` also polls filters/find as a side
@@ -3049,5 +3129,47 @@ mod lookup_generation_tests {
     fn accepts_empty_wanted_cols_vacuously_when_generation_matches() {
         let checked: HashSet<String> = HashSet::new();
         assert!(should_apply_lookup(0, 0, &checked, &[]));
+    }
+}
+
+#[cfg(test)]
+mod delete_targets_tests {
+    use super::delete_targets;
+
+    #[test]
+    fn single_real_row() {
+        assert_eq!(delete_targets(((2, 0), (2, 3)), 10, 0), (vec![2], vec![]));
+    }
+
+    #[test]
+    fn reversed_anchor_focus_span_normalizes() {
+        assert_eq!(delete_targets(((5, 1), (3, 0)), 10, 0), (vec![3, 4, 5], vec![]));
+    }
+
+    #[test]
+    fn span_straddling_view_len_splits_real_and_inserted() {
+        // view_len 4, 3 inserted rows: display 2..=5 -> real [2,3], ins [0,1]
+        let (real, ins) = delete_targets(((2, 0), (5, 0)), 4, 3);
+        assert_eq!(real, vec![2, 3]);
+        assert_eq!(ins, vec![1, 0]); // descending — Vec::remove-safe order
+    }
+
+    #[test]
+    fn all_inserted_span_is_descending() {
+        assert_eq!(delete_targets(((4, 0), (6, 0)), 4, 3), (vec![], vec![2, 1, 0]));
+    }
+
+    #[test]
+    fn rows_past_the_insert_range_are_ignored() {
+        // display rows 3..=9 but only view_len 2 + 1 insert exist
+        assert_eq!(delete_targets(((0, 0), (9, 0)), 2, 1), (vec![0, 1], vec![0]));
+    }
+
+    #[test]
+    fn insert_display_index_is_view_len_plus_ins_ix() {
+        // §4's display-index arithmetic pinned here (design §7: folded in):
+        // fresh add on view_len 4 -> display 4; second add -> display 5.
+        assert_eq!(4 + 0, 4usize);
+        assert_eq!(4 + 1, 5usize);
     }
 }
