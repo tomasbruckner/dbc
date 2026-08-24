@@ -79,7 +79,7 @@ async fn probe_and_query_with_session_are_callable() {
     let mut c = connect();
     c.probe().expect("probe should succeed against a reachable, correctly-configured server");
     let mut s = c
-        .query_with_session(&[], "SELECT 1 AS a", &[], CancelToken::new())
+        .query_with_session(&[], "SELECT 1 AS a", &[], None, CancelToken::new())
         .await
         .expect("query_with_session should run a trivial single-batch query");
     let mut rows = 0usize;
@@ -87,6 +87,45 @@ async fn probe_and_query_with_session_are_callable() {
         rows += b.unwrap().num_rows();
     }
     assert_eq!(rows, 1);
+}
+
+/// G15 T7 review MAJOR fix REQUIRED test: `max_rows` aborts the WHOLE call
+/// cleanly (a Czech message, no partial/silent truncation) the moment a
+/// single result set exceeds the cap — the concrete, live proof that
+/// routing arbitrary user SQL through `query_with_session` (the ACTUAL
+/// plan path, which genuinely executes the statement under `SET
+/// STATISTICS XML ON`) can no longer materialize unbounded memory: a
+/// `SELECT` producing 50 rows under a 10-row cap must fail, not silently
+/// return 10 (or 50) rows.
+#[tokio::test]
+#[ignore]
+async fn query_with_session_row_cap_aborts_cleanly_on_oversized_result_set() {
+    let mut c = connect();
+    // `sys.objects` cross-joined with itself reliably yields far more than
+    // 50 rows in any real database (including a bare `tempdb`), no user
+    // table needed.
+    let sql = "SELECT TOP (50) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n \
+               FROM sys.objects a, sys.objects b";
+    let err = c
+        .query_with_session(&[], sql, &[], Some(10), CancelToken::new())
+        .await
+        .expect_err("a 50-row result set must be refused under a 10-row cap, not truncated");
+    assert!(
+        err.message.contains("10"),
+        "expected the configured cap value (10) in the error message, got: {}",
+        err.message
+    );
+    // Sanity: the SAME query with no cap (`None`) still works normally —
+    // proves the cap is opt-in per call, not a blanket regression.
+    let mut ok = c
+        .query_with_session(&[], sql, &[], None, CancelToken::new())
+        .await
+        .expect("uncapped call must still succeed");
+    let mut rows = 0usize;
+    while let Some(b) = ok.batches.recv().await {
+        rows += b.unwrap().num_rows();
+    }
+    assert_eq!(rows, 50);
 }
 
 /// Case 0 (row-count characterization — added by this plan, gates
@@ -228,6 +267,7 @@ async fn autocommit_does_not_commit_between_execute_calls_inside_open_tx() {
             &["SET LOCK_TIMEOUT 1000".to_string()],
             &format!("SELECT COUNT(*) AS n FROM {table}"),
             &[],
+            None,
             CancelToken::new(),
         )
         .await;

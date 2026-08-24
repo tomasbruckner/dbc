@@ -231,17 +231,39 @@ impl MssqlConnection {
     /// verification flag from G13 §1b, bounded by "wrong text handed to a
     /// parser that fails closed").
     ///
-    /// **BOUNDED STATEMENTS ONLY (execution plans, DMV probes).** Unlike
-    /// `query()`, which streams `RecordBatch`es out over a bounded mpsc
-    /// channel as they're fetched, this method fully materializes EVERY
-    /// result set of the main batch into memory (`Vec<RecordBatch>` per
-    /// result set, collected before the selection rule ever runs) — there
-    /// is no back-pressure and no early return. That's fine for Showplan
-    /// XML and other small, single/few-row diagnostic payloads, but
-    /// routing arbitrary user SQL through this function instead of
-    /// `query()` is an unbounded-memory hazard: a large result set would
-    /// be held in full before the caller ever sees the first row. Never
-    /// use this for ordinary user-issued queries.
+    /// **BOUNDED MEMORY, by construction (G15 T7 review MAJOR fix).** Under
+    /// `SET STATISTICS XML ON` the main `sql` batch genuinely EXECUTES and
+    /// can return its own (potentially huge) data result set(s) BEFORE the
+    /// plan-XML set — so this method can never simply accumulate every
+    /// result set into memory the way the original G13/T2 draft did. Two
+    /// independent bounds now hold simultaneously:
+    /// 1. **Structural: at most two result sets are ever held at once.**
+    ///    The confirmed Showplan-named set (once found) is kept for the
+    ///    rest of the walk; every OTHER set is tracked only as the single
+    ///    "current fallback candidate", which is REPLACED (dropping the
+    ///    previous candidate's batches) as soon as a newer set is walked —
+    ///    never a growing `Vec` of every set seen. This alone caps
+    ///    "how many sets" but not "how big is one set".
+    /// 2. **Per-set row cap: `max_rows`.** Every individual result set's
+    ///    own fetch loop is capped at `max_rows` rows (checked as each
+    ///    batch arrives, before it's appended) — exceeding it aborts the
+    ///    WHOLE call with a clean `QueryError` (Czech message; postludes
+    ///    still run, same as every other error path) rather than silently
+    ///    truncating or continuing to grow. `None` disables the cap
+    ///    (existing docker/integration tests that don't care about it use
+    ///    this); `run_mssql_plan_inner` (dbc-ui) always passes `Some(_)` —
+    ///    see its own `PLAN_ROW_CAP` doc comment for the exact value and
+    ///    rationale.
+    ///
+    /// Together: peak memory is bounded to at most `2 * max_rows` rows'
+    /// worth of batches, REGARDLESS of what the user's SQL does — routing
+    /// arbitrary user SQL through this function (via `SET STATISTICS XML
+    /// ON`'s actual-execution path) is now safe as long as the caller
+    /// supplies a real `max_rows`. (Unlike `query()`, this method still has
+    /// no streaming back-pressure — the chosen set's batches are handed
+    /// over only after the whole walk completes — but "no back-pressure,
+    /// bounded to ~2*max_rows rows" is a very different risk profile than
+    /// the previous "no bound at all".)
     ///
     /// G15 T7 integration fix (found wiring `run_mssql_plan`, "reality
     /// wins" — not a T2 grounding-text deviation, a genuine build error):
@@ -262,6 +284,7 @@ impl MssqlConnection {
         prelude: &[String],
         sql: &str,
         postlude: &[String],
+        max_rows: Option<usize>,
         cancel: CancelToken,
     ) -> Result<QueryStream, QueryError> {
         let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
@@ -320,9 +343,16 @@ impl MssqlConnection {
                 }
             };
 
-            // Walk ALL result sets, materializing each fully, then apply
-            // the selection rule (design §2e) after the walk is done.
-            let mut result_sets: Vec<(bool, SchemaRef, Vec<RecordBatch>)> = Vec::new();
+            // Walk every result set; select as we go (G15 T7 review MAJOR
+            // fix — see this method's doc comment for the full bounded-
+            // memory contract). `named_match` is the confirmed
+            // Showplan-named set, kept for the rest of the walk once
+            // found; `fallback` is the CURRENT candidate for "last set
+            // walked" — replaced (dropping the previous candidate's
+            // batches) every iteration, never accumulated. At most two
+            // sets' batches are ever alive at once.
+            let mut named_match: Option<(SchemaRef, Vec<RecordBatch>)> = None;
+            let mut fallback: Option<(SchemaRef, Vec<RecordBatch>)> = None;
             loop {
                 if cancel.is_cancelled() {
                     run_postludes(&conn, &postlude);
@@ -376,6 +406,7 @@ impl MssqlConnection {
                 };
 
                 let mut batches: Vec<RecordBatch> = Vec::new();
+                let mut rows_in_set: usize = 0;
                 loop {
                     if cancel.is_cancelled() {
                         run_postludes(&conn, &postlude);
@@ -384,6 +415,23 @@ impl MssqlConnection {
                     }
                     match block_cursor.fetch() {
                         Ok(Some(batch)) => {
+                            rows_in_set += batch.num_rows();
+                            if let Some(cap) = max_rows {
+                                if rows_in_set > cap {
+                                    // G15 T7 review MAJOR fix: abort the WHOLE
+                                    // call rather than silently truncating —
+                                    // same fail-closed posture every other
+                                    // row cap in this codebase uses (e.g.
+                                    // dbc-diff's DIFF_ROW_CAP). Postludes
+                                    // still run, same as every other error
+                                    // path here.
+                                    run_postludes(&conn, &postlude);
+                                    let _ = schema_tx.send(Err(QueryError::msg(format!(
+                                        "výsledek přesáhl limit {cap} řádků — plán/analýza byla zamítnuta, aby se předešlo vyčerpání paměti"
+                                    ))));
+                                    return;
+                                }
+                            }
                             let mut builders: Vec<StringBuilder> =
                                 (0..ncols).map(|_| StringBuilder::new()).collect();
                             for (col_index, b) in builders.iter_mut().enumerate() {
@@ -427,7 +475,16 @@ impl MssqlConnection {
                         return;
                     }
                 };
-                result_sets.push((is_showplan, schema, batches));
+                // Structural memory bound (see this method's doc comment):
+                // the first Showplan-named set wins PERMANENTLY once found
+                // (never overwritten); every other set only ever replaces
+                // the single `fallback` candidate — the PREVIOUS
+                // candidate's `Vec<RecordBatch>` is dropped right here.
+                if is_showplan && named_match.is_none() {
+                    named_match = Some((schema, batches));
+                } else {
+                    fallback = Some((schema, batches));
+                }
 
                 match next_cursor.more_results() {
                     Ok(Some(next)) => {
@@ -450,16 +507,8 @@ impl MssqlConnection {
             // transaction; session settings can never leak).
             run_postludes(&conn, &postlude);
 
-            let chosen_idx = result_sets
-                .iter()
-                .position(|(is_showplan, _, _)| *is_showplan)
-                .or(if result_sets.is_empty() { None } else { Some(result_sets.len() - 1) });
-
-            let (schema, batches) = match chosen_idx {
-                Some(idx) => {
-                    let (_, schema, batches) = result_sets.into_iter().nth(idx).unwrap();
-                    (schema, batches)
-                }
+            let (schema, batches) = match named_match.or(fallback) {
+                Some(x) => x,
                 None => {
                     let _ = schema_tx.send(Err(QueryError::msg("no result sets produced")));
                     return;

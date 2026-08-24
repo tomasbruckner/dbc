@@ -121,13 +121,28 @@ pub fn hot_fraction(
 /// `main.rs::run_explain` dispatches `Engine::Mssql` to
 /// `dispatch_mssql_plan`/`QueryRunner::run_mssql_plan` (session preludes
 /// via `query_with_session`, see `runner.rs::mssql_plan_session`) BEFORE
-/// ever calling this function. The `Mssql` arm here is a documented
-/// passthrough — kept only so this match stays total (no panic path if
-/// something ever called it directly) — never actually reached.
+/// ever calling this function.
+///
+/// G15 T7 review MINOR fix: the `Mssql` arm used to be a bare passthrough
+/// (`sql.to_string()`) — kept the match total, but if `main.rs`'s routing
+/// ever regressed (the reviewer confirmed deleting it still compiles and
+/// passes the whole suite — GPUI view methods have no direct test seam,
+/// see `run_explain`'s own doc comment), `dispatch_plan_query` would hand
+/// the RAW user SQL straight to `connect_and_run` and EXECUTE it for
+/// real — including an unconfirmed write, with no confirm modal, since
+/// the estimated path is specifically the one §5 promises never executes
+/// anything. Replaced with an INERT marker — a `SELECT` of a static
+/// string literal, no user SQL embedded anywhere — so even if this arm
+/// IS ever reached by a routing regression, the worst case is a harmless
+/// read-only `SELECT` followed by a "couldn't parse this as a plan" error
+/// (`parse_plan` fails closed on non-XML text), never a side effect.
 pub fn explain_sql(engine: dbc_state::Engine, sql: &str) -> String {
     match engine {
         dbc_state::Engine::Postgres => format!("EXPLAIN (FORMAT JSON) {sql}"),
-        dbc_state::Engine::Mssql => sql.to_string(),
+        dbc_state::Engine::Mssql => {
+            "SELECT 'MSSQL EXPLAIN routing bug — see plan::explain_sql doc comment' AS error"
+                .to_string()
+        }
         dbc_state::Engine::Sqlite => format!("EXPLAIN QUERY PLAN {sql}"),
     }
 }
@@ -901,12 +916,26 @@ mod model_tests {
             explain_sql(dbc_state::Engine::Sqlite, "SELECT 1"),
             "EXPLAIN QUERY PLAN SELECT 1"
         );
-        // G15 T7: MSSQL is a documented passthrough — it never actually
-        // routes through this builder (main.rs::run_explain dispatches
-        // Engine::Mssql to run_mssql_plan's session preludes first); this
-        // just proves the match stays total with no panic/mangled-string
-        // path if something ever called it directly.
-        assert_eq!(explain_sql(dbc_state::Engine::Mssql, "SELECT 1"), "SELECT 1");
+        // G15 T7 review MINOR fix REQUIRED test (the "routing pin" —
+        // `main.rs::run_explain`'s Mssql dispatch itself has no direct
+        // test seam per GPUI convention, so this is the safety net): even
+        // if that routing ever regressed and this function WAS reached
+        // with a real write statement, it must NEVER echo the user's SQL
+        // back as something `dispatch_plan_query` would execute — proven
+        // here by feeding it an actual write and asserting the output
+        // contains neither that text nor ANY of the raw input, only the
+        // inert static marker.
+        let raw_write = "UPDATE accounts SET balance = 0 WHERE 1=1";
+        let mssql_out = explain_sql(dbc_state::Engine::Mssql, raw_write);
+        assert!(
+            !mssql_out.contains(raw_write),
+            "explain_sql(Mssql, ..) must never echo the input SQL back verbatim: {mssql_out}"
+        );
+        assert!(
+            mssql_out.trim_start().to_ascii_uppercase().starts_with("SELECT"),
+            "even if main.rs's routing ever regressed, this must stay a harmless read-only \
+             SELECT of a static marker, never user SQL: {mssql_out}"
+        );
     }
 
     #[test]

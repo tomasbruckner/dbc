@@ -1319,6 +1319,20 @@ fn mssql_plan_session(analyze: bool) -> (Vec<String>, Vec<String>) {
     }
 }
 
+/// G15 T7 review MAJOR fix: hard cap on rows `run_mssql_plan_inner` will
+/// ever let `query_with_session` materialize for ONE result set. The
+/// ACTUAL (`analyze = true`) path genuinely EXECUTES the user's SQL under
+/// `SET STATISTICS XML ON` — routing arbitrary user SQL through
+/// `query_with_session` (which has no streaming back-pressure, see its own
+/// doc comment) is only safe because a `max_rows` cap is threaded all the
+/// way through; without one, "Analyze" on `SELECT * FROM big_table` (a
+/// read — `AnalyzeGate::Run`, no confirm modal, no chance to say no) would
+/// be an OOM/freeze the instant T8 flips `mssql_plan_dispatch_available`.
+/// The plan/statistics XML result set itself is always exactly one row —
+/// 10,000 is generously above that, so this only ever fires on genuinely
+/// pathological/large user SQL, never on the plan payload itself.
+const PLAN_ROW_CAP: usize = 10_000;
+
 /// G15 T7: `QueryRunner::run_mssql_plan`'s async body — the MSSQL face of
 /// the plan/analyze feature, delivered via
 /// `MssqlConnection::query_with_session` (T2) instead of the generic
@@ -1331,6 +1345,12 @@ async fn run_mssql_plan_inner(
     analyze: bool,
     timeout_secs: Option<u64>,
 ) -> Result<String, QueryError> {
+    // G15 T7 review NIT fix: single-authority dialect resolution
+    // (`spec_dialect`), not a hard-coded `Dialect::Mssql` literal — same
+    // convention every other dialect-aware call site in this file follows,
+    // even though this function is only ever reached for a genuinely-MSSQL
+    // spec in practice (`dispatch_mssql_plan` never calls it otherwise).
+    let dialect = spec_dialect(&spec);
     // Belt-and-braces (G13 parity, same posture as `run_analyze_write_inner`):
     // an ACTUAL plan (`analyze == true`) of a WRITE statement refuses
     // read-only independently of the UI's `analyze_gate` — the UI gate is
@@ -1339,12 +1359,12 @@ async fn run_mssql_plan_inner(
     // unconditionally — stay allowed on read-only connections:
     // `mssql_plan_session`'s doc comment documents WHY (SHOWPLAN_XML never
     // executes `sql`; §5's "Explain is always safe" holds for MSSQL too).
-    // Dialect-aware (`is_read_statement_d`, `Dialect::Mssql` — batch C
-    // review carry-forward, explicitly deferred to this task): a
-    // bracket-quoted reserved word (`SELECT [Delete] FROM AuditLog`) must
-    // not false-reject a genuine read here either, same fix as
-    // `main.rs`'s Guard 1 and `analyze_gate` (plan.rs) already got.
-    if analyze && !dbc_core::is_read_statement_d(&sql, dbc_core::Dialect::Mssql) {
+    // Dialect-aware (`is_read_statement_d` — batch C review carry-forward,
+    // explicitly deferred to this task): a bracket-quoted reserved word
+    // (`SELECT [Delete] FROM AuditLog`) must not false-reject a genuine
+    // read here either, same fix as `main.rs`'s Guard 1 and `analyze_gate`
+    // (plan.rs) already got.
+    if analyze && !dbc_core::is_read_statement_d(&sql, dialect) {
         guard_not_read_only(spec_is_read_only(&spec))?;
     }
     let ConnectSpec::Config { cfg, secret } = spec else {
@@ -1361,15 +1381,23 @@ async fn run_mssql_plan_inner(
     let (prelude, postlude) = mssql_plan_session(analyze);
     let run = async {
         let mut stream = conn
-            .query_with_session(&prelude, &sql, &postlude, CancelToken::new())
+            .query_with_session(&prelude, &sql, &postlude, Some(PLAN_ROW_CAP), CancelToken::new())
             .await
             .map_err(connect::mssql_im002_hint)?;
         drain_stream_single_text_cell(&mut stream).await
     };
     match timeout_secs {
-        Some(t) => tokio::time::timeout(Duration::from_secs(t), run)
-            .await
-            .map_err(|_| QueryError::msg(format!("[timeout] analýza překročila {t}s")))?,
+        Some(t) => tokio::time::timeout(Duration::from_secs(t), run).await.map_err(|_| {
+            // G15 T7 review NIT fix: mode-appropriate timeout wording —
+            // this used to always say "analýza překročila" (analysis
+            // exceeded), even on the estimated (non-analyze) path, which
+            // never runs an analysis at all.
+            QueryError::msg(if analyze {
+                format!("[timeout] analýza překročila {t}s")
+            } else {
+                format!("[timeout] vysvětlení plánu překročilo {t}s")
+            })
+        })?,
         None => run.await,
     }
     // On timeout the blocking session is orphaned (its `spawn_blocking`
