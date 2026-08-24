@@ -80,6 +80,18 @@ pub const MONITOR_READ_ONLY_KILL_MSG: &str =
 /// file; `WholeRun` = one BEGIN…COMMIT spanning every file in the run.
 /// Wired into `main.rs` by Task 3's script-runner UI
 /// (`AppView::confirm_script_run`).
+///
+/// G15 T5: `PerFile`/`WholeRun` issue `dbc_core::tx_begin_sql`/`tx_commit_sql`/
+/// `tx_rollback_sql` for the connection's dialect — on MSSQL that is the
+/// fused `"SET XACT_ABORT ON; BEGIN TRANSACTION"` (fixes G12's bare-`BEGIN`
+/// bug). T-SQL transactions legally span batches (unlike a client library
+/// with per-batch autocommit assumptions), so a multi-file/multi-statement
+/// script's `BEGIN … COMMIT` bracket is valid T-SQL as written. Some T-SQL
+/// statements refuse to run inside an explicit user transaction at all
+/// (`BACKUP DATABASE`, `ALTER DATABASE`, full-text catalog DDL, among
+/// others) — this is NOT detected ahead of time; such a statement simply
+/// errors verbatim from the server and is handled like any other
+/// statement failure by `opts.error_policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxScope {
     None,
@@ -821,22 +833,24 @@ impl QueryRunner {
 /// specifically so the CURATION-REQUIRED test can prove the WHERE-box guard
 /// fires BEFORE `open_spec` is ever called (design CURATION §0.2: "REQUIRED
 /// test: `fetch_diff_side` with a WHERE-box payload failing
-/// `is_read_statement` is refused client-side"). `dbc_core::quote_qualified`
+/// `is_read_statement` is refused client-side"). `dbc_core::quote_qualified_d`
 /// is the SAME quoting function `sandbox.rs` already uses for its own
-/// write-path SQL (Global Constraints' quoting note — MSSQL bracket
-/// quoting via `admin_sql::quote_ident_for` is out of scope here since
-/// MSSQL is unwired in `connect::open_config` today).
+/// write-path SQL (Global Constraints' quoting note). G15 T5: gained
+/// `dialect` — MSSQL bracket quoting via `quote_qualified_d` is no longer
+/// out of scope now that `connect::open_config` wires MSSQL (T3); the
+/// read-only guard below is bracket-aware too (`is_read_statement_d`).
 fn compose_diff_select(
+    dialect: dbc_core::Dialect,
     schema: Option<&str>,
     table: &str,
     where_clause: Option<&str>,
 ) -> Result<String, QueryError> {
-    let base = format!("SELECT * FROM {}", dbc_core::quote_qualified(schema, table));
+    let base = format!("SELECT * FROM {}", dbc_core::quote_qualified_d(dialect, schema, table));
     let sql = match where_clause {
         Some(w) if !w.trim().is_empty() => format!("{base} WHERE {w}"),
         _ => base,
     };
-    if !dbc_core::is_read_statement(&sql) {
+    if !dbc_core::is_read_statement_d(&sql, dialect) {
         return Err(QueryError::msg(
             "WHERE výraz nelze spustit — musí jít o čistě čtecí SQL (žádné oddělené příkazy)"
                 .to_string(),
@@ -859,9 +873,11 @@ async fn fetch_diff_side_inner(
     where_clause: Option<String>,
     handle: tokio::runtime::Handle,
 ) -> Result<(String, SchemaRef, dbc_buffer::ResultBuffer), QueryError> {
+    // Dialect captured BEFORE `spec` moves into `open_spec` (G15 T5).
+    let dialect = spec_dialect(&spec);
     // Composed + guarded BEFORE `open_spec` — a failing WHERE box never
     // reaches a connection attempt (CURATION binding requirement).
-    let sql = compose_diff_select(schema.as_deref(), &table, where_clause.as_deref())?;
+    let sql = compose_diff_select(dialect, schema.as_deref(), &table, where_clause.as_deref())?;
     let mut opened = open_spec(spec, handle).await?;
     let mut stream = opened.conn.query(&sql, CancelToken::new()).await?;
     let columns = stream.columns.clone();
@@ -913,11 +929,41 @@ fn spec_is_read_only(spec: &ConnectSpec) -> bool {
     }
 }
 
+/// G15 T5: `ConnectSpec` -> `dbc_core::Dialect` for every transaction-control
+/// sequence in this file (`drive_write_sequence`, `drive_analyze_write`,
+/// `run_csv_import_inner`, `connect_and_run_many_inner`) and for
+/// `compose_diff_select`'s quoting/read-guard — the single spot that maps
+/// `dbc_state::Engine` to `dbc_core::Dialect` for the tx-control call sites
+/// (the SEPARATE `main.rs::dialect_for_engine` mapping — T8-gated, currently
+/// `Mssql => None` — governs the splitter/auto-limit call sites and is out
+/// of scope for this task's single-writer boundary). Captured BEFORE `spec`
+/// moves into `open_spec`, mirroring `spec_is_read_only`'s own "capture up
+/// front" convention.
+fn spec_dialect(spec: &ConnectSpec) -> dbc_core::Dialect {
+    match spec {
+        ConnectSpec::Config { cfg, .. } => match cfg.engine {
+            dbc_state::Engine::Postgres => dbc_core::Dialect::Postgres,
+            dbc_state::Engine::Sqlite => dbc_core::Dialect::Sqlite,
+            dbc_state::Engine::Mssql => dbc_core::Dialect::Mssql,
+        },
+        // CLI-arg URLs have no MSSQL form (main.rs::engine_from_url: a
+        // postgres[ql]:// scheme or a sqlite file path only) — mirrors that
+        // exact dispatch.
+        ConnectSpec::Url(url) => {
+            if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+                dbc_core::Dialect::Postgres
+            } else {
+                dbc_core::Dialect::Sqlite
+            }
+        }
+    }
+}
+
 /// G12 T2: dispatch decision behind `run_script_statement`'s per-statement
 /// read-only matrix — pure so the whole matrix is unit tested without any
-/// connection. Fail-closed inputs (`is_read_statement` returning `false` for
-/// an unterminated/unrecognized construct) are treated as writes, not
-/// reads — same posture `is_read_statement`'s own doc comment mandates, so
+/// connection. Fail-closed inputs (`is_read_statement_d` returning `false`
+/// for an unterminated/unrecognized construct) are treated as writes, not
+/// reads — same posture `is_read_statement_d`'s own doc comment mandates, so
 /// an ambiguous statement on a read-only connection is rejected rather than
 /// risked.
 /// Consumed by both `run_script` (Task 1, wired into `main.rs` by Task 3)
@@ -929,8 +975,12 @@ pub enum StmtDispatch {
     RejectReadOnly,
 }
 
-pub fn dispatch_statement(sql: &str, read_only: bool) -> StmtDispatch {
-    if dbc_core::is_read_statement(sql) {
+/// G15 T5: gained `dialect` (was pg-only `is_read_statement`) — a
+/// bracket-quoted reserved word (`[Delete]`, `[Order]`, `[Top]`) must never
+/// be mistaken for the bare keyword on an MSSQL connection (`is_read_statement_d`'s
+/// own doc comment). Postgres/Sqlite callers are unaffected.
+pub fn dispatch_statement(sql: &str, read_only: bool, dialect: dbc_core::Dialect) -> StmtDispatch {
+    if dbc_core::is_read_statement_d(sql, dialect) {
         StmtDispatch::RunAsRead
     } else if read_only {
         StmtDispatch::RejectReadOnly
@@ -1012,13 +1062,25 @@ pub fn affected_mismatch(expected: Option<u64>, reported: u64) -> bool {
 /// live network/docker dependency, and no `dbc-driver-sqlite` import
 /// outside `connect.rs` (the whole point of routing through `connect::open`
 /// rather than constructing `SqliteConnection` here).
+///
+/// G15 T5: `dialect` selects the tx-control TEXT via `dbc_core::tx_begin_sql`/
+/// `tx_commit_sql`/`tx_rollback_sql` — pg/sqlite get the historic
+/// byte-identical `"BEGIN"`/`"COMMIT"`/`"ROLLBACK"` literals (zero behavior
+/// change), MSSQL gets the fused `"SET XACT_ABORT ON; BEGIN TRANSACTION"`
+/// (fixes G12's bare-`BEGIN` bug — bare `BEGIN` is invalid T-SQL). §3b: on
+/// MSSQL, once `XACT_ABORT` aborts the transaction after a runtime error,
+/// the explicit ROLLBACK below fails with "no corresponding BEGIN
+/// TRANSACTION" — exactly the case this function's existing `let _ =`
+/// discard posture already tolerates (verified by the driver's §3c matrix,
+/// case 3).
 async fn drive_write_sequence(
     conn: &mut dyn Connection,
     statements: &[crate::admin_sql::WriteStatement],
     cancel: CancelToken,
+    dialect: dbc_core::Dialect,
 ) -> Result<u64, QueryError> {
-    if let Err(e) = conn.execute("BEGIN", cancel.clone()).await {
-        let _ = conn.execute("ROLLBACK", cancel.clone()).await;
+    if let Err(e) = conn.execute(dbc_core::tx_begin_sql(dialect), cancel.clone()).await {
+        let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.clone()).await;
         return Err(e);
     }
     let mut total: u64 = 0;
@@ -1026,13 +1088,13 @@ async fn drive_write_sequence(
         match conn.execute(&st.exec_sql, cancel.clone()).await {
             Ok(affected) => {
                 if affected_mismatch(st.expected_affected, affected) {
-                    let _ = conn.execute("ROLLBACK", cancel.clone()).await;
+                    let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.clone()).await;
                     return Err(QueryError::msg(AFFECTED_MISMATCH_MSG));
                 }
                 total += affected;
             }
             Err(e) => {
-                let _ = conn.execute("ROLLBACK", cancel.clone()).await;
+                let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.clone()).await;
                 // G10 CURATION item 3 (redaction hardening): the surfaced
                 // error is paired with `display_sql` ONLY — `exec_sql` is
                 // used exactly once, in the `execute()` call above, and
@@ -1046,8 +1108,8 @@ async fn drive_write_sequence(
             }
         }
     }
-    if let Err(e) = conn.execute("COMMIT", cancel.clone()).await {
-        let _ = conn.execute("ROLLBACK", cancel.clone()).await;
+    if let Err(e) = conn.execute(dbc_core::tx_commit_sql(dialect), cancel.clone()).await {
+        let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.clone()).await;
         return Err(e);
     }
     Ok(total)
@@ -1094,11 +1156,12 @@ async fn drive_write_sequence_bounded(
     conn: &mut dyn Connection,
     statements: &[crate::admin_sql::WriteStatement],
     cancel: CancelToken,
+    dialect: dbc_core::Dialect,
     timeout_secs: Option<u64>,
 ) -> Result<u64, QueryError> {
     match timeout_secs {
         Some(t) => {
-            let sequence = drive_write_sequence(conn, statements, cancel.clone());
+            let sequence = drive_write_sequence(conn, statements, cancel.clone(), dialect);
             match tokio::time::timeout(Duration::from_secs(t), sequence).await {
                 Ok(result) => result,
                 Err(_elapsed) => {
@@ -1109,7 +1172,7 @@ async fn drive_write_sequence_bounded(
                     // (a): bounded best-effort rollback — see this
                     // function's doc comment for why this must NOT be
                     // allowed to hang the whole function.
-                    let rollback = conn.execute("ROLLBACK", CancelToken::new());
+                    let rollback = conn.execute(dbc_core::tx_rollback_sql(dialect), CancelToken::new());
                     let _ =
                         tokio::time::timeout(Duration::from_secs(ROLLBACK_GRACE_SECS), rollback)
                             .await;
@@ -1117,7 +1180,7 @@ async fn drive_write_sequence_bounded(
                 }
             }
         }
-        None => drive_write_sequence(conn, statements, cancel).await,
+        None => drive_write_sequence(conn, statements, cancel, dialect).await,
     }
 }
 
@@ -1132,9 +1195,11 @@ async fn run_write_transaction_inner(
     handle: tokio::runtime::Handle,
 ) -> Result<u64, QueryError> {
     guard_not_read_only(spec_is_read_only(&spec))?;
+    // Captured BEFORE `spec` moves into `open_spec` (G15 T5).
+    let dialect = spec_dialect(&spec);
     let mut opened = open_spec(spec, handle).await?;
     let cancel = CancelToken::new();
-    drive_write_sequence_bounded(&mut *opened.conn, &statements, cancel, timeout_secs).await
+    drive_write_sequence_bounded(&mut *opened.conn, &statements, cancel, dialect, timeout_secs).await
     // `opened` (connection + tunnel) drops here unconditionally, tearing the
     // connection down — the ultimate backstop regardless of how the write
     // sequence above resolved.
@@ -1165,17 +1230,20 @@ async fn drain_single_text_cell(
 /// the query step's own error; the ROLLBACK still runs either way, same
 /// "tolerate ROLLBACK itself failing" posture `drive_write_sequence`
 /// already documents.
+/// G15 T5: `dialect` selects the tx-control text — see `drive_write_sequence`'s
+/// doc comment for the fused-MSSQL-begin/§3b rationale (identical here).
 async fn drive_analyze_write(
     conn: &mut dyn Connection,
     explain_analyze_sql: &str,
     cancel: CancelToken,
+    dialect: dbc_core::Dialect,
 ) -> Result<String, QueryError> {
-    if let Err(e) = conn.execute("BEGIN", cancel.clone()).await {
-        let _ = conn.execute("ROLLBACK", cancel.clone()).await;
+    if let Err(e) = conn.execute(dbc_core::tx_begin_sql(dialect), cancel.clone()).await {
+        let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.clone()).await;
         return Err(e);
     }
     let plan_result = drain_single_text_cell(conn, explain_analyze_sql, cancel.clone()).await;
-    let _ = conn.execute("ROLLBACK", cancel.clone()).await; // ALWAYS — see doc comment.
+    let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.clone()).await; // ALWAYS — see doc comment.
     plan_result
 }
 
@@ -1187,16 +1255,17 @@ async fn drive_analyze_write_bounded(
     conn: &mut dyn Connection,
     explain_analyze_sql: &str,
     cancel: CancelToken,
+    dialect: dbc_core::Dialect,
     timeout_secs: Option<u64>,
 ) -> Result<String, QueryError> {
     match timeout_secs {
         Some(t) => {
-            let sequence = drive_analyze_write(conn, explain_analyze_sql, cancel.clone());
+            let sequence = drive_analyze_write(conn, explain_analyze_sql, cancel.clone(), dialect);
             match tokio::time::timeout(Duration::from_secs(t), sequence).await {
                 Ok(result) => result,
                 Err(_elapsed) => {
                     cancel.cancel();
-                    let rollback = conn.execute("ROLLBACK", CancelToken::new());
+                    let rollback = conn.execute(dbc_core::tx_rollback_sql(dialect), CancelToken::new());
                     let _ =
                         tokio::time::timeout(Duration::from_secs(ROLLBACK_GRACE_SECS), rollback)
                             .await;
@@ -1204,7 +1273,7 @@ async fn drive_analyze_write_bounded(
                 }
             }
         }
-        None => drive_analyze_write(conn, explain_analyze_sql, cancel).await,
+        None => drive_analyze_write(conn, explain_analyze_sql, cancel, dialect).await,
     }
 }
 
@@ -1220,9 +1289,11 @@ async fn run_analyze_write_inner(
     handle: tokio::runtime::Handle,
 ) -> Result<String, QueryError> {
     guard_not_read_only(spec_is_read_only(&spec))?; // belt-and-braces — see doc comment.
+    // Captured BEFORE `spec` moves into `open_spec` (G15 T5).
+    let dialect = spec_dialect(&spec);
     let mut opened = open_spec(spec, handle).await?;
     let cancel = CancelToken::new();
-    drive_analyze_write_bounded(&mut *opened.conn, &explain_analyze_sql, cancel, timeout_secs).await
+    drive_analyze_write_bounded(&mut *opened.conn, &explain_analyze_sql, cancel, dialect, timeout_secs).await
     // `opened` drops here unconditionally — the ultimate backstop, same as run_write_transaction_inner.
 }
 
@@ -1421,10 +1492,11 @@ async fn run_script_statement(
     conn: &mut dyn Connection,
     sql: &str,
     read_only: bool,
+    dialect: dbc_core::Dialect,
     timeout_secs: Option<u64>,
     run_cancel: &CancelToken,
 ) -> Result<Option<u64>, QueryError> {
-    let action = dispatch_statement(sql, read_only);
+    let action = dispatch_statement(sql, read_only, dialect);
     if action == StmtDispatch::RejectReadOnly {
         return Err(guard_not_read_only(true).unwrap_err());
     }
@@ -1490,6 +1562,22 @@ async fn run_script_statement(
 /// `spawn_blocking` over `std::fs`/`std::io::Read` — the same "blocking
 /// work never runs on a runtime worker thread" dispatch `open_spec` already
 /// uses for the driver connect step.
+/// G15 T5 (design §2c iv): `SplitError::UnsupportedGoCount` (an MSSQL `GO
+/// <n>` repeat count, refused fail-closed by the splitter) gets a dedicated
+/// Czech message instead of the generic Debug-formatted text every other
+/// variant still gets. Deliberately duplicated in T4's own SQL-composer
+/// call sites (`split_error_message` there too) rather than shared — T4/T5
+/// are parallel, disjoint-file tasks (Global Constraints' single-writer
+/// rule), and this keeps both independently compilable/testable.
+fn split_error_message(e: &dbc_core::SplitError) -> String {
+    match e {
+        dbc_core::SplitError::UnsupportedGoCount => {
+            "GO s počtem opakování není podporováno".to_string()
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 async fn read_and_split_file(
     path: &std::path::Path,
     dialect: dbc_core::Dialect,
@@ -1512,7 +1600,8 @@ async fn read_and_split_file(
                     Ok(None) => {}
                     Err(e) => {
                         return Err(QueryError::msg(format!(
-                            "[skript] neúplný SQL konstrukt na konci souboru: {e:?}"
+                            "[skript] neúplný SQL konstrukt na konci souboru: {}",
+                            split_error_message(&e)
                         )));
                     }
                 }
@@ -1520,7 +1609,13 @@ async fn read_and_split_file(
             }
             match splitter.push(&chunk[..n]) {
                 Ok(mut more) => stmts.append(&mut more),
-                Err(e) => return Err(QueryError::msg(format!("[soubor] {}: {e:?}", path.display()))),
+                Err(e) => {
+                    return Err(QueryError::msg(format!(
+                        "[soubor] {}: {}",
+                        path.display(),
+                        split_error_message(&e)
+                    )))
+                }
             }
         }
     })
@@ -1584,7 +1679,7 @@ async fn drive_script(
     }
 
     if opts.tx_scope == TxScope::WholeRun {
-        if conn.execute("BEGIN", cancel.child_token()).await.is_err() {
+        if conn.execute(dbc_core::tx_begin_sql(opts.dialect), cancel.child_token()).await.is_err() {
             // A BEGIN failure aborts the run immediately — no tx opened,
             // nothing to roll back.
             let _ = tx
@@ -1617,7 +1712,7 @@ async fn drive_script(
         let mut stop_action: Option<FailureAction> = None;
 
         if opts.tx_scope == TxScope::PerFile {
-            if let Err(e) = conn.execute("BEGIN", cancel.child_token()).await {
+            if let Err(e) = conn.execute(dbc_core::tx_begin_sql(opts.dialect), cancel.child_token()).await {
                 let _ = tx.send(ScriptEvent::StatementFailed { stmt_index, error: e }).await;
                 statements_failed += 1;
                 file_stmts_failed += 1;
@@ -1645,6 +1740,7 @@ async fn drive_script(
                             conn,
                             stmt,
                             read_only,
+                            opts.dialect,
                             opts.statement_timeout_secs,
                             &cancel,
                         )
@@ -1690,8 +1786,8 @@ async fn drive_script(
 
         // Clean end of file: commit a per-file tx if nothing failed.
         if stop_action.is_none() && opts.tx_scope == TxScope::PerFile {
-            if let Err(e) = conn.execute("COMMIT", cancel.child_token()).await {
-                let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+            if let Err(e) = conn.execute(dbc_core::tx_commit_sql(opts.dialect), cancel.child_token()).await {
+                let _ = conn.execute(dbc_core::tx_rollback_sql(opts.dialect), cancel.child_token()).await;
                 let _ = tx.send(ScriptEvent::StatementFailed { stmt_index, error: e }).await;
                 statements_failed += 1;
                 file_stmts_failed += 1;
@@ -1704,13 +1800,13 @@ async fn drive_script(
             match action {
                 FailureAction::AbortRun => {
                     if opts.tx_scope != TxScope::None {
-                        let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                        let _ = conn.execute(dbc_core::tx_rollback_sql(opts.dialect), cancel.child_token()).await;
                     }
                     aborted = true;
                 }
                 FailureAction::NextFile => {
                     if opts.tx_scope == TxScope::PerFile {
-                        let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                        let _ = conn.execute(dbc_core::tx_rollback_sql(opts.dialect), cancel.child_token()).await;
                     }
                     // WholeRun: the run-level tx stays open — a broken file
                     // is skipped, not the whole accumulated run.
@@ -1735,8 +1831,8 @@ async fn drive_script(
     }
 
     if !aborted && opts.tx_scope == TxScope::WholeRun {
-        if conn.execute("COMMIT", cancel.child_token()).await.is_err() {
-            let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+        if conn.execute(dbc_core::tx_commit_sql(opts.dialect), cancel.child_token()).await.is_err() {
+            let _ = conn.execute(dbc_core::tx_rollback_sql(opts.dialect), cancel.child_token()).await;
             aborted = true;
         }
     }
@@ -1766,11 +1862,12 @@ async fn run_one_multi_statement(
     total: usize,
     sql: &str,
     read_only: bool,
+    dialect: dbc_core::Dialect,
     timeout_secs: Option<u64>,
     run_cancel: &CancelToken,
     tx: &tokio::sync::mpsc::Sender<MultiQueryEvent>,
 ) -> Result<(), ()> {
-    let action = dispatch_statement(sql, read_only);
+    let action = dispatch_statement(sql, read_only, dialect);
     if action == StmtDispatch::RejectReadOnly {
         let _ = tx
             .send(MultiQueryEvent::StatementFailed { index, error: guard_not_read_only(true).unwrap_err() })
@@ -1849,6 +1946,10 @@ async fn connect_and_run_many_inner(
     // Captured BEFORE `spec` moves into `open_spec` — same convention
     // `run_script`/`open_monitor` use.
     let read_only = spec_is_read_only(&spec);
+    // G15 T5: dialect for `dispatch_statement`'s bracket-aware read
+    // classification (`is_read_statement_d`) — also captured before `spec`
+    // moves.
+    let dialect = spec_dialect(&spec);
     let mut opened = match open_spec(spec, handle).await {
         Ok(o) => o,
         Err(e) => {
@@ -1865,7 +1966,7 @@ async fn connect_and_run_many_inner(
         if cancel.is_cancelled() {
             return;
         }
-        if run_one_multi_statement(conn, index, total, sql, read_only, timeout_secs, &cancel, &tx)
+        if run_one_multi_statement(conn, index, total, sql, read_only, dialect, timeout_secs, &cancel, &tx)
             .await
             .is_err()
         {
@@ -1882,15 +1983,9 @@ async fn connect_and_run_many_inner(
 /// rows are ever buffered in memory at once).
 const CSV_IMPORT_PRODUCER_DEPTH: usize = 4;
 
-/// G12 T7: the run driver — SHARED guard first, then BEGIN, then streams
-/// `job.path` through a `spawn_blocking` producer (the `csv` crate's
-/// `Reader` is synchronous; this is the same "blocking work never runs on a
-/// runtime worker thread" dispatch `open_spec`/`read_and_split_file`
-/// already use) that chunks rows into `CSV_IMPORT_BATCH_SIZE`-row pieces
-/// over a bounded channel, executing one `INSERT` per chunk via
-/// `csv_import::generate_insert_batches`. ANY failure (guard refusal, open
-/// error, producer parse/IO error, a chunk's generated statement erroring)
-/// ROLLBACKs and reports zero rows imported — never partial.
+/// G12 T7: the run driver — SHARED guard first, then open, then delegates to
+/// `run_csv_import_drive` for everything from BEGIN onward. `dialect` is
+/// captured BEFORE `spec` moves into `open_spec` (G15 T5).
 async fn run_csv_import_inner(
     spec: ConnectSpec,
     job: CsvImportJob,
@@ -1911,6 +2006,7 @@ async fn run_csv_import_inner(
         let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg("cancelled") }).await;
         return;
     }
+    let dialect = spec_dialect(&spec);
     let mut opened = match open_spec(spec, handle).await {
         Ok(o) => o,
         Err(e) => {
@@ -1923,7 +2019,35 @@ async fn run_csv_import_inner(
         return;
     }
     let conn = &mut *opened.conn;
-    if let Err(e) = conn.execute("BEGIN", cancel.child_token()).await {
+    run_csv_import_drive(conn, dialect, &job, &cancel, timeout_secs, &tx, started).await;
+    // `opened` (connection + tunnel) drops here unconditionally.
+}
+
+/// G15 T5 (deviation, "reality/tests win" — a live MSSQL server isn't
+/// available in a unit test, since `open_config`'s eager `probe()` requires
+/// one, so the dialect-correct BEGIN/COMMIT/ROLLBACK text needs a seam that
+/// doesn't require a live connection): the post-connect body of
+/// `run_csv_import_inner`, extracted so it's kept generic over
+/// `&mut dyn Connection` — same "testable via a mock `Connection`, no
+/// `ConnectSpec`/`open_spec` needed" precedent `drive_write_sequence`/
+/// `drive_script` already establish. BEGIN, then streams `job.path` through
+/// a `spawn_blocking` producer (the `csv` crate's `Reader` is synchronous;
+/// this is the same "blocking work never runs on a runtime worker thread"
+/// dispatch `open_spec`/`read_and_split_file` already use) that chunks rows
+/// into `CSV_IMPORT_BATCH_SIZE`-row pieces over a bounded channel, executing
+/// one `INSERT` per chunk via `csv_import::generate_insert_batches`. ANY
+/// failure (BEGIN, producer parse/IO error, a chunk's generated statement
+/// erroring) ROLLBACKs and reports zero rows imported — never partial.
+async fn run_csv_import_drive(
+    conn: &mut dyn Connection,
+    dialect: dbc_core::Dialect,
+    job: &CsvImportJob,
+    cancel: &CancelToken,
+    timeout_secs: Option<u64>,
+    tx: &tokio::sync::mpsc::Sender<CsvImportEvent>,
+    started: Instant,
+) {
+    if let Err(e) = conn.execute(dbc_core::tx_begin_sql(dialect), cancel.child_token()).await {
         let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
         return;
     }
@@ -1972,14 +2096,14 @@ async fn run_csv_import_inner(
     let mut batch_index: usize = 0;
     while let Some(chunk_result) = chunk_rx.recv().await {
         if cancel.is_cancelled() {
-            let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+            let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.child_token()).await;
             let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg("cancelled") }).await;
             return;
         }
         let rows = match chunk_result {
             Ok(rows) => rows,
             Err(msg) => {
-                let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.child_token()).await;
                 let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg(msg) }).await;
                 return;
             }
@@ -2012,7 +2136,7 @@ async fn run_csv_import_inner(
                 stmts.into_iter().next()
             }
             Err(msg) => {
-                let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.child_token()).await;
                 let _ = tx.send(CsvImportEvent::Failed { error: QueryError::msg(msg) }).await;
                 return;
             }
@@ -2038,7 +2162,7 @@ async fn run_csv_import_inner(
                 None => fut.await,
             };
             if let Err(e) = result {
-                let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+                let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.child_token()).await;
                 let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
                 return;
             }
@@ -2050,15 +2174,16 @@ async fn run_csv_import_inner(
             .await;
     }
 
-    if let Err(e) = conn.execute("COMMIT", cancel.child_token()).await {
-        let _ = conn.execute("ROLLBACK", cancel.child_token()).await;
+    if let Err(e) = conn.execute(dbc_core::tx_commit_sql(dialect), cancel.child_token()).await {
+        let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.child_token()).await;
         let _ = tx.send(CsvImportEvent::Failed { error: e }).await;
         return;
     }
     let _ = tx
         .send(CsvImportEvent::Finished { rows_imported: rows_committed, elapsed: started.elapsed() })
         .await;
-    // `opened` (connection + tunnel) drops here unconditionally.
+    // caller (`run_csv_import_inner`) drops `opened` (connection + tunnel)
+    // unconditionally once this function returns.
 }
 
 /// Defensive cap on materialized lookup rows — see `QueryRunner::fetch_lookup`.
@@ -2422,6 +2547,53 @@ mod write_transaction_tests {
         assert!(!spec_is_read_only(&ConnectSpec::Url("irrelevant".into())));
     }
 
+    /// G15 T5: `spec_dialect` maps every `Engine` (Config path) and every
+    /// CLI-arg URL scheme (`Url` path) exactly like `main.rs::engine_from_url`'s
+    /// own postgres-vs-sqlite dispatch.
+    #[test]
+    fn spec_dialect_maps_engines_and_url_schemes() {
+        fn cfg_with_engine(engine: dbc_state::Engine) -> dbc_state::ConnectionConfig {
+            dbc_state::ConnectionConfig {
+                id: "x".into(),
+                name: "x".into(),
+                folder: Vec::new(),
+                engine,
+                host: String::new(),
+                port: None,
+                database: String::new(),
+                user: String::new(),
+                read_only: false,
+                timeout_secs: None,
+                auto_limit: None,
+                ssh: None,
+                favourite: false,
+                mssql: None,
+            }
+        }
+        assert_eq!(
+            spec_dialect(&ConnectSpec::Config { cfg: Box::new(cfg_with_engine(dbc_state::Engine::Postgres)), secret: None }),
+            dbc_core::Dialect::Postgres
+        );
+        assert_eq!(
+            spec_dialect(&ConnectSpec::Config { cfg: Box::new(cfg_with_engine(dbc_state::Engine::Sqlite)), secret: None }),
+            dbc_core::Dialect::Sqlite
+        );
+        assert_eq!(
+            spec_dialect(&ConnectSpec::Config { cfg: Box::new(cfg_with_engine(dbc_state::Engine::Mssql)), secret: None }),
+            dbc_core::Dialect::Mssql
+        );
+        assert_eq!(
+            spec_dialect(&ConnectSpec::Url("postgres://localhost/db".into())),
+            dbc_core::Dialect::Postgres
+        );
+        assert_eq!(
+            spec_dialect(&ConnectSpec::Url("postgresql://localhost/db".into())),
+            dbc_core::Dialect::Postgres
+        );
+        assert_eq!(spec_dialect(&ConnectSpec::Url("C:/data/app.db".into())), dbc_core::Dialect::Sqlite);
+        assert_eq!(spec_dialect(&ConnectSpec::Url(":memory:".into())), dbc_core::Dialect::Sqlite);
+    }
+
     /// Opens a fresh temp-file sqlite connection via `crate::connect::open`
     /// (the ONLY sanctioned driver-crate entry point outside `connect.rs` —
     /// see that module's own doc comment) — the `NamedTempFile` must be
@@ -2465,7 +2637,7 @@ mod write_transaction_tests {
             ws("UPDATE t SET name = 'b' WHERE id = 1", Some(1)),
             ws("INSERT INTO t(id, name) VALUES (2, 'c')", None),
         ];
-        let total = drive_write_sequence(&mut *conn, &stmts, CancelToken::new()).await.unwrap();
+        let total = drive_write_sequence(&mut *conn, &stmts, CancelToken::new(), dbc_core::Dialect::Sqlite).await.unwrap();
         // 1 (the UPDATE's reported affected rows) + 1 (the INSERT's, even
         // though INSERT carries no expectation — the driver still reports
         // it, and it still counts toward the total).
@@ -2490,7 +2662,7 @@ mod write_transaction_tests {
             ws("UPDATE t SET name = 'b' WHERE id = 1", Some(1)),
             ws("UPDATE t SET name = 'z' WHERE id = 1", Some(2)),
         ];
-        let err = drive_write_sequence(&mut *conn, &stmts, CancelToken::new()).await.unwrap_err();
+        let err = drive_write_sequence(&mut *conn, &stmts, CancelToken::new(), dbc_core::Dialect::Sqlite).await.unwrap_err();
         assert_eq!(err.message, AFFECTED_MISMATCH_MSG);
 
         assert_eq!(read_one(&mut *conn, "SELECT name FROM t WHERE id = 1").await, Some("a".to_string()));
@@ -2510,7 +2682,7 @@ mod write_transaction_tests {
             ws("UPDATE t SET name = 'b' WHERE id = 1", Some(1)),
             ws("UPDATE no_such_table SET name = 'x'", None),
         ];
-        let err = drive_write_sequence(&mut *conn, &stmts, CancelToken::new()).await.unwrap_err();
+        let err = drive_write_sequence(&mut *conn, &stmts, CancelToken::new(), dbc_core::Dialect::Sqlite).await.unwrap_err();
         assert_ne!(err.message, AFFECTED_MISMATCH_MSG);
 
         assert_eq!(read_one(&mut *conn, "SELECT name FROM t WHERE id = 1").await, Some("a".to_string()));
@@ -2520,7 +2692,7 @@ mod write_transaction_tests {
     async fn drive_write_sequence_empty_statements_still_begins_and_commits() {
         let (_f, mut conn) = open_sqlite_test_conn().await;
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", CancelToken::new()).await.unwrap();
-        let total = drive_write_sequence(&mut *conn, &[], CancelToken::new()).await.unwrap();
+        let total = drive_write_sequence(&mut *conn, &[], CancelToken::new(), dbc_core::Dialect::Sqlite).await.unwrap();
         assert_eq!(total, 0);
     }
 
@@ -2560,6 +2732,84 @@ mod write_transaction_tests {
         assert!(!err.message.is_empty());
     }
 
+    /// G15 T5 REQUIRED (Global Constraints §1a): the shared guard fires
+    /// before `open_spec` for a read-only MSSQL connection too — no driver
+    /// call, no `MssqlConfig`/`MssqlConnection` ever built. Clone of
+    /// `run_write_transaction_refuses_read_only_connection_without_connecting`
+    /// with `engine: Engine::Mssql`.
+    #[tokio::test]
+    async fn run_write_transaction_refuses_read_only_mssql_without_connecting() {
+        let cfg = dbc_state::ConnectionConfig {
+            id: "x".into(),
+            name: "x".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Mssql,
+            database: "\0invalid".into(),
+            host: String::new(),
+            port: None,
+            user: String::new(),
+            read_only: true,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: None,
+        };
+        let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
+        let handle = tokio::runtime::Handle::current();
+        let err = run_write_transaction_inner(spec, Vec::new(), None, handle).await.unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    /// G15 T5: mock `Connection` recording every `execute()`d statement, so
+    /// the FIRST statement a transactional sequence sends is directly
+    /// assertable — used by the pg/MSSQL tx-begin-text regression tests
+    /// below.
+    struct CapturingConnection {
+        statements: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for CapturingConnection {
+        async fn query(
+            &mut self,
+            _sql: &str,
+            _cancel: CancelToken,
+        ) -> Result<dbc_core::QueryStream, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn execute(&mut self, sql: &str, _cancel: CancelToken) -> Result<u64, QueryError> {
+            self.statements.push(sql.to_string());
+            Ok(0)
+        }
+    }
+
+    /// G15 T5 REQUIRED: zero behavior change for pg — `drive_write_sequence`'s
+    /// first statement over a Postgres dialect is byte-equal to the historic
+    /// `"BEGIN"` literal.
+    #[tokio::test]
+    async fn pg_sequences_still_send_the_literal_begin() {
+        let mut conn = CapturingConnection { statements: Vec::new() };
+        let _ = drive_write_sequence(&mut conn, &[], CancelToken::new(), dbc_core::Dialect::Postgres).await;
+        assert_eq!(conn.statements.first().map(String::as_str), Some("BEGIN"));
+    }
+
+    /// G15 T5 REQUIRED (regression for G12's bare-`BEGIN`-on-MSSQL bug):
+    /// `drive_write_sequence`'s first statement over an Mssql dialect is the
+    /// fused `SET XACT_ABORT ON; BEGIN TRANSACTION`.
+    #[tokio::test]
+    async fn mssql_write_sequence_opens_with_fused_xact_abort_begin() {
+        let mut conn = CapturingConnection { statements: Vec::new() };
+        let _ = drive_write_sequence(&mut conn, &[], CancelToken::new(), dbc_core::Dialect::Mssql).await;
+        assert_eq!(
+            conn.statements.first().map(String::as_str),
+            Some(dbc_core::tx_begin_sql(dbc_core::Dialect::Mssql))
+        );
+    }
+
     /// G10 CURATION item 3's REQUIRED test: a mock `Connection` that fails
     /// exactly the password-bearing `ALTER ROLE` statement with a generic
     /// driver message — the runner's own error-pairing must attach
@@ -2593,7 +2843,7 @@ mod write_transaction_tests {
     async fn statement_failure_pairs_display_sql_never_exec_sql() {
         let mut conn = FailsOnAlter;
         let stmts = admin_sql::alter_password(dbc_state::Engine::Postgres, "app_user", "s3cr'et");
-        let err = drive_write_sequence(&mut conn, &stmts, CancelToken::new()).await.unwrap_err();
+        let err = drive_write_sequence(&mut conn, &stmts, CancelToken::new(), dbc_core::Dialect::Sqlite).await.unwrap_err();
         assert!(err.message.contains("'***'"), "error must carry the redacted display_sql: {}", err.message);
         assert!(err.message.contains("ALTER ROLE \"app_user\""));
         assert!(!err.message.contains("s3cr"), "real password leaked into surfaced error: {}", err.message);
@@ -2653,7 +2903,10 @@ mod write_transaction_tests {
             Err(QueryError::msg("not exercised by this test"))
         }
         async fn execute(&mut self, sql: &str, _cancel: CancelToken) -> Result<u64, QueryError> {
-            if sql == "BEGIN" {
+            // G15 T5: also recognizes the fused MSSQL begin so this mock
+            // stays assertable for every dialect, not just pg/sqlite's
+            // literal `"BEGIN"`.
+            if sql == "BEGIN" || sql == dbc_core::tx_begin_sql(dbc_core::Dialect::Mssql) {
                 return Ok(0);
             }
             if sql == "ROLLBACK" {
@@ -2687,7 +2940,8 @@ mod write_transaction_tests {
 
         let start = tokio::time::Instant::now();
         let result =
-            drive_write_sequence_bounded(&mut conn, &stmts, cancel.clone(), Some(1)).await;
+            drive_write_sequence_bounded(&mut conn, &stmts, cancel.clone(), dbc_core::Dialect::Sqlite, Some(1))
+                .await;
         let elapsed = start.elapsed();
 
         let err = result.unwrap_err();
@@ -2846,24 +3100,26 @@ mod analyze_write_tests {
             Err(QueryError::msg("not exercised by this test"))
         }
         async fn execute(&mut self, sql: &str, _cancel: CancelToken) -> Result<u64, QueryError> {
-            match sql {
-                "BEGIN" => {
-                    self.in_txn = true;
-                    Ok(0)
+            // G15 T5: `tx_begin_sql` isn't a `const fn`, so the MSSQL-fused
+            // literal can't be a match-arm pattern — an if/else-if chain
+            // (still one dispatch, no functional change) recognizes it
+            // alongside pg/sqlite's literal `"BEGIN"`, keeping this mock
+            // assertable for every dialect.
+            if sql == "BEGIN" || sql == dbc_core::tx_begin_sql(dbc_core::Dialect::Mssql) {
+                self.in_txn = true;
+                Ok(0)
+            } else if sql == "ROLLBACK" {
+                self.in_txn = false;
+                self.pending_insert = false; // discarded — never committed
+                Ok(0)
+            } else if sql == "COMMIT" {
+                if self.pending_insert {
+                    self.committed.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
-                "ROLLBACK" => {
-                    self.in_txn = false;
-                    self.pending_insert = false; // discarded — never committed
-                    Ok(0)
-                }
-                "COMMIT" => {
-                    if self.pending_insert {
-                        self.committed.store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    self.in_txn = false;
-                    Ok(0)
-                }
-                other => Err(QueryError::msg(format!("unexpected statement: {other}"))),
+                self.in_txn = false;
+                Ok(0)
+            } else {
+                Err(QueryError::msg(format!("unexpected statement: {sql}")))
             }
         }
     }
@@ -2924,7 +3180,7 @@ mod analyze_write_tests {
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new()).await.unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'a')", CancelToken::new()).await.unwrap();
 
-        let out = drive_analyze_write(&mut *conn, "SELECT 'plan-text'", CancelToken::new()).await.unwrap();
+        let out = drive_analyze_write(&mut *conn, "SELECT 'plan-text'", CancelToken::new(), dbc_core::Dialect::Sqlite).await.unwrap();
         assert_eq!(out, "plan-text");
         // Sanity: this connection is still usable afterward (ROLLBACK, not
         // a leaked open transaction) — a fresh statement succeeds.
@@ -2970,6 +3226,7 @@ mod analyze_write_tests {
             &mut conn,
             "INSERT INTO t VALUES (99, 'ghost') RETURNING n",
             CancelToken::new(),
+            dbc_core::Dialect::Postgres,
         )
         .await
         .unwrap();
@@ -2984,7 +3241,7 @@ mod analyze_write_tests {
     async fn drive_analyze_write_still_rolls_back_when_the_query_step_errors() {
         let (_f, mut conn) = open_sqlite_test_conn().await;
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", CancelToken::new()).await.unwrap();
-        let err = drive_analyze_write(&mut *conn, "SELECT * FROM no_such_table", CancelToken::new())
+        let err = drive_analyze_write(&mut *conn, "SELECT * FROM no_such_table", CancelToken::new(), dbc_core::Dialect::Sqlite)
             .await
             .unwrap_err();
         assert!(!err.message.is_empty());
@@ -3006,12 +3263,33 @@ mod script_run_tests {
 
     #[test]
     fn dispatch_statement_matrix() {
-        assert_eq!(dispatch_statement("SELECT 1", false), StmtDispatch::RunAsRead);
-        assert_eq!(dispatch_statement("SELECT 1", true), StmtDispatch::RunAsRead);
-        assert_eq!(dispatch_statement("UPDATE t SET x = 1", false), StmtDispatch::RunAsWrite);
-        assert_eq!(dispatch_statement("UPDATE t SET x = 1", true), StmtDispatch::RejectReadOnly);
+        use dbc_core::Dialect;
+        assert_eq!(dispatch_statement("SELECT 1", false, Dialect::Postgres), StmtDispatch::RunAsRead);
+        assert_eq!(dispatch_statement("SELECT 1", true, Dialect::Postgres), StmtDispatch::RunAsRead);
+        assert_eq!(dispatch_statement("UPDATE t SET x = 1", false, Dialect::Postgres), StmtDispatch::RunAsWrite);
+        assert_eq!(dispatch_statement("UPDATE t SET x = 1", true, Dialect::Postgres), StmtDispatch::RejectReadOnly);
         // fail-closed inputs are writes, not reads (guards.rs contract):
-        assert_eq!(dispatch_statement("SELECT 1 /* unterminated", true), StmtDispatch::RejectReadOnly);
+        assert_eq!(dispatch_statement("SELECT 1 /* unterminated", true, Dialect::Postgres), StmtDispatch::RejectReadOnly);
+    }
+
+    /// G15 T5: MSSQL dialect — a bracket-quoted reserved word must not
+    /// false-reject a genuine read, and the guard is still bracket-aware for
+    /// writes.
+    #[test]
+    fn dispatch_statement_matrix_mssql_bracket_aware() {
+        use dbc_core::Dialect;
+        assert_eq!(
+            dispatch_statement("SELECT [Delete], [Update] FROM AuditLog", true, Dialect::Mssql),
+            StmtDispatch::RunAsRead
+        );
+        assert_eq!(
+            dispatch_statement("UPDATE t SET x = 1", true, Dialect::Mssql),
+            StmtDispatch::RejectReadOnly
+        );
+        assert_eq!(
+            dispatch_statement("UPDATE t SET x = 1", false, Dialect::Mssql),
+            StmtDispatch::RunAsWrite
+        );
     }
 
     #[test]
@@ -3268,6 +3546,31 @@ mod script_run_tests {
         let events = drive_collect(&mut *conn, false, &[f1], &opts).await;
         assert!(events.iter().any(|e| matches!(e,
             ScriptEvent::StatementFailed { error, .. } if error.message.starts_with("[skript]"))));
+        assert!(matches!(events.last(), Some(ScriptEvent::RunFinished { aborted: true, .. })));
+    }
+
+    /// G15 T5: an MSSQL `GO <n>` repeat count is refused fail-closed by the
+    /// splitter (`SplitError::UnsupportedGoCount`) and surfaces the
+    /// dedicated Czech message via `split_error_message`, not a generic
+    /// Debug dump.
+    #[tokio::test]
+    async fn mssql_go_repeat_count_surfaces_czech_message_in_script_run() {
+        let (_f, mut conn) = open_sqlite_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", CancelToken::new()).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("01.sql");
+        std::fs::write(&f1, "SELECT 1\nGO 5\n").unwrap();
+
+        let opts = ScriptRunOptions {
+            tx_scope: TxScope::None,
+            error_policy: ErrorPolicy::Stop,
+            dialect: dbc_core::Dialect::Mssql,
+            statement_timeout_secs: None,
+        };
+        let events = drive_collect(&mut *conn, false, &[f1], &opts).await;
+        assert!(events.iter().any(|e| matches!(e,
+            ScriptEvent::StatementFailed { error, .. } if error.message.contains("GO s počtem opakování není podporováno"))));
         assert!(matches!(events.last(), Some(ScriptEvent::RunFinished { aborted: true, .. })));
     }
 
@@ -3535,6 +3838,63 @@ mod csv_import_tests {
         }
         task.await.unwrap();
         events
+    }
+
+    /// G15 T5: mock `Connection` recording every `execute()`d statement —
+    /// used by the MSSQL-BEGIN regression test below, driven directly via
+    /// `run_csv_import_drive` (no `ConnectSpec`/`open_spec`/live MSSQL
+    /// server needed — `open_config`'s eager `probe()` would otherwise
+    /// require one).
+    struct CapturingConnection {
+        statements: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for CapturingConnection {
+        async fn query(
+            &mut self,
+            _sql: &str,
+            _cancel: CancelToken,
+        ) -> Result<dbc_core::QueryStream, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn schema(&mut self) -> Result<SchemaSnapshot, QueryError> {
+            Err(QueryError::msg("not exercised by this test"))
+        }
+        async fn execute(&mut self, sql: &str, _cancel: CancelToken) -> Result<u64, QueryError> {
+            self.statements.push(sql.to_string());
+            Ok(0)
+        }
+    }
+
+    /// G15 T5 REQUIRED (regression for G12's bare-`BEGIN`-on-MSSQL bug —
+    /// bare `BEGIN` is invalid T-SQL): `run_csv_import_drive`'s FIRST
+    /// captured statement, on an Mssql dialect, is the fused
+    /// `SET XACT_ABORT ON; BEGIN TRANSACTION`, byte-equal to
+    /// `dbc_core::tx_begin_sql(Dialect::Mssql)`.
+    #[tokio::test]
+    async fn csv_import_mssql_begin_is_dialect_correct() {
+        let mut conn = CapturingConnection { statements: Vec::new() };
+        let job = CsvImportJob {
+            path: std::path::PathBuf::from("Z:/does/not/exist.csv"),
+            schema: None,
+            table: "t".to_string(),
+            columns: vec![TargetColumn { name: "id".into(), numeric: true }],
+            mapping: ColumnMapping { targets: vec![Some(0)] },
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let cancel = CancelToken::new();
+        let drive = async {
+            run_csv_import_drive(&mut conn, dbc_core::Dialect::Mssql, &job, &cancel, None, &tx, Instant::now())
+                .await;
+            drop(tx);
+        };
+        let collect = async { while rx.recv().await.is_some() {} };
+        tokio::join!(drive, collect);
+        assert_eq!(
+            conn.statements.first().map(String::as_str),
+            Some(dbc_core::tx_begin_sql(dbc_core::Dialect::Mssql)),
+        );
     }
 
     /// CURATION item 4(b), runtime half: a read-only spec is refused by the
@@ -4259,12 +4619,21 @@ mod diff_fetch_tests {
     #[test]
     fn compose_diff_select_quotes_table_and_appends_where() {
         assert_eq!(
-            compose_diff_select(Some("public"), "orders", None).unwrap(),
+            compose_diff_select(dbc_core::Dialect::Postgres, Some("public"), "orders", None).unwrap(),
             "SELECT * FROM \"public\".\"orders\""
         );
         assert_eq!(
-            compose_diff_select(None, "orders", Some("id > 10")).unwrap(),
+            compose_diff_select(dbc_core::Dialect::Postgres, None, "orders", Some("id > 10")).unwrap(),
             "SELECT * FROM \"orders\" WHERE id > 10"
+        );
+    }
+
+    /// G15 T5: MSSQL gets bracket quoting from the same composer.
+    #[test]
+    fn compose_diff_select_mssql_uses_bracket_quoting() {
+        assert_eq!(
+            compose_diff_select(dbc_core::Dialect::Mssql, Some("dbo"), "orders", None).unwrap(),
+            "SELECT * FROM [dbo].[orders]"
         );
     }
 
@@ -4277,18 +4646,21 @@ mod diff_fetch_tests {
     /// place).
     #[test]
     fn compose_diff_select_refuses_multi_statement_injection_client_side() {
-        let err = compose_diff_select(None, "orders", Some("1=1; DROP TABLE orders")).unwrap_err();
+        let err = compose_diff_select(dbc_core::Dialect::Postgres, None, "orders", Some("1=1; DROP TABLE orders")).unwrap_err();
         assert!(err.message.contains("WHERE"));
     }
 
     #[test]
     fn compose_diff_select_allows_a_read_only_subquery_in_where() {
-        assert!(compose_diff_select(None, "t", Some("id IN (SELECT id FROM other)")).is_ok());
+        assert!(compose_diff_select(dbc_core::Dialect::Postgres, None, "t", Some("id IN (SELECT id FROM other)")).is_ok());
     }
 
     #[test]
     fn compose_diff_select_empty_where_is_treated_as_absent() {
-        assert_eq!(compose_diff_select(None, "t", Some("   ")).unwrap(), "SELECT * FROM \"t\"");
+        assert_eq!(
+            compose_diff_select(dbc_core::Dialect::Postgres, None, "t", Some("   ")).unwrap(),
+            "SELECT * FROM \"t\""
+        );
     }
 
     /// End-to-end proof over a REAL (writable) sqlite connection: the guard
