@@ -7670,6 +7670,7 @@ mod plan_restore_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         }
     }
 

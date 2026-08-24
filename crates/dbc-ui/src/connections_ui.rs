@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use dbc_buffer::ResultBuffer;
-use dbc_state::{ConnectionConfig, Engine, SshTunnelConfig, Vault};
+use dbc_state::{ConnectionConfig, Engine, MssqlOptions, SshTunnelConfig, Vault};
 use gpui::{
     actions, div, fill, hsla, point, prelude::*, px, relative, size, App, AnyElement,
     Bounds, ClipboardItem, Context, CursorStyle, Div, ElementId, ElementInputHandler, Entity,
@@ -110,6 +110,7 @@ mod grouping_tests {
             auto_limit: None,
             ssh: None,
             favourite,
+            mssql: None,
         }
     }
 
@@ -804,10 +805,13 @@ pub struct ConnectionDialogUi {
     pub ssh_port: Entity<TextField>,
     pub ssh_user: Entity<TextField>,
     pub ssh_key_path: Entity<TextField>,
+    pub mssql_driver: Entity<TextField>,
     pub engine: Engine,
     pub read_only: bool,
     pub favourite: bool,
     pub ssh_enabled: bool,
+    pub mssql_encrypt: bool,
+    pub mssql_trust_cert: bool,
     pub test_result: Option<Result<String, String>>,
     /// `true` while a Test-button connect dispatched via
     /// `QueryRunner::test_connect` is in flight (Task 8 review issue #1) —
@@ -830,6 +834,19 @@ impl ConnectionDialogUi {
         } else {
             None
         };
+        // G15 T3: only carried for the Mssql engine — matches
+        // `ConnectionConfig.mssql`'s "None means non-MSSQL or all
+        // defaults" contract.
+        let mssql = if self.engine == Engine::Mssql {
+            let driver = self.mssql_driver.read(cx).text();
+            Some(MssqlOptions {
+                encrypt: self.mssql_encrypt,
+                trust_server_certificate: self.mssql_trust_cert,
+                driver: if driver.trim().is_empty() { None } else { Some(driver) },
+            })
+        } else {
+            None
+        };
         ConnectionFormData {
             id,
             name: self.name.read(cx).text(),
@@ -845,6 +862,7 @@ impl ConnectionDialogUi {
             timeout_secs: parse_u64(&self.timeout_secs.read(cx).text()),
             auto_limit: parse_u64(&self.auto_limit.read(cx).text()),
             ssh,
+            mssql,
         }
     }
 }
@@ -870,6 +888,7 @@ pub struct ConnectionFormData {
     pub timeout_secs: Option<u64>,
     pub auto_limit: Option<u64>,
     pub ssh: Option<SshTunnelConfig>,
+    pub mssql: Option<MssqlOptions>,
 }
 
 /// Hand-written `Debug` (instead of `#[derive(Debug)]`) so `password` is
@@ -894,6 +913,7 @@ impl std::fmt::Debug for ConnectionFormData {
             .field("timeout_secs", &self.timeout_secs)
             .field("auto_limit", &self.auto_limit)
             .field("ssh", &self.ssh)
+            .field("mssql", &self.mssql)
             .finish()
     }
 }
@@ -914,7 +934,54 @@ impl ConnectionFormData {
             auto_limit: self.auto_limit,
             ssh: self.ssh.clone(),
             favourite: self.favourite,
+            mssql: self.mssql.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod form_data_mssql_tests {
+    use super::*;
+
+    fn base_form_data(engine: Engine) -> ConnectionFormData {
+        ConnectionFormData {
+            id: "c1".into(),
+            name: "demo".into(),
+            engine,
+            host: "localhost".into(),
+            port: None,
+            database: "db".into(),
+            user: "u".into(),
+            password: String::new(),
+            folder: vec![],
+            read_only: false,
+            favourite: false,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            mssql: if engine == Engine::Mssql {
+                Some(MssqlOptions { encrypt: false, trust_server_certificate: true, driver: Some("ODBC Driver 17 for SQL Server".into()) })
+            } else {
+                None
+            },
+        }
+    }
+
+    #[test]
+    fn form_data_maps_mssql_options_only_for_mssql_engine() {
+        let pg_cfg = base_form_data(Engine::Postgres).to_connection_config();
+        assert_eq!(pg_cfg.mssql, None);
+
+        let mssql_data = base_form_data(Engine::Mssql);
+        let mssql_cfg = mssql_data.to_connection_config();
+        assert_eq!(
+            mssql_cfg.mssql,
+            Some(MssqlOptions {
+                encrypt: false,
+                trust_server_certificate: true,
+                driver: Some("ODBC Driver 17 for SQL Server".into()),
+            })
+        );
     }
 }
 
@@ -1429,8 +1496,9 @@ impl AppView {
         let ssh_port = cx.new(|cx| TextField::new(cx, "22", false));
         let ssh_user = cx.new(|cx| TextField::new(cx, "", false));
         let ssh_key_path = cx.new(|cx| TextField::new(cx, "~/.ssh/id_ed25519", false));
+        let mssql_driver = cx.new(|cx| TextField::new(cx, "ODBC Driver 18 for SQL Server", false));
 
-        let (editing_id, engine, read_only, favourite, ssh_enabled) = if let Some(c) = &editing {
+        let (editing_id, engine, read_only, favourite, ssh_enabled, mssql_encrypt, mssql_trust_cert) = if let Some(c) = &editing {
             name.update(cx, |f, cx| f.set_text(&c.name, cx));
             host.update(cx, |f, cx| f.set_text(&c.host, cx));
             port.update(cx, |f, cx| f.set_text(&c.port.map(|p| p.to_string()).unwrap_or_default(), cx));
@@ -1446,9 +1514,22 @@ impl AppView {
                 ssh_user.update(cx, |f, cx| f.set_text(&ssh.user, cx));
                 ssh_key_path.update(cx, |f, cx| f.set_text(ssh.key_path.as_deref().unwrap_or(""), cx));
             }
-            (Some(c.id.clone()), c.engine, c.read_only, c.favourite, ssh_enabled)
+            let mssql_opts = c.mssql.clone().unwrap_or_default();
+            if let Some(driver) = &mssql_opts.driver {
+                mssql_driver.update(cx, |f, cx| f.set_text(driver, cx));
+            }
+            (
+                Some(c.id.clone()),
+                c.engine,
+                c.read_only,
+                c.favourite,
+                ssh_enabled,
+                mssql_opts.encrypt,
+                mssql_opts.trust_server_certificate,
+            )
         } else {
-            (None, Engine::Postgres, false, false, false)
+            let defaults = MssqlOptions::default();
+            (None, Engine::Postgres, false, false, false, defaults.encrypt, defaults.trust_server_certificate)
         };
 
         let name_focus = name.focus_handle(cx);
@@ -1467,10 +1548,13 @@ impl AppView {
             ssh_port,
             ssh_user,
             ssh_key_path,
+            mssql_driver,
             engine,
             read_only,
             favourite,
             ssh_enabled,
+            mssql_encrypt,
+            mssql_trust_cert,
             test_result: None,
             testing: false,
         };
@@ -1656,6 +1740,18 @@ impl AppView {
     fn toggle_ssh_enabled(&mut self, cx: &mut Context<Self>) {
         if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
             ui.ssh_enabled = !ui.ssh_enabled;
+        }
+        cx.notify();
+    }
+    fn toggle_mssql_encrypt(&mut self, cx: &mut Context<Self>) {
+        if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
+            ui.mssql_encrypt = !ui.mssql_encrypt;
+        }
+        cx.notify();
+    }
+    fn toggle_mssql_trust(&mut self, cx: &mut Context<Self>) {
+        if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
+            ui.mssql_trust_cert = !ui.mssql_trust_cert;
         }
         cx.notify();
     }
@@ -2170,13 +2266,11 @@ fn generate_connection_id() -> String {
     format!("conn-{nanos:x}")
 }
 
-/// Builds the `ConnectSpec` for a Test/switch validation, short-circuiting
-/// the permanent MSSQL-unsupported case client-side (rather than letting it
-/// fall through to `open_config`'s own MSSQL rejection) so it doesn't need
-/// to bounce through the runner's async plumbing for a case with zero I/O.
-/// This is a permanent behaviour per the brief (the MSSQL driver is a
-/// separate roadmap item), not a placeholder this function is expected to
-/// eventually replace.
+/// Builds the `ConnectSpec` for a Test/switch validation. Every engine —
+/// including MSSQL since G15 T3 — goes through the runner to
+/// `connect::open_config` → `probe()`/handshake the same way; there is no
+/// more client-side short-circuit for MSSQL (it used to hard-refuse here
+/// before the driver was wired in).
 ///
 /// Used by both `on_test_clicked` and `switch_to_connection` — Task 8's
 /// review found the synchronous `pending_connect` this replaces froze the
@@ -2185,9 +2279,6 @@ fn generate_connection_id() -> String {
 /// spec through `QueryRunner::test_connect`, which runs entirely off the UI
 /// thread and is bounded by `connect::open_config`'s `connect_timeout`.
 fn test_connect_spec(cfg: ConnectionConfig, secret: Option<String>) -> Result<ConnectSpec, String> {
-    if cfg.engine == Engine::Mssql {
-        return Err("MSSQL driver zatím není k dispozici".into());
-    }
     Ok(ConnectSpec::Config { cfg: Box::new(cfg), secret })
 }
 
@@ -2451,6 +2542,35 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
             .child(field_row("SSH port", ui.ssh_port.clone(), *cx.theme()))
             .child(field_row("SSH uživatel", ui.ssh_user.clone(), *cx.theme()))
             .child(field_row("SSH klíč (cesta)", ui.ssh_key_path.clone(), *cx.theme()));
+    }
+
+    if ui.engine == Engine::Mssql {
+        panel = panel
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_4()
+                    .child(
+                        checkbox("chk-mssql-encrypt", "Šifrovat připojení (Encrypt)", ui.mssql_encrypt)
+                            .on_click(cx.listener(|v, _, _, cx| v.toggle_mssql_encrypt(cx))),
+                    )
+                    .child(
+                        checkbox(
+                            "chk-mssql-trust",
+                            "Důvěřovat certifikátu serveru (TrustServerCertificate)",
+                            ui.mssql_trust_cert,
+                        )
+                        .on_click(cx.listener(|v, _, _, cx| v.toggle_mssql_trust(cx))),
+                    ),
+            )
+            .child(field_row("ODBC driver (volitelné)", ui.mssql_driver.clone(), *cx.theme()))
+            // Read-only honesty, UI half (§1a): rendered only for MSSQL.
+            .child(
+                div()
+                    .text_color(cx.theme().text_muted)
+                    .child("Pouze pro čtení: u MSSQL vynuceno pouze na straně klienta"),
+            );
     }
 
     if let Some((text, ok)) = test_line {

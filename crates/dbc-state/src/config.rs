@@ -30,6 +30,31 @@ pub struct SshTunnelConfig {
     pub key_path: Option<String>,
 }
 
+fn default_true() -> bool { true }
+
+/// G15 T3: MSSQL-only connection options, saved alongside `ConnectionConfig`.
+/// Carries NO secret — the password stays vault-only, never in this struct
+/// or in `config.toml` (see `no_password_field_serialized`). `None` on
+/// `ConnectionConfig::mssql` means "all defaults" — the secure-by-default
+/// Driver 18 posture (`encrypt: true`, `trust_server_certificate: false`,
+/// `driver: None` ⇒ "ODBC Driver 18 for SQL Server") — so old config files
+/// with no `[connections.mssql]` table load unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MssqlOptions {
+    #[serde(default = "default_true")]
+    pub encrypt: bool,
+    #[serde(default)]
+    pub trust_server_certificate: bool,
+    #[serde(default)]
+    pub driver: Option<String>,
+}
+
+impl Default for MssqlOptions {
+    fn default() -> Self {
+        Self { encrypt: true, trust_server_certificate: false, driver: None }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     pub id: String,
@@ -48,6 +73,11 @@ pub struct ConnectionConfig {
     pub ssh: Option<SshTunnelConfig>,
     #[serde(default)]
     pub favourite: bool,
+    /// G15 T3: MSSQL-only options (encrypt/trust cert/driver override).
+    /// `None` for every non-MSSQL connection and for old config files —
+    /// see `MssqlOptions`'s doc comment.
+    #[serde(default)]
+    pub mssql: Option<MssqlOptions>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +183,7 @@ mod tests {
                     host: "bastion".into(), port: 22, user: "tomas".into(), key_path: None,
                 }),
                 favourite: false,
+                mssql: None,
             }],
             favourite_objects: vec![],
             theme: ThemeMode::Dark,
@@ -305,5 +336,69 @@ user = "postgres"
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.tool_paths, ToolPaths::default());
         assert_eq!(config.tool_paths.psql, None);
+    }
+
+    #[test]
+    fn old_config_without_mssql_options_loads() {
+        // G15 T3: back-compat — a pre-G15 config.toml has no
+        // `[connections.mssql]` table at all, and must load with `mssql ==
+        // None` (not a default-filled `Some(MssqlOptions::default())`).
+        let toml_str = r#"
+[[connections]]
+id = "c1"
+name = "demo"
+engine = "postgres"
+host = "localhost"
+database = "postgres"
+user = "postgres"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.connections[0].mssql, None);
+    }
+
+    #[test]
+    fn mssql_options_roundtrip_save_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        let mut config = sample();
+        config.connections[0].engine = Engine::Mssql;
+        config.connections[0].mssql = Some(MssqlOptions {
+            encrypt: false,
+            trust_server_certificate: true,
+            driver: Some("ODBC Driver 17 for SQL Server".into()),
+        });
+        config.save(&p).unwrap();
+        let loaded = AppConfig::load(&p).unwrap();
+        assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn mssql_options_partial_table_applies_serde_defaults() {
+        let toml_str = r#"
+[[connections]]
+id = "c1"
+name = "demo"
+engine = "mssql"
+host = "localhost"
+database = "master"
+user = "sa"
+
+[connections.mssql]
+trust_server_certificate = true
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        let opts = config.connections[0].mssql.clone().unwrap();
+        assert_eq!(opts.trust_server_certificate, true);
+        assert_eq!(opts.encrypt, true);
+        assert_eq!(opts.driver, None);
+    }
+
+    #[test]
+    fn non_mssql_config_serializes_no_mssql_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        sample().save(&p).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(!raw.contains("mssql"));
     }
 }

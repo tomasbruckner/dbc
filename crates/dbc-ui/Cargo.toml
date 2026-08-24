@@ -12,6 +12,7 @@ dbc-diff = { path = "../dbc-diff" }
 dbc-state = { path = "../dbc-state" }
 dbc-driver-sqlite = { path = "../dbc-driver-sqlite" }
 dbc-driver-postgres = { path = "../dbc-driver-postgres" }
+dbc-driver-mssql = { path = "../dbc-driver-mssql" }
 unicode-segmentation = "1"
 tokio.workspace = true
 dirs.workspace = true

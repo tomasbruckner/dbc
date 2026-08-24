@@ -484,6 +484,7 @@ mod tests {
                 None
             },
             favourite: true,
+            mssql: None,
         }
     }
 

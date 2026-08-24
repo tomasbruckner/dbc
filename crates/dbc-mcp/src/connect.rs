@@ -94,6 +94,7 @@ mod tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         }
     }
 

@@ -721,12 +721,12 @@ impl QueryRunner {
     /// G11 T4: MSSQL `BACKUP DATABASE` — allowed on read-only (design
     /// CURATION item 2, `backup::BackupOp::Backup` is exempt). Runs over ONE
     /// fresh connection (`open_spec`, dropped at the end), same one-shot
-    /// shape `fetch_schema`/`test_connect` already use. Against a saved
-    /// MSSQL connection this fails fast at `open_spec` with the exact,
-    /// already-existing "MSSQL driver zatím není k dispozici" error every
-    /// other MSSQL feature in this app produces today (`connect::open_config`'s
-    /// permanent `Engine::Mssql` arm) — no MSSQL-specific handling is added
-    /// around that error here.
+    /// shape `fetch_schema`/`test_connect` already use. `open_spec`'s
+    /// `Engine::Mssql` arm is real since G15 T3 (`connect::open_config`
+    /// dials out via `MssqlConnection::probe()`) — whatever `open_spec`
+    /// returns (a real connect failure, or success) is what this sees; no
+    /// MSSQL-specific handling is added around it here. `build_backup_sql`
+    /// itself stays pg-bracket-quoted until G15 T4 dialectizes it.
     pub fn run_mssql_backup(
         &self,
         spec: ConnectSpec,
@@ -2413,6 +2413,7 @@ mod write_transaction_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         };
         assert!(spec_is_read_only(&ConnectSpec::Config { cfg: Box::new(cfg.clone()), secret: None }));
         let mut cfg2 = cfg;
@@ -2545,6 +2546,7 @@ mod write_transaction_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         };
         let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
         // Exercises `run_write_transaction_inner` (the same body
@@ -2618,6 +2620,7 @@ mod write_transaction_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         };
         let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
         let stmts = admin_sql::drop_role(dbc_state::Engine::Postgres, "bob");
@@ -2900,6 +2903,7 @@ mod analyze_write_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         };
         let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
         let handle = tokio::runtime::Handle::current();
@@ -3355,6 +3359,7 @@ mod run_many_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         }
     }
 
@@ -3515,6 +3520,7 @@ mod csv_import_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         }
     }
 
@@ -4708,6 +4714,7 @@ mod backup_runner_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         }
     }
 
@@ -4794,22 +4801,34 @@ mod backup_runner_tests {
         assert!(err.message.contains("nenalezen"));
     }
 
-    // --- MSSQL: fails fast at open_spec, exactly like every other MSSQL
-    // feature in this app today (Spec section grounding) — REQUIRED. ---
+    // --- MSSQL: fails fast at open_spec, no I/O — G15 T3 wired the
+    // Engine::Mssql arm for real, so the `cfg()` test helper's empty `user`
+    // field (never set for these engine-agnostic fixtures) now hits
+    // `connect::mssql_connection_from_config`'s integrated-auth refusal
+    // instead of the old permanent "driver zatím není k dispozici" stub —
+    // REQUIRED, still zero I/O, still fails before any connection. ---
     #[tokio::test]
-    async fn run_mssql_backup_against_mssql_engine_fails_with_the_standard_unwired_message() {
+    async fn run_mssql_backup_against_mssql_engine_without_user_fails_before_connecting() {
         let spec = ConnectSpec::Config { cfg: Box::new(cfg(dbc_state::Engine::Mssql, false)), secret: None };
         let handle = tokio::runtime::Handle::current();
         let err = run_mssql_backup_inner(spec, "db".into(), r"D:\x.bak".into(), handle).await.unwrap_err();
-        assert!(err.message.contains("MSSQL driver zatím není k dispozici"));
+        assert!(
+            err.message.contains("ověření přes Windows účet zatím není podporováno"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
-    async fn run_mssql_restore_against_mssql_engine_fails_with_the_standard_unwired_message() {
+    async fn run_mssql_restore_against_mssql_engine_without_user_fails_before_connecting() {
         let spec = ConnectSpec::Config { cfg: Box::new(cfg(dbc_state::Engine::Mssql, false)), secret: None };
         let handle = tokio::runtime::Handle::current();
         let err = run_mssql_restore_inner(spec, "db".into(), r"D:\x.bak".into(), handle).await.unwrap_err();
-        assert!(err.message.contains("MSSQL driver zatím není k dispozici"));
+        assert!(
+            err.message.contains("ověření přes Windows účet zatím není podporováno"),
+            "got: {}",
+            err.message
+        );
     }
 
     // --- read-only gates, REQUIRED, no I/O attempted in the refusing path ---
@@ -4827,12 +4846,17 @@ mod backup_runner_tests {
     #[tokio::test]
     async fn mssql_backup_allowed_even_when_read_only_reaches_open_spec_not_the_guard() {
         // read_only=true + Backup must NOT be refused by the guard — the
-        // MSSQL-unwired error proves the guard passed and open_spec was
-        // actually reached.
+        // integrated-auth refusal (from inside open_spec's
+        // mssql_connection_from_config, not the read-only guard) proves the
+        // guard passed and open_spec was actually reached.
         let spec = ConnectSpec::Config { cfg: Box::new(cfg(dbc_state::Engine::Mssql, true)), secret: None };
         let handle = tokio::runtime::Handle::current();
         let err = run_mssql_backup_inner(spec, "db".into(), r"D:\x.bak".into(), handle).await.unwrap_err();
-        assert!(err.message.contains("MSSQL driver zatím není k dispozici"), "got: {}", err.message);
+        assert!(
+            err.message.contains("ověření přes Windows účet zatím není podporováno"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -4858,11 +4882,15 @@ mod backup_runner_tests {
     async fn mssql_backup_refuses_read_only_when_actually_read_only_is_false_check_control() {
         // Control for the two "allowed even when read_only" tests above:
         // Restore on a NON-read-only connection must not be refused by the
-        // guard either — it should reach the same MSSQL-unwired error.
+        // guard either — it should reach the same integrated-auth refusal.
         let spec = ConnectSpec::Config { cfg: Box::new(cfg(dbc_state::Engine::Mssql, false)), secret: None };
         let handle = tokio::runtime::Handle::current();
         let err = run_mssql_restore_inner(spec, "db".into(), r"D:\x.bak".into(), handle).await.unwrap_err();
-        assert!(err.message.contains("MSSQL driver zatím není k dispozici"), "got: {}", err.message);
+        assert!(
+            err.message.contains("ověření přes Windows účet zatím není podporováno"),
+            "got: {}",
+            err.message
+        );
     }
 
     // --- SQLite restore: magic header + real copy, temp files, no docker ---
@@ -5098,6 +5126,7 @@ mod backup_docker_tests {
             auto_limit: None,
             ssh: None,
             favourite: false,
+            mssql: None,
         }
     }
 
