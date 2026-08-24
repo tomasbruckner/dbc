@@ -3578,12 +3578,26 @@ impl AppView {
         // reasoning as the palette/modal cases above (a `"ResultGrid"`-
         // scoped `escape` binding would lose to this unscoped one).
         if let Some(active) = self.tabs.active() {
-            if let TabContent::Grid { grid, .. } = &active.content {
-                let closed = grid.update(cx, |g, _| g.close_overlay_if_open());
-                if closed {
-                    cx.notify();
-                    return;
+            match &active.content {
+                TabContent::Grid { grid, .. } => {
+                    let closed = grid.update(cx, |g, _| g.close_overlay_if_open());
+                    if closed {
+                        cx.notify();
+                        return;
+                    }
                 }
+                // UX-polish sweep #9: Esc closes an open AdminModal / the
+                // admin discard-confirm — with the M6 password rule (a
+                // typed password refuses Esc but still consumes it); see
+                // `AdminPanel::close_overlay_if_open`.
+                TabContent::Admin { view } => {
+                    let closed = view.update(cx, |p, cx| p.close_overlay_if_open(cx));
+                    if closed {
+                        cx.notify();
+                        return;
+                    }
+                }
+                _ => {}
             }
         }
         if let Some(c) = self.cancel.take() {

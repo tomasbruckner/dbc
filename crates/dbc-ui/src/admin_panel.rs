@@ -740,6 +740,13 @@ enum PendingAdminAction {
     SelectGrantee(String),
 }
 
+/// UX-polish sweep #9: whether Esc may close an admin modal — the M6
+/// password rule (never dismiss a modal holding a typed password) as a
+/// pure decision, same tier as connections_ui's `blocks_clipboard_write`.
+fn admin_esc_closable(has_password_field: bool, password_empty: bool) -> bool {
+    !has_password_field || password_empty
+}
+
 /// Panel-local overlay state — same visual idiom as the grid cell editor
 /// (a floating panel over the tab content, not a full-window modal). While
 /// the modal is open, the password sits in the `TextField`'s own buffer —
@@ -861,6 +868,9 @@ pub struct AdminPanel {
 
     #[allow(dead_code)] // reserved for future keyboard/escape handling, same posture as SchemaTree's.
     focus_handle: FocusHandle,
+    /// UX-polish: focus target for the no-input DropSchema modal —
+    /// panel-local twin of AppView's modal_focus_handle (§1.4).
+    modal_focus_handle: FocusHandle,
 }
 
 impl AdminPanel {
@@ -889,6 +899,7 @@ impl AdminPanel {
             modal: None,
             discard_confirm: None,
             focus_handle: cx.focus_handle(),
+            modal_focus_handle: cx.focus_handle(),
         }
     }
 
@@ -1156,8 +1167,8 @@ impl AdminPanel {
         if self.modal.is_some() {
             return;
         }
-        let name = cx.new(|cx| connections_ui::TextField::new(cx, "název role", false));
-        let password = cx.new(|cx| connections_ui::TextField::new(cx, "heslo", true));
+        let name = cx.new(|cx| connections_ui::TextField::form_field(cx, "název role", false));
+        let password = cx.new(|cx| connections_ui::TextField::form_field(cx, "heslo", true));
         let focus = name.focus_handle(cx);
         self.modal = Some(AdminModal::NewRole {
             name,
@@ -1176,7 +1187,7 @@ impl AdminPanel {
         if self.modal.is_some() {
             return;
         }
-        let password = cx.new(|cx| connections_ui::TextField::new(cx, "nové heslo", true));
+        let password = cx.new(|cx| connections_ui::TextField::form_field(cx, "nové heslo", true));
         let focus = password.focus_handle(cx);
         self.modal = Some(AdminModal::ChangePassword { role, password });
         window.focus(&focus, cx);
@@ -1186,6 +1197,73 @@ impl AdminPanel {
     fn close_modal(&mut self, cx: &mut Context<Self>) {
         self.modal = None;
         cx.notify();
+    }
+
+    /// UX-polish sweep #9: called from `AppView::on_cancel_query`'s new
+    /// `TabContent::Admin` arm — the SAME "the unscoped root Esc binding
+    /// is the mechanism" shape as `ResultGrid::close_overlay_if_open`.
+    /// Discard-confirm first (Esc = „Zpět", never „Zahodit" — the G5
+    /// rule), then the modal. Returns true when Esc was CONSUMED — which
+    /// includes the refused password case, so Esc against a typed
+    /// password does nothing at all rather than cancelling a query
+    /// underneath (mirrors the app-modal `closable` match's `return`).
+    pub fn close_overlay_if_open(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.discard_confirm.is_some() {
+            self.discard_confirm_no(cx);
+            return true;
+        }
+        if let Some(modal) = &self.modal {
+            let (has_password, password_empty) = match modal {
+                AdminModal::NewRole { password, .. }
+                | AdminModal::ChangePassword { password, .. } => {
+                    (true, password.read(cx).text().is_empty())
+                }
+                AdminModal::NewSchema { .. } | AdminModal::DropSchema { .. } => (true, true),
+            };
+            if admin_esc_closable(has_password, password_empty) {
+                self.close_modal(cx);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// UX-polish §1.2 (admin rows): Enter = the confirm button. NewRole/
+    /// ChangePassword stage a WriteStatement (execution still goes through
+    /// the apply bar → apply dialog gate); NewSchema emits RequestApply →
+    /// opens the apply dialog (a second explicit gate). DropSchema is a
+    /// DELIBERATE handled no-op (§3-novela: destructive intent — the pause
+    /// is the point, CASCADE warning) — do not wire it.
+    fn on_modal_confirm(
+        &mut self,
+        _: &connections_ui::ModalConfirm,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match &self.modal {
+            Some(AdminModal::NewRole { .. }) => self.confirm_new_role(cx),
+            Some(AdminModal::ChangePassword { .. }) => self.confirm_change_password(cx),
+            Some(AdminModal::NewSchema { .. }) => self.confirm_new_schema(cx),
+            Some(AdminModal::DropSchema { .. }) | None => {}
+        }
+    }
+
+    fn on_modal_focus_next(
+        &mut self,
+        _: &connections_ui::ModalFocusNext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus_next(cx);
+    }
+
+    fn on_modal_focus_prev(
+        &mut self,
+        _: &connections_ui::ModalFocusPrev,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus_prev(cx);
     }
 
     fn toggle_new_role_flag(&mut self, flag: RoleFlagKind, cx: &mut Context<Self>) {
@@ -1261,7 +1339,7 @@ impl AdminPanel {
         if self.modal.is_some() {
             return;
         }
-        let name = cx.new(|cx| connections_ui::TextField::new(cx, "název schématu", false));
+        let name = cx.new(|cx| connections_ui::TextField::form_field(cx, "název schématu", false));
         let focus = name.focus_handle(cx);
         self.modal = Some(AdminModal::NewSchema { name });
         window.focus(&focus, cx);
@@ -1269,14 +1347,17 @@ impl AdminPanel {
     }
 
     /// T6: "Smazat schéma" — opens the CASCADE-checkbox confirm modal for
-    /// `self.selected_size_schema`. No `TextField` here, so no focus
-    /// hand-off (same posture as `stage_drop_role`'s modal-less action).
-    fn open_drop_schema_modal(&mut self, cx: &mut Context<Self>) {
+    /// `self.selected_size_schema`. No `TextField` here — UX-polish sweep
+    /// #9 gives it `modal_focus_handle` instead (panel-local twin of
+    /// `AppView`'s §1.4 mechanism) so it still holds keyboard focus and
+    /// stray typing can't reach whatever was focused underneath.
+    fn open_drop_schema_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(schema) = self.selected_size_schema.clone() else { return };
         if self.modal.is_some() {
             return;
         }
         self.modal = Some(AdminModal::DropSchema { schema, cascade: false });
+        window.focus(&self.modal_focus_handle, cx);
         cx.notify();
     }
 
@@ -1834,8 +1915,8 @@ impl AdminPanel {
                     .rounded_md()
                     .text_color(if drop_enabled { theme.danger } else { theme.text_disabled })
                     .child("Smazat schéma")
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.open_drop_schema_modal(cx);
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.open_drop_schema_modal(window, cx);
                     })),
             );
 
@@ -2181,6 +2262,11 @@ impl AdminPanel {
                 .items_center()
                 .justify_center()
                 .bg(theme.bg_backdrop)
+                .key_context("ModalForm")
+                .track_focus(&self.modal_focus_handle)
+                .on_action(cx.listener(Self::on_modal_confirm))
+                .on_action(cx.listener(Self::on_modal_focus_next))
+                .on_action(cx.listener(Self::on_modal_focus_prev))
                 .occlude()
                 .child(panel)
                 .into_any_element(),
@@ -2202,6 +2288,12 @@ impl AdminPanel {
                 .items_center()
                 .justify_center()
                 .bg(theme.bg_backdrop)
+                // UX-polish §1.4: same shared focus target as
+                // `render_modal_overlay` — holds keyboard focus. NO key
+                // context here or ever: Enter must stay structurally inert
+                // on discard-confirm, admin or app (§3-novela / Global
+                // Constraints).
+                .track_focus(&self.modal_focus_handle)
                 .occlude()
                 .child(
                     div()
@@ -2321,6 +2413,24 @@ mod tests {
         assert_eq!(admin_entry_state(Some(Engine::Mssql), true), AdminEntry::Disabled);
         assert_eq!(admin_entry_state(Some(Engine::Postgres), false), AdminEntry::Enabled);
         assert_eq!(admin_entry_state(Some(Engine::Mssql), false), AdminEntry::Enabled);
+    }
+
+    // UX-polish sweep #9: the M6 password rule mirrored onto admin modals —
+    // a modal holding a typed (non-empty) password is NOT closable by Esc,
+    // same reasoning as ConnectionDialog in `AppView::on_cancel_query`.
+    #[test]
+    fn esc_closable_without_password_field() {
+        assert!(super::admin_esc_closable(false, true));
+    }
+
+    #[test]
+    fn esc_closable_with_empty_password() {
+        assert!(super::admin_esc_closable(true, true));
+    }
+
+    #[test]
+    fn esc_not_closable_with_typed_password() {
+        assert!(!super::admin_esc_closable(true, false));
     }
 
     fn rows(cols: &[&str], data: &[&[Option<&str>]]) -> AdminCatalogRows {
