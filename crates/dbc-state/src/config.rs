@@ -20,7 +20,7 @@ impl From<toml::ser::Error> for StateError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Engine { Postgres, Mssql, Sqlite }
+pub enum Engine { Postgres, Mssql, Sqlite, Duckdb }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshTunnelConfig {
@@ -354,6 +354,64 @@ user = "postgres"
 "#;
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.connections[0].mssql, None);
+    }
+
+    #[test]
+    fn pre_g16_config_without_duckdb_loads_unchanged() {
+        // §1 REQUIRED (a): adding the variant must not change how existing
+        // postgres/mssql/sqlite configs load — purely additive.
+        let toml_str = r#"
+[[connections]]
+id = "c1"
+name = "demo"
+engine = "postgres"
+host = "localhost"
+database = "postgres"
+user = "postgres"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.connections[0].engine, Engine::Postgres);
+        assert_eq!(config.connections[0].mssql, None);
+    }
+
+    #[test]
+    fn duckdb_connection_roundtrip_save_load() {
+        // §1 REQUIRED (b): a duckdb connection (database = file path,
+        // read_only) survives save/load byte-exact.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        let mut config = sample();
+        config.connections[0].engine = Engine::Duckdb;
+        config.connections[0].database = r"D:\data\analytics.duckdb".into();
+        config.connections[0].read_only = true;
+        config.connections[0].ssh = None;
+        config.save(&p).unwrap();
+        let loaded = AppConfig::load(&p).unwrap();
+        assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn duckdb_serde_string_form_is_pinned() {
+        // §1 REQUIRED (c): the exact `engine = "duckdb"` spelling is a
+        // saved-config contract — a future enum rename must not silently
+        // break existing config.toml files.
+        let toml_str = r#"
+[[connections]]
+id = "d1"
+name = "analytics"
+engine = "duckdb"
+host = ""
+database = "D:\\data\\analytics.duckdb"
+user = ""
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.connections[0].engine, Engine::Duckdb);
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        config.save(&p).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains(r#"engine = "duckdb""#), "raw: {raw}");
     }
 
     #[test]

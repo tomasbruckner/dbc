@@ -259,7 +259,9 @@ enum EditableDecision {
 /// the engine inferred from the URL itself, via the SAME postgres-vs-sqlite
 /// dispatch `connect::open` uses to pick a driver (`postgres[ql]://` ->
 /// Postgres, anything else -> a SQLite file path — MSSQL has no CLI-arg URL
-/// form at all in this app, so it never needs a branch here).
+/// form at all in this app, so it never needs a branch here). G16: a
+/// `.duckdb` CLI arg is an explicit non-goal (design §3) — saved
+/// connections are the only DuckDB entry point, so no branch here either.
 fn engine_from_url(url: &str) -> dbc_state::Engine {
     if url.starts_with("postgres://") || url.starts_with("postgresql://") {
         dbc_state::Engine::Postgres
@@ -281,6 +283,10 @@ fn dialect_for_engine(engine: dbc_state::Engine) -> Option<dbc_core::Dialect> {
         dbc_state::Engine::Postgres => Some(dbc_core::Dialect::Postgres),
         dbc_state::Engine::Sqlite => Some(dbc_core::Dialect::Sqlite),
         dbc_state::Engine::Mssql => Some(dbc_core::Dialect::Mssql),
+        // G16: DuckDB maps to the pg dialect — `"…"`-doubling ident
+        // quoting, trailing `LIMIT n`, `$tag$` dollar-quote splitting are
+        // all exactly DuckDB's rules (G12 curation item 2 delivered).
+        dbc_state::Engine::Duckdb => Some(dbc_core::Dialect::Postgres),
     }
 }
 
@@ -298,6 +304,9 @@ fn sql_dialect(engine: dbc_state::Engine) -> dbc_core::Dialect {
         dbc_state::Engine::Postgres => dbc_core::Dialect::Postgres,
         dbc_state::Engine::Sqlite => dbc_core::Dialect::Sqlite,
         dbc_state::Engine::Mssql => dbc_core::Dialect::Mssql,
+        // G16: pg-dialect composition is exactly DuckDB's SQL (G12
+        // curation item 2) — see `dialect_for_engine`'s arm.
+        dbc_state::Engine::Duckdb => dbc_core::Dialect::Postgres,
     }
 }
 
@@ -3409,6 +3418,21 @@ impl AppView {
                 cx.notify();
             }
             plan::AnalyzeGate::NeedsConfirm => {
+                if engine == dbc_state::Engine::Duckdb {
+                    // G16 T5 (resolved design gap): the DuckDB driver's
+                    // query() sessions are independent clones off the shared
+                    // root, invisible to execute()'s persistent exec_conn —
+                    // the same structural property runner.rs's
+                    // analyze_write_tests document for sqlite. So
+                    // run_analyze_write's BEGIN → EXPLAIN (ANALYZE …) →
+                    // ROLLBACK CANNOT actually wrap the analyzed write in a
+                    // transaction: the write would durably COMMIT while the
+                    // UI claims "změny vráceny zpět". Refuse honestly.
+                    // Pinned by runner.rs::duckdb_query_sessions_do_not_see_execute_transactions.
+                    self.status = "error: EXPLAIN ANALYZE zápisu není pro DuckDB podporováno — analyzovaný zápis nelze bezpečně vrátit".to_string();
+                    cx.notify();
+                    return;
+                }
                 self.modal = Some(connections_ui::ModalState::AnalyzeWriteConfirm {
                     sql,
                     engine,
@@ -3539,10 +3563,14 @@ impl AppView {
                         raw_text: raw_lines.join("\n"),
                     })
                 } else {
-                    let raw_text = if buf.row_count() == 0 || buf.cell_is_null(0, 0) {
+                    // G16 T5: DuckDB's EXPLAIN result set is
+                    // (explain_key, explain_value) — the payload sits in
+                    // the SECOND column (capture-pinned); pg stays 0.
+                    let payload_col = plan::plan_payload_col(engine);
+                    let raw_text = if buf.row_count() == 0 || buf.cell_is_null(0, payload_col) {
                         Err("EXPLAIN nevrátil žádný řádek".to_string())
                     } else {
-                        Ok(buf.cell_text(0, 0))
+                        Ok(buf.cell_text(0, payload_col))
                     };
                     raw_text.and_then(|t| plan::parse_plan(engine, is_analyze, &t))
                 };
@@ -7302,6 +7330,54 @@ impl AppView {
                 })
                 .detach();
             }
+            dbc_state::Engine::Duckdb => {
+                // G16 T4 (live since T6 flipped
+                // `backup::backup_restore_available(Duckdb)`). Display-only
+                // preview of the source db name: DuckDB names a file
+                // database after its file stem; execution re-derives it
+                // from the engine (SELECT current_database()) — pinned in
+                // duckdb_backup_command_line_preview_matches_engine_name.
+                let display_src = std::path::Path::new(&cfg.database)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| cfg.database.clone());
+                let command_line = backup::build_duckdb_backup_sql(&display_src, &dest_path).join("\n");
+                let (_log, status, _cancel_slot) = self.start_backup_session(
+                    backup::BackupKind::Backup,
+                    &cfg,
+                    &dest_path,
+                    command_line,
+                    String::new(),
+                    None,
+                    backup::BackupStatus::Running,
+                    cx,
+                );
+                let spec = ConnectSpec::Config { cfg: Box::new(cfg.clone()), secret: None };
+                let rx = self.runner.run_duckdb_backup(spec, dest_path.clone());
+                let started = std::time::Instant::now();
+                cx.spawn(async move |this, cx| {
+                    let result = rx.await;
+                    let _ = this.update(cx, |view, cx| {
+                        let err = match result {
+                            Ok(Ok(())) => None,
+                            Ok(Err(e)) => Some(e.message),
+                            Err(_) => Some("backup task panicked".to_string()),
+                        };
+                        view.finish_backup_restore(
+                            &status,
+                            backup::BackupKind::Backup,
+                            &connection_name,
+                            &database,
+                            &dest_path,
+                            started_at_unix,
+                            started.elapsed().as_millis() as i64,
+                            err,
+                            cx,
+                        );
+                    });
+                })
+                .detach();
+            }
         }
     }
 
@@ -7453,6 +7529,9 @@ impl AppView {
                 backup::build_single_user_sql(&cfg.database, true),
             ),
             Ok(RestorePlan::Sqlite) => format!("copy {source_path} -> {}", cfg.database),
+            // G16 T4: same sniff-and-copy preview as Sqlite — the DUCK
+            // magic check is runner-level, identical division of labor.
+            Ok(RestorePlan::Duckdb) => format!("copy {source_path} -> {}", cfg.database),
             Err(e) => {
                 self.status = format!("error: {e}");
                 cx.notify();
@@ -7692,6 +7771,46 @@ impl AppView {
                 );
                 let db_path = database.clone();
                 let rx = self.runner.run_sqlite_restore(db_path, source_path.clone(), cfg.read_only);
+                let started = std::time::Instant::now();
+                cx.spawn(async move |this, cx| {
+                    let result = rx.await;
+                    let _ = this.update(cx, |view, cx| {
+                        let err = match result {
+                            Ok(Ok(())) => None,
+                            Ok(Err(e)) => Some(e.message),
+                            Err(_) => Some("restore task panicked".to_string()),
+                        };
+                        view.finish_backup_restore(
+                            &status,
+                            backup::BackupKind::Restore,
+                            &connection_name,
+                            &database,
+                            &source_path,
+                            started_at_unix,
+                            started.elapsed().as_millis() as i64,
+                            err,
+                            cx,
+                        );
+                    });
+                })
+                .detach();
+            }
+            RestorePlan::Duckdb => {
+                // G16 T4: byte-for-byte the Sqlite arm above except the
+                // runner call — sniff-and-copy is runner-level.
+                let command_line = format!("copy {source_path} -> {database}");
+                let (_log, status, _cancel_slot) = self.start_backup_session(
+                    backup::BackupKind::Restore,
+                    &cfg,
+                    &source_path,
+                    command_line,
+                    database.clone(),
+                    None,
+                    backup::BackupStatus::Running,
+                    cx,
+                );
+                let db_path = database.clone();
+                let rx = self.runner.run_duckdb_restore(db_path, source_path.clone(), cfg.read_only);
                 let started = std::time::Instant::now();
                 cx.spawn(async move |this, cx| {
                     let result = rx.await;
@@ -8021,6 +8140,7 @@ fn backup_file_ext(engine: dbc_state::Engine) -> &'static str {
         dbc_state::Engine::Postgres => "backup", // pg_dump -Fc (default format here)
         dbc_state::Engine::Mssql => "bak",
         dbc_state::Engine::Sqlite => "sqlite",
+        dbc_state::Engine::Duckdb => "duckdb",
     }
 }
 
@@ -8048,6 +8168,9 @@ enum RestorePlan {
     PgTool { tool_name: String, args: Vec<String> },
     Mssql,
     Sqlite,
+    /// G16 T4: sniff-and-copy, mirroring Sqlite — the DUCK-magic check is
+    /// runner-level (`runner::run_duckdb_restore`), same division of labor.
+    Duckdb,
 }
 
 /// Reads AT MOST the first 16 bytes of `path` — exactly what
@@ -8092,6 +8215,9 @@ fn plan_restore(cfg: &dbc_state::ConnectionConfig, source_path: &str) -> Result<
         }
         dbc_state::Engine::Mssql => Ok(RestorePlan::Mssql),
         dbc_state::Engine::Sqlite => Ok(RestorePlan::Sqlite),
+        // G16 T4: no filesystem touch here — the magic sniff is
+        // runner-level, same division as sqlite.
+        dbc_state::Engine::Duckdb => Ok(RestorePlan::Duckdb),
     }
 }
 
@@ -8170,11 +8296,11 @@ mod plan_restore_tests {
     }
 
     #[test]
-    fn plan_restore_mssql_and_sqlite_never_touch_the_filesystem() {
-        // No file created at these paths at all — Mssql/Sqlite variants
-        // must not attempt to read the source file (that's runner-level,
-        // T4's own magic-header check for SQLite; MSSQL has no client-side
-        // sniff at all).
+    fn plan_restore_mssql_sqlite_and_duckdb_never_touch_the_filesystem() {
+        // No file created at these paths at all — Mssql/Sqlite/Duckdb
+        // variants must not attempt to read the source file (that's
+        // runner-level, the magic-header sniffs for SQLite/DuckDB; MSSQL
+        // has no client-side sniff at all).
         let mut mssql = pg_cfg();
         mssql.engine = dbc_state::Engine::Mssql;
         assert!(matches!(plan_restore(&mssql, r"D:\nope.bak"), Ok(RestorePlan::Mssql)));
@@ -8182,6 +8308,11 @@ mod plan_restore_tests {
         let mut sqlite = pg_cfg();
         sqlite.engine = dbc_state::Engine::Sqlite;
         assert!(matches!(plan_restore(&sqlite, r"D:\nope.sqlite"), Ok(RestorePlan::Sqlite)));
+
+        // G16 T4 (was the T3 interim refusal — mechanics landed).
+        let mut duckdb = pg_cfg();
+        duckdb.engine = dbc_state::Engine::Duckdb;
+        assert!(matches!(plan_restore(&duckdb, r"D:\nope.duckdb"), Ok(RestorePlan::Duckdb)));
     }
 }
 
@@ -8560,6 +8691,26 @@ mod editable_detection_tests {
         );
     }
 
+    /// G16 (design §4 REQUIRED matrix rows): DuckDB is sandbox-editable by
+    /// construction — no engine arm exists in detect_editable_pk since
+    /// G15's flip; `dbc_core::quote_ident` pg-style `"…"`-doubling is
+    /// exactly DuckDB's identifier quoting, `sql_value_d` emission is
+    /// engine-neutral, the driver populates `is_pk`. read_only still
+    /// blocks, same as every engine.
+    #[test]
+    fn duckdb_engine_is_editable_with_a_mapped_pk_and_read_only_still_blocks() {
+        let t = table(vec![col("id", true)]);
+        let h = headers(&["id"]);
+        assert!(matches!(
+            detect_editable_pk(rw_engine(dbc_state::Engine::Duckdb), Some(&t), &h),
+            EditableDecision::Editable(_)
+        ));
+        assert_eq!(
+            detect_editable_pk(Some((true, dbc_state::Engine::Duckdb)), Some(&t), &h),
+            EditableDecision::NotEditable
+        );
+    }
+
     #[test]
     fn no_conn_meta_at_all_is_not_editable_even_with_a_mapped_pk() {
         // Defensive-only today (`run_query_with` always builds `Some(..)`
@@ -8603,10 +8754,14 @@ mod multi_statement_tests {
     // G15 T8 ON-flip: Mssql now maps to Some(Dialect::Mssql) — see
     // dialect_for_engine's doc comment for the live evidence.
     #[test]
-    fn dialect_for_engine_maps_every_engine_including_mssql() {
+    fn dialect_for_engine_maps_every_engine_including_mssql_and_duckdb() {
         assert_eq!(dialect_for_engine(dbc_state::Engine::Postgres), Some(dbc_core::Dialect::Postgres));
         assert_eq!(dialect_for_engine(dbc_state::Engine::Sqlite), Some(dbc_core::Dialect::Sqlite));
         assert_eq!(dialect_for_engine(dbc_state::Engine::Mssql), Some(dbc_core::Dialect::Mssql));
+        // G16: DuckDB splits under the pg dialect — G12 curation item 2
+        // (`"…"` ident quoting, LIMIT n, $tag$ dollar quoting are DuckDB's
+        // own rules).
+        assert_eq!(dialect_for_engine(dbc_state::Engine::Duckdb), Some(dbc_core::Dialect::Postgres));
     }
 
     #[test]
@@ -8658,6 +8813,7 @@ mod multi_statement_tests {
         assert_eq!(sql_dialect(dbc_state::Engine::Postgres), dbc_core::Dialect::Postgres);
         assert_eq!(sql_dialect(dbc_state::Engine::Sqlite), dbc_core::Dialect::Sqlite);
         assert_eq!(sql_dialect(dbc_state::Engine::Mssql), dbc_core::Dialect::Mssql);
+        assert_eq!(sql_dialect(dbc_state::Engine::Duckdb), dbc_core::Dialect::Postgres);
     }
 
     /// Batch C review BLOCKER 2 regression: on a read-only MSSQL connection

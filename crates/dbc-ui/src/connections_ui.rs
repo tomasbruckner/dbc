@@ -2169,7 +2169,7 @@ impl AppView {
             .connections
             .iter()
             .find(|c| c.id == id)
-            .map_or(false, |c| c.engine != Engine::Sqlite);
+            .map_or(false, |c| !engine_is_file_based(c.engine));
         if connect_needs_vault_prompt(needs_secret, self.vault.is_some(), Vault::exists(&self.vault_path)) {
             let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
             let focus = input.focus_handle(cx);
@@ -2439,6 +2439,7 @@ fn engine_label(e: Engine) -> &'static str {
         Engine::Postgres => "pg",
         Engine::Mssql => "mssql",
         Engine::Sqlite => "sqlite",
+        Engine::Duckdb => "duckdb",
     }
 }
 
@@ -2446,8 +2447,24 @@ fn next_engine(e: Engine) -> Engine {
     match e {
         Engine::Postgres => Engine::Mssql,
         Engine::Mssql => Engine::Sqlite,
-        Engine::Sqlite => Engine::Postgres,
+        // G16 T6 ON-flip: Duckdb enters the picker cycle only after the
+        // embedded live tier (runner.rs duckdb_runner_tests +
+        // duckdb_backup_restore_tests, plan.rs duckdb fixtures/capture,
+        // connect.rs duckdb_connect_tests, dbc-mcp duckdb test) went green
+        // on this branch — the G15 flip discipline, embedded edition.
+        Engine::Sqlite => Engine::Duckdb,
+        Engine::Duckdb => Engine::Postgres,
     }
+}
+
+/// G16 §2: the two file-based engines share the "database = file path, no
+/// host/port/password, no vault secret" convention. ONE predicate — a
+/// missed site would mean a pointless master-password prompt (or worse, a
+/// skipped one) for the wrong engine. Used by `on_dropdown_item_click`'s
+/// needs_secret lookup, `test_needs_vault_prompt`, and the connection
+/// dialog's file-path helper row.
+pub(crate) fn engine_is_file_based(e: Engine) -> bool {
+    matches!(e, Engine::Sqlite | Engine::Duckdb)
 }
 
 fn parse_u16(s: &str) -> Option<u16> {
@@ -2536,7 +2553,7 @@ fn test_needs_vault_prompt(
     vault_unlocked: bool,
     vault_file_exists: bool,
 ) -> bool {
-    password_field_empty && engine != Engine::Sqlite && !vault_unlocked && vault_file_exists
+    password_field_empty && !engine_is_file_based(engine) && !vault_unlocked && vault_file_exists
 }
 
 #[cfg(test)]
@@ -2557,6 +2574,38 @@ mod test_vault_prompt_tests {
     #[test]
     fn sqlite_never_needs_prompt() {
         assert!(!test_needs_vault_prompt(true, Engine::Sqlite, false, true));
+    }
+
+    /// G16: DuckDB is file-based like sqlite — no password exists, so no
+    /// master-password prompt may ever fire for it.
+    #[test]
+    fn duckdb_never_needs_prompt() {
+        assert!(!test_needs_vault_prompt(true, Engine::Duckdb, false, true));
+    }
+
+    /// G16 T6 ON-flip (rewrites the T3 pre-flip pin): the dialog's engine
+    /// cycle visits all four engines exactly once and returns to start —
+    /// Duckdb is now creatable from the picker.
+    #[test]
+    fn next_engine_cycles_through_all_four() {
+        let mut seen = vec![Engine::Postgres];
+        let mut e = Engine::Postgres;
+        for _ in 0..3 {
+            e = next_engine(e);
+            assert!(!seen.contains(&e), "cycle revisited {e:?} early");
+            seen.push(e);
+        }
+        assert!(seen.contains(&Engine::Duckdb), "Duckdb must be reachable from the picker");
+        assert_eq!(next_engine(e), Engine::Postgres, "cycle must close back to the start");
+    }
+
+    /// G16: the shared file-based predicate itself, all four engines.
+    #[test]
+    fn engine_is_file_based_covers_all_engines() {
+        assert!(!engine_is_file_based(Engine::Postgres));
+        assert!(!engine_is_file_based(Engine::Mssql));
+        assert!(engine_is_file_based(Engine::Sqlite));
+        assert!(engine_is_file_based(Engine::Duckdb));
     }
 
     #[test]
@@ -2619,7 +2668,7 @@ mod test_vault_prompt_tests {
     /// true "by inspection" (design §2).
     #[test]
     fn invariant_unlocked_vault_never_needs_any_prompt() {
-        for engine in [Engine::Postgres, Engine::Mssql, Engine::Sqlite] {
+        for engine in [Engine::Postgres, Engine::Mssql, Engine::Sqlite, Engine::Duckdb] {
             for password_field_empty in [false, true] {
                 for vault_file_exists in [false, true] {
                     assert!(!test_needs_vault_prompt(
@@ -2894,7 +2943,19 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
         )
         .child(field_row("Host", ui.host.clone(), *cx.theme()))
         .child(field_row("Port", ui.port.clone(), *cx.theme()))
-        .child(field_row("Databáze", ui.database.clone(), *cx.theme()))
+        .child(field_row("Databáze", ui.database.clone(), *cx.theme()));
+
+    // G16 §2: file-path hint for the file-based engines — the fields
+    // themselves render for all engines (sqlite convention, no conditional
+    // HIDING); only this hint row is conditional.
+    if engine_is_file_based(ui.engine) {
+        panel = panel.child(
+            div()
+                .text_color(cx.theme().text_muted)
+                .child("u SQLite/DuckDB: cesta k databázovému souboru (host/port/heslo se nepoužijí)"),
+        );
+    }
+    panel = panel
         .child(field_row("Uživatel", ui.user.clone(), *cx.theme()))
         .child(field_row("Heslo", ui.password.clone(), *cx.theme()))
         .child(field_row("Složka", ui.folder.clone(), *cx.theme()))

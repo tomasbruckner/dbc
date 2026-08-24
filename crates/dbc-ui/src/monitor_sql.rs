@@ -236,6 +236,9 @@ pub fn kill_sql(engine: dbc_state::Engine, pid: i64) -> Option<String> {
         dbc_state::Engine::Postgres => Some(format!("SELECT pg_terminate_backend({pid})")),
         dbc_state::Engine::Mssql => Some(format!("KILL {pid}")),
         dbc_state::Engine::Sqlite => None,
+        // G16: protocol interrupt != server-side kill; the embedded engine
+        // has no sessions to terminate. Same posture as sqlite.
+        dbc_state::Engine::Duckdb => None,
     }
 }
 
@@ -338,6 +341,8 @@ mod tests {
         );
         assert_eq!(kill_sql(dbc_state::Engine::Mssql, 55), Some("KILL 55".to_string()));
         assert_eq!(kill_sql(dbc_state::Engine::Sqlite, 1), None);
+        // G16: embedded engine, no server sessions — same posture as sqlite.
+        assert_eq!(kill_sql(dbc_state::Engine::Duckdb, 5), None);
     }
 
     /// Documents design §0's rejected alternative: the pg kill statement

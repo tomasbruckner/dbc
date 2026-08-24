@@ -876,6 +876,50 @@ impl QueryRunner {
         });
         rx
     }
+
+    /// G16 T4: DuckDB backup — `ATTACH`/`COPY FROM DATABASE`/`DETACH` over
+    /// ONE dedicated connection via `Connection::execute` (sanctioned under
+    /// the G11 backup entry, amended in dbc-core/src/connection.rs).
+    /// Allowed on read-only configs at the GUARD level (Backup stays
+    /// exempt, design CURATION item 2) — what happens next is engine
+    /// behavior, pinned by `duckdb_backup_on_read_only_config_pins_engine_behavior`.
+    pub fn run_duckdb_backup(
+        &self,
+        spec: ConnectSpec,
+        dest_path: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            let result = run_duckdb_backup_inner(spec, dest_path, handle).await;
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
+    /// G16 T4: DuckDB restore — magic sniff (`backup::duckdb_magic_ok`,
+    /// `DUCK` at offset 8) then `fs::copy`, mirroring `run_sqlite_restore`
+    /// exactly: no `ConnectSpec` (plain file operation), `read_only`
+    /// threaded explicitly and self-guarded as the inner fn's FIRST action
+    /// (same G11 T4 review MAJOR 2 posture — never protected solely by the
+    /// UI-layer caller).
+    pub fn run_duckdb_restore(
+        &self,
+        db_path: String,
+        backup_path: String,
+        read_only: bool,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                run_duckdb_restore_inner(&db_path, &backup_path, read_only)
+            })
+            .await
+            .unwrap_or_else(|_| Err(QueryError::msg("restore task panicked")));
+            let _ = tx.send(result);
+        });
+        rx
+    }
 }
 
 /// G7 T5: pure SQL composer + guard, extracted as a standalone function
@@ -994,6 +1038,9 @@ fn spec_dialect(spec: &ConnectSpec) -> dbc_core::Dialect {
             dbc_state::Engine::Postgres => dbc_core::Dialect::Postgres,
             dbc_state::Engine::Sqlite => dbc_core::Dialect::Sqlite,
             dbc_state::Engine::Mssql => dbc_core::Dialect::Mssql,
+            // G16: DuckDB composes/tx-controls under the pg dialect (G12
+            // curation item 2 — same mapping as main.rs::sql_dialect).
+            dbc_state::Engine::Duckdb => dbc_core::Dialect::Postgres,
         },
         // CLI-arg URLs have no MSSQL form (main.rs::engine_from_url: a
         // postgres[ql]:// scheme or a sqlite file path only) — mirrors that
@@ -1003,6 +1050,26 @@ fn spec_dialect(spec: &ConnectSpec) -> dbc_core::Dialect {
                 dbc_core::Dialect::Postgres
             } else {
                 dbc_core::Dialect::Sqlite
+            }
+        }
+    }
+}
+
+/// G16 T5: sibling of `spec_dialect` — the ENGINE behind a spec, for the
+/// per-engine decisions that a Dialect can't carry (DuckDB maps to
+/// `Dialect::Postgres`, so `plan_payload_col`/the analyze-write refusal
+/// need the engine itself). Same capture-before-`open_spec` convention.
+fn spec_engine(spec: &ConnectSpec) -> dbc_state::Engine {
+    match spec {
+        ConnectSpec::Config { cfg, .. } => cfg.engine,
+        // CLI-arg URLs have no MSSQL (or DuckDB) form
+        // (main.rs::engine_from_url: a postgres[ql]:// scheme or a sqlite
+        // file path only) — mirrors that exact dispatch.
+        ConnectSpec::Url(url) => {
+            if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+                dbc_state::Engine::Postgres
+            } else {
+                dbc_state::Engine::Sqlite
             }
         }
     }
@@ -1262,20 +1329,28 @@ async fn run_write_transaction_inner(
 /// has a `&mut dyn Connection` to call `.query()` on here, since its plan
 /// text arrives via `MssqlConnection::query_with_session`, which isn't
 /// part of the `Connection` trait.
+/// G16 T5: gained `payload_col` — DuckDB's EXPLAIN result set is
+/// `(explain_key, explain_value)` with the payload in the SECOND column
+/// (`plan::plan_payload_col`, capture-pinned); every legacy caller passes
+/// `0` explicitly, keeping pg/mssql behavior byte-identical.
 async fn drain_single_text_cell(
     conn: &mut dyn Connection,
     sql: &str,
     cancel: CancelToken,
+    payload_col: usize,
 ) -> Result<String, QueryError> {
     let mut stream = conn.query(sql, cancel).await?;
     let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
     while let Some(item) = stream.batches.recv().await {
         buf.push(item?).map_err(|e| QueryError::msg(e.to_string()))?;
     }
-    if buf.row_count() == 0 || buf.cell_is_null(0, 0) {
+    if buf.row_count() == 0
+        || payload_col >= buf.column_count()
+        || buf.cell_is_null(0, payload_col)
+    {
         return Err(QueryError::msg("EXPLAIN ANALYZE nevrátil žádný řádek"));
     }
-    Ok(buf.cell_text(0, 0))
+    Ok(buf.cell_text(0, payload_col))
 }
 
 /// G15 T7: sibling of `drain_single_text_cell` that reads an
@@ -1475,12 +1550,14 @@ async fn drive_analyze_write(
     explain_analyze_sql: &str,
     cancel: CancelToken,
     dialect: dbc_core::Dialect,
+    payload_col: usize,
 ) -> Result<String, QueryError> {
     if let Err(e) = conn.execute(dbc_core::tx_begin_sql(dialect), cancel.clone()).await {
         let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.clone()).await;
         return Err(e);
     }
-    let plan_result = drain_single_text_cell(conn, explain_analyze_sql, cancel.clone()).await;
+    let plan_result =
+        drain_single_text_cell(conn, explain_analyze_sql, cancel.clone(), payload_col).await;
     let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.clone()).await; // ALWAYS — see doc comment.
     plan_result
 }
@@ -1495,10 +1572,12 @@ async fn drive_analyze_write_bounded(
     cancel: CancelToken,
     dialect: dbc_core::Dialect,
     timeout_secs: Option<u64>,
+    payload_col: usize,
 ) -> Result<String, QueryError> {
     match timeout_secs {
         Some(t) => {
-            let sequence = drive_analyze_write(conn, explain_analyze_sql, cancel.clone(), dialect);
+            let sequence =
+                drive_analyze_write(conn, explain_analyze_sql, cancel.clone(), dialect, payload_col);
             match tokio::time::timeout(Duration::from_secs(t), sequence).await {
                 Ok(result) => result,
                 Err(_elapsed) => {
@@ -1511,7 +1590,7 @@ async fn drive_analyze_write_bounded(
                 }
             }
         }
-        None => drive_analyze_write(conn, explain_analyze_sql, cancel, dialect).await,
+        None => drive_analyze_write(conn, explain_analyze_sql, cancel, dialect, payload_col).await,
     }
 }
 
@@ -1527,11 +1606,27 @@ async fn run_analyze_write_inner(
     handle: tokio::runtime::Handle,
 ) -> Result<String, QueryError> {
     guard_not_read_only(spec_is_read_only(&spec))?; // belt-and-braces — see doc comment.
+    if spec_engine(&spec) == dbc_state::Engine::Duckdb {
+        // G16 T5 (resolved deviation 3): see main.rs::run_explain's Duckdb
+        // NeedsConfirm refusal — the driver session model (query() clones
+        // fresh sessions off the shared root, invisible to execute()'s
+        // persistent exec_conn) makes the BEGIN→ROLLBACK wrapper a no-op
+        // for DuckDB: the analyzed write would durably COMMIT while the UI
+        // claims it was rolled back. Belt-and-braces at this choke point
+        // ("each layer holds on its own") — the refusal fires BEFORE
+        // open_spec, so not even a connection is constructed. Pinned by
+        // duckdb_query_sessions_do_not_see_execute_transactions.
+        return Err(QueryError::msg(
+            "EXPLAIN ANALYZE zápisu není pro DuckDB podporováno — analyzovaný zápis nelze bezpečně vrátit",
+        ));
+    }
     // Captured BEFORE `spec` moves into `open_spec` (G15 T5).
     let dialect = spec_dialect(&spec);
+    let payload_col = crate::plan::plan_payload_col(spec_engine(&spec));
     let mut opened = open_spec(spec, handle).await?;
     let cancel = CancelToken::new();
-    drive_analyze_write_bounded(&mut *opened.conn, &explain_analyze_sql, cancel, dialect, timeout_secs).await
+    drive_analyze_write_bounded(&mut *opened.conn, &explain_analyze_sql, cancel, dialect, timeout_secs, payload_col)
+        .await
     // `opened` drops here unconditionally — the ultimate backstop, same as run_write_transaction_inner.
 }
 
@@ -1647,6 +1742,7 @@ async fn run_mssql_backup_inner(
         &mut *opened.conn,
         &backup::build_verify_backup_file_exists_sql(&server_path),
         CancelToken::new(),
+        0,
     )
     .await?;
     if exists.trim() != "1" {
@@ -1717,6 +1813,7 @@ async fn run_mssql_restore_inner(
                 &mut *opened.conn,
                 &backup::build_verify_database_online_sql(&database),
                 cancel.clone(),
+                0,
             )
             .await
             {
@@ -1780,6 +1877,68 @@ fn run_sqlite_restore_inner(db_path: &str, backup_path: &str, read_only: bool) -
     let n = f.read(&mut header).map_err(|e| QueryError::msg(e.to_string()))?;
     if !backup::sqlite_magic_header_ok(&header[..n]) {
         return Err(QueryError::msg("soubor není SQLite databáze"));
+    }
+    drop(f);
+    std::fs::copy(backup_path, db_path).map_err(|e| QueryError::msg(e.to_string()))?;
+    Ok(())
+}
+
+/// G16 T4: `QueryRunner::run_duckdb_backup`'s async body — mirrors
+/// `run_sqlite_backup_inner`: shared read-only guard first (Backup stays
+/// EXEMPT per G11 curation item 2 — same predicate, no new logic), ONE
+/// dedicated connection opened in the config's OWN mode (never a sneaky
+/// read-write open: that would trip the driver's mixed-mode policy against
+/// any concurrent read-only root, and silently escalating privileges for a
+/// convenience feature is the wrong trade — a read-only instance that
+/// refuses the write-mode ATTACH surfaces the engine's error verbatim, the
+/// posture G11 curation item 2 blessed; pinned by
+/// duckdb_backup_on_read_only_config_pins_engine_behavior). The source db
+/// name is asked of the engine (`SELECT current_database()`), then the
+/// three build_duckdb_backup_sql statements run in order.
+///
+/// DETACH is best-effort ALWAYS once ATTACH succeeded (resolved deviation
+/// 6): the driver's registry root is shared process-wide and ATTACH is
+/// catalog-level, so skipping DETACH after a failed COPY would leak the
+/// `__dbc_backup` attachment into every other session on this file for as
+/// long as any root holder lives.
+async fn run_duckdb_backup_inner(
+    spec: ConnectSpec,
+    dest_path: String,
+    handle: tokio::runtime::Handle,
+) -> Result<(), QueryError> {
+    backup::guard_backup_restore_read_only(backup::BackupOp::Backup, spec_is_read_only(&spec))
+        .map_err(QueryError::msg)?;
+    let mut opened = open_spec(spec, handle).await?;
+    let src_db =
+        drain_single_text_cell(&mut *opened.conn, "SELECT current_database()", CancelToken::new(), 0)
+            .await?;
+    let stmts = backup::build_duckdb_backup_sql(&src_db, &dest_path);
+    opened.conn.execute(&stmts[0], CancelToken::new()).await?; // ATTACH — fail here = nothing to clean
+    let copy_res = opened.conn.execute(&stmts[1], CancelToken::new()).await;
+    let detach_res = opened.conn.execute(&stmts[2], CancelToken::new()).await; // ALWAYS — see doc comment
+    copy_res?;
+    detach_res?;
+    Ok(())
+}
+
+/// G16 T4: `QueryRunner::run_duckdb_restore`'s sync body — mirrors
+/// `run_sqlite_restore_inner` exactly: (1) read-only HARD-BLOCK first, no
+/// exemption, before ANY I/O; (2) magic sniff (`backup::duckdb_magic_ok`,
+/// `DUCK` at offset 8) — refuses without copying; (3) `fs::copy` over the
+/// target. If any live root holds the target (this process or another),
+/// the OS copy fails loudly and is surfaced verbatim — acceptable, the
+/// per-dispatch connection model makes a lingering root the exception
+/// (design §13). Typed-database-name confirm friction: unchanged, same
+/// modal as every restore (caller side).
+fn run_duckdb_restore_inner(db_path: &str, backup_path: &str, read_only: bool) -> Result<(), QueryError> {
+    backup::guard_backup_restore_read_only(backup::BackupOp::Restore, read_only)
+        .map_err(QueryError::msg)?;
+    let mut header = [0u8; 16];
+    let mut f = std::fs::File::open(backup_path).map_err(|e| QueryError::msg(e.to_string()))?;
+    use std::io::Read;
+    let n = f.read(&mut header).map_err(|e| QueryError::msg(e.to_string()))?;
+    if !backup::duckdb_magic_ok(&header[..n]) {
+        return Err(QueryError::msg("soubor není DuckDB databáze"));
     }
     drop(f);
     std::fs::copy(backup_path, db_path).map_err(|e| QueryError::msg(e.to_string()))?;
@@ -3084,10 +3243,11 @@ async fn run_monitor_refresh(
                 tables: drain_rows(conn, ms::TABLES, &cancel).await,
             }
         }
-        // Sqlite: no monitor concept (spec) — unreachable today
-        // (`monitor_available` gates `open_monitor` to Postgres/MSSQL-once-
-        // flipped), message unchanged.
-        dbc_state::Engine::Sqlite => {
+        // Sqlite/Duckdb: no monitor concept (spec; G16 for Duckdb — an
+        // embedded engine has no server sessions, locks, or DMVs) —
+        // unreachable today (`monitor_available` gates `open_monitor` to
+        // Postgres/MSSQL-once-flipped), message unchanged.
+        dbc_state::Engine::Sqlite | dbc_state::Engine::Duckdb => {
             let err = || Err("monitor není pro tento engine k dispozici".to_string());
             monitor::RefreshResults {
                 connections: err(), locks: err(), data_size: err(), wal_size: err(),
@@ -3833,7 +3993,7 @@ mod analyze_write_tests {
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new()).await.unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'a')", CancelToken::new()).await.unwrap();
 
-        let out = drive_analyze_write(&mut *conn, "SELECT 'plan-text'", CancelToken::new(), dbc_core::Dialect::Sqlite).await.unwrap();
+        let out = drive_analyze_write(&mut *conn, "SELECT 'plan-text'", CancelToken::new(), dbc_core::Dialect::Sqlite, 0).await.unwrap();
         assert_eq!(out, "plan-text");
         // Sanity: this connection is still usable afterward (ROLLBACK, not
         // a leaked open transaction) — a fresh statement succeeds.
@@ -3880,6 +4040,7 @@ mod analyze_write_tests {
             "INSERT INTO t VALUES (99, 'ghost') RETURNING n",
             CancelToken::new(),
             dbc_core::Dialect::Postgres,
+            0,
         )
         .await
         .unwrap();
@@ -3894,7 +4055,7 @@ mod analyze_write_tests {
     async fn drive_analyze_write_still_rolls_back_when_the_query_step_errors() {
         let (_f, mut conn) = open_sqlite_test_conn().await;
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", CancelToken::new()).await.unwrap();
-        let err = drive_analyze_write(&mut *conn, "SELECT * FROM no_such_table", CancelToken::new(), dbc_core::Dialect::Sqlite)
+        let err = drive_analyze_write(&mut *conn, "SELECT * FROM no_such_table", CancelToken::new(), dbc_core::Dialect::Sqlite, 0)
             .await
             .unwrap_err();
         assert!(!err.message.is_empty());
@@ -7597,7 +7758,7 @@ mod mssql_docker_tests {
                 .await
                 .unwrap();
             let spid_text =
-                drain_single_text_cell(&mut *blocker.conn, "SELECT CAST(@@SPID AS VARCHAR(10))", CancelToken::new())
+                drain_single_text_cell(&mut *blocker.conn, "SELECT CAST(@@SPID AS VARCHAR(10))", CancelToken::new(), 0)
                     .await
                     .unwrap();
             let blocker_spid: i64 = spid_text.trim().parse().expect("numeric @@SPID");
@@ -7832,6 +7993,7 @@ mod mssql_docker_tests {
                 &mut *master.conn,
                 &format!("SELECT CAST(v AS VARCHAR(10)) FROM [{db}].dbo.t WHERE id = 1"),
                 CancelToken::new(),
+                0,
             )
             .await
             .unwrap();
@@ -7857,6 +8019,7 @@ mod mssql_docker_tests {
                 &mut *verify.conn,
                 &format!("SELECT CAST(v AS VARCHAR(10)) FROM [{db}].dbo.t WHERE id = 1"),
                 CancelToken::new(),
+                0,
             )
             .await
             .unwrap();
@@ -8172,6 +8335,7 @@ mod mssql_docker_tests {
                 &mut *verify.conn,
                 &format!("SELECT CAST(v AS VARCHAR(10)) FROM dbo.[{table}] WHERE id = 1"),
                 CancelToken::new(),
+                0,
             )
             .await
             .unwrap();
@@ -8316,6 +8480,7 @@ mod mssql_docker_tests {
                 &mut *verify.conn,
                 &format!("SELECT CAST(v AS VARCHAR(10)) FROM dbo.[{table}] WHERE id = 1"),
                 CancelToken::new(),
+                0,
             )
             .await
             .unwrap();
@@ -8343,5 +8508,569 @@ mod mssql_docker_tests {
 
             let _ = verify.conn.execute(&format!("DROP TABLE dbo.[{table}]"), CancelToken::new()).await;
         });
+    }
+}
+
+/// G16 T4: DuckDB backup/restore over real temp-file databases — the
+/// embedded live tier (design §10), no docker, plain #[tokio::test].
+#[cfg(test)]
+mod duckdb_backup_restore_tests {
+    use super::*;
+
+    fn duckdb_cfg(path: &str, read_only: bool) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "d1".into(),
+            name: "duck".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Duckdb,
+            host: String::new(),
+            port: None,
+            database: path.into(),
+            user: String::new(),
+            read_only,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: None,
+        }
+    }
+
+    async fn seed_db(path: &std::path::Path) {
+        let mut c = dbc_driver_duckdb::DuckdbConnection::new(path);
+        c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)", CancelToken::new())
+            .await
+            .unwrap();
+        c.execute("INSERT INTO t VALUES (1, 'Příliš žluťoučký'), (2, 'kůň')", CancelToken::new())
+            .await
+            .unwrap();
+    }
+
+    /// Row count of t in the database at `path`, read through the driver.
+    async fn count_t(path: &std::path::Path) -> String {
+        let mut c = dbc_driver_duckdb::DuckdbConnection::new_with_options(path, true);
+        let mut stream = c.query("SELECT count(*) FROM t", CancelToken::new()).await.unwrap();
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.unwrap()).unwrap();
+        }
+        buf.cell_text(0, 0)
+    }
+
+    /// The COPY-FROM-DATABASE availability gate (design §13 risk 1,
+    /// converted to a test): proves the vendored engine (~1.10504.0)
+    /// supports the idiom end-to-end, AND verifies the DUCK-at-offset-8
+    /// magic constant against a REAL file (design §7 — never
+    /// documentation-trusted).
+    #[tokio::test]
+    async fn duckdb_backup_end_to_end_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.duckdb");
+        let dest = dir.path().join("zaloha.duckdb");
+        seed_db(&src).await;
+        let spec = ConnectSpec::Config {
+            cfg: Box::new(duckdb_cfg(src.to_str().unwrap(), false)),
+            secret: None,
+        };
+        run_duckdb_backup_inner(
+            spec,
+            dest.to_string_lossy().into_owned(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
+        // The DEST is a real DuckDB database carrying the seeded rows…
+        assert_eq!(count_t(&dest).await, "2");
+        // …and the magic the restore sniff checks for (constant verified
+        // against a REAL file, per design §7 — not documentation-trusted).
+        let bytes = std::fs::read(&dest).unwrap();
+        assert!(backup::duckdb_magic_ok(&bytes));
+        assert!(!backup::sqlite_magic_header_ok(&bytes));
+    }
+
+    /// Two backups while a browse connection holds the shared root: the
+    /// second succeeds ONLY if the first's DETACH really ran (a leaked
+    /// __dbc_backup attachment on the shared root would collide) — the
+    /// resolved-deviation-6 regression pin.
+    #[tokio::test]
+    async fn duckdb_backup_twice_on_a_live_root_leaves_no_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.duckdb");
+        seed_db(&src).await;
+        let mut browse = dbc_driver_duckdb::DuckdbConnection::new(&src);
+        {
+            // Bind + hold the shared root via a drained query (execute()
+            // refuses row-returning statements on some drivers).
+            let mut s = browse.query("SELECT 1", CancelToken::new()).await.unwrap();
+            while let Some(item) = s.batches.recv().await {
+                item.unwrap();
+            }
+        }
+        let spec = |p: &std::path::Path| ConnectSpec::Config {
+            cfg: Box::new(duckdb_cfg(p.to_str().unwrap(), false)),
+            secret: None,
+        };
+        let d1 = dir.path().join("z1.duckdb");
+        let d2 = dir.path().join("z2.duckdb");
+        run_duckdb_backup_inner(
+            spec(&src),
+            d1.to_string_lossy().into_owned(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
+        run_duckdb_backup_inner(
+            spec(&src),
+            d2.to_string_lossy().into_owned(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count_t(&d2).await, "2");
+        drop(browse);
+    }
+
+    #[tokio::test]
+    async fn duckdb_backup_bad_dest_surfaces_engine_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.duckdb");
+        seed_db(&src).await;
+        let bad = dir.path().join("neexistuje").join("x.duckdb"); // missing parent dir
+        let spec = ConnectSpec::Config {
+            cfg: Box::new(duckdb_cfg(src.to_str().unwrap(), false)),
+            secret: None,
+        };
+        let err = run_duckdb_backup_inner(
+            spec,
+            bad.to_string_lossy().into_owned(),
+            tokio::runtime::Handle::current(),
+        )
+        .await;
+        assert!(err.is_err());
+    }
+
+    /// §7 read-only-backup PIN (design risk 3): Backup is EXEMPT from the
+    /// read-only guard, so the guard passes and what happens next is pure
+    /// ENGINE behavior — an AccessMode::ReadOnly instance asked to ATTACH a
+    /// new file for write. Expected and pinned: the engine refuses and the
+    /// error surfaces verbatim (G11 curation item 2 posture). IF this
+    /// assertion fails because the vendored engine ALLOWS it, flip the
+    /// assertion to is_ok(), verify the dest file's contents, and record
+    /// the observed behavior in the commit message — either behavior is
+    /// acceptable; silent divergence is not.
+    #[tokio::test]
+    async fn duckdb_backup_on_read_only_config_pins_engine_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.duckdb");
+        let dest = dir.path().join("z.duckdb");
+        seed_db(&src).await;
+        let spec = ConnectSpec::Config {
+            cfg: Box::new(duckdb_cfg(src.to_str().unwrap(), true)),
+            secret: None,
+        };
+        let result = run_duckdb_backup_inner(
+            spec,
+            dest.to_string_lossy().into_owned(),
+            tokio::runtime::Handle::current(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "expected the read-only instance to refuse the write-mode ATTACH; got Ok — see this test's doc comment"
+        );
+    }
+
+    #[tokio::test]
+    async fn duckdb_restore_happy_path_replaces_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("backup.duckdb");
+        seed_db(&src).await;
+        let target = dir.path().join("live.duckdb");
+        std::fs::write(&target, b"stale not-a-database content").unwrap();
+        run_duckdb_restore_inner(target.to_str().unwrap(), src.to_str().unwrap(), false).unwrap();
+        assert_eq!(count_t(&target).await, "2");
+    }
+
+    #[tokio::test]
+    async fn duckdb_restore_refuses_wrong_magic_without_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("fake.duckdb");
+        let mut content = backup::SQLITE_MAGIC_HEADER.to_vec(); // a SQLITE file posing as duckdb
+        content.extend_from_slice(b"rest");
+        std::fs::write(&src, &content).unwrap();
+        let target = dir.path().join("live.duckdb");
+        std::fs::write(&target, b"untouched").unwrap();
+        let err = run_duckdb_restore_inner(target.to_str().unwrap(), src.to_str().unwrap(), false)
+            .unwrap_err();
+        assert_eq!(err.message, "soubor není DuckDB databáze");
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched"); // no copy attempted
+    }
+
+    #[tokio::test]
+    async fn duckdb_restore_refuses_read_only_before_any_io() {
+        // backup_path deliberately nonexistent: a read-only refusal must
+        // fire BEFORE the open — the error is the guard's, not file-not-found.
+        let err = run_duckdb_restore_inner(r"D:\nope\live.duckdb", r"D:\nope\missing.duckdb", true)
+            .unwrap_err();
+        assert!(
+            err.message.contains("čtení"),
+            "expected the read-only guard message, got: {}",
+            err.message
+        );
+    }
+
+    /// G16 T5 (resolved deviation 3, THE safety item): the runner choke
+    /// point refuses analyze-of-a-write for DuckDB BEFORE `open_spec` —
+    /// belt-and-braces under main.rs::run_explain's UI-side refusal
+    /// ("each layer holds on its own"). The db file must NOT exist after:
+    /// the refusal precedes any connection construction.
+    #[tokio::test]
+    async fn duckdb_analyze_write_is_refused_before_any_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never.duckdb");
+        let spec = ConnectSpec::Config {
+            cfg: Box::new(duckdb_cfg(path.to_str().unwrap(), false)),
+            secret: None,
+        };
+        let err = run_analyze_write_inner(
+            spec,
+            "EXPLAIN (ANALYZE, FORMAT JSON) UPDATE t SET x = 1".to_string(),
+            None,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("nelze bezpečně vrátit"), "got: {}", err.message);
+        assert!(!path.exists(), "refusal must precede open_spec — no db file may be created");
+    }
+
+    /// PIN behind the T5 analyze-write refusal (the session property):
+    /// query() clones run OUTSIDE execute()'s exec_conn transaction — a
+    /// BEGIN issued via execute() is invisible to the session that would
+    /// run EXPLAIN (ANALYZE …), so the BEGIN→ROLLBACK wrapper cannot wrap
+    /// the analyzed write. If this test ever FAILS (the count reads "1"),
+    /// the driver's session model changed and the refusal should be
+    /// re-evaluated — the two must agree.
+    #[tokio::test]
+    async fn duckdb_query_sessions_do_not_see_execute_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("tx.duckdb");
+        let mut conn = dbc_driver_duckdb::DuckdbConnection::new(&db);
+        conn.execute("CREATE TABLE t(id INTEGER)", CancelToken::new()).await.unwrap();
+        conn.execute("BEGIN", CancelToken::new()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1)", CancelToken::new()).await.unwrap();
+        // A query() clone must NOT see the uncommitted insert.
+        let mut stream = conn.query("SELECT count(*) FROM t", CancelToken::new()).await.unwrap();
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.unwrap()).unwrap();
+        }
+        assert_eq!(buf.cell_text(0, 0), "0", "query() session saw exec_conn's open transaction");
+        conn.execute("ROLLBACK", CancelToken::new()).await.unwrap();
+    }
+
+    /// Resolved deviation 7: the dialog's file-stem preview of the source
+    /// db name agrees with the engine's own current_database() for a
+    /// normal path (execution uses the engine's answer regardless).
+    #[tokio::test]
+    async fn duckdb_backup_command_line_preview_matches_engine_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("analytics.duckdb");
+        seed_db(&src).await;
+        let mut c = dbc_driver_duckdb::DuckdbConnection::new(&src);
+        let mut stream = c.query("SELECT current_database()", CancelToken::new()).await.unwrap();
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.unwrap()).unwrap();
+        }
+        assert_eq!(buf.cell_text(0, 0), "analytics");
+    }
+}
+
+/// G16 §6/§10: the embedded live tier for DuckDB's pg-style transactional
+/// semantics — the same shapes the sqlite-backed tests above have, existing
+/// because sqlite's mid-tx TOLERANCE would mask the pg-style abort
+/// divergence these pin. (The session-property pin behind T5's
+/// analyze-write refusal — duckdb_query_sessions_do_not_see_execute_transactions
+/// — lives in duckdb_backup_restore_tests above, landed with T5.)
+#[cfg(test)]
+mod duckdb_runner_tests {
+    use super::*;
+    use crate::csv_import::{ColumnMapping, TargetColumn};
+
+    /// Driver fixture quirk: DuckDB must create the file itself.
+    async fn open_duckdb_test_conn() -> (tempfile::TempPath, Box<dyn Connection>) {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let path = f.into_temp_path();
+        std::fs::remove_file(&path).ok();
+        let conn: Box<dyn Connection> =
+            Box::new(dbc_driver_duckdb::DuckdbConnection::new(&path));
+        (path, conn)
+    }
+
+    /// Reads back a single text cell — same body as
+    /// `write_transaction_tests::read_one` (sibling-module duplication
+    /// convention this file already uses).
+    async fn read_one(conn: &mut dyn Connection, sql: &str) -> Option<String> {
+        let mut stream = conn.query(sql, CancelToken::new()).await.expect("query");
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.expect("batch")).expect("push");
+        }
+        if buf.row_count() == 0 {
+            None
+        } else if buf.cell_is_null(0, 0) {
+            Some("<NULL>".to_string())
+        } else {
+            Some(buf.cell_text(0, 0))
+        }
+    }
+
+    fn duckdb_cfg(path: &str, read_only: bool) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "d1".into(),
+            name: "duck".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Duckdb,
+            host: String::new(),
+            port: None,
+            database: path.into(),
+            user: String::new(),
+            read_only,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: None,
+        }
+    }
+
+    /// §6: drive_write_sequence commit happy path over a real .duckdb.
+    #[tokio::test]
+    async fn duckdb_write_sequence_commits() {
+        let (_p, mut conn) = open_duckdb_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new())
+            .await
+            .unwrap();
+        let statements = vec![
+            crate::admin_sql::WriteStatement::from(("INSERT INTO t VALUES (1, 'a')".to_string(), None)),
+            crate::admin_sql::WriteStatement::from((
+                "UPDATE t SET n = 'b' WHERE id = 1".to_string(),
+                Some(1),
+            )),
+        ];
+        drive_write_sequence(&mut *conn, &statements, CancelToken::new(), dbc_core::Dialect::Postgres)
+            .await
+            .unwrap();
+        assert_eq!(read_one(&mut *conn, "SELECT n FROM t WHERE id = 1").await, Some("b".to_string()));
+    }
+
+    /// §6 KEYSTONE: statement 2 fails mid-sequence → the whole tx rolls
+    /// back (DuckDB aborts like pg — the driver's own
+    /// mid_transaction_error_aborts_like_postgres proof, now exercised
+    /// through the app's sanctioned sequence), the best-effort ROLLBACK's
+    /// `let _ =` discard is safe, and the connection stays usable after.
+    #[tokio::test]
+    async fn duckdb_write_sequence_mid_failure_rolls_back_everything() {
+        let (_p, mut conn) = open_duckdb_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", CancelToken::new()).await.unwrap();
+        let statements = vec![
+            crate::admin_sql::WriteStatement::from(("INSERT INTO t VALUES (1)".to_string(), None)),
+            crate::admin_sql::WriteStatement::from(("INSERT INTO t VALUES (1)".to_string(), None)), // dup PK
+        ];
+        let err =
+            drive_write_sequence(&mut *conn, &statements, CancelToken::new(), dbc_core::Dialect::Postgres)
+                .await;
+        assert!(err.is_err());
+        assert_eq!(read_one(&mut *conn, "SELECT count(*) FROM t").await, Some("0".to_string()));
+        // Usable after the abort+rollback:
+        conn.execute("INSERT INTO t VALUES (2)", CancelToken::new()).await.unwrap();
+        assert_eq!(read_one(&mut *conn, "SELECT count(*) FROM t").await, Some("1".to_string()));
+    }
+
+    /// G12 curation item 4 shape, DuckDB variant: a read-only script
+    /// rejects the write CLIENT-SIDE via the SHARED guard — same message,
+    /// no fresh read-only logic, nothing written.
+    #[tokio::test]
+    async fn duckdb_read_only_script_rejects_write_via_shared_guard() {
+        let (_p, mut conn) = open_duckdb_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER)", CancelToken::new()).await.unwrap();
+        let err = run_script_statement(
+            &mut *conn,
+            "INSERT INTO t VALUES (1)",
+            true,
+            dbc_core::Dialect::Postgres,
+            None,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.message, "připojení je jen pro čtení");
+        assert_eq!(read_one(&mut *conn, "SELECT count(*) FROM t").await, Some("0".to_string()));
+    }
+
+    /// §5 through the dispatch matrix: the idiomatic `FROM t` runs AS A
+    /// READ on DuckDB (rows drained, not a row-less execute) — the
+    /// wrong-result bug T2 exists to prevent, proven end to end.
+    #[tokio::test]
+    async fn duckdb_leading_from_statement_runs_as_read() {
+        let (_p, mut conn) = open_duckdb_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER)", CancelToken::new()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2), (3)", CancelToken::new()).await.unwrap();
+        let n = run_script_statement(
+            &mut *conn,
+            "FROM t",
+            true,
+            dbc_core::Dialect::Postgres,
+            None,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, Some(3)); // drained ROW count — the read path, even on read-only
+    }
+
+    /// §4 sandbox Apply end-to-end: generate_statements under
+    /// sql_dialect(Duckdb)=Postgres (pg-style "…" quoting) through the
+    /// sanctioned write sequence — quoted weird column name + Czech
+    /// diacritics survive byte-exact.
+    #[tokio::test]
+    async fn duckdb_sandbox_apply_quoted_column_and_diacritics_round_trip() {
+        let (_p, mut conn) = open_duckdb_test_conn().await;
+        conn.execute(r#"CREATE TABLE t(id INTEGER PRIMARY KEY, "we""ird" TEXT)"#, CancelToken::new())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'old')", CancelToken::new()).await.unwrap();
+        let sql = format!(
+            "UPDATE {} SET {} = {} WHERE {} = 1",
+            dbc_core::quote_qualified(None, "t"),
+            dbc_core::quote_ident("we\"ird"),
+            crate::sandbox::sql_value_d(Some("Příliš žluťoučký kůň"), false, dbc_core::Dialect::Postgres),
+            dbc_core::quote_ident("id"),
+        );
+        let statements = vec![crate::admin_sql::WriteStatement::from((sql, Some(1)))];
+        drive_write_sequence(&mut *conn, &statements, CancelToken::new(), dbc_core::Dialect::Postgres)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_one(&mut *conn, r#"SELECT "we""ird" FROM t WHERE id = 1"#).await,
+            Some("Příliš žluťoučký kůň".to_string())
+        );
+    }
+
+    /// Collects a full drive_script run — same body as script_run_tests'
+    /// drive_collect (sibling-module duplication convention).
+    async fn drive_collect(
+        conn: &mut dyn Connection,
+        read_only: bool,
+        files: &[std::path::PathBuf],
+        opts: &ScriptRunOptions,
+    ) -> Vec<ScriptEvent> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let cancel = CancelToken::new();
+        let drive = async {
+            drive_script(conn, read_only, files, opts, cancel, &tx).await;
+            drop(tx);
+        };
+        let collect = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let ((), events) = tokio::join!(drive, collect);
+        events
+    }
+
+    /// Mirror of `per_file_scope_continue_policy_skips_failed_file_commits_next`
+    /// (sqlite, script_run_tests) — DuckDB per-file scope: file 1's dup-PK
+    /// failure rolls the FILE tx back, Continue moves on, file 2 commits.
+    #[tokio::test]
+    async fn duckdb_script_per_file_continue_rolls_back_failed_file_and_commits_next() {
+        let (_p, mut conn) = open_duckdb_test_conn().await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new())
+            .await
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("01.sql");
+        std::fs::write(&f1, "INSERT INTO t VALUES (1, 'a');\nINSERT INTO t VALUES (1, 'dup');")
+            .unwrap();
+        let f2 = dir.path().join("02.sql");
+        std::fs::write(&f2, "INSERT INTO t VALUES (2, 'b');").unwrap();
+
+        let opts = ScriptRunOptions {
+            tx_scope: TxScope::PerFile,
+            error_policy: ErrorPolicy::Continue,
+            dialect: dbc_core::Dialect::Postgres,
+            statement_timeout_secs: None,
+        };
+        let events = drive_collect(&mut *conn, false, &[f1, f2], &opts).await;
+
+        let file_finished: Vec<_> =
+            events.iter().filter(|e| matches!(e, ScriptEvent::FileFinished { .. })).collect();
+        assert_eq!(file_finished.len(), 2);
+        assert!(matches!(events.last(), Some(ScriptEvent::RunFinished { aborted: false, .. })));
+        // file 1's first INSERT rolled back with the file tx; file 2's committed.
+        assert_eq!(read_one(&mut *conn, "SELECT n FROM t WHERE id = 1").await, None);
+        assert_eq!(read_one(&mut *conn, "SELECT n FROM t WHERE id = 2").await, Some("b".to_string()));
+        assert_eq!(read_one(&mut *conn, "SELECT count(*) FROM t").await, Some("1".to_string()));
+    }
+
+    /// Same body as csv_import_tests' drive_csv_import (sibling-module
+    /// duplication convention).
+    async fn drive_csv_import(spec: ConnectSpec, job: CsvImportJob) -> Vec<CsvImportEvent> {
+        let handle = tokio::runtime::Handle::current();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let task =
+            tokio::spawn(run_csv_import_inner(spec, job, CancelToken::new(), None, handle, tx));
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        task.await.unwrap();
+        events
+    }
+
+    /// Mirror of `csv_import_rolls_back_everything_on_batch_failure`
+    /// (sqlite, csv_import_tests) — DuckDB: the LAST CSV row violates the
+    /// PK, the ONE whole-import transaction rolls back, zero rows land.
+    #[tokio::test]
+    async fn duckdb_csv_import_is_all_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csv.duckdb");
+        {
+            // Seed the target table via the driver; root drops before the
+            // import opens its own connection.
+            let mut seed = dbc_driver_duckdb::DuckdbConnection::new(&db);
+            seed.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)", CancelToken::new())
+                .await
+                .unwrap();
+        }
+        let csv_path = dir.path().join("rows.csv");
+        // Last row repeats id=1 -> PK violation inside the import tx.
+        std::fs::write(&csv_path, "id,name\n1,alice\n2,bob\n1,dup\n").unwrap();
+
+        let spec = ConnectSpec::Config {
+            cfg: Box::new(duckdb_cfg(db.to_str().unwrap(), false)),
+            secret: None,
+        };
+        let job = CsvImportJob {
+            path: csv_path,
+            schema: None,
+            table: "t".to_string(),
+            columns: vec![
+                TargetColumn { name: "id".into(), numeric: true },
+                TargetColumn { name: "name".into(), numeric: false },
+            ],
+            mapping: ColumnMapping { targets: vec![Some(0), Some(1)] },
+        };
+        let events = drive_csv_import(spec, job).await;
+        assert!(matches!(events.last(), Some(CsvImportEvent::Failed { .. })));
+
+        // Re-open via the driver: nothing partial — zero rows.
+        let mut verify = dbc_driver_duckdb::DuckdbConnection::new(&db);
+        assert_eq!(read_one(&mut verify, "SELECT count(*) FROM t").await, Some("0".to_string()));
     }
 }

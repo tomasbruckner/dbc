@@ -144,6 +144,8 @@ pub fn explain_sql(engine: dbc_state::Engine, sql: &str) -> String {
                 .to_string()
         }
         dbc_state::Engine::Sqlite => format!("EXPLAIN QUERY PLAN {sql}"),
+        // G16: DuckDB's JSON explain form — final text (design §8).
+        dbc_state::Engine::Duckdb => format!("EXPLAIN (FORMAT JSON) {sql}"),
     }
 }
 
@@ -169,13 +171,32 @@ pub fn explain_analyze_sql(engine: dbc_state::Engine, sql: &str) -> Option<Strin
         dbc_state::Engine::Postgres => Some(format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}")),
         dbc_state::Engine::Mssql => None,
         dbc_state::Engine::Sqlite => None,
+        // G16: final text (design §8); the analyze-of-a-WRITE refusal for
+        // DuckDB is T5's, in `run_explain` (resolved deviation 3).
+        dbc_state::Engine::Duckdb => Some(format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}")),
+    }
+}
+
+/// Column index of the plan payload within an EXPLAIN result set routed
+/// through the generic wrap-and-run path: DuckDB returns
+/// (explain_key, explain_value) with the JSON in the SECOND column
+/// (capture-pinned by capture_duckdb_explain_json_shapes); pg returns a
+/// single JSON column. Sqlite/Mssql never route their payloads through
+/// this helper (typed rows / query_with_session respectively) — their rows
+/// exist so the mapping is total.
+pub fn plan_payload_col(engine: dbc_state::Engine) -> usize {
+    match engine {
+        dbc_state::Engine::Duckdb => 1,
+        dbc_state::Engine::Postgres | dbc_state::Engine::Mssql | dbc_state::Engine::Sqlite => 0,
     }
 }
 
 /// Whether the "Analyze" button should render at all for `engine`. Stays
 /// `true` for Mssql (G15 T7) — the button itself is not what's gated; see
 /// `mssql_plan_dispatch_available` for the actual ON/OFF switch clicking
-/// it goes through.
+/// it goes through. `Duckdb -> true` (G16, intended): DuckDB HAS an
+/// analyze mode (`EXPLAIN (ANALYZE, FORMAT JSON)`); the write-analyze
+/// refusal lands in T5's `run_explain`, not here.
 pub fn analyze_button_visible(engine: dbc_state::Engine) -> bool {
     !matches!(engine, dbc_state::Engine::Sqlite)
 }
@@ -802,6 +823,170 @@ pub fn parse_pg_json(is_analyze: bool, raw_text: &str) -> Result<PlanResult, Str
     })
 }
 
+/// G16 T5 (design §8 branch 1, capture-confirmed against the committed
+/// tests/fixtures/duckdb_explain_*.json files — the fixtures win over the
+/// plan's original expectations, and they did correct it): DuckDB's
+/// `EXPLAIN (FORMAT JSON)` payload is an ARRAY of operator nodes spelled
+/// `{name, children, extra_info}`; `EXPLAIN (ANALYZE, FORMAT JSON)` is a
+/// single top-level WRAPPER OBJECT (`query_name`, `latency` in seconds,
+/// whole-query counters, empty `extra_info`) whose `children` hold the
+/// operator tree with the ANALYZE spelling: `operator_name`,
+/// `operator_timing` (seconds), `operator_cardinality`. One struct covers
+/// both spellings via optional fields; `extra_info` values may be strings
+/// OR arrays (`Projections`), so they stay `serde_json::Value`.
+#[derive(Debug, Deserialize)]
+struct DuckPlanJson {
+    /// Estimated-plan node spelling.
+    #[serde(default)]
+    name: Option<String>,
+    /// ANALYZE operator-node spelling.
+    #[serde(default)]
+    operator_name: Option<String>,
+    // NOTE: the ANALYZE wrapper also carries `query_name` (the full SQL
+    // text) — deliberately NOT deserialized: far too long for a node
+    // label (the wrapper renders as "Query"), and the verbatim payload in
+    // `raw_text` preserves it for the raw toggle; serde skips unknown
+    // fields by default.
+    /// ANALYZE top-level wrapper only: whole-query wall time in SECONDS.
+    #[serde(default)]
+    latency: Option<f64>,
+    #[serde(default)]
+    extra_info: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    children: Vec<DuckPlanJson>,
+    /// ANALYZE per-operator wall time in SECONDS.
+    #[serde(default)]
+    operator_timing: Option<f64>,
+    /// ANALYZE per-operator produced-row count.
+    #[serde(default)]
+    operator_cardinality: Option<f64>,
+}
+
+/// `extra_info` value → display text: bare strings verbatim, everything
+/// else (arrays, numbers) via JSON `to_string` — design §8's "rest, never
+/// dropped" stringification for the DuckDB parser.
+fn duck_value_str(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Iterative conversion — copies `convert_pg_tree`'s explicit frame-stack
+/// shape verbatim (Global Constraints "Deep recursive tree hazard": never
+/// a self-calling function; serde_json's own 128-deep recursion limit
+/// bounds the parse itself, the same argument the pg parser relies on).
+/// Per-node mapping (capture-grounded): `operation` = `name` else
+/// `operator_name` (trimmed), else `"Query"` (the ANALYZE wrapper);
+/// `target` = first of `extra_info` keys `Table`/`Relation`/`Function`
+/// with a non-empty stringified value — VERBATIM, so DuckDB's qualified
+/// `db.schema.table` spelling is preserved, never rewritten; `est_rows` =
+/// `extra_info["Estimated Cardinality"]` (a STRING in the capture) parsed
+/// as f64; `est_cost` = None (DuckDB reports no cost unit);
+/// `actual_time_ms` = `operator_timing` × 1000; `actual_rows` =
+/// `operator_cardinality`; `extra` = EVERY `extra_info` entry in map
+/// order, including the lifted ones (design §8: "rest, never dropped").
+fn convert_duckdb_tree(root: DuckPlanJson) -> PlanNode {
+    struct Frame {
+        operation: String,
+        target: Option<String>,
+        est_rows: Option<f64>,
+        actual_rows: Option<f64>,
+        actual_time_ms: Option<f64>,
+        extra: Vec<(String, String)>,
+        pending: Vec<DuckPlanJson>,
+        done: Vec<PlanNode>,
+    }
+
+    fn make_frame(mut j: DuckPlanJson) -> Frame {
+        let operation = j
+            .name
+            .take()
+            .or_else(|| j.operator_name.take())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "Query".to_string());
+        let target = ["Table", "Relation", "Function"].iter().find_map(|k| {
+            j.extra_info
+                .get(*k)
+                .map(duck_value_str)
+                .filter(|s| !s.trim().is_empty())
+        });
+        let est_rows = finite(
+            j.extra_info
+                .get("Estimated Cardinality")
+                .and_then(|v| duck_value_str(v).trim().parse::<f64>().ok()),
+        );
+        let extra: Vec<(String, String)> =
+            j.extra_info.iter().map(|(k, v)| (k.clone(), duck_value_str(v))).collect();
+        let mut pending = std::mem::take(&mut j.children);
+        pending.reverse(); // pop() takes from the end -> preserves original order
+        Frame {
+            operation,
+            target,
+            est_rows,
+            actual_rows: finite(j.operator_cardinality),
+            actual_time_ms: finite(j.operator_timing.map(|s| s * 1000.0)),
+            extra,
+            pending,
+            done: Vec::new(),
+        }
+    }
+
+    let mut stack: Vec<Frame> = vec![make_frame(root)];
+    loop {
+        let top = stack.last_mut().expect("stack never empty inside loop");
+        if let Some(child_json) = top.pending.pop() {
+            stack.push(make_frame(child_json));
+            continue;
+        }
+        let frame = stack.pop().expect("just checked non-empty");
+        let node = PlanNode {
+            operation: frame.operation,
+            target: frame.target,
+            est_cost: None, // DuckDB reports no cost unit
+            est_rows: frame.est_rows,
+            actual_rows: frame.actual_rows,
+            actual_time_ms: frame.actual_time_ms,
+            loops: None,
+            rows_removed_by_filter: None,
+            buffers: None,
+            extra: frame.extra,
+            children: frame.done,
+        };
+        match stack.last_mut() {
+            Some(parent) => parent.done.push(node),
+            None => return node,
+        }
+    }
+}
+
+/// G16 T5: the real DuckDB JSON parser — estimated payloads are an ARRAY
+/// of roots, ANALYZE payloads a single wrapper OBJECT (capture-pinned);
+/// accept both. The wrapper's `latency` (seconds) becomes
+/// `total_execution_time_ms`. Errors here never reach the user: `parse_plan`
+/// degrades any `Err` to `parse_duckdb_raw`'s verbatim single root.
+pub fn parse_duckdb_json(is_analyze: bool, raw_text: &str) -> Result<PlanResult, String> {
+    let roots: Vec<DuckPlanJson> = match serde_json::from_str::<Vec<DuckPlanJson>>(raw_text) {
+        Ok(v) => v,
+        Err(_) => vec![
+            serde_json::from_str::<DuckPlanJson>(raw_text)
+                .map_err(|e| format!("neplatný JSON plánu: {e}"))?,
+        ],
+    };
+    let root_json =
+        roots.into_iter().next().ok_or_else(|| "prázdné pole v odpovědi EXPLAIN".to_string())?;
+    let total_execution_time_ms = finite(root_json.latency.map(|s| s * 1000.0));
+    Ok(PlanResult {
+        root: convert_duckdb_tree(root_json),
+        is_analyze,
+        engine: dbc_state::Engine::Duckdb,
+        total_planning_time_ms: None,
+        total_execution_time_ms,
+        top_level_hints: Vec::new(), // DuckDB emits no engine hints
+        raw_text: raw_text.to_string(),
+    })
+}
+
 /// Dispatches by engine; SQLite is NOT routed through here — its parser
 /// needs typed rows, not raw text (T1's `parse_sqlite_rows`, called
 /// directly by T6's tab-construction code).
@@ -818,6 +1003,45 @@ pub fn parse_plan(engine: dbc_state::Engine, is_analyze: bool, raw_text: &str) -
         dbc_state::Engine::Sqlite => Err(
             "parse_plan: SQLite plans are row-shaped — call parse_sqlite_rows directly (see plan.rs's parser entry point doc)".to_string(),
         ),
+        // G16 T5: the capture-gated JSON parser, with T3's raw single
+        // root as the fallback — still never an Err for a wired engine.
+        dbc_state::Engine::Duckdb => Ok(match parse_duckdb_json(is_analyze, raw_text) {
+            Ok(parsed) => parsed,
+            // Fail-closed for a plan VIEWER = never render a fabricated
+            // tree: unrecognized/malformed payloads degrade to the
+            // verbatim raw-text single root (T3's parse_duckdb_raw).
+            Err(_) => parse_duckdb_raw(is_analyze, raw_text),
+        }),
+    }
+}
+
+/// G16 T3 (design §8, fallback branch pre-landed): a single-root
+/// `PlanResult` whose `raw_text` carries DuckDB's EXPLAIN output verbatim —
+/// the plan tab's raw-text surface is the primary view until T5's
+/// capture-gated JSON parser lands, and remains the fail-open path for
+/// output that parser doesn't recognize afterwards. Never an `Err`: a
+/// wired engine must not have a dead "Plán" button (design §8).
+pub fn parse_duckdb_raw(is_analyze: bool, raw_text: &str) -> PlanResult {
+    PlanResult {
+        root: PlanNode {
+            operation: "DuckDB plán".to_string(),
+            target: None,
+            est_cost: None,
+            est_rows: None,
+            actual_rows: None,
+            actual_time_ms: None,
+            loops: None,
+            rows_removed_by_filter: None,
+            buffers: None,
+            extra: Vec::new(),
+            children: Vec::new(),
+        },
+        is_analyze,
+        engine: dbc_state::Engine::Duckdb,
+        total_planning_time_ms: None,
+        total_execution_time_ms: None,
+        top_level_hints: Vec::new(),
+        raw_text: raw_text.to_string(),
     }
 }
 
@@ -911,6 +1135,11 @@ mod model_tests {
             explain_sql(dbc_state::Engine::Sqlite, "SELECT 1"),
             "EXPLAIN QUERY PLAN SELECT 1"
         );
+        // G16: DuckDB's final estimated-plan text (design §8).
+        assert_eq!(
+            explain_sql(dbc_state::Engine::Duckdb, "SELECT 1"),
+            "EXPLAIN (FORMAT JSON) SELECT 1"
+        );
         // G15 T7 review MINOR fix REQUIRED test (the "routing pin" —
         // `main.rs::run_explain`'s Mssql dispatch itself has no direct
         // test seam per GPUI convention, so this is the safety net): even
@@ -942,6 +1171,12 @@ mod model_tests {
         // here makes the generic wrap-and-run path structurally unable to
         // ever emit the broken one-string form again (fail closed).
         assert_eq!(explain_analyze_sql(dbc_state::Engine::Mssql, "SELECT 1"), None);
+        // G16: DuckDB HAS an analyze mode — final text (design §8); the
+        // write-analyze refusal is T5's, in run_explain.
+        assert_eq!(
+            explain_analyze_sql(dbc_state::Engine::Duckdb, "SELECT 1"),
+            Some("EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1".to_string())
+        );
     }
 
     #[test]
@@ -949,6 +1184,27 @@ mod model_tests {
         assert!(analyze_button_visible(dbc_state::Engine::Postgres));
         assert!(analyze_button_visible(dbc_state::Engine::Mssql));
         assert!(!analyze_button_visible(dbc_state::Engine::Sqlite));
+        // G16: visible for DuckDB — it has a real analyze mode.
+        assert!(analyze_button_visible(dbc_state::Engine::Duckdb));
+    }
+
+    /// G16 T3: the pre-decided raw fallback (design §8) — single root,
+    /// verbatim text, never an Err (a wired engine must not have a dead
+    /// "Plán" button).
+    #[test]
+    fn parse_duckdb_raw_single_root_preserves_text() {
+        let raw = "┌───────────────────────────┐\n│ SEQ_SCAN t │\n└───────────┘";
+        for is_analyze in [false, true] {
+            let result = parse_duckdb_raw(is_analyze, raw);
+            assert_eq!(result.root.operation, "DuckDB plán");
+            assert!(result.root.children.is_empty());
+            assert_eq!(result.raw_text, raw);
+            assert_eq!(result.engine, dbc_state::Engine::Duckdb);
+            assert_eq!(result.is_analyze, is_analyze);
+            // parse_plan's Duckdb arm routes here and never errors.
+            let via_dispatch = parse_plan(dbc_state::Engine::Duckdb, is_analyze, raw).unwrap();
+            assert_eq!(via_dispatch.raw_text, raw);
+        }
     }
 
     /// G15 T8 ON-flip — see mssql_plan_dispatch_available's doc comment
@@ -2111,5 +2367,171 @@ mod plan_view_tests {
              — expected well under 1s (O(n)); measured ~79ms during development, and the old \
              path-based PlanNodeId took ~73s here"
         );
+    }
+}
+
+/// G16 T5: fixture-driven parser tests over the CAPTURED payloads (the
+/// committed tests/fixtures/duckdb_explain_*.json files are verbatim
+/// eprintln output of `capture_duckdb_explain_json_shapes`).
+#[cfg(test)]
+mod duckdb_parser_tests {
+    use super::*;
+
+    /// Iterative pre-order walk (no recursion, house rule) returning the
+    /// first node matching `pred`.
+    fn find_node<'a>(root: &'a PlanNode, pred: &dyn Fn(&PlanNode) -> bool) -> Option<&'a PlanNode> {
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            if pred(n) {
+                return Some(n);
+            }
+            stack.extend(n.children.iter());
+        }
+        None
+    }
+
+    #[test]
+    fn duckdb_seq_scan_fixture_parses() {
+        let raw = include_str!("../tests/fixtures/duckdb_explain_seq_scan.json");
+        let result = parse_duckdb_json(false, raw).unwrap();
+        assert_eq!(result.engine, dbc_state::Engine::Duckdb);
+        assert!(!result.is_analyze);
+        assert!(!result.root.children.is_empty(), "tree depth must be >= 1");
+        // Capture ground truth: DuckDB reports the QUALIFIED table name
+        // (`cap.main.t`) — preserved verbatim, never rewritten.
+        let scan = find_node(&result.root, &|n| n.operation == "SEQ_SCAN")
+            .expect("seq-scan node present");
+        assert_eq!(scan.target.as_deref(), Some("cap.main.t"));
+        assert!(!scan.extra.is_empty(), "extra_info entries must survive");
+        assert_eq!(scan.est_rows, Some(2.0)); // "Estimated Cardinality": "2"
+        assert_eq!(result.raw_text, raw); // verbatim, for the raw toggle
+    }
+
+    #[test]
+    fn duckdb_join_fixture_has_two_children() {
+        let raw = include_str!("../tests/fixtures/duckdb_explain_join.json");
+        let result = parse_duckdb_json(false, raw).unwrap();
+        let join = find_node(&result.root, &|n| n.operation == "HASH_JOIN")
+            .expect("join node present");
+        assert_eq!(join.children.len(), 2);
+        // Both scan children keep their (qualified) targets in order.
+        assert_eq!(join.children[0].target.as_deref(), Some("cap.main.t"));
+        assert_eq!(join.children[1].target.as_deref(), Some("cap.main.u"));
+    }
+
+    #[test]
+    fn duckdb_analyze_fixture_carries_timings() {
+        let raw = include_str!("../tests/fixtures/duckdb_explain_analyze.json");
+        let result = parse_duckdb_json(true, raw).unwrap();
+        assert!(result.is_analyze);
+        // The ANALYZE wrapper object (query_name/latency, no operator
+        // name) renders as a "Query" root with the whole-query wall time.
+        assert_eq!(result.root.operation, "Query");
+        assert!(result.total_execution_time_ms.is_some(), "wrapper latency must be lifted");
+        let timed = find_node(&result.root, &|n| {
+            n.actual_time_ms.is_some() && n.actual_rows.is_some()
+        })
+        .expect("some operator carries ANALYZE timings");
+        assert!(timed.actual_time_ms.unwrap() >= 0.0);
+    }
+
+    #[test]
+    fn duckdb_malformed_json_degrades_to_raw_root() {
+        let result = parse_plan(dbc_state::Engine::Duckdb, false, "!! not json").unwrap();
+        assert_eq!(result.root.operation, "DuckDB plán");
+        assert_eq!(result.raw_text, "!! not json");
+        assert!(result.root.children.is_empty());
+    }
+
+    #[test]
+    fn plan_payload_col_table() {
+        assert_eq!(plan_payload_col(dbc_state::Engine::Postgres), 0);
+        assert_eq!(plan_payload_col(dbc_state::Engine::Mssql), 0);
+        assert_eq!(plan_payload_col(dbc_state::Engine::Sqlite), 0);
+        assert_eq!(plan_payload_col(dbc_state::Engine::Duckdb), 1);
+    }
+
+    /// End-to-end estimated plan over a REAL temp-file database: driver →
+    /// ResultBuffer → payload column → parse_plan, asserting the REAL
+    /// parser handled live output (root is not the raw fallback's label).
+    #[tokio::test]
+    async fn duckdb_estimated_plan_end_to_end_uses_real_parser() {
+        use dbc_core::{CancelToken, Connection};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("e2e.duckdb");
+        let mut conn = dbc_driver_duckdb::DuckdbConnection::new(&db);
+        conn.execute("CREATE TABLE t(id INTEGER)", CancelToken::new()).await.unwrap();
+        let mut stream = conn
+            .query("EXPLAIN (FORMAT JSON) SELECT * FROM t", CancelToken::new())
+            .await
+            .unwrap();
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.unwrap()).unwrap();
+        }
+        let payload = buf.cell_text(0, plan_payload_col(dbc_state::Engine::Duckdb));
+        let result = parse_plan(dbc_state::Engine::Duckdb, false, &payload).unwrap();
+        assert_ne!(
+            result.root.operation, "DuckDB plán",
+            "live output must route through parse_duckdb_json, not the raw fallback"
+        );
+    }
+}
+
+/// G16 T5 step 1 — the fixture-capture gate (G13 curation item 5's
+/// discipline, embedded so it costs milliseconds): runs both EXPLAIN forms
+/// through the REAL driver and pins the result shape the extraction code
+/// depends on (two text columns, JSON payload in the LAST one, parseable
+/// by serde_json). The eprintln'd payloads are the source of the committed
+/// tests/fixtures/duckdb_explain_*.json files — re-capture whenever the
+/// vendored duckdb crate is bumped.
+#[cfg(test)]
+mod duckdb_capture_tests {
+    use super::*;
+    use dbc_core::{CancelToken, Connection};
+
+    #[tokio::test]
+    async fn capture_duckdb_explain_json_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cap.duckdb");
+        let mut conn = dbc_driver_duckdb::DuckdbConnection::new(&db);
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)", CancelToken::new())
+            .await
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t SELECT range, 'r' || range FROM range(1000)",
+            CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        conn.execute("CREATE TABLE u(id INTEGER, t_id INTEGER)", CancelToken::new())
+            .await
+            .unwrap();
+
+        for (label, sql) in [
+            ("seq_scan", "EXPLAIN (FORMAT JSON) SELECT * FROM t WHERE name = 'r5'"),
+            ("join", "EXPLAIN (FORMAT JSON) SELECT * FROM t JOIN u ON u.t_id = t.id"),
+            ("analyze", "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM t"),
+        ] {
+            let mut stream = conn.query(sql, CancelToken::new()).await.unwrap();
+            let names: Vec<String> =
+                stream.columns.fields().iter().map(|f| f.name().to_string()).collect();
+            let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+            while let Some(item) = stream.batches.recv().await {
+                buf.push(item.unwrap()).unwrap();
+            }
+            assert!(buf.row_count() >= 1, "{label}: EXPLAIN returned no rows");
+            let payload_col = buf.column_count() - 1;
+            assert_eq!(
+                payload_col,
+                plan_payload_col(dbc_state::Engine::Duckdb),
+                "{label}: payload column moved — update plan_payload_col AND the fixtures (cols: {names:?})"
+            );
+            let payload = buf.cell_text(0, payload_col);
+            let parsed: serde_json::Value = serde_json::from_str(&payload)
+                .unwrap_or_else(|e| panic!("{label}: payload is not JSON ({e}): {payload}"));
+            assert!(parsed.is_array() || parsed.is_object(), "{label}: unexpected JSON shape");
+            eprintln!("=== duckdb_explain_{label}.json ===\n{payload}\n");
+        }
     }
 }
