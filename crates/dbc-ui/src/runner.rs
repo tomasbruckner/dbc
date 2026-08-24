@@ -620,7 +620,7 @@ impl QueryRunner {
     /// G12 T7: runs a CSV import (design T7) — a SANCTIONED runner-owned
     /// write path (§3-novela): ONE transaction for the WHOLE import (not
     /// configurable, unlike `run_script`'s `tx_scope`), streaming batched
-    /// `INSERT`s via `csv_import::generate_insert_batches`. FIRST action,
+    /// `INSERT`s via `csv_import::generate_insert_batches_d`. FIRST action,
     /// before any file or DB touch: the SHARED `guard_not_read_only` guard
     /// (CURATION items 1(c)/4(b)'s runtime half). Cancellation is checked
     /// BETWEEN batches only (bounded by the 500-row cap); `timeout_secs`
@@ -2035,7 +2035,7 @@ async fn run_csv_import_inner(
 /// this is the same "blocking work never runs on a runtime worker thread"
 /// dispatch `open_spec`/`read_and_split_file` already use) that chunks rows
 /// into `CSV_IMPORT_BATCH_SIZE`-row pieces over a bounded channel, executing
-/// one `INSERT` per chunk via `csv_import::generate_insert_batches`. ANY
+/// one `INSERT` per chunk via `csv_import::generate_insert_batches_d`. ANY
 /// failure (BEGIN, producer parse/IO error, a chunk's generated statement
 /// erroring) ROLLBACKs and reports zero rows imported — never partial.
 async fn run_csv_import_drive(
@@ -2111,7 +2111,14 @@ async fn run_csv_import_drive(
         let _ = tx
             .send(CsvImportEvent::BatchStarted { batch_index, rows_in_batch: rows.len() })
             .await;
-        let stmts = crate::csv_import::generate_insert_batches(
+        // Batch C review BLOCKER 1: dialect-aware sibling, threading the
+        // SAME `dialect` this function's BEGIN/COMMIT/ROLLBACK already use
+        // (`spec_dialect`, resolved once by the caller) — an MSSQL CSV
+        // import must bracket-quote idents and `N''`-prefix string literals,
+        // not silently double-quote/plain-`''` (collation corruption class,
+        // probe-proven before this fix).
+        let stmts = crate::csv_import::generate_insert_batches_d(
+            dialect,
             job.schema.as_deref(),
             &job.table,
             &job.columns,
@@ -3868,19 +3875,29 @@ mod csv_import_tests {
     }
 
     /// G15 T5 REQUIRED (regression for G12's bare-`BEGIN`-on-MSSQL bug —
-    /// bare `BEGIN` is invalid T-SQL): `run_csv_import_drive`'s FIRST
-    /// captured statement, on an Mssql dialect, is the fused
-    /// `SET XACT_ABORT ON; BEGIN TRANSACTION`, byte-equal to
-    /// `dbc_core::tx_begin_sql(Dialect::Mssql)`.
+    /// bare `BEGIN` is invalid T-SQL), EXTENDED by batch C review BLOCKER 1
+    /// (probe-proven: `run_csv_import_drive` was calling the pg-only
+    /// `generate_insert_batches`, ignoring its own `dialect` param — fused
+    /// MSSQL BEGIN but double-quoted idents + a bare `'Příliš'` literal, a
+    /// collation-corruption class bug). Drives a REAL temp CSV file (not a
+    /// missing path) so an actual INSERT is captured, and asserts the WHOLE
+    /// statement sequence is dialect-correct: fused `XACT_ABORT` BEGIN,
+    /// bracket-quoted/`N''`-literal INSERT, plain `COMMIT`.
     #[tokio::test]
     async fn csv_import_mssql_begin_is_dialect_correct() {
         let mut conn = CapturingConnection { statements: Vec::new() };
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("rows.csv");
+        std::fs::write(&csv_path, "id,note\n1,Příliš\n").unwrap();
         let job = CsvImportJob {
-            path: std::path::PathBuf::from("Z:/does/not/exist.csv"),
+            path: csv_path,
             schema: None,
             table: "t".to_string(),
-            columns: vec![TargetColumn { name: "id".into(), numeric: true }],
-            mapping: ColumnMapping { targets: vec![Some(0)] },
+            columns: vec![
+                TargetColumn { name: "id".into(), numeric: true },
+                TargetColumn { name: "note".into(), numeric: false },
+            ],
+            mapping: ColumnMapping { targets: vec![Some(0), Some(1)] },
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
         let cancel = CancelToken::new();
@@ -3891,9 +3908,19 @@ mod csv_import_tests {
         };
         let collect = async { while rx.recv().await.is_some() {} };
         tokio::join!(drive, collect);
+
         assert_eq!(
             conn.statements.first().map(String::as_str),
             Some(dbc_core::tx_begin_sql(dbc_core::Dialect::Mssql)),
+            "csv import must open with the fused XACT_ABORT begin on MSSQL"
+        );
+        let insert = conn.statements.get(1).expect("an INSERT statement must have been captured");
+        assert!(insert.starts_with("INSERT INTO [t]"), "expected bracket-quoted table, got: {insert}");
+        assert!(insert.contains("N'Příliš'"), "expected an N''-prefixed literal, got: {insert}");
+        assert!(!insert.contains('"'), "must not double-quote identifiers on MSSQL: {insert}");
+        assert_eq!(
+            conn.statements.last().map(String::as_str),
+            Some(dbc_core::tx_commit_sql(dbc_core::Dialect::Mssql))
         );
     }
 

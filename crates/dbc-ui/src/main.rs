@@ -36,7 +36,7 @@ use std::rc::Rc;
 use dbc_buffer::ResultBuffer;
 use dbc_core::arrow::datatypes::SchemaRef;
 use dbc_core::{
-    apply_auto_limit_d, find_params, is_read_statement, quote_qualified_d, substitute_params,
+    apply_auto_limit_d, find_params, is_read_statement_d, quote_qualified_d, substitute_params,
     CancelToken, FkRef, QueryError, SchemaSnapshot, TableInfo,
 };
 use dbc_state::{
@@ -296,6 +296,16 @@ fn sql_dialect(engine: dbc_state::Engine) -> dbc_core::Dialect {
         dbc_state::Engine::Sqlite => dbc_core::Dialect::Sqlite,
         dbc_state::Engine::Mssql => dbc_core::Dialect::Mssql,
     }
+}
+
+/// `run_query_with`'s Guard 1 pure decision (batch C review BLOCKER 2):
+/// `true` means refuse. Dialect-aware via `is_read_statement_d` — for MSSQL
+/// this client-side check is the ONLY read-only enforcement (no server-side
+/// backstop, driver integration note 5), so it must not false-reject a
+/// bracket-quoted reserved word like `SELECT [Delete] FROM AuditLog`.
+/// Extracted so this is directly unit-testable without a GPUI `Context`.
+fn read_only_guard_rejects(sql: &str, read_only: bool, dialect: dbc_core::Dialect) -> bool {
+    read_only && !is_read_statement_d(sql, dialect)
 }
 
 /// G15 §2c: `SplitError` -> user-facing Czech text. Used by
@@ -1474,14 +1484,28 @@ impl AppView {
             }
         }
 
+        // Resolved once, above every guard that needs it (batch C review
+        // BLOCKER 2): `conn_meta`'s engine -> `dbc_core::Dialect`, same
+        // expression Guard 2 used to compute separately (now hoisted so
+        // Guard 1 can use it too, and both guards agree on the SAME
+        // resolution — no risk of the two guards seeing different dialects
+        // for the same run).
+        let dialect = conn_meta.map(|(_, e)| sql_dialect(e)).unwrap_or(dbc_core::Dialect::Postgres);
+
         // Guard 1: read-only — rejected client-side without connecting.
         // (Server-side enforcement lives in connect::open_config: Postgres
         // `default_transaction_read_only=on`, SQLite `SQLITE_OPEN_READ_ONLY`
         // — this check is the fast, no-connection-needed first line, not the
         // only line — EXCEPT MSSQL, which has no server-side read-only mode
         // (driver integration note 5): for MSSQL this client-side check IS
-        // the only line.)
-        if read_only && !is_read_statement(&sql) {
+        // the only line, so it MUST be dialect-aware — a bracket-quoted
+        // reserved word like `[Delete]` must not false-reject a genuine
+        // read via `is_read_statement_d` (batch C review BLOCKER 2; was
+        // the plain pg-only `is_read_statement` here, falsifying this exact
+        // comment's own stated invariant). Decision extracted to
+        // `read_only_guard_rejects` so it's directly unit-testable without a
+        // GPUI `Context`.
+        if read_only_guard_rejects(&sql, read_only, dialect) {
             let err = QueryError::msg("connection is read-only");
             self.status = format!("error: {err}");
             cx.notify();
@@ -1497,7 +1521,6 @@ impl AppView {
         let mut limit_suffix = String::new();
         if !bypass_auto_limit {
             if let Some(n) = auto_limit {
-                let dialect = conn_meta.map(|(_, e)| sql_dialect(e)).unwrap_or(dbc_core::Dialect::Postgres);
                 let (rewritten, changed) = apply_auto_limit_d(&sql, n, dialect);
                 if changed {
                     sql = rewritten;
@@ -2805,6 +2828,14 @@ impl AppView {
         // actually compares; `conn_label` is display-only.
         let conn_identity = self.current_conn_identity();
         let conn_label = self.current_connection_label();
+        // Batch C review BLOCKER 1: captured alongside `conn_identity` (same
+        // rationale — the connection dropdown stays clickable through the
+        // picker/pre-count pass) so the sample SQL shown below is built for
+        // the SAME connection `conn_identity` refers to; `confirm_csv_import`
+        // re-resolves the engine itself for the actual execution, but only
+        // ever proceeds when `conn_identity` still matches — display/exec
+        // parity holds because both resolve from the same connection.
+        let dialect = self.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres);
 
         self.status = "výběr CSV souboru…".to_string();
         cx.notify();
@@ -2878,7 +2909,11 @@ impl AppView {
             let _ = this.update(cx, |view, cx| match peek {
                 Ok((headers, row_count, first_rows)) => {
                     let mapping = default_csv_mapping(&headers, &columns);
-                    let sample_sql = csv_import::generate_insert_batches(
+                    // Batch C review BLOCKER 1: dialect-aware sibling —
+                    // `dialect` resolved above alongside `conn_identity`, the
+                    // same connection the actual import will run against.
+                    let sample_sql = csv_import::generate_insert_batches_d(
+                        dialect,
                         schema.as_deref(),
                         &table,
                         &columns,
@@ -2960,6 +2995,14 @@ impl AppView {
     /// target) fills `error` and disables "Spustit import" (see
     /// `render_csv_import_panel`'s `can_run` gate).
     fn recompute_csv_sample(&mut self, cx: &mut Context<Self>) {
+        // Batch C review BLOCKER 1: resolved BEFORE the `&mut self.modal`
+        // borrow below (needs `&self`) — same resolution
+        // (`active_engine` -> `sql_dialect`) `start_csv_import` captured for
+        // the initial sample; execution only ever proceeds when the active
+        // connection still matches the modal's `conn_identity`
+        // (`confirm_csv_import`'s guard), so this stays in parity with what
+        // will actually run.
+        let dialect = self.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres);
         if let Some(connections_ui::ModalState::CsvImport {
             schema,
             table,
@@ -2972,7 +3015,8 @@ impl AppView {
         }) = &mut self.modal
         {
             let mapping = csv_import::ColumnMapping { targets: targets.clone() };
-            match csv_import::generate_insert_batches(
+            match csv_import::generate_insert_batches_d(
+                dialect,
                 schema.as_deref(),
                 table,
                 columns.as_slice(),
@@ -8260,6 +8304,36 @@ mod multi_statement_tests {
         assert_eq!(sql_dialect(dbc_state::Engine::Postgres), dbc_core::Dialect::Postgres);
         assert_eq!(sql_dialect(dbc_state::Engine::Sqlite), dbc_core::Dialect::Sqlite);
         assert_eq!(sql_dialect(dbc_state::Engine::Mssql), dbc_core::Dialect::Mssql);
+    }
+
+    /// Batch C review BLOCKER 2 regression: on a read-only MSSQL connection
+    /// (where this client-side check is the ONLY read-only enforcement — no
+    /// server-side backstop), a bracket-quoted reserved word must not
+    /// false-reject a genuine read. Also proves pg behavior is unchanged —
+    /// `arr[1]` (an array subscript, not MSSQL bracket-quoting) still reads
+    /// fine and a real write is still rejected on both dialects.
+    #[test]
+    fn read_only_guard_rejects_is_dialect_aware() {
+        // MSSQL: bracket-quoted reserved word reads fine on a read-only
+        // connection — this is exactly the probe-proven false-reject the
+        // plain pg-only `is_read_statement` used to produce.
+        assert!(!read_only_guard_rejects(
+            "SELECT [Delete] FROM AuditLog",
+            true,
+            dbc_core::Dialect::Mssql
+        ));
+        // MSSQL: a real write is still rejected on a read-only connection.
+        assert!(read_only_guard_rejects("UPDATE t SET x = 1", true, dbc_core::Dialect::Mssql));
+        // MSSQL: writable connection never refuses regardless of statement.
+        assert!(!read_only_guard_rejects("UPDATE t SET x = 1", false, dbc_core::Dialect::Mssql));
+        // pg regression: `[1]` is an array subscript, not bracket-quoting —
+        // behavior must stay exactly as before this fix.
+        assert!(!read_only_guard_rejects(
+            "SELECT arr[1] FROM t",
+            true,
+            dbc_core::Dialect::Postgres
+        ));
+        assert!(read_only_guard_rejects("UPDATE t SET x = 1", true, dbc_core::Dialect::Postgres));
     }
 
     /// CURATION item 3's mandated test: two statements each carrying `:p` —

@@ -281,9 +281,20 @@ pub enum AnalyzeGate {
 
 /// §5's three-case dispatch, decided purely from the RAW (pre-`EXPLAIN`-
 /// wrap) editor SQL — the exact same `dbc_core::is_read_statement` call
-/// `run_query_with`'s Guard 1 already makes on the pre-wrap text; "Explain"
-/// (estimated) never calls this at all (§5: always safe, unconditionally,
-/// on every engine).
+/// `run_query_with`'s Guard 1 USED to make on the pre-wrap text before batch
+/// C review BLOCKER 2 (main.rs) switched Guard 1 to the dialect-aware
+/// `is_read_statement_d`; "Explain" (estimated) never calls this at all
+/// (§5: always safe, unconditionally, on every engine).
+///
+/// KNOWN GAP (flagged by the batch C review, not fixed here — T7 delivery
+/// closes it alongside `run_mssql_plan`): this still calls the pg-only
+/// `is_read_statement`, so a bracket-quoted reserved word (e.g.
+/// `SELECT [Delete] FROM AuditLog`) on a read-only MSSQL connection can
+/// wrongly hit `Blocked` instead of `Run` — fails safe (over-refuses a
+/// legitimate read), same class of bug as Guard 1's, just not yet wired to
+/// a real MSSQL connection/dialect here. Fix when T7 wires `run_mssql_plan`:
+/// thread the resolved `dbc_core::Dialect` in and switch to
+/// `is_read_statement_d`, mirroring `main.rs`'s Guard 1 fix.
 pub fn analyze_gate(sql: &str, read_only: bool) -> AnalyzeGate {
     if dbc_core::is_read_statement(sql) {
         AnalyzeGate::Run

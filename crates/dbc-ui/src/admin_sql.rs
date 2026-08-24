@@ -32,6 +32,18 @@ pub fn quote_qualified_for(engine: Engine, schema: &str, object: &str) -> String
 /// sandbox::sql_value applies on its quoted path, extracted here because
 /// catalog filters and passwords need the literal WITHOUT the numeric
 /// bare-path heuristic.
+///
+/// KNOWN GAP (flagged by the batch C review, not fixed here): dialect-
+/// agnostic plain `'...'` — MSSQL admin statements built from this (e.g.
+/// `ALTER ROLE ... PASSWORD = '...'`, catalog filter literals) don't get
+/// the `N''` prefix `sandbox::sql_value_d`/`csv_import::generate_insert_batches_d`
+/// use for MSSQL text. Admin SQL against MSSQL isn't live yet (gated until
+/// T8) so this is inert today; T8's live admin validation must either
+/// thread a dialect through here (an `_d` sibling, same pattern as every
+/// other dialect-aware helper in this codebase) or confirm via the matrix
+/// that plain `'...'` is acceptable for every caller (unlikely for
+/// non-ASCII text under a non-UTF8 collation — the same class of bug batch
+/// C's CSV import fix closed).
 pub fn sql_string_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }

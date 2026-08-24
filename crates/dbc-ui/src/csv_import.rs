@@ -11,15 +11,21 @@
 //!
 //! T7 (CSV import UI) is what actually calls into this module (file picker,
 //! header peek, mapping modal, row pre-count, the runner method that drives
-//! `generate_insert_batches` against a real connection) -- wired in by
+//! `generate_insert_batches_d` against a real connection) -- wired in by
 //! `runner::run_csv_import`/`main.rs`'s CSV import UI.
 //!
 //! G15 T4: `generate_insert_batches_d` is the dialect-aware sibling
-//! (bracket-quoted identifiers, `N''` literals for MSSQL); see its doc
-//! comment (and `generate_insert_batches`'s) for why no call site threads a
-//! real dialect through yet -- `main.rs`'s preview/sample-SQL call and
-//! `runner.rs::run_csv_import_inner`'s execution call must move together in
-//! a later task to preserve display/exec parity.
+//! (bracket-quoted identifiers, `N''` literals for MSSQL). G15 batch C
+//! review (BLOCKER 1): `main.rs`'s two preview/sample-SQL call sites
+//! (`start_csv_import`, `recompute_csv_sample`) and
+//! `runner.rs::run_csv_import_drive`'s execution call now ALL thread a real
+//! resolved dialect through `generate_insert_batches_d` together, in the
+//! same change -- display/exec parity holds because both resolve dialect
+//! from the same connection (`main.rs::sql_dialect`/`runner.rs::spec_dialect`
+//! agree by construction, both mapping `dbc_state::Engine` 1:1 onto
+//! `dbc_core::Dialect`). `generate_insert_batches` (no `_d`) stays the
+//! pg-convention wrapper, now used only by this module's own pg-shaped
+//! tests.
 
 use std::collections::HashSet;
 
@@ -149,24 +155,15 @@ pub type CsvRow = Vec<Option<String>>;
 /// message identifying the offending column.
 ///
 /// Thin pg-convention wrapper over [`generate_insert_batches_d`] --
-/// byte-identical pre-G15 behavior. **G15 T4 deviation (flagged for
-/// T5/merge):** the plan's T-SQLGEN grounding calls for this name itself
-/// to gain a leading `dialect` parameter, with `main.rs`'s CSV
-/// preview/sample-SQL call sites threading `sql_dialect(engine)`. That
-/// call graph also includes `runner.rs::run_csv_import_inner`'s EXECUTION
-/// call (T5-owned, off-limits here) -- threading the dialect into only
-/// the `main.rs` preview call (display) while leaving the `runner.rs`
-/// execution call on the old pg-only signature would make the CSV
-/// import's shown sample SQL diverge from what actually runs against an
-/// MSSQL table, which is worse than today's (consistently pg-quoted, if
-/// not yet MSSQL-correct) behavior -- a display/exec parity regression
-/// this plan's own CRITICAL constraints forbid. So this wrapper name
-/// keeps its old signature/behavior, unused by anything new; the
-/// dialect-aware sibling is `generate_insert_batches_d`, wired into NO
-/// call site yet. Whoever wires real MSSQL CSV import (T5/T8) must switch
-/// `main.rs`'s two preview call sites AND `runner.rs`'s execution call
-/// site to `generate_insert_batches_d` TOGETHER, threading the same
-/// resolved dialect, in the same change.
+/// byte-identical pre-G15 behavior. **G15 batch C review (BLOCKER 1) closed
+/// the T4 deviation this doc comment used to flag:** every real call site
+/// (`main.rs`'s two preview/sample-SQL sites, `runner.rs::run_csv_import_drive`'s
+/// execution call) now goes through `generate_insert_batches_d` with a real
+/// resolved dialect, switched together in one change to preserve
+/// display/exec parity -- none of them call this wrapper anymore, so it's
+/// `#[cfg(test)]`-only now (this module's own pg-shaped tests + the
+/// pg-byte-identity golden test) rather than dead production code.
+#[cfg(test)]
 pub fn generate_insert_batches(
     schema: Option<&str>,
     table: &str,
@@ -178,9 +175,9 @@ pub fn generate_insert_batches(
 }
 
 /// Dialect-aware sibling of [`generate_insert_batches`] (G15 §2b/§2c —
-/// bracket-quoted identifiers, `N''` string literals for MSSQL). See that
-/// function's doc comment for why it isn't wired into any call site by
-/// this task.
+/// bracket-quoted identifiers, `N''` string literals for MSSQL). Wired into
+/// every real call site as of the batch C review fix -- see
+/// `generate_insert_batches`'s doc comment.
 pub fn generate_insert_batches_d(
     dialect: Dialect,
     schema: Option<&str>,
