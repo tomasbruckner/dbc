@@ -985,6 +985,12 @@ pub enum PendingAfterUnlock {
     /// CURRENT text via `to_form_data`, so whatever the user had typed
     /// stays intact across the detour through this prompt.
     TestConnection(Box<ConnectionDialogUi>),
+    /// App-wide master password UX design §2/§4: the proactive "Odemknout
+    /// trezor" palette action has no interrupted action to resume — it
+    /// opens the prompt on its own, not as a side effect of some other
+    /// click. Carries no data (nothing to redact, unlike the other two
+    /// variants' payloads).
+    Nothing,
 }
 
 #[derive(Clone)]
@@ -1899,7 +1905,7 @@ impl AppView {
     fn on_save_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ModalState::ConnectionDialog(ui)) = self.modal.clone() else { return };
         let data = ui.to_form_data(cx);
-        if data.password.is_empty() || self.vault.is_some() {
+        if !save_needs_vault_prompt(data.password.is_empty(), self.vault.is_some()) {
             self.finish_save(data, cx);
             return;
         }
@@ -2016,6 +2022,44 @@ impl AppView {
         cx.notify();
     }
 
+    /// Design §2's proactive unlock — the palette's "Odemknout trezor"
+    /// action. Same single-modal guard + `MasterPasswordPrompt` shape as
+    /// every lazy trigger (`on_dropdown_item_click`/`on_test_clicked`/
+    /// `on_save_clicked`), just with no interrupted action to carry, hence
+    /// `PendingAfterUnlock::Nothing`. Callers (the palette) are expected to
+    /// have already checked `Vault::exists(..) && self.vault.is_none()` —
+    /// same "caller computes visibility, callee re-guards on `modal`"
+    /// split every other opener in this file follows — but this fn does
+    /// NOT re-check vault-exists/locked itself: unlike the lazy triggers,
+    /// there's no fallback "nothing to do" behaviour to fall through to if
+    /// it's called in the wrong state (there's no data to resume), so a
+    /// stray call would open a pointless-but-harmless unlock prompt rather
+    /// than silently doing nothing.
+    pub(crate) fn open_unlock_vault_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
+        let focus = input.focus_handle(cx);
+        self.modal = Some(ModalState::MasterPasswordPrompt {
+            input,
+            error: None,
+            pending: PendingAfterUnlock::Nothing,
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Design §3 — the palette's "Zamknout trezor" action: a pure state
+    /// change, no modal, no confirmation (relocking is non-destructive; the
+    /// next secret-needing action just re-prompts, §1). `Vault`'s `Drop`
+    /// impl zeroizes the derived key and every decrypted secret
+    /// (`vault.rs:56-74`) the moment `self.vault` is reassigned here.
+    pub(crate) fn lock_vault(&mut self, cx: &mut Context<Self>) {
+        self.status = apply_lock(&mut self.vault).to_string();
+        cx.notify();
+    }
+
     pub(crate) fn on_dropdown_item_click(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let needs_secret = self
             .config
@@ -2023,7 +2067,7 @@ impl AppView {
             .iter()
             .find(|c| c.id == id)
             .map_or(false, |c| c.engine != Engine::Sqlite);
-        if needs_secret && self.vault.is_none() && Vault::exists(&self.vault_path) {
+        if connect_needs_vault_prompt(needs_secret, self.vault.is_some(), Vault::exists(&self.vault_path)) {
             let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
             let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt {
@@ -2124,6 +2168,12 @@ impl AppView {
             PendingAfterUnlock::TestConnection(ui) => {
                 self.modal = Some(ModalState::ConnectionDialog(*ui));
                 self.on_test_clicked(window, cx);
+            }
+            // Design §4: the proactive unlock has nothing to resume — just
+            // report the unlock itself.
+            PendingAfterUnlock::Nothing => {
+                self.status = "Trezor odemčen".into();
+                cx.notify();
             }
         }
     }
@@ -2337,6 +2387,42 @@ fn test_connect_spec(cfg: ConnectionConfig, secret: Option<String>) -> Result<Co
     Ok(ConnectSpec::Config { cfg: Box::new(cfg), secret })
 }
 
+/// Whether `on_dropdown_item_click` (and the palette's `Connection` row,
+/// which routes through it) must prompt for the master password before
+/// switching — extracted (app-wide master password UX design §7/T1) so the
+/// invariant pin below can assert it directly rather than only through
+/// `on_dropdown_item_click`'s GPUI-`Context`-requiring body, which this
+/// crate has no test harness for (see `modal_confirm_kind_tests`'s note).
+/// `needs_secret` is the caller's own `engine != Sqlite` lookup on the
+/// target connection — this fn doesn't know about connections, only the
+/// three booleans the gate actually reduces to.
+fn connect_needs_vault_prompt(needs_secret: bool, vault_unlocked: bool, vault_file_exists: bool) -> bool {
+    needs_secret && !vault_unlocked && vault_file_exists
+}
+
+/// Whether `on_save_clicked` must prompt for the master password (either
+/// flavour — unlock or create, decided separately by `Vault::exists`)
+/// before it can store a non-empty password field. Extracted alongside
+/// `connect_needs_vault_prompt` for the same reason (design §7's invariant
+/// pin needs a pure fn per trigger gate). Unlike the connect/test gates
+/// this one doesn't depend on `vault_file_exists`: SOME prompt (unlock if a
+/// vault file exists, create if not) is needed whenever there's a password
+/// to store and no unlocked vault to store it in.
+fn save_needs_vault_prompt(password_field_empty: bool, vault_unlocked: bool) -> bool {
+    !password_field_empty && !vault_unlocked
+}
+
+/// The pure half of `AppView::lock_vault` (design §3): always clears the
+/// vault and returns the fixed status line, regardless of what was there
+/// before. Split out from the `Context`-touching wrapper (`cx.notify()`) so
+/// the "locking always wipes + reports" invariant is testable without a
+/// GPUI `Context` — this crate has no GPUI test harness (see
+/// `modal_confirm_kind_tests`'s note above `AppView` render helpers).
+fn apply_lock(vault: &mut Option<Vault>) -> &'static str {
+    *vault = None;
+    "Trezor zamčen"
+}
+
 /// Whether `on_test_clicked` must prompt for the master password before
 /// dispatching the test connect — security follow-up #6 (final-review.md):
 /// editing a saved connection with an empty password field while the vault
@@ -2384,6 +2470,138 @@ mod test_vault_prompt_tests {
     fn no_vault_file_never_needs_prompt() {
         // no vault created yet -> nothing to unlock, secret is simply absent.
         assert!(!test_needs_vault_prompt(true, Engine::Postgres, false, false));
+    }
+
+    // --- connect gate (on_dropdown_item_click / the palette's Connection
+    // row) — mirrors the test-gate table above.
+
+    #[test]
+    fn connect_needs_secret_locked_vault_needs_prompt() {
+        assert!(connect_needs_vault_prompt(true, false, true));
+    }
+
+    #[test]
+    fn connect_sqlite_style_no_secret_never_needs_prompt() {
+        assert!(!connect_needs_vault_prompt(false, false, true));
+    }
+
+    #[test]
+    fn connect_unlocked_vault_never_needs_prompt() {
+        assert!(!connect_needs_vault_prompt(true, true, true));
+    }
+
+    #[test]
+    fn connect_no_vault_file_never_needs_prompt() {
+        assert!(!connect_needs_vault_prompt(true, false, false));
+    }
+
+    // --- save gate (on_save_clicked) ---
+
+    #[test]
+    fn save_nonempty_password_locked_vault_needs_prompt() {
+        assert!(save_needs_vault_prompt(false, false));
+    }
+
+    #[test]
+    fn save_empty_password_never_needs_prompt() {
+        assert!(!save_needs_vault_prompt(true, false));
+    }
+
+    #[test]
+    fn save_unlocked_vault_never_needs_prompt() {
+        assert!(!save_needs_vault_prompt(false, true));
+    }
+
+    /// App-wide master password UX design §2/§7's invariant pin: once
+    /// `vault_unlocked` is true, none of the three trigger gates may fire,
+    /// for ANY combination of the other inputs (every engine, every
+    /// password-field state, whether or not a vault file exists on disk).
+    /// This is the test that makes "no code path may re-prompt after one
+    /// successful unlock" a compile-checked fact rather than something only
+    /// true "by inspection" (design §2).
+    #[test]
+    fn invariant_unlocked_vault_never_needs_any_prompt() {
+        for engine in [Engine::Postgres, Engine::Mssql, Engine::Sqlite] {
+            for password_field_empty in [false, true] {
+                for vault_file_exists in [false, true] {
+                    assert!(!test_needs_vault_prompt(
+                        password_field_empty,
+                        engine,
+                        true,
+                        vault_file_exists
+                    ));
+                }
+            }
+        }
+        for needs_secret in [false, true] {
+            for vault_file_exists in [false, true] {
+                assert!(!connect_needs_vault_prompt(needs_secret, true, vault_file_exists));
+            }
+        }
+        for password_field_empty in [false, true] {
+            assert!(!save_needs_vault_prompt(password_field_empty, true));
+        }
+    }
+
+    // --- lock action (AppView::lock_vault's pure half) ---
+
+    #[test]
+    fn apply_lock_clears_vault_and_returns_locked_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("vault.bin");
+        let v = Vault::create(&p, "correct horse").unwrap();
+        let mut vault = Some(v);
+
+        let status = apply_lock(&mut vault);
+
+        assert!(vault.is_none());
+        assert_eq!(status, "Trezor zamčen");
+    }
+
+    #[test]
+    fn apply_lock_on_already_locked_vault_is_a_harmless_no_op() {
+        let mut vault: Option<Vault> = None;
+        let status = apply_lock(&mut vault);
+        assert!(vault.is_none());
+        assert_eq!(status, "Trezor zamčen");
+    }
+
+    // --- resume_pending's Nothing arm (structural — asserted at this
+    // level, not by invoking `resume_pending` itself, since the whole crate
+    // has no GPUI test harness — see `modal_confirm_kind_tests`'s note
+    // above `AppView` render helpers). `pending_resumes_a_dispatch` mirrors
+    // `resume_pending`'s match arms: everything except `Nothing` (design
+    // §4's proactive unlock) has an interrupted action to resume.
+    fn pending_resumes_a_dispatch(pending: &PendingAfterUnlock) -> bool {
+        !matches!(pending, PendingAfterUnlock::Nothing)
+    }
+
+    #[test]
+    fn nothing_pending_resumes_no_dispatch() {
+        assert!(!pending_resumes_a_dispatch(&PendingAfterUnlock::Nothing));
+    }
+
+    #[test]
+    fn connect_and_save_pending_resume_a_dispatch() {
+        assert!(pending_resumes_a_dispatch(&PendingAfterUnlock::Connect("c1".into())));
+        assert!(pending_resumes_a_dispatch(&PendingAfterUnlock::SaveConnection(Box::new(
+            ConnectionFormData {
+                id: "c1".into(),
+                name: String::new(),
+                engine: Engine::Postgres,
+                host: String::new(),
+                port: None,
+                database: String::new(),
+                user: String::new(),
+                password: String::new(),
+                folder: Vec::new(),
+                read_only: false,
+                favourite: false,
+                timeout_secs: None,
+                auto_limit: None,
+                ssh: None,
+            }
+        ))));
     }
 }
 
@@ -2636,7 +2854,12 @@ fn render_master_password_panel(input: Entity<TextField>, error: Option<String>,
         .flex_col()
         .gap_2()
         .text_color(cx.theme().text_primary)
-        .child(div().text_size(px(16.)).child("Master heslo"))
+        .child(div().text_size(px(16.)).child("Odemknout trezor"))
+        .child(
+            div()
+                .text_color(cx.theme().text_muted)
+                .child("Master heslo platí pro celou aplikaci — zadáte ho nejvýše jednou za spuštění."),
+        )
         .child(field_row("Heslo", input, *cx.theme()));
     if let Some(e) = error {
         panel = panel.child(div().text_color(cx.theme().danger).child(e));
@@ -2672,6 +2895,11 @@ fn render_create_master_password_panel(
         .gap_2()
         .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Vytvořit master heslo"))
+        .child(
+            div()
+                .text_color(cx.theme().text_muted)
+                .child("Master heslo platí pro celou aplikaci — zadáte ho nejvýše jednou za spuštění."),
+        )
         .child(field_row("Nové heslo", input1, *cx.theme()))
         .child(field_row("Zopakujte heslo", input2, *cx.theme()));
     if let Some(e) = error {
