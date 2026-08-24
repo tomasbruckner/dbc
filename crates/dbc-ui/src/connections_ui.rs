@@ -2864,7 +2864,7 @@ fn render_compare_picker_column(
         .h(px(240.))
         .overflow_hidden()
         .border_1()
-        .border_color(cx.theme().bg_hover)
+        .border_color(cx.theme().border_subtle)
         .rounded_md();
 
     if !grouped.favourites.is_empty() {

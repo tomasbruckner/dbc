@@ -626,7 +626,7 @@ impl CompareView {
             .p_2()
             .overflow_hidden()
             .border_r_1()
-            .border_color(theme.bg_hover)
+            .border_color(theme.border_subtle)
             .text_color(theme.text_primary)
             .child(self.render_table_section(diff, cx))
             .child(self.render_routine_section(diff, cx))
@@ -922,7 +922,7 @@ impl CompareView {
     fn render_data_diff_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
         let mut section =
-            div().flex().flex_col().gap_2().mt_2().p_2().border_1().border_color(theme.bg_hover).rounded_md();
+            div().flex().flex_col().gap_2().mt_2().p_2().border_1().border_color(theme.border_subtle).rounded_md();
         section = section.child(div().text_color(theme.accent).child("Porovnání dat"));
 
         let where_text = self.data_where.clone();
