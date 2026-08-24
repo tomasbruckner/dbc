@@ -1,7 +1,8 @@
 //! Push-based incremental SQL statement splitter.
 //!
 //! Splits a stream of SQL text (fed in arbitrary byte-sized chunks) into
-//! top-level, `;`-separated statements. This is a **parallel,
+//! top-level, `;`-separated statements (Postgres/Sqlite) or `GO`-line
+//! separated batches (Mssql). This is a **parallel,
 //! independently-implemented** state machine, not a reuse of
 //! `guards::tokenize` -- that function is private, operates on a whole
 //! `&str` in one pass, and has no notion of "pause mid-scan, resume on the
@@ -14,15 +15,27 @@
 //! Fail-closed posture, matching `guards.rs`: any construct still open at
 //! EOF (`finish()`) is reported as [`SplitError::UnterminatedAtEof`] rather
 //! than guessed at.
+//!
+//! **Mssql (G15 §2c):** `;` is NEVER a split point -- T-SQL procedure/
+//! trigger bodies have no dollar-quoting to protect their interior `;`s, so
+//! "statement" simply means "batch" for this dialect. The split trigger is
+//! a bare word `GO` (case-insensitive) that is the first non-whitespace
+//! content on its line, followed only by whitespace or a `--` comment
+//! before the newline; `GO <n>` (a repeat count) is refused fail-closed
+//! ([`SplitError::UnsupportedGoCount`]) rather than silently collapsed to a
+//! single execution. This lives INSIDE this same flat state machine (new
+//! `Mode` variants, no nesting stack beyond the existing depth counters) --
+//! never a separate line-based pre-pass.
 
-/// SQL dialects the splitter understands. `Mssql` intentionally does not
-/// exist yet -- the `GO` batch separator is a client-tool line convention,
-/// not a token-nesting construct, and belongs in a separate line-based
-/// pre-pass when the MSSQL driver phase lands (see the G12 design doc, §1).
+/// SQL dialects the splitter understands. `Mssql` splits on `GO`-lines
+/// (a client-tool batch-separator convention) INSIDE this same state
+/// machine -- never on `;`, which T-SQL DDL bodies use freely with no
+/// dollar-quoting to protect them (G15 design §2c, curation item 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     Postgres,
     Sqlite,
+    Mssql,
 }
 
 /// Which open construct EOF landed inside, for [`SplitError::UnterminatedAtEof`].
@@ -33,6 +46,8 @@ pub enum UnterminatedKind {
     BlockComment,
     DollarQuote,
     TriggerBody,
+    /// Mssql only: EOF occurred inside an open `[...]` bracket identifier.
+    BracketIdent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +60,10 @@ pub enum SplitError {
     /// an open construct. Fail closed, same posture as `guards::tokenize`
     /// returning `None`.
     UnterminatedAtEof(UnterminatedKind),
+    /// Mssql only: `GO <n>` (a repeat count) was seen. Refused fail-closed
+    /// rather than silently executing the batch once instead of `n` times
+    /// (G15 design §2c iv).
+    UnsupportedGoCount,
 }
 
 /// Lexer state. Cheap to copy (small integers only), carried in
@@ -68,6 +87,11 @@ enum Mode {
     InDoubleIdent,
     /// Same ambiguity as `SingleStringMaybeEnd`, for `""`.
     DoubleIdentMaybeEnd,
+    /// Mssql only: inside a `[...]` bracket identifier.
+    InBracketIdent,
+    /// Mssql only: saw a `]` while inside a bracket identifier; deciding
+    /// whether the next char is an escaped `]]` or the real close.
+    BracketIdentMaybeEnd,
     /// `--` comment, runs to end of line (or EOF -- see `finish`'s doc
     /// comment: EOF counts as an implicit EOL, matching every other SQL
     /// tool's behavior; there is deliberately no
@@ -89,6 +113,17 @@ enum Mode {
     /// Postgres only: inside a confirmed `$tag$ ... $tag$` body. No nested
     /// lexing -- literal text until the exact closing tag recurs.
     InDollarQuote,
+    /// Mssql only: just finalized a bare word `GO` that was the first
+    /// non-whitespace content on its line -- still deciding whether the
+    /// rest of the line is only whitespace/comment (a real separator) or
+    /// something else (ordinary text).
+    GoPending,
+    /// Mssql only: inside `GoPending`, saw a `-`; deciding whether it opens
+    /// a `--` line comment (which would still allow the GO to separate).
+    GoPendingDash,
+    /// Mssql only: inside `GoPending`, confirmed a `--` comment to EOL --
+    /// the GO line is still a candidate separator, waiting for the newline.
+    GoPendingComment,
 }
 
 /// SQLite trigger-body tracking: only active once the CURRENT pending
@@ -109,7 +144,7 @@ impl TriggerLead {
     fn initial(dialect: Dialect) -> Self {
         match dialect {
             Dialect::Sqlite => TriggerLead::AwaitingCreate,
-            Dialect::Postgres => TriggerLead::NotATrigger,
+            Dialect::Postgres | Dialect::Mssql => TriggerLead::NotATrigger,
         }
     }
 }
@@ -160,6 +195,22 @@ pub struct StatementSplitter {
     /// nesting" posture the block-comment/trigger-depth counters already
     /// take, not a real parser). See `apply_trigger_word`'s doc comment.
     case_depth: u32,
+    /// Mssql: byte offset into `stmt_buf` where the current `InWord` run
+    /// began (recorded in `feed_top_level`'s word arm BEFORE pushing the
+    /// first char).
+    word_start: usize,
+    /// Mssql: "no non-comment, non-whitespace content since the last
+    /// newline". Init `true`. A newline consumed at top level or inside a
+    /// line/block comment resets it to `true`; any other non-whitespace
+    /// char consumed at top level sets it `false`. Used to recognize a `GO`
+    /// word as the first thing on its line.
+    line_only_ws: bool,
+    /// Mssql: `line_only_ws` captured at the moment the current word began,
+    /// before it's cleared -- "was this word the first thing on its line?"
+    word_at_line_start: bool,
+    /// Mssql: `word_start` snapshot taken when a GO line is recognized, so
+    /// `confirm_go` can truncate the buffered `GO…` tail away.
+    go_word_start: usize,
 }
 
 impl StatementSplitter {
@@ -177,6 +228,10 @@ impl StatementSplitter {
             trigger_lead: TriggerLead::initial(dialect),
             trigger_depth: 0,
             case_depth: 0,
+            word_start: 0,
+            line_only_ws: true,
+            word_at_line_start: false,
+            go_word_start: 0,
         }
     }
 
@@ -208,19 +263,24 @@ impl StatementSplitter {
         for c in chars {
             match self.mode {
                 Mode::Normal => self.feed_top_level(c, &mut out),
-                Mode::InWord => self.handle_word_char(c, &mut out),
+                Mode::InWord => self.handle_word_char(c, &mut out)?,
                 Mode::SawDash => self.handle_saw_dash(c, &mut out),
                 Mode::SawSlash => self.handle_saw_slash(c, &mut out),
                 Mode::InSingleString => self.handle_in_single_string(c),
                 Mode::SingleStringMaybeEnd => self.handle_single_string_maybe_end(c, &mut out),
                 Mode::InDoubleIdent => self.handle_in_double_ident(c),
                 Mode::DoubleIdentMaybeEnd => self.handle_double_ident_maybe_end(c, &mut out),
+                Mode::InBracketIdent => self.handle_in_bracket_ident(c),
+                Mode::BracketIdentMaybeEnd => self.handle_bracket_ident_maybe_end(c, &mut out),
                 Mode::InLineComment => self.handle_in_line_comment(c),
                 Mode::InBlockComment(d) => self.handle_in_block_comment(c, d),
                 Mode::BlockCommentMaybeOpen(d) => self.handle_block_comment_maybe_open(c, d),
                 Mode::BlockCommentMaybeClose(d) => self.handle_block_comment_maybe_close(c, d),
                 Mode::MaybeDollarOpen => self.handle_maybe_dollar_open(c, &mut out),
                 Mode::InDollarQuote => self.handle_in_dollar_quote(c),
+                Mode::GoPending => self.handle_go_pending(c, &mut out)?,
+                Mode::GoPendingDash => self.handle_go_pending_dash(c, &mut out)?,
+                Mode::GoPendingComment => self.handle_go_pending_comment(c, &mut out),
             }
         }
 
@@ -244,11 +304,28 @@ impl StatementSplitter {
         }
 
         match self.mode {
+            // Mssql: EOF inside a GO-pending line counts as the implicit
+            // EOL (same convention as line comments) -- drop the buffered
+            // `GO…` tail; the pre-GO batch, if non-empty, is returned by
+            // the normal tail logic below.
+            Mode::GoPending | Mode::GoPendingComment => {
+                self.stmt_buf.truncate(self.go_word_start);
+                self.mode = Mode::Normal;
+            }
+            // Mssql: a dangling `-` after `GO` never resolved into a `--`
+            // comment -- it's real content.
+            Mode::GoPendingDash => {
+                self.has_content = true;
+                self.mode = Mode::Normal;
+            }
             Mode::InSingleString => {
                 return Err(SplitError::UnterminatedAtEof(UnterminatedKind::StringLiteral));
             }
             Mode::InDoubleIdent => {
                 return Err(SplitError::UnterminatedAtEof(UnterminatedKind::QuotedIdent));
+            }
+            Mode::InBracketIdent => {
+                return Err(SplitError::UnterminatedAtEof(UnterminatedKind::BracketIdent));
             }
             Mode::InBlockComment(_)
             | Mode::BlockCommentMaybeOpen(_)
@@ -289,7 +366,7 @@ impl StatementSplitter {
     /// `stmt_buf` (except a genuine statement-terminating `;`, which is
     /// consumed as a delimiter) and transitions `mode` accordingly.
     fn feed_top_level(&mut self, c: char, out: &mut Vec<String>) {
-        if c == ';' && self.trigger_depth == 0 {
+        if c == ';' && self.trigger_depth == 0 && self.dialect != Dialect::Mssql {
             self.emit_statement(out);
             return;
         }
@@ -297,53 +374,150 @@ impl StatementSplitter {
             '\'' => {
                 self.stmt_buf.push(c);
                 self.has_content = true;
+                self.line_only_ws = false;
                 self.mode = Mode::InSingleString;
             }
             '"' => {
                 self.stmt_buf.push(c);
                 self.has_content = true;
+                self.line_only_ws = false;
                 self.mode = Mode::InDoubleIdent;
+            }
+            '[' if self.dialect == Dialect::Mssql => {
+                self.stmt_buf.push(c);
+                self.has_content = true;
+                self.line_only_ws = false;
+                self.mode = Mode::InBracketIdent;
             }
             '-' => {
                 self.stmt_buf.push(c);
+                self.line_only_ws = false;
                 self.mode = Mode::SawDash;
             }
             '/' => {
                 self.stmt_buf.push(c);
+                self.line_only_ws = false;
                 self.mode = Mode::SawSlash;
             }
             '$' if self.dialect == Dialect::Postgres => {
                 self.stmt_buf.push(c);
                 self.has_content = true;
+                self.line_only_ws = false;
                 self.dollar_tag_buf.clear();
                 self.mode = Mode::MaybeDollarOpen;
             }
             c if c.is_alphanumeric() || c == '_' => {
+                self.word_start = self.stmt_buf.len();
+                self.word_at_line_start = self.line_only_ws;
                 self.stmt_buf.push(c);
                 self.has_content = true;
+                self.line_only_ws = false;
                 self.word_buf.clear();
                 self.word_buf.push(c);
                 self.mode = Mode::InWord;
             }
             c if c.is_whitespace() => {
                 self.stmt_buf.push(c);
+                if c == '\n' {
+                    self.line_only_ws = true;
+                }
                 self.mode = Mode::Normal;
             }
             _ => {
                 self.stmt_buf.push(c);
                 self.has_content = true;
+                self.line_only_ws = false;
                 self.mode = Mode::Normal;
             }
         }
     }
 
-    fn handle_word_char(&mut self, c: char, out: &mut Vec<String>) {
+    fn handle_word_char(&mut self, c: char, out: &mut Vec<String>) -> Result<(), SplitError> {
         if c.is_alphanumeric() || c == '_' {
             self.stmt_buf.push(c);
             self.word_buf.push(c);
+            Ok(())
         } else {
             self.finalize_word();
+            match self.mode {
+                Mode::GoPending => self.handle_go_pending(c, out),
+                _ => {
+                    self.feed_top_level(c, out);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn handle_in_bracket_ident(&mut self, c: char) {
+        self.stmt_buf.push(c);
+        if c == ']' {
+            self.mode = Mode::BracketIdentMaybeEnd;
+        }
+    }
+
+    fn handle_bracket_ident_maybe_end(&mut self, c: char, out: &mut Vec<String>) {
+        if c == ']' {
+            // `]]` is an escaped `]` -- still inside the ident.
+            self.stmt_buf.push(c);
+            self.mode = Mode::InBracketIdent;
+        } else {
+            self.mode = Mode::Normal;
             self.feed_top_level(c, out);
+        }
+    }
+
+    /// The GO line is confirmed a batch separator: drop the buffered
+    /// `GO[ …ws/comment]` tail, emit the batch, start a fresh line.
+    fn confirm_go(&mut self, out: &mut Vec<String>) {
+        self.stmt_buf.truncate(self.go_word_start);
+        self.emit_statement(out);
+        self.line_only_ws = true;
+    }
+
+    fn handle_go_pending(&mut self, c: char, out: &mut Vec<String>) -> Result<(), SplitError> {
+        if c == '\n' {
+            self.stmt_buf.push(c); // truncated away by confirm_go
+            self.confirm_go(out);
+            return Ok(());
+        }
+        if c.is_ascii_digit() {
+            // `GO <n>` repeat count: refused, fail-closed (design §2c iv).
+            return Err(SplitError::UnsupportedGoCount);
+        }
+        self.stmt_buf.push(c);
+        if c.is_whitespace() {
+            return Ok(()); // still a candidate separator line
+        }
+        if c == '-' {
+            self.mode = Mode::GoPendingDash;
+            return Ok(());
+        }
+        // Something else follows GO on its line (`GO,`, `GO SELECT` …):
+        // not a separator -- everything is already in stmt_buf, resume as
+        // ordinary text. The server errors on it verbatim.
+        self.has_content = true;
+        self.mode = Mode::Normal;
+        Ok(())
+    }
+
+    fn handle_go_pending_dash(&mut self, c: char, out: &mut Vec<String>) -> Result<(), SplitError> {
+        if c == '-' {
+            self.stmt_buf.push(c);
+            self.mode = Mode::GoPendingComment;
+            return Ok(());
+        }
+        // Lone `-` after GO: not a comment, not a separator line.
+        self.has_content = true;
+        self.mode = Mode::Normal;
+        self.feed_top_level(c, out);
+        Ok(())
+    }
+
+    fn handle_go_pending_comment(&mut self, c: char, out: &mut Vec<String>) {
+        self.stmt_buf.push(c);
+        if c == '\n' {
+            self.confirm_go(out);
         }
     }
 
@@ -406,12 +580,19 @@ impl StatementSplitter {
     fn handle_in_line_comment(&mut self, c: char) {
         self.stmt_buf.push(c);
         if c == '\n' {
+            // A newline inside a comment still starts a fresh line (Mssql
+            // GO-line detection); a newline inside a STRING or BRACKET
+            // ident is data and does NOT touch the flag.
+            self.line_only_ws = true;
             self.mode = Mode::Normal;
         }
     }
 
     fn handle_in_block_comment(&mut self, c: char, depth: u32) {
         self.stmt_buf.push(c);
+        if c == '\n' {
+            self.line_only_ws = true;
+        }
         self.mode = match c {
             '/' => Mode::BlockCommentMaybeOpen(depth),
             '*' => Mode::BlockCommentMaybeClose(depth),
@@ -421,6 +602,9 @@ impl StatementSplitter {
 
     fn handle_block_comment_maybe_open(&mut self, c: char, depth: u32) {
         self.stmt_buf.push(c);
+        if c == '\n' {
+            self.line_only_ws = true;
+        }
         self.mode = match c {
             '*' => Mode::InBlockComment(depth + 1),
             '/' => Mode::BlockCommentMaybeOpen(depth),
@@ -430,6 +614,9 @@ impl StatementSplitter {
 
     fn handle_block_comment_maybe_close(&mut self, c: char, depth: u32) {
         self.stmt_buf.push(c);
+        if c == '\n' {
+            self.line_only_ws = true;
+        }
         self.mode = match c {
             '/' => {
                 let new_depth = depth.saturating_sub(1);
@@ -511,9 +698,20 @@ impl StatementSplitter {
     }
 
     fn finalize_word(&mut self) {
-        if self.dialect == Dialect::Sqlite {
-            let w = self.word_buf.to_uppercase();
-            self.apply_trigger_word(&w);
+        match self.dialect {
+            Dialect::Sqlite => {
+                let w = self.word_buf.to_uppercase();
+                self.apply_trigger_word(&w);
+            }
+            Dialect::Mssql => {
+                if self.word_at_line_start && self.word_buf.eq_ignore_ascii_case("go") {
+                    self.go_word_start = self.word_start;
+                    self.word_buf.clear();
+                    self.mode = Mode::GoPending;
+                    return;
+                }
+            }
+            Dialect::Postgres => {}
         }
         self.word_buf.clear();
         self.mode = Mode::Normal;
@@ -996,5 +1194,152 @@ mod tests {
         let mut s = StatementSplitter::new(Dialect::Postgres);
         let bad: &[u8] = &[b'S', b'E', b'L', 0xFF, 0x28];
         assert_eq!(s.push(bad), Err(SplitError::InvalidUtf8));
+    }
+
+    // ---------- Mssql GO-batch splitting (G15 T1) ----------
+
+    #[test]
+    fn mssql_go_splits_batches() {
+        assert_eq!(
+            split_sql("SELECT 1\nGO\nSELECT 2\n", Dialect::Mssql).unwrap(),
+            vec!["SELECT 1", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn mssql_semicolon_is_not_a_separator() {
+        assert_eq!(
+            split_sql("SELECT 1; SELECT 2", Dialect::Mssql).unwrap(),
+            vec!["SELECT 1; SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn mssql_go_case_insensitive_with_leading_and_trailing_whitespace() {
+        assert_eq!(
+            split_sql("SELECT 1\n  go  \nSELECT 2", Dialect::Mssql).unwrap(),
+            vec!["SELECT 1", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn mssql_go_with_trailing_line_comment_splits() {
+        assert_eq!(
+            split_sql("SELECT 1\nGO -- next\nSELECT 2", Dialect::Mssql).unwrap(),
+            vec!["SELECT 1", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn mssql_go_with_repeat_count_is_refused() {
+        assert_eq!(
+            split_sql("SELECT 1\nGO 5\n", Dialect::Mssql),
+            Err(SplitError::UnsupportedGoCount)
+        );
+    }
+
+    #[test]
+    fn mssql_go_mid_line_is_ordinary_text() {
+        assert_eq!(
+            split_sql("SELECT 1 GO", Dialect::Mssql).unwrap(),
+            vec!["SELECT 1 GO"]
+        );
+    }
+
+    #[test]
+    fn mssql_go_followed_by_other_text_is_ordinary() {
+        assert_eq!(
+            split_sql("GO, SELECT 1", Dialect::Mssql).unwrap(),
+            vec!["GO, SELECT 1"]
+        );
+    }
+
+    #[test]
+    fn mssql_go_inside_string_comment_and_bracket_is_not_a_separator() {
+        let sql = "SELECT '\nGO\n', [a\nGO\nb] /*\nGO\n*/ FROM t";
+        let out = split_sql(sql, Dialect::Mssql).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], sql);
+    }
+
+    #[test]
+    fn mssql_bracket_ident_hides_semicolon_and_escaped_bracket() {
+        let sql = "SELECT [a;b], [we]]ird] FROM t";
+        assert_eq!(split_sql(sql, Dialect::Mssql).unwrap(), vec![sql]);
+    }
+
+    #[test]
+    fn mssql_unterminated_bracket_at_eof() {
+        let mut s = StatementSplitter::new(Dialect::Mssql);
+        s.push(b"SELECT [oops").unwrap();
+        assert_eq!(
+            s.finish(),
+            Err(SplitError::UnterminatedAtEof(UnterminatedKind::BracketIdent))
+        );
+    }
+
+    #[test]
+    fn mssql_create_procedure_with_interior_semicolons_is_one_batch() {
+        let sql = "CREATE PROCEDURE p AS BEGIN\n  SELECT 1;\n  SELECT 2;\nEND\nGO\n";
+        let out = split_sql(sql, Dialect::Mssql).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].starts_with("CREATE PROCEDURE p AS BEGIN"));
+        assert!(out[0].trim_end().ends_with("END"));
+        assert_eq!(out[0].matches(';').count(), 2);
+    }
+
+    #[test]
+    fn mssql_final_batch_without_trailing_go() {
+        assert_eq!(
+            split_sql("SELECT 1\nGO\nSELECT 2", Dialect::Mssql).unwrap(),
+            vec!["SELECT 1", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn mssql_go_at_eof_without_newline() {
+        let mut s = StatementSplitter::new(Dialect::Mssql);
+        let mut out = s.push(b"SELECT 1\nGO").unwrap();
+        assert!(out.is_empty());
+        if let Some(last) = s.finish().unwrap() {
+            out.push(last);
+        }
+        assert_eq!(out, vec!["SELECT 1"]);
+    }
+
+    #[test]
+    fn mssql_go_after_block_comment_line_still_splits() {
+        assert_eq!(
+            split_sql("SELECT 1\n/* deploy\nnote */\nGO\nSELECT 2", Dialect::Mssql).unwrap(),
+            vec!["SELECT 1\n/* deploy\nnote */", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn mssql_dollar_dollar_is_ordinary_text_and_no_trigger_tracking() {
+        assert_eq!(
+            split_sql("SELECT $$foo$$\nGO\nSELECT 2", Dialect::Mssql).unwrap(),
+            vec!["SELECT $$foo$$", "SELECT 2"]
+        );
+        assert_eq!(
+            split_sql(
+                "CREATE TRIGGER t ON x AFTER INSERT AS BEGIN SELECT 1 END\nGO",
+                Dialect::Mssql
+            )
+            .unwrap(),
+            vec!["CREATE TRIGGER t ON x AFTER INSERT AS BEGIN SELECT 1 END"]
+        );
+    }
+
+    #[test]
+    fn round_trip_one_push_vs_byte_by_byte_mssql() {
+        let corpus = "SELECT 1\nGO\nSELECT '\nGO\n', [a\nGO\nb] /*\nGO\n*/ FROM t\nGO\n\
+                      SELECT [we]]ird], $$literal$$\n  go  \n\
+                      CREATE PROCEDURE p AS BEGIN\n  SELECT 1;\n  SELECT 2;\nEND\nGO\n\
+                      SELECT 1 GO\nGO -- trailing\nGO, SELECT 2";
+        let one_shot = split_sql(corpus, Dialect::Mssql).unwrap();
+        let bytewise = split_bytes_one_at_a_time(corpus, Dialect::Mssql).unwrap();
+        assert_eq!(one_shot, bytewise);
+        assert!(!one_shot.is_empty());
     }
 }

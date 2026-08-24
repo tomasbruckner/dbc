@@ -6,6 +6,8 @@
 /// appearing anywhere in the text, ...), `is_read_statement` returns `false`
 /// and `apply_auto_limit` leaves the SQL untouched.
 
+use crate::split::Dialect;
+
 /// One significant lexical item, produced by [`tokenize`]. Everything inside
 /// string literals, quoted identifiers, and comments is discarded; only bare
 /// words, `;`, and `=` survive, which is exactly what the guards below need.
@@ -310,6 +312,44 @@ pub fn is_read_statement(sql: &str) -> bool {
 ///
 /// Returns a tuple of (possibly rewritten SQL, whether it changed).
 ///
+/// Thin pg-convention wrapper over [`apply_auto_limit_d`] -- byte-identical
+/// pg/sqlite behavior, unchanged by G15.
+pub fn apply_auto_limit(sql: &str, limit: u64) -> (String, bool) {
+    apply_auto_limit_d(sql, limit, Dialect::Postgres)
+}
+
+/// Dialect-aware sibling of [`apply_auto_limit`] (G15 §2d). Postgres/Sqlite
+/// keep the historic `LIMIT {n}` suffix behavior (`apply_auto_limit_pg`,
+/// renamed from the pre-G15 `apply_auto_limit` body, byte-identical).
+/// Mssql inserts `TOP {n}` immediately after the leading `SELECT [ALL |
+/// DISTINCT]` head instead -- T-SQL has no trailing `LIMIT`.
+pub fn apply_auto_limit_d(sql: &str, limit: u64, dialect: Dialect) -> (String, bool) {
+    match dialect {
+        Dialect::Postgres | Dialect::Sqlite => apply_auto_limit_pg(sql, limit),
+        Dialect::Mssql => {
+            let items = match tokenize(sql) {
+                Some(items) => items,
+                None => return (sql.to_string(), false),
+            };
+            if first_word(&items) != Some("SELECT") {
+                return (sql.to_string(), false);
+            }
+            // T-SQL blocking tokens (design §2d list): flat scan, depth-
+            // unaware -- can only under-apply, never over-apply.
+            let has_limiting_clause = items.iter().any(|i| {
+                matches!(i, Item::Word(w) if matches!(w.as_str(), "TOP" | "OFFSET" | "FETCH" | "INTO"))
+            });
+            if has_limiting_clause {
+                return (sql.to_string(), false);
+            }
+            match select_head_insert_offset(sql) {
+                Some(pos) => (format!("{} TOP {}{}", &sql[..pos], limit, &sql[pos..]), true),
+                None => (sql.to_string(), false),
+            }
+        }
+    }
+}
+
 /// This is a heuristic that:
 /// - Only applies to statements starting with SELECT (not WITH)
 /// - Does not apply if the statement contains a LIMIT, OFFSET, FETCH, or INTO
@@ -320,7 +360,7 @@ pub fn is_read_statement(sql: &str) -> bool {
 /// - Does not apply if the statement ends in an open string literal or
 ///   comment (including unterminated nested block comments)
 /// - Appends " LIMIT {n}" before any trailing semicolon
-pub fn apply_auto_limit(sql: &str, limit: u64) -> (String, bool) {
+fn apply_auto_limit_pg(sql: &str, limit: u64) -> (String, bool) {
     let items = match tokenize(sql) {
         Some(items) => items,
         None => return (sql.to_string(), false),
@@ -351,6 +391,66 @@ pub fn apply_auto_limit(sql: &str, limit: u64) -> (String, bool) {
     };
 
     (result, true)
+}
+
+/// Byte offset just past the leading `SELECT [ALL|DISTINCT]` head of `sql`,
+/// skipping leading whitespace and comments. `None` if the head isn't
+/// found (caller then returns the SQL unchanged -- under-apply, never
+/// over-apply, same posture as the flat token scan).
+fn select_head_insert_offset(sql: &str) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    // skip whitespace and comments, iteratively
+    loop {
+        while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
+            i += 1;
+        }
+        if sql[i..].starts_with("--") {
+            i += sql[i..].find('\n').map(|p| p + 1).unwrap_or(sql.len() - i);
+            continue;
+        }
+        if sql[i..].starts_with("/*") {
+            let mut depth = 1u32;
+            let mut j = i + 2;
+            while j < bytes.len() && depth > 0 {
+                if sql[j..].starts_with("/*") {
+                    depth += 1;
+                    j += 2;
+                } else if sql[j..].starts_with("*/") {
+                    depth -= 1;
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            if depth > 0 {
+                return None; // unterminated -- tokenize() already refused anyway
+            }
+            i = j;
+            continue;
+        }
+        break;
+    }
+    let word_end = |start: usize| -> usize {
+        sql[start..]
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|p| start + p)
+            .unwrap_or(sql.len())
+    };
+    let end = word_end(i);
+    if !sql[i..end].eq_ignore_ascii_case("SELECT") {
+        return None;
+    }
+    // optionally consume one ALL/DISTINCT
+    let mut k = end;
+    while k < bytes.len() && (bytes[k] as char).is_ascii_whitespace() {
+        k += 1;
+    }
+    let k_end = word_end(k);
+    if sql[k..k_end].eq_ignore_ascii_case("DISTINCT") || sql[k..k_end].eq_ignore_ascii_case("ALL") {
+        return Some(k_end);
+    }
+    Some(end)
 }
 
 #[cfg(test)]
@@ -468,5 +568,69 @@ mod tests {
         // A string literal that happens to contain a write keyword must not
         // trip the blacklist scan.
         assert!(is_read_statement("select 'update' from t"));
+    }
+
+    // ---------- Mssql TOP auto-limit (G15 T1) ----------
+
+    #[test]
+    fn auto_top_inserts_after_select() {
+        let (sql, changed) = apply_auto_limit_d("select * from big", 1000, Dialect::Mssql);
+        assert!(changed);
+        assert_eq!(sql, "select TOP 1000 * from big");
+    }
+
+    #[test]
+    fn auto_top_after_distinct() {
+        let (sql, changed) =
+            apply_auto_limit_d("SELECT DISTINCT x FROM t", 1000, Dialect::Mssql);
+        assert!(changed);
+        assert_eq!(sql, "SELECT DISTINCT TOP 1000 x FROM t");
+    }
+
+    #[test]
+    fn auto_top_leaves_top_offset_fetch_into_alone() {
+        assert!(!apply_auto_limit_d("SELECT TOP 5 * FROM t", 1000, Dialect::Mssql).1);
+        assert!(
+            !apply_auto_limit_d(
+                "SELECT * FROM t ORDER BY x OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY",
+                1000,
+                Dialect::Mssql
+            )
+            .1
+        );
+        assert!(!apply_auto_limit_d("SELECT * INTO new_tbl FROM t", 1000, Dialect::Mssql).1);
+    }
+
+    #[test]
+    fn auto_top_with_trailing_semicolon() {
+        let (sql, changed) = apply_auto_limit_d("select * from t;", 1000, Dialect::Mssql);
+        assert!(changed);
+        assert_eq!(sql, "select TOP 1000 * from t;");
+    }
+
+    #[test]
+    fn auto_top_after_leading_comment() {
+        let (sql, changed) =
+            apply_auto_limit_d("/* hint */ SELECT x FROM t", 1000, Dialect::Mssql);
+        assert!(changed);
+        assert_eq!(sql, "/* hint */ SELECT TOP 1000 x FROM t");
+    }
+
+    #[test]
+    fn auto_top_string_literal_top_is_not_a_blocker() {
+        // Token scan ignores strings -- `TOP` inside a string literal must
+        // not suppress the auto-TOP.
+        let (sql, changed) =
+            apply_auto_limit_d("select 'top secret' from t", 1000, Dialect::Mssql);
+        assert!(changed);
+        assert_eq!(sql, "select TOP 1000 'top secret' from t");
+    }
+
+    #[test]
+    fn apply_auto_limit_wrapper_is_byte_identical_pg() {
+        assert_eq!(
+            apply_auto_limit("select * from big", 1000),
+            apply_auto_limit_d("select * from big", 1000, Dialect::Postgres)
+        );
     }
 }
