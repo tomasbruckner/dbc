@@ -5454,6 +5454,16 @@ impl AppView {
                         // items 3/4 — `sql_text` is already '***'-redacted
                         // where it matters, built once at dialog-open time).
                         view.apply_dialog = None;
+                        // G10 N2 (final review): captured before `target` is
+                        // moved into the match below — drives which
+                        // `record_history*` call runs after it, so an admin
+                        // write shows up in the History panel tagged kind
+                        // `"admin"` (its own 🛡 badge) instead of
+                        // masquerading as a plain `"query"` entry, same
+                        // pattern as G11's `"backup"`/`"restore"` kinds
+                        // (see `record_backup_restore_history` and
+                        // `history_panel::badge_for_kind`).
+                        let is_admin = matches!(target, ApplyTarget::Admin { .. });
                         match target {
                             ApplyTarget::SandboxTab { tab_id, preview_identity } => {
                                 if let Some(tab) = view.tabs.iter().find(|t| t.id == tab_id) {
@@ -5507,15 +5517,28 @@ impl AppView {
                         // entry once ITS `Finished`/`Failed` lands, same as
                         // any other preview; the admin path has no re-run at
                         // all, just this one entry.
-                        view.record_history(
-                            &sql_text,
-                            &history_conn_name,
-                            history_started_at,
-                            Some(started.elapsed().as_millis() as i64),
-                            Some(total as i64),
-                            None,
-                            cx,
-                        );
+                        if is_admin {
+                            view.record_history_with_kind(
+                                &sql_text,
+                                &history_conn_name,
+                                history_started_at,
+                                Some(started.elapsed().as_millis() as i64),
+                                Some(total as i64),
+                                None,
+                                "admin",
+                                cx,
+                            );
+                        } else {
+                            view.record_history(
+                                &sql_text,
+                                &history_conn_name,
+                                history_started_at,
+                                Some(started.elapsed().as_millis() as i64),
+                                Some(total as i64),
+                                None,
+                                cx,
+                            );
+                        }
                     }
                     Ok(Err(e)) => {
                         if let Some(ad) = &mut view.apply_dialog {

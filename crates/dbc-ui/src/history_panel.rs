@@ -68,6 +68,25 @@ pub fn collapse_sql(sql: &str, max_chars: usize) -> String {
     }
 }
 
+/// Badge prefix (including trailing space) for a history entry's first line,
+/// keyed off `HistoryEntry::kind` (brief contract, G10 N2 final review):
+/// `"query"` (the implicit default `add`/`record_history` write) gets no
+/// badge; `"backup"`/`"restore"` (G11 T7) keep the existing 🗄 badge;
+/// `"admin"` (G10 N2, `record_history_with_kind` from the admin Apply path)
+/// gets its own 🛡 badge so an admin DDL/grant write is visually
+/// distinguishable from a backup/restore run in the same list. Any OTHER
+/// kind — an old row from before a kind existed, or a future kind this
+/// build doesn't know about yet — falls back to the generic 🗄 badge rather
+/// than panicking or rendering blank, same back-compat guarantee the
+/// pre-G10-N2 `if kind == "query" {..} else { 🗄 }` shape already had.
+fn badge_for_kind(kind: &str) -> &'static str {
+    match kind {
+        "query" => "",
+        "admin" => "🛡 ",
+        _ => "🗄 ", // "backup" | "restore" | any unrecognized kind
+    }
+}
+
 /// Second line of a history entry: `"{connection} · {rows} řádků · {duration} ms"`
 /// for a successful run, or the raw error text for a failed one (brief
 /// contract #3). Returns `(text, is_error)` — `is_error` drives the caller's
@@ -109,11 +128,14 @@ impl AppView {
         }
     }
 
-    /// G11 T7: same shape as `record_history`, but records a `kind` other
-    /// than the implicit `"query"` — the ONLY way a G11 backup/restore run
-    /// shows up in the History panel with its 🗄 badge (see `render_history_panel`'s
-    /// row-building closure below). Called from `main.rs`'s
-    /// `finish_backup_restore`/`record_backup_restore_history` in place of
+    /// G11 T7 (G10 N2: also used for admin writes): same shape as
+    /// `record_history`, but records a `kind` other than the implicit
+    /// `"query"` — the ONLY way a run shows up in the History panel with a
+    /// badge instead of plain text (see `badge_for_kind` and
+    /// `render_history_panel`'s row-building closure below). Called from
+    /// `main.rs`'s `finish_backup_restore`/`record_backup_restore_history`
+    /// (kind `"backup"`/`"restore"`) and `on_confirm_apply`'s
+    /// `ApplyTarget::Admin` arm (kind `"admin"`) in place of
     /// `record_history`.
     pub(crate) fn record_history_with_kind(
         &mut self,
@@ -187,14 +209,15 @@ impl AppView {
                     let entry = &this.history_cache[ix];
                     let id = entry.id;
                     let sql_for_click = entry.sql.clone();
-                    // G11 T7: a small badge prefix for non-"query" runs —
-                    // the only rendering change the `kind` column drives;
+                    // G11 T7 (G10 N2: generalized to `badge_for_kind`) — a
+                    // small badge prefix for non-"query" runs, the only
+                    // rendering change the `kind` column drives;
                     // `format_meta_line`/`collapse_sql` themselves stay
                     // unchanged (the badge is decided once, here, at
                     // render time from `entry.kind`, not a new "meta line"
                     // variant).
                     let raw_line1 = collapse_sql(&entry.sql, SQL_COLLAPSE_MAX_CHARS);
-                    let line1 = if entry.kind == "query" { raw_line1 } else { format!("🗄 {raw_line1}") };
+                    let line1 = format!("{}{raw_line1}", badge_for_kind(&entry.kind));
                     let (line2, is_error) = format_meta_line(entry);
                     let line2_color = if is_error { cx.theme().danger } else { cx.theme().text_muted };
                     let starred = entry.starred;
@@ -278,6 +301,31 @@ impl AppView {
 #[cfg(test)]
 mod format_tests {
     use super::*;
+
+    #[test]
+    fn badge_for_kind_query_has_no_badge() {
+        assert_eq!(badge_for_kind("query"), "");
+    }
+
+    #[test]
+    fn badge_for_kind_admin_gets_its_own_badge() {
+        assert_eq!(badge_for_kind("admin"), "🛡 ");
+    }
+
+    #[test]
+    fn badge_for_kind_backup_and_restore_get_the_g11_badge() {
+        assert_eq!(badge_for_kind("backup"), "🗄 ");
+        assert_eq!(badge_for_kind("restore"), "🗄 ");
+    }
+
+    #[test]
+    fn badge_for_kind_unknown_kind_falls_back_gracefully() {
+        // Back-compat: a kind this build doesn't recognize (e.g. an older
+        // row, or a future kind) must still render something sane, not
+        // panic or render blank.
+        assert_eq!(badge_for_kind("something-new"), "🗄 ");
+        assert_eq!(badge_for_kind(""), "🗄 ");
+    }
 
     #[test]
     fn collapse_sql_collapses_whitespace_and_leaves_short_text_alone() {
