@@ -3749,6 +3749,11 @@ impl AppView {
         // gate: a chart needs an existing result buffer to draw from).
         let chart_available =
             matches!(self.tabs.active(), Some(ResultTab { content: TabContent::Grid { .. }, .. }));
+        // App-wide master password UX design §2/§3: "Odemknout trezor" only
+        // when there's actually a vault file to unlock and it's currently
+        // locked; "Zamknout trezor" only while unlocked.
+        let vault_unlockable = self.vault.is_none() && Vault::exists(&self.vault_path);
+        let vault_lockable = self.vault.is_some();
         palette::rank_items(
             query,
             &tables,
@@ -3759,6 +3764,8 @@ impl AppView {
             30,
             self.active_connection_id.is_some(),
             chart_available,
+            vault_unlockable,
+            vault_lockable,
         )
     }
 
@@ -3848,6 +3855,8 @@ impl AppView {
                 PaletteAction::OpenServerAdmin => self.open_admin_tab(cx),
                 PaletteAction::ToggleTheme => self.toggle_theme(cx),
                 PaletteAction::OpenChart => self.open_chart_picker(None, cx),
+                PaletteAction::UnlockVault => self.open_unlock_vault_prompt(window, cx),
+                PaletteAction::LockVault => self.lock_vault(cx),
             },
         }
         cx.notify();
