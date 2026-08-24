@@ -371,6 +371,46 @@ pub fn build_vacuum_into_sql(dest_path: &str) -> String {
     format!("VACUUM INTO {}", sql_string_literal(dest_path))
 }
 
+// --- DuckDB -----------------------------------------------------------------
+
+/// G16 §7: DuckDB's supported online single-file-copy idiom — there is no
+/// `VACUUM INTO`; `ATTACH` + `COPY FROM DATABASE` + `DETACH` over ONE
+/// dedicated connection is the engine-blessed equivalent (copying a live
+/// DuckDB file directly risks exactly the WAL/open-writer corruption
+/// `VACUUM INTO` exists to avoid on sqlite). Pure builder: `dest_path`
+/// single-quote-escaped by `''`-doubling (same as `build_vacuum_into_sql`);
+/// `src_db_name` (fetched at RUN time via `SELECT current_database()` —
+/// DuckDB names a file database after its file stem, but asking the engine
+/// beats duplicating that rule client-side) goes through
+/// `dbc_core::quote_ident` (pg-style `"…"` doubling — DuckDB's identifier
+/// quoting exactly). These three statements are sanctioned `execute()`
+/// callers under the EXISTING G11 backup entry (amended in
+/// dbc-core/src/connection.rs this task — an amendment, not a new entry).
+pub fn build_duckdb_backup_sql(src_db_name: &str, dest_path: &str) -> Vec<String> {
+    let escaped = sql_string_literal(dest_path);
+    let src = dbc_core::quote_ident(src_db_name);
+    vec![
+        format!("ATTACH {escaped} AS __dbc_backup"),
+        format!("COPY FROM DATABASE {src} TO __dbc_backup"),
+        "DETACH __dbc_backup".to_string(),
+    ]
+}
+
+/// G16 §7: a DuckDB database file's main header carries the ASCII bytes
+/// `DUCK` at byte offset 8 (bytes 0..8 are a block checksum). NOT trusted
+/// from documentation alone — verified against a freshly created database
+/// by `duckdb_backup_end_to_end_round_trip` (runner.rs).
+pub const DUCKDB_MAGIC_OFFSET: usize = 8;
+
+/// The four magic bytes at [`DUCKDB_MAGIC_OFFSET`].
+pub const DUCKDB_MAGIC: &[u8; 4] = b"DUCK";
+
+/// Never panics on a short slice — same posture as `sqlite_magic_header_ok`.
+pub fn duckdb_magic_ok(bytes: &[u8]) -> bool {
+    bytes.len() >= DUCKDB_MAGIC_OFFSET + DUCKDB_MAGIC.len()
+        && &bytes[DUCKDB_MAGIC_OFFSET..DUCKDB_MAGIC_OFFSET + DUCKDB_MAGIC.len()] == DUCKDB_MAGIC
+}
+
 // --- Shared read-only gate + redaction + confirm ---------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -814,6 +854,31 @@ mod pure_tests {
             build_vacuum_into_sql(r"D:\o'brien.sqlite"),
             "VACUUM INTO 'D:\\o''brien.sqlite'"
         );
+    }
+
+    // --- DuckDB backup SQL + magic (G16 T4) ---
+    #[test]
+    fn duckdb_backup_sql_shape_and_quoting() {
+        let stmts = build_duckdb_backup_sql("analytics", r"D:\zálohy\o'brien.duckdb");
+        assert_eq!(stmts, vec![
+            r"ATTACH 'D:\zálohy\o''brien.duckdb' AS __dbc_backup".to_string(),
+            "COPY FROM DATABASE \"analytics\" TO __dbc_backup".to_string(),
+            "DETACH __dbc_backup".to_string(),
+        ]);
+        // A hostile db name is quote_ident-escaped, never interpolated raw.
+        let weird = build_duckdb_backup_sql("we\"ird", "d.duckdb");
+        assert!(weird[1].contains("\"we\"\"ird\""), "got: {}", weird[1]);
+    }
+
+    #[test]
+    fn duckdb_magic_ok_bounds_and_offset() {
+        let mut good = vec![0u8; 16];
+        good[8..12].copy_from_slice(b"DUCK");
+        assert!(duckdb_magic_ok(&good));
+        assert!(!duckdb_magic_ok(b"DUCK")); // magic at offset 0 is NOT a duckdb file
+        assert!(!duckdb_magic_ok(&good[..11])); // short slice never panics
+        assert!(!duckdb_magic_ok(&[]));
+        assert!(!sqlite_magic_header_ok(&good)); // the two sniffs never overlap
     }
 
     // --- read-only exemption (design CURATION item 2, REQUIRED) ---

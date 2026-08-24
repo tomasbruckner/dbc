@@ -7312,13 +7312,52 @@ impl AppView {
                 .detach();
             }
             dbc_state::Engine::Duckdb => {
-                // G16 T3 interim honest refusal — replaced by T4's real
-                // backup dispatch. Unreachable from the UI anyway
-                // (`backup::backup_restore_available(Duckdb)` gates the
-                // dialog OFF until T6's flip), but the arm must be real,
-                // honest code, never a wildcard.
-                self.status = "error: záloha pro DuckDB zatím není k dispozici".to_string();
-                cx.notify();
+                // G16 T4 (still unreachable from the UI until T6 flips
+                // `backup::backup_restore_available(Duckdb)`). Display-only
+                // preview of the source db name: DuckDB names a file
+                // database after its file stem; execution re-derives it
+                // from the engine (SELECT current_database()) — pinned in
+                // duckdb_backup_command_line_preview_matches_engine_name.
+                let display_src = std::path::Path::new(&cfg.database)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| cfg.database.clone());
+                let command_line = backup::build_duckdb_backup_sql(&display_src, &dest_path).join("\n");
+                let (_log, status, _cancel_slot) = self.start_backup_session(
+                    backup::BackupKind::Backup,
+                    &cfg,
+                    &dest_path,
+                    command_line,
+                    String::new(),
+                    None,
+                    backup::BackupStatus::Running,
+                    cx,
+                );
+                let spec = ConnectSpec::Config { cfg: Box::new(cfg.clone()), secret: None };
+                let rx = self.runner.run_duckdb_backup(spec, dest_path.clone());
+                let started = std::time::Instant::now();
+                cx.spawn(async move |this, cx| {
+                    let result = rx.await;
+                    let _ = this.update(cx, |view, cx| {
+                        let err = match result {
+                            Ok(Ok(())) => None,
+                            Ok(Err(e)) => Some(e.message),
+                            Err(_) => Some("backup task panicked".to_string()),
+                        };
+                        view.finish_backup_restore(
+                            &status,
+                            backup::BackupKind::Backup,
+                            &connection_name,
+                            &database,
+                            &dest_path,
+                            started_at_unix,
+                            started.elapsed().as_millis() as i64,
+                            err,
+                            cx,
+                        );
+                    });
+                })
+                .detach();
             }
         }
     }
@@ -7471,6 +7510,9 @@ impl AppView {
                 backup::build_single_user_sql(&cfg.database, true),
             ),
             Ok(RestorePlan::Sqlite) => format!("copy {source_path} -> {}", cfg.database),
+            // G16 T4: same sniff-and-copy preview as Sqlite — the DUCK
+            // magic check is runner-level, identical division of labor.
+            Ok(RestorePlan::Duckdb) => format!("copy {source_path} -> {}", cfg.database),
             Err(e) => {
                 self.status = format!("error: {e}");
                 cx.notify();
@@ -7710,6 +7752,46 @@ impl AppView {
                 );
                 let db_path = database.clone();
                 let rx = self.runner.run_sqlite_restore(db_path, source_path.clone(), cfg.read_only);
+                let started = std::time::Instant::now();
+                cx.spawn(async move |this, cx| {
+                    let result = rx.await;
+                    let _ = this.update(cx, |view, cx| {
+                        let err = match result {
+                            Ok(Ok(())) => None,
+                            Ok(Err(e)) => Some(e.message),
+                            Err(_) => Some("restore task panicked".to_string()),
+                        };
+                        view.finish_backup_restore(
+                            &status,
+                            backup::BackupKind::Restore,
+                            &connection_name,
+                            &database,
+                            &source_path,
+                            started_at_unix,
+                            started.elapsed().as_millis() as i64,
+                            err,
+                            cx,
+                        );
+                    });
+                })
+                .detach();
+            }
+            RestorePlan::Duckdb => {
+                // G16 T4: byte-for-byte the Sqlite arm above except the
+                // runner call — sniff-and-copy is runner-level.
+                let command_line = format!("copy {source_path} -> {database}");
+                let (_log, status, _cancel_slot) = self.start_backup_session(
+                    backup::BackupKind::Restore,
+                    &cfg,
+                    &source_path,
+                    command_line,
+                    database.clone(),
+                    None,
+                    backup::BackupStatus::Running,
+                    cx,
+                );
+                let db_path = database.clone();
+                let rx = self.runner.run_duckdb_restore(db_path, source_path.clone(), cfg.read_only);
                 let started = std::time::Instant::now();
                 cx.spawn(async move |this, cx| {
                     let result = rx.await;
@@ -8067,6 +8149,9 @@ enum RestorePlan {
     PgTool { tool_name: String, args: Vec<String> },
     Mssql,
     Sqlite,
+    /// G16 T4: sniff-and-copy, mirroring Sqlite — the DUCK-magic check is
+    /// runner-level (`runner::run_duckdb_restore`), same division of labor.
+    Duckdb,
 }
 
 /// Reads AT MOST the first 16 bytes of `path` — exactly what
@@ -8111,9 +8196,9 @@ fn plan_restore(cfg: &dbc_state::ConnectionConfig, source_path: &str) -> Result<
         }
         dbc_state::Engine::Mssql => Ok(RestorePlan::Mssql),
         dbc_state::Engine::Sqlite => Ok(RestorePlan::Sqlite),
-        // G16 T3 interim fail-closed refusal — T4 replaces this with
-        // `Ok(RestorePlan::Duckdb)` once the restore mechanics exist.
-        dbc_state::Engine::Duckdb => Err("obnova pro DuckDB zatím není k dispozici".to_string()),
+        // G16 T4: no filesystem touch here — the magic sniff is
+        // runner-level, same division as sqlite.
+        dbc_state::Engine::Duckdb => Ok(RestorePlan::Duckdb),
     }
 }
 
@@ -8192,11 +8277,11 @@ mod plan_restore_tests {
     }
 
     #[test]
-    fn plan_restore_mssql_and_sqlite_never_touch_the_filesystem() {
-        // No file created at these paths at all — Mssql/Sqlite variants
-        // must not attempt to read the source file (that's runner-level,
-        // T4's own magic-header check for SQLite; MSSQL has no client-side
-        // sniff at all).
+    fn plan_restore_mssql_sqlite_and_duckdb_never_touch_the_filesystem() {
+        // No file created at these paths at all — Mssql/Sqlite/Duckdb
+        // variants must not attempt to read the source file (that's
+        // runner-level, the magic-header sniffs for SQLite/DuckDB; MSSQL
+        // has no client-side sniff at all).
         let mut mssql = pg_cfg();
         mssql.engine = dbc_state::Engine::Mssql;
         assert!(matches!(plan_restore(&mssql, r"D:\nope.bak"), Ok(RestorePlan::Mssql)));
@@ -8204,22 +8289,11 @@ mod plan_restore_tests {
         let mut sqlite = pg_cfg();
         sqlite.engine = dbc_state::Engine::Sqlite;
         assert!(matches!(plan_restore(&sqlite, r"D:\nope.sqlite"), Ok(RestorePlan::Sqlite)));
-    }
 
-    /// G16 T3 interim: DuckDB restore is fail-closed refused until T4
-    /// lands the mechanics (T4 replaces this assertion with
-    /// `Ok(RestorePlan::Duckdb)`).
-    #[test]
-    fn plan_restore_duckdb_interim_refusal() {
+        // G16 T4 (was the T3 interim refusal — mechanics landed).
         let mut duckdb = pg_cfg();
         duckdb.engine = dbc_state::Engine::Duckdb;
-        // No `unwrap_err` — `RestorePlan` doesn't implement `Debug` (same
-        // reason `open_for_mcp`'s tests match instead of unwrapping).
-        let err = match plan_restore(&duckdb, r"D:\nope.duckdb") {
-            Err(e) => e,
-            Ok(_) => panic!("expected the interim DuckDB restore refusal"),
-        };
-        assert_eq!(err, "obnova pro DuckDB zatím není k dispozici");
+        assert!(matches!(plan_restore(&duckdb, r"D:\nope.duckdb"), Ok(RestorePlan::Duckdb)));
     }
 }
 

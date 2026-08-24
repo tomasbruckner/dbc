@@ -49,9 +49,12 @@ pub trait Connection: Send {
     /// plain sequential `execute()` calls on the SAME connection, NOT
     /// wrapped in an explicit transaction, because T-SQL does not allow
     /// `RESTORE DATABASE` inside one); and `run_sqlite_backup` (`VACUUM
-    /// INTO`, allowed on read-only). `run_sqlite_restore` is NOT in this
+    /// INTO`, allowed on read-only); G16: DuckDB backup's `ATTACH`/`COPY
+    /// FROM DATABASE`/`DETACH` triple (`runner::run_duckdb_backup_inner`)
+    /// rides this same entry. `run_sqlite_restore` is NOT in this
     /// list — it never calls `execute()` at all, restoring via a plain
-    /// magic-header-checked `fs::copy` instead. No other code may call
+    /// magic-header-checked `fs::copy` instead (G16: `run_duckdb_restore`
+    /// shares that non-entry for the same reason). No other code may call
     /// this method.
     ///
     /// `run_mssql_plan` (G15 §2e, T7) is the MSSQL face of the

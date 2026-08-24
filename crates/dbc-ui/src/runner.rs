@@ -876,6 +876,50 @@ impl QueryRunner {
         });
         rx
     }
+
+    /// G16 T4: DuckDB backup — `ATTACH`/`COPY FROM DATABASE`/`DETACH` over
+    /// ONE dedicated connection via `Connection::execute` (sanctioned under
+    /// the G11 backup entry, amended in dbc-core/src/connection.rs).
+    /// Allowed on read-only configs at the GUARD level (Backup stays
+    /// exempt, design CURATION item 2) — what happens next is engine
+    /// behavior, pinned by `duckdb_backup_on_read_only_config_pins_engine_behavior`.
+    pub fn run_duckdb_backup(
+        &self,
+        spec: ConnectSpec,
+        dest_path: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            let result = run_duckdb_backup_inner(spec, dest_path, handle).await;
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
+    /// G16 T4: DuckDB restore — magic sniff (`backup::duckdb_magic_ok`,
+    /// `DUCK` at offset 8) then `fs::copy`, mirroring `run_sqlite_restore`
+    /// exactly: no `ConnectSpec` (plain file operation), `read_only`
+    /// threaded explicitly and self-guarded as the inner fn's FIRST action
+    /// (same G11 T4 review MAJOR 2 posture — never protected solely by the
+    /// UI-layer caller).
+    pub fn run_duckdb_restore(
+        &self,
+        db_path: String,
+        backup_path: String,
+        read_only: bool,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                run_duckdb_restore_inner(&db_path, &backup_path, read_only)
+            })
+            .await
+            .unwrap_or_else(|_| Err(QueryError::msg("restore task panicked")));
+            let _ = tx.send(result);
+        });
+        rx
+    }
 }
 
 /// G7 T5: pure SQL composer + guard, extracted as a standalone function
@@ -1783,6 +1827,68 @@ fn run_sqlite_restore_inner(db_path: &str, backup_path: &str, read_only: bool) -
     let n = f.read(&mut header).map_err(|e| QueryError::msg(e.to_string()))?;
     if !backup::sqlite_magic_header_ok(&header[..n]) {
         return Err(QueryError::msg("soubor není SQLite databáze"));
+    }
+    drop(f);
+    std::fs::copy(backup_path, db_path).map_err(|e| QueryError::msg(e.to_string()))?;
+    Ok(())
+}
+
+/// G16 T4: `QueryRunner::run_duckdb_backup`'s async body — mirrors
+/// `run_sqlite_backup_inner`: shared read-only guard first (Backup stays
+/// EXEMPT per G11 curation item 2 — same predicate, no new logic), ONE
+/// dedicated connection opened in the config's OWN mode (never a sneaky
+/// read-write open: that would trip the driver's mixed-mode policy against
+/// any concurrent read-only root, and silently escalating privileges for a
+/// convenience feature is the wrong trade — a read-only instance that
+/// refuses the write-mode ATTACH surfaces the engine's error verbatim, the
+/// posture G11 curation item 2 blessed; pinned by
+/// duckdb_backup_on_read_only_config_pins_engine_behavior). The source db
+/// name is asked of the engine (`SELECT current_database()`), then the
+/// three build_duckdb_backup_sql statements run in order.
+///
+/// DETACH is best-effort ALWAYS once ATTACH succeeded (resolved deviation
+/// 6): the driver's registry root is shared process-wide and ATTACH is
+/// catalog-level, so skipping DETACH after a failed COPY would leak the
+/// `__dbc_backup` attachment into every other session on this file for as
+/// long as any root holder lives.
+async fn run_duckdb_backup_inner(
+    spec: ConnectSpec,
+    dest_path: String,
+    handle: tokio::runtime::Handle,
+) -> Result<(), QueryError> {
+    backup::guard_backup_restore_read_only(backup::BackupOp::Backup, spec_is_read_only(&spec))
+        .map_err(QueryError::msg)?;
+    let mut opened = open_spec(spec, handle).await?;
+    let src_db =
+        drain_single_text_cell(&mut *opened.conn, "SELECT current_database()", CancelToken::new())
+            .await?;
+    let stmts = backup::build_duckdb_backup_sql(&src_db, &dest_path);
+    opened.conn.execute(&stmts[0], CancelToken::new()).await?; // ATTACH — fail here = nothing to clean
+    let copy_res = opened.conn.execute(&stmts[1], CancelToken::new()).await;
+    let detach_res = opened.conn.execute(&stmts[2], CancelToken::new()).await; // ALWAYS — see doc comment
+    copy_res?;
+    detach_res?;
+    Ok(())
+}
+
+/// G16 T4: `QueryRunner::run_duckdb_restore`'s sync body — mirrors
+/// `run_sqlite_restore_inner` exactly: (1) read-only HARD-BLOCK first, no
+/// exemption, before ANY I/O; (2) magic sniff (`backup::duckdb_magic_ok`,
+/// `DUCK` at offset 8) — refuses without copying; (3) `fs::copy` over the
+/// target. If any live root holds the target (this process or another),
+/// the OS copy fails loudly and is surfaced verbatim — acceptable, the
+/// per-dispatch connection model makes a lingering root the exception
+/// (design §13). Typed-database-name confirm friction: unchanged, same
+/// modal as every restore (caller side).
+fn run_duckdb_restore_inner(db_path: &str, backup_path: &str, read_only: bool) -> Result<(), QueryError> {
+    backup::guard_backup_restore_read_only(backup::BackupOp::Restore, read_only)
+        .map_err(QueryError::msg)?;
+    let mut header = [0u8; 16];
+    let mut f = std::fs::File::open(backup_path).map_err(|e| QueryError::msg(e.to_string()))?;
+    use std::io::Read;
+    let n = f.read(&mut header).map_err(|e| QueryError::msg(e.to_string()))?;
+    if !backup::duckdb_magic_ok(&header[..n]) {
+        return Err(QueryError::msg("soubor není DuckDB databáze"));
     }
     drop(f);
     std::fs::copy(backup_path, db_path).map_err(|e| QueryError::msg(e.to_string()))?;
@@ -8347,5 +8453,231 @@ mod mssql_docker_tests {
 
             let _ = verify.conn.execute(&format!("DROP TABLE dbo.[{table}]"), CancelToken::new()).await;
         });
+    }
+}
+
+/// G16 T4: DuckDB backup/restore over real temp-file databases — the
+/// embedded live tier (design §10), no docker, plain #[tokio::test].
+#[cfg(test)]
+mod duckdb_backup_restore_tests {
+    use super::*;
+
+    fn duckdb_cfg(path: &str, read_only: bool) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: "d1".into(),
+            name: "duck".into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Duckdb,
+            host: String::new(),
+            port: None,
+            database: path.into(),
+            user: String::new(),
+            read_only,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: None,
+        }
+    }
+
+    async fn seed_db(path: &std::path::Path) {
+        let mut c = dbc_driver_duckdb::DuckdbConnection::new(path);
+        c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)", CancelToken::new())
+            .await
+            .unwrap();
+        c.execute("INSERT INTO t VALUES (1, 'Příliš žluťoučký'), (2, 'kůň')", CancelToken::new())
+            .await
+            .unwrap();
+    }
+
+    /// Row count of t in the database at `path`, read through the driver.
+    async fn count_t(path: &std::path::Path) -> String {
+        let mut c = dbc_driver_duckdb::DuckdbConnection::new_with_options(path, true);
+        let mut stream = c.query("SELECT count(*) FROM t", CancelToken::new()).await.unwrap();
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.unwrap()).unwrap();
+        }
+        buf.cell_text(0, 0)
+    }
+
+    /// The COPY-FROM-DATABASE availability gate (design §13 risk 1,
+    /// converted to a test): proves the vendored engine (~1.10504.0)
+    /// supports the idiom end-to-end, AND verifies the DUCK-at-offset-8
+    /// magic constant against a REAL file (design §7 — never
+    /// documentation-trusted).
+    #[tokio::test]
+    async fn duckdb_backup_end_to_end_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.duckdb");
+        let dest = dir.path().join("zaloha.duckdb");
+        seed_db(&src).await;
+        let spec = ConnectSpec::Config {
+            cfg: Box::new(duckdb_cfg(src.to_str().unwrap(), false)),
+            secret: None,
+        };
+        run_duckdb_backup_inner(
+            spec,
+            dest.to_string_lossy().into_owned(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
+        // The DEST is a real DuckDB database carrying the seeded rows…
+        assert_eq!(count_t(&dest).await, "2");
+        // …and the magic the restore sniff checks for (constant verified
+        // against a REAL file, per design §7 — not documentation-trusted).
+        let bytes = std::fs::read(&dest).unwrap();
+        assert!(backup::duckdb_magic_ok(&bytes));
+        assert!(!backup::sqlite_magic_header_ok(&bytes));
+    }
+
+    /// Two backups while a browse connection holds the shared root: the
+    /// second succeeds ONLY if the first's DETACH really ran (a leaked
+    /// __dbc_backup attachment on the shared root would collide) — the
+    /// resolved-deviation-6 regression pin.
+    #[tokio::test]
+    async fn duckdb_backup_twice_on_a_live_root_leaves_no_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.duckdb");
+        seed_db(&src).await;
+        let mut browse = dbc_driver_duckdb::DuckdbConnection::new(&src);
+        {
+            // Bind + hold the shared root via a drained query (execute()
+            // refuses row-returning statements on some drivers).
+            let mut s = browse.query("SELECT 1", CancelToken::new()).await.unwrap();
+            while let Some(item) = s.batches.recv().await {
+                item.unwrap();
+            }
+        }
+        let spec = |p: &std::path::Path| ConnectSpec::Config {
+            cfg: Box::new(duckdb_cfg(p.to_str().unwrap(), false)),
+            secret: None,
+        };
+        let d1 = dir.path().join("z1.duckdb");
+        let d2 = dir.path().join("z2.duckdb");
+        run_duckdb_backup_inner(
+            spec(&src),
+            d1.to_string_lossy().into_owned(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
+        run_duckdb_backup_inner(
+            spec(&src),
+            d2.to_string_lossy().into_owned(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count_t(&d2).await, "2");
+        drop(browse);
+    }
+
+    #[tokio::test]
+    async fn duckdb_backup_bad_dest_surfaces_engine_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.duckdb");
+        seed_db(&src).await;
+        let bad = dir.path().join("neexistuje").join("x.duckdb"); // missing parent dir
+        let spec = ConnectSpec::Config {
+            cfg: Box::new(duckdb_cfg(src.to_str().unwrap(), false)),
+            secret: None,
+        };
+        let err = run_duckdb_backup_inner(
+            spec,
+            bad.to_string_lossy().into_owned(),
+            tokio::runtime::Handle::current(),
+        )
+        .await;
+        assert!(err.is_err());
+    }
+
+    /// §7 read-only-backup PIN (design risk 3): Backup is EXEMPT from the
+    /// read-only guard, so the guard passes and what happens next is pure
+    /// ENGINE behavior — an AccessMode::ReadOnly instance asked to ATTACH a
+    /// new file for write. Expected and pinned: the engine refuses and the
+    /// error surfaces verbatim (G11 curation item 2 posture). IF this
+    /// assertion fails because the vendored engine ALLOWS it, flip the
+    /// assertion to is_ok(), verify the dest file's contents, and record
+    /// the observed behavior in the commit message — either behavior is
+    /// acceptable; silent divergence is not.
+    #[tokio::test]
+    async fn duckdb_backup_on_read_only_config_pins_engine_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.duckdb");
+        let dest = dir.path().join("z.duckdb");
+        seed_db(&src).await;
+        let spec = ConnectSpec::Config {
+            cfg: Box::new(duckdb_cfg(src.to_str().unwrap(), true)),
+            secret: None,
+        };
+        let result = run_duckdb_backup_inner(
+            spec,
+            dest.to_string_lossy().into_owned(),
+            tokio::runtime::Handle::current(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "expected the read-only instance to refuse the write-mode ATTACH; got Ok — see this test's doc comment"
+        );
+    }
+
+    #[tokio::test]
+    async fn duckdb_restore_happy_path_replaces_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("backup.duckdb");
+        seed_db(&src).await;
+        let target = dir.path().join("live.duckdb");
+        std::fs::write(&target, b"stale not-a-database content").unwrap();
+        run_duckdb_restore_inner(target.to_str().unwrap(), src.to_str().unwrap(), false).unwrap();
+        assert_eq!(count_t(&target).await, "2");
+    }
+
+    #[tokio::test]
+    async fn duckdb_restore_refuses_wrong_magic_without_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("fake.duckdb");
+        let mut content = backup::SQLITE_MAGIC_HEADER.to_vec(); // a SQLITE file posing as duckdb
+        content.extend_from_slice(b"rest");
+        std::fs::write(&src, &content).unwrap();
+        let target = dir.path().join("live.duckdb");
+        std::fs::write(&target, b"untouched").unwrap();
+        let err = run_duckdb_restore_inner(target.to_str().unwrap(), src.to_str().unwrap(), false)
+            .unwrap_err();
+        assert_eq!(err.message, "soubor není DuckDB databáze");
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched"); // no copy attempted
+    }
+
+    #[tokio::test]
+    async fn duckdb_restore_refuses_read_only_before_any_io() {
+        // backup_path deliberately nonexistent: a read-only refusal must
+        // fire BEFORE the open — the error is the guard's, not file-not-found.
+        let err = run_duckdb_restore_inner(r"D:\nope\live.duckdb", r"D:\nope\missing.duckdb", true)
+            .unwrap_err();
+        assert!(
+            err.message.contains("čtení"),
+            "expected the read-only guard message, got: {}",
+            err.message
+        );
+    }
+
+    /// Resolved deviation 7: the dialog's file-stem preview of the source
+    /// db name agrees with the engine's own current_database() for a
+    /// normal path (execution uses the engine's answer regardless).
+    #[tokio::test]
+    async fn duckdb_backup_command_line_preview_matches_engine_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("analytics.duckdb");
+        seed_db(&src).await;
+        let mut c = dbc_driver_duckdb::DuckdbConnection::new(&src);
+        let mut stream = c.query("SELECT current_database()", CancelToken::new()).await.unwrap();
+        let mut buf = dbc_buffer::ResultBuffer::new(stream.columns.clone());
+        while let Some(item) = stream.batches.recv().await {
+            buf.push(item.unwrap()).unwrap();
+        }
+        assert_eq!(buf.cell_text(0, 0), "analytics");
     }
 }
