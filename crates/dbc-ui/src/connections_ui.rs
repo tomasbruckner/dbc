@@ -267,6 +267,17 @@ pub fn bind_keys(cx: &mut App) {
         // path and consumes Enter — the multiline exemption is structural,
         // not special-cased. Do not "fix" that.
         KeyBinding::new("enter", ModalConfirm, Some("ModalForm")),
+        // UX-polish §2: Tab order IS paint order (all tab_index 0 →
+        // TabStopMap falls back to insertion order): ConnectionDialog runs
+        // Název → Host → Port → Databáze → Uživatel → Heslo → Složka →
+        // Timeout → Auto-limit → (SSH host → port → uživatel → klíč, only
+        // while ssh_enabled — unpainted fields drop out of the cycle
+        // automatically). No unscoped `tab` exists and "SqlInput"'s scoped
+        // one is never on a modal's focus path, so these match directly —
+        // no fall-through needed. Dialogs with no stops: focus_next
+        // returns None → safe no-op.
+        KeyBinding::new("tab", ModalFocusNext, Some("ModalForm")),
+        KeyBinding::new("shift-tab", ModalFocusPrev, Some("ModalForm")),
     ]);
 }
 
@@ -305,13 +316,6 @@ impl TextField {
     /// input (grid filter row, find bar, history search, palette, cell
     /// editor — all deliberately `new`) would leak that background field
     /// into an open dialog's Tab cycle.
-    ///
-    /// Deviation from plan: the plan's Task 3 assumed a `pub fn` on a `pub`
-    /// type wouldn't trigger `dead_code` before Task 5 wires up call sites —
-    /// but `dbc-ui` builds as a bin crate (no external consumers), so
-    /// unused `pub` items ARE linted. `#[allow(dead_code)]` here is removed
-    /// in Task 5 once real call sites exist.
-    #[allow(dead_code)]
     pub fn form_field(
         cx: &mut Context<Self>,
         placeholder: impl Into<SharedString>,
@@ -1433,6 +1437,8 @@ impl AppView {
                 .track_focus(&self.modal_focus_handle)
                 .key_context("ModalForm")
                 .on_action(cx.listener(AppView::on_modal_confirm))
+                .on_action(cx.listener(AppView::on_modal_focus_next))
+                .on_action(cx.listener(AppView::on_modal_focus_prev))
                 .occlude()
                 .child(panel)
                 .into_any_element(),
@@ -1512,19 +1518,19 @@ impl AppView {
         if self.modal.is_some() {
             return;
         }
-        let name = cx.new(|cx| TextField::new(cx, "např. Produkce", false));
-        let host = cx.new(|cx| TextField::new(cx, "localhost", false));
-        let port = cx.new(|cx| TextField::new(cx, "5432", false));
-        let database = cx.new(|cx| TextField::new(cx, "", false));
-        let user = cx.new(|cx| TextField::new(cx, "", false));
-        let password = cx.new(|cx| TextField::new(cx, "", true));
-        let folder = cx.new(|cx| TextField::new(cx, "a/b", false));
-        let timeout_secs = cx.new(|cx| TextField::new(cx, "30", false));
-        let auto_limit = cx.new(|cx| TextField::new(cx, "1000", false));
-        let ssh_host = cx.new(|cx| TextField::new(cx, "", false));
-        let ssh_port = cx.new(|cx| TextField::new(cx, "22", false));
-        let ssh_user = cx.new(|cx| TextField::new(cx, "", false));
-        let ssh_key_path = cx.new(|cx| TextField::new(cx, "~/.ssh/id_ed25519", false));
+        let name = cx.new(|cx| TextField::form_field(cx, "např. Produkce", false));
+        let host = cx.new(|cx| TextField::form_field(cx, "localhost", false));
+        let port = cx.new(|cx| TextField::form_field(cx, "5432", false));
+        let database = cx.new(|cx| TextField::form_field(cx, "", false));
+        let user = cx.new(|cx| TextField::form_field(cx, "", false));
+        let password = cx.new(|cx| TextField::form_field(cx, "", true));
+        let folder = cx.new(|cx| TextField::form_field(cx, "a/b", false));
+        let timeout_secs = cx.new(|cx| TextField::form_field(cx, "30", false));
+        let auto_limit = cx.new(|cx| TextField::form_field(cx, "1000", false));
+        let ssh_host = cx.new(|cx| TextField::form_field(cx, "", false));
+        let ssh_port = cx.new(|cx| TextField::form_field(cx, "22", false));
+        let ssh_user = cx.new(|cx| TextField::form_field(cx, "", false));
+        let ssh_key_path = cx.new(|cx| TextField::form_field(cx, "~/.ssh/id_ed25519", false));
 
         let (editing_id, engine, read_only, favourite, ssh_enabled) = if let Some(c) = &editing {
             name.update(cx, |f, cx| f.set_text(&c.name, cx));
@@ -1608,6 +1614,20 @@ impl AppView {
             // Handled no-op: propagation already stopped, Enter dies here.
             ModalConfirmKind::Ignore => {}
         }
+    }
+
+    /// UX-polish §2: Tab inside a modal — `TabStopMap` supplies ordering,
+    /// wrap-around, and skips non-stops; only `form_field` handles are
+    /// stops, and the single-modal invariant guarantees at most one
+    /// dialog's fields are painted, so the map contains exactly the open
+    /// dialog's inputs. Buttons/checkboxes are plain divs and stay out of
+    /// the cycle in v1 (design §2.1).
+    fn on_modal_focus_next(&mut self, _: &ModalFocusNext, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus_next(cx);
+    }
+
+    fn on_modal_focus_prev(&mut self, _: &ModalFocusPrev, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus_prev(cx);
     }
 
     /// G14 T10: topbar gear entry point. Same single-modal invariant every
@@ -1815,7 +1835,7 @@ impl AppView {
             self.vault.is_some(),
             Vault::exists(&self.vault_path),
         ) {
-            let input = cx.new(|cx| TextField::new(cx, "Heslo", true));
+            let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
             let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt {
                 input,
@@ -1884,7 +1904,7 @@ impl AppView {
             return;
         }
         if Vault::exists(&self.vault_path) {
-            let input = cx.new(|cx| TextField::new(cx, "Heslo", true));
+            let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
             let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt {
                 input,
@@ -1893,8 +1913,8 @@ impl AppView {
             });
             window.focus(&focus, cx);
         } else {
-            let input1 = cx.new(|cx| TextField::new(cx, "Nové heslo", true));
-            let input2 = cx.new(|cx| TextField::new(cx, "Zopakujte heslo", true));
+            let input1 = cx.new(|cx| TextField::form_field(cx, "Nové heslo", true));
+            let input2 = cx.new(|cx| TextField::form_field(cx, "Zopakujte heslo", true));
             let focus = input1.focus_handle(cx);
             self.modal = Some(ModalState::CreateMasterPassword {
                 input1,
@@ -2004,7 +2024,7 @@ impl AppView {
             .find(|c| c.id == id)
             .map_or(false, |c| c.engine != Engine::Sqlite);
         if needs_secret && self.vault.is_none() && Vault::exists(&self.vault_path) {
-            let input = cx.new(|cx| TextField::new(cx, "Heslo", true));
+            let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
             let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt {
                 input,
@@ -2182,7 +2202,7 @@ impl AppView {
         // of the app created one), fall back to unlocking it instead of
         // clobbering it.
         if Vault::exists(&self.vault_path) {
-            let input = cx.new(|cx| TextField::new(cx, "Heslo", true));
+            let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
             let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt { input, error: None, pending });
             window.focus(&focus, cx);

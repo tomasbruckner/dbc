@@ -1268,7 +1268,7 @@ impl AppView {
             let prefill = stored.filter(|v| !v.is_null).map(|v| v.text.clone()).unwrap_or_default();
             null_flags.push(stored.map(|v| v.is_null).unwrap_or(false));
             inputs.push(cx.new(|cx| {
-                let mut f = connections_ui::TextField::new(cx, "", false);
+                let mut f = connections_ui::TextField::form_field(cx, "", false);
                 f.set_text(&prefill, cx);
                 f
             }));
@@ -7087,7 +7087,7 @@ impl AppView {
         };
 
         let expected_name = cfg.database.clone();
-        let input = cx.new(|cx| connections_ui::TextField::new(cx, &expected_name, false));
+        let input = cx.new(|cx| connections_ui::TextField::form_field(cx, &expected_name, false));
         // Review MINOR A fix: focus the typed-name field — every sibling
         // modal opener in this codebase already focuses its own first
         // field (`open_connection_dialog`, `on_dropdown_item_click`'s
