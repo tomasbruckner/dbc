@@ -2379,7 +2379,6 @@ dependencies = [
  "tempfile",
  "testcontainers-modules",
  "tokio",
- "tokio-postgres",
  "tree-sitter",
  "tree-sitter-sequel",
  "unicode-segmentation",
