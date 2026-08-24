@@ -2402,7 +2402,22 @@ async fn monitor_loop(
                 // conn.execute call. Deliberately a direct check rather
                 // than guard_not_read_only() so the design's mandated
                 // message text is exact.
-                let result = if read_only {
+                //
+                // G15 T6 review fix (MINOR, defense in depth): `pid > 0` is
+                // checked HERE too, not just in `monitor_sql::mssql::BLOCKING`'s
+                // own `blocking_session_id > 0` filter — MSSQL's DMVs can
+                // surface negative "blocker" ids for system pseudo-sessions
+                // (`-2` orphaned DTC, `-3`/`-4` recovery/latch), and this
+                // dispatch point must not trust the SQL-side filter alone
+                // (same "every layer holds on its own" posture as every
+                // other guard in this codebase). A non-positive pid is
+                // refused before any driver call, independent of
+                // `read_only` — it's a structurally invalid target, not a
+                // permission question. `kill_sql`'s own `debug_assert!(pid
+                // > 0)` stays as the last-resort backstop.
+                let result = if pid <= 0 {
+                    Err(QueryError::msg("neplatné PID procesu"))
+                } else if read_only {
                     Err(QueryError::msg(MONITOR_READ_ONLY_KILL_MSG))
                 } else {
                     match crate::monitor_sql::kill_sql(engine, pid) {
@@ -4276,6 +4291,56 @@ mod monitor_tests {
         tokio::time::timeout(Duration::from_secs(5), loop_task).await.unwrap().unwrap();
     }
 
+    /// G15 T6 review REQUIRED (MINOR, defense in depth): a non-positive pid
+    /// is refused BEFORE any driver call — `conn.execute` is never reached
+    /// — independent of `read_only`. Guards against `kill_sql`'s
+    /// `debug_assert!(pid > 0)` (a negative MSSQL `blocking_session_id`
+    /// like `-2`/`-3`/`-4` for a system pseudo-blocker must never reach
+    /// this far, even if `monitor_sql::mssql::BLOCKING`'s own `> 0` filter
+    /// were ever loosened again — this dispatch point doesn't trust that
+    /// filter alone).
+    #[tokio::test]
+    async fn monitor_kill_refuses_non_positive_pid_before_reaching_driver() {
+        let (conn, calls, _sqls) = RecordingConnection::new();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let loop_task = tokio::spawn(monitor_loop(
+            Box::new(conn),
+            dbc_state::Engine::Mssql,
+            /* read_only */ false, // a writable connection — proves the
+            // refusal is about the pid, not read-only.
+            cmd_rx,
+            event_tx,
+        ));
+
+        for bad_pid in [-2_i64, -3, -4, 0] {
+            cmd_tx.send(MonitorCmd::Kill { generation: 1, pid: bad_pid }).await.unwrap();
+            let ev = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match ev {
+                MonitorEvent::KillResult { pid, result: Err(e), .. } => {
+                    assert_eq!(pid, bad_pid);
+                    assert_ne!(
+                        e.message, MONITOR_READ_ONLY_KILL_MSG,
+                        "pid {bad_pid} must be refused for being invalid, not mistaken for the \
+                         read-only refusal"
+                    );
+                }
+                other => panic!("expected an Err KillResult for pid {bad_pid}, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a non-positive pid must never reach Connection::execute"
+        );
+
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(5), loop_task).await.unwrap().unwrap();
+    }
+
     /// End-to-end all-failed path without docker: a real sqlite connection
     /// can't run any pg catalog query, so every drain fails and the loop
     /// must send Error (with the dispatched generation), not Data and not
@@ -4435,7 +4500,7 @@ mod monitor_tests {
             use crate::monitor_sql::mssql as ms;
             Ok(match sql {
                 s if s == ms::CONNECTIONS => text_row_stream(&[("active", "5"), ("idle", "2")]),
-                s if s == ms::CONNECTIONS_MAX => text_row_stream(&[("max_conn", "0")]), // unlimited
+                s if s == ms::CONNECTIONS_MAX => text_row_stream(&[("max_conn", "100")]),
                 s if s == ms::LOCKS_WAITING => text_row_stream(&[("waiting", "1")]),
                 s if s == ms::DEADLOCKS => text_row_stream(&[("deadlocks_since_reset", "3")]),
                 s if s == ms::SIZE => {
@@ -4470,9 +4535,16 @@ mod monitor_tests {
         let results = run_monitor_refresh(&mut conn, dbc_state::Engine::Mssql, CancelToken::new()).await;
         let snap = monitor::assemble_snapshot(results, Instant::now()).expect("every constituent query ok");
 
+        // G15 T6 review fix (MINOR): a real, non-zero fixture value proves
+        // this end-to-end path actually DISPATCHES and reads
+        // CONNECTIONS_MAX — a "0" fixture (the old version of this test)
+        // asserting `max: None` is indistinguishable from the arm never
+        // issuing that query at all. The "value_in_use = 0 -> None"
+        // unlimited rule itself stays covered by
+        // `monitor::tests::merge_connections_zero_max_means_unlimited_none`.
         assert_eq!(
             snap.connections,
-            Some(monitor::ConnectionsTile { active: 5, idle: 2, max: None }) // value_in_use=0 -> unlimited
+            Some(monitor::ConnectionsTile { active: 5, idle: 2, max: Some(100) })
         );
         assert_eq!(snap.locks, Some(monitor::LocksTile { waiting: 1, deadlocks_since_reset: 3 }));
         assert_eq!(
