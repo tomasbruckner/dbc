@@ -1004,15 +1004,22 @@ enum PendingDiscard {
     },
     /// Sidebar rework (resolved deviation 11): the user confirmed dropping
     /// the staged admin edits — close the dirty admin tab, then perform
-    /// the switch.
-    SwitchDatabase { conn_id: String, db: Option<String> },
+    /// the switch. Carries the dispatch's own `follow_up` (T5 review
+    /// MAJOR 2): "Zrušit" drops this whole variant, follow-up included —
+    /// a cancelled switch can never leave an armed action behind.
+    SwitchDatabase { conn_id: String, db: Option<String>, follow_up: Option<PendingTreeAction> },
 }
 
-/// Sidebar rework (design §2.2): the one-shot action `switch_to_database`
-/// replays after a successful cross-context switch. Single-variant by
-/// design (pinned by `switch_decision_tests`) — a second queued kind needs
-/// its own design pass.
-enum PendingTreeAction {
+/// Sidebar rework (design §2.2): the one-shot action a cross-context
+/// switch replays after success. T5 review MAJOR 2: NOT a shared AppView
+/// field — each `switch_to_database` dispatch OWNS its action (parameter,
+/// captured into the spawn closure), so a superseded dispatch's action
+/// dies with it under the `switch_generation` guard, and the vault/confirm
+/// detours carry it inside their pending payloads (dropped on cancel).
+/// Single-variant by design (pinned by `switch_decision_tests`) — a second
+/// queued kind needs its own design pass.
+#[derive(Clone)]
+pub(crate) enum PendingTreeAction {
     OpenPreview { schema: Option<String>, table: String },
 }
 
@@ -1129,11 +1136,6 @@ struct AppView {
     /// still matches — same last-dispatched-wins guard as
     /// `sidebar_fetch_generation`/`switch_generation`.
     compare_fetch_generation: u64,
-    /// Sidebar rework (design §2.2): one-shot action queued behind a
-    /// cross-context `switch_to_database` — replayed on switch success,
-    /// cleared on failure/supersede. Only ever an OpenPreview today
-    /// (`PendingTreeAction`'s single variant, pinned by test).
-    pending_after_switch: Option<PendingTreeAction>,
     // --- G3 Task 3: history panel + query recording ---
     /// Opened from `default_history_path()` at startup; `None` when the open
     /// failed (surfaced once in the startup status — see `main`), in which
@@ -1354,6 +1356,17 @@ fn resolve_active_from(
 /// intent is documented once instead of three times.
 fn conn_identity_matches(tab_identity: &str, current: &str) -> bool {
     tab_identity == current
+}
+
+/// T5 review MINOR 3: pure entry-guard decision for `switch_to_database` —
+/// a switch attempted under ANY open overlay (modal, apply dialog,
+/// discard-confirm) is refused outright. Trivial by design (same posture
+/// as `conn_identity_matches`): named + testable rather than an inline
+/// `||` chain, because the failure mode it prevents is subtle — an open
+/// discard-confirm from ANOTHER flow would otherwise have skipped the
+/// dirty-admin confirmation entirely.
+fn switch_blocked_by_overlay(modal_open: bool, apply_dialog_open: bool, discard_confirm_open: bool) -> bool {
+    modal_open || apply_dialog_open || discard_confirm_open
 }
 
 /// G10 T4: what `open_admin_tab` should do given the current tab set — pure
@@ -4766,7 +4779,30 @@ impl AppView {
     /// `Some(db)` a tree-selected one. Success is the ONLY writer of
     /// `active_database`. A failed test_connect leaves the previous
     /// context untouched — same contract as the pre-rework switch.
-    pub(crate) fn switch_to_database(&mut self, id: &str, db: Option<String>, cx: &mut Context<Self>) {
+    ///
+    /// `follow_up` (T5 review MAJOR 2): the one-shot action THIS dispatch
+    /// replays on success — owned by the dispatch (captured into the spawn
+    /// closure), never shared state, so a superseding switch retires it via
+    /// the `switch_generation` guard and a vault/confirm cancel drops it
+    /// with its pending payload.
+    pub(crate) fn switch_to_database(
+        &mut self,
+        id: &str,
+        db: Option<String>,
+        follow_up: Option<PendingTreeAction>,
+        cx: &mut Context<Self>,
+    ) {
+        // T5 review MINOR 3 (house convention, cf. `run_query_with`):
+        // refuse outright under ANY open overlay — in particular an open
+        // discard-confirm from ANOTHER flow must not let the switch skip
+        // the dirty-admin confirmation below.
+        if switch_blocked_by_overlay(
+            self.modal.is_some(),
+            self.apply_dialog.is_some(),
+            self.discard_confirm.is_some(),
+        ) {
+            return;
+        }
         self.cancel_active_backup_if_running();
         let Some(cfg) = self.config.connections.iter().find(|c| c.id == id).cloned() else { return };
         // Canonical spelling: explicitly picking the default == None
@@ -4778,7 +4814,13 @@ impl AppView {
             // Already there — still worth a re-validate? No: match the old
             // dropdown behaviour (clicking the active item re-tested)?
             // Deliberate change: a no-op switch is a no-op; the ⟳ button
-            // owns re-validation. Keeps double-click idempotent.
+            // owns re-validation. Keeps double-click idempotent. A
+            // follow-up (unreachable from the cross-context arm, which
+            // implies a different identity — kept defensively) targets the
+            // already-active context, so it runs directly.
+            if let Some(PendingTreeAction::OpenPreview { schema, table }) = follow_up {
+                self.open_table_preview(schema, table, cx);
+            }
             return;
         }
         // Resolved deviation 11 (risk list "release-note + confirm"): a
@@ -4788,16 +4830,20 @@ impl AppView {
         // sandbox GRID edits deliberately get NO prompt: they are not
         // dropped — the tab stays, the apply bar dims via the identity
         // guard, and switching back to the same (conn, db) re-enables it.
-        if self.discard_confirm.is_none() {
-            if let Some(count) = self.dirty_admin_change_count(cx) {
-                self.discard_confirm = Some(DiscardConfirmState {
-                    change_count: count,
-                    action: PendingDiscard::SwitchDatabase { conn_id: id.to_string(), db },
-                });
-                self.modal_needs_focus = true;
-                cx.notify();
-                return;
-            }
+        // (The entry guard above already refused a foreign open confirm;
+        // the Yes-arm re-enters with `discard_confirm` taken.)
+        if let Some(count) = self.dirty_admin_change_count(cx) {
+            self.discard_confirm = Some(DiscardConfirmState {
+                change_count: count,
+                action: PendingDiscard::SwitchDatabase {
+                    conn_id: id.to_string(),
+                    db,
+                    follow_up,
+                },
+            });
+            self.modal_needs_focus = true;
+            cx.notify();
+            return;
         }
         // Vault gate (design §1.3/§4.4) — same three-boolean predicate as
         // the dropdown's.
@@ -4808,7 +4854,11 @@ impl AppView {
             Vault::exists(&self.vault_path),
         ) {
             self.open_vault_prompt(
-                connections_ui::PendingAfterUnlock::SwitchDatabase { conn_id: id.to_string(), db },
+                connections_ui::PendingAfterUnlock::SwitchDatabase {
+                    conn_id: id.to_string(),
+                    db,
+                    follow_up,
+                },
                 cx,
             );
             return;
@@ -4843,21 +4893,22 @@ impl AppView {
                         view.close_autocomplete(cx);
                         view.refresh_tree_context(cx);
                         view.start_schema_slot_fetch(target_id.clone(), effective.clone(), cx);
-                        if let Some(action) = view.pending_after_switch.take() {
-                            match action {
-                                PendingTreeAction::OpenPreview { schema, table } => {
-                                    view.open_table_preview(schema, table, cx);
-                                }
-                            }
+                        // T5 review MAJOR 2: the follow-up is THIS
+                        // dispatch's own (closure-captured) — a superseded
+                        // dispatch never reaches here (generation guard
+                        // above), so a stale action can never replay
+                        // against the wrong database.
+                        if let Some(PendingTreeAction::OpenPreview { schema, table }) = follow_up {
+                            view.open_table_preview(schema, table, cx);
                         }
                     }
+                    // Failure arms: the closure-owned follow-up simply
+                    // drops with them — nothing shared to clear.
                     Ok(Err(e)) => {
                         view.status = format!("error: {e}");
-                        view.pending_after_switch = None; // failure clears the queue
                     }
                     Err(_) => {
                         view.status = "error: connect zrušen".into();
-                        view.pending_after_switch = None;
                     }
                 }
                 cx.notify();
@@ -5772,7 +5823,7 @@ impl AppView {
             // (matches `AdminOpenDecision::Replace`'s posture) — and it is
             // what lets the re-entered `switch_to_database` sail past its
             // own `dirty_admin_change_count` check without looping.
-            PendingDiscard::SwitchDatabase { conn_id, db } => {
+            PendingDiscard::SwitchDatabase { conn_id, db, follow_up } => {
                 let admin_tab_id = self
                     .tabs
                     .iter()
@@ -5780,7 +5831,7 @@ impl AppView {
                 if let Some(id) = admin_tab_id {
                     self.tabs.close(id);
                 }
-                self.switch_to_database(&conn_id, db, cx);
+                self.switch_to_database(&conn_id, db, follow_up, cx);
             }
         }
         cx.notify();
@@ -6702,11 +6753,15 @@ impl AppView {
                 if self.scope_is_active(conn_id, db) {
                     self.open_table_preview(schema.clone(), table.clone(), cx);
                 } else {
-                    self.pending_after_switch = Some(PendingTreeAction::OpenPreview {
-                        schema: schema.clone(),
-                        table: table.clone(),
-                    });
-                    self.switch_to_database(conn_id, Some(db.clone()), cx);
+                    self.switch_to_database(
+                        conn_id,
+                        Some(db.clone()),
+                        Some(PendingTreeAction::OpenPreview {
+                            schema: schema.clone(),
+                            table: table.clone(),
+                        }),
+                        cx,
+                    );
                 }
             }
             TreeEvent::OpenDdl { title, ddl } => {
@@ -6772,7 +6827,7 @@ impl AppView {
                 self.start_schema_slot_fetch(conn_id.clone(), db.clone(), cx)
             }
             TreeEvent::SwitchToDatabase { conn_id, db } => {
-                self.switch_to_database(conn_id, db.clone(), cx)
+                self.switch_to_database(conn_id, db.clone(), None, cx)
             }
         }
     }
@@ -8864,7 +8919,6 @@ fn main() {
                             tree_visible: true,
                             sidebar_fetch_generation: 0,
                             compare_fetch_generation: 0,
-                            pending_after_switch: None,
                             history,
                             history_visible: true,
                             history_search,
@@ -9735,16 +9789,58 @@ mod switch_decision_tests {
         );
     }
 
-    /// The queue is one-shot open-preview only (design §2.2): success
-    /// replays it, failure clears it — both arms are in switch_to_database
-    /// and structurally covered; this pins the enum stays single-variant
-    /// (a second queued kind needs its own design pass).
+    /// The queued action is one-shot open-preview only (design §2.2) —
+    /// this pins the enum stays single-variant (a second queued kind needs
+    /// its own design pass).
     #[test]
     fn pending_tree_action_is_open_preview_only() {
         let a = PendingTreeAction::OpenPreview { schema: None, table: "t".into() };
         match a {
             PendingTreeAction::OpenPreview { .. } => {}
         }
+    }
+
+    /// T5 review MAJOR 2: each `switch_to_database` dispatch OWNS its
+    /// follow-up (parameter → spawn-closure capture; there is no shared
+    /// `pending_after_switch` field any more), and the success arm runs
+    /// only under `switch_generation == my_generation` — this models that
+    /// guard exactly: the superseded dispatch's follow-up can never
+    /// replay, because its owning closure returns before reaching it.
+    /// (Cancel disarmament is by the same ownership: the vault/confirm
+    /// detours carry the follow-up INSIDE their pending payload —
+    /// `PendingAfterUnlock::SwitchDatabase` / `PendingDiscard::
+    /// SwitchDatabase` — which cancel drops wholesale.)
+    #[test]
+    fn superseded_switch_dispatch_never_replays_its_follow_up() {
+        let mut switch_generation = 0u64;
+        // Dispatch 1 carries a follow-up for (c1, dbB):
+        switch_generation += 1;
+        let d1 = (
+            switch_generation,
+            Some(PendingTreeAction::OpenPreview { schema: None, table: "orders".into() }),
+        );
+        // Dispatch 2 (user switched elsewhere) supersedes before d1
+        // resolves:
+        switch_generation += 1;
+        let d2 = (switch_generation, None::<PendingTreeAction>);
+        // The success arm's guard, verbatim shape:
+        let applies = |my_generation: u64| my_generation == switch_generation;
+        assert!(!applies(d1.0), "superseded dispatch must not run — its follow-up dies with it");
+        assert!(applies(d2.0));
+        drop((d1, d2));
+    }
+
+    /// T5 review MINOR 3: a switch attempted under ANY open overlay is
+    /// refused outright — in particular an open discard-confirm from
+    /// another flow must never let the switch bypass the dirty-admin
+    /// confirmation.
+    #[test]
+    fn switch_refused_under_any_open_overlay() {
+        assert!(!switch_blocked_by_overlay(false, false, false));
+        assert!(switch_blocked_by_overlay(true, false, false));
+        assert!(switch_blocked_by_overlay(false, true, false));
+        assert!(switch_blocked_by_overlay(false, false, true));
+        assert!(switch_blocked_by_overlay(true, true, true));
     }
 }
 

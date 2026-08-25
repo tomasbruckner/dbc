@@ -1050,8 +1050,15 @@ pub enum PendingAfterUnlock {
     /// may fetch metadata with an empty-secret fallback (design §4.4).
     LoadDbSchema { conn_id: String, db: String },
     /// Sidebar rework: resume a `switch_to_database` (`db: None` = the
-    /// saved default). Cancel leaves the previous context untouched.
-    SwitchDatabase { conn_id: String, db: Option<String> },
+    /// saved default). Cancel leaves the previous context untouched — and
+    /// (T5 review MAJOR 2) DROPS the carried `follow_up` with the rest of
+    /// this payload, so a cancelled switch never leaves an armed one-shot
+    /// action behind.
+    SwitchDatabase {
+        conn_id: String,
+        db: Option<String>,
+        follow_up: Option<crate::PendingTreeAction>,
+    },
     SaveConnection(Box<ConnectionFormData>),
     /// Security follow-up #6 (final-review.md): the Test button used to
     /// test WITHOUT the stored secret when the vault was locked (a
@@ -2215,7 +2222,7 @@ impl AppView {
     /// `Connection` item (G3 Task 5, main.rs) keeps routing through this
     /// exact switch path — brief contract #4: "no new execution logic".
     pub(crate) fn switch_to_connection(&mut self, id: &str, cx: &mut Context<Self>) {
-        self.switch_to_database(id, None, cx);
+        self.switch_to_database(id, None, None, cx);
     }
 
     fn resume_pending(&mut self, pending: PendingAfterUnlock, window: &mut Window, cx: &mut Context<Self>) {
@@ -2225,8 +2232,8 @@ impl AppView {
             PendingAfterUnlock::LoadDbSchema { conn_id, db } => {
                 self.start_schema_slot_fetch(conn_id, db, cx)
             }
-            PendingAfterUnlock::SwitchDatabase { conn_id, db } => {
-                self.switch_to_database(&conn_id, db, cx)
+            PendingAfterUnlock::SwitchDatabase { conn_id, db, follow_up } => {
+                self.switch_to_database(&conn_id, db, follow_up, cx)
             }
             PendingAfterUnlock::SaveConnection(data) => self.finish_save(*data, cx),
             PendingAfterUnlock::TestConnection(ui) => {

@@ -786,6 +786,82 @@ pub fn apply_db_list_result(
     };
 }
 
+/// T5 review MAJOR 1: the ACTIVE context's schema fallback slot, keyed by
+/// its `(conn_id, db)` — exact `cli_slot` precedent. The switch path
+/// (dropdown/palette/double-click) fetches the active schema BEFORE the
+/// connection's database list was ever expanded; without this slot the
+/// result had nowhere to land (`slot_mut` = None) and was silently dropped
+/// — autocomplete/fk-joins/`detect_editable_pk`/palette/admin seed all
+/// degraded until a manual double expand. NOT a synthesized one-entry
+/// `Loaded` list: that would collide with `begin_db_list_load`'s
+/// refuse-over-Loaded invariant.
+pub type ActiveSlot = Option<((String, String), DbSchemaState)>;
+
+/// Transitions the fallback slot into `Loading` for `(conn_id, db)`,
+/// carrying its previous expand-set forward when the key matches (same
+/// contract as `begin_schema_load`); a different key is replaced outright
+/// (the fallback only ever serves ONE context at a time).
+pub fn begin_fallback_schema_load(slot: &mut ActiveSlot, conn_id: &str, db: &str, generation: u64) {
+    let mut state = match slot.take() {
+        Some(((c, d), st)) if c == conn_id && d == db => st,
+        _ => DbSchemaState::NotLoaded,
+    };
+    begin_schema_load(&mut state, generation);
+    *slot = Some(((conn_id.to_string(), db.to_string()), state));
+}
+
+/// `apply_schema_result` for the fallback slot — applies ONLY when the key
+/// matches `(conn_id, db)` (no cross-context leak: a fallback loaded for
+/// one scope can never absorb — or answer for — another's result).
+pub fn apply_fallback_schema_result(
+    slot: &mut ActiveSlot,
+    conn_id: &str,
+    db: &str,
+    my_gen: u64,
+    result: Result<SchemaSnapshot, String>,
+) {
+    if let Some(((c, d), state)) = slot {
+        if c == conn_id && d == db {
+            apply_schema_result(state, my_gen, result);
+        }
+    }
+}
+
+/// Read access to the fallback slot, key-gated the same way.
+pub fn fallback_slot<'a>(slot: &'a ActiveSlot, conn_id: &str, db: &str) -> Option<&'a DbSchemaState> {
+    match slot {
+        Some(((c, d), state)) if c == conn_id && d == db => Some(state),
+        _ => None,
+    }
+}
+
+/// Once `conn_id`'s database list loads, the fallback state migrates into
+/// its real `DbNode` (the fallback was only ever a stand-in for the not-
+/// yet-listed slot) and the fallback empties. Returns the migrated key
+/// when a `Loaded` snapshot moved — the caller LRU-accounts it via
+/// `touch_and_evict`. A list that does not contain the fallback's db
+/// (e.g. truncated at the cap) keeps the fallback in place — the active
+/// context must not lose its schema to a listing artifact.
+pub fn migrate_fallback_into_list(
+    node: &mut ConnNode,
+    slot: &mut ActiveSlot,
+    conn_id: &str,
+) -> Option<(String, String)> {
+    let Some(((c, _), _)) = slot else { return None };
+    if c != conn_id {
+        return None;
+    }
+    let DbListState::Loaded { dbs, .. } = &mut node.dbs else { return None };
+    let db = slot.as_ref().map(|((_, d), _)| d.clone()).expect("checked above");
+    let Some(dbn) = dbs.iter_mut().find(|x| x.name == db) else {
+        return None;
+    };
+    let (key, state) = slot.take().expect("checked above");
+    let was_loaded = matches!(state, DbSchemaState::Loaded { .. });
+    dbn.schema = state;
+    was_loaded.then_some(key)
+}
+
 /// Design §6: bounded snapshot cache. Push `touched` to the back of `lru`
 /// (dedup), then evict `Loaded` slots beyond `LOADED_SNAPSHOT_CAP` back to
 /// `NotLoaded`, oldest first, NEVER the active slot.
@@ -1119,6 +1195,13 @@ pub struct SchemaTree {
     /// The CLI root's schema slot (`conn_id == CLI_CONN_IDENTITY`,
     /// `db == ""` in every `(conn, db)` API here).
     cli_slot: DbSchemaState,
+    /// T5 review MAJOR 1: the ACTIVE context's schema fallback — holds the
+    /// switch path's schema fetch when the connection's database list was
+    /// never expanded (no `DbNode` slot exists yet). Consulted by
+    /// `begin_schema`/`finish_schema`/`slot_ref` when the map slot is
+    /// absent; migrated into the real `DbNode` once the list loads
+    /// (`finish_db_list`). See `ActiveSlot`'s doc comment.
+    active_slot: ActiveSlot,
     filter: String,
     selected: Option<SidebarRow>,
     focus_handle: FocusHandle,
@@ -1159,6 +1242,7 @@ impl SchemaTree {
             active_scope: None,
             cli_url: None,
             cli_slot: DbSchemaState::NotLoaded,
+            active_slot: None,
             filter: String::new(),
             selected: None,
             focus_handle: cx.focus_handle(),
@@ -1223,7 +1307,9 @@ impl SchemaTree {
     }
 
     /// Applies a database-list result (stale generations dropped by
-    /// `apply_db_list_result` — last-dispatched wins).
+    /// `apply_db_list_result` — last-dispatched wins), then migrates any
+    /// active-context fallback schema into its real `DbNode` (T5 review
+    /// MAJOR 1) — LRU-accounting a migrated `Loaded` snapshot.
     pub fn finish_db_list(
         &mut self,
         conn_id: &str,
@@ -1232,22 +1318,36 @@ impl SchemaTree {
         default_db: &str,
         cx: &mut Context<Self>,
     ) {
-        if let Some(node) = self.conns.get_mut(conn_id) {
-            apply_db_list_result(node, generation, result, default_db);
-            cx.notify();
+        let Some(node) = self.conns.get_mut(conn_id) else { return };
+        apply_db_list_result(node, generation, result, default_db);
+        if let Some(key) = migrate_fallback_into_list(node, &mut self.active_slot, conn_id) {
+            let active = self.active_scope.as_ref().map(|s| (s.conn_id.clone(), s.db.clone()));
+            touch_and_evict(&mut self.conns, &mut self.lru, key, active.as_ref());
         }
+        cx.notify();
     }
 
     /// Transitions one `(conn, db)` schema slot into `Loading`
     /// (`CLI_CONN_IDENTITY` targets the CLI slot; `db` is ignored there).
+    /// A missing map slot for the ACTIVE scope lands in the fallback
+    /// `active_slot` instead of being dropped (T5 review MAJOR 1 — the
+    /// switch path fetches before the db list exists); non-active scopes
+    /// without a slot still no-op (their result is generation-dropped).
     pub fn begin_schema(&mut self, conn_id: &str, db: &str, generation: u64, cx: &mut Context<Self>) {
         if conn_id == crate::CLI_CONN_IDENTITY {
             begin_schema_load(&mut self.cli_slot, generation);
         } else if let Some(slot) = self.slot_mut(conn_id, db) {
             begin_schema_load(slot, generation);
+        } else if self
+            .active_scope
+            .as_ref()
+            .is_some_and(|s| s.conn_id == conn_id && s.db == db)
+        {
+            begin_fallback_schema_load(&mut self.active_slot, conn_id, db, generation);
         } else {
-            // No such slot (list not loaded / db vanished) — the fetch
-            // result will be dropped by the generation check anyway.
+            // No such slot (list not loaded / db vanished) and not the
+            // active context — the fetch result will be dropped by the
+            // generation check anyway.
             return;
         }
         cx.notify();
@@ -1269,7 +1369,14 @@ impl SchemaTree {
             cx.notify();
             return;
         }
-        let Some(slot) = self.slot_mut(conn_id, db) else { return };
+        let Some(slot) = self.slot_mut(conn_id, db) else {
+            // T5 review MAJOR 1: the active-context fallback catches the
+            // switch path's result when the db list was never loaded —
+            // key-gated, so no cross-context result can land here.
+            apply_fallback_schema_result(&mut self.active_slot, conn_id, db, generation, result);
+            cx.notify();
+            return;
+        };
         apply_schema_result(slot, generation, result);
         let active = self.active_scope.as_ref().map(|s| (s.conn_id.clone(), s.db.clone()));
         touch_and_evict(
@@ -1298,13 +1405,20 @@ impl SchemaTree {
     }
 
     /// Immutable sibling of `slot_mut` (CLI slot for the
-    /// `CLI_CONN_IDENTITY` id, any `db`).
+    /// `CLI_CONN_IDENTITY` id, any `db`). Falls back to the key-gated
+    /// `active_slot` when the map slot is absent (T5 review MAJOR 1).
     fn slot_ref(&self, conn_id: &str, db: &str) -> Option<&DbSchemaState> {
         if conn_id == crate::CLI_CONN_IDENTITY {
             return Some(&self.cli_slot);
         }
-        let DbListState::Loaded { dbs, .. } = &self.conns.get(conn_id)?.dbs else { return None };
-        dbs.iter().find(|d| d.name == db).map(|d| &d.schema)
+        if let Some(node) = self.conns.get(conn_id) {
+            if let DbListState::Loaded { dbs, .. } = &node.dbs {
+                if let Some(d) = dbs.iter().find(|d| d.name == db) {
+                    return Some(&d.schema);
+                }
+            }
+        }
+        fallback_slot(&self.active_slot, conn_id, db)
     }
 
     /// One `(conn, db)` slot's snapshot, if `Loaded`.
@@ -2707,6 +2821,86 @@ mod sidebar_tests {
         assert_eq!(dbs.iter().map(|d| (d.name.as_str(), d.is_default)).collect::<Vec<_>>(),
             vec![("inventory", false), ("sales", true)]);
         assert!(dbs.iter().all(|d| matches!(d.schema, DbSchemaState::NotLoaded)));
+    }
+
+    /// T5 review MAJOR 1: a switch (dropdown/palette/double-click) to a
+    /// connection whose db list was never expanded must land its schema
+    /// fetch in the active-context fallback slot — pre-fix, `slot_mut`
+    /// found nothing and the snapshot was silently DROPPED (autocomplete,
+    /// fk joins, `detect_editable_pk`, palette and the admin seed all
+    /// degraded until a manual double expand).
+    #[test]
+    fn switch_to_unexpanded_connection_lands_schema_in_the_fallback_slot() {
+        let mut slot: ActiveSlot = None;
+        begin_fallback_schema_load(&mut slot, "c1", "sales", 7);
+        assert!(matches!(fallback_slot(&slot, "c1", "sales"), Some(DbSchemaState::Loading { .. })));
+        apply_fallback_schema_result(&mut slot, "c1", "sales", 7, Ok(snap()));
+        let Some(DbSchemaState::Loaded { snapshot, .. }) = fallback_slot(&slot, "c1", "sales")
+        else {
+            panic!("active-scope switch fetch must populate the fallback slot");
+        };
+        assert_eq!(snapshot.tables[0].name, "orders");
+        // Stale generation still drops (same contract as the map slots):
+        apply_fallback_schema_result(&mut slot, "c1", "sales", 6, Err("stale".into()));
+        assert!(matches!(fallback_slot(&slot, "c1", "sales"), Some(DbSchemaState::Loaded { .. })));
+    }
+
+    /// T5 review MAJOR 1 (+ the T7 census pre-pin): the fallback is
+    /// key-gated — a result for another `(conn, db)` never lands in it,
+    /// and lookups for another scope never read from it.
+    #[test]
+    fn fallback_slot_is_key_gated_no_cross_context_leak() {
+        let mut slot: ActiveSlot = None;
+        begin_fallback_schema_load(&mut slot, "c1", "sales", 1);
+        // Results for a DIFFERENT scope must not land:
+        apply_fallback_schema_result(&mut slot, "c2", "sales", 1, Ok(snap()));
+        apply_fallback_schema_result(&mut slot, "c1", "inventory", 1, Ok(snap()));
+        assert!(matches!(fallback_slot(&slot, "c1", "sales"), Some(DbSchemaState::Loading { .. })));
+        // Loaded for (c1, sales) answers ONLY (c1, sales):
+        apply_fallback_schema_result(&mut slot, "c1", "sales", 1, Ok(snap()));
+        assert!(fallback_slot(&slot, "c1", "sales").is_some());
+        assert!(fallback_slot(&slot, "c1", "inventory").is_none());
+        assert!(fallback_slot(&slot, "c2", "sales").is_none());
+    }
+
+    /// T5 review MAJOR 1: once the db list loads, the fallback schema
+    /// migrates into its real `DbNode` (the fallback empties; a `Loaded`
+    /// migration returns its key for LRU accounting). A list that does not
+    /// contain the fallback's db — or a different connection's list —
+    /// leaves the fallback in place.
+    #[test]
+    fn db_list_load_migrates_the_fallback_schema_into_its_db_node() {
+        let mut slot: ActiveSlot = None;
+        begin_fallback_schema_load(&mut slot, "c1", "sales", 1);
+        apply_fallback_schema_result(&mut slot, "c1", "sales", 1, Ok(snap()));
+        let mut node = ConnNode { dbs: DbListState::NotLoaded };
+        begin_db_list_load(&mut node, 2);
+        apply_db_list_result(
+            &mut node,
+            2,
+            Ok((vec!["postgres".into(), "sales".into()], false)),
+            "postgres",
+        );
+        assert_eq!(
+            migrate_fallback_into_list(&mut node, &mut slot, "c1"),
+            Some(("c1".into(), "sales".into()))
+        );
+        assert!(slot.is_none(), "fallback empties after migration");
+        let DbListState::Loaded { dbs, .. } = &node.dbs else { panic!("list loaded above") };
+        let d = dbs.iter().find(|d| d.name == "sales").unwrap();
+        assert!(
+            matches!(&d.schema, DbSchemaState::Loaded { snapshot, .. } if snapshot.tables[0].name == "orders"),
+            "the loaded schema must survive the migration"
+        );
+        // A list without the fallback's db (e.g. truncated) keeps it:
+        let mut slot2: ActiveSlot = None;
+        begin_fallback_schema_load(&mut slot2, "c1", "gone", 3);
+        apply_fallback_schema_result(&mut slot2, "c1", "gone", 3, Ok(snap()));
+        assert!(migrate_fallback_into_list(&mut node, &mut slot2, "c1").is_none());
+        assert!(slot2.is_some(), "active context must not lose its schema to a listing artifact");
+        // A different connection's list load leaves it untouched too:
+        assert!(migrate_fallback_into_list(&mut node, &mut slot2, "c2").is_none());
+        assert!(slot2.is_some());
     }
 
     #[test]
