@@ -4726,16 +4726,37 @@ impl AppView {
     fn set_theme(&mut self, mode: dbc_state::ThemeMode, cx: &mut Context<Self>) {
         if self.config.theme != mode {
             self.config.theme = mode;
-            self.status = match self.config.save(&self.config_path) {
-                Ok(()) => format!(
-                    "motiv: {}",
-                    match mode {
-                        dbc_state::ThemeMode::Dark => "tmavý",
-                        dbc_state::ThemeMode::Light => "světlý",
-                    }
-                ),
-                Err(e) => format!("error: motiv se nepodařilo uložit ({e})"),
-            };
+            // T7 review MAJOR-1: the SAME corrupt-config gate every other
+            // `config.toml` writer passes (`finish_save`, the two ★
+            // toggles, the scripts-dir pair). Without it, a `config.toml`
+            // that failed to parse at startup — reported only as a status
+            // string, with the UI fully usable and `self.config` replaced
+            // by `AppConfig::default()` — is destroyed by a REFLEX: one
+            // click on the light-theme radio (or the palette's „Přepnout
+            // motiv") writes a file holding `theme = "light"` and nothing
+            // else over every connection, favourite and vault key id.
+            // `AppConfig::save` is tmp + `sync_all` + rename with no
+            // backup; `guard_corrupt_config` is the only thing that keeps
+            // the original, as `config.toml.corrupt-bak`.
+            //
+            // It gates the WRITE only. The session switch below still runs
+            // unconditionally — "a save failure degrades to session-only +
+            // a status message" is this function's documented posture, and
+            // a refusal to persist is a save failure like any other.
+            // `guard_corrupt_config` sets its own status when it refuses,
+            // so nothing here overwrites it.
+            if self.guard_corrupt_config(cx) {
+                self.status = match self.config.save(&self.config_path) {
+                    Ok(()) => format!(
+                        "motiv: {}",
+                        match mode {
+                            dbc_state::ThemeMode::Dark => "tmavý",
+                            dbc_state::ThemeMode::Light => "světlý",
+                        }
+                    ),
+                    Err(e) => format!("error: motiv se nepodařilo uložit ({e})"),
+                };
+            }
         }
         cx.set_global(theme::Theme::from_mode(mode));
         // Re-highlight the editor with the new syntax palette (Task 6's
@@ -5707,14 +5728,51 @@ impl AppView {
                 }
             };
             let _ = this.update(cx, |view, cx| {
-                // Defense in depth: `scripts_dir` is inert in workspace
-                // mode, so the app must never WRITE it there either (§W8).
-                // The picker runs off the UI thread, so the user can have
-                // adopted a workspace in the meantime — this is a re-check,
-                // not a formality.
+                // §W8: `scripts_dir` is inert in workspace mode, so the app
+                // must never WRITE it there either.
+                //
+                // T7 review MINOR-2, decided: this stays, but it now
+                // REPORTS. Whether a swap can actually interleave between
+                // the native dialog closing and this continuation is not
+                // something this code can assert across three platforms, so
+                // the guard is kept — and a guard that can fire must not
+                // fire silently. A user who just picked a folder and got
+                // nothing back is the exact shape commit 4c06379 removed
+                // from `start_workspace_pick`.
+                //
+                // No generation guard here, deliberately, and NOT by
+                // analogy-failure with `start_workspace_pick`: that one
+                // needs `workspace_pick_generation` because its
+                // continuation contains a SECONDS-LONG background
+                // classification during which the window stays interactive
+                // and the user can reach a different explicit decision.
+                // This continuation has no background step — it resumes
+                // straight onto the UI thread — and the condition that
+                // actually matters here is not "did anything change" but
+                // "are we in workspace mode", which is exactly what the
+                // check below tests. A generation would be a weaker proxy
+                // for an invariant we can read directly.
                 if view.workspace_root.is_some() {
+                    view.status =
+                        connections_ui::SCRIPTS_PICK_DISCARDED_WORKSPACE.to_string();
+                    cx.notify();
                     return;
                 }
+                // T7 review MINOR-4: store the path only if it round-trips.
+                // `dbc_state::workspace::write_pointer` refuses a lossy path
+                // at the rail rather than papering over it with
+                // `display().to_string()`; a `scripts_dir` is read back the
+                // same way and deserves the same honesty. Substituting
+                // U+FFFD and reporting SUCCESS would put a path that does
+                // not exist in `config.toml` and then blame the scan for it.
+                let Some(picked_str) = picked.to_str() else {
+                    view.status = format!(
+                        "error: cesta ke složce skriptů obsahuje znaky, které nelze uložit: {}",
+                        picked.display()
+                    );
+                    cx.notify();
+                    return;
+                };
                 // Same corrupt-config gate the connection savers use
                 // (`finish_save`, the ★ toggle): with a poisoned
                 // `config.toml` the in-memory `config` is `default()`, so an
@@ -5723,11 +5781,25 @@ impl AppView {
                 if !view.guard_corrupt_config(cx) {
                     return;
                 }
-                view.config.scripts_dir = Some(picked.display().to_string());
+                view.config.scripts_dir = Some(picked_str.to_string());
                 view.status = match view.config.save(&view.config_path) {
-                    Ok(()) => format!("složka skriptů: {}", picked.display()),
+                    Ok(()) => format!("složka skriptů: {picked_str}"),
                     Err(e) => format!("error: nastavení se nepodařilo uložit ({e})"),
                 };
+                // T7 review MINOR-3: the ROOT just changed (A -> B). The
+                // per-folder expand keys are `OuterId::ScriptFolder(rel)`
+                // values naming paths under the OLD root — `reset_scripts`'
+                // own doc says they "name paths that no longer exist" — and
+                // a `reporting/` that happens to exist under B would render
+                // pre-expanded without the user ever opening it.
+                // `apply_context` and „Odebrat" already reset; the re-pick
+                // was the uncovered third context change.
+                //
+                // It is deliberately NOT inside `start_scripts_scan`: that
+                // is also the ⟳/retry path, and a refresh of the SAME root
+                // must PRESERVE expansion (the schema-slot refresh contract,
+                // resolved deviation 13).
+                view.tree.update(cx, |t, cx| t.reset_scripts(cx));
                 view.start_scripts_scan(cx);
                 cx.notify();
             });
@@ -11559,6 +11631,65 @@ mod autocomplete_handles_action_tests {
 /// as pure data. `Resolution` is plain data (dbc-state T2), so the whole
 /// "a configured-but-unusable workspace never yields a profile path"
 /// property is provable without GPUI, a filesystem, or a tempdir.
+/// T7 review MAJOR-1, pinned mechanically rather than by hand: EVERY
+/// `config.toml` writer in this crate must pass `guard_corrupt_config`
+/// first. The hazard is not one function's oversight — it is that the
+/// guard is a CONVENTION with no compiler behind it, and the one writer
+/// that forgot it (`set_theme`) was reachable by reflex from two surfaces.
+/// Same shape as `dbc-mcp`'s `no_write_path_regression`: scan our own
+/// source, build the needle at runtime so the check cannot flag itself.
+#[cfg(test)]
+mod config_save_guard_audit {
+    const SOURCES: &[(&str, &str)] =
+        &[("main.rs", include_str!("main.rs")), ("connections_ui.rs", include_str!("connections_ui.rs"))];
+
+    /// Every writer's ENCLOSING fn must mention the guard above the call.
+    #[test]
+    fn every_config_toml_write_passes_the_corrupt_config_guard() {
+        // Built at runtime — written as a literal, this needle would match
+        // its own source text and report a phantom unguarded call site.
+        let needle = format!(".{}.{}(", "config", "save");
+        let mut sites = 0usize;
+        for (name, src) in SOURCES {
+            let lines: Vec<&str> = src.lines().collect();
+            // Comments (incl. `///`) count neither as a call site NOR as
+            // the guard: this check was vacuous in its first draft because
+            // `set_theme`'s new explanatory comment MENTIONS the guard, and
+            // a prose mention satisfied it.
+            let code_of = |l: &str| match l.find("//") {
+                Some(x) => l[..x].to_string(),
+                None => l.to_string(),
+            };
+            for (i, line) in lines.iter().enumerate() {
+                let code = code_of(line);
+                if !code.contains(&needle) {
+                    continue;
+                }
+                sites += 1;
+                let start = lines[..i]
+                    .iter()
+                    .rposition(|l| {
+                        let t = l.trim_start();
+                        t.starts_with("fn ")
+                            || t.starts_with("pub fn ")
+                            || t.starts_with("pub(crate) fn ")
+                    })
+                    .unwrap_or(0);
+                assert!(
+                    lines[start..i].iter().any(|l| code_of(l).contains("guard_corrupt_config")),
+                    "unguarded config.toml write at {name}:{} — a config that failed to \
+                     parse at startup would be overwritten with defaults, destroying every \
+                     connection (T7 review MAJOR-1)",
+                    i + 1
+                );
+            }
+        }
+        // Pinned so a NEW writer forces a deliberate look at this test
+        // rather than silently inheriting whatever its neighbours do.
+        assert_eq!(sites, 6, "config.toml writer count changed — re-audit, do not just bump");
+    }
+}
+
 #[cfg(test)]
 mod workspace_startup_tests {
     use super::*;

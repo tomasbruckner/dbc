@@ -2137,7 +2137,13 @@ impl SchemaTree {
                 self.toggle_outer(row);
                 // Lazy, exactly like a Connection row: expanding a
                 // NotLoaded/Error section is what dispatches the scan.
-                if !was_expanded && self.scripts_needs_scan() {
+                // `scripts_configured` is part of the condition (T7 review
+                // NIT-2): with no root there is nothing to scan, and the
+                // expanded section renders the „není nastavena" pointer row
+                // instead. Without it the first expand made a pointless
+                // round-trip out to `main.rs` and straight back into
+                // `reset_scripts`.
+                if !was_expanded && self.scripts_configured && self.scripts_needs_scan() {
                     cx.emit(TreeEvent::ScriptsRefresh);
                 }
             }
@@ -3824,26 +3830,53 @@ mod sidebar_tests {
     }
 
     #[test]
-    fn scripts_section_adds_only_its_own_rows_and_moves_nothing_else() {
+    fn scripts_section_prepends_its_rows_and_shifts_the_rest_unchanged() {
         // Was `none_scripts_yields_exactly_some_scripts_minus_the_section_
-        // header`, the DARK contract Task 3 shipped under. Task 7 flipped
-        // the production call site to `Some(..)`, so the same assertions
-        // now pin the LIVE claim: turning the section on adds its rows at
-        // the top and shifts nothing else, element for element. The
-        // parameter stays an `Option` because the ~20 pre-existing
-        // `flatten_sidebar` tests above (favourites ordering, admin entry,
-        // db-list Loading/Error notices, filter shapes, multi-root
-        // ordering) pass `None` to assert sidebar shapes that predate the
-        // section — that is what the `None` arm is FOR now.
+        // header`, the DARK contract Task 3 shipped under; Task 7 flipped
+        // the production call site to `Some(..)`.
+        //
+        // HONEST STATUS OF THE `None` ARM (T7 review MINOR-6): after the
+        // flip, NOTHING in production passes `None` — a production
+        // parameter became a test-only affordance. The ~20 sidebar-shape
+        // tests above still pass it, and they are index-based
+        // (`rows[0]`, `rows.len()`), so every absolute index in them is now
+        // off by the height of the „Skripty" section relative to what a
+        // user actually sees. They remain correct about the ORDER and
+        // CONTENT of the connection roots and about nothing else. THIS test
+        // is the only bridge between that suite and the live sidebar, so it
+        // uses an EXPANDED, `Loaded` section with several rows rather than
+        // the one-row collapsed shape it used to assert: „its own rows" has
+        // to mean more than one row for the claim to be worth anything.
         let conns = vec![conn_cfg("c1", "Prod", &[], Engine::Postgres, "sales")];
+        let state = loaded_scripts(&[
+            ("prod", true, 0),
+            ("prod/reporting.sql", false, 1),
+            ("dotaz.sql", false, 0),
+        ]);
+        let expanded: HashSet<OuterId> =
+            [OuterId::Scripts, OuterId::ScriptFolder("prod".to_string())].into_iter().collect();
         let with_none = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
-            &HashSet::new(), "", None, &[], AdminEntry::Hidden, None);
+            &expanded, "", None, &[], AdminEntry::Hidden, None);
         let with_some = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
-            &HashSet::new(), "", None, &[], AdminEntry::Hidden,
-            Some((&ScriptsListState::NotLoaded, false)));
+            &expanded, "", None, &[], AdminEntry::Hidden, Some((&state, true)));
         assert!(!with_none.iter().any(|r| matches!(r.0, SidebarRow::ScriptsRoot)));
-        assert_eq!(with_some[0].0, SidebarRow::ScriptsRoot, "Some(..) emits the section");
-        assert_eq!(&with_some[1..], &with_none[..], "everything else is unchanged");
+
+        // The section is a CONTIGUOUS PREFIX of four rows …
+        let section: Vec<&str> = with_some[..4].iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(section, vec!["Skripty", "prod", "reporting.sql", "dotaz.sql"]);
+        assert_eq!(with_some[0].0, SidebarRow::ScriptsRoot);
+        assert!(with_some[..4].iter().all(|r| matches!(
+            r.0,
+            SidebarRow::ScriptsRoot
+                | SidebarRow::ScriptFolder { .. }
+                | SidebarRow::ScriptFile { .. }
+                | SidebarRow::ScriptNotice { .. }
+        )));
+        // … and everything after it is the `None` flatten, element for
+        // element — the section shifts the sidebar, it does not reorder or
+        // rewrite any part of it.
+        assert_eq!(&with_some[4..], &with_none[..], "everything else is unchanged");
+        assert_eq!(with_some.len(), with_none.len() + 4);
     }
 
     #[test]
@@ -3896,33 +3929,73 @@ mod sidebar_tests {
     }
 
     #[test]
-    fn the_emitted_notice_rows_agree_with_the_click_resolver() {
-        // Cross-check against what `emit_scripts_section` actually emits,
-        // so the two can never drift apart: the unconfigured row opens
-        // Settings, the error row retries, everything else is inert.
-        let cases: Vec<(ScriptsListState, bool)> = vec![
-            (ScriptsListState::NotLoaded, false),
-            (ScriptsListState::Loading, true),
-            (ScriptsListState::Error("složka zmizela".into()), true),
-            (loaded_scripts(&[]), true),
+    fn only_the_unconfigured_and_error_states_emit_an_actionable_notice() {
+        // Cross-check between what `emit_scripts_section` EMITS and what
+        // `script_notice_event` DOES with it. T7 review MINOR-5 twice over:
+        //
+        // (a) the cap-disclosure rows must be in the fixture list at all —
+        //     `loaded_scripts` hardcodes both flags to `false`, so the two
+        //     `…` notices never reached this test and were pinned only
+        //     against `every_other_notice_is_inert`'s own hardcoded copies
+        //     of their strings, which is not a cross-check of anything;
+        //
+        // (b) the expectation must be derived from the STATE, not from the
+        //     text. Deriving it from the `error:` prefix — as the first
+        //     draft of this test did — reproduces the implementation's own
+        //     rule, so rewording a truncation notice to start with `error:`
+        //     turned a disclosure into a retry with the test still green.
+        //     The real invariant is about KINDS: a scan FAILURE is
+        //     retryable, a cap disclosure is not (retrying a truncated scan
+        //     re-runs a 2000-entry walk and truncates again, forever), and
+        //     „není nastavena" is the one row that opens Nastavení.
+        let cases: Vec<(&str, ScriptsListState, bool)> = vec![
+            ("unconfigured", ScriptsListState::NotLoaded, false),
+            ("loading", ScriptsListState::Loading, true),
+            ("error", ScriptsListState::Error("složka zmizela".into()), true),
+            ("empty", loaded_scripts(&[]), true),
+            (
+                "caps",
+                ScriptsListState::Loaded {
+                    entries: script_entries(&[("a.sql", false, 0)]),
+                    truncated: true,
+                    depth_clipped: true,
+                },
+                true,
+            ),
         ];
-        for (state, configured) in cases {
+        let mut seen = Vec::new();
+        for (kind, state, configured) in cases {
             for (row, ..) in emit(&state, configured, &[OuterId::Scripts], "") {
                 let SidebarRow::ScriptNotice { text, open_settings } = &row else {
                     continue;
                 };
-                match (configured, text.starts_with("error:")) {
-                    (false, _) => assert!(*open_settings, "the pointer row is clickable"),
-                    (true, true) => assert!(matches!(
-                        script_notice_event(text, *open_settings),
-                        Some(TreeEvent::ScriptsRefresh)
-                    )),
-                    (true, false) => {
+                seen.push(kind);
+                let ev = script_notice_event(text, *open_settings);
+                match kind {
+                    "unconfigured" => {
+                        assert!(*open_settings, "the pointer row is the clickable one");
+                        assert!(matches!(ev, Some(TreeEvent::OpenScriptsSettings)), "{text}");
+                    }
+                    // The ONLY retryable notice: something went wrong, so
+                    // trying again can plausibly go right.
+                    "error" => {
                         assert!(!*open_settings);
-                        assert!(script_notice_event(text, *open_settings).is_none());
+                        assert!(matches!(ev, Some(TreeEvent::ScriptsRefresh)), "{text}");
+                    }
+                    // Everything else — loading, empty library, both cap
+                    // disclosures — is INERT, whatever it happens to say.
+                    _ => {
+                        assert!(!*open_settings, "{kind}: {text}");
+                        assert!(ev.is_none(), "{kind} notice must be inert, got a click action: {text}");
                     }
                 }
             }
         }
+        // Every fixture must actually have produced a notice; a state that
+        // silently stopped emitting one would otherwise vacuously pass.
+        for kind in ["unconfigured", "loading", "error", "empty", "caps"] {
+            assert!(seen.contains(&kind), "no notice emitted for the {kind} state");
+        }
+        assert_eq!(seen.iter().filter(|k| **k == "caps").count(), 2, "both cap rows");
     }
 }

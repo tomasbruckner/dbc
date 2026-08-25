@@ -1871,8 +1871,15 @@ impl AppView {
         panel = match &ws_root {
             // §W8: in workspace mode this is a fixed read-only line — no
             // picker, no „Odebrat". The root is a convention, not a
-            // setting, and `AppConfig.scripts_dir` is inert here.
-            Some(root) => panel.child(div().child(scripts_settings_workspace_line(root))),
+            // setting, and `AppConfig.scripts_dir` is inert here. The path
+            // comes from THE resolver (NIT-1), never from a local join.
+            Some(_) => panel.child(div().child(match self.effective_scripts_root() {
+                Some(root) => scripts_settings_workspace_line(&root),
+                // Unreachable by construction — `effective_scripts_root` is
+                // `Some` whenever `workspace_root` is — but a render fn
+                // says so honestly instead of unwrapping.
+                None => SCRIPTS_SETTINGS_UNSET.to_string(),
+            })),
             None => {
                 let current = self
                     .config
@@ -3907,6 +3914,17 @@ fn render_analyze_write_confirm_panel(
 pub(crate) const WORKSPACE_MISSING_TITLE: &str = "Pracovní prostor nenalezen";
 /// Shown when the POINTER itself could not be read, so there is no folder
 /// path to display.
+///
+/// **CROSS-CRATE TWIN of `dbc-mcp`'s `WORKSPACE_MISSING_NO_PATH`**
+/// (`crates/dbc-mcp/src/main.rs`, byte-pinned there too, and carrying the
+/// reciprocal pointer back to this const). The blocking GUI modal (§W4)
+/// and the headless server describe the SAME condition. The two sentences
+/// are deliberately not identical — this one sits under the
+/// „Pracovní prostor nenalezen" title where a bare subject reads as the
+/// modal's own path line, that one stands alone on stderr — but they must
+/// stay in agreement about WHAT is unreadable. A copy sweep that rewords
+/// one must look at the other; both are byte-pinned, so neither side can
+/// be changed quietly.
 pub(crate) const WORKSPACE_MISSING_NO_PATH: &str = "ukazatel na pracovní prostor je nečitelný";
 /// §W4 choice 1 — "the workspace moved", never "make a new one".
 pub(crate) const WORKSPACE_MISSING_FIND: &str = "Najít složku…";
@@ -4109,6 +4127,14 @@ pub(crate) const WORKSPACE_SETTINGS_PICK: &str = "Použít složku…";
 /// Workspace-mode button: the reverse switch (§W3.4).
 pub(crate) const WORKSPACE_SETTINGS_LEAVE: &str = "Přejít na lokální profil";
 
+/// A scripts-folder pick that came back while a workspace had become
+/// active (§W8: `scripts_dir` is inert there, so the pick cannot be
+/// honoured). Same „… zahozen — …" idiom as [`WORKSPACE_PICK_DISCARDED`]
+/// and `start_csv_import`'s refusal: the user acted, so the user hears
+/// back. T7 review MINOR-2 — the guard used to `return` silently.
+pub(crate) const SCRIPTS_PICK_DISCARDED_WORKSPACE: &str =
+    "výběr složky zahozen — je aktivní pracovní prostor";
+
 /// Settings block heading for the scripts library (Part S §2 / §W8).
 pub(crate) const SCRIPTS_SETTINGS_HEADING: &str = "Složka skriptů";
 /// Profile-mode placeholder shown when `AppConfig.scripts_dir` is `None`.
@@ -4118,12 +4144,15 @@ pub(crate) const SCRIPTS_SETTINGS_PICK: &str = "Vybrat složku…";
 /// Profile-mode button: clears `scripts_dir` (Part S §2).
 pub(crate) const SCRIPTS_SETTINGS_CLEAR: &str = "Odebrat";
 
-/// The WORKSPACE-mode scripts line (§W8) — read-only, no picker. Pure so
-/// the copy is byte-pinned and so the subfolder name provably comes from
-/// `dbc_state::workspace::SCRIPTS_SUBDIR`, not from a local literal that
-/// could drift away from what `init_workspace` actually creates.
-pub(crate) fn scripts_settings_workspace_line(root: &std::path::Path) -> String {
-    format!("Skripty: {}", root.join(dbc_state::workspace::SCRIPTS_SUBDIR).display())
+/// The WORKSPACE-mode scripts line (§W8) — read-only, no picker.
+///
+/// T7 review NIT-1: takes the ALREADY-RESOLVED scripts root, so it renders
+/// a path rather than recomputing one. §W8 says there is exactly ONE
+/// resolver (`crate::scripts_root_for`, reached here through
+/// `AppView::effective_scripts_root`); a second `root.join(SCRIPTS_SUBDIR)`
+/// spelling could not disagree with it today, but it is a second spelling.
+pub(crate) fn scripts_settings_workspace_line(scripts_root: &std::path::Path) -> String {
+    format!("Skripty: {}", scripts_root.display())
 }
 
 /// The Settings block's mode line. `None` ⇒ profile mode, and the profile
@@ -6090,19 +6119,32 @@ mod workspace_confirm_tests {
         assert_eq!(SCRIPTS_SETTINGS_PICK, "Vybrat složku…");
         assert_eq!(SCRIPTS_SETTINGS_CLEAR, "Odebrat");
         assert_eq!(
-            scripts_settings_workspace_line(std::path::Path::new("D:\\ws")),
-            format!("Skripty: {}", std::path::Path::new("D:\\ws").join("scripts").display())
+            SCRIPTS_PICK_DISCARDED_WORKSPACE,
+            "výběr složky zahozen — je aktivní pracovní prostor"
         );
     }
 
-    /// §W8's inertness, stated where the UI lives: the workspace line is
-    /// built from the SHARED subfolder const, so it can never disagree with
-    /// the folder `init_workspace` creates.
+    /// T7 review MINOR-2: the refusal is a NOTICE, not an error — the pick
+    /// was declined by policy, nothing failed. Same side of the `error:`
+    /// sentinel as its „… zahozen — …" sibling.
     #[test]
-    fn the_workspace_scripts_line_uses_the_shared_subdir_const() {
+    fn the_discarded_scripts_pick_is_not_an_error_status() {
+        assert!(!SCRIPTS_PICK_DISCARDED_WORKSPACE.starts_with("error: "));
+        assert!(!WORKSPACE_PICK_DISCARDED.starts_with("error: "));
+    }
+
+    /// T7 review NIT-1: the workspace line renders whatever THE resolver
+    /// produced — `crate::scripts_root_for` — so the rendered path and the
+    /// folder `init_workspace` creates cannot drift apart.
+    #[test]
+    fn the_workspace_scripts_line_renders_the_one_resolver_s_root() {
         let root = std::path::Path::new("D:\\ws");
-        assert!(scripts_settings_workspace_line(root)
-            .ends_with(dbc_state::workspace::SCRIPTS_SUBDIR));
+        let resolved = crate::scripts_root_for(Some(root), Some("C:\\jinde")).unwrap();
+        assert_eq!(resolved, root.join(dbc_state::workspace::SCRIPTS_SUBDIR));
+        assert_eq!(
+            scripts_settings_workspace_line(&resolved),
+            format!("Skripty: {}", root.join("scripts").display())
+        );
     }
 }
 
