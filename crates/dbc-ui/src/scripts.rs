@@ -4,10 +4,17 @@
 //! components onto the root; symlinks are skipped at scan; nothing here
 //! ever executes SQL or touches a database connection.
 //!
-//! Landed dark in scripts T2 (unit-tested, unreachable from `main` until
-//! T3+ wire the sidebar section and fs dispatch). Removal owner for this
-//! allow: T3/T4 (scan + state consumers), T5 (read/write), T6 (mutations)
-//! — drop it the moment the first consumer lands (admin_sql.rs precedent).
+//! Landed dark in scripts T2. Workspace T7 lit the FIRST consumers —
+//! `scan_scripts`/`ScriptEntry`/`ScriptScan` now drive the „Skripty"
+//! sidebar section — so this allow is no longer whole-module cover: it now
+//! covers exactly the 14 items Tasks 8 and 9 consume. Removal owners
+//! (workspace plan `2026-08-25-workspace-folder.md`, which SUPERSEDES the
+//! scripts plan whose T3–T6 numbering this comment used to name):
+//! **Task 8** — `read_script`, `write_script`, `resolve_rel`,
+//! `resolve_entry_rel`, `SCRIPT_OPEN_CAP`; **Task 9** — `create_script`,
+//! `create_folder`, `rename_entry`, `delete_entry`, `validate_script_name`,
+//! `conflicting_name`, `joined_rel`, `RESERVED_NAMES`, `SCRIPT_NAME_CAP`.
+//! Task 9 deletes this attribute outright (admin_sql.rs precedent).
 #![allow(dead_code)]
 
 use std::fs;

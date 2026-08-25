@@ -1864,6 +1864,48 @@ impl AppView {
                 .child(div().text_color(cx.theme().text_muted).child(WORKSPACE_GIT_WARNING)),
         };
 
+        // Design §W8 — „Složka skriptů", BELOW the „Pracovní prostor"
+        // block because in workspace mode it is subsumed by it.
+        panel = panel
+            .child(div().mt_2().text_color(cx.theme().text_muted).child(SCRIPTS_SETTINGS_HEADING));
+        panel = match &ws_root {
+            // §W8: in workspace mode this is a fixed read-only line — no
+            // picker, no „Odebrat". The root is a convention, not a
+            // setting, and `AppConfig.scripts_dir` is inert here.
+            Some(root) => panel.child(div().child(scripts_settings_workspace_line(root))),
+            None => {
+                let current = self
+                    .config
+                    .scripts_dir
+                    .clone()
+                    .unwrap_or_else(|| SCRIPTS_SETTINGS_UNSET.to_string());
+                panel
+                    .child(div().text_color(cx.theme().text_muted).child(current))
+                    .child(
+                        div()
+                            .id("settings-scripts-pick")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(cx.theme().bg_hover)
+                            .cursor_pointer()
+                            .child(SCRIPTS_SETTINGS_PICK)
+                            .on_click(cx.listener(|this, _, _, cx| this.start_scripts_dir_pick(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("settings-scripts-clear")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(cx.theme().bg_hover)
+                            .cursor_pointer()
+                            .child(SCRIPTS_SETTINGS_CLEAR)
+                            .on_click(cx.listener(|this, _, _, cx| this.clear_scripts_dir(cx))),
+                    )
+            }
+        };
+
         panel
             .child(
                 div()
@@ -4067,6 +4109,23 @@ pub(crate) const WORKSPACE_SETTINGS_PICK: &str = "Použít složku…";
 /// Workspace-mode button: the reverse switch (§W3.4).
 pub(crate) const WORKSPACE_SETTINGS_LEAVE: &str = "Přejít na lokální profil";
 
+/// Settings block heading for the scripts library (Part S §2 / §W8).
+pub(crate) const SCRIPTS_SETTINGS_HEADING: &str = "Složka skriptů";
+/// Profile-mode placeholder shown when `AppConfig.scripts_dir` is `None`.
+pub(crate) const SCRIPTS_SETTINGS_UNSET: &str = "nenastavena";
+/// Profile-mode button: opens the directory picker (Part S §2).
+pub(crate) const SCRIPTS_SETTINGS_PICK: &str = "Vybrat složku…";
+/// Profile-mode button: clears `scripts_dir` (Part S §2).
+pub(crate) const SCRIPTS_SETTINGS_CLEAR: &str = "Odebrat";
+
+/// The WORKSPACE-mode scripts line (§W8) — read-only, no picker. Pure so
+/// the copy is byte-pinned and so the subfolder name provably comes from
+/// `dbc_state::workspace::SCRIPTS_SUBDIR`, not from a local literal that
+/// could drift away from what `init_workspace` actually creates.
+pub(crate) fn scripts_settings_workspace_line(root: &std::path::Path) -> String {
+    format!("Skripty: {}", root.join(dbc_state::workspace::SCRIPTS_SUBDIR).display())
+}
+
 /// The Settings block's mode line. `None` ⇒ profile mode, and the profile
 /// directory is named so „Lokální profil" is not an abstraction — it is a
 /// path the user can open. Pure so the copy is byte-pinned.
@@ -6020,6 +6079,30 @@ mod workspace_confirm_tests {
         );
         assert!(workspace_settings_mode_line(None).starts_with("Lokální profil ("));
         assert!(workspace_settings_mode_line(None).ends_with(')'));
+    }
+
+    /// The „Složka skriptů" block's copy (Part S §2 / §W8), byte-pinned
+    /// the same way.
+    #[test]
+    fn the_settings_scripts_block_copy_is_byte_pinned() {
+        assert_eq!(SCRIPTS_SETTINGS_HEADING, "Složka skriptů");
+        assert_eq!(SCRIPTS_SETTINGS_UNSET, "nenastavena");
+        assert_eq!(SCRIPTS_SETTINGS_PICK, "Vybrat složku…");
+        assert_eq!(SCRIPTS_SETTINGS_CLEAR, "Odebrat");
+        assert_eq!(
+            scripts_settings_workspace_line(std::path::Path::new("D:\\ws")),
+            format!("Skripty: {}", std::path::Path::new("D:\\ws").join("scripts").display())
+        );
+    }
+
+    /// §W8's inertness, stated where the UI lives: the workspace line is
+    /// built from the SHARED subfolder const, so it can never disagree with
+    /// the folder `init_workspace` creates.
+    #[test]
+    fn the_workspace_scripts_line_uses_the_shared_subdir_const() {
+        let root = std::path::Path::new("D:\\ws");
+        assert!(scripts_settings_workspace_line(root)
+            .ends_with(dbc_state::workspace::SCRIPTS_SUBDIR));
     }
 }
 

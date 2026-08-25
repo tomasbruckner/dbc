@@ -327,6 +327,23 @@ fn is_same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// THE scripts-root seam (design §W8), as a free fn so both arms are
+/// testable without an `AppView`. Workspace mode always wins and always
+/// resolves to `<workspace>/scripts`: a per-workspace override would
+/// reintroduce absolute paths into a folder whose whole point is
+/// portability, so `AppConfig.scripts_dir` is INERT there — deliberately
+/// not "merged", not "preferred if set". Profile mode is Part S §2's
+/// behavior, unchanged.
+pub(crate) fn scripts_root_for(
+    workspace_root: Option<&Path>,
+    scripts_dir: Option<&str>,
+) -> Option<PathBuf> {
+    match workspace_root {
+        Some(root) => Some(root.join(dbc_state::workspace::SCRIPTS_SUBDIR)),
+        None => scripts_dir.map(PathBuf::from),
+    }
+}
+
 /// Which persistent stores `main()` is ALLOWED to open. Exists so design
 /// §W4's actual enforcement — "a broken pointer loads NOTHING" — is a
 /// pinned unit test instead of three `blocked.is_some()` conditions buried
@@ -5602,6 +5619,141 @@ impl AppView {
             t.set_admin_entry(admin_entry, cx);
         });
         self.push_active_scope_to_tree(cx);
+        // Workspace T7: „is there a scripts root at all" travels with the
+        // rest of the tree context. Pushing it never scans by itself —
+        // dispatch is `start_scripts_scan`'s job.
+        let configured = self.effective_scripts_root().is_some();
+        self.tree.update(cx, |t, cx| t.set_scripts_configured(configured, cx));
+    }
+
+    /// The scripts library's root for the ACTIVE context — see
+    /// `scripts_root_for`. Every scan and every fs op in Tasks 8/9 starts
+    /// here; there is no second resolver.
+    pub(crate) fn effective_scripts_root(&self) -> Option<PathBuf> {
+        scripts_root_for(self.workspace_root.as_deref(), self.config.scripts_dir.as_deref())
+    }
+
+    /// Dispatches a bounded background scan into the tree's scripts slot.
+    /// A missing root is NOT an error here — the section renders its
+    /// „složka skriptů není nastavena" pointer row instead (Part S §1.4),
+    /// and in workspace mode `configured` is always true, so a deleted
+    /// `<workspace>/scripts` surfaces honestly as the scan's own error row
+    /// plus its retry click.
+    ///
+    /// The scan itself NEVER executes anything: `scan_scripts` is a bounded
+    /// `read_dir` walk (Part S §7); opening or running a script is a
+    /// separate, explicit user action.
+    pub(crate) fn start_scripts_scan(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.effective_scripts_root() else {
+            self.tree.update(cx, |t, cx| {
+                t.set_scripts_configured(false, cx);
+                t.reset_scripts(cx);
+            });
+            return;
+        };
+        self.tree.update(cx, |t, cx| t.set_scripts_configured(true, cx));
+        // The generation comes from `begin_scripts_scan`'s RETURN value —
+        // `ScriptsListState::Loading` is a unit variant and deliberately
+        // carries no copy (see its doc comment). `finish_scripts_scan`
+        // compares against the tree's own counter, so a result that lands
+        // after a context swap or a newer dispatch is DROPPED, never
+        // applied to the wrong root.
+        let generation = self.tree.update(cx, |t, cx| t.begin_scripts_scan(cx));
+        let tree = self.tree.clone();
+        cx.spawn(async move |_this, cx| {
+            let result =
+                cx.background_spawn(async move { crate::scripts::scan_scripts(&root) }).await;
+            let _ = tree.update(cx, |t, cx| t.finish_scripts_scan(generation, result, cx));
+        })
+        .detach();
+    }
+
+    /// Part S §2 — PROFILE mode only (the caller only renders the button
+    /// there). Stores the absolute path, saves the config, rescans.
+    fn start_scripts_dir_pick(&mut self, cx: &mut Context<Self>) {
+        let dialog = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Vybrat".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            // DEVIATION from the plan snippet's `let … else { return }`: a
+            // swallowed dialog failure is exactly the silence this phase
+            // keeps banning. Same three arms as `start_csv_import` /
+            // `start_workspace_pick`, same strings.
+            let picked = match dialog.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
+                Ok(Ok(_)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "výběr zrušen".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = format!("error: dialog selhal: {e}");
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_canceled) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "error: dialog není dostupný".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let _ = this.update(cx, |view, cx| {
+                // Defense in depth: `scripts_dir` is inert in workspace
+                // mode, so the app must never WRITE it there either (§W8).
+                // The picker runs off the UI thread, so the user can have
+                // adopted a workspace in the meantime — this is a re-check,
+                // not a formality.
+                if view.workspace_root.is_some() {
+                    return;
+                }
+                // Same corrupt-config gate the connection savers use
+                // (`finish_save`, the ★ toggle): with a poisoned
+                // `config.toml` the in-memory `config` is `default()`, so an
+                // unguarded save would write a file with a `scripts_dir` and
+                // NO connections over the user's real one.
+                if !view.guard_corrupt_config(cx) {
+                    return;
+                }
+                view.config.scripts_dir = Some(picked.display().to_string());
+                view.status = match view.config.save(&view.config_path) {
+                    Ok(()) => format!("složka skriptů: {}", picked.display()),
+                    Err(e) => format!("error: nastavení se nepodařilo uložit ({e})"),
+                };
+                view.start_scripts_scan(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Part S §2's „Odebrat": clears the setting and the tree state. It
+    /// deliberately does NOT touch a script binding — the binding holds an
+    /// ABSOLUTE path, so „Uložit" in the caption strip keeps working; the
+    /// resolved §2 note says so explicitly, and there is no guard here.
+    fn clear_scripts_dir(&mut self, cx: &mut Context<Self>) {
+        if self.workspace_root.is_some() {
+            return;
+        }
+        // See `start_scripts_dir_pick` — same corrupt-config gate.
+        if !self.guard_corrupt_config(cx) {
+            return;
+        }
+        self.config.scripts_dir = None;
+        self.status = match self.config.save(&self.config_path) {
+            Ok(()) => "složka skriptů odebrána".to_string(),
+            Err(e) => format!("error: nastavení se nepodařilo uložit ({e})"),
+        };
+        self.start_scripts_scan(cx); // no root => resets the tree slot
+        cx.notify();
     }
 
     // -----------------------------------------------------------------
@@ -6105,10 +6257,12 @@ impl AppView {
         self.tree.update(cx, |t, cx| t.reset_fetched_context(cx));
         self.refresh_grouped_cache(cx);
         self.refresh_tree_context(cx);
-        // T7 adds ONE line here — `self.tree.update(cx, |t, cx|
-        // t.reset_scripts(cx)); self.start_scripts_scan(cx);` — the scripts
-        // root just changed. It cannot land now: the tree's scripts API is
-        // dark until the flip.
+        // §W3.4: the scripts root just changed under us. Clear to
+        // `NotLoaded` (dropping stale expand keys and any in-flight scan of
+        // the OLD root — `reset_scripts` bumps the generation), then
+        // rescan the new one.
+        self.tree.update(cx, |t, cx| t.reset_scripts(cx));
+        self.start_scripts_scan(cx);
         self.status = match &root {
             Some(r) => format!("pracovní prostor: {}", r.display()),
             None => "lokální profil obnoven".to_string(),
@@ -7970,6 +8124,21 @@ impl AppView {
             }
             TreeEvent::SwitchToDatabase { conn_id, db } => {
                 self.switch_to_database(conn_id, db.clone(), None, cx)
+            }
+            TreeEvent::ScriptsRefresh => self.start_scripts_scan(cx),
+            TreeEvent::OpenScriptsSettings => self.open_settings(cx),
+            // Tasks 8 and 9 fill these in — they land here now only because
+            // `TreeEvent`'s match is exhaustive and its variants must be
+            // emitted and handled in one task. Each is an HONEST "not yet"
+            // (a Czech status, no silent swallow), and each is replaced —
+            // not extended — by its owning task's step.
+            TreeEvent::ScriptOpen { .. }
+            | TreeEvent::ScriptRunFile { .. }
+            | TreeEvent::ScriptCreate { .. }
+            | TreeEvent::ScriptRename { .. }
+            | TreeEvent::ScriptDelete { .. } => {
+                self.status = "error: tato akce zatím není dostupná".to_string();
+                cx.notify();
             }
         }
     }
@@ -10150,6 +10319,12 @@ fn main() {
             let grouped = view.grouped_cache.clone();
             view.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
             view.refresh_tree_context(cx);
+            // Part S §1.2: scan on startup when a root is configured. It is
+            // a no-op-with-reset when there is none — and a BLOCKED start
+            // has none (`workspace_root` stays `None` and the blocked config
+            // is `AppConfig::default()`), so nothing touches the filesystem
+            // behind the §W4 modal.
+            view.start_scripts_scan(cx);
             if view.conn_url.is_some() {
                 view.start_schema_slot_fetch(CLI_CONN_IDENTITY.to_string(), String::new(), cx);
             }
@@ -11516,6 +11691,46 @@ mod workspace_startup_tests {
         ] {
             assert!(ok.config && ok.view_prefs && ok.param_values && ok.history);
         }
+    }
+
+    // ---------- The scripts-root seam (workspace T7, design §W8) ----------
+
+    #[test]
+    fn workspace_mode_roots_the_scripts_tree_in_the_folder() {
+        let root = PathBuf::from("D:\\ws");
+        assert_eq!(
+            scripts_root_for(Some(&root), Some("C:\\jinde")),
+            Some(root.join("scripts")),
+        );
+    }
+
+    #[test]
+    fn scripts_dir_is_inert_in_workspace_mode() {
+        // §W8: one root per mode, no precedence question — a hand-edited
+        // `scripts_dir` in a workspace config.toml is ignored, and this is
+        // the test that says so out loud.
+        let root = PathBuf::from("D:\\ws");
+        assert_eq!(scripts_root_for(Some(&root), None), Some(root.join("scripts")));
+        assert_eq!(
+            scripts_root_for(Some(&root), Some("C:\\jinde")),
+            scripts_root_for(Some(&root), None),
+        );
+    }
+
+    #[test]
+    fn profile_mode_uses_the_configured_scripts_dir_or_nothing() {
+        assert_eq!(scripts_root_for(None, Some("C:\\skripty")), Some(PathBuf::from("C:\\skripty")));
+        assert_eq!(scripts_root_for(None, None), None);
+    }
+
+    #[test]
+    fn the_scripts_subdir_name_comes_from_dbc_state_not_a_local_literal() {
+        assert_eq!(dbc_state::workspace::SCRIPTS_SUBDIR, "scripts");
+        let root = PathBuf::from("D:\\ws");
+        assert_eq!(
+            scripts_root_for(Some(&root), None).unwrap(),
+            root.join(dbc_state::workspace::SCRIPTS_SUBDIR),
+        );
     }
 }
 

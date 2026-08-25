@@ -36,8 +36,8 @@ use dbc_state::{ConnectionConfig, Engine, FavouriteObject};
 
 use crate::admin_panel::AdminEntry;
 use gpui::{
-    actions, div, prelude::*, px, uniform_list, App, ClickEvent, Context, EventEmitter,
-    FocusHandle, Focusable, KeyBinding, KeyDownEvent, MouseButton, Window,
+    actions, div, prelude::*, px, uniform_list, AnyElement, App, ClickEvent, Context, EventEmitter,
+    FocusHandle, Focusable, Hsla, KeyBinding, KeyDownEvent, MouseButton, Window,
 };
 
 use crate::theme::ActiveTheme;
@@ -130,6 +130,46 @@ pub enum TreeEvent {
     /// default) — `main.rs::switch_to_database` performs the context
     /// switch. Expanding (chevron) never emits this: browsing ≠ switching.
     SwitchToDatabase { conn_id: String, db: Option<String> },
+    /// Scripts library: the „Skripty" root's `⟳` icon, or a retry click
+    /// on the section's error row — `main.rs::start_scripts_scan`.
+    ScriptsRefresh,
+    /// The unconfigured-notice row was clicked — opens „Nastavení"
+    /// (discoverability without a wizard, Part S §1.4). Can only ever be
+    /// emitted in PROFILE mode: workspace mode is always configured.
+    OpenScriptsSettings,
+    /// Double-click on a `ScriptFile` row — load the file into the global
+    /// editor and bind it (Part S §5.1, Task 8). Opening NEVER runs
+    /// anything.
+    ///
+    /// PAYLOAD DARK UNTIL TASK 8 — removal owner: Task 8 (the editor
+    /// binding), whose `on_tree_event` arm reads `rel` to resolve and load
+    /// the file. Until then the handler is the honest grouped „not yet"
+    /// placeholder, which matches with `..`.
+    #[allow(dead_code)]
+    ScriptOpen { rel: String },
+    /// The `▶` icon on a `ScriptFile` row — the unchanged G12 confirm
+    /// flow over the file on DISK (Part S §6, Task 9).
+    ///
+    /// PAYLOAD DARK UNTIL TASK 9 — removal owner: Task 9 (run + mutations).
+    #[allow(dead_code)]
+    ScriptRunFile { rel: String },
+    /// The `+` icon on the root or a folder row — the create dialog
+    /// (Task 9). `parent_rel` is `""` for the root itself.
+    ///
+    /// PAYLOAD DARK UNTIL TASK 9 — removal owner: Task 9.
+    #[allow(dead_code)]
+    ScriptCreate { parent_rel: String },
+    /// The `✎` icon — the rename dialog (Task 9).
+    ///
+    /// PAYLOAD DARK UNTIL TASK 9 — removal owner: Task 9.
+    #[allow(dead_code)]
+    ScriptRename { rel: String, is_dir: bool },
+    /// The `✕` icon — the delete confirm (Task 9). Folders only when
+    /// empty (Part S §7.9: no recursive delete in v1).
+    ///
+    /// PAYLOAD DARK UNTIL TASK 9 — removal owner: Task 9.
+    #[allow(dead_code)]
+    ScriptDelete { rel: String, is_dir: bool },
 }
 
 /// One visible row: `(id, depth, label, is_expandable)`.
@@ -1163,6 +1203,23 @@ pub fn emit_scripts_section(
     }
 }
 
+/// What a single click on a `ScriptNotice` row DOES (workspace T7). Pure
+/// so both branches are pinned without GPUI: the unconfigured pointer row
+/// opens „Nastavení" (Part S §1.4), an `error:` row is a RETRY — the
+/// Notice idiom the db-list/schema notices already use — and every other
+/// notice (loading, empty, the two cap disclosures) is inert. An inert
+/// notice must stay inert: making „žádné skripty" re-scan on click would
+/// turn an idle sidebar into a filesystem loop.
+fn script_notice_event(text: &str, open_settings: bool) -> Option<TreeEvent> {
+    if open_settings {
+        Some(TreeEvent::OpenScriptsSettings)
+    } else if text.starts_with("error:") {
+        Some(TreeEvent::ScriptsRefresh)
+    } else {
+        None
+    }
+}
+
 pub fn flatten_sidebar(
     grouped: &crate::connections_ui::GroupedConnections,
     states: &HashMap<String, ConnNode>,
@@ -1489,23 +1546,17 @@ pub struct SchemaTree {
     /// Drives both `flatten`'s pinned "Správa serveru" row visibility and
     /// this row's greyed/disabled rendering.
     admin_entry: AdminEntry,
-    /// Scripts library scan state (Part S §3.3). DARK UNTIL TASK 7 —
-    /// removal owner: Task 7 (the scripts flip) deletes this attribute when
-    /// `render` starts passing `Some(..)` to `flatten_sidebar`.
-    #[allow(dead_code)]
+    /// Scripts library scan state (Part S §3.3), rendered by
+    /// `emit_scripts_section` via `flatten_sidebar`'s `scripts` argument.
     scripts: ScriptsListState,
     /// Whether a scripts root exists at all — profile mode:
     /// `AppConfig.scripts_dir.is_some()`; workspace mode: always `true`
-    /// (`<workspace>/scripts` is created by init). DARK UNTIL TASK 7 —
-    /// removal owner: Task 7.
-    #[allow(dead_code)]
+    /// (`<workspace>/scripts` is created by init). Pushed in by
+    /// `main.rs::refresh_tree_context` / `start_scripts_scan`.
     scripts_configured: bool,
     /// Stale-scan guard: the SOLE generation counter for the library. The
     /// per-slot copy `DbListState::Loading { generation }` carries has no
     /// counterpart here on purpose — see `ScriptsListState`.
-    /// DARK UNTIL TASK 7 — removal owner: Task 7 (which starts calling
-    /// `begin_scripts_scan` / `finish_scripts_scan` from `main.rs`).
-    #[allow(dead_code)]
     scripts_generation: u64,
 }
 
@@ -2020,11 +2071,13 @@ impl SchemaTree {
             }
             SidebarRow::Notice { .. } => {}
             // Scripts rows: the root and folders toggle, exactly like a
-            // grouping folder or the CLI root. A ScriptFile's "open into the
-            // editor" needs `TreeEvent::ScriptOpen`, which lands with its
-            // `main.rs` handler (Task 7/8) — inert here.
+            // grouping folder or the CLI root.
             SidebarRow::ScriptsRoot | SidebarRow::ScriptFolder { .. } => self.toggle_outer(row),
-            SidebarRow::ScriptFile { .. } | SidebarRow::ScriptNotice { .. } => {}
+            // Part S §5.1: a script file opens INTO THE EDITOR. Opening is
+            // never running — the ▶ icon (and only it) reaches the G12
+            // confirm flow.
+            SidebarRow::ScriptFile { rel } => cx.emit(TreeEvent::ScriptOpen { rel: rel.clone() }),
+            SidebarRow::ScriptNotice { .. } => {}
         }
         cx.notify();
     }
@@ -2079,12 +2132,16 @@ impl SchemaTree {
                 self.toggle_inner(&conn_id, &db, &node);
             }
             SidebarRow::Pinned(_) | SidebarRow::Notice { .. } => {}
-            // Task 3 only TOGGLES. The scan dispatch (emitting
-            // `TreeEvent::ScriptsRefresh` when the slot is
-            // `NotLoaded`/`Error`) lands in Task 7 together with `main.rs`'s
-            // handler, because `TreeEvent`'s match in `AppView::on_tree_event`
-            // is exhaustive and `main.rs` is not this task's file.
-            SidebarRow::ScriptsRoot | SidebarRow::ScriptFolder { .. } => self.toggle_outer(row),
+            SidebarRow::ScriptsRoot => {
+                let was_expanded = self.outer_expanded.contains(&OuterId::Scripts);
+                self.toggle_outer(row);
+                // Lazy, exactly like a Connection row: expanding a
+                // NotLoaded/Error section is what dispatches the scan.
+                if !was_expanded && self.scripts_needs_scan() {
+                    cx.emit(TreeEvent::ScriptsRefresh);
+                }
+            }
+            SidebarRow::ScriptFolder { .. } => self.toggle_outer(row),
             SidebarRow::ScriptFile { .. } | SidebarRow::ScriptNotice { .. } => {}
         }
         cx.notify();
@@ -2104,10 +2161,11 @@ impl SchemaTree {
                 }),
             },
             SidebarRow::Notice { .. } => {}
-            // Inert here: the notice's retry / open-„Nastavení" click needs
-            // `TreeEvent::ScriptsRefresh`/`OpenScriptsSettings`, which land
-            // with their `main.rs` handlers in Task 7.
-            SidebarRow::ScriptNotice { .. } => {}
+            SidebarRow::ScriptNotice { text, open_settings } => {
+                if let Some(ev) = script_notice_event(text, *open_settings) {
+                    cx.emit(ev);
+                }
+            }
             SidebarRow::Pinned(NodeId::AdminRoot) => {
                 if self.admin_entry == AdminEntry::Enabled {
                     cx.emit(TreeEvent::OpenAdmin);
@@ -2210,10 +2268,8 @@ impl Focusable for SchemaTree {
     }
 }
 
-/// Scripts-library state API. DARK UNTIL TASK 7 — removal owner: Task 7
-/// (the scripts flip) deletes this `#[allow(dead_code)]` when `main.rs`
-/// starts calling these from `start_scripts_scan` / `apply_context`.
-#[allow(dead_code)]
+/// Scripts-library state API — driven from `main.rs`'s
+/// `start_scripts_scan` (dispatch/result) and `apply_context` (reset).
 impl SchemaTree {
     /// Moves the slot to `Loading` and returns the generation the caller
     /// must hand back to `finish_scripts_scan` (older results are dropped).
@@ -2272,6 +2328,32 @@ impl SchemaTree {
     }
 }
 
+/// One inline scripts row-action icon — the ★/⊞/⇪ shape: always
+/// rendered, stops propagation so the row's own click never also fires,
+/// then emits. ONE builder for all seven icons: hand-rolling a second
+/// `div()` chain per glyph is how a `stop_propagation` goes missing.
+fn script_icon(
+    ix: usize,
+    id: &'static str,
+    glyph: &'static str,
+    color: Hsla,
+    cx: &mut Context<SchemaTree>,
+    emit: impl Fn(&mut Context<SchemaTree>) + 'static,
+) -> AnyElement {
+    div()
+        .id((id, ix))
+        .px_1()
+        .flex_shrink_0()
+        .cursor_pointer()
+        .text_color(color)
+        .child(glyph)
+        .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
+            cx.stop_propagation();
+            emit(cx);
+        }))
+        .into_any_element()
+}
+
 impl Render for SchemaTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Sidebar rework: the multi-root flatten, fresh every frame (brief
@@ -2286,11 +2368,12 @@ impl Render for SchemaTree {
             self.active_scope.as_ref(),
             &self.favourites,
             self.admin_entry,
-            // THE DARK CONTRACT (workspace T3): the „Skripty" section is not
-            // emitted yet, so the visible sidebar is byte-identical to
-            // pre-T3. Task 7 (the scripts flip) — and ONLY Task 7 — replaces
-            // this `None` with `Some((&self.scripts, self.scripts_configured))`.
-            None,
+            // THE FLIP (workspace T7): the „Skripty" section is live. The
+            // parameter stays an `Option` — `None` is what every
+            // sidebar-shape test that predates the section passes, and
+            // `scripts_section_adds_only_its_own_rows_and_moves_nothing_else`
+            // pins that the two differ by exactly this section.
+            Some((&self.scripts, self.scripts_configured)),
         );
         let no_roots = self.grouped.favourites.is_empty()
             && self.grouped.folders.is_empty()
@@ -2364,239 +2447,305 @@ impl Render for SchemaTree {
             // The single-root era's whole-panel loading/error states are
             // GONE — per-row Notice rows carry them now. Only the true
             // empty state remains: no saved connections AND no CLI URL.
+            //
+            // Workspace T7: this is now a HINT ABOVE the list, not a
+            // replacement FOR it. The „Skripty" section is GLOBAL (Part S
+            // §1.1) — it does not depend on a connection — and a user with
+            // no saved connections is exactly the discoverability case Part
+            // S §1.4's pointer row exists for. Rendering the hint INSTEAD
+            // of the list would have hidden the whole scripts library from
+            // that user.
             root = root.child(div().px_2().py_1().text_color(cx.theme().text_disabled).child("Bez připojení"));
-        } else {
-            root = root.child(
-                uniform_list(
-                    "schema-tree-rows",
-                    rows.len(),
-                    cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
-                        let mut items = Vec::with_capacity(range.len());
-                        for ix in range {
-                            let (row_id, depth, label, expandable) = rows[ix].clone();
-                            let is_expanded = this.row_is_expanded(&row_id);
-                            let is_selected = this.selected.as_ref() == Some(&row_id);
-                            let chevron = if expandable {
-                                if is_expanded { "▾" } else { "▸" }
-                            } else {
-                                " "
-                            };
-                            // Design §5 row 1: ambient action icons (★/⊞/⇪)
-                            // render ONLY on active-scope rows — cross-
-                            // context ambient actions don't exist.
-                            let in_scope = row_in_active_scope(&row_id, this.active_scope.as_ref());
+        }
+        root = root.child(
+            uniform_list(
+                "schema-tree-rows",
+                rows.len(),
+                cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                    let mut items = Vec::with_capacity(range.len());
+                    for ix in range {
+                        let (row_id, depth, label, expandable) = rows[ix].clone();
+                        let is_expanded = this.row_is_expanded(&row_id);
+                        let is_selected = this.selected.as_ref() == Some(&row_id);
+                        let chevron = if expandable {
+                            if is_expanded { "▾" } else { "▸" }
+                        } else {
+                            " "
+                        };
+                        // Design §5 row 1: ambient action icons (★/⊞/⇪)
+                        // render ONLY on active-scope rows — cross-
+                        // context ambient actions don't exist.
+                        let in_scope = row_in_active_scope(&row_id, this.active_scope.as_ref());
 
-                            let click_row = row_id.clone();
-                            let chevron_row = row_id.clone();
+                        let click_row = row_id.clone();
+                        let chevron_row = row_id.clone();
 
-                            // HONEST INDICATORS (design §1.4): ● = active
-                            // context (accent), ○ = inactive Connection row.
-                            // There is deliberately NO green/red "connected"
-                            // lamp — the runner is per-operation (design
-                            // fact 0.1); the two honest indicators are
-                            // active context (●) and metadata cached
-                            // (children present).
-                            let indicator = match &row_id {
-                                SidebarRow::Connection { conn_id } => {
-                                    let active = match &this.active_scope {
-                                        Some(s) => &s.conn_id == conn_id,
-                                        None => {
-                                            conn_id == crate::CLI_CONN_IDENTITY
-                                                && this.cli_url.is_some()
-                                        }
-                                    };
-                                    Some(if active {
-                                        ("●", cx.theme().accent)
-                                    } else {
-                                        ("○", cx.theme().text_disabled)
-                                    })
-                                }
-                                SidebarRow::Database { conn_id, db } => {
-                                    let active = this
-                                        .active_scope
-                                        .as_ref()
-                                        .is_some_and(|s| &s.conn_id == conn_id && &s.db == db);
-                                    active.then(|| ("●", cx.theme().accent))
-                                }
-                                _ => None,
-                            };
-                            let is_active_db = matches!(&row_id, SidebarRow::Database { conn_id, db }
-                                if this.active_scope.as_ref().is_some_and(|s| &s.conn_id == conn_id && &s.db == db));
+                        // HONEST INDICATORS (design §1.4): ● = active
+                        // context (accent), ○ = inactive Connection row.
+                        // There is deliberately NO green/red "connected"
+                        // lamp — the runner is per-operation (design
+                        // fact 0.1); the two honest indicators are
+                        // active context (●) and metadata cached
+                        // (children present).
+                        let indicator = match &row_id {
+                            SidebarRow::Connection { conn_id } => {
+                                let active = match &this.active_scope {
+                                    Some(s) => &s.conn_id == conn_id,
+                                    None => {
+                                        conn_id == crate::CLI_CONN_IDENTITY
+                                            && this.cli_url.is_some()
+                                    }
+                                };
+                                Some(if active {
+                                    ("●", cx.theme().accent)
+                                } else {
+                                    ("○", cx.theme().text_disabled)
+                                })
+                            }
+                            SidebarRow::Database { conn_id, db } => {
+                                let active = this
+                                    .active_scope
+                                    .as_ref()
+                                    .is_some_and(|s| &s.conn_id == conn_id && &s.db == db);
+                                active.then(|| ("●", cx.theme().accent))
+                            }
+                            _ => None,
+                        };
+                        let is_active_db = matches!(&row_id, SidebarRow::Database { conn_id, db }
+                            if this.active_scope.as_ref().is_some_and(|s| &s.conn_id == conn_id && &s.db == db));
 
-                            // Notice rows: muted informational text, danger
-                            // for errors; `retry` rows re-emit their Load
-                            // event on click (handle_single_click).
-                            let notice_color = match &row_id {
-                                SidebarRow::Notice { text, .. } => Some(if text.starts_with("error:") {
+                        // Notice rows: muted informational text, danger
+                        // for errors; `retry` rows re-emit their Load
+                        // event on click (handle_single_click).
+                        // Workspace T7: `ScriptNotice` joins the same
+                        // dispatch. `emit_scripts_section`'s doc calls
+                        // the `error:` prefix "the Notice COLOR SENTINEL
+                        // (the row render dispatches on it literally)" —
+                        // this is that render, and leaving the scripts
+                        // notices at `text_primary` would have made a
+                        // scan failure look like an ordinary row.
+                        let notice_color = match &row_id {
+                            SidebarRow::Notice { text, .. }
+                            | SidebarRow::ScriptNotice { text, .. } => {
+                                Some(if text.starts_with("error:") {
                                     cx.theme().danger
                                 } else {
                                     cx.theme().text_muted
-                                }),
-                                _ => None,
-                            };
+                                })
+                            }
+                            _ => None,
+                        };
 
-                            // G3 Task 4: ★/☆ toggle — `favourite_object_for`
-                            // gates to active-scope Inner rows and pinned
-                            // favourite rows itself.
-                            let fav_obj = this.favourite_object_for(&row_id);
-                            let is_fav = fav_obj.as_ref().is_some_and(|f| this.favourites.contains(f));
-                            let star = fav_obj.map(|f| {
-                                let (glyph, color) = if is_fav {
-                                    ("★", cx.theme().warn)
-                                } else {
-                                    ("☆", cx.theme().text_disabled)
-                                };
+                        // G3 Task 4: ★/☆ toggle — `favourite_object_for`
+                        // gates to active-scope Inner rows and pinned
+                        // favourite rows itself.
+                        let fav_obj = this.favourite_object_for(&row_id);
+                        let is_fav = fav_obj.as_ref().is_some_and(|f| this.favourites.contains(f));
+                        let star = fav_obj.map(|f| {
+                            let (glyph, color) = if is_fav {
+                                ("★", cx.theme().warn)
+                            } else {
+                                ("☆", cx.theme().text_disabled)
+                            };
+                            div()
+                                .id(("tree-star", ix))
+                                .px_1()
+                                .flex_shrink_0()
+                                .cursor_pointer()
+                                .text_color(color)
+                                .child(glyph)
+                                .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(TreeEvent::ToggleFavourite(f.clone()));
+                                }))
+                        });
+
+                        // G8 T6: ER-diagram entry — active-scope Schema
+                        // rows only (design §5 row 1).
+                        let diagram_icon = if let (true, SidebarRow::Inner { node: NodeId::Schema(s), .. }) =
+                            (in_scope, &row_id)
+                        {
+                            let schema_for_click =
+                                if s.is_empty() { None } else { Some(s.clone()) };
+                            Some(
                                 div()
-                                    .id(("tree-star", ix))
+                                    .id(("tree-erd", ix))
                                     .px_1()
                                     .flex_shrink_0()
                                     .cursor_pointer()
-                                    .text_color(color)
-                                    .child(glyph)
+                                    .text_color(cx.theme().accent)
+                                    .child("⊞")
                                     .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
                                         cx.stop_propagation();
-                                        cx.emit(TreeEvent::ToggleFavourite(f.clone()));
-                                    }))
-                            });
+                                        cx.emit(TreeEvent::OpenErDiagram {
+                                            schema: schema_for_click.clone(),
+                                        });
+                                    })),
+                            )
+                        } else {
+                            None
+                        };
 
-                            // G8 T6: ER-diagram entry — active-scope Schema
-                            // rows only (design §5 row 1).
-                            let diagram_icon = if let (true, SidebarRow::Inner { node: NodeId::Schema(s), .. }) =
-                                (in_scope, &row_id)
-                            {
-                                let schema_for_click =
-                                    if s.is_empty() { None } else { Some(s.clone()) };
-                                Some(
-                                    div()
-                                        .id(("tree-erd", ix))
-                                        .px_1()
-                                        .flex_shrink_0()
-                                        .cursor_pointer()
-                                        .text_color(cx.theme().accent)
-                                        .child("⊞")
-                                        .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
-                                            cx.stop_propagation();
-                                            cx.emit(TreeEvent::OpenErDiagram {
-                                                schema: schema_for_click.clone(),
-                                            });
-                                        })),
-                                )
+                        // G12 T4: CSV import — active-scope Table rows,
+                        // hidden entirely when read_only (CURATION item
+                        // 4(b)'s entry-gate half, unchanged).
+                        let csv_icon = if let (true, false, SidebarRow::Inner { node: NodeId::Table(schema, name), .. }) =
+                            (in_scope, this.read_only, &row_id)
+                        {
+                            let schema_for_click =
+                                if schema.is_empty() { None } else { Some(schema.clone()) };
+                            let table_for_click = name.clone();
+                            Some(
+                                div()
+                                    .id(("tree-csv", ix))
+                                    .px_1()
+                                    .flex_shrink_0()
+                                    .cursor_pointer()
+                                    .text_color(cx.theme().success)
+                                    .child("⇪")
+                                    .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        cx.emit(TreeEvent::ImportCsv {
+                                            schema: schema_for_click.clone(),
+                                            table: table_for_click.clone(),
+                                        });
+                                    })),
+                            )
+                        } else {
+                            None
+                        };
+
+                        // Scripts library row actions (Part S §4). Not
+                        // gated on `in_scope`: the section is GLOBAL —
+                        // scripts are files, not database objects. Not
+                        // gated on `read_only` either: that flag is the
+                        // active CONNECTION's, and a `.sql` file on disk
+                        // has nothing to do with it.
+                        let script_icons: Vec<AnyElement> = match &row_id {
+                            SidebarRow::ScriptsRoot => vec![
+                                script_icon(ix, "scripts-refresh", "⟳", cx.theme().text_primary, cx, |cx| {
+                                    cx.emit(TreeEvent::ScriptsRefresh)
+                                }),
+                                script_icon(ix, "scripts-new", "+", cx.theme().accent, cx, |cx| {
+                                    cx.emit(TreeEvent::ScriptCreate { parent_rel: String::new() })
+                                }),
+                            ],
+                            SidebarRow::ScriptFolder { rel } => {
+                                let (a, b, c) = (rel.clone(), rel.clone(), rel.clone());
+                                vec![
+                                    script_icon(ix, "scripts-new", "+", cx.theme().accent, cx, move |cx| {
+                                        cx.emit(TreeEvent::ScriptCreate { parent_rel: a.clone() })
+                                    }),
+                                    script_icon(ix, "scripts-rename", "✎", cx.theme().text_muted, cx, move |cx| {
+                                        cx.emit(TreeEvent::ScriptRename { rel: b.clone(), is_dir: true })
+                                    }),
+                                    script_icon(ix, "scripts-delete", "✕", cx.theme().danger, cx, move |cx| {
+                                        cx.emit(TreeEvent::ScriptDelete { rel: c.clone(), is_dir: true })
+                                    }),
+                                ]
+                            }
+                            SidebarRow::ScriptFile { rel } => {
+                                let (a, b, c) = (rel.clone(), rel.clone(), rel.clone());
+                                vec![
+                                    script_icon(ix, "scripts-run", "▶", cx.theme().success, cx, move |cx| {
+                                        cx.emit(TreeEvent::ScriptRunFile { rel: a.clone() })
+                                    }),
+                                    script_icon(ix, "scripts-rename", "✎", cx.theme().text_muted, cx, move |cx| {
+                                        cx.emit(TreeEvent::ScriptRename { rel: b.clone(), is_dir: false })
+                                    }),
+                                    script_icon(ix, "scripts-delete", "✕", cx.theme().danger, cx, move |cx| {
+                                        cx.emit(TreeEvent::ScriptDelete { rel: c.clone(), is_dir: false })
+                                    }),
+                                ]
+                            }
+                            _ => Vec::new(),
+                        };
+
+                        // G10 T4 (design §2): the pinned "Správa serveru"
+                        // row — greyed + inline "(pouze pro čtení)" hint
+                        // when `Disabled`; click semantics live in
+                        // `handle_single_click` (OpenAdmin when Enabled).
+                        let is_admin_root = matches!(row_id, SidebarRow::Pinned(NodeId::AdminRoot));
+                        let admin_disabled =
+                            is_admin_root && this.admin_entry == AdminEntry::Disabled;
+                        let label = if admin_disabled {
+                            format!("{label} (pouze pro čtení)")
+                        } else {
+                            label
+                        };
+
+                        let mut row = div()
+                            .id(("tree-row", ix))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .h(px(22.))
+                            .pl(px(6. + depth as f32 * 14.))
+                            .cursor_pointer()
+                            .text_color(if admin_disabled {
+                                cx.theme().text_disabled
+                            } else if let Some(c) = notice_color {
+                                c
                             } else {
-                                None
-                            };
-
-                            // G12 T4: CSV import — active-scope Table rows,
-                            // hidden entirely when read_only (CURATION item
-                            // 4(b)'s entry-gate half, unchanged).
-                            let csv_icon = if let (true, false, SidebarRow::Inner { node: NodeId::Table(schema, name), .. }) =
-                                (in_scope, this.read_only, &row_id)
-                            {
-                                let schema_for_click =
-                                    if schema.is_empty() { None } else { Some(schema.clone()) };
-                                let table_for_click = name.clone();
-                                Some(
-                                    div()
-                                        .id(("tree-csv", ix))
-                                        .px_1()
-                                        .flex_shrink_0()
-                                        .cursor_pointer()
-                                        .text_color(cx.theme().success)
-                                        .child("⇪")
-                                        .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
-                                            cx.stop_propagation();
-                                            cx.emit(TreeEvent::ImportCsv {
-                                                schema: schema_for_click.clone(),
-                                                table: table_for_click.clone(),
-                                            });
-                                        })),
-                                )
-                            } else {
-                                None
-                            };
-
-                            // G10 T4 (design §2): the pinned "Správa serveru"
-                            // row — greyed + inline "(pouze pro čtení)" hint
-                            // when `Disabled`; click semantics live in
-                            // `handle_single_click` (OpenAdmin when Enabled).
-                            let is_admin_root = matches!(row_id, SidebarRow::Pinned(NodeId::AdminRoot));
-                            let admin_disabled =
-                                is_admin_root && this.admin_entry == AdminEntry::Disabled;
-                            let label = if admin_disabled {
-                                format!("{label} (pouze pro čtení)")
-                            } else {
-                                label
-                            };
-
-                            let mut row = div()
-                                .id(("tree-row", ix))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .h(px(22.))
-                                .pl(px(6. + depth as f32 * 14.))
-                                .cursor_pointer()
-                                .text_color(if admin_disabled {
-                                    cx.theme().text_disabled
-                                } else if let Some(c) = notice_color {
-                                    c
-                                } else {
-                                    cx.theme().text_primary
-                                })
-                                .hover(|s| s.bg(cx.theme().bg_hover));
-                            if is_selected || is_active_db {
-                                // The active Database row gets the
-                                // `bg_selected`-family emphasis alongside
-                                // its ● (design §1.4).
-                                row = row.bg(cx.theme().bg_selected);
-                            }
-                            row = row
-                                .child(
-                                    div()
-                                        .id(("tree-chevron", ix))
-                                        .w(px(14.))
-                                        .flex_shrink_0()
-                                        .cursor_pointer()
-                                        .child(chevron)
-                                        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                                            cx.stop_propagation();
-                                            this.handle_chevron(&chevron_row, cx);
-                                        })),
-                                );
-                            if let Some((glyph, color)) = indicator {
-                                row = row.child(
-                                    div()
-                                        .w(px(14.))
-                                        .flex_shrink_0()
-                                        .text_color(color)
-                                        .child(glyph),
-                                );
-                            }
-                            row = row
-                                .child(div().flex_1().overflow_hidden().child(label))
-                                .on_click(cx.listener(move |this, ev: &ClickEvent, _window, cx| {
-                                    if ev.click_count() >= 2 {
-                                        this.handle_double_click(&click_row, cx);
-                                    } else {
-                                        this.handle_single_click(&click_row, cx);
-                                    }
-                                }));
-                            if let Some(star) = star {
-                                row = row.child(star);
-                            }
-                            if let Some(icon) = diagram_icon {
-                                row = row.child(icon);
-                            }
-                            if let Some(icon) = csv_icon {
-                                row = row.child(icon);
-                            }
-                            items.push(row);
+                                cx.theme().text_primary
+                            })
+                            .hover(|s| s.bg(cx.theme().bg_hover));
+                        if is_selected || is_active_db {
+                            // The active Database row gets the
+                            // `bg_selected`-family emphasis alongside
+                            // its ● (design §1.4).
+                            row = row.bg(cx.theme().bg_selected);
                         }
-                        items
-                    }),
-                )
-                .flex_1(),
-            );
-        }
+                        row = row
+                            .child(
+                                div()
+                                    .id(("tree-chevron", ix))
+                                    .w(px(14.))
+                                    .flex_shrink_0()
+                                    .cursor_pointer()
+                                    .child(chevron)
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.handle_chevron(&chevron_row, cx);
+                                    })),
+                            );
+                        if let Some((glyph, color)) = indicator {
+                            row = row.child(
+                                div()
+                                    .w(px(14.))
+                                    .flex_shrink_0()
+                                    .text_color(color)
+                                    .child(glyph),
+                            );
+                        }
+                        row = row
+                            .child(div().flex_1().overflow_hidden().child(label))
+                            .on_click(cx.listener(move |this, ev: &ClickEvent, _window, cx| {
+                                if ev.click_count() >= 2 {
+                                    this.handle_double_click(&click_row, cx);
+                                } else {
+                                    this.handle_single_click(&click_row, cx);
+                                }
+                            }));
+                        if let Some(star) = star {
+                            row = row.child(star);
+                        }
+                        if let Some(icon) = diagram_icon {
+                            row = row.child(icon);
+                        }
+                        if let Some(icon) = csv_icon {
+                            row = row.child(icon);
+                        }
+                        for icon in script_icons {
+                            row = row.child(icon);
+                        }
+                        items.push(row);
+                    }
+                    items
+                }),
+            )
+            .flex_1(),
+        );
 
         root
     }
@@ -3675,16 +3824,17 @@ mod sidebar_tests {
     }
 
     #[test]
-    fn none_scripts_yields_exactly_some_scripts_minus_the_section_header() {
-        // The DARK contract: Task 3 changes nothing on screen. What THIS
-        // test pins is the narrower, exact statement in its name — `None`
-        // emits no `ScriptsRoot` and is otherwise element-for-element the
-        // `Some(..)` flatten with its header removed. The broader "nothing
-        // else in the sidebar moved" claim is carried by the ~20
-        // pre-existing `flatten_sidebar` tests above (favourites ordering,
-        // admin entry, db-list Loading/Error notices, filter shapes,
-        // multi-root ordering), which pass unchanged with the new
-        // parameter defaulted to `None`.
+    fn scripts_section_adds_only_its_own_rows_and_moves_nothing_else() {
+        // Was `none_scripts_yields_exactly_some_scripts_minus_the_section_
+        // header`, the DARK contract Task 3 shipped under. Task 7 flipped
+        // the production call site to `Some(..)`, so the same assertions
+        // now pin the LIVE claim: turning the section on adds its rows at
+        // the top and shifts nothing else, element for element. The
+        // parameter stays an `Option` because the ~20 pre-existing
+        // `flatten_sidebar` tests above (favourites ordering, admin entry,
+        // db-list Loading/Error notices, filter shapes, multi-root
+        // ordering) pass `None` to assert sidebar shapes that predate the
+        // section — that is what the `None` arm is FOR now.
         let conns = vec![conn_cfg("c1", "Prod", &[], Engine::Postgres, "sales")];
         let with_none = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
             &HashSet::new(), "", None, &[], AdminEntry::Hidden, None);
@@ -3708,5 +3858,71 @@ mod sidebar_tests {
             .position(|r| matches!(&r.0, SidebarRow::Connection { conn_id } if conn_id == "c1"))
             .unwrap();
         assert!(scripts_ix < conn_ix);
+    }
+
+    // ---------- Notice-row click resolution (workspace T7) ----------
+
+    #[test]
+    fn the_unconfigured_notice_opens_settings_and_never_scans() {
+        // Part S §1.4: the pointer row is the ONE clickable notice that is
+        // not a retry. Emitting `ScriptsRefresh` here would scan a root
+        // that does not exist.
+        let ev = script_notice_event(
+            "složka skriptů není nastavena — klikněte pro Nastavení",
+            true,
+        );
+        assert!(matches!(ev, Some(TreeEvent::OpenScriptsSettings)));
+    }
+
+    #[test]
+    fn an_error_notice_is_a_retry() {
+        let ev = script_notice_event("error: složka neexistuje: D:\\pryč", false);
+        assert!(matches!(ev, Some(TreeEvent::ScriptsRefresh)));
+    }
+
+    #[test]
+    fn every_other_notice_is_inert() {
+        // Loading, the empty-library row and both cap disclosures. An
+        // accidental retry here turns an idle sidebar into a rescan loop —
+        // and „Načítám skripty…" would rescan the scan that is running.
+        for text in [
+            "Načítám skripty…",
+            "žádné skripty (*.sql)",
+            "… zobrazeno prvních 2000 položek — zmenšete knihovnu skriptů",
+            "… některé podsložky jsou příliš hluboko (limit 12 úrovní)",
+        ] {
+            assert!(script_notice_event(text, false).is_none(), "must be inert: {text}");
+        }
+    }
+
+    #[test]
+    fn the_emitted_notice_rows_agree_with_the_click_resolver() {
+        // Cross-check against what `emit_scripts_section` actually emits,
+        // so the two can never drift apart: the unconfigured row opens
+        // Settings, the error row retries, everything else is inert.
+        let cases: Vec<(ScriptsListState, bool)> = vec![
+            (ScriptsListState::NotLoaded, false),
+            (ScriptsListState::Loading, true),
+            (ScriptsListState::Error("složka zmizela".into()), true),
+            (loaded_scripts(&[]), true),
+        ];
+        for (state, configured) in cases {
+            for (row, ..) in emit(&state, configured, &[OuterId::Scripts], "") {
+                let SidebarRow::ScriptNotice { text, open_settings } = &row else {
+                    continue;
+                };
+                match (configured, text.starts_with("error:")) {
+                    (false, _) => assert!(*open_settings, "the pointer row is clickable"),
+                    (true, true) => assert!(matches!(
+                        script_notice_event(text, *open_settings),
+                        Some(TreeEvent::ScriptsRefresh)
+                    )),
+                    (true, false) => {
+                        assert!(!*open_settings);
+                        assert!(script_notice_event(text, *open_settings).is_none());
+                    }
+                }
+            }
+        }
     }
 }

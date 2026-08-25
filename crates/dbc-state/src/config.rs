@@ -134,6 +134,12 @@ pub struct AppConfig {
     /// Git integration for this folder is deliberately EXTERNAL (user
     /// decision 2026-08-25) — the app never reads or writes anything
     /// git-related about it.
+    ///
+    /// INERT IN WORKSPACE MODE (design §W8): while a workspace is active
+    /// the scripts root is always `<workspace>/scripts`, so a hand-edited
+    /// `scripts_dir` in a workspace `config.toml` is ignored — one root per
+    /// mode, no precedence question — and the app never WRITES this field
+    /// there either. The seam is `dbc-ui`'s `scripts_root_for`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scripts_dir: Option<String>,
 }
