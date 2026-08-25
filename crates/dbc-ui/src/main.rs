@@ -18,6 +18,7 @@ mod monitor_sql;
 mod monitor_view;
 mod palette;
 mod plan;
+mod pwchange;
 mod row_view;
 mod runner;
 mod sandbox;
