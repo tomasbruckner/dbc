@@ -148,27 +148,24 @@ pub fn scan_scripts(root: &Path) -> Result<ScriptScan, String> {
     Ok(ScriptScan { entries, truncated, depth_clipped })
 }
 
-/// SECURITY (design §7.1): joins a '/'-separated rel onto the root,
-/// rejecting empty/`.`/`..` components and anything with `\`, `:` or
-/// control characters — no rel can ever resolve outside the root.
+/// SECURITY (design §7.1): joins a '/'-separated rel onto the root. Each
+/// component goes through the SHARED rail
+/// `dbc_state::fsutil::join_component`, so empty/`.`/`..` components and
+/// anything with `\`, `:` or control characters are refused in exactly
+/// one place — no rel can ever resolve outside the root.
 /// Defense in depth: rels only originate from `scan_scripts` (single
 /// `file_name()` components) and `validate_script_name` output anyway.
+///
+/// The EMPTY rel is the root itself — that is what a top-level
+/// `parent_rel` means. Every helper that MUTATES a resolved path must go
+/// through `resolve_entry_rel` instead.
 pub fn resolve_rel(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let mut p = root.to_path_buf();
     if rel.is_empty() {
         return Ok(p);
     }
     for comp in rel.split('/') {
-        if comp.is_empty()
-            || comp == "."
-            || comp == ".."
-            || comp.contains('\\')
-            || comp.contains(':')
-            || comp.chars().any(|c| c.is_control())
-        {
-            return Err("neplatná cesta".to_string());
-        }
-        p.push(comp);
+        p = dbc_state::fsutil::join_component(&p, comp).map_err(|e| e.message)?;
     }
     Ok(p)
 }
@@ -229,42 +226,24 @@ pub fn validate_script_name(name: &str, is_file: bool) -> Result<String, String>
 }
 
 /// SECURITY: collision probe within one directory, returning the EXACT
-/// on-disk name that would collide with `name` (reusable by any future
-/// workspace writer over this same root — config, vault, prefs).
+/// on-disk name that would collide with `name`.
 ///
-/// Case folding is UNICODE-aware (`to_lowercase`, not
-/// `eq_ignore_ascii_case`): NTFS is case-insensitive across all of
-/// Unicode, so with ASCII-only folding `Řezy.sql` and `řezy.sql` compare
-/// unequal here yet name the SAME file on disk — the caller would see
-/// "no collision" and `write_script`'s replace-rename would silently
-/// destroy the user's script. Czech names make that a routine case.
-///
-/// `ignore_exact` is the byte-exact name of the entry being renamed, so
-/// an entry never collides with ITSELF (identity, not name equality —
-/// on a case-SENSITIVE directory a coexisting `A.SQL` must still block
-/// `a.sql` → `A.SQL`).
-///
-/// Non-UTF-8 names are compared lossily: a false positive merely refuses
-/// a name, which is the safe direction.
+/// Thin adapter over the SHARED rail
+/// `dbc_state::fsutil::conflicting_entry_ci` (workspace T1) — the fold
+/// rule, the identity skip and the lossy non-UTF-8 comparison live there
+/// so every writer into a user-chosen folder inherits the same
+/// semantics. Why it must be Unicode-aware at all: NTFS is
+/// case-insensitive across all of Unicode, so with ASCII-only folding
+/// `Řezy.sql` and `řezy.sql` compare unequal here yet name the SAME file
+/// on disk — the caller would see "no collision" and `write_script`'s
+/// replace-rename would silently destroy the user's script. Czech names
+/// make that a routine case.
 fn conflicting_name(
     parent: &Path,
     name: &str,
     ignore_exact: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let target_lc = name.to_lowercase();
-    let rd =
-        fs::read_dir(parent).map_err(|e| format!("nelze číst složku {}: {e}", parent.display()))?;
-    for ent in rd {
-        let ent = ent.map_err(|e| format!("nelze číst složku {}: {e}", parent.display()))?;
-        let existing = ent.file_name().to_string_lossy().into_owned();
-        if ignore_exact.is_some_and(|ex| ex == existing.as_str()) {
-            continue;
-        }
-        if existing.to_lowercase() == target_lc {
-            return Ok(Some(existing));
-        }
-    }
-    Ok(None)
+    dbc_state::fsutil::conflicting_entry_ci(parent, name, ignore_exact).map_err(|e| e.message)
 }
 
 fn joined_rel(parent_rel: &str, name: &str) -> String {
@@ -328,30 +307,15 @@ pub fn delete_entry(root: &Path, rel: &str, is_dir: bool) -> Result<(), String> 
     }
 }
 
-/// Atomic write: `.tmp` sibling + `sync_all` + rename (`AppConfig::save`
-/// shape). REPLACES an existing target by design (that is what saving an
-/// open editor buffer means) — callers that must not clobber, like
+/// Atomic write via the SHARED rail `dbc_state::fsutil::write_atomic`
+/// (`.tmp` sibling + `sync_all` + rename, the `AppConfig::save` shape).
+/// REPLACES an existing target by design (that is what saving an open
+/// editor buffer means) — callers that must not clobber, like
 /// `create_script`, are responsible for probing via `conflicting_name`
 /// first. Last-writer-wins on external edits — by the user's own model
 /// git is the history layer (design §5.2).
 pub fn write_script(path: &Path, text: &str) -> Result<(), String> {
-    use std::io::Write;
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    let write = (|| -> std::io::Result<()> {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()
-    })();
-    if let Err(e) = write {
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("uložení selhalo: {e}"));
-    }
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("uložení selhalo: {e}")
-    })
+    dbc_state::fsutil::write_atomic(path, text.as_bytes()).map_err(|e| e.message)
 }
 
 /// Reads a script for the EDITOR: refuses symlinks, > `SCRIPT_OPEN_CAP`,
@@ -471,10 +435,22 @@ mod tests {
     }
 
     /// The symlink test above SKIPS on a stock Windows box (creating a
-    /// symlink needs privilege), which would leave the escape rail
+    /// symlink needs privilege), which would leave the no-escape property
     /// unverified there. A directory JUNCTION needs no privilege and is
     /// the reparse point an attacker/user can actually plant, so this
-    /// pins the same rail on an unprivileged machine.
+    /// pins the OBSERVABLE property — a junction is never listed and never
+    /// descended — on an unprivileged machine.
+    ///
+    /// HONESTY NOTE (mutation-tested, T1 review): this test does NOT pin
+    /// the `if ft.is_symlink() { continue }` line. Deleting that line
+    /// leaves the test GREEN, because a junction reports
+    /// `is_symlink=true, is_dir=false, is_file=false` and therefore falls
+    /// through both classification arms anyway. What the test DOES catch
+    /// is a swap of the `file_type()` classification to a link-FOLLOWING
+    /// `fs::metadata()`, which would make the junction look like a plain
+    /// directory and hand the walk a path out of the root. The
+    /// `is_symlink` skip is pinned by `scan_skips_symlinks_when_creatable`
+    /// — on a machine where symlink creation is available.
     #[cfg(windows)]
     #[test]
     fn scan_skips_directory_junctions() {

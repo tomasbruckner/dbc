@@ -4,6 +4,8 @@ pub use config::{
     SshTunnelConfig, StateError, ThemeMode,
 };
 
+pub mod fsutil;
+
 mod scope;
 pub use scope::connection_scope_key;
 
