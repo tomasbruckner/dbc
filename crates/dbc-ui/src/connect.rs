@@ -316,10 +316,6 @@ pub(crate) fn mssql_connection_from_config(
 /// staré jde do `SQL_COPT_SS_OLDPWD`. Volá se VÝHRADNĚ přes
 /// `QueryRunner::change_mssql_password` (sankcionovaná cesta — UI nikdy
 /// nesahá na driver přímo).
-// Allow dead_code: T3 přistává před T4 konzumentem (dialogový confirm) —
-// unit-testované, ale ještě nevolané z main. Odstraní T4 (stejná
-// precedence jako admin_sql T1/T2).
-#[allow(dead_code)]
 pub(crate) fn change_mssql_password(
     cfg: &ConnectionConfig,
     old_password: &str,

@@ -366,9 +366,6 @@ impl QueryRunner {
     /// read-only guard: tohle není SQL write, ale údržba přihlášení —
     /// read-only připojení se zamčeným heslem by jinak nešlo zachránit
     /// (spec §3; `guard_not_read_only` se týká SQL write cesty).
-    // Allow dead_code: T3 přistává před T4 konzumentem (dialogový
-    // confirm) — unit-testované, ale ještě nevolané z main. Odstraní T4.
-    #[allow(dead_code)]
     pub fn change_mssql_password(
         &self,
         cfg: Box<dbc_state::ConnectionConfig>,

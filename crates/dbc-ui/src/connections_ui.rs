@@ -1162,6 +1162,28 @@ pub enum ModalState {
     /// never actually wired to `QueryRunner::run_analyze_write` and so
     /// could be defeated by Escape mid-flight.
     AnalyzeWriteConfirm { sql: String, engine: Engine, running: bool, error: Option<String> },
+    /// pwchange (spec §2): nabídka změny hesla po detekovaném connect
+    /// selhání (`pwchange::detect`). `user` = přihlášení, jehož heslo se
+    /// mění (z configu); `retry_db` = databáze původního pokusu (po
+    /// úspěchu se přepnutí opakuje). Admin pole se POUŽÍVAJÍ jen pro
+    /// `PgMaybeExpired` (rendrují se podmíněně); MSSQL si heslo mění sám
+    /// při loginu (staré heslo z trezoru — 18488 implikuje, že bylo
+    /// správné). Esc nezavírá s rozepsaným heslem ani za běhu
+    /// (`pwchange::esc_closable`, viz `AppView::on_cancel_query`);
+    /// `running: true` drží dialog mutovaný na místě po dobu změny,
+    /// stejný vzor jako `AnalyzeWriteConfirm` výše.
+    ChangeServerPassword {
+        conn_id: String,
+        kind: crate::pwchange::PwChangeKind,
+        user: String,
+        retry_db: Option<String>,
+        new1: Entity<TextField>,
+        new2: Entity<TextField>,
+        admin_user: Entity<TextField>,
+        admin_password: Entity<TextField>,
+        error: Option<String>,
+        running: bool,
+    },
     /// G7 T6: two-connection picker for the schema/data compare feature
     /// (design §3). `conn_a`/`conn_b` are `ConnectionConfig.id` values (or
     /// `None` while unpicked); "Spustit porovnání" (`confirm_compare_dialog`)
@@ -1309,6 +1331,9 @@ pub(crate) enum ModalConfirmKind {
     Compare,
     CloseSettings,
     ChartConfirm,
+    /// pwchange: Enter = „Změnit heslo" (`AppView::confirm_pw_change`,
+    /// self-guarding — validace + running-guard v těle).
+    ChangeServerPw,
     Ignore,
 }
 
@@ -1321,6 +1346,7 @@ pub(crate) fn modal_confirm_kind(modal: &ModalState) -> ModalConfirmKind {
         ModalState::CompareDialog { .. } => ModalConfirmKind::Compare,
         ModalState::Settings => ModalConfirmKind::CloseSettings,
         ModalState::ChartPicker { .. } => ModalConfirmKind::ChartConfirm,
+        ModalState::ChangeServerPassword { .. } => ModalConfirmKind::ChangeServerPw,
         // §3-novela Ignore arms — kept as explicit variants (not a `_`
         // catch-all) so a NEW ModalState variant is a compile error here
         // and must consciously pick a side of the policy table.
@@ -1486,6 +1512,19 @@ impl AppView {
             ModalState::AnalyzeWriteConfirm { sql, engine, running, error } => {
                 render_analyze_write_confirm_panel(&sql, engine, running, &error, cx)
             }
+            ModalState::ChangeServerPassword {
+                kind, user, new1, new2, admin_user, admin_password, error, running, ..
+            } => render_pw_change_panel(
+                kind,
+                &user,
+                new1,
+                new2,
+                admin_user,
+                admin_password,
+                error,
+                running,
+                cx,
+            ),
             ModalState::CompareDialog { conn_a, conn_b, error } => {
                 // Sidebar rework (design §5 row 7): each connection's
                 // CACHED database list, read at render time — the dialog
@@ -1762,6 +1801,7 @@ impl AppView {
             ModalConfirmKind::Compare => self.confirm_compare_dialog(cx),
             ModalConfirmKind::CloseSettings => self.close_modal(cx),
             ModalConfirmKind::ChartConfirm => self.confirm_chart_picker(cx),
+            ModalConfirmKind::ChangeServerPw => self.confirm_pw_change(cx),
             // Handled no-op: propagation already stopped, Enter dies here.
             ModalConfirmKind::Ignore => {}
         }
@@ -3104,6 +3144,63 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
             .child(styled_button("dlg-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx)))),
     );
 
+    panel.into_any_element()
+}
+
+/// pwchange (spec §2). Admin pole jen pro PG; PG navíc transparentně
+/// ukazuje redigovaný příkaz (`pwchange::pg_rescue_display` — display_sql
+/// nikdy nezávisí na hesle). Tlačítka bez on_click, dokud `running` —
+/// stejný „disabled while running" přístup jako apply dialog; Enter jde
+/// přes `confirm_pw_change`, který je self-guarding.
+#[allow(clippy::too_many_arguments)]
+fn render_pw_change_panel(
+    kind: crate::pwchange::PwChangeKind,
+    user: &str,
+    new1: Entity<TextField>,
+    new2: Entity<TextField>,
+    admin_user: Entity<TextField>,
+    admin_password: Entity<TextField>,
+    error: Option<String>,
+    running: bool,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let mut panel: Div = div()
+        .w(px(420.))
+        .bg(cx.theme().bg_panel)
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(cx.theme().text_primary)
+        .child(div().text_size(px(16.)).child("Změna hesla na serveru"))
+        .child(div().text_color(cx.theme().text_muted).child(crate::pwchange::dialog_body(kind, user)))
+        .child(field_row("Nové heslo", new1, *cx.theme()))
+        .child(field_row("Nové heslo znovu", new2, *cx.theme()));
+    if kind == crate::pwchange::PwChangeKind::PgMaybeExpired {
+        panel = panel
+            .child(field_row("Admin uživatel", admin_user, *cx.theme()))
+            .child(field_row("Admin heslo", admin_password, *cx.theme()))
+            .child(
+                div().text_color(cx.theme().text_muted).child(crate::pwchange::pg_rescue_display(user)),
+            );
+    }
+    if let Some(e) = error {
+        panel = panel.child(div().text_color(cx.theme().danger).child(e));
+    }
+    let mut cancel = styled_button("pwch-cancel", "Zrušit", *cx.theme());
+    let mut submit = styled_button(
+        "pwch-submit",
+        if running { "měním heslo…" } else { "Změnit heslo" },
+        *cx.theme(),
+    );
+    if !running {
+        cancel = cancel.on_click(cx.listener(|v, _, _, cx| v.close_modal(cx)));
+        submit = submit.on_click(cx.listener(|v, _, _, cx| v.confirm_pw_change(cx)));
+    }
+    panel = panel.child(div().flex().flex_row().gap_2().justify_end().mt_2().child(cancel).child(submit));
     panel.into_any_element()
 }
 

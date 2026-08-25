@@ -44,8 +44,9 @@ fn utf16_nul(s: &str) -> Vec<u16> {
 /// Chybové cesty (špatné staré heslo 18456, policy-odmítnuté nové heslo
 /// 18463–18466, nedostupný server, …) jdou přes [`odbc_err`], jehož text
 /// je POUZE diagnostický záznam driveru — nikdy connection string, který
-/// tady jako jediný nese obě hesla plaintext (viz negativní test
-/// `change_password_error_never_contains_either_password` a stejnou
+/// nese NOVÉ heslo plaintext; staré heslo putuje výhradně atributovým
+/// UTF-16 bufferem a do connection stringu nikdy nevstoupí (viz negativní
+/// test `change_password_error_never_contains_either_password` a stejnou
 /// pojistku `probe_error_never_contains_the_password` v lib.rs). Starý
 /// UTF-16 buffer se po použití nuluje; `conn_str` je lokální `String`
 /// žijící jen po dobu fn a nikam se neloguje (stejná disciplína jako
@@ -113,6 +114,9 @@ mod tests {
         let new_password = "nEw$ecretBbb2222";
         let cfg = MssqlConfig::new("127.0.0.1", 1, "x", "x", new_password)
             .connect_timeout_sec(3);
+        // Machine-dependent chybové varianty (obě mají `conn_str` v
+        // scope): s nainstalovaným driverem TCP-fail diagnostika, bez něj
+        // IM002 od driver manageru — pojistka platí pro obě.
         let err = change_password_at_connect(&cfg, old_password)
             .expect_err("connecting to 127.0.0.1:1 must fail");
         for secret in [old_password, new_password] {

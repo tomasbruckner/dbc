@@ -4079,6 +4079,19 @@ impl AppView {
                 // G14 T11: no secret/unsaved-run state — a pick-then-confirm
                 // dialog, same reasoning as `QueryParams`/`Settings` above.
                 connections_ui::ModalState::ChartPicker { .. } => true,
+                // pwchange (spec §2): zavíratelný jen bez rozepsaného hesla
+                // (kterékoli maskované pole) a bez běžící změny — stejná
+                // „no accidental dismissal while a password is typed"
+                // úvaha jako ConnectionDialog výše; pravdivostní tabulka
+                // je pwchange::esc_closable.
+                connections_ui::ModalState::ChangeServerPassword {
+                    new1, new2, admin_password, running, ..
+                } => {
+                    let empty = new1.read(cx).text().is_empty()
+                        && new2.read(cx).text().is_empty()
+                        && admin_password.read(cx).text().is_empty();
+                    pwchange::esc_closable(empty, *running)
+                }
                 _ => false,
             };
             if closable {
@@ -4917,6 +4930,10 @@ impl AppView {
         let effective = db.clone().unwrap_or_else(|| cfg.database.clone());
         let spec = spec_for_database(&cfg, &effective, secret);
         let target_id = cfg.id.clone();
+        // pwchange (spec §1): detekce v failure armu níže potřebuje engine
+        // + přihlašovací jméno z configu.
+        let engine = cfg.engine;
+        let conn_user = cfg.user.clone();
         self.dropdown_open = false;
         self.status = "connecting…".into();
         self.switch_generation += 1;
@@ -4955,6 +4972,19 @@ impl AppView {
                     // drops with them — nothing shared to clear.
                     Ok(Err(e)) => {
                         view.status = format!("error: {e}");
+                        // pwchange (spec §1): nabídka změny hesla — nikdy
+                        // auto-změna, dialog má Zrušit/Esc; při jiném
+                        // otevřeném modalu zůstane jen status výše
+                        // (single-modal invariant v open_pw_change_dialog).
+                        if let Some(kind) = pwchange::detect(engine, &e) {
+                            view.open_pw_change_dialog(
+                                target_id.clone(),
+                                conn_user.clone(),
+                                kind,
+                                db.clone(),
+                                cx,
+                            );
+                        }
                     }
                     Err(_) => {
                         view.status = "error: connect zrušen".into();
@@ -4984,6 +5014,255 @@ impl AppView {
     /// subscribe callbacks have no `&mut Window`) — deferred focus lands on
     /// the prompt's own input via the render-top hook (see
     /// `AppView::render`'s `modal_needs_focus` block).
+    /// pwchange (spec §1): otevírá nabídku změny hesla po detekovaném
+    /// connect selhání. Nikdy nevytlačí existující modal (single-modal
+    /// invariant — v tom případě zůstane jen chybový status, který
+    /// volající už nastavil). Deferred-focus vzor `open_vault_prompt`
+    /// níže: z async callbacku není `&mut Window`, fokus dodá render.
+    pub(crate) fn open_pw_change_dialog(
+        &mut self,
+        conn_id: String,
+        user: String,
+        kind: pwchange::PwChangeKind,
+        retry_db: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal.is_some() {
+            return;
+        }
+        let new1 = cx.new(|cx| connections_ui::TextField::form_field(cx, "nové heslo", true));
+        let new2 = cx.new(|cx| connections_ui::TextField::form_field(cx, "nové heslo znovu", true));
+        let admin_user = cx.new(|cx| connections_ui::TextField::form_field(cx, "postgres", false));
+        let admin_password =
+            cx.new(|cx| connections_ui::TextField::form_field(cx, "heslo administrátora", true));
+        self.modal = Some(connections_ui::ModalState::ChangeServerPassword {
+            conn_id,
+            kind,
+            user,
+            retry_db,
+            new1,
+            new2,
+            admin_user,
+            admin_password,
+            error: None,
+            running: false,
+        });
+        self.dropdown_open = false;
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    /// pwchange (spec §3): Enter/„Změnit heslo". Self-guarding (validace
+    /// nahoře, chyby zůstávají v dialogu) — `on_modal_confirm` nepřidává
+    /// žádnou autoritu. MSSQL: staré heslo Z TREZORU (18488 implikuje, že
+    /// bylo správné ⇒ trezor byl při connectu odemčený), změna driver-level
+    /// přes sankcionovaný `QueryRunner::change_mssql_password`. PG: admin
+    /// credentials z dialogu, existující `run_write_transaction`, zápis do
+    /// historie kind "admin" (display_sql, nikdy exec_sql). Po úspěchu
+    /// OBOU větví: `finish_pw_change_success` (trezor + retry).
+    fn confirm_pw_change(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::ChangeServerPassword {
+            conn_id,
+            kind,
+            retry_db,
+            new1,
+            new2,
+            admin_user,
+            admin_password,
+            running,
+            ..
+        }) = self.modal.clone()
+        else {
+            return;
+        };
+        if running {
+            return;
+        }
+        let new1_text = zeroize::Zeroizing::new(new1.read(cx).text());
+        let new2_text = zeroize::Zeroizing::new(new2.read(cx).text());
+        if let Err(m) = pwchange::validate_new_password(&new1_text, &new2_text) {
+            self.pw_change_set_error(m, cx);
+            return;
+        }
+        let Some(cfg) = self.config.connections.iter().find(|c| c.id == conn_id).cloned() else {
+            self.pw_change_set_error("připojení nenalezeno".to_string(), cx);
+            return;
+        };
+        if self.vault.is_none() {
+            // Defenzivní: detekce implikuje odemčený trezor (spec §4);
+            // kdyby přesto nebyl, neměníme heslo, které bychom neuměli
+            // hned uložit.
+            self.pw_change_set_error(
+                "trezor není odemčený — odemkněte ho a zkuste znovu".to_string(),
+                cx,
+            );
+            return;
+        }
+        match kind {
+            pwchange::PwChangeKind::MssqlMustChange => {
+                let Some(old) = self.vault.as_ref().and_then(|v| v.get_secret(&conn_id)) else {
+                    self.pw_change_set_error(
+                        "současné heslo není v trezoru — uložte ho v dialogu připojení".to_string(),
+                        cx,
+                    );
+                    return;
+                };
+                if let Some(connections_ui::ModalState::ChangeServerPassword {
+                    running, error, ..
+                }) = &mut self.modal
+                {
+                    *running = true;
+                    *error = None;
+                }
+                cx.notify();
+                let rx = self.runner.change_mssql_password(
+                    Box::new(cfg),
+                    zeroize::Zeroizing::new(old),
+                    zeroize::Zeroizing::new(new1_text.to_string()),
+                );
+                let new_password = zeroize::Zeroizing::new(new1_text.to_string());
+                cx.spawn(async move |this, cx| {
+                    let result = rx.await;
+                    let _ = this.update(cx, |view, cx| {
+                        match result {
+                            Ok(Ok(())) => view.finish_pw_change_success(
+                                &conn_id,
+                                &new_password,
+                                retry_db.clone(),
+                                cx,
+                            ),
+                            Ok(Err(e)) => view.pw_change_set_error(e.to_string(), cx),
+                            Err(_) => {
+                                view.pw_change_set_error("změna hesla zrušena".to_string(), cx)
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            pwchange::PwChangeKind::PgMaybeExpired => {
+                let admin_user_text = admin_user.read(cx).text();
+                if let Err(m) = pwchange::validate_pg_admin(&admin_user_text) {
+                    self.pw_change_set_error(m, cx);
+                    return;
+                }
+                let admin_password_text = zeroize::Zeroizing::new(admin_password.read(cx).text());
+                let stmt = admin_sql::alter_password_rescue_pg(&cfg.user, &new1_text);
+                let sql_text = stmt.display_sql.clone();
+                let mut rescue_cfg = cfg.clone();
+                rescue_cfg.user = admin_user_text;
+                // Server-side by default_transaction_read_only ALTER stejně
+                // odmítl; explicitně potvrzená credential operace, ne zápis
+                // dat (spec §3).
+                rescue_cfg.read_only = false;
+                if let Some(db) = &retry_db {
+                    rescue_cfg.database = db.clone();
+                }
+                if let Some(connections_ui::ModalState::ChangeServerPassword {
+                    running, error, ..
+                }) = &mut self.modal
+                {
+                    *running = true;
+                    *error = None;
+                }
+                cx.notify();
+                let history_conn_name = cfg.name.clone();
+                let history_started_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let started = std::time::Instant::now();
+                let spec = ConnectSpec::Config {
+                    cfg: Box::new(rescue_cfg),
+                    secret: Some(admin_password_text.to_string()),
+                };
+                let rx = self.runner.run_write_transaction(spec, vec![stmt], Some(60));
+                let new_password = zeroize::Zeroizing::new(new1_text.to_string());
+                cx.spawn(async move |this, cx| {
+                    let result = rx.await;
+                    let _ = this.update(cx, |view, cx| {
+                        match result {
+                            Ok(Ok(_affected)) => {
+                                let elapsed_ms = started.elapsed().as_millis() as i64;
+                                // ALTER ROLE nemá smysluplný affected count
+                                // (drive_write_sequence vrací 0) → None.
+                                view.record_history_with_kind(
+                                    &sql_text,
+                                    &history_conn_name,
+                                    history_started_at,
+                                    Some(elapsed_ms),
+                                    None,
+                                    None,
+                                    "admin",
+                                    cx,
+                                );
+                                view.finish_pw_change_success(
+                                    &conn_id,
+                                    &new_password,
+                                    retry_db.clone(),
+                                    cx,
+                                );
+                            }
+                            Ok(Err(e)) => view.pw_change_set_error(e.to_string(), cx),
+                            Err(_) => {
+                                view.pw_change_set_error("změna hesla zrušena".to_string(), cx)
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// Společný úspěchový konec obou pwchange větví: heslo OKAMŽITĚ do
+    /// trezoru (spec §4), zavřít dialog, opakovat původní přepnutí.
+    /// Selhání zápisu do trezoru se NESMÍ tvářit jako selhání změny —
+    /// heslo na serveru UŽ je změněné; dialog zůstává s poctivou instrukcí.
+    fn finish_pw_change_success(
+        &mut self,
+        conn_id: &str,
+        new_password: &str,
+        retry_db: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let saved = match self.vault.as_mut() {
+            Some(v) => v.set_secret(conn_id, new_password).map_err(|e| e.message),
+            None => Err("trezor není odemčený".to_string()),
+        };
+        match saved {
+            Ok(()) => {
+                self.modal = None;
+                self.status = "heslo změněno a uloženo do trezoru".to_string();
+                self.switch_to_database(conn_id, retry_db, None, cx);
+            }
+            Err(m) => self.pw_change_set_error(
+                format!(
+                    "heslo na serveru ZMĚNĚNO, ale uložení do trezoru selhalo: {m} — \
+                     uložte nové heslo v dialogu připojení"
+                ),
+                cx,
+            ),
+        }
+    }
+
+    /// Chyba zpět do otevřeného pwchange dialogu (a shodit `running`);
+    /// když už dialog nestojí (defenzivní — Esc je při running blokovaný),
+    /// spadne do statusu.
+    fn pw_change_set_error(&mut self, msg: String, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::ChangeServerPassword { error, running, .. }) =
+            &mut self.modal
+        {
+            *error = Some(msg);
+            *running = false;
+        } else {
+            self.status = format!("error: {msg}");
+        }
+        cx.notify();
+    }
+
     fn open_vault_prompt(&mut self, pending: connections_ui::PendingAfterUnlock, cx: &mut Context<Self>) {
         let input = cx.new(|cx| connections_ui::TextField::form_field(cx, "Heslo", true));
         self.modal = Some(connections_ui::ModalState::MasterPasswordPrompt {
