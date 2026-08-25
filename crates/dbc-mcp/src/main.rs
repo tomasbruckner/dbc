@@ -51,12 +51,26 @@ use tools::McpServer;
 enum Command {
     Serve,
     Setup { remove: bool },
+    /// The operator ASKED for usage (`--help` / `-h`) — stderr, exit 0.
     Help,
+    /// The operator got usage because their argv was wrong (unknown flag,
+    /// or a flag whose value is missing). The offending argument has
+    /// already been named on stderr by the parse loop; this variant exists
+    /// so the exit code says "you did not get what you asked for".
+    ///
+    /// Review MINOR-2: this used to be `Help`, so a typo'd flag exited 0
+    /// AND — once Task 6 made `Help` exempt from the broken-pointer check
+    /// — suppressed the workspace diagnosis entirely. `dbc-mcp --confg
+    /// C:\ws\config.toml` against a broken pointer reported nothing worth
+    /// acting on and exited 0.
+    Usage,
     /// Design §W7: the pointer file names a workspace this build cannot
     /// use, AND the command actually needs a path it would have supplied.
-    /// One stderr line, non-zero exit — dbc-mcp must not silently serve
-    /// profile-mode connections any more than the GUI may silently show
-    /// them (§W4).
+    /// One stderr MESSAGE — two lines, the diagnosis and the escape hatch
+    /// (`workspace_broken_message` guarantees exactly that shape, see
+    /// review MINOR-3) — and a non-zero exit. dbc-mcp must not silently
+    /// serve profile-mode connections any more than the GUI may silently
+    /// show them (§W4).
     Fail(String),
 }
 
@@ -66,15 +80,68 @@ struct Args {
     command: Command,
 }
 
+/// Shown when the POINTER itself could not be read, so there is no folder
+/// path to name.
+///
+/// **CROSS-CRATE TWIN of `dbc_ui::connections_ui::WORKSPACE_MISSING_NO_PATH`**
+/// (byte-pinned there by `workspace_missing_text_tests`, and carrying the
+/// reciprocal pointer back to this const). The blocking GUI modal (§W4)
+/// and this headless server describe the SAME condition; they must not
+/// drift into two different Czech sentences. A copy sweep that rewords one
+/// MUST reword the other — both are byte-pinned, so both tests fail
+/// together and neither side can be changed quietly.
+///
+/// Review MINOR-1: this was an unpinned inline literal, and the only test
+/// that touched the `None` branch was satisfied entirely by the `reason`
+/// argument — `None => String::new()` left the whole suite green.
+const WORKSPACE_MISSING_NO_PATH: &str = "ukazatel na pracovní prostor je nečitelný";
+
+/// Reduces a store-layer reason to ONE line without throwing away the part
+/// that diagnoses anything.
+///
+/// Review MINOR-3: `toml::de::Error`'s `Display` is multi-line and echoes
+/// the offending source line, so the likeliest broken-pointer case — an
+/// unparsable `workspace.toml` — rendered as eight lines with an orphaned
+/// `)`. Its shape is `<position>\n<source-echo art>\n<explanation>`, so
+/// the FIRST and LAST non-empty lines are exactly the two useful parts
+/// (where, and what) and everything between them is the `|`/`^` art. A
+/// single-line reason (every other `Resolution::Broken` case, e.g.
+/// „složka neexistuje") is returned unchanged.
+fn one_line_reason(reason: &str) -> String {
+    let mut lines = reason.lines().map(str::trim).filter(|l| !l.is_empty());
+    let Some(first) = lines.next() else { return String::new() };
+    match lines.last() {
+        Some(last) => format!("{first}: {last}"),
+        None => first.to_string(),
+    }
+}
+
 /// The stderr message for a broken pointer. Names the folder (or says the
 /// pointer itself is unreadable), names the reason, and points at the
 /// escape hatch — nothing else: no config contents, no vault bytes, no
 /// connection names (`stdout is sacred`, and stderr is a log too).
+///
+/// Exactly TWO lines, always: the diagnosis and the escape hatch. That is
+/// a tested property, not an aspiration — see `one_line_reason`.
+///
+/// **NOTE FOR THE TASK 10 SWEEP — the composed text stutters, and it is
+/// PHASE-WIDE, not an MCP quirk.** With `root: None` the message reads
+/// „…: ukazatel na pracovní prostor je nečitelný (ukazatel na pracovní
+/// prostor je poškozený: …)", because `WORKSPACE_MISSING_NO_PATH` (the
+/// subject) and `dbc-state`'s `read_pointer` reason (the predicate) both
+/// name the pointer. The GUI modal composes the same two halves and
+/// stutters identically (`connections_ui.rs`, `render_workspace_missing`'s
+/// `path_line` + `reason`). Deliberately NOT reconciled here: both halves
+/// are verbatim from binding sources pinned by two different tasks, and
+/// quietly harmonising copy across a seam is the trap this phase has
+/// already recorded twice in the §W3.1 as-built addenda. Reword BOTH
+/// crates together, or neither.
 fn workspace_broken_message(root: &Option<PathBuf>, reason: &str) -> String {
     let where_ = match root {
         Some(r) => r.display().to_string(),
-        None => "ukazatel na pracovní prostor je nečitelný".to_string(),
+        None => WORKSPACE_MISSING_NO_PATH.to_string(),
     };
+    let reason = one_line_reason(reason);
     format!(
         "dbc-mcp: pracovní prostor není použitelný: {where_} ({reason})\n\
          Otevřete aplikaci dbc a prostor obnovte, nebo spusťte dbc-mcp s explicitními cestami: --config <path> --vault <path>"
@@ -101,6 +168,7 @@ fn parse_args_from(raw: &[String], res: dbc_state::workspace::Resolution) -> Arg
     let mut is_setup = false;
     let mut remove = false;
     let mut help = false;
+    let mut argv_error = false;
 
     let mut i = 0;
     while i < raw.len() {
@@ -115,7 +183,7 @@ fn parse_args_from(raw: &[String], res: dbc_state::workspace::Resolution) -> Arg
                     config_explicit = true;
                 } else {
                     eprintln!("dbc-mcp: --config requires a path");
-                    help = true;
+                    argv_error = true;
                 }
             }
             "--vault" => {
@@ -125,26 +193,54 @@ fn parse_args_from(raw: &[String], res: dbc_state::workspace::Resolution) -> Arg
                     vault_explicit = true;
                 } else {
                     eprintln!("dbc-mcp: --vault requires a path");
-                    help = true;
+                    argv_error = true;
                 }
             }
             other => {
                 eprintln!("dbc-mcp: unrecognized argument '{other}'");
-                help = true;
+                argv_error = true;
             }
         }
         i += 1;
     }
 
-    let command =
-        if help { Command::Help } else if is_setup { Command::Setup { remove } } else { Command::Serve };
+    // An argv error OUTRANKS an explicit `--help` (`dbc-mcp --help
+    // --confg x` must not exit 0): the operator's argv was wrong either
+    // way, and the usage text is printed for both.
+    let command = if argv_error {
+        Command::Usage
+    } else if help {
+        Command::Help
+    } else if is_setup {
+        Command::Setup { remove }
+    } else {
+        Command::Serve
+    };
     // §W7: fatal only when a default the broken pointer would have supplied
     // is actually needed. `--help` needs nothing; `setup --remove` only
     // touches the credential store; `setup` needs the vault; `serve` needs
     // both. Overriding exactly what you need keeps working.
-    let needs_config = matches!(command, Command::Serve) && !config_explicit;
-    let needs_vault =
-        matches!(command, Command::Serve | Command::Setup { remove: false }) && !vault_explicit;
+    //
+    // `Usage` is listed under BOTH needs on purpose (review MINOR-2). An
+    // argv we could not parse is not an argv whose path needs we get to
+    // narrow: the reviewer's case is `--confg <path>`, where the typo
+    // means config is NOT explicit and the broken pointer's default is
+    // exactly what would have been used. Assuming the widest need is the
+    // choice that never withholds the diagnosis — and it still honours
+    // §W7's scope rule, because `--config X --vault Y --bogus` overrides
+    // both, needs neither default, and stays a plain `Usage`.
+    let needs_config = matches!(command, Command::Serve | Command::Usage) && !config_explicit;
+    let needs_vault = matches!(
+        command,
+        Command::Serve | Command::Setup { remove: false } | Command::Usage
+    ) && !vault_explicit;
+    // A broken pointer OUTRANKS a `Usage`, deliberately. Nothing is lost:
+    // the parse loop above has ALREADY named the offending argument on
+    // stderr, unconditionally, so the operator sees both problems. The
+    // ranking matters because only one of the two survives fixing the
+    // other — the typo is gone the moment they retype it, the broken
+    // workspace is still there — and `Fail` is the arm that carries the
+    // non-zero exit and the "never a silent fallback" rail (§W4/§W7).
     let command = match broken {
         Some(msg) if needs_config || needs_vault => Command::Fail(msg),
         _ => command,
@@ -294,6 +390,14 @@ async fn run_serve(config_path: &std::path::Path, vault_path: &std::path::Path) 
             return ExitCode::FAILURE;
         }
     };
+    // ORDER IS LOAD-BEARING — do not move this above the vault unlock
+    // (review NIT-1). `Command::Fail` carries empty `PathBuf`s rather than
+    // profile paths precisely so a leaked `Fail` could open nothing; that
+    // guard holds here only because `Vault::unlock_with_key("")` fails
+    // loudly first. `AppConfig::load` on a missing path returns
+    // `Ok(AppConfig::default())` — a SILENT success — so a reordering that
+    // put the config load first would start building a server from an
+    // empty config before anything complained.
     let config = match AppConfig::load(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -326,6 +430,13 @@ async fn main() -> ExitCode {
         Command::Help => {
             print_usage();
             ExitCode::SUCCESS
+        }
+        // Same text, opposite verdict: usage the operator did NOT ask for
+        // means their argv was wrong, and an MCP client that reads exit
+        // codes must be told so (review MINOR-2).
+        Command::Usage => {
+            print_usage();
+            ExitCode::FAILURE
         }
         Command::Setup { remove } => run_setup(&args.vault, remove),
         Command::Serve => run_serve(&args.config, &args.vault).await,
@@ -426,8 +537,10 @@ mod parse_args_tests {
 
     #[test]
     fn an_unrecognized_argument_still_prints_usage() {
+        // Review MINOR-2: still usage, but `Usage` rather than `Help` —
+        // `main` maps the two to opposite exit codes.
         let a = parse_args_from(&raw(&["--nonsense"]), profile());
-        assert!(matches!(a.command, Command::Help));
+        assert!(matches!(a.command, Command::Usage));
     }
 
     #[test]
@@ -441,5 +554,89 @@ mod parse_args_tests {
         assert!(m.contains("--config"), "tells the operator the override exists");
         let m = workspace_broken_message(&None, "ukazatel je poškozený");
         assert!(m.contains("ukazatel je poškozený"));
+    }
+
+    /// Review MINOR-1. The byte pin plus the assertion the old test was
+    /// missing: the `None` branch's OWN subject must reach the composed
+    /// message, so `None => String::new()` can no longer pass.
+    #[test]
+    fn the_unreadable_pointer_subject_is_byte_pinned_and_actually_composed_in() {
+        assert_eq!(WORKSPACE_MISSING_NO_PATH, "ukazatel na pracovní prostor je nečitelný");
+        let m = workspace_broken_message(&None, "ukazatel je poškozený");
+        assert!(
+            m.contains(WORKSPACE_MISSING_NO_PATH),
+            "the None branch must name the pointer itself, not just echo the reason: {m}"
+        );
+        // …and it is the SUBJECT, not something the reason happened to
+        // supply: a reason that says nothing still leaves it standing.
+        let m = workspace_broken_message(&None, "");
+        assert!(m.contains(WORKSPACE_MISSING_NO_PATH), "{m}");
+    }
+
+    /// Review MINOR-3: `toml::de::Error`'s multi-line `Display` used to
+    /// render as eight stderr lines ending in an orphaned `)`.
+    #[test]
+    fn a_multi_line_reason_keeps_its_position_and_explanation_and_drops_the_art() {
+        // Verbatim shape of a real `toml` parse error.
+        let reason = "TOML parse error at line 1, column 12\n  \
+                      |\n1 | path = \"D:\\ws-gone\"\n  |            ^\n\
+                      missing escaped value, expected `b`";
+        let m = workspace_broken_message(&None, reason);
+        assert_eq!(m.lines().count(), 2, "diagnosis + escape hatch, nothing else: {m}");
+        assert!(m.contains("TOML parse error at line 1, column 12"), "keeps WHERE: {m}");
+        assert!(m.contains("missing escaped value, expected `b`"), "keeps WHAT: {m}");
+        assert!(!m.contains("path = "), "drops toml's source echo: {m}");
+        assert!(!m.contains('^'), "drops the ascii art: {m}");
+    }
+
+    #[test]
+    fn a_single_line_reason_is_passed_through_untouched() {
+        let m = workspace_broken_message(&Some(PathBuf::from("D:\\ws-gone")), "složka neexistuje");
+        assert_eq!(m.lines().count(), 2);
+        assert!(m.contains("(složka neexistuje)"), "{m}");
+    }
+
+    /// Review MINOR-2, the reviewer's exact scenario: a typo'd `--config`
+    /// leaves config NOT explicit, so the broken pointer's default is
+    /// precisely what would have been used. The operator must hear about
+    /// the workspace, not only about the typo.
+    #[test]
+    fn a_typod_flag_cannot_mask_a_broken_pointer() {
+        let a = parse_args_from(&raw(&["--confg", "C:\\ws\\config.toml"]), broken());
+        let Command::Fail(msg) = a.command else { panic!("a typo must not swallow the diagnosis") };
+        assert!(msg.contains("D:\\ws-gone"), "{msg}");
+        // Explicit `--help` is the ONE thing that still exempts…
+        let a = parse_args_from(&raw(&["--help"]), broken());
+        assert!(matches!(a.command, Command::Help));
+        // …and it stops exempting the moment the argv is also wrong.
+        let a = parse_args_from(&raw(&["--help", "--confg", "x"]), broken());
+        assert!(matches!(a.command, Command::Fail(_)));
+        // A bad argv with a healthy pointer is a plain Usage (non-zero).
+        let a = parse_args_from(&raw(&["--help", "--nonsense"]), profile());
+        assert!(matches!(a.command, Command::Usage));
+    }
+
+    /// §W7's scope rule survives the MINOR-2 widening: overriding both
+    /// paths means no default is needed, so a bad argv stays a `Usage` and
+    /// does not get upgraded into a workspace failure it does not have.
+    #[test]
+    fn a_bad_argv_that_overrides_everything_is_still_only_a_usage_error() {
+        let a = parse_args_from(
+            &raw(&["--config", "C:\\x.toml", "--vault", "C:\\x.bin", "--bogus"]),
+            broken(),
+        );
+        assert!(matches!(a.command, Command::Usage));
+        assert_eq!(a.config, PathBuf::from("C:\\x.toml"));
+        assert_eq!(a.vault, PathBuf::from("C:\\x.bin"));
+    }
+
+    /// A missing flag VALUE is an argv error too — it used to share the
+    /// `Help` arm and therefore the exit-0 / exemption bug.
+    #[test]
+    fn a_flag_without_its_value_is_an_argv_error_not_a_help_request() {
+        let a = parse_args_from(&raw(&["--config"]), profile());
+        assert!(matches!(a.command, Command::Usage));
+        let a = parse_args_from(&raw(&["--vault"]), broken());
+        assert!(matches!(a.command, Command::Fail(_)));
     }
 }
