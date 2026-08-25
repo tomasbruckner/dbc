@@ -1367,6 +1367,29 @@ pub enum ModalState {
         /// closes the modal instead.
         error: Option<String>,
     },
+    /// Design §W3.2/§W3.3/§W3.4: the ONE confirm gate in front of a context
+    /// change. `root` is the picked folder (`None` only for `ToProfile`).
+    /// `running` holds the modal mutated in place for the duration of the
+    /// background init/pointer write — the `AnalyzeWriteConfirm`/
+    /// `BackupRestore` posture, so the app-wide `self.modal.is_some()`
+    /// busy-guards keep holding and Esc cannot abandon a half-done init.
+    /// Enter is INERT (`modal_confirm_kind`): the button is the gate.
+    WorkspaceConfirm {
+        /// Which of the three context changes this confirms (§W3).
+        mode: WorkspaceConfirmMode,
+        /// The picked folder, shown verbatim so the user confirms against
+        /// the path they actually chose. `None` ONLY for
+        /// [`WorkspaceConfirmMode::ToProfile`], which targets no folder.
+        root: Option<std::path::PathBuf>,
+        /// A FAILED confirm's message, shown in place — the modal stays
+        /// open so the user can read it against the path above and retry
+        /// or cancel. The PREVIOUS context is still fully live behind it.
+        error: Option<String>,
+        /// The init/pointer write is in flight. Double-clicking the button
+        /// is a no-op and Esc is refused while this holds
+        /// (`workspace_confirm_esc_closable`).
+        running: bool,
+    },
 }
 
 /// UX-polish §1.2: what Enter does per open modal — THE policy table as
@@ -1415,7 +1438,11 @@ pub(crate) fn modal_confirm_kind(modal: &ModalState) -> ModalConfirmKind {
         // §W4: no Enter shortcut past a wrong-context guard. Each of the
         // three choices (re-pick / explicit profile / quit) must be a
         // deliberate click.
-        | ModalState::WorkspaceMissing { .. } => ModalConfirmKind::Ignore,
+        | ModalState::WorkspaceMissing { .. }
+        // §W3.2: the LAST gate before an init writes into a folder / a
+        // pointer replaces the whole working context. Same posture as
+        // ScriptRun — the button is the gate, for all three modes.
+        | ModalState::WorkspaceConfirm { .. } => ModalConfirmKind::Ignore,
     }
 }
 
@@ -1450,6 +1477,11 @@ pub(crate) fn modal_is_blocking(modal: &ModalState) -> bool {
         | ModalState::AnalyzeWriteConfirm { .. }
         | ModalState::BackupRestore(_)
         | ModalState::ScriptRun { .. }
+        // §W3.2: a live context is still fully behind this one, so Esc is
+        // allowed — but `workspace_confirm_esc_closable` refuses while the
+        // write is running, which is the narrower per-variant question
+        // this predicate deliberately does not answer.
+        | ModalState::WorkspaceConfirm { .. }
         | ModalState::CsvImport { .. } => false,
     }
 }
@@ -1691,6 +1723,9 @@ impl AppView {
                 let focus = self.workspace_choice_focus.clone();
                 render_workspace_missing_panel(&root, &reason, &error, &panel_focus, &focus, cx)
             }
+            ModalState::WorkspaceConfirm { mode, root, error, running } => {
+                render_workspace_confirm_panel(mode, &root, &error, running, cx)
+            }
         };
         Some(
             div()
@@ -1746,7 +1781,11 @@ impl AppView {
                 .child(label)
                 .on_click(cx.listener(move |this, _, _, cx| this.set_theme(m, cx)))
         };
-        div()
+        // T5: the „Pracovní prostor" block below needs a CONDITIONAL child
+        // (two different shapes per mode), which a single `div().child(..)`
+        // chain cannot express — hence the rebindable local. Split exactly
+        // at the theme radios; nothing above changed.
+        let mut panel = div()
             .id("settings-panel")
             .w(px(360.))
             .bg(cx.theme().bg_panel)
@@ -1761,7 +1800,49 @@ impl AppView {
             .child(div().text_size(px(16.)).child("Nastavení"))
             .child(div().text_color(cx.theme().text_muted).child("Motiv"))
             .child(radio("settings-theme-dark", "Tmavý", dbc_state::ThemeMode::Dark, mode, cx))
-            .child(radio("settings-theme-light", "Světlý", dbc_state::ThemeMode::Light, mode, cx))
+            .child(radio("settings-theme-light", "Světlý", dbc_state::ThemeMode::Light, mode, cx));
+
+        // Design §W3 — the „Pracovní prostor" block. Task 7 puts „Složka
+        // skriptů" BELOW this one (it is subsumed in workspace mode, §W8).
+        let ws_root = self.workspace_root.clone();
+        panel = panel
+            .child(div().mt_2().text_color(cx.theme().text_muted).child(WORKSPACE_SETTINGS_HEADING))
+            .child(div().child(workspace_settings_mode_line(ws_root.as_deref())));
+        panel = match &ws_root {
+            // Workspace mode (§W3): NO folder picker here — creating a
+            // second workspace from inside one is not a flow this design
+            // has (§W3.2 copies from the PROFILE); the way out is the
+            // profile and back.
+            Some(_) => panel.child(
+                div()
+                    .id("settings-workspace-leave")
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(cx.theme().bg_hover)
+                    .cursor_pointer()
+                    .child(WORKSPACE_SETTINGS_LEAVE)
+                    .on_click(cx.listener(|this, _, _, cx| this.start_leave_workspace(cx))),
+            ),
+            None => panel
+                .child(
+                    div()
+                        .id("settings-workspace-pick")
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(cx.theme().bg_hover)
+                        .cursor_pointer()
+                        .child(WORKSPACE_SETTINGS_PICK)
+                        .on_click(cx.listener(|this, _, _, cx| this.start_workspace_pick(cx))),
+                )
+                // §W6.3(b): the warning renders STATICALLY wherever the
+                // folder-pick flow is offered — not only inside the confirm
+                // modal, so it is on screen BEFORE the picker opens.
+                .child(div().text_color(cx.theme().text_muted).child(WORKSPACE_GIT_WARNING)),
+        };
+
+        panel
             .child(
                 div()
                     .id("settings-close")
@@ -3899,6 +3980,294 @@ fn render_workspace_missing_panel(
         .into_any_element()
 }
 
+// ---------------------------------------------------------------------
+// Workspace T5 — the Settings „Pracovní prostor" block, its confirm modal
+// and the pure decisions behind both (design §W3, §W6.3).
+// ---------------------------------------------------------------------
+
+/// Design §W6.3 — the honest in-app warning, shown inside the init/adopt
+/// confirm modals AND statically in the Settings „Pracovní prostor" block
+/// while the folder-pick flow is offered. Once per decision point, never on
+/// startup: the user made this call knowingly (they chose „Šifrovaný trezor
+/// do složky" over the never-version-secrets recommendation), so the
+/// warning exists to keep the call INFORMED, not to relitigate it.
+///
+/// §W6.4 is why it is prose and not a recipe: this string is rendered,
+/// never executed, and the app owns no git integration to offer.
+pub(crate) const WORKSPACE_GIT_WARNING: &str = "Upozornění: složku verzujete sami — git zůstává zcela mimo aplikaci. \
+Historie gitu je trvalá: jednou commitnutý trezor (vault.bin) z ní nelze \
+nikdy spolehlivě odstranit. Bezpečnost celé složky se pak rovná síle vašeho \
+master hesla. Repozitář držte privátní, nebo vault.bin vyřaďte z verzování \
+(.gitignore ve složce má připravený zakomentovaný řádek).";
+
+/// §W3 case 3 — the refusal for a folder with real content and no marker.
+///
+/// The second half is a T4-review follow-up this task owns: an init that
+/// crashed or failed part-way leaves exactly this shape (files copied,
+/// marker not written — `dbc_state::workspace::init_contents` is separated
+/// from `write_marker` for precisely that reason), and the classify-driven
+/// flow then refuses it for BOTH init (it is not `Empty`) and adopt (it has
+/// no marker). Without naming that cause the message reads „you picked the
+/// wrong folder", and the user never discovers that emptying the folder is
+/// the way out. The app deliberately does NOT delete anything itself — the
+/// never-destructive rail holds even for files the app created.
+pub(crate) const WORKSPACE_PICK_NONEMPTY: &str = "složka není pracovní prostor dbc a není prázdná — vyberte prázdnou složku \
+nebo existující pracovní prostor; pokud v této složce dříve selhalo nebo bylo \
+přerušeno vytváření prostoru, zůstaly v ní nedokončené soubory aplikace — \
+smažte obsah složky a zkuste to znovu";
+
+/// Settings block heading (§W3).
+pub(crate) const WORKSPACE_SETTINGS_HEADING: &str = "Pracovní prostor";
+/// Profile-mode button: opens the folder picker (§W3).
+pub(crate) const WORKSPACE_SETTINGS_PICK: &str = "Použít složku…";
+/// Workspace-mode button: the reverse switch (§W3.4).
+pub(crate) const WORKSPACE_SETTINGS_LEAVE: &str = "Přejít na lokální profil";
+
+/// The Settings block's mode line. `None` ⇒ profile mode, and the profile
+/// directory is named so „Lokální profil" is not an abstraction — it is a
+/// path the user can open. Pure so the copy is byte-pinned.
+pub(crate) fn workspace_settings_mode_line(root: Option<&std::path::Path>) -> String {
+    match root {
+        Some(r) => format!("Pracovní prostor: {}", r.display()),
+        None => format!("Lokální profil ({})", dbc_state::workspace::profile_dir().display()),
+    }
+}
+
+/// Which context change a [`ModalState::WorkspaceConfirm`] is confirming.
+/// ONE modal for all three (design §W3.2/§W3.3/§W3.4) so the gates, the
+/// „Aktivní připojení bude odpojeno." line and the Enter-inert policy are
+/// written exactly once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceConfirmMode {
+    /// Empty folder ⇒ copy + `scripts/` + `.gitignore` + marker (§W3.2).
+    Init,
+    /// Marker present ⇒ pointer only, no files written (§W3.3).
+    Adopt,
+    /// „Přejít na lokální profil" ⇒ delete the pointer, touch nothing in
+    /// the folder (§W3.4's reverse switch).
+    ToProfile,
+}
+
+/// Confirm-modal title per mode (§W3.2/§W3.3/§W3.4).
+pub(crate) fn workspace_confirm_title(mode: WorkspaceConfirmMode) -> &'static str {
+    match mode {
+        WorkspaceConfirmMode::Init => "Vytvořit pracovní prostor",
+        WorkspaceConfirmMode::Adopt => "Otevřít pracovní prostor",
+        WorkspaceConfirmMode::ToProfile => "Přejít na lokální profil",
+    }
+}
+
+/// Confirm-button label per mode. „Rozumím, vytvořit" is the only one that
+/// acknowledges something, because init is the only mode that WRITES into
+/// a folder the app did not previously own (§W3.2).
+pub(crate) fn workspace_confirm_button(mode: WorkspaceConfirmMode) -> &'static str {
+    match mode {
+        WorkspaceConfirmMode::Init => "Rozumím, vytvořit",
+        WorkspaceConfirmMode::Adopt => "Otevřít",
+        WorkspaceConfirmMode::ToProfile => "Přejít",
+    }
+}
+
+/// The body lines of the confirm modal, in render order — pure, so the
+/// deliverable copy is testable without GPUI.
+pub(crate) fn workspace_confirm_lines(mode: WorkspaceConfirmMode) -> Vec<&'static str> {
+    let mut lines = vec!["Aktivní připojení bude odpojeno."];
+    match mode {
+        WorkspaceConfirmMode::Init => {
+            lines.push("Nastavení, připojení a trezor se do složky ZKOPÍRUJÍ; původní soubory zůstanou beze změny.");
+            lines.push(WORKSPACE_GIT_WARNING);
+        }
+        WorkspaceConfirmMode::Adopt => {
+            lines.push("Trezor tohoto prostoru se odemyká jeho vlastním master heslem.");
+            lines.push(WORKSPACE_GIT_WARNING);
+        }
+        WorkspaceConfirmMode::ToProfile => {
+            lines.push("Soubory v pracovním prostoru zůstanou beze změny.");
+        }
+    }
+    lines
+}
+
+/// Design §W3's folder classification, mapped to a decision. Pure over
+/// `Classification` so all five outcomes are tested without a filesystem.
+///
+/// `Classification` is already a machine-readable discriminant, which is
+/// why this function never inspects prose: the T4 review's note about
+/// `Resolution::Broken` carrying only a Czech `reason` does not bite here —
+/// the pick flow classifies a folder, it does not re-read a failed
+/// resolution.
+pub(crate) fn workspace_pick_outcome(
+    c: dbc_state::workspace::Classification,
+) -> Result<WorkspaceConfirmMode, String> {
+    use dbc_state::workspace::Classification as C;
+    match c {
+        C::Workspace => Ok(WorkspaceConfirmMode::Adopt),
+        C::Empty => Ok(WorkspaceConfirmMode::Init),
+        // Never scatter app files into someone's Documents folder by
+        // misclick; never adopt a folder we cannot vouch for (§W3 case 3).
+        C::NonEmpty => Err(WORKSPACE_PICK_NONEMPTY.to_string()),
+        C::FutureFormat(f) => {
+            Err(format!("pracovní prostor vyžaduje novější verzi aplikace (formát {f})"))
+        }
+        C::Unreadable(m) => Err(m),
+    }
+}
+
+/// May Esc close a `WorkspaceConfirm`? (§W3.2.) Nothing is dispatched until
+/// the button is clicked and nothing secret is typed here, so a PENDING
+/// confirm closes freely — but never mid-init, the same reasoning as
+/// `BackupRestore`'s `!session.is_running()`: Esc must not abandon a
+/// half-written folder and leave the modal's `running` guard behind it.
+/// Pure, on the `pwchange::esc_closable` precedent, because
+/// `AppView::on_cancel_query` takes a `Window` no test can build.
+pub(crate) fn workspace_confirm_esc_closable(running: bool) -> bool {
+    !running
+}
+
+/// Does the currently open modal block a context switch (§W3.1's „no modal
+/// open beyond Settings" gate)?
+///
+/// Two modals do NOT block, because they ARE the switch flow: `Settings` is
+/// where „Použít složku…" / „Přejít na lokální profil" are clicked, and
+/// `WorkspaceConfirm` is the confirm itself — `AppView::confirm_workspace`
+/// deliberately RE-RUNS the whole gate at click time (the pick and the
+/// folder classification did not block the app, so a query or a dialog may
+/// have started meanwhile), and it does so with its own modal on screen.
+///
+/// Everything else blocks, spelled out variant by variant so a NEW
+/// `ModalState` is a compile error here and must consciously pick a side —
+/// the `modal_confirm_kind` / `modal_is_blocking` convention.
+pub(crate) fn modal_blocks_context_switch(modal: Option<&ModalState>) -> bool {
+    match modal {
+        None | Some(ModalState::Settings) | Some(ModalState::WorkspaceConfirm { .. }) => false,
+        Some(ModalState::ConnectionDialog(_))
+        | Some(ModalState::MasterPasswordPrompt { .. })
+        | Some(ModalState::CreateMasterPassword { .. })
+        | Some(ModalState::QueryParams { .. })
+        | Some(ModalState::CompareDialog { .. })
+        | Some(ModalState::ChartPicker { .. })
+        | Some(ModalState::ChangeServerPassword { .. })
+        | Some(ModalState::KillConfirm { .. })
+        | Some(ModalState::AnalyzeWriteConfirm { .. })
+        | Some(ModalState::BackupRestore(_))
+        | Some(ModalState::ScriptRun { .. })
+        | Some(ModalState::CsvImport { .. })
+        | Some(ModalState::WorkspaceMissing { .. }) => true,
+    }
+}
+
+/// Design §W3.1's gate, as a pure decision. `AppView::context_switch_blocked`
+/// is THE gate — it reads the live state and delegates here — so this
+/// function is not a second predicate but the testable core of the only
+/// one. Returns the Czech refusal, or `None` to proceed.
+///
+/// The ORDER is deliberate and pinned: a running query is reported first
+/// because it is the one condition holding a live resource the user can
+/// end immediately; a half-finished edit next; a stray dialog last.
+///
+/// EXTENSION POINT: Task 8 adds a `dirty_script` parameter here (Part S
+/// §5.5's guard) once `AppView::script_binding` exists.
+pub(crate) fn context_switch_refusal(
+    run_in_flight: bool,
+    pending_edits: bool,
+    other_modal_open: bool,
+) -> Option<&'static str> {
+    if run_in_flight {
+        return Some("nejprve dokončete běžící dotaz");
+    }
+    if pending_edits {
+        return Some("nejprve dokončete rozpracované úpravy");
+    }
+    if other_modal_open {
+        return Some("nejprve zavřete otevřený dialog");
+    }
+    None
+}
+
+/// Design §W3.2/§W3.3/§W3.4 — the ONE confirm panel in front of a context
+/// change. Title, the picked path (verbatim), the mode's body lines
+/// (including the §W6.3 warning on the two folder-facing modes), an
+/// in-place error, then the two buttons.
+///
+/// Enter is INERT here (`modal_confirm_kind` ⇒ `Ignore`) and the panel
+/// carries no `WorkspaceChoice` key context: unlike the blocking §W4 modal,
+/// this one sits over a fully live app the user can simply leave with Esc
+/// or „Zrušit", so there is nothing a keyboard-only user is trapped by.
+///
+/// Decided, not overlooked: „Zrušit" closes the modal outright rather than
+/// returning to „Nastavení". The single-modal invariant means this confirm
+/// REPLACED the settings panel, and re-opening Settings is one click on the
+/// topbar gear — a modal stack is not a shape this app has anywhere.
+fn render_workspace_confirm_panel(
+    mode: WorkspaceConfirmMode,
+    root: &Option<std::path::PathBuf>,
+    error: &Option<String>,
+    running: bool,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let mut panel = div()
+        .id("workspace-confirm-panel")
+        .w(px(460.))
+        .bg(cx.theme().bg_panel)
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(cx.theme().text_primary)
+        .child(div().text_size(px(16.)).child(workspace_confirm_title(mode)));
+    if let Some(r) = root {
+        panel = panel.child(div().text_color(cx.theme().text_muted).child(r.display().to_string()));
+    }
+    for line in workspace_confirm_lines(mode) {
+        panel = panel.child(div().text_color(cx.theme().text_muted).child(line));
+    }
+    if let Some(e) = error {
+        panel = panel.child(div().text_color(cx.theme().danger).child(format!("error: {e}")));
+    }
+    // `running` is visible, not just enforced: the button says so and goes
+    // inert (`confirm_workspace` returns early), so a second click during a
+    // slow network-share init cannot start a second one.
+    let confirm_bg = if running { cx.theme().bg_selected } else { cx.theme().bg_hover };
+    panel
+        .child(
+            div()
+                .id("workspace-confirm-ok")
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .bg(confirm_bg)
+                .cursor_pointer()
+                .child(if running { "Pracuji…" } else { workspace_confirm_button(mode) })
+                .on_click(cx.listener(|this, _, _, cx| this.confirm_workspace(cx))),
+        )
+        .child(
+            // „Zrušit" is inert while `running`, exactly as Esc is
+            // (`workspace_confirm_esc_closable`). DEVIATION FROM THE PLAN
+            // TEXT, recorded: the plan wired this button straight to
+            // `close_modal`, which would have let a click abandon the modal
+            // mid-init — and the background job's success arm then calls
+            // `apply_context` regardless, i.e. the context would change
+            // AFTER the user asked to cancel. „Never a silent context
+            // change" makes that a defect, not a nit. Cancelling the
+            // WRITE itself is not offered because it cannot be honoured:
+            // the copy is already under way and nothing is ever deleted.
+            div()
+                .id("workspace-confirm-cancel")
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .bg(cx.theme().bg_hover)
+                .when(!running, |d| d.cursor_pointer())
+                .when(running, |d| d.text_color(cx.theme().text_muted))
+                .child("Zrušit")
+                .on_click(cx.listener(|this, _, _, cx| this.cancel_workspace_confirm(cx))),
+        )
+        .into_any_element()
+}
+
 /// Does this keystroke activate the button that currently HAS focus?
 /// (T4 review NIT-11.) Enter or Space with no modifier held — the platform
 /// convention for "press the focused button". Pure, so the §W4 keyboard
@@ -4896,7 +5265,7 @@ mod modal_confirm_kind_tests {
     // the manual visual checklist. Every other variant — including EVERY
     // §3-novela Ignore arm — is asserted here.
 
-    fn query_params() -> ModalState {
+    pub(super) fn query_params() -> ModalState {
         ModalState::QueryParams {
             names: Vec::new(),
             inputs: Vec::new(),
@@ -4907,7 +5276,7 @@ mod modal_confirm_kind_tests {
         }
     }
 
-    fn kill_confirm() -> ModalState {
+    pub(super) fn kill_confirm() -> ModalState {
         ModalState::KillConfirm {
             pid: 1,
             label: "u · app · běží 1s".into(),
@@ -4918,7 +5287,7 @@ mod modal_confirm_kind_tests {
         }
     }
 
-    fn analyze_write() -> ModalState {
+    pub(super) fn analyze_write() -> ModalState {
         ModalState::AnalyzeWriteConfirm {
             sql: "UPDATE t SET a = 1".into(),
             engine: Engine::Postgres,
@@ -4927,7 +5296,7 @@ mod modal_confirm_kind_tests {
         }
     }
 
-    fn backup_restore(status: backup::BackupStatus) -> ModalState {
+    pub(super) fn backup_restore(status: backup::BackupStatus) -> ModalState {
         ModalState::BackupRestore(backup::BackupSession {
             kind: backup::BackupKind::Backup,
             engine: Engine::Postgres,
@@ -4945,7 +5314,7 @@ mod modal_confirm_kind_tests {
         })
     }
 
-    fn script_run() -> ModalState {
+    pub(super) fn script_run() -> ModalState {
         ModalState::ScriptRun {
             files: Vec::new(),
             file_counts: Vec::new(),
@@ -4959,7 +5328,7 @@ mod modal_confirm_kind_tests {
         }
     }
 
-    fn csv_import() -> ModalState {
+    pub(super) fn csv_import() -> ModalState {
         ModalState::CsvImport {
             path: std::path::PathBuf::new(),
             schema: None,
@@ -4976,7 +5345,7 @@ mod modal_confirm_kind_tests {
         }
     }
 
-    fn chart_picker() -> ModalState {
+    pub(super) fn chart_picker() -> ModalState {
         let schema = std::sync::Arc::new(dbc_core::arrow::datatypes::Schema::empty());
         ModalState::ChartPicker {
             source_title: String::new(),
@@ -5224,6 +5593,299 @@ mod workspace_missing_text_tests {
                 assert_ne!(a, b);
             }
         }
+    }
+}
+
+/// Workspace T5 — the deliverable copy and the pure decision functions of
+/// the Settings „Pracovní prostor" block. Everything here is pure: no
+/// GPUI, no filesystem, no window.
+#[cfg(test)]
+mod workspace_confirm_tests {
+    use super::modal_confirm_kind_tests::{
+        analyze_write, backup_restore, chart_picker, csv_import, kill_confirm, query_params,
+        script_run,
+    };
+    use super::*;
+
+    /// Deliverable copy (design §W6.3): the honest warning, byte for byte.
+    /// It names the permanence of git history, the vault file by name, the
+    /// master-password dependency, and BOTH mitigations. If a future edit
+    /// softens any of those four, this test is the thing that must be
+    /// argued with.
+    #[test]
+    fn workspace_git_warning_is_byte_pinned() {
+        assert_eq!(
+            WORKSPACE_GIT_WARNING,
+            "Upozornění: složku verzujete sami — git zůstává zcela mimo aplikaci. \
+             Historie gitu je trvalá: jednou commitnutý trezor (vault.bin) z ní nelze \
+             nikdy spolehlivě odstranit. Bezpečnost celé složky se pak rovná síle vašeho \
+             master hesla. Repozitář držte privátní, nebo vault.bin vyřaďte z verzování \
+             (.gitignore ve složce má připravený zakomentovaný řádek)."
+        );
+    }
+
+    /// Security rail (§W6.5) + the permanent no-git rail (§W6.4): this
+    /// string is shown, never executed, and must never grow a recipe.
+    ///
+    /// DEVIATION FROM THE PLAN TEXT, recorded: the plan banned the
+    /// substring `"git "`, which the byte-pinned warning above necessarily
+    /// contains („git zůstává zcela mimo aplikaci") — the two assertions as
+    /// written could not both hold. The INTENT is that the warning carries
+    /// no git COMMAND, no URL and no credential, so the ban is on actual
+    /// git subcommands. The word „git" itself must stay: the warning is
+    /// about git.
+    #[test]
+    fn the_warning_carries_no_secret_and_no_git_command() {
+        for banned in [
+            "git add",
+            "git commit",
+            "git push",
+            "git init",
+            "git clone",
+            "git rm",
+            "git filter",
+            "http",
+            "password=",
+            "heslo:",
+        ] {
+            assert!(!WORKSPACE_GIT_WARNING.contains(banned), "warning must not contain {banned:?}");
+        }
+        assert!(WORKSPACE_GIT_WARNING.contains("git"), "the warning is ABOUT git");
+    }
+
+    #[test]
+    fn workspace_confirm_titles_and_buttons_are_the_designed_copy() {
+        assert_eq!(workspace_confirm_title(WorkspaceConfirmMode::Init), "Vytvořit pracovní prostor");
+        assert_eq!(workspace_confirm_title(WorkspaceConfirmMode::Adopt), "Otevřít pracovní prostor");
+        assert_eq!(
+            workspace_confirm_title(WorkspaceConfirmMode::ToProfile),
+            "Přejít na lokální profil"
+        );
+        assert_eq!(workspace_confirm_button(WorkspaceConfirmMode::Init), "Rozumím, vytvořit");
+        assert_eq!(workspace_confirm_button(WorkspaceConfirmMode::Adopt), "Otevřít");
+        assert_eq!(workspace_confirm_button(WorkspaceConfirmMode::ToProfile), "Přejít");
+    }
+
+    #[test]
+    fn every_workspace_confirm_mode_warns_about_the_disconnect() {
+        for mode in [
+            WorkspaceConfirmMode::Init,
+            WorkspaceConfirmMode::Adopt,
+            WorkspaceConfirmMode::ToProfile,
+        ] {
+            assert!(workspace_confirm_lines(mode)
+                .iter()
+                .any(|l| *l == "Aktivní připojení bude odpojeno."));
+        }
+        // §W3.3: adopt additionally explains the foreign vault.
+        assert!(workspace_confirm_lines(WorkspaceConfirmMode::Adopt)
+            .iter()
+            .any(|l| *l == "Trezor tohoto prostoru se odemyká jeho vlastním master heslem."));
+        // §W6.3: the git warning renders on the two folder-facing modes;
+        // going back to the profile writes nothing into any folder.
+        assert!(workspace_confirm_lines(WorkspaceConfirmMode::Init)
+            .iter()
+            .any(|l| *l == WORKSPACE_GIT_WARNING));
+        assert!(workspace_confirm_lines(WorkspaceConfirmMode::Adopt)
+            .iter()
+            .any(|l| *l == WORKSPACE_GIT_WARNING));
+        assert!(!workspace_confirm_lines(WorkspaceConfirmMode::ToProfile)
+            .iter()
+            .any(|l| *l == WORKSPACE_GIT_WARNING));
+    }
+
+    /// §W3.2's never-destructive promise and §W3.4's "the folder is not
+    /// touched" promise, each stated to the user BEFORE the write.
+    #[test]
+    fn init_promises_a_copy_and_to_profile_promises_no_folder_write() {
+        assert!(workspace_confirm_lines(WorkspaceConfirmMode::Init).iter().any(|l| *l
+            == "Nastavení, připojení a trezor se do složky ZKOPÍRUJÍ; původní soubory zůstanou beze změny."));
+        assert!(workspace_confirm_lines(WorkspaceConfirmMode::ToProfile)
+            .iter()
+            .any(|l| *l == "Soubory v pracovním prostoru zůstanou beze změny."));
+    }
+
+    #[test]
+    fn enter_is_inert_on_every_new_workspace_modal() {
+        // §W3.2/§W4: the BUTTON is the gate — a deliberate,
+        // security-relevant decision, same posture as ScriptRun.
+        assert_eq!(
+            modal_confirm_kind(&ModalState::WorkspaceMissing {
+                root: None,
+                reason: String::new(),
+                error: None,
+            }),
+            ModalConfirmKind::Ignore
+        );
+        for mode in [
+            WorkspaceConfirmMode::Init,
+            WorkspaceConfirmMode::Adopt,
+            WorkspaceConfirmMode::ToProfile,
+        ] {
+            assert_eq!(
+                modal_confirm_kind(&ModalState::WorkspaceConfirm {
+                    mode,
+                    root: Some(std::path::PathBuf::from("D:\\ws")),
+                    error: None,
+                    running: false,
+                }),
+                ModalConfirmKind::Ignore
+            );
+        }
+    }
+
+    /// §W3.2: the confirm modal is NOT blocking in the §W4 sense (there is
+    /// a live context behind it), so Esc may cancel it — but only while
+    /// nothing has been dispatched. See `workspace_confirm_esc_closable`.
+    #[test]
+    fn the_confirm_modal_is_not_a_blocking_modal() {
+        assert!(!modal_is_blocking(&ModalState::WorkspaceConfirm {
+            mode: WorkspaceConfirmMode::Init,
+            root: Some(std::path::PathBuf::from("D:\\ws")),
+            error: None,
+            running: false,
+        }));
+    }
+
+    /// §W3.2: Esc cancels a confirm that has dispatched NOTHING, and is
+    /// refused once the init/pointer write is in flight — the
+    /// `BackupRestore { !session.is_running() }` posture. Pure, because
+    /// `AppView::on_cancel_query` needs a `Window` no test can build.
+    #[test]
+    fn esc_closes_a_pending_confirm_but_never_a_running_one() {
+        assert!(workspace_confirm_esc_closable(false));
+        assert!(!workspace_confirm_esc_closable(true));
+    }
+
+    #[test]
+    fn a_picked_folder_is_classified_into_exactly_one_outcome() {
+        use dbc_state::workspace::Classification;
+        assert_eq!(
+            workspace_pick_outcome(Classification::Workspace),
+            Ok(WorkspaceConfirmMode::Adopt)
+        );
+        assert_eq!(workspace_pick_outcome(Classification::Empty), Ok(WorkspaceConfirmMode::Init));
+        assert_eq!(
+            workspace_pick_outcome(Classification::NonEmpty),
+            Err(WORKSPACE_PICK_NONEMPTY.to_string())
+        );
+        assert_eq!(
+            workspace_pick_outcome(Classification::FutureFormat(7)),
+            Err("pracovní prostor vyžaduje novější verzi aplikace (formát 7)".to_string())
+        );
+        assert_eq!(
+            workspace_pick_outcome(Classification::Unreadable("přístup odepřen".into())),
+            Err("přístup odepřen".to_string())
+        );
+    }
+
+    /// T4-review follow-up that T5 owns: the CRASH-MID-INIT dead end. An
+    /// interrupted init leaves the folder `NonEmpty`, which the
+    /// classify-driven flow refuses for BOTH init (not `Empty`) and adopt
+    /// (no marker), so the user must empty it by hand. The refusal has to
+    /// say that the APP may have put those files there — otherwise the
+    /// only honest reading of „není prázdná" is „you picked the wrong
+    /// folder", and the user never tries the one thing that works.
+    #[test]
+    fn the_non_empty_refusal_names_the_interrupted_init_it_may_have_caused() {
+        assert_eq!(
+            WORKSPACE_PICK_NONEMPTY,
+            "složka není pracovní prostor dbc a není prázdná — vyberte prázdnou složku \
+             nebo existující pracovní prostor; pokud v této složce dříve selhalo nebo bylo \
+             přerušeno vytváření prostoru, zůstaly v ní nedokončené soubory aplikace — \
+             smažte obsah složky a zkuste to znovu"
+        );
+        // The two halves that must survive any future rewording.
+        assert!(WORKSPACE_PICK_NONEMPTY.contains("vyberte prázdnou složku"));
+        assert!(WORKSPACE_PICK_NONEMPTY.contains("přerušeno vytváření prostoru"));
+        // A refusal, not a recipe: the app never deletes for the user, and
+        // never grows a git instruction (§W6.4) — the folder is emptied by
+        // the user, with whatever tool they like.
+        for banned in ["git ", "del ", "rmdir", "Remove-Item"] {
+            assert!(!WORKSPACE_PICK_NONEMPTY.contains(banned), "must not contain {banned:?}");
+        }
+    }
+
+    /// §W3.1's gate as a pure truth table. `AppView::context_switch_blocked`
+    /// is the ONE gate — it gathers the live state and delegates here, so
+    /// the PRECEDENCE (a running query is reported before a stale dialog)
+    /// is pinned without a GPUI window. Task 8 adds the dirty-script arm to
+    /// BOTH halves; it does not write a second gate.
+    #[test]
+    fn context_switch_refusal_is_ordered_and_lets_a_quiet_app_through() {
+        assert_eq!(context_switch_refusal(false, false, false), None);
+        assert_eq!(
+            context_switch_refusal(true, false, false),
+            Some("nejprve dokončete běžící dotaz")
+        );
+        assert_eq!(
+            context_switch_refusal(false, true, false),
+            Some("nejprve dokončete rozpracované úpravy")
+        );
+        assert_eq!(
+            context_switch_refusal(false, false, true),
+            Some("nejprve zavřete otevřený dialog")
+        );
+        // A running query outranks everything else: it is the condition the
+        // user can act on immediately, and the one with a live resource.
+        assert_eq!(
+            context_switch_refusal(true, true, true),
+            Some("nejprve dokončete běžící dotaz")
+        );
+    }
+
+    /// The two modals that belong to the switch flow must NOT block it —
+    /// `confirm_workspace` re-runs the gate with its own `WorkspaceConfirm`
+    /// on screen, so treating it as "some other dialog" would make the
+    /// confirm button permanently refuse itself. Everything else blocks.
+    #[test]
+    fn only_the_switch_flows_own_modals_let_a_context_switch_through() {
+        assert!(!modal_blocks_context_switch(None));
+        assert!(!modal_blocks_context_switch(Some(&ModalState::Settings)));
+        for mode in [
+            WorkspaceConfirmMode::Init,
+            WorkspaceConfirmMode::Adopt,
+            WorkspaceConfirmMode::ToProfile,
+        ] {
+            assert!(!modal_blocks_context_switch(Some(&ModalState::WorkspaceConfirm {
+                mode,
+                root: None,
+                error: None,
+                running: false,
+            })));
+        }
+        for m in [
+            query_params(),
+            kill_confirm(),
+            analyze_write(),
+            script_run(),
+            csv_import(),
+            chart_picker(),
+            backup_restore(backup::BackupStatus::Confirming),
+            ModalState::CompareDialog { conn_a: None, conn_b: None, error: None },
+            ModalState::WorkspaceMissing {
+                root: None,
+                reason: String::new(),
+                error: None,
+            },
+        ] {
+            assert!(modal_blocks_context_switch(Some(&m)), "must block a context switch");
+        }
+    }
+
+    /// The Settings block's own copy (§W3), byte-pinned like every other
+    /// deliverable string in this phase.
+    #[test]
+    fn the_settings_workspace_block_copy_is_byte_pinned() {
+        assert_eq!(WORKSPACE_SETTINGS_HEADING, "Pracovní prostor");
+        assert_eq!(WORKSPACE_SETTINGS_PICK, "Použít složku…");
+        assert_eq!(WORKSPACE_SETTINGS_LEAVE, "Přejít na lokální profil");
+        assert_eq!(
+            workspace_settings_mode_line(Some(std::path::Path::new("D:\\ws"))),
+            "Pracovní prostor: D:\\ws"
+        );
+        assert!(workspace_settings_mode_line(None).starts_with("Lokální profil ("));
+        assert!(workspace_settings_mode_line(None).ends_with(')'));
     }
 }
 

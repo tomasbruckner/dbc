@@ -4293,6 +4293,15 @@ impl AppView {
                         && admin_password.read(cx).text().is_empty();
                     pwchange::esc_closable(empty, *running)
                 }
+                // §W3.2: nothing is dispatched until the button is
+                // clicked, and nothing secret is typed here — so Esc
+                // cancels freely, BUT never mid-init (`running`), the same
+                // reasoning as `BackupRestore`'s `!session.is_running()`
+                // above. The truth table is
+                // `connections_ui::workspace_confirm_esc_closable`.
+                connections_ui::ModalState::WorkspaceConfirm { running, .. } => {
+                    connections_ui::workspace_confirm_esc_closable(*running)
+                }
                 // `WorkspaceMissing` never reaches this match — the
                 // `modal_is_blocking` guard above returns first.
                 _ => false,
@@ -5650,6 +5659,236 @@ impl AppView {
     /// succeeded) — never reopens it, never writes over another modal.
     fn set_workspace_missing_error(&mut self, message: String, cx: &mut Context<Self>) {
         if let Some(connections_ui::ModalState::WorkspaceMissing { error, .. }) = &mut self.modal {
+            *error = Some(message);
+        }
+        cx.notify();
+    }
+
+    /// Design §W3.1 — THE common gate in front of EVERY context change
+    /// (init, adopt, „Přejít na lokální profil"). A context replacement
+    /// demands a quiet app: the same gate style as `start_script_pick`.
+    /// Returns the Czech refusal to show, or `None` to proceed.
+    ///
+    /// This function reads the live state; the DECISION (and its
+    /// precedence) lives in the pure `connections_ui::context_switch_refusal`
+    /// so it can be unit-pinned without a GPUI window — the
+    /// `modal_is_blocking` / `pwchange::esc_closable` precedent. The two
+    /// together are ONE gate, not two: nothing else in the app may answer
+    /// „is it safe to switch".
+    ///
+    /// EXTENSION POINT: Task 8 adds the dirty-`script_binding` arm (Part S
+    /// §5.5's guard) to this function and to `context_switch_refusal`'s
+    /// signature, once that field exists. There must remain exactly ONE
+    /// gate — a second „is it safe to switch" predicate is a
+    /// review-blocking defect.
+    pub(crate) fn context_switch_blocked(&self) -> Option<String> {
+        connections_ui::context_switch_refusal(
+            self.cancel.is_some(),
+            self.apply_dialog.is_some() || self.discard_confirm.is_some(),
+            // The switch flow's OWN modals (Settings, and the confirm
+            // itself) do not count as "some other dialog" — see
+            // `modal_blocks_context_switch`. Every other open dialog does
+            // (single-modal invariant, app-wide).
+            connections_ui::modal_blocks_context_switch(self.modal.as_ref()),
+        )
+        .map(str::to_string)
+    }
+
+    /// §W3: „Použít složku…". Gates first, then picks, then classifies in
+    /// the background, then opens the confirm modal. NOTHING is written
+    /// before the user clicks the confirm button — the classification is a
+    /// read-only `read_dir` (§W6.4: nothing under `.git/` is ever opened).
+    fn start_workspace_pick(&mut self, cx: &mut Context<Self>) {
+        if let Some(reason) = self.context_switch_blocked() {
+            self.status = format!("error: {reason}");
+            cx.notify();
+            return;
+        }
+        let dialog = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Použít".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = match dialog.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
+                Ok(Ok(_)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "výběr zrušen".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = format!("error: dialog selhal: {e}");
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_canceled) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "error: dialog není dostupný".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let probe = picked.clone();
+            let outcome = cx
+                .background_spawn(async move {
+                    connections_ui::workspace_pick_outcome(dbc_state::workspace::classify(&probe))
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| match outcome {
+                Ok(mode) => view.open_workspace_confirm(mode, Some(picked), cx),
+                Err(e) => {
+                    view.status = format!("error: {e}");
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// §W3.4's reverse switch — same gate, same confirm shape. Nothing in
+    /// the workspace folder is read or written: only the pointer goes.
+    fn start_leave_workspace(&mut self, cx: &mut Context<Self>) {
+        if let Some(reason) = self.context_switch_blocked() {
+            self.status = format!("error: {reason}");
+            cx.notify();
+            return;
+        }
+        self.open_workspace_confirm(connections_ui::WorkspaceConfirmMode::ToProfile, None, cx);
+    }
+
+    fn open_workspace_confirm(
+        &mut self,
+        mode: connections_ui::WorkspaceConfirmMode,
+        root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        // The Settings modal is what the user clicked from — replace it in
+        // place (the single-modal invariant holds: exactly one is open).
+        self.modal = Some(connections_ui::ModalState::WorkspaceConfirm {
+            mode,
+            root,
+            error: None,
+            running: false,
+        });
+        // UX-polish §1.4: no-input modal, cx-only opener.
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    /// The confirm button of `ModalState::WorkspaceConfirm`. The order is
+    /// the design's, and the order MATTERS: files first, marker last
+    /// (inside `init_workspace`), pointer only after that returns `Ok`,
+    /// live swap only after the pointer is on disk. A failure at any step
+    /// leaves the PREVIOUS context fully intact and the error in the modal.
+    fn confirm_workspace(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::WorkspaceConfirm { mode, root, running, .. }) =
+            &mut self.modal
+        else {
+            return;
+        };
+        if *running {
+            return; // double-click guard, `KillConfirm::dispatched`'s role
+        }
+        let (mode, root) = (*mode, root.clone());
+        // Re-run the gate: the pick + classification did not block the app,
+        // so a query or a dialog may have started in the meantime.
+        if let Some(reason) = self.context_switch_blocked() {
+            self.set_workspace_confirm_error(reason, cx);
+            return;
+        }
+        if let Some(connections_ui::ModalState::WorkspaceConfirm { running, .. }) = &mut self.modal
+        {
+            *running = true;
+        }
+        cx.notify();
+        // §W3.2 step 1: init copies from the PROFILE, always — workspace
+        // mode offers no picker (§W3), so the profile is the only possible
+        // origin. `from` is captured here, on the UI thread, and moved into
+        // the background job.
+        let from = dbc_state::workspace::profile_paths();
+        let pointer = dbc_state::workspace::pointer_path();
+        cx.spawn(async move |this, cx| {
+            let job_root = root.clone();
+            let result: Result<(), String> = cx
+                .background_spawn(async move {
+                    match mode {
+                        connections_ui::WorkspaceConfirmMode::Init => {
+                            let root = job_root.ok_or("chybí cílová složka")?;
+                            // Copies + scripts/ + .gitignore + MARKER LAST.
+                            // Every write inside goes through the shared
+                            // rails (`fsutil::write_atomic` /
+                            // `join_component` / `entry_exists_ci`) — this
+                            // call site must NEVER grow its own copy loop.
+                            dbc_state::workspace::init_workspace(&root, &from)
+                                .map_err(|e| e.message)?;
+                            dbc_state::workspace::write_pointer(&pointer, &root)
+                                .map_err(|e| e.message)
+                        }
+                        connections_ui::WorkspaceConfirmMode::Adopt => {
+                            let root = job_root.ok_or("chybí cílová složka")?;
+                            // §W3.3: NOTHING is written but the pointer.
+                            dbc_state::workspace::write_pointer(&pointer, &root)
+                                .map_err(|e| e.message)
+                        }
+                        connections_ui::WorkspaceConfirmMode::ToProfile => {
+                            // §W3.4: the folder is not touched in any way.
+                            dbc_state::workspace::clear_pointer(&pointer).map_err(|e| e.message)
+                        }
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| match result {
+                Ok(()) => {
+                    view.close_modal(cx);
+                    // THE single seam (§W3.4). It bumps
+                    // `workspace_pick_generation`, so any „Najít složku…"
+                    // continuation still in flight is superseded by this.
+                    view.apply_context(root.clone(), cx);
+                }
+                Err(e) => {
+                    // The previous context is untouched: `apply_context`
+                    // was never reached, and nothing partial was pointed
+                    // at (the pointer is written LAST inside the job).
+                    view.set_workspace_confirm_error(e, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// „Zrušit" on `ModalState::WorkspaceConfirm`. Refuses while the
+    /// init/pointer write is in flight, for the same reason Esc does
+    /// (`connections_ui::workspace_confirm_esc_closable`): the background
+    /// job's success arm calls `apply_context`, so letting the modal close
+    /// mid-write would change the whole working context AFTER the user
+    /// asked to cancel — a silent context change, which this design bans.
+    /// Nothing is lost by waiting: the write is a handful of file copies,
+    /// and a FAILED one leaves the previous context fully intact.
+    fn cancel_workspace_confirm(&mut self, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::WorkspaceConfirm { running, .. }) = &self.modal {
+            if !connections_ui::workspace_confirm_esc_closable(*running) {
+                return;
+            }
+        }
+        self.close_modal(cx);
+    }
+
+    /// Replaces the `WorkspaceConfirm` modal's in-place error line and
+    /// releases its `running` guard. A no-op if the modal is gone (the user
+    /// cancelled while the write was still pending) — never reopens it,
+    /// never writes over another modal.
+    fn set_workspace_confirm_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::WorkspaceConfirm { error, running, .. }) =
+            &mut self.modal
+        {
+            *running = false;
             *error = Some(message);
         }
         cx.notify();
