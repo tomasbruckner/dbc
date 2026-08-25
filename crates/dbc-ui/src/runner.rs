@@ -359,6 +359,31 @@ impl QueryRunner {
         rx
     }
 
+    /// pwchange (spec §3): jediná sankcionovaná cesta UI k
+    /// `connect::change_mssql_password`. Blocking ODBC práce běží na
+    /// `spawn_blocking` (stejné pravidlo jako `open_spec`); hesla
+    /// přicházejí jako `Zeroizing` a zanikají s closure. ŽÁDNÝ
+    /// read-only guard: tohle není SQL write, ale údržba přihlášení —
+    /// read-only připojení se zamčeným heslem by jinak nešlo zachránit
+    /// (spec §3; `guard_not_read_only` se týká SQL write cesty).
+    pub fn change_mssql_password(
+        &self,
+        cfg: Box<dbc_state::ConnectionConfig>,
+        old_password: zeroize::Zeroizing<String>,
+        new_password: zeroize::Zeroizing<String>,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                connect::change_mssql_password(&cfg, &old_password, &new_password)
+            })
+            .await
+            .unwrap_or_else(|_| Err(QueryError::msg("password change task panicked")));
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
     /// Fetches a `SchemaSnapshot` for the tree panel (G2 Task 6): opens
     /// `spec` off the UI thread (same `open_spec` dispatch as
     /// `test_connect`/`connect_and_run`'s connect step), calls
@@ -3003,6 +3028,27 @@ mod db_list_tests {
             favourite: false,
             mssql: None,
         }
+    }
+
+    /// pwchange T3: sankcionovaná metoda existuje a propaguje
+    /// config-refusal přes oneshot — víc bez živého serveru testovat
+    /// nejde (mechanismus sám je živě jištěn driver testem
+    /// `must_change_login_full_rescue_cycle`). Stejné hodnoty jako
+    /// `connect.rs::base_cfg()`, jen prázdný user → refusal.
+    #[test]
+    fn change_mssql_password_runner_propagates_refusal() {
+        let runner = QueryRunner::new();
+        let mut cfg = file_cfg(dbc_state::Engine::Mssql, "master");
+        cfg.host = "localhost".into();
+        cfg.port = Some(1433);
+        cfg.user = String::new();
+        let rx = runner.change_mssql_password(
+            Box::new(cfg),
+            zeroize::Zeroizing::new("old".to_string()),
+            zeroize::Zeroizing::new("new".to_string()),
+        );
+        let err = rx.blocking_recv().expect("sender dropped").unwrap_err();
+        assert!(err.message.contains("zadejte uživatele"), "{err}");
     }
 
     /// Resolved deviation 3/5: file engines answer from `cfg.database`

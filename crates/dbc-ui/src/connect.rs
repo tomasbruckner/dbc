@@ -259,10 +259,14 @@ pub fn resolve_secret_for_connect(vault: Option<&Vault>, cfg: &ConnectionConfig)
 /// than routing through a boolean predicate would be; `mssql_connect_refusal`
 /// exists for callers that need the yes/no answer before they even have a
 /// secret to pass in here, per its own doc comment.
-pub(crate) fn mssql_connection_from_config(
+/// Vytažené z `mssql_connection_from_config` (pwchange T3): tentýž config
+/// build — včetně obou refusalů a timeout defaultu — potřebuje i změna
+/// hesla při loginu ([`change_mssql_password`]), která NEotevírá
+/// `MssqlConnection`.
+pub(crate) fn mssql_config_from_config(
     cfg: &ConnectionConfig,
     secret: Option<String>,
-) -> Result<MssqlConnection, QueryError> {
+) -> Result<MssqlConfig, QueryError> {
     // §1d: Encrypt=yes + a 127.0.0.1 tunnel endpoint makes the server
     // cert's hostname never match, so a tunneled MSSQL connection only
     // works with TrustServerCertificate=yes — an untested encryption
@@ -298,7 +302,27 @@ pub(crate) fn mssql_connection_from_config(
     if let Some(driver) = opts.driver.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
         mssql_cfg = mssql_cfg.driver(driver.to_string());
     }
-    Ok(MssqlConnection::new(&mssql_cfg))
+    Ok(mssql_cfg)
+}
+
+pub(crate) fn mssql_connection_from_config(
+    cfg: &ConnectionConfig,
+    secret: Option<String>,
+) -> Result<MssqlConnection, QueryError> {
+    Ok(MssqlConnection::new(&mssql_config_from_config(cfg, secret)?))
+}
+
+/// pwchange (spec §3): `cfg`ovo heslo pro connect string = NOVÉ heslo,
+/// staré jde do `SQL_COPT_SS_OLDPWD`. Volá se VÝHRADNĚ přes
+/// `QueryRunner::change_mssql_password` (sankcionovaná cesta — UI nikdy
+/// nesahá na driver přímo).
+pub(crate) fn change_mssql_password(
+    cfg: &ConnectionConfig,
+    old_password: &str,
+    new_password: &str,
+) -> Result<(), QueryError> {
+    let mssql_cfg = mssql_config_from_config(cfg, Some(new_password.to_string()))?;
+    dbc_driver_mssql::change_password_at_connect(&mssql_cfg, old_password)
 }
 
 /// §1c: SQLSTATE IM002 ("data source name not found and no default
@@ -582,6 +606,28 @@ mod mssql_connect_tests {
             err.message,
             "MSSQL: zadejte uživatele — ověření přes Windows účet zatím není podporováno"
         );
+    }
+
+    /// pwchange T3: změna hesla jde přes STEJNÝ config-builder jako
+    /// connect — oba refusaly (SSH tunel, prázdný uživatel) platí i pro
+    /// ni a extrakce `mssql_config_from_config` nesmí změnit chování
+    /// `mssql_connection_from_config` (okolní testy to jistí).
+    #[test]
+    fn change_mssql_password_propagates_config_refusals() {
+        let mut cfg = base_cfg();
+        cfg.user = String::new();
+        let err = change_mssql_password(&cfg, "old", "new").unwrap_err();
+        assert!(err.message.contains("zadejte uživatele"), "{err}");
+
+        let mut cfg = base_cfg();
+        cfg.ssh = Some(SshTunnelConfig {
+            host: "bastion".into(),
+            port: 22,
+            user: "tomas".into(),
+            key_path: None,
+        });
+        let err = change_mssql_password(&cfg, "old", "new").unwrap_err();
+        assert!(err.message.contains("SSH tunel"), "{err}");
     }
 
     #[test]
