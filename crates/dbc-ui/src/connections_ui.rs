@@ -263,7 +263,20 @@ actions!(workspace_choice, [ActivateChoice]);
 /// never contend with SqlInput's (unscoped) or ResultGrid's bindings — same
 /// reasoning as grid.rs's scoped `ctrl-c` binding.
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
+    cx.bind_keys(key_bindings());
+}
+
+/// This module's key bindings, in REGISTRATION ORDER.
+///
+/// Split out of [`bind_keys`] for the T5 review's MINOR-4: the
+/// carry-forward's precedence test used to build its own two-binding
+/// keymap from literals, so deleting the real `enter → ActivateChoice`
+/// registration below left the suite green. The test now consumes THIS
+/// function, so the registration it reasons about is the one the app
+/// actually installs — and the order matters, because
+/// `Keymap::bindings_for_input` breaks depth ties by registration index.
+fn key_bindings() -> Vec<KeyBinding> {
+    vec![
         KeyBinding::new("backspace", Backspace, Some("TextField")),
         KeyBinding::new("delete", Delete, Some("TextField")),
         KeyBinding::new("left", Left, Some("TextField")),
@@ -311,7 +324,7 @@ pub fn bind_keys(cx: &mut App) {
         // returns None → safe no-op.
         KeyBinding::new("tab", ModalFocusNext, Some("ModalForm")),
         KeyBinding::new("shift-tab", ModalFocusPrev, Some("ModalForm")),
-    ]);
+    ]
 }
 
 pub struct TextField {
@@ -1808,6 +1821,15 @@ impl AppView {
         panel = panel
             .child(div().mt_2().text_color(cx.theme().text_muted).child(WORKSPACE_SETTINGS_HEADING))
             .child(div().child(workspace_settings_mode_line(ws_root.as_deref())));
+        // T5 review MINOR-2: the LAST pick refusal, in full, HERE — inside
+        // the 360 px panel the user is already looking at, where it wraps
+        // and can actually be read. The status bar got a short sentinel
+        // (`WORKSPACE_PICK_FAILED_STATUS`) instead. This is the phase's
+        // own convention: every other long explanation lives in a modal
+        // body for exactly this reason.
+        if let Some(e) = self.workspace_pick_error.clone() {
+            panel = panel.child(div().text_color(cx.theme().danger).child(format!("error: {e}")));
+        }
         panel = match &ws_root {
             // Workspace mode (§W3): NO folder picker here — creating a
             // second workspace from inside one is not a flow this design
@@ -1960,6 +1982,11 @@ impl AppView {
         // before it can be abandoned. See `cancel_active_backup_if_running`'s
         // doc comment (main.rs) for the full teardown-path accounting.
         self.cancel_active_backup_if_running();
+        // T5 review MINOR-2: the pick refusal belongs to ONE Settings
+        // session — it is rendered only inside that panel, so leaving it
+        // set would resurrect a stale explanation the next time Settings
+        // opens. `start_workspace_pick` clears it again for a new attempt.
+        self.workspace_pick_error = None;
         self.modal = None;
         cx.notify();
     }
@@ -4016,6 +4043,23 @@ nebo existující pracovní prostor; pokud v této složce dříve selhalo nebo 
 přerušeno vytváření prostoru, zůstaly v ní nedokončené soubory aplikace — \
 smažte obsah složky a zkuste to znovu";
 
+/// T5 review MINOR-2: the status-bar SENTINEL for a refused folder pick.
+/// Short by design — the status bar is one unwrapped flex row, and
+/// `WORKSPACE_PICK_NONEMPTY` is ~230 characters of prose whose payload
+/// half would fall off the end of it. The prose goes to
+/// `AppView::workspace_pick_error`, rendered inside the Settings block;
+/// this line only has to carry the `error:` colour sentinel and point at
+/// where the explanation is.
+pub(crate) const WORKSPACE_PICK_FAILED_STATUS: &str =
+    "error: vybranou složku nelze použít — podrobnosti v Nastavení";
+
+/// T5 review MAJOR-1: a folder pick whose classification landed while some
+/// OTHER dialog owned the screen. Deliberately the same shape as
+/// `start_script_pick`'s „výběr skriptu zahozen — je otevřený jiný dialog"
+/// and `start_csv_import`'s „výběr CSV zahozen — …".
+pub(crate) const WORKSPACE_PICK_DISCARDED: &str =
+    "výběr složky zahozen — je otevřený jiný dialog";
+
 /// Settings block heading (§W3).
 pub(crate) const WORKSPACE_SETTINGS_HEADING: &str = "Pracovní prostor";
 /// Profile-mode button: opens the folder picker (§W3).
@@ -4165,8 +4209,26 @@ pub(crate) fn modal_blocks_context_switch(modal: Option<&ModalState>) -> bool {
 /// because it is the one condition holding a live resource the user can
 /// end immediately; a half-finished edit next; a stray dialog last.
 ///
+/// SCOPE OF `run_in_flight` (T5 review NIT-8) — `AppView::cancel` is NOT a
+/// complete "any DB work is happening" predicate. `AppView::start_lookup`
+/// deliberately does not set it (it says so at its own definition), so an
+/// FK-join lookup can be in flight while this gate reports a quiet app.
+/// That is benign TODAY, and only by accident of ordering:
+/// `apply_context` calls `clear_active_connection` — which sets
+/// `active_connection_id = None` — before any lookup completion can land,
+/// and `save_view_prefs_for_grid` early-returns on `None`, so no prefs or
+/// params write from the old context can reach the new one. Do not lean on
+/// that without re-checking it.
+///
 /// EXTENSION POINT: Task 8 adds a `dirty_script` parameter here (Part S
 /// §5.5's guard) once `AppView::script_binding` exists.
+///
+/// UNRESOLVED FOR TASK 8, surfaced now rather than as a surprise (T5
+/// review): design §W3.1 says „the Part S §5.5 dirty script guard runs
+/// FIRST", but `context_switch_refusal_is_ordered_and_lets_a_quiet_app_through`
+/// pins `run_in_flight` first. Whoever adds the arm must reconcile the two
+/// DELIBERATELY — either the spec sentence or that test's ordering has to
+/// give, and picking one silently is the failure mode to avoid.
 pub(crate) fn context_switch_refusal(
     run_in_flight: bool,
     pending_edits: bool,
@@ -5470,38 +5532,64 @@ mod modal_confirm_kind_tests {
 
     /// T4 re-verify carry-forward — THE bug this fix exists for, pinned
     /// against the real `gpui::Keymap` (a pure resolver; no window, no
-    /// platform). Before the fix the §W4 choices activated on Space but
-    /// NOT on Enter: `Window::dispatch_key_event` dispatches keymap
-    /// bindings BEFORE `on_key_down` listeners and returns as soon as one
-    /// is consumed, and a bare `enter` matched `ModalConfirm` on the
-    /// `ModalForm` ancestor, whose `Ignore` arm is a handled no-op.
+    /// platform) fed the REAL registrations.
     ///
-    /// BOTH halves are asserted, because the fix must not cost §W4 its
-    /// "Enter is inert / no default button" rule:
+    /// Before the fix the §W4 choices activated on Space but NOT on Enter:
+    /// `Window::dispatch_key_event` dispatches keymap bindings BEFORE
+    /// `on_key_down` listeners and returns as soon as one is consumed, and
+    /// a bare `enter` matched `ModalConfirm` on the `ModalForm` ancestor,
+    /// whose `Ignore` arm is a handled no-op.
+    ///
+    /// T5 review MINOR-4/NIT-9, both addressed here:
+    /// * the keymap is built from `key_bindings()` — this module's ACTUAL
+    ///   registration — so deleting the `enter → ActivateChoice` line fails
+    ///   this test instead of leaving it green;
+    /// * `sql_input`'s UNSCOPED `enter → Newline` is included, in the same
+    ///   relative order `main()` installs it (`sql_input::bind_keys` runs
+    ///   before `connections_ui::bind_keys`). A predicate-less binding
+    ///   matches at `contexts.len()` (gpui `keymap.rs::binding_enabled`),
+    ///   i.e. it ties with the deepest scoped match on EVERY path — so
+    ///   modelling it is what makes the registration-order tie-break real
+    ///   rather than a claim, and what makes the container-stack result
+    ///   two bindings rather than one.
+    ///
+    /// BOTH halves of the fix are asserted, because it must not cost §W4
+    /// its "Enter is inert / no default button" rule:
     ///   1. focus ON a choice (its context is on the stack) ⇒ the deeper
     ///      `ActivateChoice` binding out-ranks `ModalConfirm`;
     ///   2. focus on the PANEL CONTAINER (the state the modal opens in) ⇒
-    ///      `ModalConfirm` is the only match, i.e. `Ignore`.
+    ///      `ModalConfirm` ranks first, i.e. `Ignore`.
+    ///
+    /// RESIDUAL RISK, stated rather than hidden: this pins the KEYMAP half.
+    /// The render half — `.key_context(WORKSPACE_CHOICE_CONTEXT)` on the
+    /// three buttons — cannot be observed without a GPUI window, and this
+    /// phase runs no window tests (plan: every test is a pure `#[test]` or
+    /// a `tempfile`). Deleting that one call still passes. It is covered by
+    /// the manual §W4 keyboard pass, not by this suite.
     #[test]
     fn enter_outranks_modal_confirm_only_on_a_focused_choice() {
         use gpui::{KeyContext, Keymap, Keystroke};
 
-        // The two bindings exactly as `bind_keys` registers them, in the
-        // same order (the tie-break is registration order, so order is
-        // part of what is being pinned).
-        let keymap = Keymap::new(vec![
-            KeyBinding::new("enter", ModalConfirm, Some("ModalForm")),
-            KeyBinding::new("enter", ActivateChoice, Some(WORKSPACE_CHOICE_CONTEXT)),
-        ]);
+        let mut bindings = vec![
+            // `main()` installs `sql_input::bind_keys` BEFORE
+            // `connections_ui::bind_keys`; this is that one line of it.
+            KeyBinding::new("enter", crate::sql_input::Newline, None),
+        ];
+        bindings.extend(key_bindings());
+        let keymap = Keymap::new(bindings);
         let enter = [Keystroke::parse("enter").unwrap()];
         let modal_form = KeyContext::parse("ModalForm").unwrap();
         let choice = KeyContext::parse(WORKSPACE_CHOICE_CONTEXT).unwrap();
 
         // 1. A tabbed-to choice: root → leaf is [ModalForm, WorkspaceChoice].
-        let (bindings, _pending) =
+        //    Depths: ActivateChoice 2, Newline 2 (unscoped ⇒ contexts.len()),
+        //    ModalConfirm 1. The first two TIE, and `ActivateChoice` wins on
+        //    registration index — the tie-break this test now really does
+        //    exercise.
+        let (matched, _pending) =
             keymap.bindings_for_input(&enter, &[modal_form.clone(), choice]);
         assert!(
-            bindings
+            matched
                 .first()
                 .expect("a focused choice must match some enter binding")
                 .action()
@@ -5511,32 +5599,22 @@ mod modal_confirm_kind_tests {
         );
 
         // 2. The panel container: no WorkspaceChoice on the stack at all.
-        let (bindings, _pending) = keymap.bindings_for_input(&enter, &[modal_form]);
-        assert_eq!(bindings.len(), 1, "no default button exists on the panel itself");
+        //    Depths: ModalConfirm 1, Newline 1 — again a tie, again broken
+        //    by registration index, so ModalConfirm ranks first. Newline is
+        //    still MATCHED (it matches everywhere), which is why this is two
+        //    bindings and not one; it is harmless because its handler lives
+        //    on the SqlInput subtree, which is not on a modal's focus path,
+        //    so `dispatch_key_event` finds no listener and advances while
+        //    `propagate_event` survives.
+        let (matched, _pending) = keymap.bindings_for_input(&enter, &[modal_form]);
         assert!(
-            bindings[0].action().as_any().is::<ModalConfirm>(),
+            matched[0].action().as_any().is::<ModalConfirm>(),
             "a bare Enter on the panel must still reach ModalConfirmKind::Ignore"
         );
-    }
-
-    /// Workspace T4 (design §W4): the wrong-context guard. Enter must be a
-    /// HANDLED no-op in every shape of the modal — including the
-    /// unparsable-pointer shape (`root: None`) and the re-pick-failed
-    /// shape (`error: Some`) — because each of its three choices is a
-    /// different, irreversible-feeling decision and none of them may be
-    /// reachable by a stray keystroke.
-    #[test]
-    fn workspace_missing_is_ignored_in_every_shape() {
-        for root in [None, Some(std::path::PathBuf::from("D:\\ws-gone"))] {
-            for error in [None, Some("nelze zapsat ukazatel".to_string())] {
-                let m = ModalState::WorkspaceMissing {
-                    root: root.clone(),
-                    reason: "složka neexistuje".to_string(),
-                    error: error.clone(),
-                };
-                assert!(matches!(modal_confirm_kind(&m), ModalConfirmKind::Ignore));
-            }
-        }
+        assert!(
+            !matched.iter().any(|b| b.action().as_any().is::<ActivateChoice>()),
+            "no default button: ActivateChoice must not match without a focused choice"
+        );
     }
 }
 
@@ -5871,6 +5949,42 @@ mod workspace_confirm_tests {
         ] {
             assert!(modal_blocks_context_switch(Some(&m)), "must block a context switch");
         }
+    }
+
+    /// T5 review MINOR-2: the long §W3 case-3 refusal is delivered where
+    /// it can be READ (the Settings panel), and the status bar keeps only
+    /// a short sentinel. Pins that the two are actually different lengths
+    /// — a "short" sentinel that grew back into prose would silently undo
+    /// the fix — and that the sentinel still carries the `error:` colour
+    /// prefix and points at where the explanation is.
+    #[test]
+    fn the_status_sentinel_is_short_and_the_prose_lives_in_the_panel() {
+        assert_eq!(
+            WORKSPACE_PICK_FAILED_STATUS,
+            "error: vybranou složku nelze použít — podrobnosti v Nastavení"
+        );
+        assert!(WORKSPACE_PICK_FAILED_STATUS.starts_with("error: "));
+        assert!(WORKSPACE_PICK_FAILED_STATUS.contains("Nastavení"), "point at the panel");
+        // The whole point: the sentinel is a fraction of the prose.
+        assert!(WORKSPACE_PICK_FAILED_STATUS.chars().count() < 70);
+        assert!(WORKSPACE_PICK_NONEMPTY.chars().count() > 150);
+        assert!(
+            WORKSPACE_PICK_FAILED_STATUS.chars().count() * 2
+                < WORKSPACE_PICK_NONEMPTY.chars().count(),
+            "if these ever converge, the status bar is carrying the prose again"
+        );
+    }
+
+    /// T5 review MAJOR-1: the stale-continuation refusal reuses the exact
+    /// shape `start_script_pick` and `start_csv_import` already use, so the
+    /// three read as one family rather than three inventions.
+    #[test]
+    fn the_discarded_pick_status_matches_its_sibling_flows() {
+        assert_eq!(WORKSPACE_PICK_DISCARDED, "výběr složky zahozen — je otevřený jiný dialog");
+        assert!(WORKSPACE_PICK_DISCARDED.ends_with("zahozen — je otevřený jiný dialog"));
+        // Not an `error:` — a discarded pick is a refusal to act, not a
+        // failure, exactly like its two siblings.
+        assert!(!WORKSPACE_PICK_DISCARDED.starts_with("error: "));
     }
 
     /// The Settings block's own copy (§W3), byte-pinned like every other

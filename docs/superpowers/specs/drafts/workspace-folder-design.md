@@ -181,6 +181,26 @@ On folder pick, classify (in `workspace.rs`, background-dispatched):
    prostor dbc a není prázdná — vyberte prázdnou složku nebo existující
    pracovní prostor". Rationale: never scatter app files into
    `~/Documents` by misclick; never adopt a folder we cannot vouch for.
+
+   **AS-BUILT ADDENDUM (workspace T5) — this copy was EXTENDED, and the
+   short form above is no longer the binding text.** An init that crashed
+   or failed part-way leaves exactly this shape (contents copied, marker
+   not written — §W3.2 step 4 makes that the crash-safe outcome by
+   design), and the classify-driven flow then refuses it for BOTH init (it
+   is not empty) and adopt (it has no marker), with no in-app way out. The
+   short form reads „you picked the wrong folder", so the user never tries
+   the one thing that works. The shipped refusal appends: „…; pokud v této
+   složce dříve selhalo nebo bylo přerušeno vytváření prostoru, zůstaly v
+   ní nedokončené soubory aplikace — smažte obsah složky a zkuste to
+   znovu". The app still deletes nothing itself: the never-destructive
+   rail holds even for files the app created.
+
+   **AS-BUILT ADDENDUM (workspace T5) — where that refusal is DELIVERED.**
+   At ~230 characters it does not fit the status bar (one unwrapped flex
+   row, behind the modal backdrop), which would have truncated away the
+   half that matters. The prose renders inside the Settings „Pracovní
+   prostor" block; the status bar carries only a short sentinel
+   („error: vybranou složku nelze použít — podrobnosti v Nastavení").
 4. Marker present but `format` > 1 ⇒ refuse: „error: pracovní prostor
    vyžaduje novější verzi aplikace".
 
@@ -195,6 +215,33 @@ about to change; keeping a session from the OLD context alive under
 the NEW config would be exactly the silent-context-mixing this design
 bans. The confirm modal says so: „Aktivní připojení bude odpojeno."
 
+**AS-BUILT ADDENDUM (workspace T5) — „no modal open beyond Settings" is
+as-built „beyond Settings AND the confirm modal itself".** The sentence
+above, taken literally, makes the confirm button refuse itself. The gate is
+deliberately RE-RUN at confirm time (the folder pick and its classification
+did not block the app, so a query or a dialog may have started meanwhile),
+and it necessarily runs with `ModalState::WorkspaceConfirm` on screen. The
+two modals that ARE the switch flow — `Settings`, where it is started, and
+`WorkspaceConfirm`, where it is confirmed — therefore do not count as „some
+other dialog"; every other variant does. The exclusion lives in one
+exhaustively-matched predicate (`connections_ui::modal_blocks_context_switch`)
+so a new `ModalState` is a compile error that must pick a side.
+
+**AS-BUILT ADDENDUM (workspace T5) — the gate's ORDER is pinned, and it
+contradicts this section's „runs first".** §W3.1 says the dirty-script
+guard runs first; the shipped `context_switch_refusal` reports a running
+query first, then pending edits, then a stray dialog, and a test pins that
+order. Task 8, which adds the dirty-script arm, MUST reconcile the two
+deliberately — either this sentence or that ordering has to give.
+
+**AS-BUILT ADDENDUM (workspace T5) — `run_in_flight` is not every DB
+operation.** The gate reads `AppView::cancel`, which `start_lookup`
+deliberately does not set, so an FK-join lookup can be in flight while the
+gate reports a quiet app. Benign today only by ordering: `apply_context`
+clears `active_connection_id` before any completion can land, and
+`save_view_prefs_for_grid` early-returns on `None`, so no write from the old
+context reaches the new one. Recorded so nobody leans on it unchecked.
+
 #### W3.2 Initialize (empty folder): COPY, never move — never destructive
 
 Confirm modal „Vytvořit pracovní prostor" shows the target path, the
@@ -202,6 +249,26 @@ full security warning (§W6.3), and „Aktivní připojení bude odpojeno."
 Buttons „Rozumím, vytvořit" / „Zrušit"; **Enter is inert** (ScriptRun-
 confirm posture — this is a deliberate, security-relevant decision, the
 button is the gate). On confirm, in `cx.background_spawn`:
+
+**AS-BUILT ADDENDUM (workspace T5) — „Zrušit" is INERT while the write
+runs, and so is Esc.** Once the confirm has dispatched, the background
+job's success arm calls `apply_context` unconditionally; letting the modal
+close mid-write would therefore swap the entire working context AFTER the
+user asked to cancel — the silent context change this design bans.
+Cancelling the WRITE itself is not offered, because it cannot be honoured:
+the copy is already under way and nothing is ever deleted. The same
+`running` latch is the double-click guard.
+
+**AS-BUILT ADDENDUM (workspace T5) — the folder pick's continuation is
+generation- AND modal-guarded.** The platform picker is modal to the app,
+but the classification that follows it is not: it yields the UI thread, and
+Settings is Esc-closable. A stale classification landing afterwards must
+never raw-assign the modal — it could unlatch a `running` confirm, bypass
+`close_modal` over a live `pg_restore` session, or wipe a half-typed
+connection dialog. Two refusals, deliberately distinct: a SUPERSEDED pick
+(the context already swapped) is inert and silent, the §W4 posture; a pick
+that is merely in the wrong modal refuses with „výběr složky zahozen — je
+otevřený jiný dialog", matching `start_script_pick` and `start_csv_import`.
 
 1. Copy the profile files that exist — `config.toml`, `vault.bin`,
    `views.toml`, `params.toml` — into the folder (each via tmp+rename;
@@ -302,6 +369,22 @@ Three buttons, all explicit:
   připojení a nastavení než v pracovním prostoru."
 - „Ukončit" — quit the app.
 
+**AS-BUILT ADDENDUM (workspace T4 re-verify) — „Enter is inert" means „no
+DEFAULT button", not „Enter does nothing anywhere in this modal".** The
+three choices are real tab stops, and a choice that has been tabbed to
+activates on Enter as well as Space — the platform convention for pressing
+a focused button. This needed a fix, not just a doc: `dispatch_key_event`
+runs keymap bindings BEFORE `on_key_down` listeners and stops at the first
+consumer, so the ancestor `ModalForm`'s `enter → ModalConfirm` (whose
+`Ignore` arm is a handled no-op) was swallowing Enter before the button's
+own listener ran, and only Space worked. The buttons now carry a deeper
+`WorkspaceChoice` key context with its own `enter` binding, which
+out-ranks the ancestor by `KeyBindingContextPredicate::depth_of`. The modal
+still OPENS with focus on the panel container, where that context is not on
+the dispatch path at all — so a bare Enter before any Tab still reaches
+`ModalConfirmKind::Ignore` and does nothing, and there is still no default
+button.
+
 **Never a silent fallback**: without the pointer's target, the app must
 not quietly show profile-mode connections — the user would be one
 muscle-memory click from running a query against the wrong context's
@@ -397,6 +480,14 @@ offered:
 Honest, specific, once-per-decision-point; no nagging on every
 startup (the user made this call knowingly — the warning exists so the
 call stays informed, not to relitigate it).
+
+**AS-BUILT ADDENDUM (workspace T5) — how „carries no git command" is
+tested.** The warning necessarily contains the word „git" („git zůstává
+zcela mimo aplikaci"), so the guard test bans actual git SUBCOMMANDS
+(`git add|commit|push|init|clone|rm|filter`), plus URLs and credential
+shapes — and asserts the word „git" REMAINS, since the warning is about
+git. An earlier substring ban on `"git "` was self-contradictory against
+the byte-pinned copy.
 
 #### W6.4 Public-remote detection — NOT done; static warning instead (decided)
 

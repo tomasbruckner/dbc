@@ -417,6 +417,66 @@ pub(crate) fn recovery_pick_may_commit(
     workspace_missing_modal_open && dispatched_generation == current_generation
 }
 
+/// What `start_workspace_pick`'s continuation is allowed to do when its
+/// folder classification finally lands (T5 review MAJOR-1).
+///
+/// The race, and why `recovery_pick_may_commit`'s shape is not enough
+/// here: the platform folder picker IS modal to the app, but the
+/// `classify()` that follows it is a `cx.background_spawn` — it yields the
+/// UI thread, and `ModalState::Settings` is Esc-closable. So between the
+/// pick and its result the user can close Settings and reach ANY other
+/// state: a second workspace pick that is already initializing, a running
+/// `BackupRestore`, a half-typed `ConnectionDialog`. `open_workspace_confirm`
+/// used to raw-assign `self.modal` regardless, which meant a stale
+/// continuation could (a) reset a `running: true` confirm's latch and let
+/// the context swap after the user dismissed it, (b) overwrite a running
+/// backup session WITHOUT going through `close_modal` (the one teardown
+/// funnel that cancels the child process), or (c) simply wipe a typed
+/// password.
+///
+/// Two refusals, deliberately distinct, because they deserve different
+/// treatment:
+/// * `Superseded` — a context swap has happened under the task
+///   (`apply_context` bumps the generation). Say NOTHING and change
+///   nothing: the user has already reached a newer, explicit decision, and
+///   even a status line would be a stale write over it. This is
+///   `recovery_pick_may_commit`'s posture, for the same reason.
+/// * `OtherDialog` — the generation is current, but the app is no longer
+///   sitting on the Settings modal this pick started from. A status line
+///   here is safe and informative (`WORKSPACE_PICK_DISCARDED`), matching
+///   `start_script_pick`'s and `start_csv_import`'s „… zahozen — je
+///   otevřený jiný dialog" wording.
+///
+/// The generation is checked FIRST so a superseded pick stays silent even
+/// when it is also in the wrong modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspacePickVerdict {
+    /// Commit: open the confirm modal over the Settings modal.
+    Open,
+    /// A context swap happened under this pick — inert AND silent.
+    Superseded,
+    /// Still current, but some other dialog owns the screen — refuse with
+    /// a status line.
+    OtherDialog,
+}
+
+/// The guard behind [`WorkspacePickVerdict`]. Pure, because the
+/// continuation it protects is a `cx.spawn` no unit test can drive — the
+/// `recovery_pick_may_commit` precedent.
+pub(crate) fn workspace_pick_verdict(
+    settings_modal_open: bool,
+    dispatched_generation: u64,
+    current_generation: u64,
+) -> WorkspacePickVerdict {
+    if dispatched_generation != current_generation {
+        return WorkspacePickVerdict::Superseded;
+    }
+    if !settings_modal_open {
+        return WorkspacePickVerdict::OtherDialog;
+    }
+    WorkspacePickVerdict::Open
+}
+
 /// G12 T5: engine -> splitter dialect for the editor's multi-statement
 /// unlock / script runner. `Mssql -> Some(Dialect::Mssql)` since G15 T8's
 /// ON-flip (live-verified: `mssql_go_script_with_procedure_and_top_auto_limit_live`
@@ -1250,6 +1310,17 @@ struct AppView {
     /// classification finished after the context already changed under it
     /// is inert — see `recovery_pick_may_commit`.
     workspace_pick_generation: u64,
+    /// T5 review MINOR-2: the LAST folder-pick refusal, rendered inside the
+    /// Settings „Pracovní prostor" block. `WORKSPACE_PICK_NONEMPTY` is a
+    /// ~230-character explanation; the status bar is a single unwrapped
+    /// flex row behind the modal backdrop, so its payload half (the
+    /// interrupted-init hint this task exists to deliver) was physically
+    /// unreadable there. The status bar keeps a SHORT sentinel
+    /// (`WORKSPACE_PICK_FAILED_STATUS`); the prose lands here, in the panel
+    /// the user is already looking at. Cleared when a new pick starts and
+    /// when the modal closes (`close_modal`) — it belongs to one Settings
+    /// session, not to the app.
+    workspace_pick_error: Option<String>,
     /// T4 review NIT-11: tab stops for the `WorkspaceMissing` modal's three
     /// choices. A BLOCKING dialog whose only exit is a mouse click leaves a
     /// keyboard-only user with nothing but the window close button, so the
@@ -5704,6 +5775,14 @@ impl AppView {
             cx.notify();
             return;
         }
+        // A new attempt supersedes the previous one's refusal text.
+        self.workspace_pick_error = None;
+        // T5 review MAJOR-1/MINOR-3: capture the generation this pick
+        // belongs to, exactly as `pick_workspace_for_recovery` does. The
+        // picker is modal to the app but the `classify()` below is NOT —
+        // it yields the UI thread, and Settings is Esc-closable, so every
+        // continuation arm from here on is a potential STALE write.
+        let my_generation = self.workspace_pick_generation;
         let dialog = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -5715,22 +5794,27 @@ impl AppView {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
                 Ok(Ok(_)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "výběr zrušen".to_string();
-                        cx.notify();
+                        view.set_workspace_pick_status(my_generation, "výběr zrušen".into(), cx);
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = format!("error: dialog selhal: {e}");
-                        cx.notify();
+                        view.set_workspace_pick_status(
+                            my_generation,
+                            format!("error: dialog selhal: {e}"),
+                            cx,
+                        );
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "error: dialog není dostupný".to_string();
-                        cx.notify();
+                        view.set_workspace_pick_status(
+                            my_generation,
+                            "error: dialog není dostupný".into(),
+                            cx,
+                        );
                     });
                     return;
                 }
@@ -5742,14 +5826,38 @@ impl AppView {
                 })
                 .await;
             let _ = this.update(cx, |view, cx| match outcome {
-                Ok(mode) => view.open_workspace_confirm(mode, Some(picked), cx),
+                Ok(mode) => view.open_workspace_confirm(mode, Some(picked), my_generation, cx),
+                // T5 review MINOR-2: the prose goes into the Settings
+                // panel, the status bar keeps a short sentinel.
                 Err(e) => {
-                    view.status = format!("error: {e}");
+                    if view.workspace_pick_generation != my_generation {
+                        return; // superseded — silent, like the Ok arm
+                    }
+                    view.workspace_pick_error = Some(e);
+                    view.status = connections_ui::WORKSPACE_PICK_FAILED_STATUS.to_string();
                     cx.notify();
                 }
             });
         })
         .detach();
+    }
+
+    /// A status write from `start_workspace_pick`'s continuation
+    /// (T5 review MINOR-3). Silent when superseded: a context swap means
+    /// the user has already reached a newer decision, and „výběr zrušen"
+    /// landing over „pracovní prostor: D:\ws" would be a stale write over
+    /// it. Same posture as `set_workspace_missing_error`'s no-op arm.
+    fn set_workspace_pick_status(
+        &mut self,
+        dispatched_generation: u64,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace_pick_generation != dispatched_generation {
+            return;
+        }
+        self.status = message;
+        cx.notify();
     }
 
     /// §W3.4's reverse switch — same gate, same confirm shape. Nothing in
@@ -5760,17 +5868,49 @@ impl AppView {
             cx.notify();
             return;
         }
-        self.open_workspace_confirm(connections_ui::WorkspaceConfirmMode::ToProfile, None, cx);
+        // Synchronous from the Settings click — nothing can have gone
+        // stale, so this pick's generation IS the current one.
+        let my_generation = self.workspace_pick_generation;
+        self.open_workspace_confirm(
+            connections_ui::WorkspaceConfirmMode::ToProfile,
+            None,
+            my_generation,
+            cx,
+        );
     }
 
+    /// Opens the confirm modal OVER the Settings modal it was started
+    /// from — behind the `workspace_pick_verdict` guard (T5 review
+    /// MAJOR-1). The precondition this function's older comment merely
+    /// ASSERTED is now CHECKED: the raw `self.modal = Some(..)` below is a
+    /// destructive write, and a stale classification landing on a
+    /// `WorkspaceConfirm { running: true }`, a `BackupRestore`, or a
+    /// half-typed `ConnectionDialog` would silently destroy it.
     fn open_workspace_confirm(
         &mut self,
         mode: connections_ui::WorkspaceConfirmMode,
         root: Option<PathBuf>,
+        dispatched_generation: u64,
         cx: &mut Context<Self>,
     ) {
-        // The Settings modal is what the user clicked from — replace it in
-        // place (the single-modal invariant holds: exactly one is open).
+        let settings_open = matches!(self.modal, Some(connections_ui::ModalState::Settings));
+        match workspace_pick_verdict(
+            settings_open,
+            dispatched_generation,
+            self.workspace_pick_generation,
+        ) {
+            WorkspacePickVerdict::Open => {}
+            // The user has already reached a newer, explicit decision.
+            WorkspacePickVerdict::Superseded => return,
+            WorkspacePickVerdict::OtherDialog => {
+                self.status = connections_ui::WORKSPACE_PICK_DISCARDED.to_string();
+                cx.notify();
+                return;
+            }
+        }
+        // Now verified: exactly one modal is open and it is Settings, the
+        // one this flow started from — replacing it in place keeps the
+        // single-modal invariant.
         self.modal = Some(connections_ui::ModalState::WorkspaceConfirm {
             mode,
             root,
@@ -9962,6 +10102,7 @@ fn main() {
                             vault_path,
                             workspace_root,
                             workspace_pick_generation: 0,
+                            workspace_pick_error: None,
                             workspace_choice_focus: [
                                 cx.focus_handle(),
                                 cx.focus_handle(),
@@ -11375,6 +11516,76 @@ mod workspace_startup_tests {
         ] {
             assert!(ok.config && ok.view_prefs && ok.param_values && ok.history);
         }
+    }
+}
+
+/// T5 review MAJOR-1: `start_workspace_pick`'s continuation guard. The
+/// three scenarios below are all reachable on the pre-fix code, because
+/// `classify()` runs in `cx.background_spawn` (it yields the UI thread)
+/// while `ModalState::Settings` is Esc-closable — so `open_workspace_confirm`
+/// could raw-assign over ANY modal the user reached meanwhile.
+#[cfg(test)]
+mod workspace_pick_guard_tests {
+    use super::*;
+
+    #[test]
+    fn a_current_pick_over_the_settings_modal_opens_the_confirm() {
+        assert_eq!(workspace_pick_verdict(true, 7, 7), WorkspacePickVerdict::Open);
+    }
+
+    /// SCENARIO (A) — the context changing after the user cancelled.
+    /// Pick folder A on a slow share → Esc closes Settings → re-open, pick
+    /// local folder B → confirm → `running = true`, B's init dispatched →
+    /// `classify(A)` finally returns. The generation has NOT bumped yet
+    /// (B's `apply_context` has not run), so it is the MODAL check that has
+    /// to catch this: without it, A's continuation overwrote the running
+    /// confirm with `running: false`, unlatching Esc/„Zrušit" while B's
+    /// init kept going toward an unconditional `apply_context(B)`.
+    #[test]
+    fn a_pick_landing_on_a_running_confirm_is_refused_not_committed() {
+        // Settings is not open — a `WorkspaceConfirm { running: true }` is.
+        assert_eq!(workspace_pick_verdict(false, 7, 7), WorkspacePickVerdict::OtherDialog);
+    }
+
+    /// SCENARIO (B) — a running `BackupRestore`. Same verdict, and the
+    /// point is what does NOT happen: no raw assign, so the one teardown
+    /// funnel that cancels a live `pg_restore` child (`close_modal` →
+    /// `cancel_active_backup_if_running`) is never bypassed.
+    ///
+    /// SCENARIO (C) — a half-typed `ConnectionDialog`. Same verdict; the
+    /// typed host/user/password survive. Both are the same predicate input
+    /// as (A): "the modal is not Settings".
+    #[test]
+    fn a_pick_landing_on_any_other_dialog_is_refused_with_a_status() {
+        for current in [0u64, 7, u64::MAX] {
+            assert_eq!(
+                workspace_pick_verdict(false, current, current),
+                WorkspacePickVerdict::OtherDialog
+            );
+        }
+    }
+
+    /// A superseded pick is refused SILENTLY — not with a status line.
+    /// The generation is checked first precisely so a pick that is both
+    /// stale AND in the wrong modal says nothing: the user has already
+    /// reached a newer explicit decision, and „výběr složky zahozen…"
+    /// landing over „pracovní prostor: D:\\ws" would be a stale write over
+    /// it. This is `recovery_pick_may_commit`'s posture.
+    #[test]
+    fn a_superseded_pick_is_silent_whatever_modal_is_open() {
+        assert_eq!(workspace_pick_verdict(true, 7, 8), WorkspacePickVerdict::Superseded);
+        assert_eq!(workspace_pick_verdict(false, 7, 8), WorkspacePickVerdict::Superseded);
+    }
+
+    /// Pins that the two refusals are DISTINCT states, not one bool. If a
+    /// future edit collapses them, either a superseded pick starts writing
+    /// status over a fresh context, or a wrong-modal pick goes silent and
+    /// the user never learns why nothing happened.
+    #[test]
+    fn the_two_refusals_are_not_interchangeable() {
+        assert_ne!(WorkspacePickVerdict::Superseded, WorkspacePickVerdict::OtherDialog);
+        assert_ne!(WorkspacePickVerdict::Open, WorkspacePickVerdict::OtherDialog);
+        assert_ne!(WorkspacePickVerdict::Open, WorkspacePickVerdict::Superseded);
     }
 }
 
