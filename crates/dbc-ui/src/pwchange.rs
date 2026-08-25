@@ -2,11 +2,6 @@
 //! žádné I/O; stejná disciplína jako admin_sql.rs). Detekce ze sentinel
 //! kódů, validace dialogu, české texty. Spec:
 //! docs/superpowers/specs/drafts/forced-password-change-design.md
-//!
-//! Allow dead_code na úrovni modulu: T2 přistává před T4/T5 konzumenty
-//! (dialog v connections_ui/main, enrich v on_test_clicked) — vše je
-//! unit-testované, ale ještě nevolané z main. Odstraní T5.
-#![allow(dead_code)]
 
 use dbc_core::QueryError;
 use dbc_state::Engine;

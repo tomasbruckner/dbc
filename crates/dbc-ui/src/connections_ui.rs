@@ -2110,6 +2110,7 @@ impl AppView {
                 cx.notify();
 
                 let rx = self.runner.test_connect(spec);
+                let engine = data.engine;
                 cx.spawn(async move |this, cx| {
                     let result = rx.await;
                     let _ = this.update(cx, |view, cx| {
@@ -2122,7 +2123,13 @@ impl AppView {
                                 ui.testing = false;
                                 ui.test_result = Some(match result {
                                     Ok(Ok(())) => Ok(format!("Připojeno ({engine_lbl})")),
-                                    Ok(Err(e)) => Err(e.to_string()),
+                                    // pwchange (spec §1): Test NIKDY neotvírá
+                                    // druhý modal (single-modal invariant) —
+                                    // detekovaná vynucená/expirovaná změna
+                                    // hesla jen obohatí text o nápovědu.
+                                    Ok(Err(e)) => {
+                                        Err(crate::pwchange::enrich_test_error(engine, &e))
+                                    }
                                     Err(_) => Err("connect zrušen".to_string()),
                                 });
                             }
