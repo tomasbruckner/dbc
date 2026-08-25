@@ -1,5 +1,7 @@
 # Scripts Library (Bruno model) Implementation Plan
 
+> **SCOPE WIDENED 2026-08-25 — do not execute this plan as-is.** The phase now covers a full git-versioned **workspace folder** (connections, settings, vault, prefs, scripts); the binding design is `docs/superpowers/specs/drafts/workspace-folder-design.md`. T1/T2 below are DONE (branches `sc-t1-config`, `sc-t2-fsmod`); T3–T6 remain valid with the `effective_scripts_root` seam (design §W8); a rewritten plan will supersede this file after design review.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Recommend **sonnet** implementers per task, a **sonnet** adversarial review per task, and a **default-model** final review once all tasks land (house staffing convention). NO docker, NO external server anywhere in this phase: every test is a pure `#[test]` over plain data or a `tempfile` directory.
 
 **Goal:** A Bruno-style scripts library — plain `.sql` files in one user-chosen folder, shown as a new pinned „Skripty" section in the sidebar: open into the (global) editor with Ctrl+S save + dirty tracking, create/rename/delete files and folders, and run a file through the UNCHANGED G12 script-run confirm flow. Git stays 100% external.
