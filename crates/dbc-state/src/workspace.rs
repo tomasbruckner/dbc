@@ -35,12 +35,22 @@ pub const WORKSPACE_FORMAT: u32 = 1;
 /// Shipped `.gitignore` (§W6.2). The `vault.bin` line is COMMENTED OUT on
 /// purpose: the user chose to version the vault, so the opt-out must be
 /// discoverable without being imposed.
+///
+/// The tmp rule is the BLANKET `*.tmp`, not an enumeration of extensions.
+/// [`crate::fsutil::write_atomic`] names its temporary sibling
+/// `<path>.tmp` for whatever it is given, so the set of suffixes that can
+/// appear is exactly "every file the app writes": `*.toml.tmp`,
+/// `*.bin.tmp`, `*.sql.tmp` (by far the most frequent — a crash during
+/// Ctrl+S in the scripts library), and even `.gitignore.tmp`. An
+/// enumeration silently stops covering the next store that is added;
+/// `*.tmp` cannot drift out of date, and the file is the user's to edit
+/// from the moment it is written.
 pub const GITIGNORE_TEMPLATE: &str = "# dbc workspace — pracovní prostor aplikace dbc.\n\
 # Git zde spravujete výhradně vy; aplikace s gitem nikdy nepracuje.\n\
 \n\
-# Dočasné soubory atomických zápisů (po pádu aplikace mohou zůstat):\n\
-*.toml.tmp\n\
-*.bin.tmp\n\
+# Dočasné soubory atomických zápisů (po pádu aplikace mohou zůstat).\n\
+# Aplikace je vždy pojmenuje <soubor>.tmp, proto jediné pravidlo:\n\
+*.tmp\n\
 \n\
 # DOPORUČENÍ: vault.bin je šifrovaný trezor hesel (Argon2id).\n\
 # Pokud ho NECHCETE verzovat (bezpečnější volba), odkomentujte\n\
@@ -154,10 +164,36 @@ pub fn workspace_paths(root: &Path) -> Paths {
     }
 }
 
-/// Reads the pointer. Absent file ⇒ `Ok(None)`; unparsable ⇒ `Err`.
+/// Reads the pointer. Genuinely ABSENT file ⇒ `Ok(None)`; unreadable or
+/// unparsable ⇒ `Err` (which [`resolve_at`] turns into
+/// [`Resolution::Broken`]).
+///
+/// The existence check is [`Path::try_exists`], NOT `Path::exists`:
+/// `exists()` collapses every `io::Error` into `false`, so a pointer that
+/// IS there but cannot be probed (deny-read ACL from a corporate GPO or a
+/// mis-applied `icacls`, a dangling reparse point) would read as "no
+/// pointer" and silently drop the user into profile mode — the exact
+/// fallback §W4 exists to prevent.
 pub fn read_pointer(pointer: &Path) -> Result<Option<PathBuf>, StateError> {
-    if !pointer.exists() {
-        return Ok(None);
+    read_pointer_probed(pointer, pointer.try_exists())
+}
+
+/// Testable seam for [`read_pointer`]: the existence probe is injected,
+/// so the "pointer is there but unreadable" branch can be pinned without
+/// needing a genuinely deny-read file on every platform CI runs on.
+fn read_pointer_probed(
+    pointer: &Path,
+    probe: std::io::Result<bool>,
+) -> Result<Option<PathBuf>, StateError> {
+    match probe {
+        Ok(false) => return Ok(None),
+        Ok(true) => {}
+        Err(e) => {
+            return Err(err(format!(
+                "ukazatel na pracovní prostor nelze ověřit ({}): {e}",
+                pointer.display()
+            )));
+        }
     }
     let raw = std::fs::read_to_string(pointer)?;
     let p: PointerFile = toml::from_str(&raw)
@@ -166,11 +202,30 @@ pub fn read_pointer(pointer: &Path) -> Result<Option<PathBuf>, StateError> {
 }
 
 /// Writes the pointer atomically (shared rail).
+///
+/// `root` must be ABSOLUTE and representable as UTF-8: the pointer is
+/// read back in a different process, from a different working directory,
+/// and the TOML body carries the path as a string. A relative or lossily
+/// convertible path would round-trip into a DIFFERENT folder, which is
+/// the silent-wrong-context direction — so it is refused at the rail
+/// instead of being papered over by `display().to_string()`.
 pub fn write_pointer(pointer: &Path, root: &Path) -> Result<(), StateError> {
+    if !root.is_absolute() {
+        return Err(err(format!(
+            "cesta k pracovnímu prostoru musí být absolutní: {}",
+            root.display()
+        )));
+    }
+    let Some(root_str) = root.to_str() else {
+        return Err(err(format!(
+            "cesta k pracovnímu prostoru obsahuje znaky, které nelze uložit: {}",
+            root.display()
+        )));
+    };
     if let Some(dir) = pointer.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let body = toml::to_string_pretty(&PointerFile { path: root.display().to_string() })
+    let body = toml::to_string_pretty(&PointerFile { path: root_str.to_string() })
         .map_err(|e| err(e.to_string()))?;
     write_atomic(pointer, body.as_bytes())
 }
@@ -187,7 +242,15 @@ pub fn clear_pointer(pointer: &Path) -> Result<(), StateError> {
 /// Classifies a picked folder WITHOUT writing anything.
 pub fn classify(root: &Path) -> Classification {
     if !root.is_dir() {
-        return Classification::Unreadable("složka neexistuje".to_string());
+        // "Not a directory" has three distinct causes and the user needs
+        // to be told WHICH: a path that is gone, a path that is a FILE
+        // (typing `…\ws\config.toml` into the picker), and a path that
+        // cannot be probed at all.
+        return match root.try_exists() {
+            Ok(true) => Classification::Unreadable("cesta není složka".to_string()),
+            Ok(false) => Classification::Unreadable("složka neexistuje".to_string()),
+            Err(e) => Classification::Unreadable(format!("složku nelze ověřit: {e}")),
+        };
     }
     let marker = root.join(MARKER_FILE);
     if marker.exists() {
@@ -196,8 +259,14 @@ pub fn classify(root: &Path) -> Classification {
             Err(e) => return Classification::Unreadable(format!("{MARKER_FILE}: {e}")),
         };
         return match toml::from_str::<Marker>(&raw) {
-            Ok(m) if m.format <= WORKSPACE_FORMAT => Classification::Workspace,
-            Ok(m) => Classification::FutureFormat(m.format),
+            // Formats are 1-based: no build ever wrote `format = 0`, so a
+            // zero is a hand-edited or truncated marker, NOT an old
+            // layout to be adopted silently.
+            Ok(m) if (1..=WORKSPACE_FORMAT).contains(&m.format) => Classification::Workspace,
+            Ok(m) if m.format > WORKSPACE_FORMAT => Classification::FutureFormat(m.format),
+            Ok(m) => {
+                Classification::Unreadable(format!("{MARKER_FILE}: neplatný formát {}", m.format))
+            }
             Err(e) => Classification::Unreadable(format!("{MARKER_FILE}: {e}")),
         };
     }
@@ -218,7 +287,15 @@ pub fn classify(root: &Path) -> Classification {
 
 /// Resolves the active context from a pointer file path (testable core).
 pub fn resolve_at(pointer: &Path) -> Resolution {
-    let root = match read_pointer(pointer) {
+    resolve_from_pointer(read_pointer(pointer))
+}
+
+/// The pointer-read → [`Resolution`] mapping, split out so the
+/// never-silently-`Profile` rail can be pinned for reads that no portable
+/// test can provoke on disk. `Ok(None)` — and ONLY `Ok(None)` — is
+/// profile mode.
+fn resolve_from_pointer(read: Result<Option<PathBuf>, StateError>) -> Resolution {
+    let root = match read {
         Ok(None) => return Resolution::Profile(profile_paths()),
         Ok(Some(r)) => r,
         Err(e) => return Resolution::Broken { root: None, reason: e.message },
@@ -262,9 +339,27 @@ fn copy_one(src: &Path, root: &Path, name: &str) -> Result<(), StateError> {
 /// Steps 1–4 of [`init_workspace`] — the copies, `scripts/` and the
 /// `.gitignore` — WITHOUT the marker. Separate so the marker-last
 /// ordering is a testable property, not a comment (§W3.2).
+///
+/// PRECONDITION, checked here and not merely by the caller:
+/// [`classify`] must say [`Classification::Empty`]. `copy_one` refuses to
+/// overwrite, but it refuses ONE file at a time — a destination holding
+/// only `params.toml` would pass the first two copies and fail on the
+/// third, leaving `config.toml` and a full copy of the encrypted
+/// `vault.bin` scattered in a folder the user may not be tracking.
+/// Nothing is destroyed, but a stray vault copy is not debris we get to
+/// leave behind. The guard is the rail BEHIND the caller's own check, so
+/// a future second caller cannot reintroduce the hole.
 pub fn init_contents(root: &Path, from: &Paths) -> Result<(), StateError> {
-    if !root.is_dir() {
-        return Err(err("složka neexistuje"));
+    match classify(root) {
+        Classification::Empty => {}
+        // Preserves the pre-existing "složka neexistuje" wording for a
+        // missing root (and now says something truer for a file/probe
+        // failure).
+        Classification::Unreadable(m) => return Err(err(m)),
+        Classification::Workspace | Classification::FutureFormat(_) => {
+            return Err(err("složka už je pracovní prostor"));
+        }
+        Classification::NonEmpty => return Err(err("složka není prázdná")),
     }
     copy_one(&from.config, root, "config.toml")?;
     copy_one(&from.vault, root, "vault.bin")?;
@@ -444,6 +539,107 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_pointer_is_broken_never_profile() {
+        // THE rail (design §W4). `Path::exists()` collapses EVERY io::Error
+        // into `false`, so a pointer that is on disk but cannot be probed
+        // (deny-read ACL from a corporate GPO, a mis-applied `icacls`, a
+        // dangling reparse point) used to read as "no pointer at all" and
+        // hand the user profile-mode connections without a single word —
+        // one muscle-memory click from the wrong „prod". No portable test
+        // can create such a file on every platform, so the probe is
+        // injected at the seam; what is pinned is that an `Err` NEVER
+        // becomes `Profile`.
+        let td = tempfile::tempdir().unwrap();
+        let ptr = td.path().join("workspace.toml");
+        let denied = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Access is denied. (os error 5)",
+        );
+
+        let read = read_pointer_probed(&ptr, Err(denied));
+        let e = read.as_ref().unwrap_err();
+        assert!(e.message.contains("nelze ověřit"), "{}", e.message);
+        assert!(e.message.contains("workspace.toml"), "must name the pointer: {}", e.message);
+
+        match resolve_from_pointer(read) {
+            Resolution::Broken { root, reason } => {
+                assert_eq!(root, None);
+                assert!(reason.contains("nelze ověřit"), "{reason}");
+            }
+            other => panic!("an unreadable pointer must NEVER resolve to Profile, got {other:?}"),
+        }
+
+        // And the two probe outcomes that are NOT errors still behave.
+        assert_eq!(read_pointer_probed(&ptr, Ok(false)).unwrap(), None);
+        assert!(matches!(
+            resolve_from_pointer(read_pointer_probed(&ptr, Ok(false))),
+            Resolution::Profile(_)
+        ));
+    }
+
+    #[test]
+    fn a_pointer_that_is_a_directory_is_broken_not_profile() {
+        // The same rail, provoked for real and portably: the pointer path
+        // EXISTS (so `try_exists` says true) but `read_to_string` cannot
+        // read it.
+        let td = tempfile::tempdir().unwrap();
+        let ptr = td.path().join("workspace.toml");
+        std::fs::create_dir(&ptr).unwrap();
+        assert!(read_pointer(&ptr).is_err(), "a directory pointer must not read as None");
+        assert!(
+            matches!(resolve_at(&ptr), Resolution::Broken { .. }),
+            "expected Broken, never Profile"
+        );
+    }
+
+    #[test]
+    fn write_pointer_refuses_a_relative_root() {
+        // The pointer is read back from another process with another CWD:
+        // a relative path would round-trip into a DIFFERENT folder.
+        let td = tempfile::tempdir().unwrap();
+        let ptr = td.path().join("workspace.toml");
+        let e = write_pointer(&ptr, Path::new("ws")).unwrap_err();
+        assert!(e.message.contains("absolutní"), "{}", e.message);
+        assert!(!ptr.exists(), "nothing may be written for a refused root");
+        // Refused at the rail ⇒ still no pointer ⇒ still profile mode.
+        assert!(matches!(resolve_at(&ptr), Resolution::Profile(_)));
+    }
+
+    #[test]
+    fn a_pointer_aimed_at_a_file_says_so_instead_of_composing_neexistuje() {
+        let td = tempfile::tempdir().unwrap();
+        let target = td.path().join("config.toml");
+        std::fs::write(&target, "").unwrap();
+        assert_eq!(classify(&target), Classification::Unreadable("cesta není složka".to_string()));
+        let ptr = td.path().join("workspace.toml");
+        write_pointer(&ptr, &target).unwrap();
+        match resolve_at(&ptr) {
+            Resolution::Broken { root, reason } => {
+                assert_eq!(root, Some(target));
+                assert_eq!(reason, "cesta není složka");
+            }
+            other => panic!("expected Broken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_zero_is_not_a_workspace() {
+        // No build ever wrote `format = 0`; a zero is a hand-edited or
+        // truncated marker, not an older layout to adopt silently.
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join(MARKER_FILE), "format = 0\n").unwrap();
+        assert_eq!(
+            classify(&root),
+            Classification::Unreadable(format!("{MARKER_FILE}: neplatný formát 0"))
+        );
+        let ptr = td.path().join("workspace.toml");
+        write_pointer(&ptr, &root).unwrap();
+        assert!(matches!(resolve_at(&ptr), Resolution::Broken { .. }));
+    }
+
+    #[test]
     fn classify_empty_and_dot_only_folders_are_empty() {
         let td = tempfile::tempdir().unwrap();
         let a = td.path().join("a");
@@ -545,24 +741,35 @@ mod tests {
 
     #[test]
     fn a_failing_init_writes_no_marker() {
-        // Deterministic failure injection: `scripts` already exists as a FILE,
-        // so `create_dir` fails mid-init.
+        // Deterministic failure injection AFTER the Empty precondition: the
+        // destination is genuinely empty, but the SOURCE `config.toml` is a
+        // directory, so `copy_one`'s `fs::read` fails mid-init. (The old
+        // injection — `scripts` pre-existing as a file — is now caught one
+        // step earlier by the precondition, so it no longer reaches the
+        // marker-ordering code this test is about.)
         let td = tempfile::tempdir().unwrap();
         let prof = td.path().join("profile");
         std::fs::create_dir(&prof).unwrap();
-        let from = fake_profile(&prof);
+        let mut from = fake_profile(&prof);
+        std::fs::create_dir(prof.join("config-dir")).unwrap();
+        from.config = prof.join("config-dir");
         let root = td.path().join("ws");
         std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join(SCRIPTS_SUBDIR), b"not a directory").unwrap();
 
         assert!(init_workspace(&root, &from).is_err());
         assert!(!root.join(MARKER_FILE).exists());
         assert_ne!(classify(&root), Classification::Workspace);
-        assert!(from.config.exists() && from.vault.exists());
+        assert!(from.vault.exists());
     }
 
     #[test]
     fn init_refuses_to_overwrite_an_existing_file_case_insensitively() {
+        // TWO rails now stand between an init and a user's file: the
+        // `classify(root) == Empty` precondition (which fires first, before
+        // ANY byte is written) and `copy_one`'s case-insensitive
+        // `entry_exists_ci` refusal behind it (pinned directly in
+        // `fsutil::tests`). What this test owns is the OUTCOME: the user's
+        // `Config.TOML` survives byte-identical and no marker appears.
         let td = tempfile::tempdir().unwrap();
         let prof = td.path().join("profile");
         std::fs::create_dir(&prof).unwrap();
@@ -574,6 +781,54 @@ mod tests {
         assert!(init_workspace(&root, &from).is_err());
         assert_eq!(std::fs::read_to_string(root.join("Config.TOML")).unwrap(), "PRECIOUS");
         assert!(!root.join(MARKER_FILE).exists());
+    }
+
+    #[test]
+    fn init_into_a_non_empty_folder_leaves_no_debris_not_even_a_vault_copy() {
+        // The finding this pins: without the `Empty` precondition, a
+        // destination whose only clash is `params.toml` sails through the
+        // config.toml and vault.bin copies and only THEN fails — leaving a
+        // full copy of the encrypted vault in a folder the user may not be
+        // tracking. Nothing is destroyed either way; the point is that
+        // nothing is SCATTERED either.
+        let td = tempfile::tempdir().unwrap();
+        let prof = td.path().join("profile");
+        std::fs::create_dir(&prof).unwrap();
+        let from = fake_profile(&prof);
+        let root = td.path().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("params.toml"), "MOJE").unwrap();
+
+        let e = init_workspace(&root, &from).unwrap_err();
+        assert_eq!(e.message, "složka není prázdná");
+
+        assert!(!root.join("config.toml").exists(), "config.toml debris");
+        assert!(!root.join("vault.bin").exists(), "VAULT COPY debris");
+        assert!(!root.join("views.toml").exists());
+        assert!(!root.join(SCRIPTS_SUBDIR).exists());
+        assert!(!root.join(GITIGNORE_FILE).exists());
+        assert!(!root.join(MARKER_FILE).exists());
+        // The one file that was there is untouched.
+        assert_eq!(std::fs::read_to_string(root.join("params.toml")).unwrap(), "MOJE");
+        // Exactly one entry in the folder: the user's own.
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn init_refuses_a_folder_that_is_already_a_workspace() {
+        let td = tempfile::tempdir().unwrap();
+        let prof = td.path().join("profile");
+        std::fs::create_dir(&prof).unwrap();
+        let from = fake_profile(&prof);
+        let root = td.path().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        write_marker(&root).unwrap();
+
+        assert_eq!(
+            init_workspace(&root, &from).unwrap_err().message,
+            "složka už je pracovní prostor"
+        );
+        assert!(!root.join("vault.bin").exists());
     }
 
     #[test]
@@ -610,9 +865,9 @@ mod tests {
             "# dbc workspace — pracovní prostor aplikace dbc.\n\
              # Git zde spravujete výhradně vy; aplikace s gitem nikdy nepracuje.\n\
              \n\
-             # Dočasné soubory atomických zápisů (po pádu aplikace mohou zůstat):\n\
-             *.toml.tmp\n\
-             *.bin.tmp\n\
+             # Dočasné soubory atomických zápisů (po pádu aplikace mohou zůstat).\n\
+             # Aplikace je vždy pojmenuje <soubor>.tmp, proto jediné pravidlo:\n\
+             *.tmp\n\
              \n\
              # DOPORUČENÍ: vault.bin je šifrovaný trezor hesel (Argon2id).\n\
              # Pokud ho NECHCETE verzovat (bezpečnější volba), odkomentujte\n\

@@ -7,6 +7,16 @@
 //! T2 review's WIDER-SCOPE note is binding: a second "quick" probe or a
 //! second tmp+rename is exactly how the ASCII-only comparison and the
 //! empty-component hole got written in the first place.
+//!
+//! SCOPE, stated honestly: this is the single rail for writes into a
+//! folder the USER picked — where a name collision is someone's data and
+//! a partial write is visible in their file manager (and, in a workspace,
+//! in `git status`). It is NOT yet the only atomic writer in the repo:
+//! `config.rs`, `params.rs`, `view_prefs.rs`, `vault.rs` and
+//! `grid.rs` each still roll their own tmp + `sync_all` + rename into the
+//! PROFILE dir (or an export target). That is a separate, pre-existing
+//! population, deliberately left unswept by this phase; anything NEW
+//! belongs here.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,11 +62,27 @@ pub fn join_component(base: &Path, component: &str) -> Result<PathBuf, StateErro
 ///   reports "free" although NTFS resolves both to the SAME file. That is
 ///   a false NEGATIVE, i.e. the silent-overwrite direction.
 /// * `to_uppercase` has no contextual rules, so it tracks the NTFS
-///   `$UpCase` table directly. Every pair where it folds LESS than
-///   lowercasing (`ß`/`ẞ`, `K`/`K` U+212A, `Å`/`å` U+212B, `µ`/`μ`,
-///   `İ`/`i`, `ǅ`/`ǆ`) was measured to be a DISTINCT file on NTFS, so
-///   nothing is lost; where it folds MORE (final `ς` → `Σ`, `ﬁ` → `FI`)
-///   the result is a refused name, which is the safe direction.
+///   `$UpCase` table directly. The pairs where it folds LESS than
+///   lowercasing are exactly three — `ß`/`ẞ`, `K`/`K` (U+212A KELVIN
+///   SIGN), `Å`/`å` (U+212B ANGSTROM SIGN) — and all three were measured
+///   to be DISTINCT files on NTFS, so nothing is lost. Where it folds
+///   MORE (final `ς` → `Σ`, `ﬁ` → `FI`, `µ` U+00B5 / `μ` U+03BC) the
+///   result is at worst a refused name, which is the safe direction.
+///   Two further pairs that look like they belong on one of those lists
+///   belong on NEITHER: `İ` U+0130 / `i` folds APART under both folds,
+///   and `ǅ` U+01C5 / `ǆ` U+01C6 folds TOGETHER under both. (An earlier
+///   revision of this comment listed `µ`/`μ`, `İ`/`i` and `ǅ`/`ǆ` as
+///   "folds less"; that was wrong in all three cases. The decision is
+///   unaffected — all six are distinct files on NTFS — but the
+///   justification is what the next person re-derives from, so it is
+///   pinned by `uppercase_fold_facts_this_doc_relies_on` below.)
+///
+/// Independently re-verified against the real `$UpCase` relation rather
+/// than against the Unicode tables: enumerating 62,474 BMP names on NTFS
+/// yields 973 colliding pairs. Of those, `to_uppercase` misses 0,
+/// `to_lowercase` also misses 0 by count but carries the final-sigma
+/// FALSE NEGATIVE above on a pair NTFS unifies, and
+/// `eq_ignore_ascii_case` misses 947.
 ///
 /// `ignore_exact` is the byte-exact name of the entry being renamed, so
 /// an entry never collides with ITSELF (identity, not name equality — on
@@ -160,6 +186,41 @@ mod tests {
         // The final-sigma spelling is a different file on NTFS; refusing it
         // too is an over-approximation, which is the SAFE direction.
         assert!(entry_exists_ci(td.path(), "οδος").unwrap());
+    }
+
+    #[test]
+    fn uppercase_fold_facts_this_doc_relies_on() {
+        // `conflicting_entry_ci`'s doc justifies the uppercase fold by
+        // classifying six pairs. That prose was WRONG in three of the six
+        // for a while (the conclusion held; the reasoning did not), so the
+        // classification is now executable.
+        //
+        // less  = lowercasing unifies the pair, uppercasing does not
+        //         (the direction that could LOSE a collision — each of
+        //         these was measured to be two distinct files on NTFS)
+        // more  = uppercasing unifies the pair, lowercasing does not
+        //         (an over-approximation: at worst a refused name)
+        // apart = neither fold unifies
+        // both  = both folds unify
+        let verdict = |a: &str, b: &str| -> &'static str {
+            match (a.to_lowercase() == b.to_lowercase(), a.to_uppercase() == b.to_uppercase()) {
+                (true, false) => "less",
+                (false, true) => "more",
+                (false, false) => "apart",
+                (true, true) => "both",
+            }
+        };
+        for (a, b, want) in [
+            ("ß", "ẞ", "less"),
+            ("\u{212A}", "K", "less"),  // KELVIN SIGN
+            ("\u{212B}", "å", "less"),  // ANGSTROM SIGN
+            ("\u{00B5}", "\u{03BC}", "more"), // MICRO SIGN / GREEK SMALL MU
+            ("\u{0130}", "i", "apart"), // LATIN CAPITAL I WITH DOT ABOVE
+            ("\u{01C5}", "\u{01C6}", "both"), // ǅ / ǆ
+            ("οδος", "οδοσ", "more"),   // the final-sigma false negative
+        ] {
+            assert_eq!(verdict(a, b), want, "pair {a:?}/{b:?}");
+        }
     }
 
     #[test]

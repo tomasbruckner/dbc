@@ -89,8 +89,13 @@ fn list_dir_sorted(dir: &Path, rel_prefix: &str, depth: usize) -> Result<Vec<Scr
             files.push(name);
         }
     }
-    folders.sort_by_key(|n| n.to_lowercase());
-    files.sort_by_key(|n| n.to_lowercase());
+    // Display-only ordering, but it uses the SAME fold as the collision
+    // probe (`fsutil::conflicting_entry_ci`, `to_uppercase`). Two names
+    // the probe calls identical must not sort apart here, and one file
+    // with two disagreeing folds is how the next reader learns the wrong
+    // rule.
+    folders.sort_by_key(|n| n.to_uppercase());
+    files.sort_by_key(|n| n.to_uppercase());
     let make = |name: String, is_dir: bool| {
         let rel = if rel_prefix.is_empty() { name } else { format!("{rel_prefix}/{name}") };
         ScriptEntry { rel, is_dir, depth }
