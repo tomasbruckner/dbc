@@ -657,20 +657,34 @@ pub enum DbListState {
 }
 
 /// Lazy-scan state machine for the scripts library (Part S §3.3) — the same
-/// family as `DbListState`, `generation` guarding against a stale in-flight
-/// scan clobbering a newer dispatch. There is exactly ONE of these on
-/// `SchemaTree`: the library is global, not per-connection (Part S §1.1).
+/// family as `DbListState`. There is exactly ONE of these on `SchemaTree`:
+/// the library is global, not per-connection (Part S §1.1).
+///
+/// DELIBERATE DEVIATION from the plan's published shape (workspace plan
+/// §Task 3, scripts plan line 656), which spelled this
+/// `Loading { generation: u64 }` by analogy with `DbListState`: **`Loading`
+/// here is a UNIT variant.** The analogy does not carry, because the two
+/// state machines are not shaped the same. `DbListState` lives per
+/// connection in a map, so its `generation` must travel WITH the slot for
+/// `apply_db_list_result` to compare against. `ScriptsListState` is a
+/// single field beside a single `SchemaTree::scripts_generation` counter,
+/// and `finish_scripts_scan` compares the caller's generation against THAT
+/// counter — which is sufficient across all three interleavings (result
+/// lands while Loading; result lands after a newer `begin`; result lands
+/// after `reset_scripts`, which also bumps the counter). A copy inside the
+/// variant would be pure redundancy, and it was never readable: it carried
+/// an `#[allow(dead_code)]` naming Task 7 as removal owner, but Task 7
+/// cannot fulfil that — `emit_scripts_section` matches `Loading { .. }` and
+/// discards it, and Task 7's own `start_scripts_scan` uses
+/// `begin_scripts_scan`'s RETURN value as the generation and never
+/// destructures the variant. The attribute would have become permanent, so
+/// the field is gone instead.
+///
+/// TASK 7, READ THIS: construct `ScriptsListState::Loading` with no fields.
+/// Nothing else about the scan contract changed.
 pub enum ScriptsListState {
     NotLoaded,
-    Loading {
-        /// The dispatch this `Loading` belongs to. Written by
-        /// `begin_scripts_scan`; the staleness comparison itself reads
-        /// `SchemaTree::scripts_generation`, so nothing reads this copy
-        /// until the flip. DARK UNTIL TASK 7 — removal owner: Task 7 (the
-        /// scripts flip), whose sidebar render surfaces it.
-        #[allow(dead_code)]
-        generation: u64,
-    },
+    Loading,
     Error(String),
     Loaded { entries: Vec<crate::scripts::ScriptEntry>, truncated: bool, depth_clipped: bool },
 }
@@ -1004,19 +1018,51 @@ fn script_ancestors_expanded(
 /// this very pass can itself be dropped (nested misses collapse fully) —
 /// the `flatten_sidebar` childless-row idiom, adapted to a depth-first
 /// splice where children always follow their parent at a greater depth.
+/// ONE backward pass building a keep-mask, then ONE `retain` — NOT
+/// `Vec::remove` per drop. `flatten_sidebar` is re-run from scratch on
+/// every frame, so this is on the keystroke path of the speed search:
+/// with `SCRIPTS_ENTRY_CAP = 2000` folder-heavy rows and a filter that
+/// matches nothing, per-removal shifting is ~2M tuple moves PER FRAME.
+/// This is O(n) in the number of rows regardless of how many are dropped.
+///
+/// `next_kept_depth` is the depth of the nearest row after `i` that
+/// SURVIVES — i.e. the row that will physically follow `i` once the
+/// `retain` compacts the vec. That is what makes the nested collapse work:
+/// a folder whose only child was itself just pruned correctly reads as
+/// childless, exactly as the immediate-`remove` version did.
 fn prune_childless_script_folders(rows: &mut Vec<SidebarFlatRow>, first: usize, filter_lc: &str) {
+    if first >= rows.len() {
+        return;
+    }
+    let mut keep = vec![true; rows.len()];
+    let mut next_kept_depth: Option<usize> = None;
+    let mut dropped = false;
     let mut i = rows.len();
     while i > first {
         i -= 1;
         let (row, depth, label, _) = &rows[i];
-        if !matches!(row, SidebarRow::ScriptFolder { .. }) {
-            continue;
+        let has_child = next_kept_depth.is_some_and(|d| d > *depth);
+        if matches!(row, SidebarRow::ScriptFolder { .. })
+            && !has_child
+            && !name_matches(label, filter_lc)
+        {
+            keep[i] = false;
+            dropped = true;
+            continue; // dropped rows do not become anyone's `next_kept`
         }
-        let has_child = rows.get(i + 1).is_some_and(|(_, d, _, _)| *d > *depth);
-        if !has_child && !name_matches(label, filter_lc) {
-            rows.remove(i);
-        }
+        next_kept_depth = Some(*depth);
     }
+    if !dropped {
+        return;
+    }
+    // `Vec::retain` visits every element exactly once in the original
+    // order, so a positional counter is a faithful mask application.
+    let mut ix = 0usize;
+    rows.retain(|_| {
+        let k = keep[ix];
+        ix += 1;
+        k
+    });
 }
 
 /// Emits the pinned „Skripty" section (Part S §3.3/§3.4). Pure, GPUI-free,
@@ -1043,7 +1089,7 @@ pub fn emit_scripts_section(
     match state {
         // The expand handler is dispatching the scan; nothing to show yet.
         ScriptsListState::NotLoaded => {}
-        ScriptsListState::Loading { .. } => notice(out, "Načítám skripty…".to_string(), false),
+        ScriptsListState::Loading => notice(out, "Načítám skripty…".to_string(), false),
         // The `error:` prefix is the Notice COLOR SENTINEL (the row render
         // dispatches on it literally) — never reword it away.
         ScriptsListState::Error(e) => notice(out, format!("error: {e}"), false),
@@ -1427,8 +1473,11 @@ pub struct SchemaTree {
     /// removal owner: Task 7.
     #[allow(dead_code)]
     scripts_configured: bool,
-    /// Stale-scan guard, the `DbListState::Loading { generation }` shape.
-    /// DARK UNTIL TASK 7 — removal owner: Task 7.
+    /// Stale-scan guard: the SOLE generation counter for the library. The
+    /// per-slot copy `DbListState::Loading { generation }` carries has no
+    /// counterpart here on purpose — see `ScriptsListState`.
+    /// DARK UNTIL TASK 7 — removal owner: Task 7 (which starts calling
+    /// `begin_scripts_scan` / `finish_scripts_scan` from `main.rs`).
     #[allow(dead_code)]
     scripts_generation: u64,
 }
@@ -2117,7 +2166,7 @@ impl SchemaTree {
     /// must hand back to `finish_scripts_scan` (older results are dropped).
     pub fn begin_scripts_scan(&mut self, cx: &mut Context<Self>) -> u64 {
         self.scripts_generation = self.scripts_generation.wrapping_add(1);
-        self.scripts = ScriptsListState::Loading { generation: self.scripts_generation };
+        self.scripts = ScriptsListState::Loading;
         cx.notify();
         self.scripts_generation
     }
@@ -3366,7 +3415,7 @@ mod sidebar_tests {
 
     #[test]
     fn loading_and_error_states_render_their_own_notice_rows() {
-        let rows = emit(&ScriptsListState::Loading { generation: 3 }, true, &[OuterId::Scripts], "");
+        let rows = emit(&ScriptsListState::Loading, true, &[OuterId::Scripts], "");
         assert_eq!(rows[1].2, "Načítám skripty…");
         let rows =
             emit(&ScriptsListState::Error("složka zmizela".into()), true, &[OuterId::Scripts], "");
@@ -3452,6 +3501,32 @@ mod sidebar_tests {
     }
 
     #[test]
+    fn a_filter_matching_nothing_collapses_a_nested_tree_all_the_way_up() {
+        // Regression pin for the keep-mask rewrite of
+        // `prune_childless_script_folders`. The old version called
+        // `Vec::remove` immediately, so a parent examined later simply saw
+        // the shortened vec; the mask version has to reason about the
+        // nearest SURVIVING row instead. Three levels, nothing matching:
+        // the file goes, then `b` (now childless), then `a`.
+        let state = loaded_scripts(&[("a", true, 0), ("a/b", true, 1), ("a/b/x.sql", false, 2)]);
+        let rows = emit(&state, true, &[OuterId::Scripts], "zzz");
+        let labels: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(labels, vec!["Skripty"]);
+    }
+
+    #[test]
+    fn a_pruned_folder_does_not_hide_its_parents_surviving_sibling() {
+        // The other half of the mask contract: a dropped row must NOT
+        // become the "next row" anybody reads its depth from, but the row
+        // BEHIND it still counts as `a`'s child.
+        let state =
+            loaded_scripts(&[("a", true, 0), ("a/b", true, 1), ("a/c.sql", false, 1)]);
+        let rows = emit(&state, true, &[OuterId::Scripts], "c.sql");
+        let labels: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(labels, vec!["Skripty", "a", "c.sql"]);
+    }
+
+    #[test]
     fn cap_notices_render_after_the_entries() {
         let state = ScriptsListState::Loaded {
             entries: script_entries(&[("a.sql", false, 0)]),
@@ -3472,8 +3547,16 @@ mod sidebar_tests {
     }
 
     #[test]
-    fn flatten_sidebar_with_none_scripts_is_byte_identical_to_before() {
-        // The DARK contract: Task 3 changes nothing on screen.
+    fn none_scripts_yields_exactly_some_scripts_minus_the_section_header() {
+        // The DARK contract: Task 3 changes nothing on screen. What THIS
+        // test pins is the narrower, exact statement in its name — `None`
+        // emits no `ScriptsRoot` and is otherwise element-for-element the
+        // `Some(..)` flatten with its header removed. The broader "nothing
+        // else in the sidebar moved" claim is carried by the ~20
+        // pre-existing `flatten_sidebar` tests above (favourites ordering,
+        // admin entry, db-list Loading/Error notices, filter shapes,
+        // multi-root ordering), which pass unchanged with the new
+        // parameter defaulted to `None`.
         let conns = vec![conn_cfg("c1", "Prod", &[], Engine::Postgres, "sales")];
         let with_none = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
             &HashSet::new(), "", None, &[], AdminEntry::Hidden, None);
