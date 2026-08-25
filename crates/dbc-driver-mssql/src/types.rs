@@ -42,18 +42,36 @@ pub fn map_row_count(row_count: Option<usize>) -> Result<u64, QueryError> {
 /// sentinel, matching `pg_err`'s `57014` special case, so UI-level cancel
 /// handling doesn't need to special-case this driver even when a
 /// server/driver-side cancel (rather than this driver's own cooperative
-/// check) is what produced the error. Variants without a diagnostic record
+/// check) is what produced the error. Login errors 18487/18488 (expired /
+/// MUST_CHANGE password, SQLSTATE 28000) are similarly normalized to
+/// [`PASSWORD_CHANGE_REQUIRED_CODE`] — see that const's doc. Variants
+/// without a diagnostic record
 /// (`NoDiagnostics`, `FailedAllocatingEnvironment`, ...) get `code: None`.
 pub fn odbc_err(e: odbc_api::Error) -> QueryError {
     let code = match &e {
         odbc_api::Error::Diagnostics { record, .. } => {
             let state = record.state.as_str();
-            Some(if state == "HY008" { "cancelled".to_string() } else { state.to_string() })
+            Some(if state == "HY008" {
+                "cancelled".to_string()
+            } else if state == "28000" && matches!(record.native_error, 18487 | 18488) {
+                PASSWORD_CHANGE_REQUIRED_CODE.to_string()
+            } else {
+                state.to_string()
+            })
         }
         _ => None,
     };
     QueryError { code, message: e.to_string(), position: None }
 }
+
+/// Sentinel `QueryError.code` pro „server vyžaduje změnu hesla" — login
+/// chyby 18488 (MUST_CHANGE flag) a 18487 (expirované heslo), obě se
+/// SQLSTATE 28000 sdíleným s obyčejným špatným heslem (18456); rozlišení
+/// nese pouze `record.native_error`. UI (dbc-ui::pwchange) na sentinelu
+/// staví nabídku změny hesla; stejná normalizační konvence jako
+/// `"cancelled"` výše — nikdy nesmí chytit 18456, jinak by aplikace
+/// nabízela změnu hesla na každý překlep.
+pub const PASSWORD_CHANGE_REQUIRED_CODE: &str = "password_change_required";
 
 /// Standard "operation was cooperatively cancelled" error, matching the
 /// `code: Some("cancelled")` convention the sqlite/postgres drivers use so
@@ -72,6 +90,34 @@ mod tests {
             record: Record { state: State(*state), native_error: 207, message: Vec::new() },
             function: "SQLExecDirect",
         }
+    }
+
+    fn diagnostics_error_native(state: &[u8; 5], native_error: i32) -> odbc_api::Error {
+        odbc_api::Error::Diagnostics {
+            record: Record { state: State(*state), native_error, message: Vec::new() },
+            function: "SQLDriverConnect",
+        }
+    }
+
+    /// Vynucená změna hesla (spec §0): 18488 (MUST_CHANGE) i 18487
+    /// (expirované) přicházejí se SQLSTATE 28000 — stejně jako obyčejné
+    /// špatné heslo (18456). Rozlišení nese POUZE native_error, který
+    /// odbc_err dosud zahazoval; normalizace na sentinel zrcadlí
+    /// existující HY008 → "cancelled".
+    #[test]
+    fn odbc_err_maps_must_change_and_expired_to_sentinel() {
+        for native in [18487, 18488] {
+            let mapped = odbc_err(diagnostics_error_native(b"28000", native));
+            assert_eq!(mapped.code.as_deref(), Some(PASSWORD_CHANGE_REQUIRED_CODE));
+        }
+    }
+
+    /// Obyčejné login selhání (18456) sentinel dostat NESMÍ — jinak by
+    /// UI nabízelo změnu hesla na každý překlep.
+    #[test]
+    fn odbc_err_keeps_plain_login_failure_as_28000() {
+        let mapped = odbc_err(diagnostics_error_native(b"28000", 18456));
+        assert_eq!(mapped.code.as_deref(), Some("28000"));
     }
 
     #[test]

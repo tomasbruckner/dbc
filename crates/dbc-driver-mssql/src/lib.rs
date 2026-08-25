@@ -137,6 +137,7 @@
 //! path, not as a general substitute for `query()`.
 
 mod config;
+mod password;
 mod schema;
 mod types;
 mod wide;
@@ -153,6 +154,8 @@ use dbc_core::{
 use odbc_api::{ConnectionOptions, Cursor, Environment, ResultSetMetadata};
 
 pub use config::{escape_odbc_value, MssqlConfig};
+pub use password::change_password_at_connect;
+pub use types::PASSWORD_CHANGE_REQUIRED_CODE;
 
 use types::{cancelled_err, map_row_count, odbc_err};
 

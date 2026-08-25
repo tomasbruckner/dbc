@@ -512,6 +512,25 @@ pub fn alter_password(engine: Engine, name: &str, password: &str) -> Vec<WriteSt
     }
 }
 
+/// Záchrana expirovaného/vynuceného hesla (pwchange, spec §3) — pg-only:
+/// MSSQL se zachraňuje driver-level při loginu
+/// (`dbc_driver_mssql::change_password_at_connect`, žádné SQL),
+/// SQLite/DuckDB auth nemají. `VALID UNTIL 'infinity'` je pevná součást:
+/// bez ní změna hesla expiraci nezruší (živě ověřeno, spec §0) a
+/// „záchrana" by nezachránila. Stejný display/exec redakční pár jako
+/// [`alter_password`].
+pub fn alter_password_rescue_pg(name: &str, password: &str) -> WriteStatement {
+    let ident = quote_ident_for(Engine::Postgres, name);
+    WriteStatement {
+        exec_sql: format!(
+            "ALTER ROLE {ident} PASSWORD {} VALID UNTIL 'infinity'",
+            sql_string_literal(password)
+        ),
+        display_sql: format!("ALTER ROLE {ident} PASSWORD {REDACTED} VALID UNTIL 'infinity'"),
+        expected_affected: None,
+    }
+}
+
 /// pg: DROP ROLE (1). MSSQL: DROP USER + DROP LOGIN (2). SQLite: empty.
 pub fn drop_role(engine: Engine, name: &str) -> Vec<WriteStatement> {
     let ident = quote_ident_for(engine, name);
@@ -743,6 +762,25 @@ mod mutation_tests {
         // G15 T8 fix: MSSQL password literals get the N'' prefix now.
         assert_eq!(ms[0].exec_sql, "ALTER LOGIN [bob] WITH PASSWORD = N'tajne'");
         assert_eq!(ms[0].display_sql, "ALTER LOGIN [bob] WITH PASSWORD = '***'");
+    }
+
+    /// Spec §0 (živě ověřeno): samotné ALTER ROLE … PASSWORD expiraci
+    /// NEZRUŠÍ — rolvaliduntil zůstává v minulosti a login dál padá.
+    /// Záchrana proto VŽDY nese VALID UNTIL 'infinity'. Redakční pár
+    /// stejný jako alter_password (byte-for-byte parallel construction).
+    #[test]
+    fn alter_password_rescue_pg_resets_valid_until_and_redacts() {
+        let ws = alter_password_rescue_pg("bob", "taj'ne");
+        assert_eq!(ws.exec_sql, "ALTER ROLE \"bob\" PASSWORD 'taj''ne' VALID UNTIL 'infinity'");
+        assert_eq!(ws.display_sql, "ALTER ROLE \"bob\" PASSWORD '***' VALID UNTIL 'infinity'");
+        assert!(!ws.display_sql.contains("taj"));
+        assert_eq!(ws.expected_affected, None);
+        // Hand-written Debug (BLOCKER 1 carry-forward) kryje i tento builder.
+        let debug = format!("{ws:?}");
+        assert!(!debug.contains("taj"), "Debug leaked the real password: {debug}");
+        // Ident se quotuje stejnou cestou jako alter_password.
+        let weird = alter_password_rescue_pg("we\"ird", "p");
+        assert!(weird.exec_sql.starts_with("ALTER ROLE \"we\"\"ird\" PASSWORD "));
     }
 
     #[test]

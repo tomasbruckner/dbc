@@ -304,3 +304,75 @@ async fn mid_tx_error_behavior_probe_xact_abort_off() {
     let _ = c.execute("ROLLBACK", CancelToken::new()).await;
     let _ = c.execute(&format!("DROP TABLE {table}"), CancelToken::new()).await;
 }
+
+/// Parsuje host,port ze `Server={tcp:host,port}` / `Server=tcp:host,port`
+/// části connection stringu, který vrací `common::conn_str_or_skip`.
+fn host_port_from(cs: &str) -> Option<(String, u16)> {
+    let s = cs.split(';').find_map(|kv| kv.strip_prefix("Server="))?;
+    let s = s.trim_start_matches('{').trim_end_matches('}');
+    let s = s.strip_prefix("tcp:").unwrap_or(s);
+    let (h, p) = s.rsplit_once(',')?;
+    Some((h.to_string(), p.parse().ok()?))
+}
+
+/// pwchange T1 (spec §0, dříve ověřeno samostatnou sondou 2026-08-25):
+/// celý záchranný cyklus — MUST_CHANGE login → probe padá se sentinelem
+/// `PASSWORD_CHANGE_REQUIRED_CODE` → `change_password_at_connect` uspěje →
+/// probe s novým heslem projde. Unikátní jméno loginu drží reruny proti
+/// dlouhoživotnému kontejneru zelené; login se na konci uklízí.
+#[tokio::test]
+#[ignore]
+async fn must_change_login_full_rescue_cycle() {
+    let Some(cs) = common::conn_str_or_skip("must_change_login_full_rescue_cycle").await else {
+        return;
+    };
+    let mut sa = MssqlConnection::from_connection_string(cs.clone());
+    if let Err(e) = sa.probe() {
+        if common::skip_if_no_odbc_driver("must_change_login_full_rescue_cycle", &e) {
+            return;
+        }
+        panic!("sa connect failed: {e}");
+    }
+    let Some((host, port)) = host_port_from(&cs) else {
+        panic!("Server= nelze parsovat z connection stringu")
+    };
+    let login = format!(
+        "pw_rescue_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    sa.execute(
+        &format!(
+            "CREATE LOGIN [{login}] WITH PASSWORD = N'Old!Passw0rd1' MUST_CHANGE, \
+             CHECK_EXPIRATION = ON, CHECK_POLICY = ON"
+        ),
+        CancelToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let cfg_old = dbc_driver_mssql::MssqlConfig::new(
+        host.clone(),
+        port,
+        "master",
+        login.clone(),
+        "Old!Passw0rd1",
+    )
+    .trust_server_certificate(true);
+    let err = MssqlConnection::new(&cfg_old).probe().unwrap_err();
+    assert_eq!(
+        err.code.as_deref(),
+        Some(dbc_driver_mssql::PASSWORD_CHANGE_REQUIRED_CODE),
+        "{err}"
+    );
+
+    let cfg_new =
+        dbc_driver_mssql::MssqlConfig::new(host, port, "master", login.clone(), "New!Passw0rd2")
+            .trust_server_certificate(true);
+    dbc_driver_mssql::change_password_at_connect(&cfg_new, "Old!Passw0rd1").unwrap();
+    MssqlConnection::new(&cfg_new).probe().unwrap();
+
+    sa.execute(&format!("DROP LOGIN [{login}]"), CancelToken::new()).await.unwrap();
+}
