@@ -5,6 +5,7 @@ pub use config::{
 };
 
 pub mod fsutil;
+pub mod workspace;
 
 mod scope;
 pub use scope::connection_scope_key;
