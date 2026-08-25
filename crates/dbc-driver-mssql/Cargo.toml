@@ -16,6 +16,8 @@ async-trait.workspace = true
 # macro crate) is intentionally omitted: nothing in this crate uses its
 # macros.
 odbc-api = { version = "29", default-features = false, features = ["odbc_version_3_80"] }
+# pwchange T1: wipes the UTF-16 old-password buffer in password.rs.
+zeroize.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
