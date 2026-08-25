@@ -91,6 +91,18 @@ fn badge_for_kind(kind: &str) -> &'static str {
 /// for a successful run, or the raw error text for a failed one (brief
 /// contract #3). Returns `(text, is_error)` — `is_error` drives the caller's
 /// red-vs-muted text color.
+/// Design §5 row 8: „{name}/{db}" when the active db ≠ default, plain
+/// name otherwise. Display text only — history keeps recording names,
+/// never URLs/credentials (design §4.6); dedup (`sql + connection +
+/// window`) naturally scopes per db. The known name-collision lossiness
+/// (rename/delete → "cli") is unchanged and out of scope.
+pub(crate) fn history_conn_label(name: &str, non_default_db: Option<&str>) -> String {
+    match non_default_db {
+        Some(db) => format!("{name}/{db}"),
+        None => name.to_string(),
+    }
+}
+
 pub fn format_meta_line(entry: &HistoryEntry) -> (String, bool) {
     if let Some(err) = &entry.error {
         (err.clone(), true)
@@ -167,13 +179,15 @@ impl AppView {
     }
 
     /// Connection name to record with a run (brief contract #2): the active
-    /// saved connection's `name`, or `"cli"` for the CLI-arg back-compat
-    /// path. Only meaningful once `run_query_with` has already resolved a
-    /// `ConnectSpec` successfully (a query can't run with neither set).
+    /// saved connection's `name` — „{name}/{db}" when the active database
+    /// ≠ default (sidebar rework, design §5 row 8) — or `"cli"` for the
+    /// CLI-arg back-compat path. Only meaningful once `run_query_with` has
+    /// already resolved a `ConnectSpec` successfully (a query can't run
+    /// with neither set).
     pub(crate) fn active_connection_name_for_history(&self) -> String {
         if let Some(id) = &self.active_connection_id {
             if let Some(c) = self.config.connections.iter().find(|c| &c.id == id) {
-                return c.name.clone();
+                return history_conn_label(&c.name, self.active_database.as_deref());
             }
         }
         "cli".to_string()
@@ -375,5 +389,12 @@ mod format_tests {
         let (line, is_error) = format_meta_line(&entry(Some("syntax error"), None, None));
         assert_eq!(line, "syntax error");
         assert!(is_error);
+    }
+
+    // Sidebar rework T8 (design §5 row 8): the recorded connection label.
+    #[test]
+    fn history_conn_label_appends_db_only_when_non_default() {
+        assert_eq!(history_conn_label("prod", None), "prod");
+        assert_eq!(history_conn_label("prod", Some("inventory")), "prod/inventory");
     }
 }

@@ -328,7 +328,7 @@ pub struct CompareView {
     pub data_diff: DataDiffState,
     /// Bumped on every "Porovnat data" dispatch; a `fetch_diff_side` pair's
     /// result only applies if the generation still matches — same
-    /// last-dispatched-wins guard `AppView::trigger_schema_fetch` uses.
+    /// last-dispatched-wins guard `AppView::start_schema_slot_fetch` uses.
     pub data_diff_generation: u64,
 }
 
@@ -363,7 +363,7 @@ impl CompareView {
 
     /// "Porovnat data" — dispatches `fetch_diff_side` for BOTH sides of the
     /// currently-selected matched table pair (design §4). Fire-and-forget,
-    /// generation-guarded exactly like `trigger_schema_fetch`/
+    /// generation-guarded exactly like `start_schema_slot_fetch`/
     /// `confirm_compare_dialog`. Called from `AppView::on_compare_view_event`
     /// (which owns `runner`), not from this entity's own click handler
     /// directly. A no-op if the current selection isn't a data-diffable

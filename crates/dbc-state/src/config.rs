@@ -86,6 +86,12 @@ pub struct FavouriteObject {
     pub schema: Option<String>,
     pub name: String,
     pub kind: String,
+    /// Sidebar rework (design §5 row 9): the database this favourite lives
+    /// in. `None` = the connection's DEFAULT database (whatever
+    /// `ConnectionConfig::database` says at read time), so every existing
+    /// config.toml entry keeps meaning exactly what it meant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -236,6 +242,7 @@ mod tests {
             schema: Some("public".into()),
             name: "users".into(),
             kind: "table".into(),
+            database: None,
         };
 
         // Toggle on
@@ -273,6 +280,72 @@ user = "postgres"
 "#;
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.favourite_objects, vec![]);
+    }
+
+    #[test]
+    fn favourite_without_database_field_loads_and_roundtrips_byte_identically() {
+        // Sidebar rework: `database` is additive with serde(default) +
+        // skip_serializing_if — an old config.toml must load AND save back
+        // without gaining the field (same posture as G16's variant pin).
+        let toml_str = r#"
+[[connections]]
+id = "c1"
+name = "demo"
+engine = "postgres"
+host = "localhost"
+database = "postgres"
+user = "postgres"
+
+[[favourite_objects]]
+connection_id = "c1"
+name = "orders"
+kind = "table"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.favourite_objects[0].database, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        config.save(&p).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(!raw.contains("database = ") || raw.matches("database = ").count() == 1,
+            "favourite must not serialize a database key when None (only the connection's own): {raw}");
+        let reloaded = AppConfig::load(&p).unwrap();
+        assert_eq!(reloaded, config);
+    }
+
+    #[test]
+    fn favourite_with_database_roundtrips() {
+        let mut config = AppConfig::default();
+        config.favourite_objects.push(FavouriteObject {
+            connection_id: "c1".into(),
+            schema: Some("public".into()),
+            name: "orders".into(),
+            kind: "table".into(),
+            database: Some("inventory".into()),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        config.save(&p).unwrap();
+        let reloaded = AppConfig::load(&p).unwrap();
+        assert_eq!(reloaded.favourite_objects[0].database.as_deref(), Some("inventory"));
+    }
+
+    #[test]
+    fn toggle_favourite_distinguishes_databases() {
+        // Full-struct equality in toggle_favourite means the same table in
+        // two databases is two distinct favourites — pin it.
+        let mut config = AppConfig::default();
+        let f_default = FavouriteObject {
+            connection_id: "c1".into(), schema: None, name: "t".into(),
+            kind: "table".into(), database: None,
+        };
+        let f_other = FavouriteObject { database: Some("inventory".into()), ..f_default.clone() };
+        assert!(config.toggle_favourite(f_default.clone()));
+        assert!(config.toggle_favourite(f_other.clone()));
+        assert_eq!(config.favourite_objects.len(), 2);
+        assert!(!config.toggle_favourite(f_default)); // removes only the default-db one
+        assert_eq!(config.favourite_objects.len(), 1);
     }
 
     #[test]

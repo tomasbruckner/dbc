@@ -103,6 +103,21 @@ mod tests {
     }
 
     #[test]
+    fn scope_key_isolates_databases_and_preserves_legacy_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("params.toml");
+        let mut store = ParamValuesStore::load(&p).unwrap();
+        let legacy = ParamValue { text: "1".into(), is_null: false };
+        let scoped_v = ParamValue { text: "2".into(), is_null: false };
+        store.set("conn-1", "id", legacy.clone()).unwrap();
+        let scoped = crate::connection_scope_key("conn-1", Some("inventory"));
+        store.set(&scoped, "id", scoped_v.clone()).unwrap();
+        let loaded = ParamValuesStore::load(&p).unwrap();
+        assert_eq!(loaded.get("conn-1", "id"), Some(&legacy));
+        assert_eq!(loaded.get(&scoped, "id"), Some(&scoped_v));
+    }
+
+    #[test]
     fn key_collision_safety() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("params.toml");

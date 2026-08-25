@@ -126,6 +126,23 @@ mod tests {
     }
 
     #[test]
+    fn scope_key_isolates_databases_and_preserves_legacy_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("views.toml");
+        let mut store = ViewPrefsStore::load(&p).unwrap();
+        let legacy = TableViewPrefs { hidden_columns: vec!["a".into()], ..Default::default() };
+        let other = TableViewPrefs { hidden_columns: vec!["b".into()], ..Default::default() };
+        // Written pre-phase with the bare id:
+        store.set("conn-1", Some("public"), "t", legacy.clone()).unwrap();
+        // Written post-phase for a non-default db:
+        let scoped = crate::connection_scope_key("conn-1", Some("inventory"));
+        store.set(&scoped, Some("public"), "t", other.clone()).unwrap();
+        let loaded = ViewPrefsStore::load(&p).unwrap();
+        assert_eq!(loaded.get("conn-1", Some("public"), "t"), Some(&legacy));
+        assert_eq!(loaded.get(&scoped, Some("public"), "t"), Some(&other));
+    }
+
+    #[test]
     fn key_collision_safety() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("views.toml");
