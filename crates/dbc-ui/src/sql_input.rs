@@ -13,7 +13,7 @@
 //   gone; `MultilineBuffer` owns cursor/selection and this file only ever
 //   reads `buffer.text()` / `buffer.selection()` / `buffer.cursor()`.
 // - `text()` returns the real multiline text (the v1 `\n` -> ' ' hack is
-//   deleted); `set_text()` is new, for future history-load.
+//   deleted); `replace_buffer()` is new, for future history-load.
 // - `MultilineBuffer` exposes `set_cursor`/`select_range` (added in G1 Task 4
 //   fix round 1, per review) for placing the cursor/selection at an
 //   arbitrary absolute byte offset in a single O(n) pass over the buffer.
@@ -303,7 +303,7 @@ pub struct SqlInput {
     marked_range: Option<Range<usize>>,
     scroll_offset_lines: usize,
     /// Set by every cursor-moving/editing action (insert, backspace,
-    /// delete, move_*, click/drag, `set_text`, paste, IME); consumed and
+    /// delete, move_*, click/drag, `replace_buffer`, paste, IME); consumed and
     /// cleared by the next `TextElement::prepaint`, which only re-clamps
     /// the visible window to the cursor's line when this is set. Keeps a
     /// deliberate mouse-wheel scroll from being immediately undone by the
@@ -458,9 +458,21 @@ impl SqlInput {
         self.buffer.text().to_string()
     }
 
-    /// Replaces the whole buffer — used by the history panel (G3 Task 3) to
-    /// load a clicked entry's SQL into the editor without running it.
-    pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+    /// Replaces the whole buffer, destroying whatever the user had typed —
+    /// this editor has NO undo, so a call here is unrecoverable.
+    ///
+    /// Deliberately NOT called `set_text` any more (workspace T8 review
+    /// MAJOR-3): `TextField` and `TextModel` both have a `set_text`, so a
+    /// grep for editor clobbers drowned in false positives and — worse —
+    /// missed real ones written in a different shape. This name is unique
+    /// crate-wide, which is what lets
+    /// `main.rs`'s `editor_clobber_audit` be a sound pin instead of a
+    /// hopeful one: EVERY buffer replacement, however the entity was
+    /// reached (rebound local, method chain, UFCS, multi-line closure),
+    /// must mention this identifier. Only `AppView::bind_script` and
+    /// `AppView::perform_script_action` may call it — both sit behind
+    /// `AppView::editor_load_guarded` (Part S §5.5).
+    pub fn replace_buffer(&mut self, text: &str, cx: &mut Context<Self>) {
         self.buffer.set_text(text);
         self.marked_range = None;
         self.scroll_offset_lines = 0;

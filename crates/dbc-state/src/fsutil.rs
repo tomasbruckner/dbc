@@ -121,15 +121,45 @@ pub fn entry_exists_ci(parent: &Path, name: &str) -> Result<bool, StateError> {
     Ok(conflicting_entry_ci(parent, name, None)?.is_some())
 }
 
+/// The scratch file [`write_atomic`] writes before renaming: `<path>.tmp`,
+/// nothing more. Public so the single-writer contract documented on
+/// `write_atomic` is a testable property rather than a promise — it is
+/// exactly BECAUSE this is a pure function of `path` that two overlapping
+/// writes to one target collide. Keep the `.tmp` ending: §W6.2's shipped
+/// `.gitignore` matches on it.
+pub fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    PathBuf::from(tmp)
+}
+
 /// Atomic write: `<path>.tmp` + `sync_all` + rename (the
 /// `AppConfig::save` shape). Takes BYTES, so it carries `vault.bin` as
 /// happily as a `.sql` file. The tmp file is removed on every failure
 /// path. Does NOT create parent directories — callers own their folder.
+///
+/// **SINGLE WRITER PER PATH — a caller contract, not an implementation
+/// detail** (workspace T8 review MAJOR-2). The tmp path is a DETERMINISTIC
+/// function of `path` (see [`tmp_path_for`]), and `sync_all` holds it open
+/// for tens of milliseconds. Two overlapping calls for the same target
+/// therefore share one tmp file and race three ways: the second
+/// `File::create` truncates the first's tmp mid-`write_all` (a
+/// byte-interleaved result file), the loser's `rename` fails ENOENT and
+/// reports „uložení selhalo" over a file that is perfectly fine, and — the
+/// dangerous one — the winner on disk need not be the caller whose
+/// completion runs last, so a caller that records „saved" from its own
+/// completion can end up believing bytes are on disk that never got there.
+/// Every caller must serialize its own writes per path; `AppView::
+/// save_script`'s `script_save_in_flight` flag is the worked example.
+///
+/// The tmp name is deliberately NOT made unique to sidestep this: the
+/// shipped `.gitignore` (§W6.2) ignores `*.toml.tmp` / `*.bin.tmp`, no
+/// gitignore pattern survives inserting a nonce, and `init_contents` never
+/// overwrites an existing `.gitignore` — so a rename here would silently
+/// stop every ALREADY-created workspace from ignoring these files.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
     use std::io::Write as _;
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
+    let tmp = tmp_path_for(path);
     let write = (|| -> std::io::Result<()> {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(bytes)?;
@@ -241,6 +271,22 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let gone = td.path().join("neni");
         assert!(entry_exists_ci(&gone, "a.sql").is_err());
+    }
+
+    /// The single-writer contract, made checkable (workspace T8 review
+    /// MAJOR-2): the scratch path is a pure function of the target, so two
+    /// overlapping `write_atomic` calls for one file DO collide — every
+    /// caller has to serialize its own writes per path. Pinned here so the
+    /// hazard is a property of the rail, not a comment someone can drift
+    /// away from; the `.tmp` ending is pinned because §W6.2's shipped
+    /// `.gitignore` matches on it and init never rewrites an existing one.
+    #[test]
+    fn the_tmp_path_is_deterministic_which_is_why_callers_must_serialize() {
+        let a = Path::new("D:").join("ws").join("config.toml");
+        assert_eq!(tmp_path_for(&a), tmp_path_for(&a), "same target, same scratch file");
+        assert_ne!(tmp_path_for(&a), tmp_path_for(&Path::new("D:").join("ws").join("views.toml")));
+        assert!(tmp_path_for(&a).to_string_lossy().ends_with(".toml.tmp"));
+        assert!(tmp_path_for(Path::new("vault.bin")).to_string_lossy().ends_with(".bin.tmp"));
     }
 
     #[test]

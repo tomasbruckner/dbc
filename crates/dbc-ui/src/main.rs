@@ -1288,6 +1288,34 @@ fn script_binding_target_changed(old: Option<&Path>, new: Option<&Path>) -> bool
     }
 }
 
+/// T8 review MAJOR-2: the refusal when a save of this editor is already in
+/// flight. Not an „error:" — nothing failed; the user's keystroke simply
+/// arrived while the previous write was still fsyncing, and the „ •" stays
+/// up so they can see the buffer is not yet on disk.
+pub(crate) const SCRIPT_SAVE_IN_FLIGHT: &str = "ukládání skriptu už probíhá";
+
+/// May an in-flight `open_script` still replace the editor's buffer?
+///
+/// T8 review BLOCKER-1. `editor_load_guarded` answers „is it safe" at
+/// DISPATCH; `read_script` then yields the UI thread, so by the time the
+/// text arrives the answer may have expired. TWO things must still hold:
+/// the binding must not have moved (`script_binding_generation`) AND the
+/// buffer must be byte-identical to what the guard actually looked at.
+///
+/// The second half is the load-bearing one, and it is not redundant with
+/// the first: `set_script_binding` bumps the generation only when the
+/// bound PATH changes, so typing — the exact thing the guard protects —
+/// leaves the generation untouched. `SqlInput` has no undo, so a
+/// replacement that lands over fresh keystrokes destroys them for good.
+fn script_open_may_land(
+    binding_now: u64,
+    binding_dispatched: u64,
+    text_now: &str,
+    text_dispatched: &str,
+) -> bool {
+    binding_now == binding_dispatched && text_now == text_dispatched
+}
+
 /// The discard prompt's question line. `script_rel` is `Some` only for a
 /// `PendingDiscard::Script` (Part S §5.5's copy); every other action keeps
 /// the pre-existing staged-rows wording byte for byte, because for those
@@ -1629,6 +1657,14 @@ struct AppView {
     /// `start_csv_import`, `pick_workspace_for_recovery`,
     /// `open_workspace_confirm` are the precedents).
     script_binding_generation: u64,
+    /// T8 review MAJOR-2: is a `save_script` write still in flight? The
+    /// shared `fsutil::write_atomic` rail derives ONE tmp path per target,
+    /// so two overlapping writes to the same file corrupt each other's tmp
+    /// and can leave the caption reading clean over contents the disk does
+    /// not hold. OS key auto-repeat on a held Ctrl+S is enough to trigger
+    /// it. One editor means one flag is enough; a second dispatch is
+    /// refused out loud (`SCRIPT_SAVE_IN_FLIGHT`), never queued silently.
+    script_save_in_flight: bool,
     // --- UX-polish §1.4: modal keyboard-focus plumbing ---
     /// Shared focus target for every overlay that owns no TextField of its
     /// own (KillConfirm, AnalyzeWriteConfirm, CompareDialog, ScriptRun,
@@ -6043,7 +6079,7 @@ impl AppView {
     /// never drift (a `set_text` without a matching `saved_text` update is
     /// exactly how a phantom „ •" appears).
     pub(crate) fn bind_script(&mut self, path: PathBuf, text: String, cx: &mut Context<Self>) {
-        self.sql.update(cx, |s, cx| s.set_text(&text, cx));
+        self.sql.update(cx, |s, cx| s.replace_buffer(&text, cx));
         self.set_script_binding(Some(ScriptBinding { path, saved_text: text }));
         self.status = String::new();
         cx.notify();
@@ -6057,7 +6093,21 @@ impl AppView {
         action: PendingScriptAction,
         cx: &mut Context<Self>,
     ) {
-        if self.script_is_dirty(cx) && self.discard_confirm.is_none() {
+        // T8 review MINOR-1: this used to read
+        // `if dirty && discard_confirm.is_none() { park }`, which fell
+        // THROUGH to performing the destructive action whenever a prompt
+        // was already up — the fail-safe direction inverted. Unreachable
+        // today (the overlay is a full-screen `.occlude()` that also takes
+        // focus, and `on_open_palette` refuses while one is open), but
+        // „another question is already unanswered" must mean REFUSE, never
+        // „do it anyway". Refusing out loud, because a silent no-op is the
+        // other thing this phase keeps banning.
+        if self.discard_confirm.is_some() {
+            self.status = "nejprve dokončete rozpracované úpravy".to_string();
+            cx.notify();
+            return;
+        }
+        if self.script_is_dirty(cx) {
             self.discard_confirm = Some(DiscardConfirmState {
                 // Scripts are text, not staged rows — the count is „one
                 // file", and `discard_confirm_question`'s script branch is
@@ -6087,7 +6137,7 @@ impl AppView {
                 cx.notify();
             }
             PendingScriptAction::LoadText { sql } => {
-                self.sql.update(cx, |s, cx| s.set_text(&sql, cx));
+                self.sql.update(cx, |s, cx| s.replace_buffer(&sql, cx));
                 self.set_script_binding(None);
                 cx.notify();
             }
@@ -6113,16 +6163,32 @@ impl AppView {
             }
         };
         let dispatched = self.script_binding_generation;
+        // T8 review BLOCKER-1. `editor_load_guarded` ran at DISPATCH; the
+        // read below then yields the UI thread, and the buffer is not
+        // replaced until it comes back. The generation rail alone is
+        // structurally BLIND to the one thing the guard exists to protect:
+        // `set_script_binding` bumps only when the bound PATH changes, and
+        // TYPING changes no binding. So a clean (or unbound) editor, a
+        // double-click, a few keystrokes while a OneDrive/network-backed
+        // root answers, and the read landed on top of them — permanently
+        // (`SqlInput` has no undo) and silently (`bind_script` even clears
+        // the status). The buffer gets the same treatment as the binding.
+        let dispatched_text = self.sql.read(cx).text();
         cx.spawn(async move |this, cx| {
             let job = path.clone();
             let result =
                 cx.background_spawn(async move { crate::scripts::read_script(&job) }).await;
             let _ = this.update(cx, |view, cx| {
                 // The read yielded the UI thread, so the user may have
-                // opened something else (or closed the binding) meanwhile.
-                // Binding THIS file now would be a silent context change —
+                // opened something else, closed the binding, or typed
+                // meanwhile. Landing now would be a silent context change —
                 // and it would clobber whatever they moved on to.
-                if view.script_binding_generation != dispatched {
+                if !script_open_may_land(
+                    view.script_binding_generation,
+                    dispatched,
+                    &view.sql.read(cx).text(),
+                    &dispatched_text,
+                ) {
                     view.status = "otevření skriptu zrušeno — editor se mezitím změnil".to_string();
                     cx.notify();
                     return;
@@ -6149,7 +6215,33 @@ impl AppView {
     /// on the UI thread, i.e. BEFORE the background write had landed, so
     /// the freshly created file was routinely missing from the tree.
     /// Rescanning in the success arm is the only ordering that can show it.
+    ///
+    /// SERIALIZED (T8 review MAJOR-2). `fsutil::write_atomic` derives a
+    /// FIXED `<path>.tmp`, and `sync_all` holds that window open for tens
+    /// of milliseconds — long enough for OS key auto-repeat on a held
+    /// Ctrl+S to dispatch a second write into the SAME tmp file. That
+    /// races three ways: a truncated tmp mid-`write_all` (a byte-interleaved
+    /// `.sql`), an ENOENT rename reported as „uložení selhalo" over a file
+    /// that is fine, and — worst — a phantom-clean caption, where the
+    /// later-completing update sets `saved_text` to text the disk does not
+    /// hold and the „ •" disappears over an unsaved file.
+    ///
+    /// The fix is here rather than in the shared rail, deliberately.
+    /// Making `write_atomic`'s tmp name unique would stop matching the
+    /// shipped `.gitignore`'s `*.toml.tmp` / `*.bin.tmp` lines (§W6.2) —
+    /// gitignore has no pattern that survives inserting a nonce, and init
+    /// never overwrites an existing `.gitignore`, so every ALREADY-created
+    /// workspace would silently stop ignoring the app's temp files. A
+    /// per-path single-writer discipline in the caller is the smaller,
+    /// safer half of the same guarantee; `write_atomic`'s doc comment now
+    /// states that contract for every other writer over a user folder.
     fn save_script(&mut self, path: PathBuf, text: String, rescan: bool, cx: &mut Context<Self>) {
+        if self.script_save_in_flight {
+            self.status = SCRIPT_SAVE_IN_FLIGHT.to_string();
+            cx.notify();
+            return;
+        }
+        self.script_save_in_flight = true;
         let dispatched = self.script_binding_generation;
         cx.spawn(async move |this, cx| {
             let (job_path, job_text) = (path.clone(), text.clone());
@@ -6157,6 +6249,7 @@ impl AppView {
                 .background_spawn(async move { crate::scripts::write_script(&job_path, &job_text) })
                 .await;
             let _ = this.update(cx, |view, cx| {
+                view.script_save_in_flight = false;
                 let name =
                     path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                 match result {
@@ -6173,16 +6266,20 @@ impl AppView {
                                 saved_text: text.clone(),
                             }));
                             view.status = format!("skript uložen: {name}");
-                            if rescan
-                                && view
-                                    .effective_scripts_root()
-                                    .is_some_and(|root| path.starts_with(&root))
-                            {
-                                view.start_scripts_scan(cx);
-                            }
                         } else {
                             view.status =
                                 format!("skript uložen: {name} — editor se mezitím změnil");
+                        }
+                        // T8 review MINOR-2: the rescan is INDEPENDENT of
+                        // the re-bind decision and lives outside it. A
+                        // save-as that lands after the binding moved still
+                        // created a file in the library; leaving it out of
+                        // the tree, with a status that talks only about the
+                        // binding, is a silently incomplete result.
+                        if rescan
+                            && view.effective_scripts_root().is_some_and(|r| path.starts_with(&r))
+                        {
+                            view.start_scripts_scan(cx);
                         }
                     }
                     Err(e) => view.status = format!("error: {e}"),
@@ -6207,6 +6304,22 @@ impl AppView {
             return;
         };
         let dispatched = self.script_binding_generation;
+        // Verified in the pinned GPUI rev (907ed09,
+        // `gpui_windows/src/platform.rs::file_save_dialog`): a non-empty
+        // `directory` is canonicalized and pushed through
+        // `IFileSaveDialog::SetFolder` — the FORCING call, not
+        // `SetDefaultFolder` — so this really does open in the library,
+        // with `dotaz.sql` prefilled via `SetFileName`. The same function
+        // sets `SetFileTypes` to „All files"/`*.*`, which is why
+        // `with_sql_extension` below is both correct and necessary.
+        //
+        // KNOWN, UNOBSERVABLE FALLBACK: if `root.canonicalize()` fails —
+        // the scripts folder deleted or unmounted between the scan and
+        // this click — GPUI `log_err()`s and opens the dialog at the
+        // PLATFORM DEFAULT instead. The app cannot see that happen, so the
+        // user can land in their home folder with no explanation. Not
+        // fixable from here without duplicating the canonicalize (and then
+        // racing it); recorded so it is not mistaken for our own silence.
         let dialog = cx.prompt_for_new_path(&root, Some("dotaz.sql"));
         cx.spawn(async move |this, cx| {
             // Same three arms as the backup save picker: a swallowed dialog
@@ -6781,6 +6894,17 @@ impl AppView {
         // rescan the new one.
         self.tree.update(cx, |t, cx| t.reset_scripts(cx));
         self.start_scripts_scan(cx);
+        // T8 review MINOR-3: the script binding is context state too, and
+        // nothing else drops it. `context_switch_blocked` refuses a swap
+        // only while the binding is DIRTY, so a CLEAN one would ride into
+        // the new workspace: the caption would silently degrade from
+        // `prod/trzby.sql` to a bare `trzby.sql` (the path no longer sits
+        // under the new root) and the next Ctrl+S would write back into the
+        // OLD workspace folder — precisely the cross-context leak §W3.4
+        // exists to prevent. The editor TEXT stays, exactly as „Zavřít"
+        // leaves it (§5.3): it is the binding that belongs to the old
+        // context, not the buffer.
+        self.set_script_binding(None);
         self.status = match &root {
             Some(r) => format!("pracovní prostor: {}", r.display()),
             None => "lokální profil obnoven".to_string(),
@@ -10320,6 +10444,11 @@ impl Render for AppView {
                 // keyboard precedence item 3).
                 div()
                     .h(px(20. * 8. + 4. * 2.))
+                    // T8 review: `.h()` is a flex BASE, and the default
+                    // `flex-shrink: 1` lets it collapse below eight lines
+                    // when the column is tight — likelier now that the
+                    // 22px caption strip is a sibling. Pin the height.
+                    .flex_shrink_0()
                     .px_2()
                     .bg(theme.bg_app)
                     .on_action(cx.listener(Self::on_ac_up))
@@ -10893,6 +11022,7 @@ fn main() {
                             script_binding: None,
                             script_dirty_flag: false,
                             script_binding_generation: 0,
+                            script_save_in_flight: false,
                             modal_focus_handle: cx.focus_handle(),
                             modal_needs_focus: false,
                             autocomplete: None,
@@ -12601,6 +12731,36 @@ mod script_binding_tests {
         assert!(script_binding_target_changed(Some(&a), None), "unbinding is a move");
         assert!(script_binding_target_changed(None, Some(&a)), "save-as binds where nothing was");
     }
+
+    /// T8 review BLOCKER-1. The guard runs at dispatch; `read_script` then
+    /// yields the UI thread. The generation rail alone is structurally
+    /// blind to typing — `set_script_binding` bumps only on a PATH change
+    /// — so an open that lands over fresh keystrokes destroyed them
+    /// permanently (`SqlInput` has no undo) and silently (`bind_script`
+    /// clears the status). Both halves are load-bearing.
+    #[test]
+    fn an_open_may_only_land_while_both_the_binding_and_the_buffer_stand_still() {
+        assert!(script_open_may_land(4, 4, "SELECT 1", "SELECT 1"));
+        // The half that used to be missing: same binding, typed buffer.
+        assert!(
+            !script_open_may_land(4, 4, "SELECT 1 -- rozepsáno", "SELECT 1"),
+            "typing under a stable binding must abort the open"
+        );
+        // Even one character, and even from an EMPTY start — the unbound
+        // ad-hoc case the guard itself deliberately does not protect is
+        // still protected against a background write landing on it.
+        assert!(!script_open_may_land(0, 0, "s", ""));
+        // The half that already existed: the binding moved.
+        assert!(!script_open_may_land(5, 4, "SELECT 1", "SELECT 1"));
+        assert!(!script_open_may_land(5, 4, "typed", "SELECT 1"));
+    }
+
+    /// T8 review MAJOR-2's refusal text: not an „error:" — nothing failed.
+    #[test]
+    fn the_second_concurrent_save_is_refused_in_plain_words() {
+        assert_eq!(SCRIPT_SAVE_IN_FLIGHT, "ukládání skriptu už probíhá");
+        assert!(!SCRIPT_SAVE_IN_FLIGHT.starts_with("error:"));
+    }
 }
 
 /// Workspace T8: the „never destructive" rail for the EDITOR, pinned the
@@ -12615,6 +12775,32 @@ mod script_binding_tests {
 /// script's unsaved changes with no guard at all since long before this
 /// phase. A third such site added later would silently reopen the hole,
 /// and nothing else in the test suite would notice.
+///
+/// T8 REVIEW MAJOR-3, rewritten. The first version keyed on
+/// `sql.update(cx, |s,` + `set_text` ON THE SAME LINE, and six shapes
+/// walked straight past it — a rebound local, a method chain, a UFCS call,
+/// a rustfmt-wrapped closure body, a differently-named closure parameter,
+/// and a direct `perform_script_action` call that skipped the guard
+/// entirely. Two of those are ordinary formatting and naming, not
+/// adversarial. This version keys on IDENTIFIERS that are unique
+/// crate-wide instead of on an expression shape, so how the editor entity
+/// is reached and how rustfmt breaks the lines are both irrelevant:
+///
+/// * `SqlInput::set_text` was RENAMED to `replace_buffer` (see its doc
+///   comment) precisely so that the one identifier every buffer
+///   replacement must mention cannot be confused with `TextField`'s or
+///   `TextModel`'s same-named methods.
+/// * `perform_script_action` and `bind_script` are counted too, so the
+///   guard cannot be bypassed by calling the performer directly.
+///
+/// The structural alternative the review preferred — the editor entity
+/// behind a private accessor whose mutator is unreachable outside the
+/// guard — was NOT taken. Rust's finest privacy granularity is the module,
+/// so it would mean moving `AppView.sql` and both guard functions into a
+/// separate module, splitting `impl AppView` across files and dragging the
+/// autocomplete plumbing (`accept_completion`, `set_autocomplete_active`,
+/// `kick_highlight`, the ten `read(cx)` sites) with it. That is a `main.rs`
+/// restructure, not a Task 8 fix.
 #[cfg(test)]
 mod editor_clobber_audit {
     const SOURCES: &[(&str, &str)] = &[
@@ -12623,55 +12809,105 @@ mod editor_clobber_audit {
         ("palette.rs", include_str!("palette.rs")),
         ("connections_ui.rs", include_str!("connections_ui.rs")),
         ("schema_tree.rs", include_str!("schema_tree.rs")),
+        ("grid.rs", include_str!("grid.rs")),
+        ("tabs.rs", include_str!("tabs.rs")),
+        ("sql_input.rs", include_str!("sql_input.rs")),
     ];
 
-    /// The two functions allowed to replace the SQL editor's buffer, both
-    /// reached only through `editor_load_guarded` / `bind_script`.
-    const SANCTIONED_FNS: &[&str] = &["bind_script", "perform_script_action"];
+    /// Strips line comments so a prose mention is neither a call site nor
+    /// an alibi (`config_save_guard_audit`'s lesson: its first draft was
+    /// vacuous because an explanatory comment satisfied it).
+    fn code_of(l: &str) -> &str {
+        match l.find("//") {
+            Some(x) => &l[..x],
+            None => l,
+        }
+    }
 
-    #[test]
-    fn only_the_guarded_sites_may_replace_the_sql_editors_text() {
-        // Both closure spellings in use today. Unlike
-        // `config_save_guard_audit`, these needles do NOT need runtime
-        // assembly to avoid matching their own source line: the
-        // `set_text` condition below already excludes it.
-        const NEEDLES: [&str; 2] = ["sql.update(cx, |s,", "sql.update(cx, |sql,"];
+    /// The enclosing `fn`'s signature line, or `""` at file scope.
+    fn owner_of<'a>(lines: &[&'a str], i: usize) -> &'a str {
+        lines[..i]
+            .iter()
+            .rposition(|l| {
+                let t = l.trim_start();
+                t.starts_with("fn ")
+                    || t.starts_with("pub fn ")
+                    || t.starts_with("pub(crate) fn ")
+                    || t.starts_with("pub(super) fn ")
+            })
+            .map(|p| lines[p])
+            .unwrap_or("")
+    }
+
+    /// Every CALL of `needle` must sit inside one of `sanctioned`, and
+    /// there must be exactly `expected` of them. Definition lines
+    /// (`fn <needle>`) are skipped — they are not call sites.
+    fn audit(needle: &str, sanctioned: &[&str], expected: usize, why: &str) {
+        let call = format!("{needle}(");
+        let define = format!("fn {needle}");
         let mut sites = 0usize;
         for (name, src) in SOURCES {
             let lines: Vec<&str> = src.lines().collect();
-            let code_of = |l: &str| match l.find("//") {
-                Some(x) => l[..x].to_string(),
-                None => l.to_string(),
-            };
             for (i, line) in lines.iter().enumerate() {
                 let code = code_of(line);
-                if !NEEDLES.iter().any(|n| code.contains(n)) {
-                    continue;
-                }
-                // Only buffer REPLACEMENT counts; the flag pokes
-                // (`set_autocomplete_active`, scroll sync) are harmless.
-                if !code.contains("set_text") {
+                if !code.contains(&call) || code.contains(&define) {
                     continue;
                 }
                 sites += 1;
-                let start = lines[..i]
-                    .iter()
-                    .rposition(|l| l.trim_start().starts_with("fn ")
-                        || l.trim_start().starts_with("pub fn ")
-                        || l.trim_start().starts_with("pub(crate) fn "))
-                    .unwrap_or(0);
-                let owner = lines[start];
+                let owner = owner_of(&lines, i);
                 assert!(
-                    SANCTIONED_FNS.iter().any(|f| owner.contains(f)),
-                    "unguarded editor clobber at {name}:{} (in `{}`) — route it through \
-                     `AppView::editor_load_guarded` (Part S §5.5) or a bound script's \
-                     unsaved changes are destroyed silently",
+                    sanctioned.iter().any(|f| owner.contains(f)),
+                    "unguarded `{needle}` call at {name}:{} (in `{}`) — {why}",
                     i + 1,
                     owner.trim()
                 );
             }
         }
-        // Pinned so a NEW editor writer forces a deliberate look here.
-        assert_eq!(sites, 2, "editor-replacement site count changed — re-audit, do not just bump");
+        assert_eq!(
+            sites, expected,
+            "`{needle}` call-site count changed — re-audit deliberately, do not just bump"
+        );
+    }
+
+    /// Shape-independent: whatever expression reaches the editor entity,
+    /// the replacement itself must name `replace_buffer`.
+    #[test]
+    fn only_the_guarded_sites_may_replace_the_sql_editors_buffer() {
+        audit(
+            "replace_buffer",
+            &["bind_script", "perform_script_action"],
+            2,
+            "route it through `AppView::editor_load_guarded` (Part S §5.5) or a bound \
+             script's unsaved changes are destroyed silently, with no undo",
+        );
+    }
+
+    /// …and the performer must not be reachable around the guard. The two
+    /// legal callers are the guard's own clean-editor fall-through and
+    /// „Zahodit" (`on_discard_confirm_yes`), which is the user answering
+    /// the guard's question.
+    #[test]
+    fn the_parked_action_is_only_performed_by_the_guard_or_its_confirm() {
+        audit(
+            "perform_script_action",
+            &["editor_load_guarded", "on_discard_confirm_yes"],
+            2,
+            "the guard exists to stand in front of this — call \
+             `AppView::editor_load_guarded` instead",
+        );
+    }
+
+    /// `bind_script` replaces the buffer too, so it is guard-territory
+    /// even though it takes text rather than a rel: only `open_script`
+    /// (itself reachable only through `perform_script_action`) may call it.
+    #[test]
+    fn the_binder_is_only_reached_from_the_guarded_open_path() {
+        audit(
+            "bind_script",
+            &["open_script"],
+            1,
+            "binding replaces the editor's buffer — go through \
+             `AppView::editor_load_guarded(PendingScriptAction::Open { .. })`",
+        );
     }
 }

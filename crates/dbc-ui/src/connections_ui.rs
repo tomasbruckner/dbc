@@ -4321,11 +4321,16 @@ pub(crate) fn modal_blocks_context_switch(modal: Option<&ModalState>) -> bool {
 ///    when several hold at once, so „runs first" was never a safety
 ///    property; reading it as one would have been the real mistake.
 /// 2. Under that reading, the existing rule still holds and is the better
-///    one: a running query is the only condition holding a LIVE resource
-///    (a connection this very switch is about to disconnect, §W3.1) and
-///    the only one that resolves itself. Telling a user to save a script
-///    while their query is still streaming would send them at the less
-///    urgent of two problems.
+///    one: a running query is the most immediate condition holding a LIVE
+///    resource — the connection this very switch is about to disconnect
+///    (§W3.1) — and the one that will clear itself if the user simply
+///    waits. (Not the ONLY such condition, T8 review NIT-1:
+///    `pending_edits` folds in `apply_dialog`, and an apply that is
+///    `running` is a live DB write on that same connection. It is not
+///    separable from the staged-edit state it travels with, and both are
+///    reported by the same sentence, so the ordering is unaffected.)
+///    Telling a user to save a script while their query is still streaming
+///    would send them at the less urgent of two problems.
 /// 3. §W3.1's intent — „the dirty guard is part of this gate, not an
 ///    afterthought bolted on at the call sites" — is honoured in full, and
 ///    given the maximum reading the pinned rule leaves: `dirty_script` is
@@ -6035,8 +6040,11 @@ mod workspace_confirm_tests {
             context_switch_refusal(false, false, false, true),
             Some("nejprve zavřete otevřený dialog")
         );
-        // A running query outranks everything else: it is the condition the
-        // user can act on immediately, and the one with a live resource.
+        // A running query outranks everything else: it is the condition
+        // the user can act on immediately, and the most immediate holder
+        // of a live resource (T8 review NIT-1: a `running` apply_dialog,
+        // folded into `pending_edits`, is a live write too — it just is
+        // not separable from the staged edits it travels with).
         // Workspace T8's §W3.1 reconciliation (see `context_switch_refusal`'s
         // own doc comment for the full rationale): the spec's „the dirty
         // script guard runs first" gave way to this pinned ordering,

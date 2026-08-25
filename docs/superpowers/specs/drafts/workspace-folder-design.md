@@ -249,11 +249,17 @@ condition"**. Rationale, recorded so it is not re-litigated:
    property of this gate, and reading it as one would have been the actual
    error.
 2. Under that reading the pre-existing rule is the better one and stands: a
-   running query is the only condition holding a LIVE resource — the very
+   running query is the most immediate holder of a LIVE resource — the very
    connection this switch is about to disconnect (see the paragraph above)
-   — and the only one that resolves itself if the user simply waits.
-   Sending a user to save a `.sql` buffer while their query is still
-   streaming points them at the less urgent of two problems.
+   — and the one that resolves itself if the user simply waits. Sending a
+   user to save a `.sql` buffer while their query is still streaming points
+   them at the less urgent of two problems. (Precision, T8 review NIT-1: it
+   is not the *only* live-resource condition. `pending_edits` is
+   `apply_dialog.is_some() || discard_confirm.is_some()`, and an
+   `apply_dialog` with `running: true` is a live write transaction on that
+   same connection. It is not separable from the staged-edit state it
+   travels with, and both are reported by one sentence, so the ordering is
+   unaffected — but the claim is „most immediate", not „only".)
 3. §W3.1's actual intent is honoured in full, and given the strongest
    reading the live-resource rule leaves: `dirty_script` is checked FIRST
    among the unsaved-work conditions, ahead of `pending_edits`. Losing a
