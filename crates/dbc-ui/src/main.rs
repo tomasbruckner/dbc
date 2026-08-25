@@ -47,7 +47,8 @@ use dbc_state::{
 };
 use gpui::{
     actions, div, prelude::*, px, size, uniform_list, AnyElement, App, Bounds, ClipboardItem,
-    Context, Entity, Focusable, KeyBinding, PathPromptOptions, ScrollDelta, ScrollWheelEvent,
+    Context, Entity, FocusHandle, Focusable, KeyBinding, PathPromptOptions, ScrollDelta,
+    ScrollWheelEvent,
     Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
@@ -290,10 +291,58 @@ const BLOCKED_WORKSPACE_SENTINEL: &str = "__pracovni-prostor-nenalezen__";
 /// an empty default config saved over `%APPDATA%\dbc\config.toml` would
 /// erase connections the user never agreed to lose.
 pub(crate) fn blocked_paths(root: Option<&Path>) -> dbc_state::workspace::Paths {
-    let base = root
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| dbc_state::workspace::profile_dir().join(BLOCKED_WORKSPACE_SENTINEL));
+    let profile = dbc_state::workspace::profile_dir();
+    // T4 review MAJOR-2: the doc comment above promises "NEVER at the
+    // profile's real files", but `workspace_paths(root)` was handed
+    // whatever the POINTER said — and a `workspace.toml` containing
+    // `path = "…\AppData\Roaming\dbc"` resolves to exactly the profile's
+    // real `config.toml`/`vault.bin`/`views.toml`/`params.toml`. The app
+    // cannot write such a pointer itself (init demands `Empty`, adopt
+    // demands a marker) and no writer is reachable while the blocking
+    // modal is up — but "not reachable today" is not an invariant, and the
+    // failure mode is an empty default config written over the user's real
+    // connections. So the promise is now STRUCTURAL: a root that resolves
+    // to the profile dir falls through to the sentinel.
+    let base = match root {
+        Some(r) if !is_same_dir(r, &profile) => r.to_path_buf(),
+        _ => profile.join(BLOCKED_WORKSPACE_SENTINEL),
+    };
     dbc_state::workspace::workspace_paths(&base)
+}
+
+/// "Do these two paths name the same directory?" — exact match first (works
+/// for paths that do not exist), then a canonicalised compare, which on
+/// Windows also normalises casing, `.`/`..` segments and short names.
+/// `canonicalize` FAILS on a non-existent path, so a failure means the two
+/// cannot both be the (existing) profile dir and `false` is the right
+/// answer — the exact-match arm above has already covered the identical
+/// spelling case.
+fn is_same_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Which persistent stores `main()` is ALLOWED to open. Exists so design
+/// §W4's actual enforcement — "a broken pointer loads NOTHING" — is a
+/// pinned unit test instead of three `blocked.is_some()` conditions buried
+/// in `fn main()`, which no test can reach (T4 review MINOR-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StartupLoads {
+    /// `AppConfig::load` — the connection list. NEVER on a blocked start.
+    pub config: bool,
+    /// `ViewPrefsStore::load`.
+    pub view_prefs: bool,
+    /// `ParamValuesStore::load`.
+    pub param_values: bool,
+    /// `HistoryDb::open` — machine-local in BOTH modes (§W5), so it opens
+    /// even on a blocked start: it carries no context-specific connection
+    /// state and losing it would degrade an unrelated feature.
+    pub history: bool,
 }
 
 /// What `main()` needs to know before it opens a single store. Pure over
@@ -313,6 +362,22 @@ pub(crate) struct StartupContext {
 
 /// Turns a [`dbc_state::workspace::Resolution`] into the three things
 /// `main()` acts on. Pure — no I/O, no GPUI.
+impl StartupContext {
+    /// Design §W4, as a value rather than as control flow. A blocked start
+    /// opens NOTHING that carries context: not the workspace's files (they
+    /// are unusable — that is what "broken" means) and above all not the
+    /// profile's (that would be the silent fallback this design bans).
+    pub(crate) fn loads(&self) -> StartupLoads {
+        let blocked = self.blocked.is_some();
+        StartupLoads {
+            config: !blocked,
+            view_prefs: !blocked,
+            param_values: !blocked,
+            history: true,
+        }
+    }
+}
+
 pub(crate) fn startup_context(res: dbc_state::workspace::Resolution) -> StartupContext {
     match res {
         dbc_state::workspace::Resolution::Profile(paths) => {
@@ -327,6 +392,29 @@ pub(crate) fn startup_context(res: dbc_state::workspace::Resolution) -> StartupC
             blocked: Some((root, reason)),
         },
     }
+}
+
+/// May a „Najít složku…" continuation still commit its pick? (T4 review
+/// MAJOR-1.) Extracted as a pure predicate — the `pwchange::esc_closable`
+/// precedent — because the racing code path lives inside a `cx.spawn`
+/// continuation that no unit test can drive.
+///
+/// TWO independent conditions, and both are load-bearing:
+///
+/// * the `WorkspaceMissing` modal must still be OPEN — if the user has
+///   meanwhile clicked „Použít lokální profil", the app is in profile mode
+///   by their EXPLICIT choice, and a folder pick landing afterwards would
+///   override it silently, which is the whole class of bug §W4 exists to
+///   prevent;
+/// * the pick's generation must still be current — every context swap
+///   (`apply_context`) bumps it, so a superseded pick is inert even in the
+///   window where a new modal has been opened by something else.
+pub(crate) fn recovery_pick_may_commit(
+    workspace_missing_modal_open: bool,
+    dispatched_generation: u64,
+    current_generation: u64,
+) -> bool {
+    workspace_missing_modal_open && dispatched_generation == current_generation
 }
 
 /// G12 T5: engine -> splitter dialect for the editor's multi-statement
@@ -1157,6 +1245,30 @@ struct AppView {
     /// There is no third state — a broken pointer never reaches here (it
     /// is blocked at startup, §W4). Written ONLY by `apply_context`.
     workspace_root: Option<PathBuf>,
+    /// T4 review MAJOR-1: bumped by EVERY context swap (`apply_context`),
+    /// captured by each „Najít složku…" dispatch. A pick whose folder
+    /// classification finished after the context already changed under it
+    /// is inert — see `recovery_pick_may_commit`.
+    workspace_pick_generation: u64,
+    /// T4 review NIT-11: tab stops for the `WorkspaceMissing` modal's three
+    /// choices. A BLOCKING dialog whose only exit is a mouse click leaves a
+    /// keyboard-only user with nothing but the window close button, so the
+    /// buttons are real focus targets (`tab_index` requires a tracked
+    /// handle in the pinned gpui). Enter/Space activate the FOCUSED button
+    /// only; a bare Enter from the modal's own focus still reaches the
+    /// `ModalConfirmKind::Ignore` policy, so §W4's "no default button"
+    /// rule holds.
+    workspace_choice_focus: [FocusHandle; 3],
+    /// T4 review NIT-11: the `WorkspaceMissing` panel's own focus handle,
+    /// which makes the panel a gpui TAB GROUP. Focused when the modal
+    /// opens (instead of the shared `modal_focus_handle`), so the first
+    /// Tab descends into the three choices deterministically rather than
+    /// into whatever else the window happens to expose — the pinned gpui
+    /// documents exactly this "focus the container, then `focus_next`"
+    /// contract on `InteractiveElement::tab_stop`. Focus lands on the
+    /// CONTAINER, not on a button, so a bare Enter still reaches
+    /// `ModalConfirmKind::Ignore`: §W4's "no default button" holds.
+    workspace_panel_focus: FocusHandle,
     /// Unlocked vault, kept for the session once the user has entered the
     /// master password once (brief: prompt on first use, not at startup).
     vault: Option<Vault>,
@@ -1200,7 +1312,10 @@ struct AppView {
     /// `sidebar_fetch_generation`/`switch_generation`.
     compare_fetch_generation: u64,
     // --- G3 Task 3: history panel + query recording ---
-    /// Opened from `default_history_path()` at startup; `None` when the open
+    /// Opened at startup from the ACTIVE context's history path
+    /// (`StartupContext::paths.history`, workspace T4) — which is
+    /// `default_history_path()` in BOTH modes, because history is
+    /// deliberately machine-local (§W5); `None` when the open
     /// failed (surfaced once in the startup status — see `main`), in which
     /// case the app stays fully functional, just without recording/search
     /// (`record_history` and the panel's search both no-op gracefully).
@@ -1231,15 +1346,22 @@ struct AppView {
     /// `on_open_palette`/`render_palette_overlay`).
     palette: Option<PaletteState>,
     // --- G4 Task 6: per-table view memory ---
-    /// Opened from `dbc_state::default_view_prefs_path()` at startup;
-    /// `None` when the open failed (surfaced once in the startup status —
-    /// see `main`), in which case the feature is simply off — no apply, no
+    /// Opened at startup from the ACTIVE context's views path
+    /// (`StartupContext::paths.views`, workspace T4 — the profile path in
+    /// profile mode, `<workspace>/views.toml` in workspace mode) and
+    /// rebuilt by `apply_context` on every swap. `None` when the open
+    /// failed (surfaced once in the startup status — see `main`) or when
+    /// the start was BLOCKED (§W4 loads nothing — see `StartupLoads`), in
+    /// which case the feature is simply off — no apply, no
     /// save — the rest of the app is fully functional either way, same
     /// "degrade gracefully" precedent as `history: Option<HistoryDb>`.
     view_prefs: Option<ViewPrefsStore>,
     // --- G6 Task 3: parametrized `:name` query values ---
-    /// Opened from `dbc_state::default_param_values_path()` at startup;
-    /// `None` on a load failure (same "degrade gracefully" posture as
+    /// Opened at startup from the ACTIVE context's params path
+    /// (`StartupContext::paths.params`, workspace T4) and rebuilt by
+    /// `apply_context` on every swap; `None` on a load failure or a
+    /// BLOCKED start (§W4 — see `StartupLoads`), same "degrade
+    /// gracefully" posture as
     /// `view_prefs` — the values dialog still opens and runs queries, it
     /// just won't prefill/remember values across runs). Keyed by
     /// `(connection_id, param name)` — see `open_query_params_dialog`/
@@ -4115,6 +4237,15 @@ impl AppView {
             return;
         }
         if let Some(modal) = self.modal.clone() {
+            // §W4 (T4 review MINOR-4): a BLOCKING modal is never
+            // Esc-closable, whatever its contents — checked before the
+            // per-variant rules below, which all ask the narrower "is there
+            // unsaved secret state / a running job?" question. The property
+            // lives in `connections_ui::modal_is_blocking` so it can be
+            // pinned by a unit test; this handler cannot be.
+            if connections_ui::modal_is_blocking(&modal) {
+                return;
+            }
             let closable = match &modal {
                 connections_ui::ModalState::ConnectionDialog(ui) => ui.password.read(cx).text().is_empty(),
                 // G6 Task 3: no password/unsaved-secret concern here — Esc
@@ -4154,12 +4285,8 @@ impl AppView {
                         && admin_password.read(cx).text().is_empty();
                     pwchange::esc_closable(empty, *running)
                 }
-                // §W4: not Esc-closable, ever. Dismissing it would leave an
-                // app with an empty config and no context — the modal IS
-                // the recovery UI, not an interruption of one. Explicit
-                // (not left to the `_` arm below) because "blocking" is a
-                // load-bearing property of this modal, not a default.
-                connections_ui::ModalState::WorkspaceMissing { .. } => false,
+                // `WorkspaceMissing` never reaches this match — the
+                // `modal_is_blocking` guard above returns first.
                 _ => false,
             };
             if closable {
@@ -5415,6 +5542,13 @@ impl AppView {
     /// non-workspace one — initialization is a Settings decision with its
     /// own confirm + security warning (T5), never a recovery side effect.
     fn pick_workspace_for_recovery(&mut self, cx: &mut Context<Self>) {
+        // T4 review MAJOR-1: capture the generation this pick belongs to.
+        // The picker and the classification below are both slow (a folder
+        // dialog, then a `read_dir` that can take seconds on a network
+        // share) and the window stays interactive throughout, so the user
+        // can reach a DIFFERENT decision — „Použít lokální profil" — while
+        // this task is still running.
+        let my_generation = self.workspace_pick_generation;
         let dialog = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -5438,35 +5572,66 @@ impl AppView {
                     return;
                 }
             };
-            // Off the UI thread: classification + the pointer write.
-            let outcome: Result<PathBuf, String> = cx
-                .background_spawn(async move {
-                    match dbc_state::workspace::classify(&picked) {
-                        dbc_state::workspace::Classification::Workspace => {
-                            dbc_state::workspace::write_pointer(
-                                &dbc_state::workspace::pointer_path(),
-                                &picked,
-                            )
-                            .map_err(|e| e.message)?;
-                            Ok(picked)
+            // Off the UI thread: classification ONLY. The pointer write
+            // deliberately does NOT happen here (T4 review MAJOR-1): a
+            // stale task that had already rewritten the pointer would leave
+            // the NEXT launch in workspace mode even after being refused
+            // here, and undoing a write after the fact is its own race.
+            // Nothing is persisted until the UI-thread guard below passes.
+            let classified = cx
+                .background_spawn({
+                    let picked = picked.clone();
+                    async move {
+                        match dbc_state::workspace::classify(&picked) {
+                            dbc_state::workspace::Classification::Workspace => Ok(()),
+                            dbc_state::workspace::Classification::FutureFormat(f) => Err(format!(
+                                "pracovní prostor vyžaduje novější verzi aplikace (formát {f})"
+                            )),
+                            dbc_state::workspace::Classification::Unreadable(m) => Err(m),
+                            _ => Err(
+                                "vybraná složka není pracovní prostor dbc — vyberte složku s dbc-workspace.toml"
+                                    .to_string(),
+                            ),
                         }
-                        dbc_state::workspace::Classification::FutureFormat(f) => Err(format!(
-                            "pracovní prostor vyžaduje novější verzi aplikace (formát {f})"
-                        )),
-                        dbc_state::workspace::Classification::Unreadable(m) => Err(m),
-                        _ => Err(
-                            "vybraná složka není pracovní prostor dbc — vyberte složku s dbc-workspace.toml"
-                                .to_string(),
-                        ),
                     }
                 })
                 .await;
-            let _ = this.update(cx, |view, cx| match outcome {
-                Ok(root) => {
-                    view.close_modal(cx);
-                    view.apply_context(Some(root), cx);
+            let _ = this.update(cx, |view, cx| {
+                if let Err(e) = classified {
+                    view.set_workspace_missing_error(e, cx);
+                    return;
                 }
-                Err(e) => view.set_workspace_missing_error(e, cx),
+                // THE GUARD (T4 review MAJOR-1). Both halves are pinned by
+                // `recovery_pick_may_commit`'s tests.
+                let modal_open = matches!(
+                    view.modal,
+                    Some(connections_ui::ModalState::WorkspaceMissing { .. })
+                );
+                if !recovery_pick_may_commit(
+                    modal_open,
+                    my_generation,
+                    view.workspace_pick_generation,
+                ) {
+                    // Superseded by the user's own explicit choice. Say
+                    // nothing and change nothing: the pointer was never
+                    // written, so there is no state to undo, and stealing
+                    // the context back now is exactly the silent override
+                    // this guard exists to stop.
+                    return;
+                }
+                // Only now, and only on the UI thread behind the guard, is
+                // anything persisted. A small atomic TOML write — the same
+                // deliberately-synchronous posture as `apply_context`'s
+                // `AppConfig::load`.
+                if let Err(e) = dbc_state::workspace::write_pointer(
+                    &dbc_state::workspace::pointer_path(),
+                    &picked,
+                ) {
+                    view.set_workspace_missing_error(e.message, cx);
+                    return;
+                }
+                view.close_modal(cx);
+                view.apply_context(Some(picked), cx);
             });
         })
         .detach();
@@ -5536,6 +5701,21 @@ impl AppView {
         self.param_values = ParamValuesStore::load(&paths.params).ok();
         // history: NOT touched — machine-local in both modes (§W5).
         self.workspace_root = root.clone();
+        // T4 review MAJOR-1: every swap supersedes any „Najít složku…"
+        // continuation still in flight, so a stale pick can never override
+        // the choice the user just made (`recovery_pick_may_commit`).
+        self.workspace_pick_generation = self.workspace_pick_generation.wrapping_add(1);
+        // T4 review MINOR-6 (as-built addendum to §W3.4, which listed only
+        // the scripts tree): drop the OLD context's fetched database lists
+        // and schema snapshots BEFORE `sync_connections` re-seeds the map.
+        // `sync_connections` keeps every cached entry whose connection id
+        // still exists — and because §W3.2 initialises a workspace by
+        // copying `config.toml` verbatim, the two contexts share ids by
+        // construction, so without this the sidebar would render context
+        // A's databases and schemas under context B's identically-id'd
+        // connection. Display-only (queries rebuild from the new config),
+        // but a wrong-context display is still a wrong context.
+        self.tree.update(cx, |t, cx| t.reset_fetched_context(cx));
         self.refresh_grouped_cache(cx);
         self.refresh_tree_context(cx);
         // T7 adds ONE line here — `self.tree.update(cx, |t, cx|
@@ -8956,6 +9136,16 @@ impl Render for AppView {
                 // openers (dropdown/test).
                 let focus = input.focus_handle(cx);
                 window.focus(&focus, cx);
+            } else if matches!(
+                self.modal,
+                Some(connections_ui::ModalState::WorkspaceMissing { .. })
+            ) {
+                // T4 review NIT-11: focus the §W4 panel (a tab group), not
+                // the shared overlay handle, so Tab descends into its three
+                // choices. Still a container, not a button — Enter stays
+                // inert (`ModalConfirmKind::Ignore`).
+                let focus = self.workspace_panel_focus.clone();
+                window.focus(&focus, cx);
             } else if self.modal.is_some() || self.discard_confirm.is_some() {
                 window.focus(&self.modal_focus_handle, cx);
             }
@@ -9373,6 +9563,11 @@ fn main() {
     let vault_path = startup.paths.vault.clone();
     let workspace_root = startup.workspace_root.clone();
     let blocked = startup.blocked.clone();
+    // §W4's enforcement, as a value rather than three scattered
+    // `blocked.is_some()` conditions (T4 review MINOR-3) — pinned by
+    // `workspace_startup_tests::a_broken_start_opens_no_context_store`.
+    let loads = startup.loads();
+    let blocked_start = blocked.is_some();
     // Design §W4: a broken pointer loads NOTHING. Not the workspace's
     // files (they are unusable — that is what "broken" means), and above
     // all not the profile's (that would be the silent fallback this design
@@ -9383,7 +9578,7 @@ fn main() {
     // corrupt — surfaced in the status bar below rather than silently
     // discarded (final-review must-fix #2). `finish_save` refuses to
     // overwrite the file until it's been moved aside.
-    let (config, config_load_error) = if blocked.is_some() {
+    let (config, config_load_error) = if !loads.config {
         (AppConfig::default(), None)
     } else {
         match AppConfig::load(&config_path) {
@@ -9399,15 +9594,19 @@ fn main() {
     // already resolves it to the profile path, so this line is mode-blind
     // (and a blocked start still gets its history, which carries no
     // context-specific connection state).
-    let (history, history_open_error) = match HistoryDb::open(&startup.paths.history) {
-        Ok(h) => (Some(h), None),
-        Err(e) => (None, Some(e.to_string())),
+    let (history, history_open_error) = if !loads.history {
+        (None, None)
+    } else {
+        match HistoryDb::open(&startup.paths.history) {
+            Ok(h) => (Some(h), None),
+            Err(e) => (None, Some(e.to_string())),
+        }
     };
     // G4 Task 6: opened once at startup; a failure (e.g. a corrupt
     // views.toml) is surfaced in the status bar below but never blocks the
     // rest of the app — the feature is just off (`view_prefs: None`), same
     // "degrade gracefully" precedent `history_open_error` already follows.
-    let (view_prefs, view_prefs_open_error) = if blocked.is_some() {
+    let (view_prefs, view_prefs_open_error) = if !loads.view_prefs {
         (None, None)
     } else {
         match ViewPrefsStore::load(&startup.paths.views) {
@@ -9421,7 +9620,7 @@ fn main() {
     // that the feature stops working, so (unlike `view_prefs`/`history`)
     // this isn't surfaced as its own startup status notice.
     let param_values =
-        if blocked.is_some() { None } else { ParamValuesStore::load(&startup.paths.params).ok() };
+        if !loads.param_values { None } else { ParamValuesStore::load(&startup.paths.params).ok() };
 
     application().run(move |cx: &mut App| {
         cx.bind_keys([
@@ -9468,7 +9667,15 @@ fn main() {
                         // view-prefs open failure (G4 Task 6) is the least
                         // severe of the three (only per-table grid memory is
                         // affected).
-                        let status = if let Some(detail) = &config_load_error {
+                        // T4 review NIT-9: „ready" behind a modal saying
+                        // the workspace was not found is a lie, and it is
+                        // the line that stays on screen after the modal is
+                        // dealt with. §W4's blocked start outranks every
+                        // other startup notice — there is no config to be
+                        // corrupt and no view prefs to have failed.
+                        let status = if blocked_start {
+                            connections_ui::WORKSPACE_MISSING_STATUS.to_string()
+                        } else if let Some(detail) = &config_load_error {
                             format!("error: config.toml je poškozený – oprav nebo smaž soubor ({detail})")
                         } else if let Some(detail) = &history_open_error {
                             format!("error: historie nedostupná ({detail})")
@@ -9507,6 +9714,13 @@ fn main() {
                             config_load_error,
                             vault_path,
                             workspace_root,
+                            workspace_pick_generation: 0,
+                            workspace_choice_focus: [
+                                cx.focus_handle(),
+                                cx.focus_handle(),
+                                cx.focus_handle(),
+                            ],
+                            workspace_panel_focus: cx.focus_handle(),
                             vault: None,
                             active_connection_id: None,
                             active_database: None,
@@ -10850,5 +11064,111 @@ mod workspace_startup_tests {
     fn blocked_paths_never_collide_with_the_profile_dir_itself() {
         let p = blocked_paths(None);
         assert_ne!(p.config.parent(), Some(dbc_state::workspace::profile_dir().as_path()));
+    }
+
+    /// T4 review MAJOR-2. `blocked_paths(Some(root))` used to return
+    /// `workspace_paths(root)` for WHATEVER the pointer said — so a
+    /// hand-written `workspace.toml` naming the profile dir yielded the
+    /// profile's real `config.toml`/`vault.bin`/`views.toml`/`params.toml`,
+    /// directly contradicting the fn's own doc comment. Not reachable
+    /// today (no writer runs while the blocking modal is up), but the
+    /// failure mode is an empty default config written over the user's
+    /// real connections, so the promise is now structural.
+    #[test]
+    fn a_pointer_aimed_at_the_profile_dir_falls_through_to_the_sentinel() {
+        let prof = dbc_state::workspace::profile_dir();
+        let sentinel = blocked_paths(None);
+        let real = profile_paths();
+
+        let got = blocked_paths(Some(&prof));
+        assert_eq!(got, sentinel, "the profile dir must resolve to the sentinel");
+        assert_ne!(got.config, real.config);
+        assert_ne!(got.vault, real.vault);
+        assert_ne!(got.views, real.views);
+        assert_ne!(got.params, real.params);
+
+        // A non-canonical spelling of the same directory must not slip
+        // past the exact-match arm. `canonicalize` needs the path to
+        // exist, so this half only runs where the profile dir is real.
+        if prof.is_dir() {
+            let odd = prof.join(".");
+            assert_eq!(blocked_paths(Some(&odd)), sentinel, "{}", odd.display());
+        }
+
+        // A genuine workspace root is still used as-is.
+        let real_ws = prof.join("nekde-jinde-workspace");
+        assert_eq!(blocked_paths(Some(&real_ws)).config, real_ws.join("config.toml"));
+    }
+
+    /// T4 review MINOR-3: the rail's ENFORCEMENT, not just its paths. The
+    /// five tests above all decide where stores would open; this one pins
+    /// that on a blocked start they are not opened at all — the property a
+    /// "simplification" of `fn main()`'s conditions would silently undo.
+    #[test]
+    fn a_broken_start_opens_no_context_store() {
+        let blocked = startup_context(Resolution::Broken {
+            root: Some(PathBuf::from("D:\\ws-gone")),
+            reason: "složka neexistuje".to_string(),
+        })
+        .loads();
+        assert!(!blocked.config, "config.toml is THE silent-fallback vector");
+        assert!(!blocked.view_prefs);
+        assert!(!blocked.param_values);
+        // §W5: history is machine-local in both modes and carries no
+        // context — it is the one store a blocked start may still open.
+        assert!(blocked.history);
+
+        for ok in [
+            startup_context(Resolution::Profile(profile_paths())).loads(),
+            startup_context(Resolution::Workspace {
+                root: PathBuf::from("D:\\ws"),
+                paths: workspace_paths(Path::new("D:\\ws")),
+            })
+            .loads(),
+        ] {
+            assert!(ok.config && ok.view_prefs && ok.param_values && ok.history);
+        }
+    }
+}
+
+/// T4 review MAJOR-1: the „Najít složku…" continuation's commit guard.
+/// The race it closes: broken pointer → modal → „Najít složku…" → the
+/// picker and `classify()` (a `read_dir`, seconds on a network share) run
+/// while the window stays interactive → the user gives up and clicks
+/// „Použít lokální profil" → the stale task lands and swaps them into
+/// workspace mode anyway, overriding an explicit choice.
+#[cfg(test)]
+mod recovery_pick_guard_tests {
+    use super::*;
+
+    #[test]
+    fn a_current_pick_over_the_open_modal_commits() {
+        assert!(recovery_pick_may_commit(true, 7, 7));
+    }
+
+    #[test]
+    fn a_closed_modal_refuses_the_pick() {
+        // „Použít lokální profil" closed it: the user has ALREADY chosen.
+        assert!(!recovery_pick_may_commit(false, 7, 7));
+    }
+
+    #[test]
+    fn a_superseded_generation_refuses_the_pick() {
+        // A context swap happened under the task. Belt to the modal
+        // check's braces: a modal reopened in the meantime must not make a
+        // stale pick look current again.
+        assert!(!recovery_pick_may_commit(true, 7, 8));
+        assert!(!recovery_pick_may_commit(false, 7, 8));
+    }
+
+    #[test]
+    fn both_conditions_are_required_not_either() {
+        // Pins the AND. An OR here would reopen the exact hole: the modal
+        // is closed but the generation happens to match, or vice versa.
+        for (open, dispatched, current) in
+            [(true, 1u64, 2u64), (false, 1, 1), (false, 1, 2)]
+        {
+            assert!(!recovery_pick_may_commit(open, dispatched, current));
+        }
     }
 }

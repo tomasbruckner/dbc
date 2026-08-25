@@ -253,23 +253,46 @@ pub fn classify(root: &Path) -> Classification {
         };
     }
     let marker = root.join(MARKER_FILE);
-    if marker.exists() {
-        let raw = match std::fs::read_to_string(&marker) {
-            Ok(r) => r,
-            Err(e) => return Classification::Unreadable(format!("{MARKER_FILE}: {e}")),
-        };
-        return match toml::from_str::<Marker>(&raw) {
-            // Formats are 1-based: no build ever wrote `format = 0`, so a
-            // zero is a hand-edited or truncated marker, NOT an old
-            // layout to be adopted silently.
-            Ok(m) if (1..=WORKSPACE_FORMAT).contains(&m.format) => Classification::Workspace,
-            Ok(m) if m.format > WORKSPACE_FORMAT => Classification::FutureFormat(m.format),
-            Ok(m) => {
-                Classification::Unreadable(format!("{MARKER_FILE}: neplatný formát {}", m.format))
-            }
-            Err(e) => Classification::Unreadable(format!("{MARKER_FILE}: {e}")),
-        };
+    let probe = marker.try_exists();
+    classify_probed(root, &marker, probe)
+}
+
+/// Testable seam for [`classify`]: the MARKER existence probe is injected,
+/// so the "marker is there but cannot even be probed" branch can be pinned
+/// without needing a genuinely deny-read file on every platform CI runs on
+/// (same seam shape as [`read_pointer_probed`]).
+///
+/// The probe is [`Path::try_exists`], NOT `Path::exists`: `exists()`
+/// collapses every `io::Error` into `false`, which here would report a
+/// deny-read marker as „chybí dbc-workspace.toml". Still `Broken` either
+/// way — but with a reason that sends the user hunting for a file that is
+/// sitting right there. A wrong diagnosis is its own defect.
+fn classify_probed(root: &Path, marker: &Path, probe: std::io::Result<bool>) -> Classification {
+    match probe {
+        Ok(true) => {}
+        Ok(false) => return classify_unmarked(root),
+        Err(e) => {
+            return Classification::Unreadable(format!("{MARKER_FILE} nelze ověřit: {e}"));
+        }
     }
+    let raw = match std::fs::read_to_string(marker) {
+        Ok(r) => r,
+        Err(e) => return Classification::Unreadable(format!("{MARKER_FILE}: {e}")),
+    };
+    match toml::from_str::<Marker>(&raw) {
+        // Formats are 1-based: no build ever wrote `format = 0`, so a
+        // zero is a hand-edited or truncated marker, NOT an old layout to
+        // be adopted silently.
+        Ok(m) if (1..=WORKSPACE_FORMAT).contains(&m.format) => Classification::Workspace,
+        Ok(m) if m.format > WORKSPACE_FORMAT => Classification::FutureFormat(m.format),
+        Ok(m) => Classification::Unreadable(format!("{MARKER_FILE}: neplatný formát {}", m.format)),
+        Err(e) => Classification::Unreadable(format!("{MARKER_FILE}: {e}")),
+    }
+}
+
+/// A directory with no marker: `Empty` (nothing, or only dot-entries — a
+/// fresh clone) or `NonEmpty` (real content we must never scatter into).
+fn classify_unmarked(root: &Path) -> Classification {
     let rd = match std::fs::read_dir(root) {
         Ok(rd) => rd,
         Err(e) => return Classification::Unreadable(e.to_string()),
@@ -604,6 +627,38 @@ mod tests {
         let ptr = Path::new("a\u{0}b.toml");
         assert!(read_pointer(ptr).is_err(), "exists() would silently report no pointer");
         assert!(matches!(resolve_at(ptr), Resolution::Broken { .. }));
+    }
+
+    #[test]
+    fn an_unprobeable_marker_says_so_instead_of_chybi() {
+        // T4 review NIT-10. `classify` used `marker.exists()`, which
+        // collapses every io::Error into `false` — a deny-read marker
+        // (corporate ACL, dangling reparse point) was therefore reported as
+        // „chybí dbc-workspace.toml", sending the user to look for a file
+        // that is sitting right there. Still Broken either way; a wrong
+        // diagnosis is its own defect. No portable test can create such a
+        // file, so the probe is injected at the seam.
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        let marker = root.join(MARKER_FILE);
+        let denied =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Access is denied.");
+
+        match classify_probed(&root, &marker, Err(denied)) {
+            Classification::Unreadable(m) => {
+                assert!(m.contains("nelze ověřit"), "{m}");
+                assert!(!m.contains("chybí"), "must not claim the marker is missing: {m}");
+                assert!(m.contains(MARKER_FILE), "must name the file: {m}");
+            }
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+
+        // The two non-error probe outcomes are unchanged.
+        assert_eq!(classify_probed(&root, &marker, Ok(false)), Classification::Empty);
+        write_marker(&root).unwrap();
+        assert_eq!(classify_probed(&root, &marker, Ok(true)), Classification::Workspace);
+        assert_eq!(classify(&root), Classification::Workspace);
     }
 
     #[test]

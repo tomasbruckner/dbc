@@ -39,7 +39,8 @@ use dbc_state::{ConnectionConfig, Engine, MssqlOptions, SshTunnelConfig, Vault};
 use gpui::{
     actions, div, fill, hsla, point, prelude::*, px, relative, size, App, AnyElement,
     Bounds, ClipboardItem, Context, CursorStyle, Div, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
+    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
+    LayoutId, Modifiers,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Stateful, Style, TextRun, UTF16Selection, UnderlineStyle,
     uniform_list, Window,
@@ -1320,8 +1321,20 @@ pub enum ModalState {
     /// only when the POINTER itself was unparsable (there is no folder to
     /// name); `error` carries a failed re-pick's message, shown in place.
     WorkspaceMissing {
+        /// The folder the pointer named, shown verbatim so the user can
+        /// recognise a moved/renamed/unmounted path. `None` ONLY when the
+        /// pointer file itself could not be read or parsed — there is then
+        /// no folder to name, and the panel says so instead.
         root: Option<std::path::PathBuf>,
+        /// Why it is unusable, straight from
+        /// `dbc_state::workspace::Resolution::Broken` („složka neexistuje",
+        /// „chybí dbc-workspace.toml", a future-format line, …). Rendered
+        /// with the `error:` status prefix; never composed here.
         reason: String,
+        /// A FAILED „Najít složku…" attempt's message, shown in place under
+        /// `reason` so the modal never has to close to report a refusal.
+        /// `None` until the user tries and it fails; a successful pick
+        /// closes the modal instead.
         error: Option<String>,
     },
 }
@@ -1373,6 +1386,41 @@ pub(crate) fn modal_confirm_kind(modal: &ModalState) -> ModalConfirmKind {
         // three choices (re-pick / explicit profile / quit) must be a
         // deliberate click.
         | ModalState::WorkspaceMissing { .. } => ModalConfirmKind::Ignore,
+    }
+}
+
+/// Is this modal BLOCKING — i.e. must Esc refuse to close it whatever its
+/// contents? (T4 review MINOR-4.) Extracted from `AppView::on_cancel_query`
+/// on the `pwchange::esc_closable` precedent, precisely because that
+/// handler needs a `Window`/`Context` and so cannot be unit-tested, while
+/// "the §W4 modal is not Esc-closable" is the single most load-bearing
+/// property this phase has.
+///
+/// The distinction against the per-variant `closable` rules that follow it:
+/// those ask "is there unsaved secret state / a running job?" and can
+/// answer `true`; this one is unconditional. Written with every variant
+/// spelled out (same convention as `modal_confirm_kind`) so a NEW
+/// `ModalState` is a compile error here and must consciously pick a side.
+pub(crate) fn modal_is_blocking(modal: &ModalState) -> bool {
+    match modal {
+        // Design §W4: the app behind it is deliberately EMPTY — no config,
+        // no vault, no view prefs were loaded. Dismissing this is not
+        // "getting out of a dialog", it is being left in a context-less
+        // app with no way back.
+        ModalState::WorkspaceMissing { .. } => true,
+        ModalState::ConnectionDialog(_)
+        | ModalState::MasterPasswordPrompt { .. }
+        | ModalState::CreateMasterPassword { .. }
+        | ModalState::QueryParams { .. }
+        | ModalState::CompareDialog { .. }
+        | ModalState::Settings
+        | ModalState::ChartPicker { .. }
+        | ModalState::ChangeServerPassword { .. }
+        | ModalState::KillConfirm { .. }
+        | ModalState::AnalyzeWriteConfirm { .. }
+        | ModalState::BackupRestore(_)
+        | ModalState::ScriptRun { .. }
+        | ModalState::CsvImport { .. } => false,
     }
 }
 
@@ -1609,7 +1657,9 @@ impl AppView {
                 render_chart_picker_panel(source_title, columns, kind, x_col, y_selected, edit_tab, cx)
             }
             ModalState::WorkspaceMissing { root, reason, error } => {
-                render_workspace_missing_panel(&root, &reason, &error, cx)
+                let panel_focus = self.workspace_panel_focus.clone();
+                let focus = self.workspace_choice_focus.clone();
+                render_workspace_missing_panel(&root, &reason, &error, &panel_focus, &focus, cx)
             }
         };
         Some(
@@ -3689,6 +3739,12 @@ pub(crate) const WORKSPACE_MISSING_PROFILE_HINT: &str =
 pub(crate) const WORKSPACE_MISSING_PROFILE: &str = "Použít lokální profil";
 /// §W4 choice 3.
 pub(crate) const WORKSPACE_MISSING_QUIT: &str = "Ukončit";
+/// The status-bar line on a BLOCKED start (T4 review NIT-9). „ready" was a
+/// lie behind a modal saying the workspace was not found — and it is the
+/// line left on screen once the modal is dealt with. Carries the `error:`
+/// status prefix, like every other startup failure notice.
+pub(crate) const WORKSPACE_MISSING_STATUS: &str =
+    "error: pracovní prostor nenalezen — vyberte složku, nebo použijte lokální profil";
 
 /// Design §W4 — the blocking „Pracovní prostor nenalezen" panel. Three
 /// explicit choices, no implicit ones: Enter is `Ignore`
@@ -3700,24 +3756,53 @@ fn render_workspace_missing_panel(
     root: &Option<std::path::PathBuf>,
     reason: &str,
     error: &Option<String>,
+    panel_focus: &FocusHandle,
+    focus: &[FocusHandle; 3],
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let path_line = root
         .as_ref()
         .map(|r| r.display().to_string())
         .unwrap_or_else(|| WORKSPACE_MISSING_NO_PATH.to_string());
-    let button = |id: &'static str, label: &'static str, cx: &mut Context<AppView>| {
+    // T4 review NIT-11: a BLOCKING dialog must be operable without a
+    // mouse — otherwise a keyboard-only user's only exit from an app with
+    // no context is the window close button. Each choice is a real tab
+    // stop (`tab_index` needs a tracked handle in the pinned gpui) and
+    // Enter/Space activate the FOCUSED one. §W4's "Enter is inert" rule is
+    // untouched: initial focus is the modal's own handle, not a button, so
+    // a bare Enter still lands on `ModalConfirmKind::Ignore` — there is no
+    // default button, only a deliberately tabbed-to one.
+    let button = |idx: usize,
+                  id: &'static str,
+                  label: &'static str,
+                  focus: &[FocusHandle; 3],
+                  cx: &mut Context<AppView>| {
+        let ring = cx.theme().accent;
+        let base = cx.theme().bg_hover;
         div()
             .id(id)
+            .track_focus(&focus[idx])
+            .tab_index(idx as isize)
             .px_3()
             .py_1()
             .rounded_md()
-            .bg(cx.theme().bg_hover)
+            .bg(base)
+            .border_1()
+            .border_color(base)
+            // Keyboard users must SEE which choice Enter/Space would take.
+            .focus(|s| s.border_color(ring))
             .cursor_pointer()
             .child(label)
     };
     let mut panel = div()
         .id("workspace-missing-panel")
+        // T4 review NIT-11: the panel is a TAB GROUP tracking its own
+        // handle, and `AppView::render` focuses that handle when the modal
+        // opens — the pinned gpui's documented "focus the container, then
+        // `focus_next` descends into this group's first item" contract, so
+        // Tab reaches the three choices instead of the window at large.
+        .track_focus(panel_focus)
+        .tab_group()
         .w(px(460.))
         .bg(cx.theme().bg_panel)
         .border_1()
@@ -3736,21 +3821,53 @@ fn render_workspace_missing_panel(
     }
     panel
         .child(
-            button("workspace-missing-find", WORKSPACE_MISSING_FIND, cx)
-                .on_click(cx.listener(|this, _, _, cx| this.pick_workspace_for_recovery(cx))),
+            button(0, "workspace-missing-find", WORKSPACE_MISSING_FIND, &focus, cx)
+                .on_click(cx.listener(|this, _, _, cx| this.pick_workspace_for_recovery(cx)))
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                    if activates_focused_choice(ev) {
+                        cx.stop_propagation();
+                        this.pick_workspace_for_recovery(cx);
+                    }
+                })),
+        )
+        .child(div().text_color(cx.theme().text_muted).child(WORKSPACE_MISSING_PROFILE_HINT))
+        .child(
+            button(1, "workspace-missing-profile", WORKSPACE_MISSING_PROFILE, &focus, cx)
+                .on_click(cx.listener(|this, _, _, cx| this.use_local_profile(cx)))
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                    if activates_focused_choice(ev) {
+                        cx.stop_propagation();
+                        this.use_local_profile(cx);
+                    }
+                })),
         )
         .child(
-            div().text_color(cx.theme().text_muted).child(WORKSPACE_MISSING_PROFILE_HINT),
-        )
-        .child(
-            button("workspace-missing-profile", WORKSPACE_MISSING_PROFILE, cx)
-                .on_click(cx.listener(|this, _, _, cx| this.use_local_profile(cx))),
-        )
-        .child(
-            button("workspace-missing-quit", WORKSPACE_MISSING_QUIT, cx)
-                .on_click(cx.listener(|_this, _, _, cx| cx.quit())),
+            button(2, "workspace-missing-quit", WORKSPACE_MISSING_QUIT, &focus, cx)
+                .on_click(cx.listener(|_this, _, _, cx| cx.quit()))
+                .on_key_down(cx.listener(|_this, ev: &KeyDownEvent, _, cx| {
+                    if activates_focused_choice(ev) {
+                        cx.stop_propagation();
+                        cx.quit();
+                    }
+                })),
         )
         .into_any_element()
+}
+
+/// Does this keystroke activate the button that currently HAS focus?
+/// (T4 review NIT-11.) Enter or Space with no modifier held — the platform
+/// convention for "press the focused button". Pure, so the §W4 keyboard
+/// contract is unit-pinned; the modifier check is what keeps Ctrl+Enter
+/// (`RunQuery`) and friends from being swallowed by a focused choice.
+pub(crate) fn choice_key_activates(key: &str, mods: &Modifiers) -> bool {
+    if mods.control || mods.platform || mods.alt || mods.shift || mods.function {
+        return false;
+    }
+    key == "enter" || key == "space"
+}
+
+fn activates_focused_choice(ev: &KeyDownEvent) -> bool {
+    choice_key_activates(&ev.keystroke.key, &ev.keystroke.modifiers)
 }
 
 /// G7 T6: which column of the `CompareDialog` picker a row click targets.
@@ -4872,6 +4989,62 @@ mod modal_confirm_kind_tests {
         assert!(matches!(modal_confirm_kind(&csv_import()), ModalConfirmKind::Ignore));
     }
 
+    /// T4 review MINOR-4: the Esc-inert property, which used to be a
+    /// comment inside `AppView::on_cancel_query` (a `Window`-taking handler
+    /// no test can drive). `WorkspaceMissing` is the ONLY blocking modal —
+    /// every other arm answers the narrower "unsaved secret / running job"
+    /// question and may legitimately be closable.
+    #[test]
+    fn workspace_missing_is_the_only_blocking_modal() {
+        for root in [None, Some(std::path::PathBuf::from("D:\\ws-gone"))] {
+            for error in [None, Some("nelze zapsat ukazatel".to_string())] {
+                assert!(modal_is_blocking(&ModalState::WorkspaceMissing {
+                    root: root.clone(),
+                    reason: "chybí dbc-workspace.toml".to_string(),
+                    error: error.clone(),
+                }));
+            }
+        }
+        for m in [
+            ModalState::Settings,
+            query_params(),
+            kill_confirm(),
+            analyze_write(),
+            script_run(),
+            csv_import(),
+            chart_picker(),
+            backup_restore(backup::BackupStatus::Running),
+        ] {
+            assert!(!modal_is_blocking(&m), "must stay Esc-closable by its own rules");
+        }
+    }
+
+    /// T4 review NIT-11: the keyboard contract for the three choices.
+    /// Enter/Space activate the FOCUSED button; anything with a modifier
+    /// falls through, so a focused choice cannot swallow Ctrl+Enter
+    /// (`RunQuery`) or Ctrl+K. §W4's "Enter is inert" rule is preserved by
+    /// initial focus sitting on the modal's own handle, not on a button —
+    /// there is no default button, only a deliberately tabbed-to one.
+    #[test]
+    fn only_unmodified_enter_or_space_activates_a_focused_choice() {
+        let none = Modifiers::default();
+        assert!(choice_key_activates("enter", &none));
+        assert!(choice_key_activates("space", &none));
+        for k in ["escape", "tab", "a", "left", "right", "f4"] {
+            assert!(!choice_key_activates(k, &none), "{k}");
+        }
+        for m in [
+            Modifiers { control: true, ..Default::default() },
+            Modifiers { alt: true, ..Default::default() },
+            Modifiers { shift: true, ..Default::default() },
+            Modifiers { platform: true, ..Default::default() },
+            Modifiers { function: true, ..Default::default() },
+        ] {
+            assert!(!choice_key_activates("enter", &m));
+            assert!(!choice_key_activates("space", &m));
+        }
+    }
+
     /// Workspace T4 (design §W4): the wrong-context guard. Enter must be a
     /// HANDLED no-op in every shape of the modal — including the
     /// unparsable-pointer shape (`root: None`) and the re-pick-failed
@@ -4913,6 +5086,24 @@ mod workspace_missing_text_tests {
         );
         assert_eq!(WORKSPACE_MISSING_PROFILE, "Použít lokální profil");
         assert_eq!(WORKSPACE_MISSING_QUIT, "Ukončit");
+        assert_eq!(
+            WORKSPACE_MISSING_STATUS,
+            "error: pracovní prostor nenalezen — vyberte složku, nebo použijte lokální profil"
+        );
+    }
+
+    /// T4 review NIT-9: the blocked-start status line must not read
+    /// „ready" (it is also the line left behind once the modal is dealt
+    /// with), and it carries the `error:` prefix every other startup
+    /// failure notice uses — that prefix is the status bar's colour
+    /// sentinel, so dropping it would silently de-escalate the message.
+    #[test]
+    fn the_blocked_start_status_is_an_error_not_ready() {
+        assert!(WORKSPACE_MISSING_STATUS.starts_with("error: "));
+        assert_ne!(WORKSPACE_MISSING_STATUS, "ready");
+        // It must name both ways out, so the status alone is actionable.
+        assert!(WORKSPACE_MISSING_STATUS.contains("složku"));
+        assert!(WORKSPACE_MISSING_STATUS.contains("lokální profil"));
     }
 
     #[test]

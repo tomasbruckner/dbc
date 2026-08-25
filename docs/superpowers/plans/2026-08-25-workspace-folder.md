@@ -2096,11 +2096,27 @@ And the swap itself — **the one seam** (design §W3.4). Task 5 wraps it with g
 
 - [ ] **Step 8: Manual verification of the blocking posture**
 
-Build and run: `%USERPROFILE%\.cargo\bin\cargo.exe run -p dbc-ui`, having first hand-written `%APPDATA%\dbc\workspace.toml` with `path = "D:\\neexistuje"`.
-Expected, all four:
-1. The modal reads „Pracovní prostor nenalezen", the path, and „error: složka neexistuje".
-2. Esc does nothing; Enter does nothing.
-3. The connection dropdown behind it lists NOTHING (empty config).
+**AS-BUILT NOTE (T4 review):** parts of this checklist turned out to be machine-verifiable and are now covered by automated tests — do NOT re-verify those by hand, and do NOT treat their unit tests as a substitute for the rest.
+
+| Check | Status |
+|---|---|
+| 2, Esc half — the modal is not Esc-closable | **AUTOMATED.** `connections_ui::modal_is_blocking` + `workspace_missing_is_the_only_blocking_modal` (T4 review MINOR-4). |
+| 2, Enter half — Enter is inert | **AUTOMATED.** `modal_confirm_kind_tests::workspace_missing_is_ignored_in_every_shape`. |
+| 3, substance — no context store is opened on a blocked start | **AUTOMATED.** `StartupContext::loads()` + `workspace_startup_tests::a_broken_start_opens_no_context_store` (T4 review MINOR-3). |
+| 1 — the RENDERED panel text | **NEEDS A HUMAN.** The panel needs a GPUI `Context`; only its `const` strings are byte-pinned. |
+| 3, appearance — the dropdown visibly lists nothing | **NEEDS A HUMAN.** |
+| 4 — `config.toml` byte-identical across the run | **NEEDS A HUMAN.** |
+| NIT-11 keyboard path — Tab reaches the three choices, Enter/Space activates the focused one, a bare Enter still does nothing | **NEEDS A HUMAN.** The `choice_key_activates` predicate is pinned; gpui tab ORDER cannot be verified headlessly. |
+
+Build and run: `%USERPROFILE%\.cargo\bin\cargo.exe run -p dbc-ui`, having first hand-written `%APPDATA%\dbc\workspace.toml`. Run it **twice**, with two different pointer targets:
+
+- `path = "D:\neexistuje"` — the missing-folder case.
+- `path = "<%APPDATA%>\dbc"` — the pointer aimed at the PROFILE DIR ITSELF. This is the direct empirical test of T4 review MAJOR-2: `blocked_paths` must fall through to the sentinel, so the run must not be able to touch the real profile files. `certutil -hashfile %APPDATA%\dbc\config.toml` before and after must match, and `%APPDATA%\dbc\__pracovni-prostor-nenalezen__` must NOT be created.
+
+Expected, per run:
+1. The modal reads „Pracovní prostor nenalezen", the path, and the reason line („error: složka neexistuje" / „error: chybí dbc-workspace.toml").
+2. Esc does nothing; Enter does nothing. Tab moves the focus ring across the three choices; Enter/Space on a focused choice activates THAT choice.
+3. The connection dropdown behind it lists NOTHING (empty config), and the status bar reads „error: pracovní prostor nenalezen — vyberte složku, nebo použijte lokální profil" (NOT „ready" — T4 review NIT-9).
 4. „Použít lokální profil" deletes the pointer, restores the real connection list, and the status reads „lokální profil obnoven"; `%APPDATA%\dbc\config.toml` is byte-identical to before the run (`certutil -hashfile` before/after).
 
 - [ ] **Step 9: Gate**

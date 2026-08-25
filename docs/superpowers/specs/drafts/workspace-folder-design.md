@@ -248,6 +248,37 @@ switch („Přejít na lokální profil") is the same function with the
 profile resolution, gated and confirmed the same way (it deletes the
 pointer file, touching nothing in the workspace).
 
+**AS-BUILT ADDENDUM (workspace T4 review, MINOR-6) — the swap must also
+drop the CONNECTION schema cache, not just the scripts tree.** The list
+above named only the scripts tree, which was an omission in this spec,
+not in the implementation. `SchemaTree::sync_connections` deliberately
+RETAINS every cached `DbListState`/schema snapshot whose connection id
+still exists — and profile and workspace contexts share ids **by
+construction**, because §W3.2 initialises a workspace by copying
+`config.toml` verbatim. Without an explicit reset the sidebar therefore
+renders context A's databases, schemas and tables underneath context B's
+identically-id'd connection after a swap. It is display-only (every query
+rebuilds its connection from the new config, so nothing is ever RUN
+against the wrong server) but a wrong-context display is still a wrong
+context, and it is exactly the muscle-memory hazard §W4 argues about.
+`apply_context` therefore calls `SchemaTree::reset_fetched_context`
+BEFORE `sync_connections` re-seeds the map. Reset: per-connection database
+lists and their snapshots, the snapshot LRU, the active-context schema
+fallback, the CLI slot, and the selected row. Deliberately NOT reset:
+expand state (holds no fetched data — it simply re-renders as
+`NotLoaded`) and the sidebar filter (live user input).
+
+**AS-BUILT ADDENDUM (workspace T4 review, MAJOR-1) — the swap is
+generation-guarded.** Every `apply_context` bumps a pick generation, and
+the §W4 „Najít složku…" recovery flow captures it at dispatch. Its folder
+classification runs off the UI thread and can take seconds on a network
+share, while the window stays interactive — so the user can reach a
+different, EXPLICIT decision („Použít lokální profil") in the meantime. A
+continuation whose generation is stale, or whose `WorkspaceMissing` modal
+is no longer open, commits nothing. The pointer write was moved out of the
+background step and onto the UI thread behind that same guard, so a
+superseded pick leaves nothing persisted to undo.
+
 ### W4. Missing/moved workspace at startup — fail loudly (decided)
 
 If `resolve()` returns `Broken` (pointer set; folder missing, marker

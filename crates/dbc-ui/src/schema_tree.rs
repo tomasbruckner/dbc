@@ -859,6 +859,33 @@ pub fn apply_db_list_result(
 /// refuse-over-Loaded invariant.
 pub type ActiveSlot = Option<((String, String), DbSchemaState)>;
 
+/// Pure core of [`SchemaTree::reset_fetched_context`] (workspace T4 review
+/// MINOR-6), extracted for testability on the same precedent as
+/// `begin_db_list_load` — the method itself needs a `Context` and this
+/// module's tests are plain `#[test]`s.
+///
+/// Clears EVERYTHING that came from a database, and only that:
+/// per-connection database lists and their schema snapshots, the snapshot
+/// LRU, the active-context schema fallback, the CLI root's slot, and the
+/// selected row (which can name a table that existed only in the old
+/// context's snapshot). Leaves `grouped`/`favourites`/`read_only`/
+/// `admin_entry` alone — `main.rs` re-pushes those on the same swap — and
+/// leaves `outer_expanded`/`filter` alone on purpose (expand state holds
+/// no fetched data; the filter is live user input).
+pub(crate) fn clear_fetched_context(
+    conns: &mut HashMap<String, ConnNode>,
+    lru: &mut Vec<(String, String)>,
+    active_slot: &mut ActiveSlot,
+    cli_slot: &mut DbSchemaState,
+    selected: &mut Option<SidebarRow>,
+) {
+    conns.clear();
+    lru.clear();
+    *active_slot = None;
+    *cli_slot = DbSchemaState::NotLoaded;
+    *selected = None;
+}
+
 /// Transitions the fallback slot into `Loading` for `(conn_id, db)`,
 /// carrying its previous expand-set forward when the key matches (same
 /// contract as `begin_schema_load`); a different key is replaced outright
@@ -1529,6 +1556,32 @@ impl SchemaTree {
         }
         self.lru.retain(|(c, _)| ids.contains(c));
         self.grouped = grouped;
+        cx.notify();
+    }
+
+    /// Workspace T4 review MINOR-6: drop everything FETCHED from a
+    /// database, keeping only what `main.rs` pushes in. Called by
+    /// `AppView::apply_context` — the §W3.4 context swap — immediately
+    /// before `sync_connections`, which by itself would RETAIN every
+    /// cached entry whose connection id still exists. Profile and
+    /// workspace contexts share connection ids by construction (§W3.2
+    /// initialises a workspace by copying `config.toml` verbatim), so
+    /// without this the sidebar renders the old context's database list
+    /// and schema tree under the new context's identically-id'd
+    /// connection.
+    ///
+    /// Deliberately NOT reset: `outer_expanded` (expand state holds no
+    /// fetched data — it just re-renders as `NotLoaded`) and `filter`
+    /// (live user input). `cli_slot`/`active_scope` are cleared on the same
+    /// swap by `set_cli(None)`/`set_active_scope(None)`.
+    pub fn reset_fetched_context(&mut self, cx: &mut Context<Self>) {
+        clear_fetched_context(
+            &mut self.conns,
+            &mut self.lru,
+            &mut self.active_slot,
+            &mut self.cli_slot,
+            &mut self.selected,
+        );
         cx.notify();
     }
 
@@ -2881,6 +2934,81 @@ mod sidebar_tests {
             },
         });
         m
+    }
+
+    /// Workspace T4 review MINOR-6. `sync_connections` RETAINS every
+    /// cached entry whose connection id still exists — and profile and
+    /// workspace contexts share ids by construction (§W3.2 initialises a
+    /// workspace by copying `config.toml` verbatim). Without a reset, the
+    /// §W3.4 swap therefore renders context A's databases and schemas
+    /// under context B's identically-id'd connection.
+    #[test]
+    fn clearing_the_fetched_context_drops_every_cached_snapshot() {
+        let mut conns = loaded_states("c1", "sales");
+        let mut lru = vec![("c1".to_string(), "sales".to_string())];
+        let mut active_slot: ActiveSlot = Some((
+            ("c1".to_string(), "sales".to_string()),
+            DbSchemaState::Loaded { snapshot: snap(), expanded: HashSet::new() },
+        ));
+        let mut cli_slot =
+            DbSchemaState::Loaded { snapshot: snap(), expanded: HashSet::new() };
+        let mut selected =
+            Some(SidebarRow::Database { conn_id: "c1".to_string(), db: "sales".to_string() });
+
+        clear_fetched_context(
+            &mut conns,
+            &mut lru,
+            &mut active_slot,
+            &mut cli_slot,
+            &mut selected,
+        );
+
+        assert!(conns.is_empty(), "cached database lists + snapshots must go");
+        assert!(lru.is_empty());
+        assert!(active_slot.is_none());
+        assert!(matches!(cli_slot, DbSchemaState::NotLoaded));
+        assert!(selected.is_none(), "a selected row can name the old context's table");
+    }
+
+    /// The user-visible half of the same fix: after the reset, the SAME
+    /// connection id renders with nothing spliced under it — the sidebar
+    /// shows an unexpanded, unloaded connection instead of the previous
+    /// context's `sales` database and `orders` table.
+    #[test]
+    fn a_swapped_context_shows_no_rows_from_the_previous_one() {
+        let conns_cfg = vec![conn_cfg("c1", "prod-pg", &[], Engine::Postgres, "sales")];
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Connection("c1".into()));
+        outer.insert(OuterId::Database("c1".into(), "sales".into()));
+
+        let before = flatten_sidebar(&grouped(&conns_cfg), &loaded_states("c1", "sales"), None,
+            &outer, "", None, &[], AdminEntry::Hidden, None);
+        assert!(
+            before.iter().any(|r| matches!(&r.0, SidebarRow::Database { db, .. } if db == "sales")),
+            "precondition: the stale database list DOES render"
+        );
+        assert!(
+            before.iter().any(|r| matches!(&r.0, SidebarRow::Inner { .. })),
+            "precondition: the stale SNAPSHOT does too (schema rows splice in)"
+        );
+
+        let mut conns = loaded_states("c1", "sales");
+        let mut lru = Vec::new();
+        let mut active_slot: ActiveSlot = None;
+        let mut cli_slot = DbSchemaState::NotLoaded;
+        let mut selected = None;
+        clear_fetched_context(&mut conns, &mut lru, &mut active_slot, &mut cli_slot, &mut selected);
+
+        let after = flatten_sidebar(&grouped(&conns_cfg), &conns, None,
+            &outer, "", None, &[], AdminEntry::Hidden, None);
+        assert!(
+            !after
+                .iter()
+                .any(|r| matches!(&r.0, SidebarRow::Inner { .. } | SidebarRow::Database { .. })),
+            "no fetched row may survive from the old context: {:?}",
+            after.iter().map(|r| r.2.clone()).collect::<Vec<_>>()
+        );
+        assert!(!after.iter().any(|r| r.2 == "sales" || r.2 == "public"));
     }
 
     #[test]
