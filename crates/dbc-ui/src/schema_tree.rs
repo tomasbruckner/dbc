@@ -586,6 +586,22 @@ pub enum SidebarRow {
     /// "Načítám…"/error/truncation rows. `retry` = a click re-emits the
     /// Load event (db == None → LoadDatabases, Some → LoadSchema).
     Notice { conn_id: String, db: Option<String>, text: String, retry: bool },
+    /// Scripts library (Part S §3.3): the pinned „Skripty" section header.
+    /// Unparameterized, like `Pinned(NodeId::AdminRoot)` — the section is
+    /// GLOBAL (it does not depend on the active scope: scripts are files,
+    /// not database objects).
+    ScriptsRoot,
+    /// A folder inside the scripts library. `rel` is '/'-separated on every
+    /// platform (the `ScriptEntry::rel` convention) and doubles as the
+    /// expand key (`OuterId::ScriptFolder`).
+    ScriptFolder { rel: String },
+    /// A `*.sql` file inside the scripts library.
+    ScriptFile { rel: String },
+    /// Scripts-section notice (unconfigured / loading / error / cap
+    /// disclosure). `open_settings` marks the ONE clickable kind — the
+    /// unconfigured pointer row, which opens „Nastavení" (Part S §1.4:
+    /// discoverability without a wizard).
+    ScriptNotice { text: String, open_settings: bool },
 }
 
 /// Expand-state key for the OUTER (multi-root) levels — the inner
@@ -603,6 +619,13 @@ pub enum OuterId {
     Connection(String),
     Database(String, String),
     Favourites,
+    /// The „Skripty" section itself — LAZY polarity (presence = expanded),
+    /// like `Connection`/`Database`/`Favourites`, NOT the inverted
+    /// `Folder` polarity: the section is collapsed by default (Part S §1.4).
+    Scripts,
+    /// One scripts-library folder, keyed by its '/'-separated `rel`. Lazy
+    /// polarity too — the scripts tree is browsed, not pre-opened.
+    ScriptFolder(String),
 }
 
 /// The active `(connection, database)` context as the sidebar sees it —
@@ -631,6 +654,39 @@ pub enum DbListState {
     Loading { generation: u64 },
     Error(String),
     Loaded { dbs: Vec<DbNode>, truncated: bool },
+}
+
+/// Lazy-scan state machine for the scripts library (Part S §3.3) — the same
+/// family as `DbListState`. There is exactly ONE of these on `SchemaTree`:
+/// the library is global, not per-connection (Part S §1.1).
+///
+/// DELIBERATE DEVIATION from the plan's published shape (workspace plan
+/// §Task 3, scripts plan line 656), which spelled this
+/// `Loading { generation: u64 }` by analogy with `DbListState`: **`Loading`
+/// here is a UNIT variant.** The analogy does not carry, because the two
+/// state machines are not shaped the same. `DbListState` lives per
+/// connection in a map, so its `generation` must travel WITH the slot for
+/// `apply_db_list_result` to compare against. `ScriptsListState` is a
+/// single field beside a single `SchemaTree::scripts_generation` counter,
+/// and `finish_scripts_scan` compares the caller's generation against THAT
+/// counter — which is sufficient across all three interleavings (result
+/// lands while Loading; result lands after a newer `begin`; result lands
+/// after `reset_scripts`, which also bumps the counter). A copy inside the
+/// variant would be pure redundancy, and it was never readable: it carried
+/// an `#[allow(dead_code)]` naming Task 7 as removal owner, but Task 7
+/// cannot fulfil that — `emit_scripts_section` matches `Loading { .. }` and
+/// discards it, and Task 7's own `start_scripts_scan` uses
+/// `begin_scripts_scan`'s RETURN value as the generation and never
+/// destructures the variant. The attribute would have become permanent, so
+/// the field is gone instead.
+///
+/// TASK 7, READ THIS: construct `ScriptsListState::Loading` with no fields.
+/// Nothing else about the scan contract changed.
+pub enum ScriptsListState {
+    NotLoaded,
+    Loading,
+    Error(String),
+    Loaded { entries: Vec<crate::scripts::ScriptEntry>, truncated: bool, depth_clipped: bool },
 }
 
 /// One database under a connection. `name` is the SPEC-LEVEL string (full
@@ -701,10 +757,16 @@ pub fn row_in_active_scope(row: &SidebarRow, scope: Option<&ActiveScope>) -> boo
             Some(s) => &s.conn_id == conn_id && &s.db == db,
             None => conn_id == crate::CLI_CONN_IDENTITY,
         },
+        // Scripts rows are NEVER in scope and never favouritable — they
+        // are files, not database objects (Part S §1.4).
         SidebarRow::Folder { .. }
         | SidebarRow::Connection { .. }
         | SidebarRow::Database { .. }
-        | SidebarRow::Notice { .. } => false,
+        | SidebarRow::Notice { .. }
+        | SidebarRow::ScriptsRoot
+        | SidebarRow::ScriptFolder { .. }
+        | SidebarRow::ScriptFile { .. }
+        | SidebarRow::ScriptNotice { .. } => false,
     }
 }
 
@@ -917,6 +979,163 @@ pub fn touch_and_evict(
 /// Speed search filters LOADED content only (binding, design §6): this
 /// function is pure over its inputs — typing can never trigger a fetch,
 /// which holds by construction.
+/// The last '/'-component of a rel — what a scripts row displays. Rels
+/// always originate from the scan (single `file_name()` components joined
+/// with '/'), so this never has to canonicalize anything.
+fn script_row_name(rel: &str) -> &str {
+    rel.rsplit('/').next().unwrap_or(rel)
+}
+
+/// Visibility rule for one scanned entry: EVERY ancestor folder rel must be
+/// expanded. Under an active filter every folder counts as expanded — the
+/// sidebar-wide auto-expand contract (Part S §3.3), so a match buried three
+/// levels down is actually reachable.
+fn script_ancestors_expanded(
+    rel: &str,
+    outer_expanded: &HashSet<OuterId>,
+    filter_active: bool,
+) -> bool {
+    if filter_active {
+        return true;
+    }
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    parts.pop(); // the entry's own name is not one of its ancestors
+    let mut prefix = String::new();
+    for p in parts {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(p);
+        if !outer_expanded.contains(&OuterId::ScriptFolder(prefix.clone())) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Filter pass: drop a `ScriptFolder` row left with NO children whose own
+/// name also misses. Walked BACKWARD from the end so a folder emptied by
+/// this very pass can itself be dropped (nested misses collapse fully) —
+/// the `flatten_sidebar` childless-row idiom, adapted to a depth-first
+/// splice where children always follow their parent at a greater depth.
+/// ONE backward pass building a keep-mask, then ONE `retain` — NOT
+/// `Vec::remove` per drop. `flatten_sidebar` is re-run from scratch on
+/// every frame, so this is on the keystroke path of the speed search:
+/// with `SCRIPTS_ENTRY_CAP = 2000` folder-heavy rows and a filter that
+/// matches nothing, per-removal shifting is ~2M tuple moves PER FRAME.
+/// This is O(n) in the number of rows regardless of how many are dropped.
+///
+/// `next_kept_depth` is the depth of the nearest row after `i` that
+/// SURVIVES — i.e. the row that will physically follow `i` once the
+/// `retain` compacts the vec. That is what makes the nested collapse work:
+/// a folder whose only child was itself just pruned correctly reads as
+/// childless, exactly as the immediate-`remove` version did.
+fn prune_childless_script_folders(rows: &mut Vec<SidebarFlatRow>, first: usize, filter_lc: &str) {
+    if first >= rows.len() {
+        return;
+    }
+    let mut keep = vec![true; rows.len()];
+    let mut next_kept_depth: Option<usize> = None;
+    let mut dropped = false;
+    let mut i = rows.len();
+    while i > first {
+        i -= 1;
+        let (row, depth, label, _) = &rows[i];
+        let has_child = next_kept_depth.is_some_and(|d| d > *depth);
+        if matches!(row, SidebarRow::ScriptFolder { .. })
+            && !has_child
+            && !name_matches(label, filter_lc)
+        {
+            keep[i] = false;
+            dropped = true;
+            continue; // dropped rows do not become anyone's `next_kept`
+        }
+        next_kept_depth = Some(*depth);
+    }
+    if !dropped {
+        return;
+    }
+    // `Vec::retain` visits every element exactly once in the original
+    // order, so a positional counter is a faithful mask application.
+    let mut ix = 0usize;
+    rows.retain(|_| {
+        let k = keep[ix];
+        ix += 1;
+        k
+    });
+}
+
+/// Emits the pinned „Skripty" section (Part S §3.3/§3.4). Pure, GPUI-free,
+/// never fetches — typing in the speed search can only ever narrow what the
+/// last scan produced.
+pub fn emit_scripts_section(
+    out: &mut Vec<SidebarFlatRow>,
+    state: &ScriptsListState,
+    configured: bool,
+    outer_expanded: &HashSet<OuterId>,
+    filter: &str,
+) {
+    out.push((SidebarRow::ScriptsRoot, 0, "Skripty".to_string(), true));
+    if !outer_expanded.contains(&OuterId::Scripts) {
+        return;
+    }
+    fn notice(out: &mut Vec<SidebarFlatRow>, text: String, open_settings: bool) {
+        out.push((SidebarRow::ScriptNotice { text: text.clone(), open_settings }, 1, text, false));
+    }
+    if !configured {
+        notice(out, "složka skriptů není nastavena — klikněte pro Nastavení".to_string(), true);
+        return;
+    }
+    match state {
+        // The expand handler is dispatching the scan; nothing to show yet.
+        ScriptsListState::NotLoaded => {}
+        ScriptsListState::Loading => notice(out, "Načítám skripty…".to_string(), false),
+        // The `error:` prefix is the Notice COLOR SENTINEL (the row render
+        // dispatches on it literally) — never reword it away.
+        ScriptsListState::Error(e) => notice(out, format!("error: {e}"), false),
+        ScriptsListState::Loaded { entries, truncated, depth_clipped } => {
+            if entries.is_empty() {
+                notice(out, "žádné skripty (*.sql)".to_string(), false);
+            }
+            let filter_lc = filter.to_lowercase();
+            let filter_active = !filter_lc.is_empty();
+            let first = out.len();
+            for e in entries {
+                if !script_ancestors_expanded(&e.rel, outer_expanded, filter_active) {
+                    continue;
+                }
+                let name = script_row_name(&e.rel).to_string();
+                if filter_active && !e.is_dir && !name_matches(&name, &filter_lc) {
+                    continue;
+                }
+                let row = if e.is_dir {
+                    SidebarRow::ScriptFolder { rel: e.rel.clone() }
+                } else {
+                    SidebarRow::ScriptFile { rel: e.rel.clone() }
+                };
+                out.push((row, 1 + e.depth, name, e.is_dir));
+            }
+            if filter_active {
+                prune_childless_script_folders(out, first, &filter_lc);
+            }
+            if *truncated {
+                notice(
+                    out,
+                    "… zobrazeno prvních 2000 položek — zmenšete knihovnu skriptů".to_string(),
+                    false,
+                );
+            }
+            if *depth_clipped {
+                notice(
+                    out,
+                    "… některé podsložky jsou příliš hluboko (limit 12 úrovní)".to_string(),
+                    false,
+                );
+            }
+        }
+    }
+}
+
 pub fn flatten_sidebar(
     grouped: &crate::connections_ui::GroupedConnections,
     states: &HashMap<String, ConnNode>,
@@ -926,6 +1145,12 @@ pub fn flatten_sidebar(
     active: Option<&ActiveScope>,
     favourites: &[FavouriteObject],
     admin: AdminEntry,
+    // Scripts library section (Part S §1.4/§3.3): `None` keeps the section
+    // out of the sidebar entirely — the state Task 3 ships in, and the
+    // state every pre-existing test asserts against. `Some((state,
+    // configured))` = live (Task 7's flip); `configured` is
+    // `AppView::effective_scripts_root().is_some()`.
+    scripts: Option<(&ScriptsListState, bool)>,
 ) -> Vec<SidebarFlatRow> {
     let mut out: Vec<SidebarFlatRow> = Vec::new();
     let filter_lc = filter.to_lowercase();
@@ -962,6 +1187,13 @@ pub fn flatten_sidebar(
                 }
             }
         }
+    }
+
+    // Scripts library (Part S §1.4): a third pinned root section, after
+    // „Oblíbené" and before the CLI/connection roots. GLOBAL — unlike the
+    // pinned rows above it, it does not depend on `active`.
+    if let Some((state, configured)) = scripts {
+        emit_scripts_section(&mut out, state, configured, outer_expanded, filter);
     }
 
     // CLI synthetic root (design §3.4 / resolved deviation 12): schema rows
@@ -1230,6 +1462,24 @@ pub struct SchemaTree {
     /// Drives both `flatten`'s pinned "Správa serveru" row visibility and
     /// this row's greyed/disabled rendering.
     admin_entry: AdminEntry,
+    /// Scripts library scan state (Part S §3.3). DARK UNTIL TASK 7 —
+    /// removal owner: Task 7 (the scripts flip) deletes this attribute when
+    /// `render` starts passing `Some(..)` to `flatten_sidebar`.
+    #[allow(dead_code)]
+    scripts: ScriptsListState,
+    /// Whether a scripts root exists at all — profile mode:
+    /// `AppConfig.scripts_dir.is_some()`; workspace mode: always `true`
+    /// (`<workspace>/scripts` is created by init). DARK UNTIL TASK 7 —
+    /// removal owner: Task 7.
+    #[allow(dead_code)]
+    scripts_configured: bool,
+    /// Stale-scan guard: the SOLE generation counter for the library. The
+    /// per-slot copy `DbListState::Loading { generation }` carries has no
+    /// counterpart here on purpose — see `ScriptsListState`.
+    /// DARK UNTIL TASK 7 — removal owner: Task 7 (which starts calling
+    /// `begin_scripts_scan` / `finish_scripts_scan` from `main.rs`).
+    #[allow(dead_code)]
+    scripts_generation: u64,
 }
 
 impl SchemaTree {
@@ -1250,6 +1500,9 @@ impl SchemaTree {
             favourites: Vec::new(),
             read_only: false,
             admin_entry: AdminEntry::Hidden,
+            scripts: ScriptsListState::NotLoaded,
+            scripts_configured: false,
+            scripts_generation: 0,
         }
     }
 
@@ -1559,6 +1812,8 @@ impl SchemaTree {
             SidebarRow::Connection { conn_id } => OuterId::Connection(conn_id.clone()),
             SidebarRow::Database { conn_id, db } => OuterId::Database(conn_id.clone(), db.clone()),
             SidebarRow::Pinned(NodeId::FavouriteSection) => OuterId::Favourites,
+            SidebarRow::ScriptsRoot => OuterId::Scripts,
+            SidebarRow::ScriptFolder { rel } => OuterId::ScriptFolder(rel.clone()),
             _ => return,
         };
         if !self.outer_expanded.remove(&id) {
@@ -1711,6 +1966,12 @@ impl SchemaTree {
                 }
             }
             SidebarRow::Notice { .. } => {}
+            // Scripts rows: the root and folders toggle, exactly like a
+            // grouping folder or the CLI root. A ScriptFile's "open into the
+            // editor" needs `TreeEvent::ScriptOpen`, which lands with its
+            // `main.rs` handler (Task 7/8) — inert here.
+            SidebarRow::ScriptsRoot | SidebarRow::ScriptFolder { .. } => self.toggle_outer(row),
+            SidebarRow::ScriptFile { .. } | SidebarRow::ScriptNotice { .. } => {}
         }
         cx.notify();
     }
@@ -1765,6 +2026,13 @@ impl SchemaTree {
                 self.toggle_inner(&conn_id, &db, &node);
             }
             SidebarRow::Pinned(_) | SidebarRow::Notice { .. } => {}
+            // Task 3 only TOGGLES. The scan dispatch (emitting
+            // `TreeEvent::ScriptsRefresh` when the slot is
+            // `NotLoaded`/`Error`) lands in Task 7 together with `main.rs`'s
+            // handler, because `TreeEvent`'s match in `AppView::on_tree_event`
+            // is exhaustive and `main.rs` is not this task's file.
+            SidebarRow::ScriptsRoot | SidebarRow::ScriptFolder { .. } => self.toggle_outer(row),
+            SidebarRow::ScriptFile { .. } | SidebarRow::ScriptNotice { .. } => {}
         }
         cx.notify();
     }
@@ -1783,6 +2051,10 @@ impl SchemaTree {
                 }),
             },
             SidebarRow::Notice { .. } => {}
+            // Inert here: the notice's retry / open-„Nastavení" click needs
+            // `TreeEvent::ScriptsRefresh`/`OpenScriptsSettings`, which land
+            // with their `main.rs` handlers in Task 7.
+            SidebarRow::ScriptNotice { .. } => {}
             SidebarRow::Pinned(NodeId::AdminRoot) => {
                 if self.admin_entry == AdminEntry::Enabled {
                     cx.emit(TreeEvent::OpenAdmin);
@@ -1821,6 +2093,13 @@ impl SchemaTree {
                     _ => false,
                 }
             }
+            SidebarRow::ScriptsRoot => self.outer_expanded.contains(&OuterId::Scripts),
+            SidebarRow::ScriptFolder { rel } => {
+                // Filter auto-expands, mirroring `emit_scripts_section`.
+                !self.filter.is_empty()
+                    || self.outer_expanded.contains(&OuterId::ScriptFolder(rel.clone()))
+            }
+            SidebarRow::ScriptFile { .. } | SidebarRow::ScriptNotice { .. } => false,
             SidebarRow::Pinned(_) | SidebarRow::Notice { .. } => false,
         }
     }
@@ -1878,6 +2157,68 @@ impl Focusable for SchemaTree {
     }
 }
 
+/// Scripts-library state API. DARK UNTIL TASK 7 — removal owner: Task 7
+/// (the scripts flip) deletes this `#[allow(dead_code)]` when `main.rs`
+/// starts calling these from `start_scripts_scan` / `apply_context`.
+#[allow(dead_code)]
+impl SchemaTree {
+    /// Moves the slot to `Loading` and returns the generation the caller
+    /// must hand back to `finish_scripts_scan` (older results are dropped).
+    pub fn begin_scripts_scan(&mut self, cx: &mut Context<Self>) -> u64 {
+        self.scripts_generation = self.scripts_generation.wrapping_add(1);
+        self.scripts = ScriptsListState::Loading;
+        cx.notify();
+        self.scripts_generation
+    }
+
+    /// Applies a scan result, DROPPING it when a newer scan has since been
+    /// dispatched (`DbListState`'s generation contract verbatim).
+    pub fn finish_scripts_scan(
+        &mut self,
+        generation: u64,
+        result: Result<crate::scripts::ScriptScan, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.scripts_generation {
+            return;
+        }
+        self.scripts = match result {
+            Ok(scan) => ScriptsListState::Loaded {
+                entries: scan.entries,
+                truncated: scan.truncated,
+                depth_clipped: scan.depth_clipped,
+            },
+            Err(e) => ScriptsListState::Error(e),
+        };
+        cx.notify();
+    }
+
+    /// Pushes „is there a scripts root at all" (Task 7 calls this from
+    /// `refresh_tree_context`). Changing it never scans by itself.
+    pub fn set_scripts_configured(&mut self, configured: bool, cx: &mut Context<Self>) {
+        if self.scripts_configured != configured {
+            self.scripts_configured = configured;
+            cx.notify();
+        }
+    }
+
+    /// Back to `NotLoaded`, bumping the generation so an in-flight scan of
+    /// the OLD root can never land, and dropping the per-folder expand keys
+    /// (they name paths that no longer exist). The context swap (§W3.4) and
+    /// „Odebrat" both need exactly this.
+    pub fn reset_scripts(&mut self, cx: &mut Context<Self>) {
+        self.scripts_generation = self.scripts_generation.wrapping_add(1);
+        self.scripts = ScriptsListState::NotLoaded;
+        self.outer_expanded.retain(|id| !matches!(id, OuterId::ScriptFolder(_)));
+        cx.notify();
+    }
+
+    /// True when expanding (or retrying) the root should dispatch a scan.
+    pub fn scripts_needs_scan(&self) -> bool {
+        matches!(self.scripts, ScriptsListState::NotLoaded | ScriptsListState::Error(_))
+    }
+}
+
 impl Render for SchemaTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Sidebar rework: the multi-root flatten, fresh every frame (brief
@@ -1892,6 +2233,11 @@ impl Render for SchemaTree {
             self.active_scope.as_ref(),
             &self.favourites,
             self.admin_entry,
+            // THE DARK CONTRACT (workspace T3): the „Skripty" section is not
+            // emitted yet, so the visible sidebar is byte-identical to
+            // pre-T3. Task 7 (the scripts flip) — and ONLY Task 7 — replaces
+            // this `None` with `Some((&self.scripts, self.scripts_configured))`.
+            None,
         );
         let no_roots = self.grouped.favourites.is_empty()
             && self.grouped.folders.is_empty()
@@ -2546,7 +2892,7 @@ mod sidebar_tests {
         outer.insert(OuterId::Connection("c1".into()));
         outer.insert(OuterId::Database("c1".into(), "sales".into()));
         let rows = flatten_sidebar(&grouped(&conns), &loaded_states("c1", "sales"), None,
-            &outer, "", None, &[], AdminEntry::Hidden);
+            &outer, "", None, &[], AdminEntry::Hidden, None);
         // folder(0) -> connection(1) -> database(2) -> spliced schema rows (3+)
         assert!(matches!(&rows[0], (SidebarRow::Folder { path }, 0, _, true) if path == &vec!["work".to_string()]));
         assert!(matches!(&rows[1], (SidebarRow::Connection { conn_id }, 1, _, true) if conn_id == "c1"));
@@ -2566,7 +2912,7 @@ mod sidebar_tests {
         outer.insert(OuterId::Folder(vec!["work".into()]));
         outer.insert(OuterId::Connection("c1".into()));
         let rows = flatten_sidebar(&grouped(&conns), &loaded_states("c1", "sales"), None,
-            &outer, "", None, &[], AdminEntry::Hidden);
+            &outer, "", None, &[], AdminEntry::Hidden, None);
         assert_eq!(rows.len(), 1, "collapsed folder shows only its own row");
         assert!(matches!(&rows[0], (SidebarRow::Folder { .. }, 0, _, true)));
     }
@@ -2575,7 +2921,7 @@ mod sidebar_tests {
     fn loose_connections_sit_at_depth_zero() {
         let conns = vec![conn_cfg("c1", "loose", &[], Engine::Postgres, "db")];
         let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
-            &HashSet::new(), "", None, &[], AdminEntry::Hidden);
+            &HashSet::new(), "", None, &[], AdminEntry::Hidden, None);
         assert!(matches!(&rows[0], (SidebarRow::Connection { .. }, 0, _, true)));
     }
 
@@ -2586,7 +2932,7 @@ mod sidebar_tests {
         // NOT in outer_expanded -> only the connection row renders; the
         // Loaded cache is untouched (re-expand is instant by construction).
         let rows = flatten_sidebar(&grouped(&conns), &states, None,
-            &HashSet::new(), "", None, &[], AdminEntry::Hidden);
+            &HashSet::new(), "", None, &[], AdminEntry::Hidden, None);
         assert_eq!(rows.len(), 1);
     }
 
@@ -2602,7 +2948,7 @@ mod sidebar_tests {
             let mut states = HashMap::new();
             states.insert("c1".into(), ConnNode { dbs: state });
             let rows = flatten_sidebar(&grouped(&conns), &states, None,
-                &outer, "", None, &[], AdminEntry::Hidden);
+                &outer, "", None, &[], AdminEntry::Hidden, None);
             assert!(matches!(&rows[1], (SidebarRow::Notice { conn_id, db: None, text, retry }, 1, _, false)
                 if conn_id == "c1" && text == expect_text && *retry == expect_retry),
                 "state expecting {expect_text}: got {:?}", rows.get(1));
@@ -2619,7 +2965,7 @@ mod sidebar_tests {
         let mut outer = HashSet::new();
         outer.insert(OuterId::Connection("c1".into()));
         let rows = flatten_sidebar(&grouped(&conns), &states, None,
-            &outer, "", None, &[], AdminEntry::Hidden);
+            &outer, "", None, &[], AdminEntry::Hidden, None);
         let last = rows.last().unwrap();
         assert!(matches!(&last.0, SidebarRow::Notice { retry: false, text, .. }
             if text == "… zobrazeno prvních 2000 databází — použijte výchozí databázi nebo filtr"));
@@ -2637,7 +2983,7 @@ mod sidebar_tests {
         let mut outer = HashSet::new();
         outer.insert(OuterId::Connection("c1".into()));
         let rows = flatten_sidebar(&grouped(&conns), &loaded_states("c1", r"D:\data\analytics.duckdb"),
-            None, &outer, "", None, &[], AdminEntry::Hidden);
+            None, &outer, "", None, &[], AdminEntry::Hidden, None);
         assert!(matches!(&rows[1], (SidebarRow::Database { db, .. }, 1, label, true)
             if db == r"D:\data\analytics.duckdb" && label.starts_with("analytics")));
     }
@@ -2650,7 +2996,7 @@ mod sidebar_tests {
         let mut outer = HashSet::new();
         outer.insert(OuterId::Connection(crate::CLI_CONN_IDENTITY.to_string()));
         let rows = flatten_sidebar(&grouped(&[]), &HashMap::new(),
-            Some(("postgres://localhost/x", &slot)), &outer, "", None, &[], AdminEntry::Hidden);
+            Some(("postgres://localhost/x", &slot)), &outer, "", None, &[], AdminEntry::Hidden, None);
         assert!(matches!(&rows[0], (SidebarRow::Connection { conn_id }, 0, label, true)
             if conn_id == crate::CLI_CONN_IDENTITY && label == "postgres://localhost/x"));
         assert!(matches!(&rows[1], (SidebarRow::Inner { db, .. }, 1, _, _) if db.is_empty()));
@@ -2669,7 +3015,7 @@ mod sidebar_tests {
         let mut outer = HashSet::new();
         outer.insert(OuterId::Favourites);
         let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
-            &outer, "", Some(&scope), &favs, AdminEntry::Enabled);
+            &outer, "", Some(&scope), &favs, AdminEntry::Enabled, None);
         assert!(matches!(&rows[0], (SidebarRow::Pinned(NodeId::AdminRoot), 0, _, false)));
         // Only the default-db favourite is in scope (database: None == default):
         assert!(matches!(&rows[1], (SidebarRow::Pinned(NodeId::FavouriteSection), 0, label, true)
@@ -2700,7 +3046,7 @@ mod sidebar_tests {
         let mut outer = HashSet::new();
         outer.insert(OuterId::Favourites);
         let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
-            &outer, "", Some(&scope), &favs, AdminEntry::Hidden);
+            &outer, "", Some(&scope), &favs, AdminEntry::Hidden, None);
         // rows[0] = the section header; the connection root follows the
         // favourite items — take exactly the five item rows.
         let ids: Vec<&SidebarRow> = rows.iter().skip(1).take(5).map(|(id, ..)| id).collect();
@@ -2732,7 +3078,7 @@ mod sidebar_tests {
         let mut outer = HashSet::new();
         outer.insert(OuterId::Favourites);
         let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
-            &outer, "", None, &favs, AdminEntry::Hidden);
+            &outer, "", None, &favs, AdminEntry::Hidden, None);
         assert!(!rows
             .iter()
             .any(|(id, ..)| matches!(id, SidebarRow::Pinned(NodeId::FavouriteSection))));
@@ -2752,7 +3098,7 @@ mod sidebar_tests {
         }];
         let scope = ActiveScope { conn_id: "c1".into(), db: "sales".into(), default_db: "sales".into() };
         let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
-            &HashSet::new(), "", Some(&scope), &favs, AdminEntry::Hidden);
+            &HashSet::new(), "", Some(&scope), &favs, AdminEntry::Hidden, None);
         assert!(matches!(&rows[0], (SidebarRow::Pinned(NodeId::FavouriteSection), 0, label, true)
             if label == "Oblíbené (1)"));
         assert!(
@@ -2785,7 +3131,7 @@ mod sidebar_tests {
         let mut outer = HashSet::new();
         outer.insert(OuterId::Favourites);
         let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
-            &outer, "", Some(&scope), &favs, AdminEntry::Hidden);
+            &outer, "", Some(&scope), &favs, AdminEntry::Hidden, None);
         let labels: Vec<&str> = rows
             .iter()
             .filter(|(id, ..)| matches!(id, SidebarRow::Pinned(NodeId::Favourite(..))))
@@ -2849,13 +3195,13 @@ mod sidebar_tests {
         // nothing loaded) is hidden. Filtering NEVER fetches — pure fn,
         // holds by construction.
         let rows = flatten_sidebar(&grouped(&conns), &loaded_states("c1", "sales"), None,
-            &outer, "orders", None, &[], AdminEntry::Hidden);
+            &outer, "orders", None, &[], AdminEntry::Hidden, None);
         assert!(rows.iter().any(|r| matches!(&r.0, SidebarRow::Connection { conn_id } if conn_id == "c1")));
         assert!(!rows.iter().any(|r| matches!(&r.0, SidebarRow::Connection { conn_id } if conn_id == "c2")));
         assert!(rows.iter().any(|r| matches!(&r.0, SidebarRow::Inner { node: NodeId::Table(_, t), .. } if t == "orders")));
         // A filter matching a connection's own NAME keeps its row visible:
         let rows = flatten_sidebar(&grouped(&conns), &loaded_states("c1", "sales"), None,
-            &outer, "staging", None, &[], AdminEntry::Hidden);
+            &outer, "staging", None, &[], AdminEntry::Hidden, None);
         assert!(rows.iter().any(|r| matches!(&r.0, SidebarRow::Connection { conn_id } if conn_id == "c2")));
     }
 
@@ -3010,5 +3356,229 @@ mod sidebar_tests {
         assert!(!loaded.contains(&"db1"));
         // Re-touching moves to the back — touch db3 again, then overflow once more:
         touch_and_evict(&mut states, &mut lru, ("c1".into(), "db3".into()), Some(&active));
+    }
+
+    // ---------- Scripts section (workspace T3, dark) ----------
+
+    fn script_entries(specs: &[(&str, bool, usize)]) -> Vec<crate::scripts::ScriptEntry> {
+        specs
+            .iter()
+            .map(|(rel, is_dir, depth)| crate::scripts::ScriptEntry {
+                rel: (*rel).to_string(),
+                is_dir: *is_dir,
+                depth: *depth,
+            })
+            .collect()
+    }
+
+    fn loaded_scripts(specs: &[(&str, bool, usize)]) -> ScriptsListState {
+        ScriptsListState::Loaded {
+            entries: script_entries(specs),
+            truncated: false,
+            depth_clipped: false,
+        }
+    }
+
+    fn emit(
+        state: &ScriptsListState,
+        configured: bool,
+        expanded: &[OuterId],
+        filter: &str,
+    ) -> Vec<SidebarFlatRow> {
+        let set: HashSet<OuterId> = expanded.iter().cloned().collect();
+        let mut out = Vec::new();
+        emit_scripts_section(&mut out, state, configured, &set, filter);
+        out
+    }
+
+    #[test]
+    fn scripts_root_is_collapsed_by_default_and_shows_only_its_header() {
+        let rows = emit(&loaded_scripts(&[("a.sql", false, 0)]), true, &[], "");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, SidebarRow::ScriptsRoot);
+        assert_eq!(rows[0].2, "Skripty");
+        assert!(rows[0].3, "the root row is expandable");
+    }
+
+    #[test]
+    fn expanded_unconfigured_root_shows_the_settings_pointer_notice() {
+        let rows = emit(&ScriptsListState::NotLoaded, false, &[OuterId::Scripts], "");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[1].0,
+            SidebarRow::ScriptNotice {
+                text: "složka skriptů není nastavena — klikněte pro Nastavení".to_string(),
+                open_settings: true,
+            }
+        );
+    }
+
+    #[test]
+    fn loading_and_error_states_render_their_own_notice_rows() {
+        let rows = emit(&ScriptsListState::Loading, true, &[OuterId::Scripts], "");
+        assert_eq!(rows[1].2, "Načítám skripty…");
+        let rows =
+            emit(&ScriptsListState::Error("složka zmizela".into()), true, &[OuterId::Scripts], "");
+        // The `error:` prefix is the Notice color sentinel — keep it literal.
+        assert_eq!(rows[1].2, "error: složka zmizela");
+        assert_eq!(
+            rows[1].0,
+            SidebarRow::ScriptNotice {
+                text: "error: složka zmizela".to_string(),
+                open_settings: false,
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_loaded_library_says_so() {
+        let rows = emit(&loaded_scripts(&[]), true, &[OuterId::Scripts], "");
+        assert_eq!(rows[1].2, "žádné skripty (*.sql)");
+    }
+
+    #[test]
+    fn children_appear_only_under_expanded_folders_at_depth_one_plus_entry_depth() {
+        let state = loaded_scripts(&[
+            ("prod", true, 0),
+            ("prod/reporting.sql", false, 1),
+            ("dotaz.sql", false, 0),
+        ]);
+        // Folder collapsed: its child is hidden, the sibling file is not.
+        let rows = emit(&state, true, &[OuterId::Scripts], "");
+        let labels: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(labels, vec!["Skripty", "prod", "dotaz.sql"]);
+        assert_eq!(rows[1].1, 1, "a root-level entry sits at 1 + depth 0");
+
+        // Folder expanded: the child splices in at 1 + depth 1.
+        let rows = emit(
+            &state,
+            true,
+            &[OuterId::Scripts, OuterId::ScriptFolder("prod".to_string())],
+            "",
+        );
+        let labels: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(labels, vec!["Skripty", "prod", "reporting.sql", "dotaz.sql"]);
+        assert_eq!(rows[2].1, 2);
+        assert_eq!(rows[2].0, SidebarRow::ScriptFile { rel: "prod/reporting.sql".to_string() });
+    }
+
+    #[test]
+    fn a_grandchild_stays_hidden_when_any_ancestor_is_collapsed() {
+        let state = loaded_scripts(&[("a", true, 0), ("a/b", true, 1), ("a/b/c.sql", false, 2)]);
+        // Only the INNER folder is expanded — the outer one is not, so
+        // nothing below `a` may appear.
+        let rows = emit(
+            &state,
+            true,
+            &[OuterId::Scripts, OuterId::ScriptFolder("a/b".to_string())],
+            "",
+        );
+        let labels: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(labels, vec!["Skripty", "a"]);
+    }
+
+    #[test]
+    fn filter_auto_expands_folders_and_drops_childless_non_matching_ones() {
+        let state = loaded_scripts(&[
+            ("prod", true, 0),
+            ("prod/trzby.sql", false, 1),
+            ("test", true, 0),
+            ("test/smoke.sql", false, 1),
+        ]);
+        let rows = emit(&state, true, &[OuterId::Scripts], "trzby");
+        let labels: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        // `prod` survives because a descendant matched (auto-expand); `test`
+        // is childless after filtering and its own name misses.
+        assert_eq!(labels, vec!["Skripty", "prod", "trzby.sql"]);
+    }
+
+    #[test]
+    fn filter_keeps_a_folder_whose_own_name_matches_even_with_no_children() {
+        let state = loaded_scripts(&[("prod", true, 0), ("prod/trzby.sql", false, 1)]);
+        let rows = emit(&state, true, &[OuterId::Scripts], "prod");
+        let labels: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(labels, vec!["Skripty", "prod"]);
+    }
+
+    #[test]
+    fn a_filter_matching_nothing_collapses_a_nested_tree_all_the_way_up() {
+        // Regression pin for the keep-mask rewrite of
+        // `prune_childless_script_folders`. The old version called
+        // `Vec::remove` immediately, so a parent examined later simply saw
+        // the shortened vec; the mask version has to reason about the
+        // nearest SURVIVING row instead. Three levels, nothing matching:
+        // the file goes, then `b` (now childless), then `a`.
+        let state = loaded_scripts(&[("a", true, 0), ("a/b", true, 1), ("a/b/x.sql", false, 2)]);
+        let rows = emit(&state, true, &[OuterId::Scripts], "zzz");
+        let labels: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(labels, vec!["Skripty"]);
+    }
+
+    #[test]
+    fn a_pruned_folder_does_not_hide_its_parents_surviving_sibling() {
+        // The other half of the mask contract: a dropped row must NOT
+        // become the "next row" anybody reads its depth from, but the row
+        // BEHIND it still counts as `a`'s child.
+        let state =
+            loaded_scripts(&[("a", true, 0), ("a/b", true, 1), ("a/c.sql", false, 1)]);
+        let rows = emit(&state, true, &[OuterId::Scripts], "c.sql");
+        let labels: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(labels, vec!["Skripty", "a", "c.sql"]);
+    }
+
+    #[test]
+    fn cap_notices_render_after_the_entries() {
+        let state = ScriptsListState::Loaded {
+            entries: script_entries(&[("a.sql", false, 0)]),
+            truncated: true,
+            depth_clipped: true,
+        };
+        let rows = emit(&state, true, &[OuterId::Scripts], "");
+        let labels: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Skripty",
+                "a.sql",
+                "… zobrazeno prvních 2000 položek — zmenšete knihovnu skriptů",
+                "… některé podsložky jsou příliš hluboko (limit 12 úrovní)",
+            ]
+        );
+    }
+
+    #[test]
+    fn none_scripts_yields_exactly_some_scripts_minus_the_section_header() {
+        // The DARK contract: Task 3 changes nothing on screen. What THIS
+        // test pins is the narrower, exact statement in its name — `None`
+        // emits no `ScriptsRoot` and is otherwise element-for-element the
+        // `Some(..)` flatten with its header removed. The broader "nothing
+        // else in the sidebar moved" claim is carried by the ~20
+        // pre-existing `flatten_sidebar` tests above (favourites ordering,
+        // admin entry, db-list Loading/Error notices, filter shapes,
+        // multi-root ordering), which pass unchanged with the new
+        // parameter defaulted to `None`.
+        let conns = vec![conn_cfg("c1", "Prod", &[], Engine::Postgres, "sales")];
+        let with_none = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+            &HashSet::new(), "", None, &[], AdminEntry::Hidden, None);
+        let with_some = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+            &HashSet::new(), "", None, &[], AdminEntry::Hidden,
+            Some((&ScriptsListState::NotLoaded, false)));
+        assert!(!with_none.iter().any(|r| matches!(r.0, SidebarRow::ScriptsRoot)));
+        assert_eq!(with_some[0].0, SidebarRow::ScriptsRoot, "Some(..) emits the section");
+        assert_eq!(&with_some[1..], &with_none[..], "everything else is unchanged");
+    }
+
+    #[test]
+    fn scripts_section_is_emitted_after_favourites_and_before_the_connection_roots() {
+        let conns = vec![conn_cfg("c1", "Prod", &[], Engine::Postgres, "sales")];
+        let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+            &HashSet::new(), "", None, &[], AdminEntry::Hidden,
+            Some((&ScriptsListState::NotLoaded, true)));
+        let scripts_ix = rows.iter().position(|r| matches!(r.0, SidebarRow::ScriptsRoot)).unwrap();
+        let conn_ix = rows
+            .iter()
+            .position(|r| matches!(&r.0, SidebarRow::Connection { conn_id } if conn_id == "c1"))
+            .unwrap();
+        assert!(scripts_ix < conn_ix);
     }
 }
