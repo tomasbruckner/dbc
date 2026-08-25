@@ -23,6 +23,7 @@ mod row_view;
 mod runner;
 mod sandbox;
 mod schema_tree;
+mod scripts;
 mod sql_highlight;
 mod sql_input;
 mod tabs;
