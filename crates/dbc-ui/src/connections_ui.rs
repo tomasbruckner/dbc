@@ -5616,6 +5616,26 @@ mod modal_confirm_kind_tests {
             "no default button: ActivateChoice must not match without a focused choice"
         );
     }
+
+    /// Workspace T4 (design §W4): the wrong-context guard. Enter must be a
+    /// HANDLED no-op in every shape of the modal — including the
+    /// unparsable-pointer shape (`root: None`) and the re-pick-failed
+    /// shape (`error: Some`) — because each of its three choices is a
+    /// different, irreversible-feeling decision and none of them may be
+    /// reachable by a stray keystroke.
+    #[test]
+    fn workspace_missing_is_ignored_in_every_shape() {
+        for root in [None, Some(std::path::PathBuf::from("D:\\ws-gone"))] {
+            for error in [None, Some("nelze zapsat ukazatel".to_string())] {
+                let m = ModalState::WorkspaceMissing {
+                    root: root.clone(),
+                    reason: "složka neexistuje".to_string(),
+                    error: error.clone(),
+                };
+                assert!(matches!(modal_confirm_kind(&m), ModalConfirmKind::Ignore));
+            }
+        }
+    }
 }
 
 /// Workspace T4: byte pins for the design §W4 deliverable strings. The
