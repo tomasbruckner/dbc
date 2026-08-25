@@ -63,6 +63,12 @@ fn is_sql_name(name: &str) -> bool {
 /// (design §7.2), dot-directories (keeps `.git/` invisible AND
 /// undescended, design §1.5) and non-UTF-8 names (cannot round-trip
 /// through the '/'-joined rel convention).
+///
+/// Asymmetry, deliberate: only dot-DIRECTORIES are hidden here (a
+/// dot-FILE ending in `.sql` is listed, since `.sql` files are the whole
+/// point), while `validate_script_name` refuses to CREATE any dot-named
+/// entry — the app shows what the user put there but never adds hidden
+/// entries itself.
 fn list_dir_sorted(dir: &Path, rel_prefix: &str, depth: usize) -> Result<Vec<ScriptEntry>, String> {
     let rd = fs::read_dir(dir).map_err(|e| format!("nelze číst složku {}: {e}", dir.display()))?;
     let mut folders: Vec<String> = Vec::new();
@@ -167,9 +173,27 @@ pub fn resolve_rel(root: &Path, rel: &str) -> Result<PathBuf, String> {
     Ok(p)
 }
 
-const RESERVED_NAMES: [&str; 22] = [
+/// SECURITY: like `resolve_rel`, but REFUSES the empty rel. `resolve_rel`
+/// deliberately maps `""` to the root itself (that is what a top-level
+/// `parent_rel` means), so every helper that MUTATES a resolved path must
+/// route through this rail instead — otherwise `delete_entry(root, "",
+/// true)` removes the user's library folder and `rename_entry(root, "",
+/// …)` renames it. The rail lives here, not in each caller, so future
+/// writers over this root (config, vault, prefs) inherit it.
+pub fn resolve_entry_rel(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    if rel.trim().is_empty() {
+        return Err("kořen knihovny nelze měnit".to_string());
+    }
+    resolve_rel(root, rel)
+}
+
+/// Windows device names. The superscript COM¹/COM²/COM³ and LPT¹/LPT²/
+/// LPT³ forms (U+00B9/U+00B2/U+00B3) are reserved by Win32 too — they
+/// are NOT reachable by ASCII uppercasing, hence the explicit rows.
+const RESERVED_NAMES: [&str; 28] = [
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "COM9", "COM\u{b9}", "COM\u{b2}", "COM\u{b3}", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+    "LPT7", "LPT8", "LPT9", "LPT\u{b9}", "LPT\u{b2}", "LPT\u{b3}",
 ];
 
 /// Validates a SINGLE name component typed in-app (design §7.3); returns
@@ -204,41 +228,67 @@ pub fn validate_script_name(name: &str, is_file: bool) -> Result<String, String>
     Ok(full)
 }
 
-/// Case-insensitive existence probe within one directory (Windows-honest
-/// collision check; ASCII-insensitive matches NTFS's common case).
-fn entry_exists(parent: &Path, name: &str) -> Result<bool, String> {
+/// SECURITY: collision probe within one directory, returning the EXACT
+/// on-disk name that would collide with `name` (reusable by any future
+/// workspace writer over this same root — config, vault, prefs).
+///
+/// Case folding is UNICODE-aware (`to_lowercase`, not
+/// `eq_ignore_ascii_case`): NTFS is case-insensitive across all of
+/// Unicode, so with ASCII-only folding `Řezy.sql` and `řezy.sql` compare
+/// unequal here yet name the SAME file on disk — the caller would see
+/// "no collision" and `write_script`'s replace-rename would silently
+/// destroy the user's script. Czech names make that a routine case.
+///
+/// `ignore_exact` is the byte-exact name of the entry being renamed, so
+/// an entry never collides with ITSELF (identity, not name equality —
+/// on a case-SENSITIVE directory a coexisting `A.SQL` must still block
+/// `a.sql` → `A.SQL`).
+///
+/// Non-UTF-8 names are compared lossily: a false positive merely refuses
+/// a name, which is the safe direction.
+fn conflicting_name(
+    parent: &Path,
+    name: &str,
+    ignore_exact: Option<&str>,
+) -> Result<Option<String>, String> {
+    let target_lc = name.to_lowercase();
     let rd =
         fs::read_dir(parent).map_err(|e| format!("nelze číst složku {}: {e}", parent.display()))?;
     for ent in rd {
-        let ent =
-            ent.map_err(|e| format!("nelze číst složku {}: {e}", parent.display()))?;
-        if ent.file_name().to_str().is_some_and(|n| n.eq_ignore_ascii_case(name)) {
-            return Ok(true);
+        let ent = ent.map_err(|e| format!("nelze číst složku {}: {e}", parent.display()))?;
+        let existing = ent.file_name().to_string_lossy().into_owned();
+        if ignore_exact.is_some_and(|ex| ex == existing.as_str()) {
+            continue;
+        }
+        if existing.to_lowercase() == target_lc {
+            return Ok(Some(existing));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn joined_rel(parent_rel: &str, name: &str) -> String {
     if parent_rel.is_empty() { name.to_string() } else { format!("{parent_rel}/{name}") }
 }
 
-/// Creates an EMPTY `.sql` file; returns its new rel. Never overwrites.
+/// Creates an EMPTY `.sql` file; returns its new rel. Never overwrites —
+/// the Unicode-aware `conflicting_name` probe is what makes that true on
+/// a case-insensitive filesystem (`write_script` itself REPLACES).
 pub fn create_script(root: &Path, parent_rel: &str, name: &str) -> Result<String, String> {
     let file = validate_script_name(name, true)?;
     let parent = resolve_rel(root, parent_rel)?;
-    if entry_exists(&parent, &file)? {
+    if conflicting_name(&parent, &file, None)?.is_some() {
         return Err("název už existuje".to_string());
     }
     write_script(&parent.join(&file), "")?;
     Ok(joined_rel(parent_rel, &file))
 }
 
-/// Creates a folder; returns its new rel.
+/// Creates a folder; returns its new rel. Never overwrites.
 pub fn create_folder(root: &Path, parent_rel: &str, name: &str) -> Result<String, String> {
     let folder = validate_script_name(name, false)?;
     let parent = resolve_rel(root, parent_rel)?;
-    if entry_exists(&parent, &folder)? {
+    if conflicting_name(&parent, &folder, None)?.is_some() {
         return Err("název už existuje".to_string());
     }
     fs::create_dir(parent.join(&folder)).map_err(|e| format!("vytvoření složky selhalo: {e}"))?;
@@ -246,14 +296,15 @@ pub fn create_folder(root: &Path, parent_rel: &str, name: &str) -> Result<String
 }
 
 /// Renames within the same directory; returns the new rel. A case-only
-/// rename of the same entry is allowed (the collision probe would
-/// false-positive on itself).
+/// rename is allowed because the probe skips the entry ITSELF by exact
+/// name — not by name equality, so a coexisting differently-cased
+/// sibling on a case-sensitive directory still blocks the rename.
 pub fn rename_entry(root: &Path, rel: &str, new_name: &str, is_dir: bool) -> Result<String, String> {
     let new_file = validate_script_name(new_name, !is_dir)?;
-    let old = resolve_rel(root, rel)?;
+    let old = resolve_entry_rel(root, rel)?;
     let (parent_rel, old_name) = rel.rsplit_once('/').unwrap_or(("", rel));
     let parent = resolve_rel(root, parent_rel)?;
-    if !old_name.eq_ignore_ascii_case(&new_file) && entry_exists(&parent, &new_file)? {
+    if conflicting_name(&parent, &new_file, Some(old_name))?.is_some() {
         return Err("název už existuje".to_string());
     }
     fs::rename(&old, parent.join(&new_file)).map_err(|e| format!("přejmenování selhalo: {e}"))?;
@@ -261,9 +312,10 @@ pub fn rename_entry(root: &Path, rel: &str, new_name: &str, is_dir: bool) -> Res
 }
 
 /// Deletes a file, or an EMPTY folder (design §7.9 — no recursive delete
-/// in v1: git can restore a deleted file; we cannot).
+/// in v1: git can restore a deleted file; we cannot). The root itself is
+/// never deletable (`resolve_entry_rel`).
 pub fn delete_entry(root: &Path, rel: &str, is_dir: bool) -> Result<(), String> {
-    let p = resolve_rel(root, rel)?;
+    let p = resolve_entry_rel(root, rel)?;
     if is_dir {
         let mut rd =
             fs::read_dir(&p).map_err(|e| format!("nelze číst složku {}: {e}", p.display()))?;
@@ -277,7 +329,10 @@ pub fn delete_entry(root: &Path, rel: &str, is_dir: bool) -> Result<(), String> 
 }
 
 /// Atomic write: `.tmp` sibling + `sync_all` + rename (`AppConfig::save`
-/// shape). Last-writer-wins on external edits — by the user's own model
+/// shape). REPLACES an existing target by design (that is what saving an
+/// open editor buffer means) — callers that must not clobber, like
+/// `create_script`, are responsible for probing via `conflicting_name`
+/// first. Last-writer-wins on external edits — by the user's own model
 /// git is the history layer (design §5.2).
 pub fn write_script(path: &Path, text: &str) -> Result<(), String> {
     use std::io::Write;
@@ -405,17 +460,65 @@ mod tests {
         #[cfg(unix)]
         let made = std::os::unix::fs::symlink(outside.path(), td.path().join("link")).is_ok();
         if !made {
+            eprintln!(
+                "SKIP scan_skips_symlinks_when_creatable: symlink creation unavailable \
+                 (needs developer mode / privilege) — the skip rail was NOT verified here"
+            );
             return;
         }
         let scan = scan_scripts(td.path()).unwrap();
         assert!(scan.entries.is_empty(), "symlinked dir must be invisible: {:?}", scan.entries);
     }
 
+    /// The symlink test above SKIPS on a stock Windows box (creating a
+    /// symlink needs privilege), which would leave the escape rail
+    /// unverified there. A directory JUNCTION needs no privilege and is
+    /// the reparse point an attacker/user can actually plant, so this
+    /// pins the same rail on an unprivileged machine.
+    #[cfg(windows)]
+    #[test]
+    fn scan_skips_directory_junctions() {
+        let td = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        touch(&outside.path().join("secret.sql"));
+        let link = td.path().join("link");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(outside.path())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("SKIP scan_skips_directory_junctions: mklink /J unavailable");
+            return;
+        }
+        let scan = scan_scripts(td.path()).unwrap();
+        assert!(
+            scan.entries.is_empty(),
+            "junction must never be listed or descended (root escape): {:?}",
+            scan.entries
+        );
+    }
+
     #[test]
     fn resolve_rel_rejects_traversal_shapes() {
         let root = Path::new("D:/lib");
-        for bad in ["..", "a/../b", "a/..", "/abs", "a//b", "C:\\x", "\\\\srv\\share", "a\u{0}b", "."]
-        {
+        // "a:b" pins the ADS/drive-colon rail INDEPENDENTLY: "C:\\x" also
+        // contains a backslash, so it would stay rejected even if the ':'
+        // check were deleted.
+        for bad in [
+            "..",
+            "a/../b",
+            "a/..",
+            "/abs",
+            "a//b",
+            "C:\\x",
+            "a:b",
+            "\\\\srv\\share",
+            "a\u{0}b",
+            ".",
+        ] {
             assert!(resolve_rel(root, bad).is_err(), "{bad} must be rejected");
         }
         assert_eq!(resolve_rel(root, "a/b.sql").unwrap(), root.join("a").join("b.sql"));
@@ -477,5 +580,89 @@ mod tests {
         let bad = td.path().join("bad.sql");
         fs::write(&bad, [0xffu8, 0xfe, 0x00, 0x01]).unwrap();
         assert_eq!(read_script(&bad).unwrap_err(), "soubor není platné UTF-8");
+    }
+
+    #[test]
+    fn write_script_replaces_an_existing_target() {
+        // Load-bearing property: saving an open buffer overwrites. It is
+        // exactly WHY create_* must probe for collisions first.
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("a.sql");
+        write_script(&p, "first").unwrap();
+        write_script(&p, "second").unwrap();
+        assert_eq!(read_script(&p).unwrap(), "second");
+    }
+
+    #[test]
+    fn create_refuses_unicode_case_variant_of_existing_name() {
+        // MAJOR regression (Czech UI, NTFS): `Ř` vs `ř` fold equal on
+        // disk but NOT under eq_ignore_ascii_case — with ASCII folding
+        // the probe said "free", write_script replaced the rename target
+        // and the user's script was destroyed silently.
+        let td = tempfile::tempdir().unwrap();
+        let r = td.path();
+        fs::write(r.join("Řezy.sql"), b"-- puvodni obsah").unwrap();
+        assert_eq!(create_script(r, "", "řezy").unwrap_err(), "název už existuje");
+        assert_eq!(
+            fs::read_to_string(r.join("Řezy.sql")).unwrap(),
+            "-- puvodni obsah",
+            "the original file must be untouched"
+        );
+        // Non-Czech accented pair, folders too.
+        create_folder(r, "", "Ärchiv").unwrap();
+        assert_eq!(create_folder(r, "", "ärchiv").unwrap_err(), "název už existuje");
+    }
+
+    #[test]
+    fn rename_refuses_unicode_case_variant_but_allows_case_only_self_rename() {
+        let td = tempfile::tempdir().unwrap();
+        let r = td.path();
+        fs::write(r.join("Řezy.sql"), b"-- puvodni obsah").unwrap();
+        fs::write(r.join("jine.sql"), b"-- jine").unwrap();
+        assert_eq!(
+            rename_entry(r, "jine.sql", "řezy", false).unwrap_err(),
+            "název už existuje"
+        );
+        assert_eq!(fs::read_to_string(r.join("Řezy.sql")).unwrap(), "-- puvodni obsah");
+        // Identity: an entry never collides with ITSELF (exact-name skip),
+        // so a case-only rename still works — and so does a no-op rename.
+        assert_eq!(rename_entry(r, "jine.sql", "JINE", false).unwrap(), "JINE.sql");
+        assert_eq!(rename_entry(r, "JINE.sql", "JINE", false).unwrap(), "JINE.sql");
+        assert_eq!(fs::read_to_string(r.join("JINE.sql")).unwrap(), "-- jine");
+    }
+
+    #[test]
+    fn empty_rel_can_never_mutate_the_library_root() {
+        // MINOR 2: resolve_rel("") is the ROOT by design (parent_rel), so
+        // the mutation helpers must refuse it or they delete/rename the
+        // user's whole library folder.
+        let td = tempfile::tempdir().unwrap();
+        let r = td.path();
+        touch(&r.join("a.sql"));
+        assert_eq!(delete_entry(r, "", true).unwrap_err(), "kořen knihovny nelze měnit");
+        assert_eq!(delete_entry(r, "   ", true).unwrap_err(), "kořen knihovny nelze měnit");
+        assert_eq!(
+            rename_entry(r, "", "jinak", true).unwrap_err(),
+            "kořen knihovny nelze měnit"
+        );
+        assert!(r.is_dir(), "root must survive");
+        assert!(r.join("a.sql").is_file());
+        assert!(resolve_entry_rel(r, "").is_err());
+        assert_eq!(resolve_entry_rel(r, "a.sql").unwrap(), r.join("a.sql"));
+        // The actual data-loss shape: an EMPTY root passes the
+        // "folder not empty" guard, so only the rail stops the removal.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            delete_entry(empty.path(), "", true).unwrap_err(),
+            "kořen knihovny nelze měnit"
+        );
+        assert!(empty.path().is_dir(), "empty root must survive");
+    }
+
+    #[test]
+    fn superscript_device_names_are_reserved() {
+        assert!(validate_script_name("COM\u{b9}", true).is_err());
+        assert!(validate_script_name("lpt\u{b2}", false).is_err());
+        assert!(validate_script_name("com\u{b3}", true).is_err());
     }
 }
