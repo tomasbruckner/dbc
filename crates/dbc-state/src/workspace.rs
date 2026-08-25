@@ -593,6 +593,20 @@ mod tests {
     }
 
     #[test]
+    fn read_pointer_probes_with_try_exists_not_exists() {
+        // REGRESSION PIN for the probe choice itself. The two tests above
+        // both survive a revert of `try_exists()` back to `exists()` — one
+        // injects at the `read_pointer_probed` seam (bypassing the probe
+        // entirely), the other uses a directory (which `exists()` reports
+        // as `true` just the same). This one does not: an interior-NUL path
+        // makes `exists()` return `false` (⇒ `Ok(None)` ⇒ silent PROFILE
+        // mode) while `try_exists()` returns `Err(InvalidInput)` (⇒ Broken).
+        let ptr = Path::new("a\u{0}b.toml");
+        assert!(read_pointer(ptr).is_err(), "exists() would silently report no pointer");
+        assert!(matches!(resolve_at(ptr), Resolution::Broken { .. }));
+    }
+
+    #[test]
     fn write_pointer_refuses_a_relative_root() {
         // The pointer is read back from another process with another CWD:
         // a relative path would round-trip into a DIFFERENT folder.
@@ -742,34 +756,46 @@ mod tests {
     #[test]
     fn a_failing_init_writes_no_marker() {
         // Deterministic failure injection AFTER the Empty precondition: the
-        // destination is genuinely empty, but the SOURCE `config.toml` is a
-        // directory, so `copy_one`'s `fs::read` fails mid-init. (The old
-        // injection — `scripts` pre-existing as a file — is now caught one
-        // step earlier by the precondition, so it no longer reaches the
-        // marker-ordering code this test is about.)
+        // destination is genuinely empty, but the SOURCE `views.toml` is a
+        // directory, so `copy_one`'s `fs::read` fails on the THIRD copy.
+        // (The old injection — `scripts` pre-existing as a file — is now
+        // caught one step earlier by the precondition, so it no longer
+        // reaches the marker-ordering code this test is about.)
+        //
+        // Injecting at `views` and not at `config` is the point: two copies
+        // LAND first, so the folder holds real partial state when the
+        // failure hits. That is what makes this a marker-LAST pin rather
+        // than a "nothing happened at all" pin.
         let td = tempfile::tempdir().unwrap();
         let prof = td.path().join("profile");
         std::fs::create_dir(&prof).unwrap();
         let mut from = fake_profile(&prof);
-        std::fs::create_dir(prof.join("config-dir")).unwrap();
-        from.config = prof.join("config-dir");
+        std::fs::create_dir(prof.join("views-dir")).unwrap();
+        from.views = prof.join("views-dir");
         let root = td.path().join("ws");
         std::fs::create_dir(&root).unwrap();
 
         assert!(init_workspace(&root, &from).is_err());
+        // Real partial state on disk — the copies before the failure DID
+        // land, and the marker still did not.
+        assert!(root.join("config.toml").exists(), "the first copy landed");
+        assert!(root.join("vault.bin").exists(), "the second copy landed");
+        assert!(!root.join("views.toml").exists(), "the failing copy did not");
         assert!(!root.join(MARKER_FILE).exists());
         assert_ne!(classify(&root), Classification::Workspace);
-        assert!(from.vault.exists());
+        assert_eq!(classify(&root), Classification::NonEmpty, "not adoptable");
+        assert!(from.config.exists() && from.vault.exists());
     }
 
     #[test]
-    fn init_refuses_to_overwrite_an_existing_file_case_insensitively() {
+    fn init_refuses_a_non_empty_folder_before_touching_the_users_file() {
         // TWO rails now stand between an init and a user's file: the
         // `classify(root) == Empty` precondition (which fires first, before
-        // ANY byte is written) and `copy_one`'s case-insensitive
-        // `entry_exists_ci` refusal behind it (pinned directly in
-        // `fsutil::tests`). What this test owns is the OUTCOME: the user's
-        // `Config.TOML` survives byte-identical and no marker appears.
+        // ANY byte is written — that is what this test pins) and
+        // `copy_one`'s case-insensitive `entry_exists_ci` refusal behind it
+        // (pinned directly in `fsutil::tests`). What this test owns is the
+        // OUTCOME: the user's `Config.TOML` survives byte-identical, no
+        // marker appears, and nothing new is written beside it.
         let td = tempfile::tempdir().unwrap();
         let prof = td.path().join("profile");
         std::fs::create_dir(&prof).unwrap();
@@ -781,6 +807,13 @@ mod tests {
         assert!(init_workspace(&root, &from).is_err());
         assert_eq!(std::fs::read_to_string(root.join("Config.TOML")).unwrap(), "PRECIOUS");
         assert!(!root.join(MARKER_FILE).exists());
+        // The precondition fired BEFORE any byte was written: the user's
+        // file is still the only entry in the folder.
+        let names: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["Config.TOML".to_string()]);
     }
 
     #[test]
