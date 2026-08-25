@@ -1172,7 +1172,16 @@ pub enum ModalState {
     /// surfaced on the resulting `CompareView` tab, T7, not back into this
     /// already-closed dialog) but kept for a uniform modal-state shape and
     /// possible future pre-dispatch validation.
-    CompareDialog { conn_a: Option<String>, conn_b: Option<String>, error: Option<String> },
+    /// Sidebar rework (design §5 row 7): each side is `(connection id,
+    /// database)` — `None` db = the connection's default. The picker's db
+    /// sub-rows come from the sidebar's CACHED lists only (the dialog
+    /// never triggers fetches); same-connection-two-databases is the
+    /// flagship pick this widening enables.
+    CompareDialog {
+        conn_a: Option<(String, Option<String>)>,
+        conn_b: Option<(String, Option<String>)>,
+        error: Option<String>,
+    },
     /// G11 T6 (design §2/§3, §3-novela): backup/restore confirm/progress
     /// overlay — one panel per `BackupSession::status` transition
     /// (Confirming [Restore only] -> Running -> terminal), same
@@ -1328,10 +1337,14 @@ pub(crate) fn modal_confirm_kind(modal: &ModalState) -> ModalConfirmKind {
 // ---------------------------------------------------------------------
 
 impl AppView {
+    /// Sidebar rework (design §2.5): the top-bar status label — gains the
+    /// „· {db}" segment only for a NON-default active database
+    /// (`active_database` is always `None` for the default, T3's
+    /// normalization invariant).
     pub(crate) fn current_connection_label(&self) -> String {
         if let Some(id) = &self.active_connection_id {
             if let Some(c) = self.config.connections.iter().find(|c| &c.id == id) {
-                return format!("{} ({})", c.name, engine_label(c.engine));
+                return connection_label(&c.name, c.engine, self.active_database.as_deref());
             }
         }
         if let Some(url) = &self.conn_url {
@@ -1474,7 +1487,28 @@ impl AppView {
                 render_analyze_write_confirm_panel(&sql, engine, running, &error, cx)
             }
             ModalState::CompareDialog { conn_a, conn_b, error } => {
-                render_compare_dialog_panel(conn_a, conn_b, error, self.grouped_cache.clone(), cx)
+                // Sidebar rework (design §5 row 7): each connection's
+                // CACHED database list, read at render time — the dialog
+                // never triggers fetches; a connection without a cached
+                // list offers only its default row. `is_default` entries
+                // are skipped (the connection row IS the default pick).
+                let grouped = self.grouped_cache.clone();
+                let tree = self.tree.read(cx);
+                let mut db_lists: Vec<(String, Vec<String>)> = Vec::new();
+                for c in grouped
+                    .favourites
+                    .iter()
+                    .chain(grouped.folders.iter().flat_map(|g| g.connections.iter()))
+                {
+                    if let Some((dbs, _truncated)) = tree.db_list_for(&c.id) {
+                        let names: Vec<String> =
+                            dbs.iter().filter(|d| !d.is_default).map(|d| d.name.clone()).collect();
+                        if !names.is_empty() {
+                            db_lists.push((c.id.clone(), names));
+                        }
+                    }
+                }
+                render_compare_dialog_panel(conn_a, conn_b, error, grouped, db_lists, cx)
             }
             ModalState::BackupRestore(session) => render_backup_restore_panel(&session, cx),
             ModalState::ScriptRun {
@@ -1784,12 +1818,20 @@ impl AppView {
     /// A picker-row click on side `side` — updates `conn_a`/`conn_b` on the
     /// open `CompareDialog`, a no-op if some other modal is open by the time
     /// this fires (defensive; the dialog's own overlay occludes clicks
-    /// elsewhere while open).
-    pub(crate) fn select_compare_side(&mut self, side: CompareSide, id: String, cx: &mut Context<Self>) {
+    /// elsewhere while open). Sidebar rework: `db == None` = the
+    /// connection's default (the connection row itself); `Some(db)` = a
+    /// cached-list db sub-row.
+    pub(crate) fn select_compare_side(
+        &mut self,
+        side: CompareSide,
+        id: String,
+        db: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(ModalState::CompareDialog { conn_a, conn_b, .. }) = &mut self.modal {
             match side {
-                CompareSide::A => *conn_a = Some(id),
-                CompareSide::B => *conn_b = Some(id),
+                CompareSide::A => *conn_a = Some((id, db)),
+                CompareSide::B => *conn_b = Some((id, db)),
             }
         }
         cx.notify();
@@ -1836,12 +1878,34 @@ impl AppView {
         let Some(ModalState::CompareDialog { conn_a, conn_b, .. }) = self.modal.clone() else {
             return;
         };
-        let (Some(id_a), Some(id_b)) = (conn_a, conn_b) else { return };
+        let (Some((id_a, db_a)), Some((id_b, db_b))) = (conn_a, conn_b) else { return };
         let Some(cfg_a) = self.config.connections.iter().find(|c| c.id == id_a).cloned() else {
             return;
         };
         let Some(cfg_b) = self.config.connections.iter().find(|c| c.id == id_b).cloned() else {
             return;
+        };
+        // Sidebar rework (design §5 row 7): a picked non-default database
+        // swaps into the config ONCE up front — the stored
+        // `CompareView::conn_a/conn_b` (used later by the data-diff leg)
+        // already carry the effective database, so the `ConnectSpec`
+        // construction below needs no change. Same-connection-two-databases
+        // is now expressible — the flagship capability.
+        let cfg_a = match &db_a {
+            Some(db) => {
+                let mut c = cfg_a;
+                c.database = db.clone();
+                c
+            }
+            None => cfg_a,
+        };
+        let cfg_b = match &db_b {
+            Some(db) => {
+                let mut c = cfg_b;
+                c.database = db.clone();
+                c
+            }
+            None => cfg_b,
         };
         // G15 T8 HARD GATE ITEM 2: see `connect::resolve_secret_for_connect`'s
         // doc comment — skips the vault lookup for a refused MSSQL config.
@@ -1851,8 +1915,8 @@ impl AppView {
         self.modal = None; // design §3: closes as soon as the request is dispatched
         self.compare_fetch_generation += 1;
         let my_generation = self.compare_fetch_generation;
-        let label_a = format!("{} ({})", cfg_a.name, engine_label(cfg_a.engine));
-        let label_b = format!("{} ({})", cfg_b.name, engine_label(cfg_b.engine));
+        let label_a = compare_side_label(&cfg_a.name, cfg_a.engine, db_a.as_deref());
+        let label_b = compare_side_label(&cfg_b.name, cfg_b.engine, db_b.as_deref());
         let spec_a = ConnectSpec::Config { cfg: Box::new(cfg_a.clone()), secret: secret_a.clone() };
         let spec_b = ConnectSpec::Config { cfg: Box::new(cfg_b.clone()), secret: secret_b.clone() };
         let rx = self.runner.fetch_schema_pair(spec_a, spec_b);
@@ -2423,6 +2487,24 @@ pub(crate) fn engine_label(e: Engine) -> &'static str {
     }
 }
 
+/// Design §2.5: „{name} ({engine}) · {db}" — the db segment renders only
+/// for a NON-default active database (`active_db == None` = default).
+pub(crate) fn connection_label(name: &str, engine: Engine, active_db: Option<&str>) -> String {
+    match active_db {
+        Some(db) => format!("{} ({}) · {}", name, engine_label(engine), db),
+        None => format!("{} ({})", name, engine_label(engine)),
+    }
+}
+
+/// Design §5 row 7: compare-side display label; `/` separator to match
+/// `conn_name_for_identity`'s mismatch-text convention.
+pub(crate) fn compare_side_label(name: &str, engine: Engine, db: Option<&str>) -> String {
+    match db {
+        Some(db) => format!("{} ({}) / {}", name, engine_label(engine), db),
+        None => format!("{} ({})", name, engine_label(engine)),
+    }
+}
+
 fn next_engine(e: Engine) -> Engine {
     match e {
         Engine::Postgres => Engine::Mssql,
@@ -2923,7 +3005,16 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
         )
         .child(field_row("Host", ui.host.clone(), *cx.theme()))
         .child(field_row("Port", ui.port.clone(), *cx.theme()))
-        .child(field_row("Databáze", ui.database.clone(), *cx.theme()));
+        // Sidebar rework (design §8 — label only, config shape untouched):
+        // for server engines this field names the DEFAULT database of a
+        // multi-database connection; for file engines "výchozí" would be
+        // meaningless (one file, one database), so the plain label stays
+        // alongside G16's file-path hint row below.
+        .child(field_row(
+            if engine_is_file_based(ui.engine) { "Databáze" } else { "Databáze (výchozí)" },
+            ui.database.clone(),
+            *cx.theme(),
+        ));
 
     // G16 §2: file-path hint for the file-based engines — the fields
     // themselves render for all engines (sqlite convention, no conditional
@@ -3469,10 +3560,11 @@ pub(crate) enum CompareSide {
 /// "Spustit porovnání" disabled until both `conn_a`/`conn_b` are `Some`
 /// (same connection on both sides explicitly allowed — no equality guard).
 fn render_compare_dialog_panel(
-    conn_a: Option<String>,
-    conn_b: Option<String>,
+    conn_a: Option<(String, Option<String>)>,
+    conn_b: Option<(String, Option<String>)>,
     error: Option<String>,
     grouped: GroupedConnections,
+    db_lists: Vec<(String, Vec<String>)>,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let both_picked = conn_a.is_some() && conn_b.is_some();
@@ -3500,6 +3592,7 @@ fn render_compare_dialog_panel(
                     CompareSide::A,
                     &conn_a,
                     &grouped,
+                    &db_lists,
                     cx,
                 ))
                 .child(render_compare_picker_column(
@@ -3508,6 +3601,7 @@ fn render_compare_dialog_panel(
                     CompareSide::B,
                     &conn_b,
                     &grouped,
+                    &db_lists,
                     cx,
                 )),
         );
@@ -3552,8 +3646,9 @@ fn render_compare_picker_column(
     id: &'static str,
     label: &'static str,
     side: CompareSide,
-    selected: &Option<String>,
+    selected: &Option<(String, Option<String>)>,
     grouped: &GroupedConnections,
+    db_lists: &[(String, Vec<String>)],
     cx: &mut Context<AppView>,
 ) -> impl IntoElement {
     let mut list = div()
@@ -3569,10 +3664,19 @@ fn render_compare_picker_column(
         .border_color(cx.theme().border_subtle)
         .rounded_md();
 
+    // Sidebar rework (design §5 row 7): every connection row (= its
+    // default database) is followed by indented rows for its CACHED
+    // non-default databases; connections without a cached list offer only
+    // their default row.
     if !grouped.favourites.is_empty() {
         list = list.child(div().text_color(cx.theme().warn).child("Oblíbené"));
         for c in &grouped.favourites {
             list = list.child(compare_picker_row(c, side, selected, cx));
+            if let Some((_, dbs)) = db_lists.iter().find(|(cid, _)| cid == &c.id) {
+                for db in dbs {
+                    list = list.child(compare_picker_db_row(&c.id, db, side, selected, cx));
+                }
+            }
         }
     }
     for folder in &grouped.folders {
@@ -3580,6 +3684,11 @@ fn render_compare_picker_column(
         list = list.child(div().text_color(cx.theme().text_disabled).child(header));
         for c in &folder.connections {
             list = list.child(compare_picker_row(c, side, selected, cx));
+            if let Some((_, dbs)) = db_lists.iter().find(|(cid, _)| cid == &c.id) {
+                for db in dbs {
+                    list = list.child(compare_picker_db_row(&c.id, db, side, selected, cx));
+                }
+            }
         }
     }
 
@@ -3589,11 +3698,14 @@ fn render_compare_picker_column(
 fn compare_picker_row(
     c: &ConnectionConfig,
     side: CompareSide,
-    selected: &Option<String>,
+    selected: &Option<(String, Option<String>)>,
     cx: &mut Context<AppView>,
 ) -> impl IntoElement {
     let id = c.id.clone();
-    let is_selected = selected.as_deref() == Some(c.id.as_str());
+    // The connection row IS the (id, default) pick — full-tuple compare,
+    // so a selected db sub-row does not also highlight its parent.
+    let is_selected =
+        selected.as_ref().is_some_and(|(cid, db)| cid == &c.id && db.is_none());
     let side_tag = match side {
         CompareSide::A => "a",
         CompareSide::B => "b",
@@ -3608,7 +3720,38 @@ fn compare_picker_row(
         .hover(|s| s.bg(cx.theme().bg_hover))
         .child(label)
         .on_click(cx.listener(move |view, _, _, cx| {
-            view.select_compare_side(side, id.clone(), cx);
+            view.select_compare_side(side, id.clone(), None, cx);
+        }))
+}
+
+/// Sidebar rework (design §5 row 7): one indented, cached non-default
+/// database under its connection row — click picks `(conn, Some(db))`.
+fn compare_picker_db_row(
+    conn_id: &str,
+    db: &str,
+    side: CompareSide,
+    selected: &Option<(String, Option<String>)>,
+    cx: &mut Context<AppView>,
+) -> impl IntoElement {
+    let is_selected = selected
+        .as_ref()
+        .is_some_and(|(cid, d)| cid == conn_id && d.as_deref() == Some(db));
+    let side_tag = match side {
+        CompareSide::A => "a",
+        CompareSide::B => "b",
+    };
+    let (id_for_click, db_for_click) = (conn_id.to_string(), db.to_string());
+    div()
+        .id(SharedString::from(format!("compare-row-{side_tag}-{conn_id}-{db}")))
+        .pl_4()
+        .px_1()
+        .cursor_pointer()
+        .rounded_md()
+        .when(is_selected, |d| d.bg(cx.theme().bg_hover).text_color(cx.theme().success))
+        .hover(|s| s.bg(cx.theme().bg_hover))
+        .child(format!("· {db}"))
+        .on_click(cx.listener(move |view, _, _, cx| {
+            view.select_compare_side(side, id_for_click.clone(), Some(db_for_click.clone()), cx);
         }))
 }
 
@@ -3804,7 +3947,11 @@ mod compare_dialog_tests {
         // early-return guard — proven directly on the enum shape rather than
         // through a full `AppView`/window harness, same precedent as
         // `Tabs`' own plain-data tests (tabs.rs's module doc comment).
-        let one_picked = ModalState::CompareDialog { conn_a: Some("x".into()), conn_b: None, error: None };
+        let one_picked = ModalState::CompareDialog {
+            conn_a: Some(("x".into(), None)),
+            conn_b: None,
+            error: None,
+        };
         let (a, b) = match one_picked {
             ModalState::CompareDialog { conn_a, conn_b, .. } => (conn_a, conn_b),
             _ => unreachable!(),
@@ -3815,12 +3962,52 @@ mod compare_dialog_tests {
     #[test]
     fn same_connection_on_both_sides_is_a_valid_pick() {
         // design §3: explicitly allowed, not a validation error.
-        let both_same = ModalState::CompareDialog { conn_a: Some("x".into()), conn_b: Some("x".into()), error: None };
+        let both_same = ModalState::CompareDialog {
+            conn_a: Some(("x".into(), None)),
+            conn_b: Some(("x".into(), None)),
+            error: None,
+        };
         let (a, b) = match both_same {
             ModalState::CompareDialog { conn_a, conn_b, .. } => (conn_a, conn_b),
             _ => unreachable!(),
         };
         assert!(a.is_some() && b.is_some());
+    }
+
+    /// Sidebar rework (design §5 row 7): the flagship pick — the SAME
+    /// connection with two different databases is two distinct sides.
+    #[test]
+    fn same_connection_two_databases_is_expressible_and_distinct() {
+        let m = ModalState::CompareDialog {
+            conn_a: Some(("x".into(), None)),
+            conn_b: Some(("x".into(), Some("inventory".into()))),
+            error: None,
+        };
+        let (a, b) = match m {
+            ModalState::CompareDialog { conn_a, conn_b, .. } => (conn_a, conn_b),
+            _ => unreachable!(),
+        };
+        assert!(a.is_some() && b.is_some());
+        assert_ne!(a, b, "default vs non-default db on one connection are distinct picks");
+    }
+}
+
+// Sidebar rework T6: the top-bar / compare-side display labels (design
+// §2.5 / §5 row 7).
+#[cfg(test)]
+mod top_bar_label_tests {
+    use super::*;
+
+    #[test]
+    fn label_appends_db_segment_only_when_non_default() {
+        assert_eq!(connection_label("prod", Engine::Postgres, None), "prod (pg)");
+        assert_eq!(connection_label("prod", Engine::Postgres, Some("inventory")), "prod (pg) · inventory");
+    }
+
+    #[test]
+    fn compare_side_label_appends_db() {
+        assert_eq!(compare_side_label("prod", Engine::Postgres, None), "prod (pg)");
+        assert_eq!(compare_side_label("prod", Engine::Mssql, Some("staging")), "prod (mssql) / staging");
     }
 }
 

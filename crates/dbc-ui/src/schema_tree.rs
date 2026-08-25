@@ -1430,12 +1430,9 @@ impl SchemaTree {
     }
 
     /// Sidebar rework (T6's compare picker): the fetched database list for
-    /// `conn_id`, with its truncation flag, if `Loaded`.
-    ///
-    /// Allow dead_code: T5 lands ahead of T6's consumer (the compare
-    /// dialog's per-connection database sub-pick). Remove once T6 wires it
-    /// in.
-    #[allow(dead_code)]
+    /// `conn_id`, with its truncation flag, if `Loaded` — consumed by
+    /// `render_modal_overlay`'s CompareDialog arm (cached lists only, the
+    /// dialog never triggers fetches).
     pub fn db_list_for(&self, conn_id: &str) -> Option<(&[DbNode], bool)> {
         match &self.conns.get(conn_id)?.dbs {
             DbListState::Loaded { dbs, truncated } => Some((dbs.as_slice(), *truncated)),
