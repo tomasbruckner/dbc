@@ -128,6 +128,14 @@ pub struct AppConfig {
     /// not a connection property) — design §1.
     #[serde(default)]
     pub tool_paths: ToolPaths,
+    /// Scripts library (Bruno model, design §2): absolute path of the
+    /// user-chosen folder of plain `.sql` files. `None` = feature dormant
+    /// (the sidebar section points at Settings). A path, not a secret.
+    /// Git integration for this folder is deliberately EXTERNAL (user
+    /// decision 2026-08-25) — the app never reads or writes anything
+    /// git-related about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scripts_dir: Option<String>,
 }
 
 impl AppConfig {
@@ -194,6 +202,7 @@ mod tests {
             favourite_objects: vec![],
             theme: ThemeMode::Dark,
             tool_paths: ToolPaths::default(),
+            scripts_dir: None,
         }
     }
 
@@ -409,6 +418,34 @@ user = "postgres"
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.tool_paths, ToolPaths::default());
         assert_eq!(config.tool_paths.psql, None);
+    }
+
+    #[test]
+    fn old_config_without_scripts_dir_loads_and_roundtrips_byte_identically() {
+        // Scripts library (design §2): additive Option field with
+        // serde(default) + skip_serializing_if — an old config.toml must
+        // load AND save back without gaining the field.
+        let toml_str = r#"[[connections]]
+id = "c1"
+name = "demo"
+engine = "postgres"
+host = "localhost"
+database = "postgres"
+user = "postgres"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.scripts_dir, None);
+        let back = toml::to_string_pretty(&config).unwrap();
+        assert!(!back.contains("scripts_dir"));
+    }
+
+    #[test]
+    fn scripts_dir_set_roundtrips() {
+        let mut config = AppConfig::default();
+        config.scripts_dir = Some("D:\\sql\\library".to_string());
+        let s = toml::to_string_pretty(&config).unwrap();
+        let back: AppConfig = toml::from_str(&s).unwrap();
+        assert_eq!(back.scripts_dir.as_deref(), Some("D:\\sql\\library"));
     }
 
     #[test]
