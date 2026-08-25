@@ -1310,6 +1310,20 @@ pub enum ModalState {
         /// place instead of opening a new tab.
         edit_tab: Option<u64>,
     },
+    /// Design §W4: the pointer file names a workspace this build cannot
+    /// use (folder missing, marker gone, unreadable, future format). The
+    /// app is already up but EMPTY — no config, no vault, no view prefs
+    /// were loaded — and this modal is the only way out. Deliberately the
+    /// most locked-down arm in this enum: Enter is `Ignore`, Esc does not
+    /// close it (see `AppView::on_cancel_query`), and its three buttons are
+    /// the three explicit choices the design enumerates. `root` is `None`
+    /// only when the POINTER itself was unparsable (there is no folder to
+    /// name); `error` carries a failed re-pick's message, shown in place.
+    WorkspaceMissing {
+        root: Option<std::path::PathBuf>,
+        reason: String,
+        error: Option<String>,
+    },
 }
 
 /// UX-polish §1.2: what Enter does per open modal — THE policy table as
@@ -1354,7 +1368,11 @@ pub(crate) fn modal_confirm_kind(modal: &ModalState) -> ModalConfirmKind {
         | ModalState::AnalyzeWriteConfirm { .. }
         | ModalState::BackupRestore(_)
         | ModalState::ScriptRun { .. }
-        | ModalState::CsvImport { .. } => ModalConfirmKind::Ignore,
+        | ModalState::CsvImport { .. }
+        // §W4: no Enter shortcut past a wrong-context guard. Each of the
+        // three choices (re-pick / explicit profile / quit) must be a
+        // deliberate click.
+        | ModalState::WorkspaceMissing { .. } => ModalConfirmKind::Ignore,
     }
 }
 
@@ -1589,6 +1607,9 @@ impl AppView {
             ModalState::Settings => self.render_settings_panel(cx),
             ModalState::ChartPicker { source_title, columns, kind, x_col, y_selected, edit_tab, .. } => {
                 render_chart_picker_panel(source_title, columns, kind, x_col, y_selected, edit_tab, cx)
+            }
+            ModalState::WorkspaceMissing { root, reason, error } => {
+                render_workspace_missing_panel(&root, &reason, &error, cx)
             }
         };
         Some(
@@ -3650,6 +3671,88 @@ fn render_analyze_write_confirm_panel(
     panel.into_any_element()
 }
 
+/// Design §W4 deliverable text — quoted verbatim in the spec, so it lives
+/// as a `const` with a byte-pinned test (`workspace_missing_text_tests`)
+/// rather than as a literal buried in a render fn no unit test can reach.
+pub(crate) const WORKSPACE_MISSING_TITLE: &str = "Pracovní prostor nenalezen";
+/// Shown when the POINTER itself could not be read, so there is no folder
+/// path to display.
+pub(crate) const WORKSPACE_MISSING_NO_PATH: &str = "ukazatel na pracovní prostor je nečitelný";
+/// §W4 choice 1 — "the workspace moved", never "make a new one".
+pub(crate) const WORKSPACE_MISSING_FIND: &str = "Najít složku…";
+/// §W4: the honest consequence, printed ABOVE the profile button — the
+/// user must read what „lokální profil" actually means before clicking it.
+pub(crate) const WORKSPACE_MISSING_PROFILE_HINT: &str =
+    "Otevře se lokální profil — jiná připojení a nastavení než v pracovním prostoru.";
+/// §W4 choice 2 — the EXPLICIT action that a silent fallback would have
+/// taken for the user.
+pub(crate) const WORKSPACE_MISSING_PROFILE: &str = "Použít lokální profil";
+/// §W4 choice 3.
+pub(crate) const WORKSPACE_MISSING_QUIT: &str = "Ukončit";
+
+/// Design §W4 — the blocking „Pracovní prostor nenalezen" panel. Three
+/// explicit choices, no implicit ones: Enter is `Ignore`
+/// (`modal_confirm_kind`), Esc is refused (`AppView::on_cancel_query`), and
+/// the overlay `.occlude()`s everything behind it. The app underneath is
+/// deliberately EMPTY (no config, no vault, no view prefs were loaded), so
+/// there is nothing here to fall back to by accident.
+fn render_workspace_missing_panel(
+    root: &Option<std::path::PathBuf>,
+    reason: &str,
+    error: &Option<String>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let path_line = root
+        .as_ref()
+        .map(|r| r.display().to_string())
+        .unwrap_or_else(|| WORKSPACE_MISSING_NO_PATH.to_string());
+    let button = |id: &'static str, label: &'static str, cx: &mut Context<AppView>| {
+        div()
+            .id(id)
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(cx.theme().bg_hover)
+            .cursor_pointer()
+            .child(label)
+    };
+    let mut panel = div()
+        .id("workspace-missing-panel")
+        .w(px(460.))
+        .bg(cx.theme().bg_panel)
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(cx.theme().text_primary)
+        .child(div().text_size(px(16.)).child(WORKSPACE_MISSING_TITLE))
+        .child(div().text_color(cx.theme().text_muted).child(path_line))
+        .child(div().text_color(cx.theme().danger).child(format!("error: {reason}")));
+    if let Some(e) = error {
+        panel = panel.child(div().text_color(cx.theme().danger).child(format!("error: {e}")));
+    }
+    panel
+        .child(
+            button("workspace-missing-find", WORKSPACE_MISSING_FIND, cx)
+                .on_click(cx.listener(|this, _, _, cx| this.pick_workspace_for_recovery(cx))),
+        )
+        .child(
+            div().text_color(cx.theme().text_muted).child(WORKSPACE_MISSING_PROFILE_HINT),
+        )
+        .child(
+            button("workspace-missing-profile", WORKSPACE_MISSING_PROFILE, cx)
+                .on_click(cx.listener(|this, _, _, cx| this.use_local_profile(cx))),
+        )
+        .child(
+            button("workspace-missing-quit", WORKSPACE_MISSING_QUIT, cx)
+                .on_click(cx.listener(|_this, _, _, cx| cx.quit())),
+        )
+        .into_any_element()
+}
+
 /// G7 T6: which column of the `CompareDialog` picker a row click targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompareSide {
@@ -4767,6 +4870,64 @@ mod modal_confirm_kind_tests {
     #[test]
     fn csv_import_is_ignored() {
         assert!(matches!(modal_confirm_kind(&csv_import()), ModalConfirmKind::Ignore));
+    }
+
+    /// Workspace T4 (design §W4): the wrong-context guard. Enter must be a
+    /// HANDLED no-op in every shape of the modal — including the
+    /// unparsable-pointer shape (`root: None`) and the re-pick-failed
+    /// shape (`error: Some`) — because each of its three choices is a
+    /// different, irreversible-feeling decision and none of them may be
+    /// reachable by a stray keystroke.
+    #[test]
+    fn workspace_missing_is_ignored_in_every_shape() {
+        for root in [None, Some(std::path::PathBuf::from("D:\\ws-gone"))] {
+            for error in [None, Some("nelze zapsat ukazatel".to_string())] {
+                let m = ModalState::WorkspaceMissing {
+                    root: root.clone(),
+                    reason: "složka neexistuje".to_string(),
+                    error: error.clone(),
+                };
+                assert!(matches!(modal_confirm_kind(&m), ModalConfirmKind::Ignore));
+            }
+        }
+    }
+}
+
+/// Workspace T4: byte pins for the design §W4 deliverable strings. The
+/// panel itself needs a GPUI `Context` and so has no test harness (same
+/// note as `modal_confirm_kind_tests`); these consts are the part of it
+/// that CAN be pinned, and the honesty of the „lokální profil" hint is the
+/// whole reason §W4 calls that choice explicit rather than a fallback.
+#[cfg(test)]
+mod workspace_missing_text_tests {
+    use super::*;
+
+    #[test]
+    fn the_workspace_missing_texts_are_byte_pinned() {
+        assert_eq!(WORKSPACE_MISSING_TITLE, "Pracovní prostor nenalezen");
+        assert_eq!(WORKSPACE_MISSING_NO_PATH, "ukazatel na pracovní prostor je nečitelný");
+        assert_eq!(WORKSPACE_MISSING_FIND, "Najít složku…");
+        assert_eq!(
+            WORKSPACE_MISSING_PROFILE_HINT,
+            "Otevře se lokální profil — jiná připojení a nastavení než v pracovním prostoru."
+        );
+        assert_eq!(WORKSPACE_MISSING_PROFILE, "Použít lokální profil");
+        assert_eq!(WORKSPACE_MISSING_QUIT, "Ukončit");
+    }
+
+    #[test]
+    fn the_three_choices_are_distinct_and_none_is_a_default() {
+        // §W4: three EXPLICIT buttons. If a future edit collapses two of
+        // them into one label, the user loses the ability to tell "the
+        // workspace moved" apart from "abandon the workspace".
+        let labels =
+            [WORKSPACE_MISSING_FIND, WORKSPACE_MISSING_PROFILE, WORKSPACE_MISSING_QUIT];
+        for (i, a) in labels.iter().enumerate() {
+            assert!(!a.is_empty());
+            for b in labels.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+        }
     }
 }
 

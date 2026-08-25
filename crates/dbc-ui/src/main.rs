@@ -32,7 +32,7 @@ mod theme;
 mod tunnel;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use dbc_buffer::ResultBuffer;
@@ -269,6 +269,63 @@ fn engine_from_url(url: &str) -> dbc_state::Engine {
         dbc_state::Engine::Postgres
     } else {
         dbc_state::Engine::Sqlite
+    }
+}
+
+// ---------------------------------------------------------------------
+// Workspace T4 — startup context resolution (design §W4).
+// ---------------------------------------------------------------------
+
+/// Folder name used for the BLOCKED start's paths when the pointer itself
+/// is unreadable, so there is no target folder to name. Deliberately not a
+/// real directory: nothing creates it, so every store open and every save
+/// against it fails loudly.
+const BLOCKED_WORKSPACE_SENTINEL: &str = "__pracovni-prostor-nenalezen__";
+
+/// Paths for a BLOCKED start (design §W4). They point INTO the unusable
+/// workspace (or, when the pointer is unreadable, into a sentinel folder
+/// that does not exist) — NEVER at the profile's real files. Two reasons,
+/// both binding: (a) never a silent fallback — a bug that dismissed the
+/// blocking modal must find nothing to connect to; (b) never destructive —
+/// an empty default config saved over `%APPDATA%\dbc\config.toml` would
+/// erase connections the user never agreed to lose.
+pub(crate) fn blocked_paths(root: Option<&Path>) -> dbc_state::workspace::Paths {
+    let base = root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dbc_state::workspace::profile_dir().join(BLOCKED_WORKSPACE_SENTINEL));
+    dbc_state::workspace::workspace_paths(&base)
+}
+
+/// What `main()` needs to know before it opens a single store. Pure over
+/// `Resolution` (workspace T2), so the whole never-silent-fallback rule is
+/// testable without a filesystem.
+pub(crate) struct StartupContext {
+    /// Where every store opens from.
+    pub paths: dbc_state::workspace::Paths,
+    /// `Some(root)` = workspace mode. Drives the Settings block (T5) and
+    /// `effective_scripts_root` (T7). A BROKEN workspace is NOT an active
+    /// workspace, so this stays `None` while `blocked` is `Some`.
+    pub workspace_root: Option<PathBuf>,
+    /// `Some((root, reason))` ⇒ open `ModalState::WorkspaceMissing` and load
+    /// NOTHING (design §W4).
+    pub blocked: Option<(Option<PathBuf>, String)>,
+}
+
+/// Turns a [`dbc_state::workspace::Resolution`] into the three things
+/// `main()` acts on. Pure — no I/O, no GPUI.
+pub(crate) fn startup_context(res: dbc_state::workspace::Resolution) -> StartupContext {
+    match res {
+        dbc_state::workspace::Resolution::Profile(paths) => {
+            StartupContext { paths, workspace_root: None, blocked: None }
+        }
+        dbc_state::workspace::Resolution::Workspace { root, paths } => {
+            StartupContext { paths, workspace_root: Some(root), blocked: None }
+        }
+        dbc_state::workspace::Resolution::Broken { root, reason } => StartupContext {
+            paths: blocked_paths(root.as_deref()),
+            workspace_root: None,
+            blocked: Some((root, reason)),
+        },
     }
 }
 
@@ -1096,6 +1153,10 @@ struct AppView {
     /// must-fix #2).
     config_load_error: Option<String>,
     vault_path: PathBuf,
+    /// Design §W2: the ACTIVE workspace root, or `None` in profile mode.
+    /// There is no third state — a broken pointer never reaches here (it
+    /// is blocked at startup, §W4). Written ONLY by `apply_context`.
+    workspace_root: Option<PathBuf>,
     /// Unlocked vault, kept for the session once the user has entered the
     /// master password once (brief: prompt on first use, not at startup).
     vault: Option<Vault>,
@@ -4093,6 +4154,12 @@ impl AppView {
                         && admin_password.read(cx).text().is_empty();
                     pwchange::esc_closable(empty, *running)
                 }
+                // §W4: not Esc-closable, ever. Dismissing it would leave an
+                // app with an empty config and no context — the modal IS
+                // the recovery UI, not an interruption of one. Explicit
+                // (not left to the `_` arm below) because "blocking" is a
+                // load-bearing property of this modal, not a default.
+                connections_ui::ModalState::WorkspaceMissing { .. } => false,
                 _ => false,
             };
             if closable {
@@ -5320,6 +5387,185 @@ impl AppView {
             t.set_admin_entry(admin_entry, cx);
         });
         self.push_active_scope_to_tree(cx);
+    }
+
+    // -----------------------------------------------------------------
+    // Workspace T4 — the §W4 recovery flow + the §W3.4 context swap.
+    // -----------------------------------------------------------------
+
+    /// Design §W4. Opened only from `main()`'s startup wiring — there is no
+    /// other way to reach a broken resolution, and no guard is needed
+    /// (nothing else can be open one frame after the window appears).
+    fn open_workspace_missing_modal(
+        &mut self,
+        root: Option<PathBuf>,
+        reason: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.modal =
+            Some(connections_ui::ModalState::WorkspaceMissing { root, reason, error: None });
+        // UX-polish §1.4: no-input modal, cx-only opener.
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    /// „Najít složku…" — THE WORKSPACE MOVED, not "make a new one": only a
+    /// folder carrying a valid `dbc-workspace.toml` marker is accepted here
+    /// (design §W4). An empty folder is refused with the same honesty as a
+    /// non-workspace one — initialization is a Settings decision with its
+    /// own confirm + security warning (T5), never a recovery side effect.
+    fn pick_workspace_for_recovery(&mut self, cx: &mut Context<Self>) {
+        let dialog = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Otevřít".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = match dialog.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
+                Ok(Ok(_)) => return, // cancelled: the modal stays up
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.set_workspace_missing_error(format!("dialog selhal: {e}"), cx);
+                    });
+                    return;
+                }
+                Err(_canceled) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.set_workspace_missing_error("dialog není dostupný".into(), cx);
+                    });
+                    return;
+                }
+            };
+            // Off the UI thread: classification + the pointer write.
+            let outcome: Result<PathBuf, String> = cx
+                .background_spawn(async move {
+                    match dbc_state::workspace::classify(&picked) {
+                        dbc_state::workspace::Classification::Workspace => {
+                            dbc_state::workspace::write_pointer(
+                                &dbc_state::workspace::pointer_path(),
+                                &picked,
+                            )
+                            .map_err(|e| e.message)?;
+                            Ok(picked)
+                        }
+                        dbc_state::workspace::Classification::FutureFormat(f) => Err(format!(
+                            "pracovní prostor vyžaduje novější verzi aplikace (formát {f})"
+                        )),
+                        dbc_state::workspace::Classification::Unreadable(m) => Err(m),
+                        _ => Err(
+                            "vybraná složka není pracovní prostor dbc — vyberte složku s dbc-workspace.toml"
+                                .to_string(),
+                        ),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| match outcome {
+                Ok(root) => {
+                    view.close_modal(cx);
+                    view.apply_context(Some(root), cx);
+                }
+                Err(e) => view.set_workspace_missing_error(e, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Replaces the `WorkspaceMissing` modal's in-place error line. A no-op
+    /// if the modal is gone (the user quit, or an earlier re-pick already
+    /// succeeded) — never reopens it, never writes over another modal.
+    fn set_workspace_missing_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::WorkspaceMissing { error, .. }) = &mut self.modal {
+            *error = Some(message);
+        }
+        cx.notify();
+    }
+
+    /// „Použít lokální profil" — the EXPLICIT user action design §W4
+    /// contrasts with a silent fallback: it deletes the pointer (so the
+    /// next start is plain profile mode) and swaps the live context. The
+    /// workspace folder itself is not touched in any way.
+    fn use_local_profile(&mut self, cx: &mut Context<Self>) {
+        if let Err(e) = dbc_state::workspace::clear_pointer(&dbc_state::workspace::pointer_path()) {
+            self.set_workspace_missing_error(e.message, cx);
+            return;
+        }
+        self.close_modal(cx);
+        self.apply_context(None, cx);
+    }
+
+    /// Design §W3.4 — the live, in-place context swap. THE single seam:
+    /// „Najít složku…" (§W4), „Použít lokální profil" (§W4), init (§W3.2),
+    /// adopt (§W3.3) and „Přejít na lokální profil" all end here.
+    ///
+    /// PRECONDITIONS the caller owns: the §W3.1 gates have passed (no run
+    /// in flight, no pending apply/discard, no dirty script — T5's
+    /// `context_switch_blocked`) and the pointer file has already been
+    /// written or cleared. This fn performs no I/O beyond loading the NEW
+    /// context's stores, and never deletes, moves, or rewrites anything in
+    /// the OLD one (never-destructive rail).
+    ///
+    /// `AppConfig::load` runs on the UI thread here, exactly as it does in
+    /// `fn main()` — a small TOML read, deliberately synchronous so the
+    /// swap is atomic from the user's point of view (no frame in which the
+    /// paths are new but the connections are still the old ones).
+    pub(crate) fn apply_context(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        let paths = match &root {
+            Some(r) => dbc_state::workspace::workspace_paths(r),
+            None => dbc_state::workspace::profile_paths(),
+        };
+        // §W3.1: the connection list itself is about to change — keeping a
+        // session from the OLD context alive under the NEW config is
+        // exactly the silent context mixing this design bans.
+        self.clear_active_connection(cx);
+        // §W3.4: a workspace vault is a DIFFERENT file; the session unlock
+        // must not carry over. The existing lazy prompt re-fires on the
+        // next secret use, at most once per run.
+        self.vault = None;
+        self.config_path = paths.config.clone();
+        self.vault_path = paths.vault.clone();
+        let (config, config_load_error) = match AppConfig::load(&paths.config) {
+            Ok(c) => (c, None),
+            Err(e) => (AppConfig::default(), Some(e.to_string())),
+        };
+        self.config = config;
+        self.config_load_error = config_load_error;
+        // Existing degrade-to-None postures, unchanged.
+        self.view_prefs = ViewPrefsStore::load(&paths.views).ok();
+        self.param_values = ParamValuesStore::load(&paths.params).ok();
+        // history: NOT touched — machine-local in both modes (§W5).
+        self.workspace_root = root.clone();
+        self.refresh_grouped_cache(cx);
+        self.refresh_tree_context(cx);
+        // T7 adds ONE line here — `self.tree.update(cx, |t, cx|
+        // t.reset_scripts(cx)); self.start_scripts_scan(cx);` — the scripts
+        // root just changed. It cannot land now: the tree's scripts API is
+        // dark until the flip.
+        self.status = match &root {
+            Some(r) => format!("pracovní prostor: {}", r.display()),
+            None => "lokální profil obnoven".to_string(),
+        };
+        if let Some(detail) = self.config_load_error.clone() {
+            self.status =
+                format!("error: config.toml je poškozený – oprav nebo smaž soubor ({detail})");
+        }
+        cx.notify();
+    }
+
+    /// §W3.1's „Aktivní připojení bude odpojeno." made real. The app keeps
+    /// no persistent session (the runner is per-operation — sidebar design
+    /// fact 0.1), so disconnecting IS dropping the active identity and
+    /// bumping `switch_generation` so an in-flight switch's result can
+    /// never land in the NEW context. The CLI-arg root goes too: it belongs
+    /// to the old context and, per the sidebar design, cannot come back.
+    fn clear_active_connection(&mut self, cx: &mut Context<Self>) {
+        self.active_connection_id = None;
+        self.active_database = None;
+        self.conn_url = None;
+        self.switch_generation = self.switch_generation.wrapping_add(1);
+        self.dropdown_open = false;
+        cx.notify();
     }
 
     /// The old trigger_schema_fetch success-arm's M2-guarded admin-schema
@@ -9119,22 +9365,41 @@ fn main() {
     // when present, otherwise the app starts with no active connection and
     // the user picks one from the top-bar switcher (Task 7).
     let conn_url = std::env::args().nth(1);
-    let config_path = dbc_state::default_config_path();
-    let vault_path = dbc_state::default_vault_path();
+    // Design §W0.1: workspace mode is a PATH-RESOLUTION change at exactly
+    // two call sites; this is one of them (`dbc-mcp::parse_args` is the
+    // other — workspace T6). Everything downstream still takes a `&Path`.
+    let startup = startup_context(dbc_state::workspace::resolve());
+    let config_path = startup.paths.config.clone();
+    let vault_path = startup.paths.vault.clone();
+    let workspace_root = startup.workspace_root.clone();
+    let blocked = startup.blocked.clone();
+    // Design §W4: a broken pointer loads NOTHING. Not the workspace's
+    // files (they are unusable — that is what "broken" means), and above
+    // all not the profile's (that would be the silent fallback this design
+    // bans). The modal opened after the window is the only way forward.
+    //
     // A parse error (as opposed to a missing file, which `AppConfig::load`
     // treats as an empty default) means an existing config.toml is
     // corrupt — surfaced in the status bar below rather than silently
     // discarded (final-review must-fix #2). `finish_save` refuses to
     // overwrite the file until it's been moved aside.
-    let (config, config_load_error) = match AppConfig::load(&config_path) {
-        Ok(cfg) => (cfg, None),
-        Err(e) => (AppConfig::default(), Some(e.to_string())),
+    let (config, config_load_error) = if blocked.is_some() {
+        (AppConfig::default(), None)
+    } else {
+        match AppConfig::load(&config_path) {
+            Ok(cfg) => (cfg, None),
+            Err(e) => (AppConfig::default(), Some(e.to_string())),
+        }
     };
     // G3 Task 3: opened once at startup; a failure (e.g. an unwritable
     // config dir) is surfaced in the status bar below but never blocks the
     // rest of the app — `record_history`/the panel's search both treat
     // `history: None` as "no history available" rather than panicking.
-    let (history, history_open_error) = match HistoryDb::open(&dbc_state::default_history_path()) {
+    // §W5: history is machine-local in BOTH modes — `workspace_paths`
+    // already resolves it to the profile path, so this line is mode-blind
+    // (and a blocked start still gets its history, which carries no
+    // context-specific connection state).
+    let (history, history_open_error) = match HistoryDb::open(&startup.paths.history) {
         Ok(h) => (Some(h), None),
         Err(e) => (None, Some(e.to_string())),
     };
@@ -9142,17 +9407,21 @@ fn main() {
     // views.toml) is surfaced in the status bar below but never blocks the
     // rest of the app — the feature is just off (`view_prefs: None`), same
     // "degrade gracefully" precedent `history_open_error` already follows.
-    let (view_prefs, view_prefs_open_error) =
-        match ViewPrefsStore::load(&dbc_state::default_view_prefs_path()) {
+    let (view_prefs, view_prefs_open_error) = if blocked.is_some() {
+        (None, None)
+    } else {
+        match ViewPrefsStore::load(&startup.paths.views) {
             Ok(v) => (Some(v), None),
             Err(e) => (None, Some(e.to_string())),
-        };
+        }
+    };
     // G6 Task 3: same "open at startup, None on failure, degrade
     // gracefully" posture as `view_prefs` — a load failure here only means
     // the values dialog won't prefill/remember values across runs, not
     // that the feature stops working, so (unlike `view_prefs`/`history`)
     // this isn't surfaced as its own startup status notice.
-    let param_values = ParamValuesStore::load(&dbc_state::default_param_values_path()).ok();
+    let param_values =
+        if blocked.is_some() { None } else { ParamValuesStore::load(&startup.paths.params).ok() };
 
     application().run(move |cx: &mut App| {
         cx.bind_keys([
@@ -9237,6 +9506,7 @@ fn main() {
                             config_path,
                             config_load_error,
                             vault_path,
+                            workspace_root,
                             vault: None,
                             active_connection_id: None,
                             active_database: None,
@@ -9285,6 +9555,11 @@ fn main() {
             // startup (history panel defaults to visible) instead of
             // leaving it empty until the first recorded run/search edit.
             view.refresh_history_cache(cx);
+            // Design §W4: the blocking modal goes up LAST, so it occludes a
+            // fully-constructed (and deliberately empty) app.
+            if let Some((root, reason)) = blocked {
+                view.open_workspace_missing_modal(root, reason, cx);
+            }
         });
     });
 }
@@ -10500,5 +10775,80 @@ mod autocomplete_handles_action_tests {
         // silently eating Escape and making the global CancelQuery binding
         // unreachable while the editor had focus.
         assert!(!autocomplete_handles_action(false));
+    }
+}
+
+/// Workspace T4 (design §W4): the never-silent-fallback rail, unit-tested
+/// as pure data. `Resolution` is plain data (dbc-state T2), so the whole
+/// "a configured-but-unusable workspace never yields a profile path"
+/// property is provable without GPUI, a filesystem, or a tempdir.
+#[cfg(test)]
+mod workspace_startup_tests {
+    use super::*;
+    use dbc_state::workspace::{profile_paths, workspace_paths, Resolution};
+
+    #[test]
+    fn no_pointer_starts_in_profile_mode_with_todays_paths() {
+        let ctx = startup_context(Resolution::Profile(profile_paths()));
+        assert_eq!(ctx.paths, profile_paths());
+        assert_eq!(ctx.workspace_root, None);
+        assert!(ctx.blocked.is_none());
+    }
+
+    #[test]
+    fn a_valid_pointer_starts_in_workspace_mode_over_the_folder() {
+        let root = PathBuf::from("D:\\ws");
+        let ctx = startup_context(Resolution::Workspace {
+            root: root.clone(),
+            paths: workspace_paths(&root),
+        });
+        assert_eq!(ctx.paths.config, root.join("config.toml"));
+        assert_eq!(ctx.paths.vault, root.join("vault.bin"));
+        // §W5: history stays machine-local even in workspace mode.
+        assert_eq!(ctx.paths.history, profile_paths().history);
+        assert_eq!(ctx.workspace_root, Some(root));
+        assert!(ctx.blocked.is_none());
+    }
+
+    #[test]
+    fn a_broken_pointer_blocks_and_never_yields_a_single_profile_path() {
+        // THE never-silent-fallback rail (design §W4).
+        let root = PathBuf::from("D:\\ws-gone");
+        let ctx = startup_context(Resolution::Broken {
+            root: Some(root.clone()),
+            reason: "složka neexistuje".to_string(),
+        });
+        assert_eq!(ctx.blocked, Some((Some(root.clone()), "složka neexistuje".to_string())));
+        assert_eq!(ctx.workspace_root, None, "a broken workspace is NOT an active workspace");
+        let p = profile_paths();
+        for got in [&ctx.paths.config, &ctx.paths.vault, &ctx.paths.views, &ctx.paths.params] {
+            assert_ne!(got, &p.config);
+            assert_ne!(got, &p.vault);
+            assert_ne!(got, &p.views);
+            assert_ne!(got, &p.params);
+        }
+        assert!(ctx.paths.config.starts_with(&root), "blocked paths stay inside the broken root");
+    }
+
+    #[test]
+    fn a_broken_pointer_with_no_readable_root_still_never_targets_the_profile() {
+        let ctx = startup_context(Resolution::Broken {
+            root: None,
+            reason: "ukazatel na pracovní prostor je poškozený: expected a table".to_string(),
+        });
+        assert!(ctx.blocked.is_some());
+        let p = profile_paths();
+        assert_ne!(ctx.paths.config, p.config);
+        assert_ne!(ctx.paths.vault, p.vault);
+        // The sentinel folder does not exist and is never created, so any
+        // stray save fails LOUDLY instead of overwriting the profile the
+        // user has not chosen (never-destructive rail).
+        assert!(!ctx.paths.config.exists());
+    }
+
+    #[test]
+    fn blocked_paths_never_collide_with_the_profile_dir_itself() {
+        let p = blocked_paths(None);
+        assert_ne!(p.config.parent(), Some(dbc_state::workspace::profile_dir().as_path()));
     }
 }
