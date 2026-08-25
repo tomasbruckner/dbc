@@ -234,6 +234,39 @@ query first, then pending edits, then a stray dialog, and a test pins that
 order. Task 8, which adds the dirty-script arm, MUST reconcile the two
 deliberately — either this sentence or that ordering has to give.
 
+**AS-BUILT ADDENDUM (workspace T8) — RESOLVED: the pinned ordering wins, and
+the sentence above gives.** As built, `context_switch_refusal(run_in_flight,
+dirty_script, pending_edits, other_modal_open)` reports, in order: the
+running query, the dirty script, the pending edits, the stray dialog. The
+section's „the Part S §5.5 dirty script guard runs first" is hereby
+**amended to „…is part of this gate, ahead of every other unsaved-work
+condition"**. Rationale, recorded so it is not re-litigated:
+
+1. The gate is **all-or-nothing** — every condition blocks the switch
+   equally, and `context_switch_blocked` returns the first non-`None`. The
+   order therefore decides only WHICH single Czech sentence the user reads
+   when several conditions hold at once. „Runs first" was never a safety
+   property of this gate, and reading it as one would have been the actual
+   error.
+2. Under that reading the pre-existing rule is the better one and stands: a
+   running query is the only condition holding a LIVE resource — the very
+   connection this switch is about to disconnect (see the paragraph above)
+   — and the only one that resolves itself if the user simply waits.
+   Sending a user to save a `.sql` buffer while their query is still
+   streaming points them at the less urgent of two problems.
+3. §W3.1's actual intent is honoured in full, and given the strongest
+   reading the live-resource rule leaves: `dirty_script` is checked FIRST
+   among the unsaved-work conditions, ahead of `pending_edits`. Losing a
+   hand-written script is worse than losing staged grid rows, which the
+   sandbox can regenerate.
+
+The refusal text is „skript má neuložené změny — nejprve jej uložte nebo
+zavřete". `AppView::context_switch_blocked` feeds it from
+`script_binding.is_some() && script_dirty_flag` — the per-frame flag, not a
+live `cx` read, because the gate deliberately takes no `cx`; see that
+field's doc comment for why one frame of staleness can only err toward
+refusing.
+
 **AS-BUILT ADDENDUM (workspace T5) — `run_in_flight` is not every DB
 operation.** The gate reads `AppView::cancel`, which `start_lookup`
 deliberately does not set, so an FK-join lookup can be in flight while the

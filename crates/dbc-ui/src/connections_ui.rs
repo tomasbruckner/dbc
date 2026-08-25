@@ -4295,7 +4295,8 @@ pub(crate) fn modal_blocks_context_switch(modal: Option<&ModalState>) -> bool {
 ///
 /// The ORDER is deliberate and pinned: a running query is reported first
 /// because it is the one condition holding a live resource the user can
-/// end immediately; a half-finished edit next; a stray dialog last.
+/// end immediately; the half-finished edits next (the bound script's, then
+/// the grid's/admin's); a stray dialog last.
 ///
 /// SCOPE OF `run_in_flight` (T5 review NIT-8) — `AppView::cancel` is NOT a
 /// complete "any DB work is happening" predicate. `AppView::start_lookup`
@@ -4308,22 +4309,40 @@ pub(crate) fn modal_blocks_context_switch(modal: Option<&ModalState>) -> bool {
 /// params write from the old context can reach the new one. Do not lean on
 /// that without re-checking it.
 ///
-/// EXTENSION POINT: Task 8 adds a `dirty_script` parameter here (Part S
-/// §5.5's guard) once `AppView::script_binding` exists.
+/// RESOLVED IN TASK 8 — the „UNRESOLVED" note this comment used to carry.
+/// Design §W3.1 said „the Part S §5.5 dirty script guard runs FIRST", while
+/// `context_switch_refusal_is_ordered_and_lets_a_quiet_app_through` pinned
+/// `run_in_flight` first. **The pinned ordering wins; the spec sentence was
+/// amended** (§W3.1 now carries the workspace T8 as-built addendum saying
+/// so). Rationale, so nobody re-litigates it silently:
 ///
-/// UNRESOLVED FOR TASK 8, surfaced now rather than as a surprise (T5
-/// review): design §W3.1 says „the Part S §5.5 dirty script guard runs
-/// FIRST", but `context_switch_refusal_is_ordered_and_lets_a_quiet_app_through`
-/// pins `run_in_flight` first. Whoever adds the arm must reconcile the two
-/// DELIBERATELY — either the spec sentence or that test's ordering has to
-/// give, and picking one silently is the failure mode to avoid.
+/// 1. The gate is all-or-nothing — EVERY condition blocks the switch
+///    equally. The order decides only WHICH single sentence the user reads
+///    when several hold at once, so „runs first" was never a safety
+///    property; reading it as one would have been the real mistake.
+/// 2. Under that reading, the existing rule still holds and is the better
+///    one: a running query is the only condition holding a LIVE resource
+///    (a connection this very switch is about to disconnect, §W3.1) and
+///    the only one that resolves itself. Telling a user to save a script
+///    while their query is still streaming would send them at the less
+///    urgent of two problems.
+/// 3. §W3.1's intent — „the dirty guard is part of this gate, not an
+///    afterthought bolted on at the call sites" — is honoured in full, and
+///    given the maximum reading the pinned rule leaves: `dirty_script` is
+///    checked FIRST among the unsaved-work conditions, ahead of
+///    `pending_edits`. Losing a hand-written `.sql` buffer is worse than
+///    losing staged grid rows, which the sandbox can still regenerate.
 pub(crate) fn context_switch_refusal(
     run_in_flight: bool,
+    dirty_script: bool,
     pending_edits: bool,
     other_modal_open: bool,
 ) -> Option<&'static str> {
     if run_in_flight {
         return Some("nejprve dokončete běžící dotaz");
+    }
+    if dirty_script {
+        return Some("skript má neuložené změny — nejprve jej uložte nebo zavřete");
     }
     if pending_edits {
         return Some("nejprve dokončete rozpracované úpravy");
@@ -5995,28 +6014,43 @@ mod workspace_confirm_tests {
     /// §W3.1's gate as a pure truth table. `AppView::context_switch_blocked`
     /// is the ONE gate — it gathers the live state and delegates here, so
     /// the PRECEDENCE (a running query is reported before a stale dialog)
-    /// is pinned without a GPUI window. Task 8 adds the dirty-script arm to
-    /// BOTH halves; it does not write a second gate.
+    /// is pinned without a GPUI window. Workspace T8 added the
+    /// dirty-script arm to BOTH halves; it did not write a second gate.
     #[test]
     fn context_switch_refusal_is_ordered_and_lets_a_quiet_app_through() {
-        assert_eq!(context_switch_refusal(false, false, false), None);
+        assert_eq!(context_switch_refusal(false, false, false, false), None);
         assert_eq!(
-            context_switch_refusal(true, false, false),
+            context_switch_refusal(true, false, false, false),
             Some("nejprve dokončete běžící dotaz")
         );
         assert_eq!(
-            context_switch_refusal(false, true, false),
+            context_switch_refusal(false, true, false, false),
+            Some("skript má neuložené změny — nejprve jej uložte nebo zavřete")
+        );
+        assert_eq!(
+            context_switch_refusal(false, false, true, false),
             Some("nejprve dokončete rozpracované úpravy")
         );
         assert_eq!(
-            context_switch_refusal(false, false, true),
+            context_switch_refusal(false, false, false, true),
             Some("nejprve zavřete otevřený dialog")
         );
         // A running query outranks everything else: it is the condition the
         // user can act on immediately, and the one with a live resource.
+        // Workspace T8's §W3.1 reconciliation (see `context_switch_refusal`'s
+        // own doc comment for the full rationale): the spec's „the dirty
+        // script guard runs first" gave way to this pinned ordering,
+        // because the gate is all-or-nothing and the order only picks WHICH
+        // refusal is shown — but the script DOES outrank the staged rows
+        // and the stray dialog, which is §W3.1's intent as far as the
+        // live-resource rule allows.
         assert_eq!(
-            context_switch_refusal(true, true, true),
+            context_switch_refusal(true, true, true, true),
             Some("nejprve dokončete běžící dotaz")
+        );
+        assert_eq!(
+            context_switch_refusal(false, true, true, true),
+            Some("skript má neuložené změny — nejprve jej uložte nebo zavřete")
         );
     }
 

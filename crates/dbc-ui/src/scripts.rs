@@ -5,16 +5,18 @@
 //! ever executes SQL or touches a database connection.
 //!
 //! Landed dark in scripts T2. Workspace T7 lit the FIRST consumers —
-//! `scan_scripts`/`ScriptEntry`/`ScriptScan` now drive the „Skripty"
-//! sidebar section — so this allow is no longer whole-module cover: it now
-//! covers exactly the 14 items Tasks 8 and 9 consume. Removal owners
-//! (workspace plan `2026-08-25-workspace-folder.md`, which SUPERSEDES the
-//! scripts plan whose T3–T6 numbering this comment used to name):
-//! **Task 8** — `read_script`, `write_script`, `resolve_rel`,
-//! `resolve_entry_rel`, `SCRIPT_OPEN_CAP`; **Task 9** — `create_script`,
-//! `create_folder`, `rename_entry`, `delete_entry`, `validate_script_name`,
-//! `conflicting_name`, `joined_rel`, `RESERVED_NAMES`, `SCRIPT_NAME_CAP`.
-//! Task 9 deletes this attribute outright (admin_sql.rs precedent).
+//! `scan_scripts`/`ScriptEntry`/`ScriptScan` drive the „Skripty" sidebar
+//! section — and workspace T8 lit the editor binding's four:
+//! `resolve_rel`, `read_script`, `write_script` and (transitively, inside
+//! `read_script`) `SCRIPT_OPEN_CAP`. What is still dark is exactly the 10
+//! items **Task 9** owns — the fs mutations and their rails:
+//! `resolve_entry_rel`, `create_script`, `create_folder`, `rename_entry`,
+//! `delete_entry`, `validate_script_name`, `conflicting_name`,
+//! `joined_rel`, `RESERVED_NAMES`, `SCRIPT_NAME_CAP`. (`resolve_entry_rel`
+//! moved from T8's list to T9's deliberately: it is the MUTATION rail, and
+//! T8 only reads and overwrites an already-resolved path.) Removal owner:
+//! the workspace plan `2026-08-25-workspace-folder.md`'s Task 9, which
+//! deletes this attribute outright (admin_sql.rs precedent).
 #![allow(dead_code)]
 
 use std::fs;

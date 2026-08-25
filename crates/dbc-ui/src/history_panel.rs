@@ -252,10 +252,25 @@ impl AppView {
                             .hover(|s| s.bg(cx.theme().bg_hover))
                             // Brief contract #4: click loads the SQL into
                             // the editor and focuses it, but NEVER runs it.
+                            //
+                            // Workspace T8: LEGACY CLOBBER SITE 2 of 2 —
+                            // this used to overwrite the editor with no
+                            // guard at all, destroying a bound script's
+                            // unsaved changes. It now routes through THE
+                            // guard (Part S §5.5); the focus call is
+                            // conditional for the same reason as the
+                            // palette's history arm (see it in main.rs).
                             .on_click(cx.listener(move |view, _, window, cx| {
-                                view.sql.update(cx, |sql, cx| sql.set_text(&sql_for_click, cx));
-                                let editor_focus = view.sql.focus_handle(cx);
-                                window.focus(&editor_focus, cx);
+                                view.editor_load_guarded(
+                                    crate::PendingScriptAction::LoadText {
+                                        sql: sql_for_click.clone(),
+                                    },
+                                    cx,
+                                );
+                                if view.discard_confirm.is_none() {
+                                    let editor_focus = view.sql.focus_handle(cx);
+                                    window.focus(&editor_focus, cx);
+                                }
                                 cx.notify();
                             }))
                             .child(
