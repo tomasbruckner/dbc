@@ -395,8 +395,10 @@ when `script_binding` is dirty, park the action in the existing
 `PendingDiscard::Script(PendingScriptAction)` arm (message branches:
 „Neuložené změny skriptu {name} budou zahozeny."); else perform
 immediately. Actions: `Open { rel }`, `Unbind`, `LoadText { sql }`
-(the history-panel and palette history-click sites route here),
-`DeleteBound { rel }`. The guard NEVER protects unbound ad-hoc text —
+(the history-panel and palette history-click sites route here) —
+deleting a dirty-bound file needs NO action here, §4 resolved it to a
+second line inside the delete confirm. The guard NEVER protects unbound
+ad-hoc text —
 identical exposure to today, zero behavioral regression surface.
 
 ## 6. Running a saved script — G12 reuse, verbatim gates
