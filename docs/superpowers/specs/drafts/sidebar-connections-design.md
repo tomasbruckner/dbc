@@ -653,3 +653,111 @@ databases (§5 row 6); palette items for databases (§5 row 14); MSSQL
 - Honesty check on requirement (b): "ALL databases" is bounded by
   `datallowconn`/ONLINE filters and the 2000-row cap — both are
   disclosed in-UI (§1.4, §6), not silent.
+
+---
+
+## As-built (v0.20.0) — implementation deltas, disclosures, release notes
+
+Shipped 2026-08-25 off `feature/sidebar-connections` (plan:
+`docs/superpowers/plans/2026-08-25-sidebar-connections.md`). This spec
+remains the record; the deltas below are binding corrections/extensions
+discovered during implementation and review.
+
+### (a) Resolved deviations (from the plan header, as implemented)
+
+1. Version: G16 shipped 0.19.0, so this phase ships **0.20.0**.
+2. MSSQL DB-list cap uses `SELECT TOP (2001) …` (T-SQL has no `LIMIT`);
+   pg keeps `LIMIT 2001`. Each cap is baked into its pinned SQL const.
+3. File engines go through the runner uniformly — `fetch_database_list`
+   resolves Sqlite/Duckdb immediately from `cfg.database` without
+   opening a connection; one dispatch path, no vault prompt for them.
+4. `fetch_database_list` takes no `engine` parameter — the engine is
+   read from the spec's own `cfg.engine`.
+5. File-engine `DbNode.name` holds the spec-level string (full path);
+   the file stem is display-only (`display_db_name`). The Database row
+   is kept for file engines (it is the double-click switch target).
+6. DuckDB takes the same single-`DbNode` shape as sqlite; no `ATTACH`.
+7. `spec_for_database` lives in main.rs next to `resolve_active`.
+8. Store-key call sites landed with the identity core (T3) — the
+   legacy-key-for-default rule shipped in the same commit as the
+   identity widening, so no mid-phase orphaning window existed.
+9. `PendingAfterUnlock::{ExpandConnection, SwitchDatabase, LoadDbSchema}`
+   landed with the flip (T5); `LoadDbSchema` closes the
+   vault-locked-between-expand-and-fetch gap (§4.4).
+10. `switch_to_connection` became a delegating wrapper over
+    `switch_to_database(id, None)` inside T5.
+11. Same-connection db switch with dirty staged ADMIN edits prompts a
+    confirm (`PendingDiscard::SwitchDatabase`); dirty sandbox GRID
+    edits get NO prompt — the tab stays, the apply bar dims, switching
+    back re-enables it.
+12. The CLI-arg root has NO Database level — schema rows splice
+    directly under the synthetic root with `db = ""`.
+13. `DbSchemaState::Loading` carries `prev_expanded` so a ⟳ refresh
+    preserves the slot's expansion through `prune_stale_ids`.
+14. `SidebarRow::Pinned(NodeId)` wraps the pinned Správa-serveru /
+    Oblíbené rows so their click semantics stay the pre-rework paths.
+
+### Review-driven deltas (beyond the plan header)
+
+- **U+001F escape (T1 review; corrects §2.3/§7/§10's overbroad claim):**
+  Postgres identifiers may contain any character except NUL, so
+  `connection_scope_key` ESCAPES the database component (backslash
+  doubled first, then U+001F becomes the 6-char literal backslash +
+  "u001F") before joining — store buckets can never alias. The conn
+  IDENTITY stays unescaped (compared atomically, never split for
+  authorization); display splitting scrubs the raw separator in every
+  branch (`conn_name_for_identity_from`).
+- **Active-slot fallback (T5 review MAJOR 1):** a switch to a
+  connection whose database list was never expanded lands its schema
+  fetch in a dedicated key-gated fallback slot (cli_slot precedent)
+  instead of being dropped — autocomplete/fk-joins/editable-detection/
+  palette/admin seed work immediately after every switch; the fallback
+  migrates into the real `DbNode` once the list loads.
+- **Dispatch-owned switch follow-up (T5 review MAJOR 2):** the queued
+  cross-context OpenPreview is a parameter of `switch_to_database`
+  captured per-dispatch (no shared field) — superseded switches retire
+  it via the generation guard; vault/confirm cancels drop it with
+  their pending payload.
+- **Overlay entry guard (T5 review MINOR 3):** `switch_to_database`
+  refuses outright under any open modal/apply-dialog/discard-confirm.
+- **`ActiveConn.identity` retired (T7 audit verdict):** every
+  stamp/guard site evaluates `current_conn_identity()` fresh
+  (capture-then-recheck); a snapshot-coupled identity had no consumer.
+
+### (b) Disclosed limits
+
+- Database listing caps at **2000** rows (+1 sentinel detects "more"),
+  disclosed by an in-UI Notice row; pg lists only
+  `NOT datistemplate AND datallowconn`, MSSQL only ONLINE (`state = 0`,
+  system DBs included — DataGrip precedent).
+- Snapshot cache: at most **8** `(conn, db)` schema slots stay Loaded
+  (LRU; the active slot is never evicted).
+- Speed search filters LOADED content only — typing never fetches.
+
+### (c) Behavioral release notes
+
+- **Safety fix:** a same-connection database switch now invalidates
+  pending Apply/script/CSV/admin writes — the identity every write
+  guard compares is `(connection, database)`, no longer just the
+  connection.
+- Dirty staged ADMIN edits prompt a confirm before a context switch
+  (the confirmed switch closes the admin tab — that IS the discard).
+- Dirty GRID edits are never dropped by a switch — the tab dims and
+  re-enables when you switch back to the same (connection, database).
+- History records „{name}/{db}" for a non-default database; top bar
+  shows „{name} ({engine}) · {db}"; compare sides show „… / {db}".
+- Compare can now diff two databases of the SAME connection (cached
+  lists only — the dialog never fetches).
+
+### (d) Recorded follow-ups (NOT this phase)
+
+- Backup/restore of non-default databases: pg is trivial (swap the
+  spec); MSSQL `RESTORE … MOVE` relocates data/log files and needs its
+  own safety pass before it may target a non-default database (§5
+  row 6).
+- Palette items for databases (rejected this phase — would require
+  eager listing, violating the lazy contract; §5 row 14).
+- MSSQL `USE`-based session switching: permanently rejected (§3.3 —
+  session-level switching desynchronizes identity from wire state).
+- Release-profile `chart_data` test failures (2, pre-existing since
+  G14): known backlog item, untouched by this phase.
