@@ -24,13 +24,13 @@
 // update the tree entity when it resolves" too (see
 // `AppView::trigger_schema_fetch`).
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use dbc_core::{
     synthesize_create_table, ColumnInfo, RoutineInfo, RoutineKind, SchemaSnapshot, SequenceInfo,
     TableInfo, TableKind, TriggerInfo,
 };
-use dbc_state::FavouriteObject;
+use dbc_state::{ConnectionConfig, Engine, FavouriteObject};
 
 use crate::admin_panel::AdminEntry;
 use gpui::{
@@ -436,8 +436,6 @@ pub fn flatten(
     admin: AdminEntry,
 ) -> Vec<FlatNode> {
     let mut out = Vec::new();
-    let filter_lc = filter.to_lowercase();
-    let filter_active = !filter_lc.is_empty();
 
     // G10 T4 (design §2): the pinned "Správa serveru" row, when not
     // Hidden, renders FIRST — above even "Oblíbené" below. Never
@@ -451,6 +449,26 @@ pub fn flatten(
     // G3 Task 4: the "Oblíbené" section always comes first, ahead of any
     // schema/section node below.
     emit_favourites_section(&mut out, favourites, active_connection_id, expanded);
+
+    out.extend(flatten_schema(snapshot, expanded, filter));
+    out
+}
+
+/// Sidebar rework (T4): the schema-only core of `flatten` — the schema-key
+/// collection, the `single_implicit` decision, and the per-schema
+/// `emit_sections` loop, extracted verbatim so `flatten_sidebar` can splice
+/// one database's rows at an arbitrary depth without dragging the pinned
+/// admin/favourites rows along. Takes the RAW filter and lowercases
+/// internally (same convention as `flatten`, which it inherited the body
+/// from). Pure, GPUI-free; never fetches.
+pub fn flatten_schema(
+    snapshot: &SchemaSnapshot,
+    expanded: &HashSet<NodeId>,
+    filter: &str,
+) -> Vec<FlatNode> {
+    let mut out = Vec::new();
+    let filter_lc = filter.to_lowercase();
+    let filter_active = !filter_lc.is_empty();
 
     let mut schema_key_set: BTreeSet<Option<String>> = BTreeSet::new();
     for t in &snapshot.tables {
@@ -573,6 +591,536 @@ fn prune_stale_ids(
     let expanded = expanded.iter().filter(|id| valid.contains(*id)).cloned().collect();
     let selected = selected.clone().filter(|id| valid.contains(id));
     (expanded, selected)
+}
+
+// ---------------------------------------------------------------------
+// Sidebar rework (T4): ADDITIVE multi-root state layer + `flatten_sidebar`.
+//
+// ON-flip discipline (plan T4): NOTHING below is wired into rendering yet —
+// the old single-root `flatten` still drives the UI. T5 (the flip) is the
+// named removal owner of every `#[allow(dead_code)]` in this section: it
+// wires these types/functions into the `SchemaTree` entity, its render and
+// `main.rs`, and deletes the allows.
+// ---------------------------------------------------------------------
+
+/// One row of the multi-root sidebar. `NodeId` itself is UNCHANGED
+/// (path-stable within one database) — the `(conn_id, db)` scope travels
+/// ALONGSIDE it in this wrapper, not inside it (design §1.1).
+#[allow(dead_code)] // removal owner: T5 (the flip) wires this into render.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SidebarRow {
+    Folder { path: Vec<String> },
+    Connection { conn_id: String },
+    Database { conn_id: String, db: String },
+    Inner { conn_id: String, db: String, node: NodeId },
+    /// Pinned active-context rows: AdminRoot, FavouriteSection, Favourite.
+    /// Reuses the existing `NodeId` values so their click/double-click
+    /// semantics stay the pre-rework code paths verbatim (resolved
+    /// deviation 14).
+    Pinned(NodeId),
+    /// "Načítám…"/error/truncation rows. `retry` = a click re-emits the
+    /// Load event (db == None → LoadDatabases, Some → LoadSchema).
+    Notice { conn_id: String, db: Option<String>, text: String, retry: bool },
+}
+
+/// Expand-state key for the OUTER (multi-root) levels — the inner
+/// per-database `expanded: HashSet<NodeId>` lives in each `DbSchemaState`
+/// slot.
+///
+/// POLARITY ASYMMETRY: presence of `Folder(_)` in the set means COLLAPSED
+/// (folders default OPEN — the pre-rework dropdown showed everything;
+/// storing the exception keeps old sessions looking unchanged), while
+/// presence of `Connection(_)`/`Database(..)`/`Favourites` means EXPANDED
+/// (they default CLOSED — lazy).
+#[allow(dead_code)] // removal owner: T5 (the flip) wires this into the entity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum OuterId {
+    Folder(Vec<String>),
+    Connection(String),
+    Database(String, String),
+    Favourites,
+}
+
+/// The active `(connection, database)` context as the sidebar sees it —
+/// handed in by `main.rs` (T5) from `resolve_active`.
+#[allow(dead_code)] // removal owner: T5 (the flip) constructs this from resolve_active.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveScope {
+    pub conn_id: String,
+    /// The EFFECTIVE database (spec-level string).
+    pub db: String,
+    /// The saved config's database — resolves `FavouriteObject::database:
+    /// None` (design §5 row 9).
+    pub default_db: String,
+}
+
+/// Per-connection sidebar state: the lazily fetched database list, each
+/// entry carrying its own lazily fetched schema slot.
+#[allow(dead_code)] // removal owner: T5 (the flip) owns the state map on the entity.
+pub struct ConnNode {
+    pub id: String,
+    pub dbs: DbListState,
+}
+
+/// Lazy-fetch state machine for one connection's database list (design
+/// §1.2): `generation` guards against a stale in-flight result clobbering a
+/// newer dispatch (`apply_db_list_result` drops mismatches).
+#[allow(dead_code)] // removal owner: T5 (the flip).
+pub enum DbListState {
+    NotLoaded,
+    Loading { generation: u64 },
+    Error(String),
+    Loaded { dbs: Vec<DbNode>, truncated: bool },
+}
+
+/// One database under a connection. `name` is the SPEC-LEVEL string (full
+/// file path for file engines — resolved deviation 5; `display_db_name`
+/// renders the stem).
+#[allow(dead_code)] // removal owner: T5 (the flip).
+pub struct DbNode {
+    pub name: String,
+    pub is_default: bool,
+    pub schema: DbSchemaState,
+}
+
+/// Lazy-fetch state machine for one `(conn, db)` schema slot. `Loading`
+/// carries `prev_expanded` (resolved deviation 13): a ⟳ refresh of a Loaded
+/// slot must carry its expand-set forward through the Loading transition
+/// into `prune_stale_ids`, or the same-slot-refresh-preserves-expansion
+/// contract (design §1.2) is silently lost.
+#[allow(dead_code)] // removal owner: T5 (the flip).
+pub enum DbSchemaState {
+    NotLoaded,
+    Loading { generation: u64, prev_expanded: HashSet<NodeId> },
+    Error(String),
+    Loaded { snapshot: SchemaSnapshot, expanded: HashSet<NodeId> },
+}
+
+/// One visible sidebar row: `(row, depth, label, is_expandable)` — the
+/// multi-root analogue of `FlatNode`.
+#[allow(dead_code)] // removal owner: T5 (the flip) renders these rows.
+pub type SidebarFlatRow = (SidebarRow, usize, String, bool);
+
+/// Design §6: bounded snapshot cache — at most this many `(conn, db)`
+/// schema slots stay `Loaded` (LRU, never evicting the active slot). A
+/// `SchemaSnapshot` can be thousands of objects; eight covers real cross-db
+/// work while bounding memory on a hoarder server.
+#[allow(dead_code)] // removal owner: T5 (the flip).
+pub const LOADED_SNAPSHOT_CAP: usize = 8;
+
+/// Display label for a Database row: file engines show the file stem —
+/// the DATA MODEL keeps the full spec-level path (resolved deviation 5:
+/// a name that can't round-trip into `spec_for_database` must not live
+/// in `DbNode.name`).
+#[allow(dead_code)] // removal owner: T5 (the flip).
+pub fn display_db_name(engine: Engine, db: &str) -> String {
+    if crate::connections_ui::engine_is_file_based(engine) {
+        std::path::Path::new(db)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| db.to_string())
+    } else {
+        db.to_string()
+    }
+}
+
+/// Design §5 row 9: a favourite belongs to the active scope when its
+/// connection matches AND its database-or-default equals the scope's db.
+#[allow(dead_code)] // removal owner: T5 (the flip).
+pub fn favourite_in_scope(f: &FavouriteObject, scope: &ActiveScope) -> bool {
+    f.connection_id == scope.conn_id
+        && f.database.as_deref().unwrap_or(&scope.default_db) == scope.db
+}
+
+/// Design §5 row 1: whether a row may carry the ambient action icons
+/// (★/⊞/⇪) and DDL-header enablement — `Inner` rows of the ACTIVE scope
+/// and `Pinned` rows (active-context by definition) only. T5's render is
+/// the sole consumer; pure so the gating is testable without GPUI.
+#[allow(dead_code)] // removal owner: T5 (the flip).
+pub fn row_in_active_scope(row: &SidebarRow, scope: Option<&ActiveScope>) -> bool {
+    match row {
+        SidebarRow::Pinned(_) => scope.is_some(),
+        // CLI rows are the active context whenever no saved connection is
+        // (the CLI root only renders in that state) — they keep the
+        // ⊞/⇪/DDL affordances they had pre-rework; ★ still yields None via
+        // favourite_object_for (no connection id to stamp).
+        SidebarRow::Inner { conn_id, db, .. } => match scope {
+            Some(s) => &s.conn_id == conn_id && &s.db == db,
+            None => conn_id == crate::CLI_CONN_IDENTITY,
+        },
+        SidebarRow::Folder { .. }
+        | SidebarRow::Connection { .. }
+        | SidebarRow::Database { .. }
+        | SidebarRow::Notice { .. } => false,
+    }
+}
+
+/// Transitions a schema slot into `Loading`, carrying the previous
+/// expand-set forward (from `Loaded` OR an in-flight `Loading` — a
+/// superseding dispatch must not lose it either).
+#[allow(dead_code)] // removal owner: T5 (the flip).
+pub fn begin_schema_load(slot: &mut DbSchemaState, generation: u64) {
+    let prev_expanded = match std::mem::replace(slot, DbSchemaState::NotLoaded) {
+        DbSchemaState::Loaded { expanded, .. } => expanded,
+        DbSchemaState::Loading { prev_expanded, .. } => prev_expanded,
+        DbSchemaState::NotLoaded | DbSchemaState::Error(_) => HashSet::new(),
+    };
+    *slot = DbSchemaState::Loading { generation, prev_expanded };
+}
+
+/// Last-dispatched-wins: applies only while the slot is still Loading with
+/// the SAME generation; anything else means a newer dispatch superseded
+/// this result — drop it (design §1.2).
+#[allow(dead_code)] // removal owner: T5 (the flip).
+pub fn apply_schema_result(
+    slot: &mut DbSchemaState,
+    my_gen: u64,
+    result: Result<SchemaSnapshot, String>,
+) {
+    let DbSchemaState::Loading { generation, prev_expanded } = slot else { return };
+    if *generation != my_gen {
+        return;
+    }
+    // Take ownership BEFORE reassigning *slot — building the new value
+    // while still borrowing through `slot` would be an overlapping-borrow
+    // compile error.
+    let prev = std::mem::take(prev_expanded);
+    *slot = match result {
+        Err(e) => DbSchemaState::Error(e),
+        Ok(snapshot) => {
+            let (expanded, _sel) = prune_stale_ids(&prev, &None, &snapshot);
+            DbSchemaState::Loaded { snapshot, expanded }
+        }
+    };
+}
+
+/// Transitions a connection's database list into `Loading`.
+#[allow(dead_code)] // removal owner: T5 (the flip).
+pub fn begin_db_list_load(node: &mut ConnNode, generation: u64) {
+    // INVARIANT: only NotLoaded/Error re-dispatch (a Loaded list is cached;
+    // re-expand is instant and the ⟳ refresh targets the active SCHEMA
+    // slot, not the list). A begin over Loaded would drop every child
+    // schema slot — refuse it here rather than trusting every caller.
+    if matches!(node.dbs, DbListState::Loaded { .. }) {
+        return;
+    }
+    node.dbs = DbListState::Loading { generation };
+}
+
+/// Last-dispatched-wins counterpart of `apply_schema_result` for the
+/// database list; marks `is_default` against the saved config's database
+/// and starts every schema slot at `NotLoaded` (lazy).
+#[allow(dead_code)] // removal owner: T5 (the flip).
+pub fn apply_db_list_result(
+    node: &mut ConnNode,
+    my_gen: u64,
+    result: Result<(Vec<String>, bool), String>,
+    default_db: &str,
+) {
+    let DbListState::Loading { generation } = &node.dbs else { return };
+    if *generation != my_gen {
+        return;
+    }
+    node.dbs = match result {
+        Err(e) => DbListState::Error(e),
+        Ok((names, truncated)) => DbListState::Loaded {
+            dbs: names
+                .into_iter()
+                .map(|name| DbNode {
+                    is_default: name == default_db,
+                    schema: DbSchemaState::NotLoaded,
+                    name,
+                })
+                .collect(),
+            truncated,
+        },
+    };
+}
+
+/// Design §6: bounded snapshot cache. Push `touched` to the back of `lru`
+/// (dedup), then evict `Loaded` slots beyond `LOADED_SNAPSHOT_CAP` back to
+/// `NotLoaded`, oldest first, NEVER the active slot.
+#[allow(dead_code)] // removal owner: T5 (the flip).
+pub fn touch_and_evict(
+    states: &mut HashMap<String, ConnNode>,
+    lru: &mut Vec<(String, String)>,
+    touched: (String, String),
+    active: Option<&(String, String)>,
+) {
+    lru.retain(|k| k != &touched);
+    lru.push(touched);
+    let loaded: Vec<(String, String)> = lru
+        .iter()
+        .filter(|(c, d)| {
+            states.get(c.as_str()).is_some_and(|n| match &n.dbs {
+                DbListState::Loaded { dbs, .. } => dbs
+                    .iter()
+                    .any(|x| &x.name == d && matches!(x.schema, DbSchemaState::Loaded { .. })),
+                _ => false,
+            })
+        })
+        .cloned()
+        .collect();
+    if loaded.len() <= LOADED_SNAPSHOT_CAP {
+        return;
+    }
+    let mut to_evict = loaded.len() - LOADED_SNAPSHOT_CAP;
+    for key in loaded {
+        if to_evict == 0 {
+            break;
+        }
+        if Some(&key) == active {
+            continue;
+        }
+        if let Some(node) = states.get_mut(&key.0) {
+            if let DbListState::Loaded { dbs, .. } = &mut node.dbs {
+                if let Some(d) = dbs.iter_mut().find(|d| d.name == key.1) {
+                    d.schema = DbSchemaState::NotLoaded;
+                    to_evict -= 1;
+                }
+            }
+        }
+        lru.retain(|k| k != &key || Some(k) == active);
+    }
+}
+
+/// The multi-root analogue of `flatten` (design §1.1/§6): pure, GPUI-free,
+/// called fresh every render by T5. A plain outer loop — NO recursion
+/// anywhere (folder-path length is only an indent multiplier, never a
+/// recursion depth); the inner tree reuses the existing iterative
+/// `flatten_schema`.
+///
+/// Speed search filters LOADED content only (binding, design §6): this
+/// function is pure over its inputs — typing can never trigger a fetch,
+/// which holds by construction.
+#[allow(dead_code)] // removal owner: T5 (the flip) calls this from render.
+pub fn flatten_sidebar(
+    grouped: &crate::connections_ui::GroupedConnections,
+    states: &HashMap<String, ConnNode>,
+    cli: Option<(&str, &DbSchemaState)>,
+    outer_expanded: &HashSet<OuterId>,
+    filter: &str,
+    active: Option<&ActiveScope>,
+    favourites: &[FavouriteObject],
+    admin: AdminEntry,
+) -> Vec<SidebarFlatRow> {
+    let mut out: Vec<SidebarFlatRow> = Vec::new();
+    let filter_lc = filter.to_lowercase();
+    let filter_active = !filter_lc.is_empty();
+
+    // Pinned rows — active context only, ONCE, above everything (design §1.1).
+    if admin != AdminEntry::Hidden {
+        out.push((SidebarRow::Pinned(NodeId::AdminRoot), 0, "Správa serveru".to_string(), false));
+    }
+    if let Some(scope) = active {
+        let items: Vec<&FavouriteObject> =
+            favourites.iter().filter(|f| favourite_in_scope(f, scope)).collect();
+        if !items.is_empty() {
+            out.push((
+                SidebarRow::Pinned(NodeId::FavouriteSection),
+                0,
+                format!("Oblíbené ({})", items.len()),
+                true,
+            ));
+            if outer_expanded.contains(&OuterId::Favourites) {
+                for f in items {
+                    let schema_key = f.schema.clone().unwrap_or_default();
+                    let label = if schema_key.is_empty() {
+                        f.name.clone()
+                    } else {
+                        format!("{}.{}", schema_key, f.name)
+                    };
+                    out.push((
+                        SidebarRow::Pinned(NodeId::Favourite(f.kind.clone(), schema_key, f.name.clone())),
+                        1,
+                        label,
+                        false,
+                    ));
+                }
+            }
+        }
+    }
+
+    // CLI synthetic root (design §3.4 / resolved deviation 12): schema rows
+    // splice directly under it with `db = ""` — no Database level, the CLI
+    // session cannot switch databases.
+    if let Some((label, slot)) = cli {
+        let row = SidebarRow::Connection { conn_id: crate::CLI_CONN_IDENTITY.to_string() };
+        out.push((row, 0, label.to_string(), true));
+        if outer_expanded.contains(&OuterId::Connection(crate::CLI_CONN_IDENTITY.to_string())) {
+            emit_schema_slot(&mut out, crate::CLI_CONN_IDENTITY, "", slot, 1, filter);
+        }
+    }
+
+    // Saved connections: group_connections order verbatim (design §8) —
+    // favourites first, then the BTreeMap-of-paths (loose before named
+    // folders, parents before children, alphabetical within siblings).
+    let emit_conn = |out: &mut Vec<SidebarFlatRow>, c: &ConnectionConfig, depth: usize| {
+        let mut label = format!("{} ({})", c.name, crate::connections_ui::engine_label(c.engine));
+        if c.read_only {
+            label.push_str(" (pouze pro čtení)");
+        }
+        let conn_expanded = outer_expanded.contains(&OuterId::Connection(c.id.clone()));
+        let start = out.len();
+        out.push((SidebarRow::Connection { conn_id: c.id.clone() }, depth, label.clone(), true));
+        if conn_expanded {
+            match states.get(&c.id).map(|n| &n.dbs).unwrap_or(&DbListState::NotLoaded) {
+                DbListState::NotLoaded => {} // expand handler is dispatching; nothing yet
+                DbListState::Loading { .. } => out.push((
+                    SidebarRow::Notice {
+                        conn_id: c.id.clone(),
+                        db: None,
+                        text: "Načítám databáze…".into(),
+                        retry: false,
+                    },
+                    depth + 1,
+                    "Načítám databáze…".into(),
+                    false,
+                )),
+                DbListState::Error(e) => out.push((
+                    SidebarRow::Notice {
+                        conn_id: c.id.clone(),
+                        db: None,
+                        text: format!("error: {e}"),
+                        retry: true,
+                    },
+                    depth + 1,
+                    format!("error: {e}"),
+                    false,
+                )),
+                DbListState::Loaded { dbs, truncated } => {
+                    for d in dbs {
+                        let mut db_label = display_db_name(c.engine, &d.name);
+                        if d.is_default {
+                            db_label.push_str(" (výchozí)");
+                        }
+                        let db_start = out.len();
+                        out.push((
+                            SidebarRow::Database { conn_id: c.id.clone(), db: d.name.clone() },
+                            depth + 1,
+                            db_label.clone(),
+                            true,
+                        ));
+                        if outer_expanded.contains(&OuterId::Database(c.id.clone(), d.name.clone())) {
+                            emit_schema_slot(out, &c.id, &d.name, &d.schema, depth + 2, filter);
+                        }
+                        // Filter: drop a childless db row whose own label misses.
+                        if filter_active
+                            && out.len() == db_start + 1
+                            && !name_matches(&db_label, &filter_lc)
+                        {
+                            out.truncate(db_start);
+                        }
+                    }
+                    if *truncated {
+                        let text =
+                            "… zobrazeno prvních 2000 databází — použijte výchozí databázi nebo filtr"
+                                .to_string();
+                        out.push((
+                            SidebarRow::Notice {
+                                conn_id: c.id.clone(),
+                                db: None,
+                                text: text.clone(),
+                                retry: false,
+                            },
+                            depth + 1,
+                            text,
+                            false,
+                        ));
+                    }
+                }
+            }
+        }
+        // Filter: drop a childless connection row whose own label misses.
+        if filter_active && out.len() == start + 1 && !name_matches(&label, &filter_lc) {
+            out.truncate(start);
+        }
+    };
+
+    for c in &grouped.favourites {
+        emit_conn(&mut out, c, 0);
+    }
+    for group in &grouped.folders {
+        if group.path.is_empty() {
+            for c in &group.connections {
+                emit_conn(&mut out, c, 0);
+            }
+            continue;
+        }
+        let depth = group.path.len() - 1;
+        let folder_start = out.len();
+        out.push((
+            SidebarRow::Folder { path: group.path.clone() },
+            depth,
+            group.path.last().cloned().unwrap_or_default(),
+            true,
+        ));
+        // A folder is "collapsed" when its OuterId is IN the set — see the
+        // polarity note on `OuterId` (folders default to expanded).
+        let collapsed = outer_expanded.contains(&OuterId::Folder(group.path.clone()));
+        if !collapsed {
+            for c in &group.connections {
+                emit_conn(&mut out, c, group.path.len());
+            }
+        }
+        if filter_active && out.len() == folder_start + 1 {
+            out.truncate(folder_start); // childless folder under a filter
+        }
+    }
+    out
+}
+
+/// Splices one `(conn, db)` slot's rows: Notice for Loading/Error, the
+/// EXISTING `flatten_schema` output (depth-shifted, wrapped in
+/// `SidebarRow::Inner`) for Loaded. Pure; never fetches. Takes the RAW
+/// filter — `flatten_schema` lowercases internally (it inherited the old
+/// `flatten` body verbatim, which did); `flatten_sidebar`'s own label
+/// matching uses its locally-lowercased copy. ONE convention per layer,
+/// pinned by `filter_narrows_loaded_content_and_matches_row_labels`.
+#[allow(dead_code)] // removal owner: T5 (the flip), together with flatten_sidebar.
+fn emit_schema_slot(
+    out: &mut Vec<SidebarFlatRow>,
+    conn_id: &str,
+    db: &str,
+    slot: &DbSchemaState,
+    base_depth: usize,
+    filter: &str,
+) {
+    match slot {
+        DbSchemaState::NotLoaded => {}
+        DbSchemaState::Loading { .. } => out.push((
+            SidebarRow::Notice {
+                conn_id: conn_id.to_string(),
+                db: Some(db.to_string()),
+                text: "Načítám schéma…".into(),
+                retry: false,
+            },
+            base_depth,
+            "Načítám schéma…".into(),
+            false,
+        )),
+        DbSchemaState::Error(e) => out.push((
+            SidebarRow::Notice {
+                conn_id: conn_id.to_string(),
+                db: Some(db.to_string()),
+                text: format!("error: {e}"),
+                retry: true,
+            },
+            base_depth,
+            format!("error: {e}"),
+            false,
+        )),
+        DbSchemaState::Loaded { snapshot, expanded } => {
+            for (node, depth, label, expandable) in flatten_schema(snapshot, expanded, filter) {
+                out.push((
+                    SidebarRow::Inner { conn_id: conn_id.to_string(), db: db.to_string(), node },
+                    base_depth + depth,
+                    label,
+                    expandable,
+                ));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1648,5 +2196,338 @@ mod flatten_tests {
         assert!(matches!(out.first(), Some((NodeId::AdminRoot, ..))));
         let out = flatten(&snapshot, &expanded, "", &[], None, AdminEntry::Hidden);
         assert!(out.iter().all(|(id, ..)| *id != NodeId::AdminRoot));
+    }
+}
+
+#[cfg(test)]
+mod sidebar_tests {
+    use super::*;
+    use dbc_state::ConnectionConfig;
+    use dbc_state::Engine;
+    use std::collections::HashMap;
+
+    fn conn_cfg(id: &str, name: &str, folder: &[&str], engine: Engine, db: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            id: id.into(), name: name.into(),
+            folder: folder.iter().map(|s| s.to_string()).collect(),
+            engine, host: "h".into(), port: None, database: db.into(),
+            user: "u".into(), read_only: false, timeout_secs: None,
+            auto_limit: None, ssh: None, favourite: false, mssql: None,
+        }
+    }
+
+    fn grouped(conns: &[ConnectionConfig]) -> crate::connections_ui::GroupedConnections {
+        crate::connections_ui::group_connections(conns)
+    }
+
+    /// A tiny one-schema/one-table snapshot, same shape flatten_tests uses.
+    fn snap() -> SchemaSnapshot {
+        SchemaSnapshot {
+            tables: vec![TableInfo {
+                schema: Some("public".into()), name: "orders".into(),
+                kind: TableKind::Table,
+                columns: vec![ColumnInfo {
+                    name: "id".into(), data_type: "integer".into(),
+                    nullable: false, is_pk: true, fk: None, default: None,
+                }],
+                indexes: vec![], constraints: vec![], ddl: None,
+            }],
+            routines: vec![], triggers: vec![], sequences: vec![],
+        }
+    }
+
+    fn loaded_states(conn_id: &str, db: &str) -> HashMap<String, ConnNode> {
+        let mut m = HashMap::new();
+        m.insert(conn_id.to_string(), ConnNode {
+            id: conn_id.to_string(),
+            dbs: DbListState::Loaded {
+                dbs: vec![DbNode {
+                    name: db.to_string(), is_default: true,
+                    schema: DbSchemaState::Loaded { snapshot: snap(), expanded: HashSet::new() },
+                }],
+                truncated: false,
+            },
+        });
+        m
+    }
+
+    #[test]
+    fn folder_connection_database_depths_compose() {
+        let conns = vec![conn_cfg("c1", "prod-pg", &["work"], Engine::Postgres, "sales")];
+        let mut outer = HashSet::new();
+        // Folders default OPEN (OuterId::Folder in the set means COLLAPSED
+        // — see the polarity note on `OuterId`), so "work" is NOT inserted.
+        outer.insert(OuterId::Connection("c1".into()));
+        outer.insert(OuterId::Database("c1".into(), "sales".into()));
+        let rows = flatten_sidebar(&grouped(&conns), &loaded_states("c1", "sales"), None,
+            &outer, "", None, &[], AdminEntry::Hidden);
+        // folder(0) -> connection(1) -> database(2) -> spliced schema rows (3+)
+        assert!(matches!(&rows[0], (SidebarRow::Folder { path }, 0, _, true) if path == &vec!["work".to_string()]));
+        assert!(matches!(&rows[1], (SidebarRow::Connection { conn_id }, 1, _, true) if conn_id == "c1"));
+        assert!(matches!(&rows[2], (SidebarRow::Database { conn_id, db }, 2, label, true)
+            if conn_id == "c1" && db == "sales" && label.contains("(výchozí)")));
+        assert!(matches!(&rows[3], (SidebarRow::Inner { conn_id, db, node: NodeId::Schema(_) }, 3, _, _)
+            if conn_id == "c1" && db == "sales"));
+    }
+
+    /// Pins the polarity asymmetry doc'd on `OuterId`: presence of
+    /// `OuterId::Folder` in the set means COLLAPSED (folders default open;
+    /// connections/databases default closed — presence means expanded).
+    #[test]
+    fn folder_in_outer_set_is_collapsed() {
+        let conns = vec![conn_cfg("c1", "prod-pg", &["work"], Engine::Postgres, "sales")];
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Folder(vec!["work".into()]));
+        outer.insert(OuterId::Connection("c1".into()));
+        let rows = flatten_sidebar(&grouped(&conns), &loaded_states("c1", "sales"), None,
+            &outer, "", None, &[], AdminEntry::Hidden);
+        assert_eq!(rows.len(), 1, "collapsed folder shows only its own row");
+        assert!(matches!(&rows[0], (SidebarRow::Folder { .. }, 0, _, true)));
+    }
+
+    #[test]
+    fn loose_connections_sit_at_depth_zero() {
+        let conns = vec![conn_cfg("c1", "loose", &[], Engine::Postgres, "db")];
+        let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+            &HashSet::new(), "", None, &[], AdminEntry::Hidden);
+        assert!(matches!(&rows[0], (SidebarRow::Connection { .. }, 0, _, true)));
+    }
+
+    #[test]
+    fn collapsed_connection_hides_children_but_keeps_cache() {
+        let conns = vec![conn_cfg("c1", "prod", &[], Engine::Postgres, "sales")];
+        let states = loaded_states("c1", "sales");
+        // NOT in outer_expanded -> only the connection row renders; the
+        // Loaded cache is untouched (re-expand is instant by construction).
+        let rows = flatten_sidebar(&grouped(&conns), &states, None,
+            &HashSet::new(), "", None, &[], AdminEntry::Hidden);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn lazy_states_render_their_notice_rows() {
+        let conns = vec![conn_cfg("c1", "prod", &[], Engine::Postgres, "sales")];
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Connection("c1".into()));
+        for (state, expect_text, expect_retry) in [
+            (DbListState::Loading { generation: 1 }, "Načítám databáze…", false),
+            (DbListState::Error("kaput".into()), "error: kaput", true),
+        ] {
+            let mut states = HashMap::new();
+            states.insert("c1".into(), ConnNode { id: "c1".into(), dbs: state });
+            let rows = flatten_sidebar(&grouped(&conns), &states, None,
+                &outer, "", None, &[], AdminEntry::Hidden);
+            assert!(matches!(&rows[1], (SidebarRow::Notice { conn_id, db: None, text, retry }, 1, _, false)
+                if conn_id == "c1" && text == expect_text && *retry == expect_retry),
+                "state expecting {expect_text}: got {:?}", rows.get(1));
+        }
+    }
+
+    #[test]
+    fn truncation_notice_renders_after_the_db_rows() {
+        let conns = vec![conn_cfg("c1", "prod", &[], Engine::Postgres, "sales")];
+        let mut states = loaded_states("c1", "sales");
+        if let DbListState::Loaded { truncated, .. } = &mut states.get_mut("c1").unwrap().dbs {
+            *truncated = true;
+        }
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Connection("c1".into()));
+        let rows = flatten_sidebar(&grouped(&conns), &states, None,
+            &outer, "", None, &[], AdminEntry::Hidden);
+        let last = rows.last().unwrap();
+        assert!(matches!(&last.0, SidebarRow::Notice { retry: false, text, .. }
+            if text == "… zobrazeno prvních 2000 databází — použijte výchozí databázi nebo filtr"));
+    }
+
+    #[test]
+    fn file_engine_db_row_keeps_spec_path_but_displays_stem() {
+        // Resolved deviation 5: the row's identity is the SPEC string; the
+        // label is the stem. One uniform hierarchy — the Database row stays
+        // (it is the double-click switch target).
+        assert_eq!(display_db_name(Engine::Duckdb, r"D:\data\analytics.duckdb"), "analytics");
+        assert_eq!(display_db_name(Engine::Sqlite, r"D:\x\app.db"), "app");
+        assert_eq!(display_db_name(Engine::Postgres, "sales"), "sales");
+        let conns = vec![conn_cfg("c1", "duck", &[], Engine::Duckdb, r"D:\data\analytics.duckdb")];
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Connection("c1".into()));
+        let rows = flatten_sidebar(&grouped(&conns), &loaded_states("c1", r"D:\data\analytics.duckdb"),
+            None, &outer, "", None, &[], AdminEntry::Hidden);
+        assert!(matches!(&rows[1], (SidebarRow::Database { db, .. }, 1, label, true)
+            if db == r"D:\data\analytics.duckdb" && label.starts_with("analytics")));
+    }
+
+    #[test]
+    fn cli_root_splices_schema_directly_without_a_database_level() {
+        // Resolved deviation 12: no db switching on the CLI path => no dead
+        // switch-target row.
+        let slot = DbSchemaState::Loaded { snapshot: snap(), expanded: HashSet::new() };
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Connection(crate::CLI_CONN_IDENTITY.to_string()));
+        let rows = flatten_sidebar(&grouped(&[]), &HashMap::new(),
+            Some(("postgres://localhost/x", &slot)), &outer, "", None, &[], AdminEntry::Hidden);
+        assert!(matches!(&rows[0], (SidebarRow::Connection { conn_id }, 0, label, true)
+            if conn_id == crate::CLI_CONN_IDENTITY && label == "postgres://localhost/x"));
+        assert!(matches!(&rows[1], (SidebarRow::Inner { db, .. }, 1, _, _) if db.is_empty()));
+    }
+
+    #[test]
+    fn pinned_admin_and_favourites_render_once_scoped_to_active_context() {
+        let conns = vec![conn_cfg("c1", "prod", &[], Engine::Postgres, "sales")];
+        let favs = vec![
+            FavouriteObject { connection_id: "c1".into(), schema: Some("public".into()),
+                name: "orders".into(), kind: "table".into(), database: None },
+            FavouriteObject { connection_id: "c1".into(), schema: Some("public".into()),
+                name: "other".into(), kind: "table".into(), database: Some("inventory".into()) },
+        ];
+        let scope = ActiveScope { conn_id: "c1".into(), db: "sales".into(), default_db: "sales".into() };
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Favourites);
+        let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+            &outer, "", Some(&scope), &favs, AdminEntry::Enabled);
+        assert!(matches!(&rows[0], (SidebarRow::Pinned(NodeId::AdminRoot), 0, _, false)));
+        // Only the default-db favourite is in scope (database: None == default):
+        assert!(matches!(&rows[1], (SidebarRow::Pinned(NodeId::FavouriteSection), 0, label, true)
+            if label == "Oblíbené (1)"));
+        assert!(matches!(&rows[2], (SidebarRow::Pinned(NodeId::Favourite(..)), 1, label, false)
+            if label == "public.orders"));
+    }
+
+    /// Design §5 row 1's REQUIRED "active-scope gating of icon
+    /// affordances" test — the pure predicate T5's render uses to decide
+    /// whether a row gets the star/ER/import icons and DDL-header
+    /// enablement. Cross-context ambient actions must simply not exist.
+    #[test]
+    fn icon_affordances_gate_on_active_scope() {
+        let scope = ActiveScope { conn_id: "c1".into(), db: "sales".into(), default_db: "sales".into() };
+        let node = NodeId::Table("public".into(), "orders".into());
+        let in_scope = SidebarRow::Inner { conn_id: "c1".into(), db: "sales".into(), node: node.clone() };
+        let other_db = SidebarRow::Inner { conn_id: "c1".into(), db: "inventory".into(), node: node.clone() };
+        let other_conn = SidebarRow::Inner { conn_id: "c2".into(), db: "sales".into(), node };
+        assert!(row_in_active_scope(&in_scope, Some(&scope)));
+        assert!(!row_in_active_scope(&other_db, Some(&scope)));
+        assert!(!row_in_active_scope(&other_conn, Some(&scope)));
+        assert!(!row_in_active_scope(&in_scope, None));
+        // CLI rows stay active-context when no saved connection is:
+        let cli_row = SidebarRow::Inner {
+            conn_id: crate::CLI_CONN_IDENTITY.into(), db: String::new(),
+            node: NodeId::Table("".into(), "t".into()),
+        };
+        assert!(row_in_active_scope(&cli_row, None));
+        assert!(!row_in_active_scope(&cli_row, Some(&scope)));
+        // Pinned rows are active-context by definition:
+        assert!(row_in_active_scope(&SidebarRow::Pinned(NodeId::AdminRoot), Some(&scope)));
+        // Structural rows never carry ambient icons:
+        assert!(!row_in_active_scope(&SidebarRow::Connection { conn_id: "c1".into() }, Some(&scope)));
+    }
+
+    #[test]
+    fn favourite_in_scope_resolves_none_as_default_db() {
+        let scope = ActiveScope { conn_id: "c1".into(), db: "inventory".into(), default_db: "sales".into() };
+        let f = |database: Option<&str>| FavouriteObject {
+            connection_id: "c1".into(), schema: None, name: "t".into(),
+            kind: "table".into(), database: database.map(String::from),
+        };
+        assert!(!favourite_in_scope(&f(None), &scope));            // default (= sales) != inventory
+        assert!(favourite_in_scope(&f(Some("inventory")), &scope));
+        let default_scope = ActiveScope { conn_id: "c1".into(), db: "sales".into(), default_db: "sales".into() };
+        assert!(favourite_in_scope(&f(None), &default_scope));
+    }
+
+    #[test]
+    fn filter_narrows_loaded_content_and_matches_row_labels() {
+        let conns = vec![
+            conn_cfg("c1", "prod-pg", &[], Engine::Postgres, "sales"),
+            conn_cfg("c2", "staging", &[], Engine::Postgres, "sales"),
+        ];
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Connection("c1".into()));
+        outer.insert(OuterId::Database("c1".into(), "sales".into()));
+        // "orders" matches only inside c1's loaded snapshot: c1's chain
+        // stays visible (ancestors auto-show), c2's row (label-only miss,
+        // nothing loaded) is hidden. Filtering NEVER fetches — pure fn,
+        // holds by construction.
+        let rows = flatten_sidebar(&grouped(&conns), &loaded_states("c1", "sales"), None,
+            &outer, "orders", None, &[], AdminEntry::Hidden);
+        assert!(rows.iter().any(|r| matches!(&r.0, SidebarRow::Connection { conn_id } if conn_id == "c1")));
+        assert!(!rows.iter().any(|r| matches!(&r.0, SidebarRow::Connection { conn_id } if conn_id == "c2")));
+        assert!(rows.iter().any(|r| matches!(&r.0, SidebarRow::Inner { node: NodeId::Table(_, t), .. } if t == "orders")));
+        // A filter matching a connection's own NAME keeps its row visible:
+        let rows = flatten_sidebar(&grouped(&conns), &loaded_states("c1", "sales"), None,
+            &outer, "staging", None, &[], AdminEntry::Hidden);
+        assert!(rows.iter().any(|r| matches!(&r.0, SidebarRow::Connection { conn_id } if conn_id == "c2")));
+    }
+
+    // ---------- state-machine transitions ----------
+
+    #[test]
+    fn schema_load_carries_expansion_through_refresh_and_prunes_stale() {
+        let mut expanded = HashSet::new();
+        expanded.insert(NodeId::Schema("public".into()));
+        expanded.insert(NodeId::Table("public".into(), "vanished".into()));
+        let mut slot = DbSchemaState::Loaded { snapshot: snap(), expanded };
+        begin_schema_load(&mut slot, 7);
+        assert!(matches!(&slot, DbSchemaState::Loading { generation: 7, prev_expanded } if prev_expanded.len() == 2));
+        apply_schema_result(&mut slot, 7, Ok(snap()));
+        let DbSchemaState::Loaded { expanded, .. } = &slot else { panic!("Loaded expected") };
+        assert!(expanded.contains(&NodeId::Schema("public".into())));
+        assert!(!expanded.contains(&NodeId::Table("public".into(), "vanished".into())),
+            "stale ids must be pruned (design §1.2 carry-forward)");
+    }
+
+    #[test]
+    fn stale_generation_results_are_dropped() {
+        let mut slot = DbSchemaState::NotLoaded;
+        begin_schema_load(&mut slot, 1);
+        begin_schema_load(&mut slot, 2); // superseding dispatch
+        apply_schema_result(&mut slot, 1, Ok(snap()));
+        assert!(matches!(&slot, DbSchemaState::Loading { generation: 2, .. }),
+            "gen-1 result must not clobber the gen-2 in-flight state");
+        apply_schema_result(&mut slot, 2, Err("boom".into()));
+        assert!(matches!(&slot, DbSchemaState::Error(e) if e == "boom"));
+    }
+
+    #[test]
+    fn db_list_result_marks_default_and_truncation() {
+        let mut node = ConnNode { id: "c1".into(), dbs: DbListState::NotLoaded };
+        begin_db_list_load(&mut node, 3);
+        apply_db_list_result(&mut node, 3,
+            Ok((vec!["inventory".into(), "sales".into()], true)), "sales");
+        let DbListState::Loaded { dbs, truncated } = &node.dbs else { panic!() };
+        assert!(truncated);
+        assert_eq!(dbs.iter().map(|d| (d.name.as_str(), d.is_default)).collect::<Vec<_>>(),
+            vec![("inventory", false), ("sales", true)]);
+        assert!(dbs.iter().all(|d| matches!(d.schema, DbSchemaState::NotLoaded)));
+    }
+
+    #[test]
+    fn lru_evicts_oldest_loaded_but_never_the_active_slot() {
+        let mut states: HashMap<String, ConnNode> = HashMap::new();
+        let mut lru: Vec<(String, String)> = Vec::new();
+        // Load CAP + 2 slots on one connection.
+        let db_names: Vec<String> = (0..LOADED_SNAPSHOT_CAP + 2).map(|i| format!("db{i}")).collect();
+        states.insert("c1".into(), ConnNode {
+            id: "c1".into(),
+            dbs: DbListState::Loaded {
+                dbs: db_names.iter().map(|n| DbNode {
+                    name: n.clone(), is_default: n == "db0",
+                    schema: DbSchemaState::Loaded { snapshot: snap(), expanded: HashSet::new() },
+                }).collect(),
+                truncated: false,
+            },
+        });
+        let active = ("c1".to_string(), "db0".to_string());
+        for n in &db_names {
+            touch_and_evict(&mut states, &mut lru, ("c1".into(), n.clone()), Some(&active));
+        }
+        let DbListState::Loaded { dbs, .. } = &states["c1"].dbs else { panic!() };
+        let loaded: Vec<&str> = dbs.iter()
+            .filter(|d| matches!(d.schema, DbSchemaState::Loaded { .. }))
+            .map(|d| d.name.as_str()).collect();
+        assert!(loaded.len() <= LOADED_SNAPSHOT_CAP);
+        assert!(loaded.contains(&"db0"), "the ACTIVE slot is never evicted");
+        // The oldest non-active touches (db1, db2) were evicted back to NotLoaded:
+        assert!(!loaded.contains(&"db1"));
+        // Re-touching moves to the back — touch db3 again, then overflow once more:
+        touch_and_evict(&mut states, &mut lru, ("c1".into(), "db3".into()), Some(&active));
     }
 }

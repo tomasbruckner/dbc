@@ -2434,7 +2434,7 @@ impl AppView {
 // 5. Free helper functions.
 // ---------------------------------------------------------------------
 
-fn engine_label(e: Engine) -> &'static str {
+pub(crate) fn engine_label(e: Engine) -> &'static str {
     match e {
         Engine::Postgres => "pg",
         Engine::Mssql => "mssql",
@@ -2511,7 +2511,7 @@ fn test_connect_spec(cfg: ConnectionConfig, secret: Option<String>) -> Result<Co
 /// `needs_secret` is the caller's own `engine != Sqlite` lookup on the
 /// target connection — this fn doesn't know about connections, only the
 /// three booleans the gate actually reduces to.
-fn connect_needs_vault_prompt(needs_secret: bool, vault_unlocked: bool, vault_file_exists: bool) -> bool {
+pub(crate) fn connect_needs_vault_prompt(needs_secret: bool, vault_unlocked: bool, vault_file_exists: bool) -> bool {
     needs_secret && !vault_unlocked && vault_file_exists
 }
 
