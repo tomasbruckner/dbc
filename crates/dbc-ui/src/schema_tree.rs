@@ -2713,6 +2713,87 @@ mod sidebar_tests {
         assert_eq!(ids, want.iter().collect::<Vec<_>>());
     }
 
+    // T7 re-pins: three favourites-section behaviors whose single-root
+    // pins were thinned when the old `flatten` tests were deleted in T5.
+
+    /// The "Oblíbené" section is ABSENT without an active scope (CLI /
+    /// no-connection: nothing to stamp a new toggle with, nothing to
+    /// filter against) — even with favourites configured.
+    #[test]
+    fn favourites_section_absent_without_active_scope() {
+        let conns = vec![conn_cfg("c1", "prod", &[], Engine::Postgres, "sales")];
+        let favs = vec![FavouriteObject {
+            connection_id: "c1".into(),
+            schema: Some("public".into()),
+            name: "orders".into(),
+            kind: "table".into(),
+            database: None,
+        }];
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Favourites);
+        let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+            &outer, "", None, &favs, AdminEntry::Hidden);
+        assert!(!rows
+            .iter()
+            .any(|(id, ..)| matches!(id, SidebarRow::Pinned(NodeId::FavouriteSection))));
+    }
+
+    /// The section renders collapsed by default — header only; item rows
+    /// appear only once `OuterId::Favourites` is in the expand set.
+    #[test]
+    fn favourites_section_stays_collapsed_until_expanded() {
+        let conns = vec![conn_cfg("c1", "prod", &[], Engine::Postgres, "sales")];
+        let favs = vec![FavouriteObject {
+            connection_id: "c1".into(),
+            schema: Some("public".into()),
+            name: "orders".into(),
+            kind: "table".into(),
+            database: None,
+        }];
+        let scope = ActiveScope { conn_id: "c1".into(), db: "sales".into(), default_db: "sales".into() };
+        let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+            &HashSet::new(), "", Some(&scope), &favs, AdminEntry::Hidden);
+        assert!(matches!(&rows[0], (SidebarRow::Pinned(NodeId::FavouriteSection), 0, label, true)
+            if label == "Oblíbené (1)"));
+        assert!(
+            !rows.iter().any(|(id, ..)| matches!(id, SidebarRow::Pinned(NodeId::Favourite(..)))),
+            "item rows hidden until the section is expanded"
+        );
+    }
+
+    /// Item labels: „{schema}.{name}" with a schema, bare „{name}" without.
+    #[test]
+    fn favourites_section_labels_schema_dot_name_or_bare_name() {
+        let conns = vec![conn_cfg("c1", "prod", &[], Engine::Postgres, "sales")];
+        let favs = vec![
+            FavouriteObject {
+                connection_id: "c1".into(),
+                schema: Some("public".into()),
+                name: "t1".into(),
+                kind: "table".into(),
+                database: None,
+            },
+            FavouriteObject {
+                connection_id: "c1".into(),
+                schema: None,
+                name: "seq1".into(),
+                kind: "sequence".into(),
+                database: None,
+            },
+        ];
+        let scope = ActiveScope { conn_id: "c1".into(), db: "sales".into(), default_db: "sales".into() };
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Favourites);
+        let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+            &outer, "", Some(&scope), &favs, AdminEntry::Hidden);
+        let labels: Vec<&str> = rows
+            .iter()
+            .filter(|(id, ..)| matches!(id, SidebarRow::Pinned(NodeId::Favourite(..))))
+            .map(|(_, _, l, _)| l.as_str())
+            .collect();
+        assert_eq!(labels, vec!["public.t1", "seq1"]);
+    }
+
     /// Design §5 row 1's REQUIRED "active-scope gating of icon
     /// affordances" test — the pure predicate T5's render uses to decide
     /// whether a row gets the star/ER/import icons and DDL-header

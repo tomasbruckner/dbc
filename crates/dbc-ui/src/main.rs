@@ -1239,6 +1239,53 @@ const CLI_CONN_IDENTITY: &str = "cli";
 /// escaping `connection_scope_key` instead — see `store_scope_key`. The
 /// CLI path keeps the plain `"cli"` sentinel (its URL bakes its own
 /// database).
+///
+/// # T7 AUDIT RECORD (design §7, verified 2026-08-25 on the final code —
+/// grep census recorded verbatim in the T7 commit message)
+///
+/// **29 `current_conn_identity()` sites** (main.rs + connections_ui.rs,
+/// non-test), all funneling through this composition:
+/// - 17 stamp sites: `run_query_with`, `run_many`, `start_script_pick`
+///   (ScriptRun modal), `confirm_script_run` (progress tab),
+///   `start_csv_import` (CsvImport modal), `confirm_csv_import` (progress
+///   tab), `dispatch_plan_query`, `dispatch_mssql_plan`,
+///   `on_confirm_analyze_write` (Plan tabs), `confirm_chart_picker`,
+///   `open_admin_tab` (panel + tab), `open_monitor_tab`
+///   (`"monitor:{identity}"` key + tab), `open_er_diagram`,
+///   `on_er_diagram_event` (DDL child), `on_tree_event` (tree-DDL text
+///   tab, inert), `confirm_compare_dialog` (compare tab, inert).
+/// - 12 guard-"current" sides: the script pair (`start_script_pick`
+///   continuation + `confirm_script_run`'s `script_run_dispatch_allowed`),
+///   the CSV pair, `fetch_admin_catalog_into` (M2),
+///   `on_open_apply_dialog`, `on_confirm_apply`,
+///   `open_admin_apply_dialog`, `render_apply_bar` dim-out, PLUS the
+///   three T5-added consumers: `push_admin_schemas_if_matching` (the
+///   relocated schema-push M2 guard), `dirty_admin_change_count` (the
+///   switch's dirty-admin confirm gate), and `switch_to_database`'s
+///   no-op-switch equality (a census finding beyond the design table —
+///   full-identity compare, so a same-connection different-db switch is
+///   correctly NOT a no-op).
+/// - `store_scope_key` deliberately does NOT appear (legacy bucket key,
+///   T3).
+///
+/// **9 guard families, zero weakened** (11 physical
+/// `conn_identity_matches` sites + `admin_open_decision`'s full-identity
+/// `==`) — pinned by `identity_audit_tests`. **`ConnectSpec::Config`
+/// constructors**: only `spec_for_database`, `ActiveConn::into_spec`
+/// (the `resolve_active` projection), and the by-design explicit-config
+/// paths (`run_backup_now`/`run_restore_now`, compare's swapped configs +
+/// `CompareView`'s data-diff leg, the dialog's `test_connect_spec`) —
+/// zero direct `active_connection_id`-based builds (T3's invariant
+/// holds).
+///
+/// **Intentionally guard-free surfaces re-affirmed**: monitor (identity
+/// is only a tab key; per-operation runner), backup/restore (explicit id
+/// + existence check by design), compare (self-contained swapped
+/// configs), read-only artifact tabs (stamped, never checked). The
+/// sidebar's cross-context SNAPSHOT non-leak is pre-pinned by the T5 fix
+/// round's fallback key-gate tests
+/// (`fallback_slot_is_key_gated_no_cross_context_leak` and siblings,
+/// schema_tree.rs) — referenced here, not duplicated.
 pub(crate) fn conn_identity_for(conn_id: &str, database: &str) -> String {
     format!("{conn_id}\u{1F}{database}")
 }
@@ -1274,18 +1321,20 @@ struct ActiveConn {
     engine: dbc_state::Engine,
     timeout_secs: Option<u64>,
     auto_limit: Option<u64>,
-    /// `conn_identity_for(..)` of the same snapshot — a caller that stamps
-    /// and dispatches in one motion should use this, never a re-read.
-    ///
-    /// Allow dead_code: no production stamp site consumes the snapshot's
-    /// identity yet (T5's `switch_to_database` computes its TARGET identity
-    /// from explicit args before any state changes, deliberately not from
-    /// `resolve_active`) — asserted by `identity_widening_tests`. Removal
-    /// owner: T7 (the stamp/guard audit) either wires a consumer or retires
-    /// the field with a documented verdict.
-    #[allow(dead_code)]
-    identity: String,
 }
+
+// T7 AUDIT VERDICT (the field `identity: String` this struct carried
+// through T3–T6 is RETIRED here, per its allow's named-owner note): the
+// census found ZERO stamp sites that want a snapshot-coupled identity —
+// every stamp/guard site deliberately evaluates `current_conn_identity()`
+// FRESH at its own stamp/recheck moment (that capture-then-recheck
+// discipline is exactly what the guard families test), and
+// `switch_to_database` computes its TARGET identity from explicit args
+// before any state changes. An unread snapshot identity would only invite
+// divergence from the freshly-read one; the coherence it pinned
+// (`cfg.database` already swapped ⇒ the identity composes from the same
+// snapshot) is asserted directly in `identity_widening_tests` via
+// `conn_identity_for(&a.cfg.id, &a.cfg.database)`.
 
 impl ActiveConn {
     fn into_spec(self) -> ConnectSpec {
@@ -1334,7 +1383,6 @@ fn resolve_active_from(
     }
     let secret = connect::resolve_secret_for_connect(vault, &cfg);
     Some(ActiveConn {
-        identity: conn_identity_for(&cfg.id, &cfg.database),
         read_only: cfg.read_only,
         engine: cfg.engine,
         timeout_secs: cfg.timeout_secs,
@@ -9723,14 +9771,20 @@ mod identity_widening_tests {
         // Default database:
         let a = resolve_active_from(&config, None, "conn-a", None).unwrap();
         assert_eq!(a.cfg.database, "sales");
-        assert_eq!(a.identity, conn_identity_for("conn-a", "sales"));
+        // Identity coherence (T7: the snapshot no longer carries a
+        // pre-composed identity field — see the ActiveConn audit verdict —
+        // but the snapshot's cfg must still compose to the expected one):
+        assert_eq!(conn_identity_for(&a.cfg.id, &a.cfg.database), conn_identity_for("conn-a", "sales"));
         assert!(a.read_only);
         assert_eq!(a.timeout_secs, Some(30));
         assert_eq!(a.auto_limit, Some(500));
         // Non-default database:
         let a = resolve_active_from(&config, None, "conn-a", Some("inventory")).unwrap();
         assert_eq!(a.cfg.database, "inventory");
-        assert_eq!(a.identity, conn_identity_for("conn-a", "inventory"));
+        assert_eq!(
+            conn_identity_for(&a.cfg.id, &a.cfg.database),
+            conn_identity_for("conn-a", "inventory")
+        );
         assert!(a.read_only, "read_only inherits into every derived db (design §4.2)");
         // Deleted connection:
         assert!(resolve_active_from(&config, None, "gone", None).is_none());
@@ -9841,6 +9895,82 @@ mod switch_decision_tests {
         assert!(switch_blocked_by_overlay(false, true, false));
         assert!(switch_blocked_by_overlay(false, false, true));
         assert!(switch_blocked_by_overlay(true, true, true));
+    }
+}
+
+// Sidebar rework T7: the identity-widening AUDIT's guard-family tests
+// (design §7) — pinned ON THE FINAL CODE that no guard got weaker: every
+// family refuses a stale identity across a SAME-CONNECTION database
+// switch, which the pre-phase bare-id identities all passed.
+#[cfg(test)]
+mod identity_audit_tests {
+    use super::*;
+
+    /// Design §7's headline fix, per guard family: a SAME-CONNECTION
+    /// database switch invalidates every pending write captured against
+    /// the previous database. Pre-phase identities (bare ids) passed all
+    /// four of these — pinning that they now refuse.
+    #[test]
+    fn same_connection_db_switch_refuses_script_and_csv_dispatch() {
+        let sales = conn_identity_for("conn-a", "sales");
+        let inventory = conn_identity_for("conn-a", "inventory");
+        assert!(!script_run_dispatch_allowed(&sales, &inventory));
+        assert!(!csv_import_dispatch_allowed(&sales, &inventory));
+        assert!(script_run_dispatch_allowed(&sales, &sales));
+    }
+
+    /// Apply flow (on_open_apply_dialog / on_confirm_apply backstop /
+    /// render_apply_bar dim-out all route through conn_identity_matches).
+    #[test]
+    fn apply_guard_refuses_across_db_switch_and_reenables_on_return() {
+        let sales = conn_identity_for("conn-a", "sales");
+        let inventory = conn_identity_for("conn-a", "inventory");
+        assert!(!conn_identity_matches(&sales, &inventory));
+        // Switching BACK re-enables the dimmed tab — staged grid edits are
+        // never dropped by a switch, only inert while away (resolved
+        // deviation 11's grid half).
+        assert!(conn_identity_matches(&sales, &conn_identity_for("conn-a", "sales")));
+    }
+
+    /// Admin singleton: a db switch now yields Replace (stale staged admin
+    /// edits must never survive a context switch — design §5 row 4).
+    #[test]
+    fn admin_open_decision_replaces_across_db_switch() {
+        let mut tabs = Tabs::new();
+        tabs.open(ResultTab {
+            id: 0,
+            title: "Správa serveru".into(),
+            pinned: false,
+            preview_key: Some(admin_panel::ADMIN_PREVIEW_KEY.to_string()),
+            conn_identity: conn_identity_for("conn-a", "sales"),
+            content: TabContent::Text { text: String::new(), scroll_lines: 0 },
+        });
+        assert!(matches!(
+            admin_open_decision(&tabs, &conn_identity_for("conn-a", "inventory")),
+            AdminOpenDecision::Replace(_)
+        ));
+        assert!(matches!(
+            admin_open_decision(&tabs, &conn_identity_for("conn-a", "sales")),
+            AdminOpenDecision::Activate(_)
+        ));
+    }
+
+    /// Monitor tab singleton key widens automatically → one monitor tab
+    /// per (conn, db) — consistent with its DATA_SIZE tile being
+    /// per-database (design §5 row 5).
+    #[test]
+    fn monitor_preview_key_scopes_per_database() {
+        assert_ne!(
+            format!("monitor:{}", conn_identity_for("conn-a", "sales")),
+            format!("monitor:{}", conn_identity_for("conn-a", "inventory")),
+        );
+    }
+
+    /// CLI sentinel unchanged and never equal to any composite identity.
+    #[test]
+    fn cli_sentinel_is_disjoint_from_composites() {
+        assert!(!conn_identity_matches(CLI_CONN_IDENTITY, &conn_identity_for("conn-a", "sales")));
+        assert!(!conn_identity_matches(&conn_identity_for("cli", "x"), CLI_CONN_IDENTITY));
     }
 }
 
