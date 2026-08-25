@@ -1002,6 +1002,18 @@ enum PendingDiscard {
         preview: Box<PreviewTarget>,
         revert: Option<(Entity<ResultGrid>, usize, String)>,
     },
+    /// Sidebar rework (resolved deviation 11): the user confirmed dropping
+    /// the staged admin edits — close the dirty admin tab, then perform
+    /// the switch.
+    SwitchDatabase { conn_id: String, db: Option<String> },
+}
+
+/// Sidebar rework (design §2.2): the one-shot action `switch_to_database`
+/// replays after a successful cross-context switch. Single-variant by
+/// design (pinned by `switch_decision_tests`) — a second queued kind needs
+/// its own design pass.
+enum PendingTreeAction {
+    OpenPreview { schema: Option<String>, table: String },
 }
 
 /// G5 Task 4 (folded T3 review issue 2): confirm prompt for an action that
@@ -1033,7 +1045,7 @@ struct DiscardConfirmState {
 /// (rather than a second entity being constructed here), so the tab
 /// actually shows "Načítám schéma…" for the duration of the fetch instead
 /// of only appearing once it's already done. `generation` mirrors
-/// `schema_fetch_generation`'s guard shape — a newer dispatch's result
+/// `sidebar_fetch_generation`'s guard shape — a newer dispatch's result
 /// always wins over an older, still-in-flight one.
 pub(crate) struct PendingCompare {
     pub view: Entity<compare::CompareView>,
@@ -1097,33 +1109,31 @@ struct AppView {
     /// on dropdown-open and after config mutations (see
     /// `AppView::refresh_grouped_cache`) rather than on every render frame.
     grouped_cache: connections_ui::GroupedConnections,
-    // --- G2 Task 6: schema tree panel ---
-    /// Loading/error/snapshot state lives on the entity itself, driven by
-    /// direct mutation from `trigger_schema_fetch` (see schema_tree.rs's
-    /// header comment for why this isn't done via `TreeEvent` instead).
+    // --- G2 Task 6 / sidebar rework: multi-root sidebar panel ---
+    /// Per-slot lazy-fetch state lives on the entity itself, driven by
+    /// direct mutation from `start_db_list_fetch`/`start_schema_slot_fetch`
+    /// (see schema_tree.rs's header comment).
     tree: Entity<SchemaTree>,
     /// Ctrl+B (`ToggleTree`, app action, binding context `None`). `false`
     /// means the panel isn't rendered at all (0 px), not just visually
     /// hidden.
     tree_visible: bool,
-    /// Bumped on every `trigger_schema_fetch` dispatch; a fetch result only
-    /// applies if the generation still matches (last-dispatched wins — same
-    /// pattern as `switch_generation`). Fixes review Issue 1: without this,
-    /// a slow fetch for a connection the user has since switched away from
-    /// can resolve after a faster fetch for the new connection and silently
-    /// overwrite the tree with the wrong connection's schema.
-    schema_fetch_generation: u64,
+    /// Sidebar rework: bumped on every db-list/schema-slot fetch dispatch;
+    /// a result only applies if the generation still matches
+    /// (last-dispatched wins — the slot state machines in schema_tree.rs
+    /// carry the captured generation and drop mismatches). Replaces the
+    /// single-root `schema_fetch_generation`.
+    sidebar_fetch_generation: u64,
     /// G7 T6: bumped on every `confirm_compare_dialog` dispatch; an
     /// `on_compare_schema_pair_ready` result only applies if the generation
     /// still matches — same last-dispatched-wins guard as
-    /// `schema_fetch_generation`/`switch_generation`.
+    /// `sidebar_fetch_generation`/`switch_generation`.
     compare_fetch_generation: u64,
-    /// Identity (see `conn_spec_key`) of the connection whose schema is
-    /// currently being fetched/shown in `tree`, so `trigger_schema_fetch`
-    /// can tell `SchemaTree::set_snapshot` whether an incoming snapshot is a
-    /// same-connection refresh (preserve expand/filter/selection) or a
-    /// switch to a different connection (reset them) — review Issue 3.
-    schema_tree_connection_key: Option<String>,
+    /// Sidebar rework (design §2.2): one-shot action queued behind a
+    /// cross-context `switch_to_database` — replayed on switch success,
+    /// cleared on failure/supersede. Only ever an OpenPreview today
+    /// (`PendingTreeAction`'s single variant, pinned by test).
+    pending_after_switch: Option<PendingTreeAction>,
     // --- G3 Task 3: history panel + query recording ---
     /// Opened from `default_history_path()` at startup; `None` when the open
     /// failed (surfaced once in the startup status — see `main`), in which
@@ -1210,20 +1220,6 @@ struct AppView {
     last_ac_cursor: usize,
 }
 
-/// Stable identity for a `ConnectSpec`, used only to decide whether two
-/// `trigger_schema_fetch` dispatches target the "same connection" (see
-/// `schema_tree_connection_key`) — not used for anything security-sensitive,
-/// so the secret on `ConnectSpec::Config` is deliberately not part of it.
-/// Widened by the sidebar rework — its autocomplete/schema caching identity
-/// must distinguish databases; the spec's `cfg.database` is already the
-/// effective one.
-fn conn_spec_key(spec: &ConnectSpec) -> String {
-    match spec {
-        ConnectSpec::Config { cfg, .. } => format!("cfg:{}\u{1F}{}", cfg.id, cfg.database),
-        ConnectSpec::Url(u) => format!("url:{u}"),
-    }
-}
-
 /// G5 Task 4 review fix (BLOCKER 1): sentinel `ResultTab::conn_identity`/
 /// `AppView::current_conn_identity` use for the CLI-arg back-compat path
 /// (no saved `ConnectionConfig`, hence no stable id to use instead).
@@ -1251,11 +1247,6 @@ pub(crate) fn conn_identity_for(conn_id: &str, database: &str) -> String {
 /// applies default_transaction_read_only / file-engine read-only modes),
 /// same ssh/timeout/auto_limit. No new secret storage, no new config
 /// entry; this function moves a secret field it never reads.
-///
-/// Allow dead_code: T3 lands ahead of T5's consumers (`switch_to_database`
-/// and the sidebar's per-database fetch dispatch) — exercised directly by
-/// `identity_widening_tests` until then. Remove once T5 wires it in.
-#[allow(dead_code)]
 pub(crate) fn spec_for_database(
     cfg: &ConnectionConfig,
     db: &str,
@@ -1281,13 +1272,15 @@ struct ActiveConn {
     engine: dbc_state::Engine,
     timeout_secs: Option<u64>,
     auto_limit: Option<u64>,
-    /// `conn_identity_for(..)` of the same snapshot — callers that stamp
-    /// and dispatch in one motion use this, never a re-read.
+    /// `conn_identity_for(..)` of the same snapshot — a caller that stamps
+    /// and dispatches in one motion should use this, never a re-read.
     ///
-    /// Allow dead_code: T3 lands ahead of T5's stamp-and-dispatch callers
-    /// (`switch_to_database`'s success arm and the sidebar handlers) —
-    /// asserted by `identity_widening_tests` until then. Remove once T5
-    /// wires them in.
+    /// Allow dead_code: no production stamp site consumes the snapshot's
+    /// identity yet (T5's `switch_to_database` computes its TARGET identity
+    /// from explicit args before any state changes, deliberately not from
+    /// `resolve_active`) — asserted by `identity_widening_tests`. Removal
+    /// owner: T7 (the stamp/guard audit) either wires a consumer or retires
+    /// the field with a documented verdict.
     #[allow(dead_code)]
     identity: String,
 }
@@ -1295,6 +1288,32 @@ struct ActiveConn {
 impl ActiveConn {
     fn into_spec(self) -> ConnectSpec {
         ConnectSpec::Config { cfg: Box::new(self.cfg), secret: self.secret }
+    }
+}
+
+/// Pure core of `AppView::conn_name_for_identity` — free function so it is
+/// testable without a GPUI context. NEVER renders the raw `\u{1F}` control
+/// character (batch B review NIT 1): a hostile db name can itself contain
+/// the separator (design §7 CORRECTION), so BOTH branches — deleted
+/// connection AND found-connection non-default db — replace it with a
+/// visible " / " before display.
+fn conn_name_for_identity_from(connections: &[ConnectionConfig], identity: &str) -> String {
+    if identity == CLI_CONN_IDENTITY {
+        return "cli".to_string();
+    }
+    let (id, db) = match identity.split_once('\u{1F}') {
+        Some((id, db)) => (id, Some(db)),
+        None => (identity, None), // defensive: nothing stamps the bare shape any more
+    };
+    match connections.iter().find(|c| c.id == id) {
+        // Deleted connection: never render the raw control character.
+        None => identity.replace('\u{1F}', " / "),
+        Some(c) => match db {
+            Some(db) if db != c.database => {
+                format!("{} / {}", c.name, db.replace('\u{1F}', " / "))
+            }
+            _ => c.name.clone(),
+        },
     }
 }
 
@@ -4270,15 +4289,20 @@ impl AppView {
                     self.open_connection_dialog(None, window, cx);
                 }
                 PaletteAction::RefreshSchema => {
-                    // Exactly `on_tree_event`'s `TreeEvent::RefreshRequested` arm.
-                    if let Some(spec) = self.active_conn_spec() {
-                        self.trigger_schema_fetch(spec, cx);
+                    // Exactly `on_tree_event`'s `TreeEvent::RefreshRequested`
+                    // arm (sidebar rework: the ACTIVE slot).
+                    if let Some(id) = self.active_connection_id.clone() {
+                        if let Some(db) = self.effective_database() {
+                            self.start_schema_slot_fetch(id, db, cx);
+                        }
+                    } else if self.conn_url.is_some() {
+                        self.start_schema_slot_fetch(
+                            CLI_CONN_IDENTITY.to_string(),
+                            String::new(),
+                            cx,
+                        );
                     } else {
-                        self.schema_tree_connection_key = None;
-                        self.tree.update(cx, |t, cx| {
-                            t.clear(cx);
-                            t.set_admin_entry(admin_panel::AdminEntry::Hidden, cx);
-                        });
+                        self.refresh_tree_context(cx);
                     }
                 }
                 PaletteAction::OpenMonitor => self.open_monitor_tab(cx),
@@ -4438,8 +4462,8 @@ impl AppView {
     /// G6 T7 (review round 3, MAJOR 1): unconditionally closes the
     /// autocomplete popup — called from every place the ACTIVE connection's
     /// identity or schema snapshot changes underneath it
-    /// (`connections_ui::switch_to_connection`'s success arm, AND
-    /// `trigger_schema_fetch`'s successful-snapshot arm below), not just
+    /// (`switch_to_database`'s success arm, AND
+    /// `start_schema_slot_fetch`'s active-slot success arm), not just
     /// from `on_ac_escape`. Without this, `refresh_autocomplete`'s
     /// text/cursor/focus-based lazy-diff has no signal that the SCHEMA
     /// changed (the SQL editor's own text/cursor/focus are untouched by a
@@ -4730,6 +4754,307 @@ impl AppView {
     fn resolve_active(&self) -> Option<ActiveConn> {
         let id = self.active_connection_id.as_deref()?;
         resolve_active_from(&self.config, self.vault.as_ref(), id, self.active_database.as_deref())
+    }
+
+    // -----------------------------------------------------------------
+    // Sidebar rework (T5): the (connection, database) context switch and
+    // the per-slot sidebar fetches.
+    // -----------------------------------------------------------------
+
+    /// Design §2.2: THE context switch. `db == None` targets the saved
+    /// default database (dropdown/palette/tree-connection-row semantics);
+    /// `Some(db)` a tree-selected one. Success is the ONLY writer of
+    /// `active_database`. A failed test_connect leaves the previous
+    /// context untouched — same contract as the pre-rework switch.
+    pub(crate) fn switch_to_database(&mut self, id: &str, db: Option<String>, cx: &mut Context<Self>) {
+        self.cancel_active_backup_if_running();
+        let Some(cfg) = self.config.connections.iter().find(|c| c.id == id).cloned() else { return };
+        // Canonical spelling: explicitly picking the default == None
+        // (pinned by `db_choice_normalizes_default_to_none` — the whole
+        // legacy-store-key contract rests on this line).
+        let db = db.filter(|d| d != &cfg.database);
+        let target_identity = conn_identity_for(id, db.as_deref().unwrap_or(&cfg.database));
+        if target_identity == self.current_conn_identity() {
+            // Already there — still worth a re-validate? No: match the old
+            // dropdown behaviour (clicking the active item re-tested)?
+            // Deliberate change: a no-op switch is a no-op; the ⟳ button
+            // owns re-validation. Keeps double-click idempotent.
+            return;
+        }
+        // Resolved deviation 11 (risk list "release-note + confirm"): a
+        // context switch makes a dirty admin tab's staged edits
+        // permanently inapplicable (the identity guard will refuse them
+        // and the next admin open Replaces the tab) — confirm first. Dirty
+        // sandbox GRID edits deliberately get NO prompt: they are not
+        // dropped — the tab stays, the apply bar dims via the identity
+        // guard, and switching back to the same (conn, db) re-enables it.
+        if self.discard_confirm.is_none() {
+            if let Some(count) = self.dirty_admin_change_count(cx) {
+                self.discard_confirm = Some(DiscardConfirmState {
+                    change_count: count,
+                    action: PendingDiscard::SwitchDatabase { conn_id: id.to_string(), db },
+                });
+                self.modal_needs_focus = true;
+                cx.notify();
+                return;
+            }
+        }
+        // Vault gate (design §1.3/§4.4) — same three-boolean predicate as
+        // the dropdown's.
+        let needs_secret = !connections_ui::engine_is_file_based(cfg.engine);
+        if connections_ui::connect_needs_vault_prompt(
+            needs_secret,
+            self.vault.is_some(),
+            Vault::exists(&self.vault_path),
+        ) {
+            self.open_vault_prompt(
+                connections_ui::PendingAfterUnlock::SwitchDatabase { conn_id: id.to_string(), db },
+                cx,
+            );
+            return;
+        }
+        let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
+        let engine_lbl = connections_ui::engine_label(cfg.engine);
+        let effective = db.clone().unwrap_or_else(|| cfg.database.clone());
+        let spec = spec_for_database(&cfg, &effective, secret);
+        let target_id = cfg.id.clone();
+        self.dropdown_open = false;
+        self.status = "connecting…".into();
+        self.switch_generation += 1;
+        let my_generation = self.switch_generation;
+        cx.notify();
+        let rx = self.runner.test_connect(spec);
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |view, cx| {
+                if view.switch_generation != my_generation {
+                    return; // superseded — last-dispatched wins
+                }
+                match result {
+                    Ok(Ok(())) => {
+                        view.status = format!("Připojeno ({engine_lbl})");
+                        view.active_connection_id = Some(target_id.clone());
+                        view.active_database = db.clone();
+                        view.conn_url = None;
+                        // G6 T7 review round 3, MAJOR 1 (carried forward):
+                        // close any open autocomplete at the moment the
+                        // identity changes — don't wait for the schema
+                        // fetch below to land.
+                        view.close_autocomplete(cx);
+                        view.refresh_tree_context(cx);
+                        view.start_schema_slot_fetch(target_id.clone(), effective.clone(), cx);
+                        if let Some(action) = view.pending_after_switch.take() {
+                            match action {
+                                PendingTreeAction::OpenPreview { schema, table } => {
+                                    view.open_table_preview(schema, table, cx);
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        view.status = format!("error: {e}");
+                        view.pending_after_switch = None; // failure clears the queue
+                    }
+                    Err(_) => {
+                        view.status = "error: connect zrušen".into();
+                        view.pending_after_switch = None;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Some(change_count) when an open admin tab is stamped with the
+    /// CURRENT identity and has staged edits (roles/memberships/matrix).
+    fn dirty_admin_change_count(&self, cx: &Context<Self>) -> Option<usize> {
+        let current = self.current_conn_identity();
+        self.tabs.iter().find_map(|t| match &t.content {
+            TabContent::Admin { view } => {
+                let p = view.read(cx);
+                let n = p.change_count();
+                (p.conn_identity() == current && n > 0).then_some(n)
+            }
+            _ => None,
+        })
+    }
+
+    /// Opens the master-password prompt from a cx-only context (tree
+    /// subscribe callbacks have no `&mut Window`) — deferred focus lands on
+    /// the prompt's own input via the render-top hook (see
+    /// `AppView::render`'s `modal_needs_focus` block).
+    fn open_vault_prompt(&mut self, pending: connections_ui::PendingAfterUnlock, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| connections_ui::TextField::form_field(cx, "Heslo", true));
+        self.modal = Some(connections_ui::ModalState::MasterPasswordPrompt {
+            input,
+            error: None,
+            pending,
+        });
+        self.dropdown_open = false;
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    /// Whether `(conn_id, db)` IS the active context — the CLI sentinel
+    /// pair (`CLI_CONN_IDENTITY`, any db) answers for the CLI-arg session.
+    fn scope_is_active(&self, conn_id: &str, db: &str) -> bool {
+        if conn_id == CLI_CONN_IDENTITY {
+            return self.active_connection_id.is_none() && self.conn_url.is_some();
+        }
+        self.active_connection_id.as_deref() == Some(conn_id)
+            && self.effective_database().as_deref() == Some(db)
+    }
+
+    /// Pushes the active `(connection, database)` scope + CLI url into the
+    /// tree — the sidebar's ● indicator, icon gating and favourites
+    /// filtering all derive from this one push.
+    fn push_active_scope_to_tree(&mut self, cx: &mut Context<Self>) {
+        let scope = self.active_connection_id.as_ref().and_then(|id| {
+            let cfg = self.config.connections.iter().find(|c| &c.id == id)?;
+            Some(schema_tree::ActiveScope {
+                conn_id: id.clone(),
+                db: self.active_database.clone().unwrap_or_else(|| cfg.database.clone()),
+                default_db: cfg.database.clone(),
+            })
+        });
+        let cli = self.conn_url.clone();
+        self.tree.update(cx, |t, cx| {
+            t.set_active_scope(scope, cx);
+            // Switch success sets conn_url = None → the CLI root
+            // disappears (design §3.4).
+            t.set_cli(cli, cx);
+        });
+    }
+
+    /// Consolidated tree-context push (sidebar rework): favourites +
+    /// read_only + admin entry + active scope, called from the slot-fetch
+    /// success arm, the ★ toggle, the switch success arm, and startup.
+    fn refresh_tree_context(&mut self, cx: &mut Context<Self>) {
+        let favourites = self.config.favourite_objects.clone();
+        let read_only = self.active_read_only();
+        let admin_entry = admin_panel::admin_entry_state(self.active_engine(), read_only);
+        self.tree.update(cx, |t, cx| {
+            t.set_favourites(favourites, cx);
+            t.set_read_only(read_only, cx);
+            t.set_admin_entry(admin_entry, cx);
+        });
+        self.push_active_scope_to_tree(cx);
+    }
+
+    /// The old trigger_schema_fetch success-arm's M2-guarded admin-schema
+    /// push, verbatim (AUDIT SITE — design §7 guard list: "only push into
+    /// an admin panel whose OWN stamped identity still matches the
+    /// CURRENTLY active connection").
+    fn push_admin_schemas_if_matching(&mut self, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.tree.read(cx).snapshot() else { return };
+        let schemas = admin_panel::distinct_schemas(snapshot);
+        if let Some(panel) = self.tabs.iter().find_map(|t| match &t.content {
+            TabContent::Admin { view } => Some(view.clone()),
+            _ => None,
+        }) {
+            let current_identity = self.current_conn_identity();
+            if conn_identity_matches(panel.read(cx).conn_identity(), &current_identity) {
+                panel.update(cx, |p, cx| p.set_schemas(schemas, cx));
+            }
+        }
+    }
+
+    /// Expand of a Connection row (or its error-row retry / vault resume).
+    /// Design §1.2: NOT eager — one bounded metadata fetch over one
+    /// short-lived connection to the DEFAULT database; no other connection
+    /// is touched, no schema is fetched yet.
+    fn start_db_list_fetch(&mut self, conn_id: String, cx: &mut Context<Self>) {
+        let Some(cfg) = self.config.connections.iter().find(|c| c.id == conn_id).cloned() else {
+            return;
+        };
+        let needs_secret = !connections_ui::engine_is_file_based(cfg.engine);
+        if connections_ui::connect_needs_vault_prompt(
+            needs_secret,
+            self.vault.is_some(),
+            Vault::exists(&self.vault_path),
+        ) {
+            self.open_vault_prompt(connections_ui::PendingAfterUnlock::ExpandConnection(conn_id), cx);
+            return;
+        }
+        let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
+        self.sidebar_fetch_generation += 1;
+        let my_generation = self.sidebar_fetch_generation;
+        let default_db = cfg.database.clone();
+        self.tree.update(cx, |t, cx| t.begin_db_list(&conn_id, my_generation, cx));
+        let rx = self.runner.fetch_database_list(spec_for_database(&cfg, &cfg.database, secret));
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |view, cx| {
+                let result = match result {
+                    Ok(Ok(r)) => Ok(r),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err("výpis databází zrušen".to_string()),
+                };
+                view.tree.update(cx, |t, cx| {
+                    t.finish_db_list(&conn_id, my_generation, result, &default_db, cx)
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Expand of a Database row / ⟳ refresh of the active slot / the
+    /// switch success arm. CLI slot: `conn_id == CLI_CONN_IDENTITY`, db "".
+    fn start_schema_slot_fetch(&mut self, conn_id: String, db: String, cx: &mut Context<Self>) {
+        self.sidebar_fetch_generation += 1;
+        let my_generation = self.sidebar_fetch_generation;
+        let spec = if conn_id == CLI_CONN_IDENTITY {
+            let Some(url) = self.conn_url.clone() else { return };
+            ConnectSpec::Url(url)
+        } else {
+            let Some(cfg) = self.config.connections.iter().find(|c| c.id == conn_id).cloned() else {
+                return;
+            };
+            let needs_secret = !connections_ui::engine_is_file_based(cfg.engine);
+            if connections_ui::connect_needs_vault_prompt(
+                needs_secret,
+                self.vault.is_some(),
+                Vault::exists(&self.vault_path),
+            ) {
+                // Design §4.4 + resolved deviation 9: the vault can lock
+                // BETWEEN expanding a connection and expanding one of its
+                // databases — never fetch with an empty secret fallback.
+                self.open_vault_prompt(
+                    connections_ui::PendingAfterUnlock::LoadDbSchema { conn_id, db },
+                    cx,
+                );
+                return;
+            }
+            let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
+            spec_for_database(&cfg, &db, secret)
+        };
+        self.tree.update(cx, |t, cx| t.begin_schema(&conn_id, &db, my_generation, cx));
+        let rx = self.runner.fetch_schema(spec);
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |view, cx| {
+                let result = match result {
+                    Ok(Ok(s)) => Ok(s),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err("fetch zrušen".to_string()),
+                };
+                let ok = result.is_ok();
+                view.tree
+                    .update(cx, |t, cx| t.finish_schema(&conn_id, &db, my_generation, result, cx));
+                // The old trigger_schema_fetch success-arm side effects,
+                // ACTIVE slot only:
+                if ok && view.scope_is_active(&conn_id, &db) {
+                    view.refresh_tree_context(cx);
+                    view.push_admin_schemas_if_matching(cx); // M2 guard preserved verbatim (audit site!)
+                    // Review round 3, MAJOR 1 (carried forward): a new
+                    // snapshot invalidates an open autocomplete popup's
+                    // candidates.
+                    view.close_autocomplete(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// G4 Task 5, PREVIEW tabs: looks the previewed `(schema, table)` up in
@@ -5442,6 +5767,21 @@ impl AppView {
             PendingDiscard::RunPreview { sql, preview, .. } => {
                 self.run_query_with(sql, Some(*preview), true, cx);
             }
+            // Sidebar rework (resolved deviation 11): closing the dirty
+            // admin tab IS the "drop staged edits" the user just confirmed
+            // (matches `AdminOpenDecision::Replace`'s posture) — and it is
+            // what lets the re-entered `switch_to_database` sail past its
+            // own `dirty_admin_change_count` check without looping.
+            PendingDiscard::SwitchDatabase { conn_id, db } => {
+                let admin_tab_id = self
+                    .tabs
+                    .iter()
+                    .find_map(|t| matches!(&t.content, TabContent::Admin { .. }).then_some(t.id));
+                if let Some(id) = admin_tab_id {
+                    self.tabs.close(id);
+                }
+                self.switch_to_database(&conn_id, db, cx);
+            }
         }
         cx.notify();
     }
@@ -5528,23 +5868,10 @@ impl AppView {
     /// connection has since been deleted (rare, but must never panic or
     /// silently say "cli" for a real connection that's simply gone).
     /// Sidebar rework: splits on `\u{1F}`; the db segment renders only when
-    /// ≠ the connection's current default.
+    /// ≠ the connection's current default. Delegates to the pure
+    /// `conn_name_for_identity_from` (testable without a GPUI context).
     fn conn_name_for_identity(&self, identity: &str) -> String {
-        if identity == CLI_CONN_IDENTITY {
-            return "cli".to_string();
-        }
-        let (id, db) = match identity.split_once('\u{1F}') {
-            Some((id, db)) => (id, Some(db)),
-            None => (identity, None), // defensive: nothing stamps the bare shape any more
-        };
-        match self.config.connections.iter().find(|c| c.id == id) {
-            // Deleted connection: never render the raw control character.
-            None => identity.replace('\u{1F}', " / "),
-            Some(c) => match db {
-                Some(db) if db != c.database => format!("{} / {}", c.name, db),
-                _ => c.name.clone(),
-            },
-        }
+        conn_name_for_identity_from(&self.config.connections, identity)
     }
 
     // -----------------------------------------------------------------
@@ -5632,8 +5959,8 @@ impl AppView {
         });
         // G10 T5: seeds the Privileges sub-view's schema selector from
         // whatever's already in the tree's SchemaSnapshot — same source
-        // `trigger_schema_fetch`'s own success arm re-pushes on every
-        // subsequent refresh (see its `set_schemas` call there).
+        // `push_admin_schemas_if_matching` re-pushes on every subsequent
+        // active-slot refresh (`start_schema_slot_fetch`'s success arm).
         let schemas = self.tree.read(cx).snapshot().map(admin_panel::distinct_schemas).unwrap_or_default();
         panel.update(cx, |p, cx| p.set_schemas(schemas, cx));
         self.fetch_admin_catalog_into(panel, admin_sql::roles_catalog(engine), cx);
@@ -5662,7 +5989,7 @@ impl AppView {
     /// Dispatches `runner.fetch_admin_catalog(spec, queries)` off the UI
     /// thread and routes the result into `panel` — same one-shot
     /// "dispatch, `cx.spawn`, update the entity when it resolves" shape
-    /// `trigger_schema_fetch`/`fetch_lookup` already use. No read-only
+    /// `start_schema_slot_fetch`/`fetch_lookup` already use. No read-only
     /// guard here (design: catalog reads are never gated) and no
     /// generation counter (unlike schema fetches, a stale admin-catalog
     /// result landing after a newer one is a non-issue: the same sub-view's
@@ -6287,109 +6614,6 @@ impl AppView {
         cx.notify();
     }
 
-    /// Dispatches `runner.fetch_schema(spec)` off the UI thread and updates
-    /// `self.tree`'s loading/snapshot/error state as it resolves — same
-    /// "UI thread only ever awaits a channel via `cx.spawn`" shape as
-    /// `run_query`/`switch_to_connection`. Called from the
-    /// `switch_to_connection` success arm, `TreeEvent::RefreshRequested`,
-    /// and once at CLI-arg startup (see `main`).
-    ///
-    /// Guarded by `schema_fetch_generation` (review Issue 1, mirroring
-    /// `switch_generation`): every dispatch bumps the counter and captures
-    /// it, and the `cx.spawn` completion drops its result if the generation
-    /// has since moved on — so a slow fetch for a connection the user has
-    /// already switched away from can never overwrite a newer one
-    /// (last-dispatched wins, not last-resolved).
-    fn trigger_schema_fetch(&mut self, spec: ConnectSpec, cx: &mut Context<Self>) {
-        self.tree.update(cx, |t, cx| t.set_loading(cx));
-        let key = conn_spec_key(&spec);
-        self.schema_fetch_generation += 1;
-        let my_generation = self.schema_fetch_generation;
-        let rx = self.runner.fetch_schema(spec);
-        cx.spawn(async move |this, cx| {
-            let result = rx.await;
-            let _ = this.update(cx, |view, cx| {
-                // A newer fetch was dispatched meanwhile — this result is
-                // stale, drop it (last-dispatched wins).
-                if view.schema_fetch_generation != my_generation {
-                    return;
-                }
-                // `same_connection` is decided at APPLY time against the key
-                // of the snapshot actually shown in the tree — deciding it at
-                // dispatch time let a superseded switch-fetch leave the key
-                // pointing at the new target before any reset ever applied,
-                // so a same-target refresh would "preserve" the previous
-                // connection's expand/filter state (re-review residual race).
-                match result {
-                    Ok(Ok(snapshot)) => {
-                        let same_connection =
-                            view.schema_tree_connection_key.as_deref() == Some(key.as_str());
-                        view.schema_tree_connection_key = Some(key.clone());
-                        // G3 Task 4: (re-)apply the favourite set alongside
-                        // every snapshot — a fresh connection switch needs it
-                        // for its "Oblíbené" section to show anything at all,
-                        // and a same-connection refresh needs it re-applied
-                        // too since `set_snapshot` doesn't touch it.
-                        let favourites = view.config.favourite_objects.clone();
-                        let active_id = view.active_connection_id.clone();
-                        let read_only = view.active_read_only();
-                        // G10 T4: recomputed alongside every snapshot apply,
-                        // same posture as favourites/read_only above — the
-                        // tree's pinned "Správa serveru" row visibility must
-                        // never lag a connection switch.
-                        let admin_entry = admin_panel::admin_entry_state(view.active_engine(), read_only);
-                        // G10 T5: the Privileges sub-view's schema selector,
-                        // computed BEFORE `snapshot` moves into
-                        // `set_snapshot` below — pushed into whichever admin
-                        // tab is currently open (there is at most one, the
-                        // singleton-per-connection invariant), same
-                        // "refreshes alongside every snapshot" posture as
-                        // favourites/read_only/admin_entry.
-                        let schemas_for_admin = admin_panel::distinct_schemas(&snapshot);
-                        view.tree.update(cx, |t, cx| {
-                            t.set_snapshot(snapshot, same_connection, cx);
-                            t.set_favourites(favourites, active_id, cx);
-                            t.set_read_only(read_only, cx);
-                            t.set_admin_entry(admin_entry, cx);
-                        });
-                        // Review finding M2: only push into an admin panel
-                        // whose OWN stamped identity still matches the
-                        // CURRENTLY active connection — a stale admin tab
-                        // left open from a since-abandoned connection (the
-                        // singleton-per-connection invariant only replaces
-                        // it on the NEXT `open_admin_tab` call, not
-                        // automatically on every switch) must never have
-                        // another connection's schema list silently pushed
-                        // into it.
-                        if let Some(panel) = view.tabs.iter().find_map(|t| match &t.content {
-                            TabContent::Admin { view } => Some(view.clone()),
-                            _ => None,
-                        }) {
-                            let current_identity = view.current_conn_identity();
-                            if conn_identity_matches(panel.read(cx).conn_identity(), &current_identity) {
-                                panel.update(cx, |p, cx| p.set_schemas(schemas_for_admin, cx));
-                            }
-                        }
-                        // Review round 3, MAJOR 1: a new snapshot landing
-                        // (connection switch OR a same-connection refresh)
-                        // invalidates whatever candidates an open popup was
-                        // computed from — close it rather than risk an
-                        // accept inserting a stale/wrong-schema name.
-                        view.close_autocomplete(cx);
-                    }
-                    Ok(Err(e)) => {
-                        view.tree.update(cx, |t, cx| t.set_error(e.to_string(), cx));
-                    }
-                    Err(_) => {
-                        view.tree
-                            .update(cx, |t, cx| t.set_error("fetch zrušen".to_string(), cx));
-                    }
-                }
-            });
-        })
-        .detach();
-    }
-
     /// G7 T7: computes `mode` from the two connections' engines, runs
     /// `dbc_diff::schema_diff::diff_schema`, and updates the ALREADY-OPEN
     /// Compare tab's `CompareView` entity (`pending.view`, created and
@@ -6397,7 +6621,7 @@ impl AppView {
     /// `CompareLoadState::Loading` at dispatch time — design §3) in place.
     /// `result`'s `Err` case (the oneshot channel closing — the runner task
     /// panicked/dropped, which never happens in normal operation, but is
-    /// still a `Result`, not an `unwrap`, same posture `trigger_schema_fetch`
+    /// still a `Result`, not an `unwrap`, same posture `start_schema_slot_fetch`
     /// takes on its own oneshot) surfaces as a `CompareLoadState::Error` on
     /// BOTH legs rather than leaving the tab stuck on "Načítám schéma…".
     pub(crate) fn on_compare_schema_pair_ready(
@@ -6466,8 +6690,24 @@ impl AppView {
     /// just opens a read-only `Text` tab — no DB round-trip either way.
     fn on_tree_event(&mut self, _emitter: Entity<SchemaTree>, event: &TreeEvent, cx: &mut Context<Self>) {
         match event {
-            TreeEvent::OpenPreview { schema, table } => {
-                self.open_table_preview(schema.clone(), table.clone(), cx);
+            // Sidebar rework (design §5 row 1): scope-checked — an
+            // active-scope open runs directly (including its dirty-preview
+            // discard-confirm gate inside `open_table_preview`); a
+            // cross-context double-click switches FIRST and opens after
+            // (one-shot queue; cleared on failure/supersede — §2.2). The
+            // queued replay goes through the SAME `open_table_preview`, so
+            // it also passes the dirty gate — a queued open must never
+            // silently drop staged edits either.
+            TreeEvent::OpenPreview { conn_id, db, schema, table } => {
+                if self.scope_is_active(conn_id, db) {
+                    self.open_table_preview(schema.clone(), table.clone(), cx);
+                } else {
+                    self.pending_after_switch = Some(PendingTreeAction::OpenPreview {
+                        schema: schema.clone(),
+                        table: table.clone(),
+                    });
+                    self.switch_to_database(conn_id, Some(db.clone()), cx);
+                }
             }
             TreeEvent::OpenDdl { title, ddl } => {
                 self.tabs.open(ResultTab {
@@ -6483,15 +6723,19 @@ impl AppView {
                 self.status = format!("DDL otevřeno: {title}");
                 cx.notify();
             }
+            // Sidebar rework: ⟳ refreshes the ACTIVE slot (a `Loading`
+            // transition carries the slot's expand-set forward — resolved
+            // deviation 13). Nothing active → just re-push the (empty)
+            // context; there is no whole-panel state to clear any more.
             TreeEvent::RefreshRequested => {
-                if let Some(spec) = self.active_conn_spec() {
-                    self.trigger_schema_fetch(spec, cx);
+                if let Some(id) = self.active_connection_id.clone() {
+                    if let Some(db) = self.effective_database() {
+                        self.start_schema_slot_fetch(id, db, cx);
+                    }
+                } else if self.conn_url.is_some() {
+                    self.start_schema_slot_fetch(CLI_CONN_IDENTITY.to_string(), String::new(), cx);
                 } else {
-                    self.schema_tree_connection_key = None;
-                    self.tree.update(cx, |t, cx| {
-                        t.clear(cx);
-                        t.set_admin_entry(admin_panel::AdminEntry::Hidden, cx);
-                    });
+                    self.refresh_tree_context(cx);
                 }
             }
             // G3 Task 4: a row's ★/☆ toggle (a table/view/routine/trigger/
@@ -6503,14 +6747,15 @@ impl AppView {
                 if !self.guard_corrupt_config(cx) {
                     return;
                 }
+                // Full-struct equality in `toggle_favourite` means the same
+                // table in two databases is two distinct favourites (T1's
+                // `toggle_favourite_distinguishes_databases` pin).
                 self.config.toggle_favourite(fav.clone());
                 self.status = match self.config.save(&self.config_path) {
                     Ok(()) => "Uloženo".to_string(),
                     Err(e) => format!("error saving config: {}", e.message),
                 };
-                let favourites = self.config.favourite_objects.clone();
-                let active_id = self.active_connection_id.clone();
-                self.tree.update(cx, |t, cx| t.set_favourites(favourites, active_id, cx));
+                self.refresh_tree_context(cx);
                 cx.notify();
             }
             TreeEvent::OpenErDiagram { schema } => {
@@ -6521,6 +6766,13 @@ impl AppView {
             }
             TreeEvent::OpenAdmin => {
                 self.open_admin_tab(cx);
+            }
+            TreeEvent::LoadDatabases { conn_id } => self.start_db_list_fetch(conn_id.clone(), cx),
+            TreeEvent::LoadSchema { conn_id, db } => {
+                self.start_schema_slot_fetch(conn_id.clone(), db.clone(), cx)
+            }
+            TreeEvent::SwitchToDatabase { conn_id, db } => {
+                self.switch_to_database(conn_id, db.clone(), cx)
             }
         }
     }
@@ -8066,7 +8318,15 @@ impl Render for AppView {
         // already closed again before this frame, just clear the flag.
         if self.modal_needs_focus {
             self.modal_needs_focus = false;
-            if self.modal.is_some() || self.discard_confirm.is_some() {
+            if let Some(connections_ui::ModalState::MasterPasswordPrompt { input, .. }) = &self.modal
+            {
+                // Sidebar rework: the tree's expand/switch vault gate opens
+                // this input-owning prompt from a cx-only subscribe callback
+                // — focus its field, same end state as the window-having
+                // openers (dropdown/test).
+                let focus = input.focus_handle(cx);
+                window.focus(&focus, cx);
+            } else if self.modal.is_some() || self.discard_confirm.is_some() {
                 window.focus(&self.modal_focus_handle, cx);
             }
         }
@@ -8602,9 +8862,9 @@ fn main() {
                             grouped_cache,
                             tree,
                             tree_visible: true,
-                            schema_fetch_generation: 0,
+                            sidebar_fetch_generation: 0,
                             compare_fetch_generation: 0,
-                            schema_tree_connection_key: None,
+                            pending_after_switch: None,
                             history,
                             history_visible: true,
                             history_search,
@@ -8627,13 +8887,16 @@ fn main() {
             .unwrap();
         cx.activate(true);
 
-        // CLI-arg back-compat startup path (brief contract #6): also fires
-        // the initial schema fetch, exactly like a dropdown connection
-        // switch does — `active_conn_spec` reads `conn_url` when no saved
-        // connection is active yet, which is always true this early.
+        // Sidebar rework startup wiring: seed the multi-root sidebar's
+        // connection roots + context (favourites/read_only/admin/scope/CLI
+        // url), then — CLI-arg back-compat path (brief contract #6) — fire
+        // the CLI slot's initial schema fetch, exactly like a switch does.
         let _ = window_handle.update(cx, |view, _window, cx| {
-            if let Some(spec) = view.active_conn_spec() {
-                view.trigger_schema_fetch(spec, cx);
+            let grouped = view.grouped_cache.clone();
+            view.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
+            view.refresh_tree_context(cx);
+            if view.conn_url.is_some() {
+                view.start_schema_slot_fetch(CLI_CONN_IDENTITY.to_string(), String::new(), cx);
             }
             // G3 Task 3 review fix: populate `history_cache` once at
             // startup (history panel defaults to visible) instead of
@@ -9343,8 +9606,9 @@ mod conn_identity_matches_tests {
 }
 
 // Sidebar rework T3: the `(connection, database)` identity widening —
-// `conn_identity_for`, `spec_for_database`, `conn_spec_key`, and the pure
-// core of `resolve_active`.
+// `conn_identity_for`, `spec_for_database`, and the pure core of
+// `resolve_active`. (`conn_spec_key` was deleted in T5 with its last
+// consumer, the single-root `trigger_schema_fetch`.)
 #[cfg(test)]
 mod identity_widening_tests {
     use super::*;
@@ -9370,16 +9634,6 @@ mod identity_widening_tests {
         ));
         // Bare pre-phase shape never equals the composite (defensive).
         assert!(!conn_identity_matches("conn-a", &conn_identity_for("conn-a", "sales")));
-    }
-
-    #[test]
-    fn conn_spec_key_distinguishes_databases() {
-        let mut cfg = test_cfg("conn-a", "sales");
-        let key_sales = conn_spec_key(&ConnectSpec::Config { cfg: Box::new(cfg.clone()), secret: None });
-        cfg.database = "inventory".into();
-        let key_inv = conn_spec_key(&ConnectSpec::Config { cfg: Box::new(cfg), secret: None });
-        assert_ne!(key_sales, key_inv);
-        assert_eq!(key_sales, "cfg:conn-a\u{1F}sales");
     }
 
     fn test_cfg(id: &str, db: &str) -> dbc_state::ConnectionConfig {
@@ -9426,6 +9680,71 @@ mod identity_widening_tests {
         assert!(a.read_only, "read_only inherits into every derived db (design §4.2)");
         // Deleted connection:
         assert!(resolve_active_from(&config, None, "gone", None).is_none());
+    }
+
+    /// Batch B review NIT 1: the "never rendered raw" doc claim must hold
+    /// in BOTH branches of the display translation — a hostile database
+    /// name containing `\u{1F}` renders visibly even when the connection
+    /// still exists.
+    #[test]
+    fn conn_name_for_identity_never_renders_the_raw_separator() {
+        let connections = vec![test_cfg("conn-a", "sales")];
+        // Found connection, non-default db: name / db.
+        assert_eq!(
+            conn_name_for_identity_from(&connections, &conn_identity_for("conn-a", "inventory")),
+            "prod / inventory"
+        );
+        // Found connection, default db: bare name.
+        assert_eq!(
+            conn_name_for_identity_from(&connections, &conn_identity_for("conn-a", "sales")),
+            "prod"
+        );
+        // Found connection, HOSTILE db name with an embedded separator —
+        // the found-connection branch must scrub it too (NIT 1's fix).
+        let rendered =
+            conn_name_for_identity_from(&connections, &conn_identity_for("conn-a", "x\u{1F}y"));
+        assert!(!rendered.contains('\u{1F}'), "raw separator leaked: {rendered:?}");
+        assert_eq!(rendered, "prod / x / y");
+        // Deleted connection: already-scrubbed fallback, unchanged.
+        let rendered =
+            conn_name_for_identity_from(&connections, &conn_identity_for("gone", "db"));
+        assert!(!rendered.contains('\u{1F}'));
+        assert_eq!(rendered, "gone / db");
+        // CLI sentinel untouched.
+        assert_eq!(conn_name_for_identity_from(&connections, CLI_CONN_IDENTITY), "cli");
+    }
+}
+
+// Sidebar rework T5: pure decision slices of `switch_to_database` (this
+// crate has no GPUI harness — the async/entity halves are covered by the
+// structural pins in the method itself).
+#[cfg(test)]
+mod switch_decision_tests {
+    use super::*;
+
+    #[test]
+    fn db_choice_normalizes_default_to_none() {
+        // The `.filter(|d| d != &cfg.database)` line in switch_to_database —
+        // pinned so identity/store-key/label logic keeps ONE canonical
+        // spelling for "the default database".
+        let default = "sales".to_string();
+        assert_eq!(Some("sales".to_string()).filter(|d| d != &default), None);
+        assert_eq!(
+            Some("inventory".to_string()).filter(|d| d != &default),
+            Some("inventory".to_string())
+        );
+    }
+
+    /// The queue is one-shot open-preview only (design §2.2): success
+    /// replays it, failure clears it — both arms are in switch_to_database
+    /// and structurally covered; this pins the enum stays single-variant
+    /// (a second queued kind needs its own design pass).
+    #[test]
+    fn pending_tree_action_is_open_preview_only() {
+        let a = PendingTreeAction::OpenPreview { schema: None, table: "t".into() };
+        match a {
+            PendingTreeAction::OpenPreview { .. } => {}
+        }
     }
 }
 

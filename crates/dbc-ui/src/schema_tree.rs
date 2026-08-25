@@ -9,20 +9,22 @@
 //      logic that turns a `SchemaSnapshot` + `expanded` set + `filter`
 //      string into the exact list of VISIBLE rows to render this frame.
 //      Unit-tested directly below, with no GPUI dependency at all.
-//   3. `SchemaTree` — the GPUI entity: owns the snapshot/expanded/filter/
-//      selection/loading/error state, renders via `uniform_list` (calling
-//      `flatten` fresh every frame — brief contract #2), and emits
+//   3. `SchemaTree` — the GPUI entity. Sidebar rework (T5): a multi-root
+//      sidebar — every saved connection is a root, expanding into its
+//      databases, each database into its own schema slot (`ConnNode`/
+//      `DbListState`/`DbSchemaState`); renders via `uniform_list` (calling
+//      `flatten_sidebar` fresh every frame — brief contract #2), and emits
 //      `TreeEvent`s for the things it can't handle itself (opening a
-//      preview/DDL tab, asking to be refreshed).
+//      preview/DDL tab, fetching a db list/schema slot, switching the
+//      active database).
 //
-// Fetch-lifecycle state (`loading`/`error`/`snapshot`) is driven by direct
-// entity mutation from `main.rs` (`set_loading`/`set_snapshot`/`set_error`/
-// `clear`), NOT by `TreeEvent` — the brief's `TreeEvent` enum only has
-// `OpenPreview`/`OpenDdl`/`RefreshRequested`, so lifecycle transitions have
-// no event variant to ride; `main.rs` already owns the `QueryRunner` and the
-// active connection spec, so it's the natural owner of "start a fetch,
-// update the tree entity when it resolves" too (see
-// `AppView::trigger_schema_fetch`).
+// Fetch-lifecycle state is driven by direct entity mutation from `main.rs`
+// (`begin_db_list`/`finish_db_list`/`begin_schema`/`finish_schema`), with
+// the FETCH REQUESTS themselves riding `TreeEvent::{LoadDatabases,
+// LoadSchema}` — `main.rs` owns the `QueryRunner`, the vault gate and the
+// spec resolution, so it remains the owner of "start a fetch, update the
+// tree entity when it resolves" (see `AppView::start_db_list_fetch`/
+// `start_schema_slot_fetch`).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -86,8 +88,15 @@ pub enum NodeId {
 /// Emitted by `SchemaTree` (`EventEmitter<TreeEvent>`) for the things it
 /// can't act on itself — `main.rs` subscribes and handles them.
 pub enum TreeEvent {
-    OpenPreview { schema: Option<String>, table: String },
+    /// WIDENED (sidebar rework, design §5 row 1): carries the scope of the
+    /// row that emitted it, so `main.rs` can switch-then-open across
+    /// contexts (an inactive-scope double-click queues the open and
+    /// switches first).
+    OpenPreview { conn_id: String, db: String, schema: Option<String>, table: String },
     OpenDdl { title: String, ddl: String },
+    /// Targets the ACTIVE `(connection, database)` slot (sidebar rework —
+    /// the ⟳ header button's semantics are unchanged from the single-root
+    /// era: refresh what the editor is talking to).
     RefreshRequested,
     /// G3 Task 4: the row's ★/☆ toggle was clicked (either a table/view/
     /// routine/trigger/sequence row, or an item already listed under
@@ -108,6 +117,19 @@ pub enum TreeEvent {
     /// defensively (belt-and-braces with the runner's shared read-only
     /// guard).
     OpenAdmin,
+    /// Sidebar rework: expand (or error-row retry) of a Connection row
+    /// whose database list is `NotLoaded`/`Error` — `main.rs` dispatches
+    /// `fetch_database_list` (vault-gated).
+    LoadDatabases { conn_id: String },
+    /// Sidebar rework: expand (or error-row retry) of a Database row whose
+    /// schema slot is `NotLoaded`/`Error` — `main.rs` dispatches
+    /// `fetch_schema` for that `(conn, db)` slot (vault-gated, design §4.4).
+    LoadSchema { conn_id: String, db: String },
+    /// Sidebar rework (design §2.1): double-click on a Database row
+    /// (`db: Some(..)`) or a Connection row (`db: None` = the saved
+    /// default) — `main.rs::switch_to_database` performs the context
+    /// switch. Expanding (chevron) never emits this: browsing ≠ switching.
+    SwitchToDatabase { conn_id: String, db: Option<String> },
 }
 
 /// One visible row: `(id, depth, label, is_expandable)`.
@@ -346,30 +368,6 @@ fn emit_sequence_section(
 /// forced open by an active speed-search filter — favourites are a small,
 /// flat, orthogonal-to-schema list, not something a filter needs to reach
 /// into.
-fn emit_favourites_section(
-    out: &mut Vec<FlatNode>,
-    favourites: &[FavouriteObject],
-    active_connection_id: Option<&str>,
-    expanded: &HashSet<NodeId>,
-) {
-    let Some(conn_id) = active_connection_id else { return };
-    let items: Vec<&FavouriteObject> = favourites.iter().filter(|f| f.connection_id == conn_id).collect();
-    if items.is_empty() {
-        return;
-    }
-    let section_id = NodeId::FavouriteSection;
-    out.push((section_id.clone(), 0, format!("Oblíbené ({})", items.len()), true));
-    if !expanded.contains(&section_id) {
-        return;
-    }
-    for f in items {
-        let schema_key = f.schema.clone().unwrap_or_default();
-        let label = if schema_key.is_empty() { f.name.clone() } else { format!("{}.{}", schema_key, f.name) };
-        let id = NodeId::Favourite(f.kind.clone(), schema_key, f.name.clone());
-        out.push((id, 1, label, false));
-    }
-}
-
 /// Emits all seven sections (fixed order: Tabulky, Pohledy, Funkce,
 /// Procedury, Triggery, Indexy, Sekvence) for one schema, at `depth`.
 fn emit_sections(
@@ -417,48 +415,20 @@ fn emit_sections(
     emit_sequence_section(out, &schema_name, seqs, depth, expanded, filter_lc, filter_active);
 }
 
-/// Pure, GPUI-free: computes exactly the visible rows for the current
-/// `snapshot`/`expanded`/`filter`. Called fresh every render (brief
-/// contract #2 — rows are cheap, snapshots can be thousands of objects).
+/// Sidebar rework (T4): the schema-only core of the old `flatten` (deleted
+/// in T5 — `flatten_sidebar` owns the pinned admin/favourites rows now,
+/// design §1.1). Schema grouping (contract #3): when every
+/// table/routine/trigger/sequence in `snapshot` has `schema: None` (SQLite
+/// has no schema concept), the schema level is a single implicit level and
+/// is omitted entirely — sections render straight at depth 0. Otherwise
+/// each distinct schema gets its own expandable `Schema` node at depth 0,
+/// with sections nested one level deeper once that schema is expanded.
 ///
-/// Schema grouping (contract #3): when every table/routine/trigger/sequence
-/// in `snapshot` has `schema: None` (SQLite has no schema concept), the
-/// schema level is a single implicit level and is omitted entirely —
-/// sections render straight at depth 0. Otherwise each distinct schema gets
-/// its own expandable `Schema` node at depth 0, with sections nested one
-/// level deeper once that schema is expanded.
-pub fn flatten(
-    snapshot: &SchemaSnapshot,
-    expanded: &HashSet<NodeId>,
-    filter: &str,
-    favourites: &[FavouriteObject],
-    active_connection_id: Option<&str>,
-    admin: AdminEntry,
-) -> Vec<FlatNode> {
-    let mut out = Vec::new();
-
-    // G10 T4 (design §2): the pinned "Správa serveru" row, when not
-    // Hidden, renders FIRST — above even "Oblíbené" below. Never
-    // expandable (`false`). Its greyed/disabled `Disabled` rendering lives
-    // in `SchemaTree::render` (this function only decides visibility, not
-    // styling).
-    if admin != AdminEntry::Hidden {
-        out.push((NodeId::AdminRoot, 0, "Správa serveru".to_string(), false));
-    }
-
-    // G3 Task 4: the "Oblíbené" section always comes first, ahead of any
-    // schema/section node below.
-    emit_favourites_section(&mut out, favourites, active_connection_id, expanded);
-
-    out.extend(flatten_schema(snapshot, expanded, filter));
-    out
-}
-
-/// Sidebar rework (T4): the schema-only core of `flatten` — the schema-key
-/// collection, the `single_implicit` decision, and the per-schema
-/// `emit_sections` loop, extracted verbatim so `flatten_sidebar` can splice
-/// one database's rows at an arbitrary depth without dragging the pinned
-/// admin/favourites rows along. Takes the RAW filter and lowercases
+/// The schema-key collection, the `single_implicit` decision, and the
+/// per-schema `emit_sections` loop were extracted verbatim so
+/// `flatten_sidebar` can splice one database's rows at an arbitrary depth
+/// without dragging the pinned admin/favourites rows along. Takes the RAW
+/// filter and lowercases
 /// internally (same convention as `flatten`, which it inherited the body
 /// from). Pure, GPUI-free; never fetches.
 pub fn flatten_schema(
@@ -594,19 +564,14 @@ fn prune_stale_ids(
 }
 
 // ---------------------------------------------------------------------
-// Sidebar rework (T4): ADDITIVE multi-root state layer + `flatten_sidebar`.
-//
-// ON-flip discipline (plan T4): NOTHING below is wired into rendering yet —
-// the old single-root `flatten` still drives the UI. T5 (the flip) is the
-// named removal owner of every `#[allow(dead_code)]` in this section: it
-// wires these types/functions into the `SchemaTree` entity, its render and
-// `main.rs`, and deletes the allows.
+// Sidebar rework (T4 state layer, wired into the entity/render by T5 —
+// the multi-root sidebar IS the UI now; the T4-era `#[allow(dead_code)]`
+// markers are gone with their owner's arrival).
 // ---------------------------------------------------------------------
 
 /// One row of the multi-root sidebar. `NodeId` itself is UNCHANGED
 /// (path-stable within one database) — the `(conn_id, db)` scope travels
 /// ALONGSIDE it in this wrapper, not inside it (design §1.1).
-#[allow(dead_code)] // removal owner: T5 (the flip) wires this into render.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SidebarRow {
     Folder { path: Vec<String> },
@@ -632,7 +597,6 @@ pub enum SidebarRow {
 /// storing the exception keeps old sessions looking unchanged), while
 /// presence of `Connection(_)`/`Database(..)`/`Favourites` means EXPANDED
 /// (they default CLOSED — lazy).
-#[allow(dead_code)] // removal owner: T5 (the flip) wires this into the entity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum OuterId {
     Folder(Vec<String>),
@@ -643,7 +607,6 @@ pub enum OuterId {
 
 /// The active `(connection, database)` context as the sidebar sees it —
 /// handed in by `main.rs` (T5) from `resolve_active`.
-#[allow(dead_code)] // removal owner: T5 (the flip) constructs this from resolve_active.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActiveScope {
     pub conn_id: String,
@@ -656,16 +619,13 @@ pub struct ActiveScope {
 
 /// Per-connection sidebar state: the lazily fetched database list, each
 /// entry carrying its own lazily fetched schema slot.
-#[allow(dead_code)] // removal owner: T5 (the flip) owns the state map on the entity.
 pub struct ConnNode {
-    pub id: String,
     pub dbs: DbListState,
 }
 
 /// Lazy-fetch state machine for one connection's database list (design
 /// §1.2): `generation` guards against a stale in-flight result clobbering a
 /// newer dispatch (`apply_db_list_result` drops mismatches).
-#[allow(dead_code)] // removal owner: T5 (the flip).
 pub enum DbListState {
     NotLoaded,
     Loading { generation: u64 },
@@ -676,7 +636,6 @@ pub enum DbListState {
 /// One database under a connection. `name` is the SPEC-LEVEL string (full
 /// file path for file engines — resolved deviation 5; `display_db_name`
 /// renders the stem).
-#[allow(dead_code)] // removal owner: T5 (the flip).
 pub struct DbNode {
     pub name: String,
     pub is_default: bool,
@@ -688,7 +647,6 @@ pub struct DbNode {
 /// slot must carry its expand-set forward through the Loading transition
 /// into `prune_stale_ids`, or the same-slot-refresh-preserves-expansion
 /// contract (design §1.2) is silently lost.
-#[allow(dead_code)] // removal owner: T5 (the flip).
 pub enum DbSchemaState {
     NotLoaded,
     Loading { generation: u64, prev_expanded: HashSet<NodeId> },
@@ -698,21 +656,18 @@ pub enum DbSchemaState {
 
 /// One visible sidebar row: `(row, depth, label, is_expandable)` — the
 /// multi-root analogue of `FlatNode`.
-#[allow(dead_code)] // removal owner: T5 (the flip) renders these rows.
 pub type SidebarFlatRow = (SidebarRow, usize, String, bool);
 
 /// Design §6: bounded snapshot cache — at most this many `(conn, db)`
 /// schema slots stay `Loaded` (LRU, never evicting the active slot). A
 /// `SchemaSnapshot` can be thousands of objects; eight covers real cross-db
 /// work while bounding memory on a hoarder server.
-#[allow(dead_code)] // removal owner: T5 (the flip).
 pub const LOADED_SNAPSHOT_CAP: usize = 8;
 
 /// Display label for a Database row: file engines show the file stem —
 /// the DATA MODEL keeps the full spec-level path (resolved deviation 5:
 /// a name that can't round-trip into `spec_for_database` must not live
 /// in `DbNode.name`).
-#[allow(dead_code)] // removal owner: T5 (the flip).
 pub fn display_db_name(engine: Engine, db: &str) -> String {
     if crate::connections_ui::engine_is_file_based(engine) {
         std::path::Path::new(db)
@@ -726,7 +681,6 @@ pub fn display_db_name(engine: Engine, db: &str) -> String {
 
 /// Design §5 row 9: a favourite belongs to the active scope when its
 /// connection matches AND its database-or-default equals the scope's db.
-#[allow(dead_code)] // removal owner: T5 (the flip).
 pub fn favourite_in_scope(f: &FavouriteObject, scope: &ActiveScope) -> bool {
     f.connection_id == scope.conn_id
         && f.database.as_deref().unwrap_or(&scope.default_db) == scope.db
@@ -736,7 +690,6 @@ pub fn favourite_in_scope(f: &FavouriteObject, scope: &ActiveScope) -> bool {
 /// (★/⊞/⇪) and DDL-header enablement — `Inner` rows of the ACTIVE scope
 /// and `Pinned` rows (active-context by definition) only. T5's render is
 /// the sole consumer; pure so the gating is testable without GPUI.
-#[allow(dead_code)] // removal owner: T5 (the flip).
 pub fn row_in_active_scope(row: &SidebarRow, scope: Option<&ActiveScope>) -> bool {
     match row {
         SidebarRow::Pinned(_) => scope.is_some(),
@@ -758,7 +711,6 @@ pub fn row_in_active_scope(row: &SidebarRow, scope: Option<&ActiveScope>) -> boo
 /// Transitions a schema slot into `Loading`, carrying the previous
 /// expand-set forward (from `Loaded` OR an in-flight `Loading` — a
 /// superseding dispatch must not lose it either).
-#[allow(dead_code)] // removal owner: T5 (the flip).
 pub fn begin_schema_load(slot: &mut DbSchemaState, generation: u64) {
     let prev_expanded = match std::mem::replace(slot, DbSchemaState::NotLoaded) {
         DbSchemaState::Loaded { expanded, .. } => expanded,
@@ -771,7 +723,6 @@ pub fn begin_schema_load(slot: &mut DbSchemaState, generation: u64) {
 /// Last-dispatched-wins: applies only while the slot is still Loading with
 /// the SAME generation; anything else means a newer dispatch superseded
 /// this result — drop it (design §1.2).
-#[allow(dead_code)] // removal owner: T5 (the flip).
 pub fn apply_schema_result(
     slot: &mut DbSchemaState,
     my_gen: u64,
@@ -795,7 +746,6 @@ pub fn apply_schema_result(
 }
 
 /// Transitions a connection's database list into `Loading`.
-#[allow(dead_code)] // removal owner: T5 (the flip).
 pub fn begin_db_list_load(node: &mut ConnNode, generation: u64) {
     // INVARIANT: only NotLoaded/Error re-dispatch (a Loaded list is cached;
     // re-expand is instant and the ⟳ refresh targets the active SCHEMA
@@ -810,7 +760,6 @@ pub fn begin_db_list_load(node: &mut ConnNode, generation: u64) {
 /// Last-dispatched-wins counterpart of `apply_schema_result` for the
 /// database list; marks `is_default` against the saved config's database
 /// and starts every schema slot at `NotLoaded` (lazy).
-#[allow(dead_code)] // removal owner: T5 (the flip).
 pub fn apply_db_list_result(
     node: &mut ConnNode,
     my_gen: u64,
@@ -840,7 +789,6 @@ pub fn apply_db_list_result(
 /// Design §6: bounded snapshot cache. Push `touched` to the back of `lru`
 /// (dedup), then evict `Loaded` slots beyond `LOADED_SNAPSHOT_CAP` back to
 /// `NotLoaded`, oldest first, NEVER the active slot.
-#[allow(dead_code)] // removal owner: T5 (the flip).
 pub fn touch_and_evict(
     states: &mut HashMap<String, ConnNode>,
     lru: &mut Vec<(String, String)>,
@@ -893,7 +841,6 @@ pub fn touch_and_evict(
 /// Speed search filters LOADED content only (binding, design §6): this
 /// function is pure over its inputs — typing can never trigger a fetch,
 /// which holds by construction.
-#[allow(dead_code)] // removal owner: T5 (the flip) calls this from render.
 pub fn flatten_sidebar(
     grouped: &crate::connections_ui::GroupedConnections,
     states: &HashMap<String, ConnNode>,
@@ -1077,7 +1024,6 @@ pub fn flatten_sidebar(
 /// `flatten` body verbatim, which did); `flatten_sidebar`'s own label
 /// matching uses its locally-lowercased copy. ONE convention per layer,
 /// pinned by `filter_narrows_loaded_content_and_matches_row_labels`.
-#[allow(dead_code)] // removal owner: T5 (the flip), together with flatten_sidebar.
 fn emit_schema_slot(
     out: &mut Vec<SidebarFlatRow>,
     conn_id: &str,
@@ -1146,12 +1092,35 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 pub struct SchemaTree {
-    snapshot: Option<SchemaSnapshot>,
-    expanded: HashSet<NodeId>,
+    /// Folder/favourite grouping of the saved connections — pushed by
+    /// `main.rs` (`sync_connections`) on startup and after every config
+    /// mutation; the tree never owns a second long-term copy of the config.
+    grouped: crate::connections_ui::GroupedConnections,
+    /// Per-connection lazy sidebar state, keyed by connection id. An id
+    /// missing from the map renders as `NotLoaded` (see `flatten_sidebar`),
+    /// but `sync_connections` keeps an entry per saved connection so
+    /// `begin_db_list` always has a slot to write into.
+    conns: HashMap<String, ConnNode>,
+    /// LRU order of `(conn_id, db)` schema-slot touches — `touch_and_evict`
+    /// bounds the number of `Loaded` snapshots at `LOADED_SNAPSHOT_CAP`.
+    lru: Vec<(String, String)>,
+    /// Expand state for the OUTER (multi-root) levels — see `OuterId`'s
+    /// polarity note (folders inverted: presence = collapsed).
+    outer_expanded: HashSet<OuterId>,
+    /// The active `(connection, database)` context, pushed by `main.rs`
+    /// (`set_active_scope` via `push_active_scope_to_tree`). `None` = CLI
+    /// context or no connection at all.
+    active_scope: Option<ActiveScope>,
+    /// The CLI-arg URL (design §3.4): renders a synthetic root whose schema
+    /// rows splice directly under it (no Database level — the CLI session
+    /// cannot switch databases). `None` once a saved connection has been
+    /// switched to (the CLI root disappears, and cannot come back).
+    cli_url: Option<String>,
+    /// The CLI root's schema slot (`conn_id == CLI_CONN_IDENTITY`,
+    /// `db == ""` in every `(conn, db)` API here).
+    cli_slot: DbSchemaState,
     filter: String,
-    selected: Option<NodeId>,
-    loading: bool,
-    error: Option<String>,
+    selected: Option<SidebarRow>,
     focus_handle: FocusHandle,
     /// The SQL editor's focus handle, handed in by `main.rs` at construction
     /// (it owns both entities) so `on_tree_escape` can blur the tree back to
@@ -1160,18 +1129,14 @@ pub struct SchemaTree {
     /// callback) — see `on_tree_escape`.
     editor_focus: FocusHandle,
     /// G3 Task 4: `AppConfig::favourite_objects`, pushed in by `main.rs`
-    /// (`set_favourites`) on every schema-fetch apply and after every ★
-    /// toggle — NOT filtered by connection here; `flatten`/`favourite_object_for`
-    /// do that filtering against `active_connection_id` below.
+    /// (`set_favourites`) on every tree-context refresh and after every ★
+    /// toggle — NOT filtered by connection here; `flatten_sidebar`/
+    /// `favourite_object_for` filter against `active_scope` (sidebar
+    /// rework: the old `active_connection_id` parameter is gone — the
+    /// scope subsumes it).
     favourites: Vec<FavouriteObject>,
-    /// The active connection's id (`AppView::active_connection_id`), handed
-    /// in alongside `favourites` by `set_favourites` — `None` for the
-    /// CLI-arg URL path (no `ConnectionConfig`/id to match favourites
-    /// against, so the "Oblíbené" section stays hidden) or before any
-    /// connection has been chosen.
-    active_connection_id: Option<String>,
     /// G12 T4: `AppView::active_read_only()`, pushed in alongside every
-    /// snapshot/favourites update (`main.rs::trigger_schema_fetch`) — gates
+    /// snapshot/favourites update (`main.rs::refresh_tree_context`) — gates
     /// the per-table-row "⇪" CSV-import affordance (CURATION item 4(b)'s
     /// entry-gate half: hidden entirely, not merely disabled, on a
     /// read-only connection).
@@ -1187,18 +1152,180 @@ pub struct SchemaTree {
 impl SchemaTree {
     pub fn new(cx: &mut Context<Self>, editor_focus: FocusHandle) -> Self {
         Self {
-            snapshot: None,
-            expanded: HashSet::new(),
+            grouped: crate::connections_ui::GroupedConnections::default(),
+            conns: HashMap::new(),
+            lru: Vec::new(),
+            outer_expanded: HashSet::new(),
+            active_scope: None,
+            cli_url: None,
+            cli_slot: DbSchemaState::NotLoaded,
             filter: String::new(),
             selected: None,
-            loading: false,
-            error: None,
             focus_handle: cx.focus_handle(),
             editor_focus,
             favourites: Vec::new(),
-            active_connection_id: None,
             read_only: false,
             admin_entry: AdminEntry::Hidden,
+        }
+    }
+
+    /// Sidebar rework: re-sync the saved-connection roots after a config
+    /// mutation (add/rename/delete/favourite/folder move). Keeps existing
+    /// per-connection state for still-present ids, seeds `NotLoaded` for
+    /// new ids, and drops removed ids (with their LRU entries).
+    pub fn sync_connections(
+        &mut self,
+        grouped: crate::connections_ui::GroupedConnections,
+        cx: &mut Context<Self>,
+    ) {
+        let ids: HashSet<String> = grouped
+            .favourites
+            .iter()
+            .chain(grouped.folders.iter().flat_map(|g| g.connections.iter()))
+            .map(|c| c.id.clone())
+            .collect();
+        self.conns.retain(|id, _| ids.contains(id));
+        for id in &ids {
+            self.conns
+                .entry(id.clone())
+                .or_insert_with(|| ConnNode { dbs: DbListState::NotLoaded });
+        }
+        self.lru.retain(|(c, _)| ids.contains(c));
+        self.grouped = grouped;
+        cx.notify();
+    }
+
+    /// Sidebar rework: the active `(connection, database)` context — drives
+    /// the ● indicator, icon gating, favourites filtering and `snapshot()`.
+    pub fn set_active_scope(&mut self, scope: Option<ActiveScope>, cx: &mut Context<Self>) {
+        self.active_scope = scope;
+        cx.notify();
+    }
+
+    /// Sidebar rework (design §3.4): the CLI synthetic root's URL. A switch
+    /// to a saved connection sets it `None` — the CLI root disappears for
+    /// good (its slot is dropped too; `conn_url` is never re-set).
+    pub fn set_cli(&mut self, url: Option<String>, cx: &mut Context<Self>) {
+        if url.is_none() {
+            self.cli_slot = DbSchemaState::NotLoaded;
+        }
+        self.cli_url = url;
+        cx.notify();
+    }
+
+    /// Transitions `conn_id`'s database list into `Loading` under
+    /// `generation` (no-op over a `Loaded` list — see `begin_db_list_load`).
+    pub fn begin_db_list(&mut self, conn_id: &str, generation: u64, cx: &mut Context<Self>) {
+        if let Some(node) = self.conns.get_mut(conn_id) {
+            begin_db_list_load(node, generation);
+            cx.notify();
+        }
+    }
+
+    /// Applies a database-list result (stale generations dropped by
+    /// `apply_db_list_result` — last-dispatched wins).
+    pub fn finish_db_list(
+        &mut self,
+        conn_id: &str,
+        generation: u64,
+        result: Result<(Vec<String>, bool), String>,
+        default_db: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(node) = self.conns.get_mut(conn_id) {
+            apply_db_list_result(node, generation, result, default_db);
+            cx.notify();
+        }
+    }
+
+    /// Transitions one `(conn, db)` schema slot into `Loading`
+    /// (`CLI_CONN_IDENTITY` targets the CLI slot; `db` is ignored there).
+    pub fn begin_schema(&mut self, conn_id: &str, db: &str, generation: u64, cx: &mut Context<Self>) {
+        if conn_id == crate::CLI_CONN_IDENTITY {
+            begin_schema_load(&mut self.cli_slot, generation);
+        } else if let Some(slot) = self.slot_mut(conn_id, db) {
+            begin_schema_load(slot, generation);
+        } else {
+            // No such slot (list not loaded / db vanished) — the fetch
+            // result will be dropped by the generation check anyway.
+            return;
+        }
+        cx.notify();
+    }
+
+    /// Applies a schema-fetch result to its slot (stale generations dropped
+    /// by `apply_schema_result`) and drives the LRU cap — the ACTIVE slot
+    /// is never evicted (`touch_and_evict`).
+    pub fn finish_schema(
+        &mut self,
+        conn_id: &str,
+        db: &str,
+        generation: u64,
+        result: Result<SchemaSnapshot, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if conn_id == crate::CLI_CONN_IDENTITY {
+            apply_schema_result(&mut self.cli_slot, generation, result);
+            cx.notify();
+            return;
+        }
+        let Some(slot) = self.slot_mut(conn_id, db) else { return };
+        apply_schema_result(slot, generation, result);
+        let active = self.active_scope.as_ref().map(|s| (s.conn_id.clone(), s.db.clone()));
+        touch_and_evict(
+            &mut self.conns,
+            &mut self.lru,
+            (conn_id.to_string(), db.to_string()),
+            active.as_ref(),
+        );
+        cx.notify();
+    }
+
+    /// Vault-prompt cancel path (design §1.3): the user declined — collapse
+    /// the row back; its state stays `NotLoaded`, no error row.
+    pub fn collapse_connection(&mut self, conn_id: &str, cx: &mut Context<Self>) {
+        self.outer_expanded.remove(&OuterId::Connection(conn_id.to_string()));
+        cx.notify();
+    }
+
+    /// Mutable access to one `(conn, db)` schema slot (saved connections
+    /// only — the CLI slot is special-cased by callers).
+    fn slot_mut(&mut self, conn_id: &str, db: &str) -> Option<&mut DbSchemaState> {
+        let DbListState::Loaded { dbs, .. } = &mut self.conns.get_mut(conn_id)?.dbs else {
+            return None;
+        };
+        dbs.iter_mut().find(|d| d.name == db).map(|d| &mut d.schema)
+    }
+
+    /// Immutable sibling of `slot_mut` (CLI slot for the
+    /// `CLI_CONN_IDENTITY` id, any `db`).
+    fn slot_ref(&self, conn_id: &str, db: &str) -> Option<&DbSchemaState> {
+        if conn_id == crate::CLI_CONN_IDENTITY {
+            return Some(&self.cli_slot);
+        }
+        let DbListState::Loaded { dbs, .. } = &self.conns.get(conn_id)?.dbs else { return None };
+        dbs.iter().find(|d| d.name == db).map(|d| &d.schema)
+    }
+
+    /// One `(conn, db)` slot's snapshot, if `Loaded`.
+    fn snapshot_for(&self, conn_id: &str, db: &str) -> Option<&SchemaSnapshot> {
+        match self.slot_ref(conn_id, db)? {
+            DbSchemaState::Loaded { snapshot, .. } => Some(snapshot),
+            _ => None,
+        }
+    }
+
+    /// Sidebar rework (T6's compare picker): the fetched database list for
+    /// `conn_id`, with its truncation flag, if `Loaded`.
+    ///
+    /// Allow dead_code: T5 lands ahead of T6's consumer (the compare
+    /// dialog's per-connection database sub-pick). Remove once T6 wires it
+    /// in.
+    #[allow(dead_code)]
+    pub fn db_list_for(&self, conn_id: &str) -> Option<(&[DbNode], bool)> {
+        match &self.conns.get(conn_id)?.dbs {
+            DbListState::Loaded { dbs, truncated } => Some((dbs.as_slice(), *truncated)),
+            _ => None,
         }
     }
 
@@ -1214,39 +1341,46 @@ impl SchemaTree {
         cx.notify();
     }
 
-    /// Called by `main.rs` on every schema-fetch apply (`trigger_schema_fetch`)
-    /// and again right after a ★ toggle resolves (`config.toggle_favourite` +
-    /// guarded save) — `flatten`'s "Oblíbené" section and every row's star
-    /// state are recomputed fresh from these two fields on the very next
-    /// render, same as `snapshot`/`expanded`/`filter`.
-    pub fn set_favourites(
-        &mut self,
-        favourites: Vec<FavouriteObject>,
-        active_connection_id: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
+    /// Called by `main.rs` on every tree-context refresh
+    /// (`refresh_tree_context`) and again right after a ★ toggle resolves
+    /// (`config.toggle_favourite` + guarded save) — the "Oblíbené" section
+    /// and every row's star state are recomputed fresh from this field on
+    /// the very next render. Sidebar rework: the old `active_connection_id`
+    /// parameter is gone — filtering runs against `active_scope`
+    /// (`favourite_in_scope`, design §5 row 9).
+    pub fn set_favourites(&mut self, favourites: Vec<FavouriteObject>, cx: &mut Context<Self>) {
         self.favourites = favourites;
-        self.active_connection_id = active_connection_id;
         cx.notify();
     }
 
-    /// The `FavouriteObject` a given row's ★/☆ toggle targets, or `None` for
-    /// rows that don't support favouriting (`Schema`/`Section`/`Column`/
-    /// `Index`) and whenever there's no active connection id to stamp onto a
-    /// new `FavouriteObject` (can't build one — and `is_favourite` would
-    /// never match one from a different connection anyway). For
-    /// `NodeId::Table`, the table/view distinction (`kind: "table"|"view"`)
-    /// is looked up from `self.snapshot` since the node id alone doesn't
-    /// carry it; a table that's since vanished from the snapshot (a rename/
-    /// drop raced with the click) safely yields `None` rather than guessing.
-    fn favourite_object_for(&self, id: &NodeId) -> Option<FavouriteObject> {
-        let connection_id = self.active_connection_id.clone()?;
+    /// The `FavouriteObject` a given row's ★/☆ toggle targets, or `None`
+    /// for rows that don't support favouriting and for every row OUTSIDE
+    /// the active scope (design §5 row 1: cross-context ambient actions
+    /// don't exist; CLI rows have no connection id to stamp — `None` too,
+    /// pre-rework posture). For `NodeId::Table`, the table/view distinction
+    /// is looked up from the ACTIVE slot's snapshot; a table that's since
+    /// vanished (a rename/drop raced with the click) safely yields `None`.
+    /// Stamps `database`: `Some(db)` for a non-default active db, `None`
+    /// for the default (design §5 row 9's back-compat rule — existing
+    /// favourites keep meaning what they meant).
+    fn favourite_object_for(&self, row: &SidebarRow) -> Option<FavouriteObject> {
+        let scope = self.active_scope.as_ref()?;
+        let node = match row {
+            SidebarRow::Inner { conn_id, db, node }
+                if conn_id == &scope.conn_id && db == &scope.db =>
+            {
+                node
+            }
+            SidebarRow::Pinned(node @ NodeId::Favourite(..)) => node,
+            _ => return None,
+        };
+        let database = (scope.db != scope.default_db).then(|| scope.db.clone());
+        let connection_id = scope.conn_id.clone();
         let schema_opt = |s: &str| if s.is_empty() { None } else { Some(s.to_string()) };
-        match id {
+        match node {
             NodeId::Table(schema, name) => {
                 let kind = self
-                    .snapshot
-                    .as_ref()?
+                    .snapshot()?
                     .tables
                     .iter()
                     .find(|t| &t.name == name && &schema_key_string(&t.schema) == schema)
@@ -1254,121 +1388,110 @@ impl SchemaTree {
                         TableKind::Table => "table",
                         TableKind::View | TableKind::MaterializedView => "view",
                     })?;
-                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: kind.to_string(), database: None })
+                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: kind.to_string(), database })
             }
             NodeId::Routine(schema, name) => {
-                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: "routine".into(), database: None })
+                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: "routine".into(), database })
             }
             NodeId::Trigger(schema, name) => {
-                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: "trigger".into(), database: None })
+                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: "trigger".into(), database })
             }
             NodeId::Sequence(schema, name) => {
-                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: "sequence".into(), database: None })
+                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: "sequence".into(), database })
             }
             NodeId::Favourite(kind, schema, name) => {
-                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: kind.clone(), database: None })
+                Some(FavouriteObject { connection_id, schema: schema_opt(schema), name: name.clone(), kind: kind.clone(), database })
             }
             _ => None,
         }
     }
 
-    /// Called by `AppView::trigger_schema_fetch` right before dispatching
-    /// `runner.fetch_schema` — shows the "Načítám…" row until the fetch
-    /// resolves via `set_snapshot`/`set_error`.
-    pub fn set_loading(&mut self, cx: &mut Context<Self>) {
-        self.loading = true;
-        self.error = None;
-        cx.notify();
-    }
-
-    /// `same_connection` (passed by the caller, `AppView::trigger_schema_fetch`,
-    /// which knows whether this snapshot is a refresh of the connection
-    /// already shown or a switch to a different one — see
-    /// `conn_spec_key`/`schema_tree_connection_key` in `main.rs`) decides
-    /// what happens to `expanded`/`filter`/`selected`:
-    ///
-    /// - Same connection (e.g. a ⟳ refresh): preserved. `NodeId`'s
-    ///   path-based stability (see the module doc comment) means ids for
-    ///   unchanged objects come back identical, so `prune_stale_ids` only
-    ///   needs to drop the ones that no longer exist (a table/column that
-    ///   was dropped since the last fetch) rather than resetting everything.
-    /// - Different connection: reset entirely, since the new snapshot may
-    ///   describe a completely different database — stale node ids (and a
-    ///   stale filter hiding everything) would be actively misleading.
-    pub fn set_snapshot(&mut self, snapshot: SchemaSnapshot, same_connection: bool, cx: &mut Context<Self>) {
-        if same_connection {
-            let (expanded, selected) = prune_stale_ids(&self.expanded, &self.selected, &snapshot);
-            self.expanded = expanded;
-            self.selected = selected;
-        } else {
-            self.expanded.clear();
-            self.filter.clear();
-            self.selected = None;
-        }
-        self.snapshot = Some(snapshot);
-        self.loading = false;
-        self.error = None;
-        cx.notify();
-    }
-
-    /// G3 Task 5: read-only access to the current snapshot for the command
-    /// palette's table/view source (`main.rs`'s `build_palette_items`) —
-    /// `None` before any fetch has resolved, same as every other accessor
-    /// here.
+    /// The ACTIVE context's snapshot — same signature as the single-root
+    /// era so every `main.rs` consumer (fk lookups, editable detection,
+    /// palette items, autocomplete, admin schema seed) compiles untouched.
+    /// The CLI slot answers when no saved connection is active and a CLI
+    /// URL exists.
     pub fn snapshot(&self) -> Option<&SchemaSnapshot> {
-        self.snapshot.as_ref()
+        if let Some(scope) = &self.active_scope {
+            return self.snapshot_for(&scope.conn_id, &scope.db);
+        }
+        if self.cli_url.is_some() {
+            if let DbSchemaState::Loaded { snapshot, .. } = &self.cli_slot {
+                return Some(snapshot);
+            }
+        }
+        None
     }
 
-    pub fn set_error(&mut self, message: String, cx: &mut Context<Self>) {
-        self.loading = false;
-        self.error = Some(message);
-        cx.notify();
-    }
-
-    /// Back to "Bez připojení" — used when there's no active connection to
-    /// fetch a schema for (e.g. a `RefreshRequested` with nothing to
-    /// refresh).
-    pub fn clear(&mut self, cx: &mut Context<Self>) {
-        self.snapshot = None;
-        self.loading = false;
-        self.error = None;
-        self.expanded.clear();
-        self.filter.clear();
-        self.selected = None;
-        cx.notify();
-    }
-
-    fn toggle_expand(&mut self, id: &NodeId) {
-        if !self.expanded.remove(id) {
-            self.expanded.insert(id.clone());
+    /// Chevron/double-click on an Inner row: toggles the `NodeId` in ITS
+    /// slot's expand set (kept per-slot so collapsing a database and
+    /// re-expanding it restores the inner shape — design §1.2).
+    fn toggle_inner(&mut self, conn_id: &str, db: &str, node: &NodeId) {
+        let slot = if conn_id == crate::CLI_CONN_IDENTITY {
+            Some(&mut self.cli_slot)
+        } else {
+            self.slot_mut(conn_id, db)
+        };
+        if let Some(DbSchemaState::Loaded { expanded, .. }) = slot {
+            if !expanded.remove(node) {
+                expanded.insert(node.clone());
+            }
         }
     }
 
-    fn find_routine_ddl(&self, schema: &str, name: &str) -> Option<String> {
-        self.snapshot
-            .as_ref()?
+    /// Chevron on a Folder/Connection/Database/FavouriteSection row.
+    /// Folders are INVERTED (presence in the set = collapsed; they default
+    /// open — see `OuterId`'s doc comment); everything else presence = open.
+    fn toggle_outer(&mut self, row: &SidebarRow) {
+        let id = match row {
+            SidebarRow::Folder { path } => OuterId::Folder(path.clone()),
+            SidebarRow::Connection { conn_id } => OuterId::Connection(conn_id.clone()),
+            SidebarRow::Database { conn_id, db } => OuterId::Database(conn_id.clone(), db.clone()),
+            SidebarRow::Pinned(NodeId::FavouriteSection) => OuterId::Favourites,
+            _ => return,
+        };
+        if !self.outer_expanded.remove(&id) {
+            self.outer_expanded.insert(id);
+        }
+    }
+
+    fn find_routine_ddl_in(&self, conn_id: &str, db: &str, schema: &str, name: &str) -> Option<String> {
+        self.snapshot_for(conn_id, db)?
             .routines
             .iter()
             .find(|r| r.name == name && schema_key_string(&r.schema) == schema)
             .and_then(|r| r.ddl.clone())
     }
 
-    fn find_trigger_ddl(&self, schema: &str, name: &str) -> Option<String> {
-        self.snapshot
-            .as_ref()?
+    fn find_trigger_ddl_in(&self, conn_id: &str, db: &str, schema: &str, name: &str) -> Option<String> {
+        self.snapshot_for(conn_id, db)?
             .triggers
             .iter()
             .find(|t| t.name == name && schema_key_string(&t.schema) == schema)
             .and_then(|t| t.ddl.clone())
     }
 
-    /// The currently-selected table/view's `TableInfo`, if `selected` points
-    /// at one — used both to decide whether the header's "DDL" button is
-    /// enabled and, on click, to build the DDL it opens (`handle_generate_ddl`).
+    /// The currently-selected table/view's `TableInfo`, if `selected` is an
+    /// `Inner` Table row AT THE ACTIVE SCOPE (design §5 row 1: the DDL
+    /// header button is an ambient action — cross-context rows don't arm
+    /// it) — looked up in `snapshot()`, the active slot.
     fn selected_table(&self) -> Option<&TableInfo> {
-        let NodeId::Table(schema, name) = self.selected.as_ref()? else { return None };
-        self.snapshot
-            .as_ref()?
+        let Some(SidebarRow::Inner { conn_id, db, node: NodeId::Table(schema, name) }) =
+            self.selected.as_ref()
+        else {
+            return None;
+        };
+        if !row_in_active_scope(
+            &SidebarRow::Inner {
+                conn_id: conn_id.clone(),
+                db: db.clone(),
+                node: NodeId::Table(schema.clone(), name.clone()),
+            },
+            self.active_scope.as_ref(),
+        ) {
+            return None;
+        }
+        self.snapshot()?
             .tables
             .iter()
             .find(|t| &t.name == name && &schema_key_string(&t.schema) == schema)
@@ -1388,49 +1511,207 @@ impl SchemaTree {
         cx.emit(TreeEvent::OpenDdl { title: t.name.clone(), ddl });
     }
 
-    /// Contract #4: double-click table/view -> `OpenPreview`; double-click
-    /// routine/trigger -> `OpenDdl` (fallback text when no `ddl`);
-    /// otherwise toggle expand.
-    fn handle_double_click(&mut self, id: &NodeId, cx: &mut Context<Self>) {
-        self.selected = Some(id.clone());
-        match id {
-            NodeId::Table(schema, name) => {
-                let schema = if schema.is_empty() { None } else { Some(schema.clone()) };
-                cx.emit(TreeEvent::OpenPreview { schema, table: name.clone() });
+    /// Contract #4, widened over `SidebarRow` (sidebar rework): double-click
+    /// table/view -> `OpenPreview` (scope-stamped); routine/trigger ->
+    /// `OpenDdl`; Database/Connection rows -> `SwitchToDatabase` (design
+    /// §2.1 — a double-click on the ALREADY-active row is a no-op inside
+    /// `switch_to_database`'s identity check); otherwise toggle expand.
+    fn handle_double_click(&mut self, row: &SidebarRow, cx: &mut Context<Self>) {
+        self.selected = Some(row.clone());
+        match row {
+            // Design §2.1: double-click on a Database row switches; on a
+            // Connection row switches to the DEFAULT db (dropdown parity).
+            // Expanding (chevron) never switches — browsing ≠ switching.
+            SidebarRow::Database { conn_id, db } => cx.emit(TreeEvent::SwitchToDatabase {
+                conn_id: conn_id.clone(),
+                db: Some(db.clone()),
+            }),
+            SidebarRow::Connection { conn_id } if conn_id != crate::CLI_CONN_IDENTITY => {
+                cx.emit(TreeEvent::SwitchToDatabase { conn_id: conn_id.clone(), db: None })
             }
-            NodeId::Routine(schema, name) => {
-                let ddl = self.find_routine_ddl(schema, name).unwrap_or_else(|| DDL_FALLBACK.to_string());
-                cx.emit(TreeEvent::OpenDdl { title: name.clone(), ddl });
-            }
-            NodeId::Trigger(schema, name) => {
-                let ddl = self.find_trigger_ddl(schema, name).unwrap_or_else(|| DDL_FALLBACK.to_string());
-                cx.emit(TreeEvent::OpenDdl { title: name.clone(), ddl });
-            }
-            // G3 Task 4: a favourites-section row uses the same double-click
-            // semantics as its counterpart elsewhere in the tree — table/view
-            // -> OpenPreview, routine/trigger -> OpenDdl. Sequences have no
-            // double-click action anywhere in the tree, so that's a no-op
-            // here too (falls through without emitting).
-            NodeId::Favourite(kind, schema, name) => {
-                let schema_opt = if schema.is_empty() { None } else { Some(schema.clone()) };
-                match kind.as_str() {
-                    "table" | "view" => {
-                        cx.emit(TreeEvent::OpenPreview { schema: schema_opt, table: name.clone() });
+            // The CLI root cannot switch (design §3.4) — double-click just
+            // toggles it, same as a folder.
+            SidebarRow::Connection { .. } | SidebarRow::Folder { .. } => self.toggle_outer(row),
+            SidebarRow::Inner { conn_id, db, node } => match node {
+                NodeId::Table(schema, name) => {
+                    let schema = if schema.is_empty() { None } else { Some(schema.clone()) };
+                    cx.emit(TreeEvent::OpenPreview {
+                        conn_id: conn_id.clone(),
+                        db: db.clone(),
+                        schema,
+                        table: name.clone(),
+                    });
+                }
+                NodeId::Routine(schema, name) => {
+                    let ddl = self
+                        .find_routine_ddl_in(conn_id, db, schema, name)
+                        .unwrap_or_else(|| DDL_FALLBACK.to_string());
+                    cx.emit(TreeEvent::OpenDdl { title: name.clone(), ddl });
+                }
+                NodeId::Trigger(schema, name) => {
+                    let ddl = self
+                        .find_trigger_ddl_in(conn_id, db, schema, name)
+                        .unwrap_or_else(|| DDL_FALLBACK.to_string());
+                    cx.emit(TreeEvent::OpenDdl { title: name.clone(), ddl });
+                }
+                // Everything else (Schema/Section/Column/Index/…): toggle
+                // the row's SLOT-LOCAL inner expand set.
+                other => {
+                    let (conn_id, db, other) = (conn_id.clone(), db.clone(), other.clone());
+                    self.toggle_inner(&conn_id, &db, &other);
+                }
+            },
+            // Pinned favourite rows keep the pre-flip semantics verbatim,
+            // resolved against the ACTIVE slot's snapshot: table/view →
+            // OpenPreview (with the active scope's conn/db), routine/
+            // trigger → OpenDdl, sequence → no-op; the section header
+            // toggles `OuterId::Favourites`; AdminRoot double-click is a
+            // no-op (single click handles it, as today).
+            SidebarRow::Pinned(node) => {
+                if let (NodeId::Favourite(kind, schema, name), Some(scope)) =
+                    (node, self.active_scope.clone())
+                {
+                    let schema_opt = if schema.is_empty() { None } else { Some(schema.clone()) };
+                    match kind.as_str() {
+                        "table" | "view" => cx.emit(TreeEvent::OpenPreview {
+                            conn_id: scope.conn_id,
+                            db: scope.db,
+                            schema: schema_opt,
+                            table: name.clone(),
+                        }),
+                        "routine" => {
+                            let ddl = self
+                                .find_routine_ddl_in(&scope.conn_id, &scope.db, schema, name)
+                                .unwrap_or_else(|| DDL_FALLBACK.to_string());
+                            cx.emit(TreeEvent::OpenDdl { title: name.clone(), ddl });
+                        }
+                        "trigger" => {
+                            let ddl = self
+                                .find_trigger_ddl_in(&scope.conn_id, &scope.db, schema, name)
+                                .unwrap_or_else(|| DDL_FALLBACK.to_string());
+                            cx.emit(TreeEvent::OpenDdl { title: name.clone(), ddl });
+                        }
+                        _ => {}
                     }
-                    "routine" => {
-                        let ddl = self.find_routine_ddl(schema, name).unwrap_or_else(|| DDL_FALLBACK.to_string());
-                        cx.emit(TreeEvent::OpenDdl { title: name.clone(), ddl });
+                } else if matches!(node, NodeId::FavouriteSection) {
+                    if !self.outer_expanded.remove(&OuterId::Favourites) {
+                        self.outer_expanded.insert(OuterId::Favourites);
                     }
-                    "trigger" => {
-                        let ddl = self.find_trigger_ddl(schema, name).unwrap_or_else(|| DDL_FALLBACK.to_string());
-                        cx.emit(TreeEvent::OpenDdl { title: name.clone(), ddl });
-                    }
-                    _ => {}
                 }
             }
-            _ => self.toggle_expand(id),
+            SidebarRow::Notice { .. } => {}
         }
         cx.notify();
+    }
+
+    /// Chevron click. Expanding a Connection whose db list is
+    /// `NotLoaded`/`Error` ALSO emits `LoadDatabases`; expanding a Database
+    /// whose schema slot is `NotLoaded`/`Error` ALSO emits `LoadSchema`
+    /// (lazy, design §1.2 — collapsing/re-expanding a cached slot fetches
+    /// nothing). The CLI root's slot re-fetch rides `LoadSchema` with
+    /// `db == ""`.
+    fn handle_chevron(&mut self, row: &SidebarRow, cx: &mut Context<Self>) {
+        match row {
+            SidebarRow::Folder { .. } | SidebarRow::Pinned(NodeId::FavouriteSection) => {
+                self.toggle_outer(row)
+            }
+            SidebarRow::Connection { conn_id } => {
+                let was_expanded =
+                    self.outer_expanded.contains(&OuterId::Connection(conn_id.clone()));
+                self.toggle_outer(row);
+                if !was_expanded {
+                    if conn_id == crate::CLI_CONN_IDENTITY {
+                        if matches!(self.cli_slot, DbSchemaState::NotLoaded | DbSchemaState::Error(_)) {
+                            cx.emit(TreeEvent::LoadSchema {
+                                conn_id: conn_id.clone(),
+                                db: String::new(),
+                            });
+                        }
+                    } else if matches!(
+                        self.conns.get(conn_id).map(|n| &n.dbs),
+                        None | Some(DbListState::NotLoaded) | Some(DbListState::Error(_))
+                    ) {
+                        cx.emit(TreeEvent::LoadDatabases { conn_id: conn_id.clone() });
+                    }
+                }
+            }
+            SidebarRow::Database { conn_id, db } => {
+                let was_expanded = self
+                    .outer_expanded
+                    .contains(&OuterId::Database(conn_id.clone(), db.clone()));
+                self.toggle_outer(row);
+                if !was_expanded
+                    && matches!(
+                        self.slot_ref(conn_id, db),
+                        None | Some(DbSchemaState::NotLoaded) | Some(DbSchemaState::Error(_))
+                    )
+                {
+                    cx.emit(TreeEvent::LoadSchema { conn_id: conn_id.clone(), db: db.clone() });
+                }
+            }
+            SidebarRow::Inner { conn_id, db, node } => {
+                let (conn_id, db, node) = (conn_id.clone(), db.clone(), node.clone());
+                self.toggle_inner(&conn_id, &db, &node);
+            }
+            SidebarRow::Pinned(_) | SidebarRow::Notice { .. } => {}
+        }
+        cx.notify();
+    }
+
+    /// Single click: select. `Notice { retry: true }` rows instead RE-EMIT
+    /// their Load event (`db: None` → `LoadDatabases`, `Some` →
+    /// `LoadSchema`); the pinned AdminRoot keeps its pre-rework "click
+    /// opens when Enabled, never selects" semantics.
+    fn handle_single_click(&mut self, row: &SidebarRow, cx: &mut Context<Self>) {
+        match row {
+            SidebarRow::Notice { conn_id, db, retry: true, .. } => match db {
+                None => cx.emit(TreeEvent::LoadDatabases { conn_id: conn_id.clone() }),
+                Some(db) => cx.emit(TreeEvent::LoadSchema {
+                    conn_id: conn_id.clone(),
+                    db: db.clone(),
+                }),
+            },
+            SidebarRow::Notice { .. } => {}
+            SidebarRow::Pinned(NodeId::AdminRoot) => {
+                if self.admin_entry == AdminEntry::Enabled {
+                    cx.emit(TreeEvent::OpenAdmin);
+                }
+            }
+            _ => {
+                self.selected = Some(row.clone());
+            }
+        }
+        cx.notify();
+    }
+
+    /// The ▾/▸ chevron state for one row — outer rows read `outer_expanded`
+    /// (folders inverted), Inner rows read their slot's expand set (with
+    /// the same filter-active auto-expand `flatten_schema` applies).
+    fn row_is_expanded(&self, row: &SidebarRow) -> bool {
+        match row {
+            SidebarRow::Folder { path } => {
+                !self.outer_expanded.contains(&OuterId::Folder(path.clone()))
+            }
+            SidebarRow::Connection { conn_id } => {
+                self.outer_expanded.contains(&OuterId::Connection(conn_id.clone()))
+            }
+            SidebarRow::Database { conn_id, db } => self
+                .outer_expanded
+                .contains(&OuterId::Database(conn_id.clone(), db.clone())),
+            SidebarRow::Pinned(NodeId::FavouriteSection) => {
+                self.outer_expanded.contains(&OuterId::Favourites)
+            }
+            SidebarRow::Inner { conn_id, db, node } => {
+                if !self.filter.is_empty() {
+                    return true; // filter auto-expands (mirrors `is_expanded`)
+                }
+                match self.slot_ref(conn_id, db) {
+                    Some(DbSchemaState::Loaded { expanded, .. }) => expanded.contains(node),
+                    _ => false,
+                }
+            }
+            SidebarRow::Pinned(_) | SidebarRow::Notice { .. } => false,
+        }
     }
 
     /// Esc: clears an active filter and consumes the keystroke; with an
@@ -1488,20 +1769,22 @@ impl Focusable for SchemaTree {
 
 impl Render for SchemaTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = self
-            .snapshot
-            .as_ref()
-            .map(|s| {
-                flatten(
-                    s,
-                    &self.expanded,
-                    &self.filter,
-                    &self.favourites,
-                    self.active_connection_id.as_deref(),
-                    self.admin_entry,
-                )
-            })
-            .unwrap_or_default();
+        // Sidebar rework: the multi-root flatten, fresh every frame (brief
+        // contract #2 unchanged). Pure over entity state — typing in the
+        // speed search can never trigger a fetch (design §6, binding).
+        let rows = flatten_sidebar(
+            &self.grouped,
+            &self.conns,
+            self.cli_url.as_deref().map(|u| (u, &self.cli_slot)),
+            &self.outer_expanded,
+            &self.filter,
+            self.active_scope.as_ref(),
+            &self.favourites,
+            self.admin_entry,
+        );
+        let no_roots = self.grouped.favourites.is_empty()
+            && self.grouped.folders.is_empty()
+            && self.cli_url.is_none();
 
         let header_label =
             if self.filter.is_empty() { "Strom schémat".to_string() } else { format!("Strom schémat [{}]", self.filter) };
@@ -1567,11 +1850,10 @@ impl Render for SchemaTree {
             )
             .child(header);
 
-        if self.loading {
-            root = root.child(div().px_2().py_1().text_color(cx.theme().text_muted).child("Načítám…"));
-        } else if let Some(err) = &self.error {
-            root = root.child(div().px_2().py_1().text_color(cx.theme().danger).child(format!("error: {err}")));
-        } else if self.snapshot.is_none() {
+        if no_roots {
+            // The single-root era's whole-panel loading/error states are
+            // GONE — per-row Notice rows carry them now. Only the true
+            // empty state remains: no saved connections AND no CLI URL.
             root = root.child(div().px_2().py_1().text_color(cx.theme().text_disabled).child("Bez připojení"));
         } else {
             root = root.child(
@@ -1581,24 +1863,72 @@ impl Render for SchemaTree {
                     cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
                         let mut items = Vec::with_capacity(range.len());
                         for ix in range {
-                            let (id, depth, label, expandable) = rows[ix].clone();
-                            let is_expanded = this.expanded.contains(&id);
-                            let is_selected = this.selected.as_ref() == Some(&id);
+                            let (row_id, depth, label, expandable) = rows[ix].clone();
+                            let is_expanded = this.row_is_expanded(&row_id);
+                            let is_selected = this.selected.as_ref() == Some(&row_id);
                             let chevron = if expandable {
                                 if is_expanded { "▾" } else { "▸" }
                             } else {
                                 " "
                             };
+                            // Design §5 row 1: ambient action icons (★/⊞/⇪)
+                            // render ONLY on active-scope rows — cross-
+                            // context ambient actions don't exist.
+                            let in_scope = row_in_active_scope(&row_id, this.active_scope.as_ref());
 
-                            let click_id = id.clone();
-                            let chevron_id = id.clone();
+                            let click_row = row_id.clone();
+                            let chevron_row = row_id.clone();
 
-                            // G3 Task 4: a ★/☆ toggle, right-aligned (pushed
-                            // there by the label's `flex_1()` below), for
-                            // every favouritable row — `favourite_object_for`
-                            // returns `None` for `Schema`/`Section`/`Column`/
-                            // `Index` rows, which get no star at all.
-                            let fav_obj = this.favourite_object_for(&id);
+                            // HONEST INDICATORS (design §1.4): ● = active
+                            // context (accent), ○ = inactive Connection row.
+                            // There is deliberately NO green/red "connected"
+                            // lamp — the runner is per-operation (design
+                            // fact 0.1); the two honest indicators are
+                            // active context (●) and metadata cached
+                            // (children present).
+                            let indicator = match &row_id {
+                                SidebarRow::Connection { conn_id } => {
+                                    let active = match &this.active_scope {
+                                        Some(s) => &s.conn_id == conn_id,
+                                        None => {
+                                            conn_id == crate::CLI_CONN_IDENTITY
+                                                && this.cli_url.is_some()
+                                        }
+                                    };
+                                    Some(if active {
+                                        ("●", cx.theme().accent)
+                                    } else {
+                                        ("○", cx.theme().text_disabled)
+                                    })
+                                }
+                                SidebarRow::Database { conn_id, db } => {
+                                    let active = this
+                                        .active_scope
+                                        .as_ref()
+                                        .is_some_and(|s| &s.conn_id == conn_id && &s.db == db);
+                                    active.then(|| ("●", cx.theme().accent))
+                                }
+                                _ => None,
+                            };
+                            let is_active_db = matches!(&row_id, SidebarRow::Database { conn_id, db }
+                                if this.active_scope.as_ref().is_some_and(|s| &s.conn_id == conn_id && &s.db == db));
+
+                            // Notice rows: muted informational text, danger
+                            // for errors; `retry` rows re-emit their Load
+                            // event on click (handle_single_click).
+                            let notice_color = match &row_id {
+                                SidebarRow::Notice { text, .. } => Some(if text.starts_with("error:") {
+                                    cx.theme().danger
+                                } else {
+                                    cx.theme().text_muted
+                                }),
+                                _ => None,
+                            };
+
+                            // G3 Task 4: ★/☆ toggle — `favourite_object_for`
+                            // gates to active-scope Inner rows and pinned
+                            // favourite rows itself.
+                            let fav_obj = this.favourite_object_for(&row_id);
                             let is_fav = fav_obj.as_ref().is_some_and(|f| this.favourites.contains(f));
                             let star = fav_obj.map(|f| {
                                 let (glyph, color) = if is_fav {
@@ -1619,10 +1949,11 @@ impl Render for SchemaTree {
                                     }))
                             });
 
-                            // G8 T6: a second icon-button, gated to
-                            // `NodeId::Schema(_)` rows only — the schema-tree
-                            // entry point for the ER diagram tab.
-                            let diagram_icon = if let NodeId::Schema(s) = &id {
+                            // G8 T6: ER-diagram entry — active-scope Schema
+                            // rows only (design §5 row 1).
+                            let diagram_icon = if let (true, SidebarRow::Inner { node: NodeId::Schema(s), .. }) =
+                                (in_scope, &row_id)
+                            {
                                 let schema_for_click =
                                     if s.is_empty() { None } else { Some(s.clone()) };
                                 Some(
@@ -1644,52 +1975,42 @@ impl Render for SchemaTree {
                                 None
                             };
 
-                            // G12 T4: a third icon-button, gated to
-                            // `NodeId::Table(_, _)` rows AND hidden entirely
-                            // (not merely disabled) when the tree is
-                            // `read_only` — CURATION item 4(b)'s entry-gate
-                            // half.
-                            let csv_icon = if let NodeId::Table(schema, name) = &id {
-                                if this.read_only {
-                                    None
-                                } else {
-                                    let schema_for_click =
-                                        if schema.is_empty() { None } else { Some(schema.clone()) };
-                                    let table_for_click = name.clone();
-                                    Some(
-                                        div()
-                                            .id(("tree-csv", ix))
-                                            .px_1()
-                                            .flex_shrink_0()
-                                            .cursor_pointer()
-                                            .text_color(cx.theme().success)
-                                            .child("⇪")
-                                            .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
-                                                cx.stop_propagation();
-                                                cx.emit(TreeEvent::ImportCsv {
-                                                    schema: schema_for_click.clone(),
-                                                    table: table_for_click.clone(),
-                                                });
-                                            })),
-                                    )
-                                }
+                            // G12 T4: CSV import — active-scope Table rows,
+                            // hidden entirely when read_only (CURATION item
+                            // 4(b)'s entry-gate half, unchanged).
+                            let csv_icon = if let (true, false, SidebarRow::Inner { node: NodeId::Table(schema, name), .. }) =
+                                (in_scope, this.read_only, &row_id)
+                            {
+                                let schema_for_click =
+                                    if schema.is_empty() { None } else { Some(schema.clone()) };
+                                let table_for_click = name.clone();
+                                Some(
+                                    div()
+                                        .id(("tree-csv", ix))
+                                        .px_1()
+                                        .flex_shrink_0()
+                                        .cursor_pointer()
+                                        .text_color(cx.theme().success)
+                                        .child("⇪")
+                                        .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
+                                            cx.stop_propagation();
+                                            cx.emit(TreeEvent::ImportCsv {
+                                                schema: schema_for_click.clone(),
+                                                table: table_for_click.clone(),
+                                            });
+                                        })),
+                                )
                             } else {
                                 None
                             };
 
                             // G10 T4 (design §2): the pinned "Správa serveru"
-                            // row is neither expandable nor selectable like
-                            // an ordinary tree node — greyed + an inline
-                            // "(pouze pro čtení)" hint when `Disabled` (this
-                            // codebase has no tooltip primitive elsewhere to
-                            // reuse — see the module's admin_panel.rs
-                            // sibling doc comment), and its click emits
-                            // `TreeEvent::OpenAdmin` only when `Enabled`.
-                            let is_admin_root = matches!(id, NodeId::AdminRoot);
+                            // row — greyed + inline "(pouze pro čtení)" hint
+                            // when `Disabled`; click semantics live in
+                            // `handle_single_click` (OpenAdmin when Enabled).
+                            let is_admin_root = matches!(row_id, SidebarRow::Pinned(NodeId::AdminRoot));
                             let admin_disabled =
                                 is_admin_root && this.admin_entry == AdminEntry::Disabled;
-                            let admin_enabled =
-                                is_admin_root && this.admin_entry == AdminEntry::Enabled;
                             let label = if admin_disabled {
                                 format!("{label} (pouze pro čtení)")
                             } else {
@@ -1706,11 +2027,16 @@ impl Render for SchemaTree {
                                 .cursor_pointer()
                                 .text_color(if admin_disabled {
                                     cx.theme().text_disabled
+                                } else if let Some(c) = notice_color {
+                                    c
                                 } else {
                                     cx.theme().text_primary
                                 })
                                 .hover(|s| s.bg(cx.theme().bg_hover));
-                            if is_selected {
+                            if is_selected || is_active_db {
+                                // The active Database row gets the
+                                // `bg_selected`-family emphasis alongside
+                                // its ● (design §1.4).
                                 row = row.bg(cx.theme().bg_selected);
                             }
                             row = row
@@ -1723,25 +2049,25 @@ impl Render for SchemaTree {
                                         .child(chevron)
                                         .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                                             cx.stop_propagation();
-                                            if !is_admin_root {
-                                                this.toggle_expand(&chevron_id);
-                                                cx.notify();
-                                            }
+                                            this.handle_chevron(&chevron_row, cx);
                                         })),
-                                )
+                                );
+                            if let Some((glyph, color)) = indicator {
+                                row = row.child(
+                                    div()
+                                        .w(px(14.))
+                                        .flex_shrink_0()
+                                        .text_color(color)
+                                        .child(glyph),
+                                );
+                            }
+                            row = row
                                 .child(div().flex_1().overflow_hidden().child(label))
                                 .on_click(cx.listener(move |this, ev: &ClickEvent, _window, cx| {
-                                    if is_admin_root {
-                                        if admin_enabled {
-                                            cx.emit(TreeEvent::OpenAdmin);
-                                        }
-                                        return;
-                                    }
                                     if ev.click_count() >= 2 {
-                                        this.handle_double_click(&click_id, cx);
+                                        this.handle_double_click(&click_row, cx);
                                     } else {
-                                        this.selected = Some(click_id.clone());
-                                        cx.notify();
+                                        this.handle_single_click(&click_row, cx);
                                     }
                                 }));
                             if let Some(star) = star {
@@ -1805,7 +2131,7 @@ mod flatten_tests {
             tables: vec![table(None, "users", TableKind::Table, vec![col("id", "INTEGER")])],
             ..Default::default()
         };
-        let rows = flatten(&snap, &HashSet::new(), "", &[], None, AdminEntry::Hidden);
+        let rows = flatten_schema(&snap, &HashSet::new(), "");
         // No `NodeId::Schema` row anywhere, and the section sits at depth 0.
         assert!(!rows.iter().any(|(id, ..)| matches!(id, NodeId::Schema(_))));
         assert_eq!(rows[0].0, NodeId::Section("".to_string(), "Tabulky"));
@@ -1821,7 +2147,7 @@ mod flatten_tests {
             ],
             ..Default::default()
         };
-        let rows = flatten(&snap, &HashSet::new(), "", &[], None, AdminEntry::Hidden);
+        let rows = flatten_schema(&snap, &HashSet::new(), "");
         // Only the two Schema headers show — nothing is expanded yet.
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], (NodeId::Schema("audit".into()), 0, "audit".into(), true));
@@ -1829,7 +2155,7 @@ mod flatten_tests {
 
         let mut expanded = HashSet::new();
         expanded.insert(NodeId::Schema("public".into()));
-        let rows = flatten(&snap, &expanded, "", &[], None, AdminEntry::Hidden);
+        let rows = flatten_schema(&snap, &expanded, "");
         // "public" expanded reveals its Tabulky section nested one level in;
         // "audit" stays collapsed to just its header.
         assert!(rows.iter().any(|(id, depth, ..)| {
@@ -1850,7 +2176,7 @@ mod flatten_tests {
             triggers: vec![trigger(None, "trg1", "a")],
             sequences: vec![sequence(None, "seq1")],
         };
-        let rows = flatten(&snap, &HashSet::new(), "", &[], None, AdminEntry::Hidden);
+        let rows = flatten_schema(&snap, &HashSet::new(), "");
         let labels: Vec<&str> = rows.iter().map(|(_, _, label, _)| label.as_str()).collect();
         // Procedury and Indexy are absent (empty); the rest appear in the
         // brief's fixed order, with correct counts.
@@ -1866,7 +2192,7 @@ mod flatten_tests {
             ],
             ..Default::default()
         };
-        let rows = flatten(&snap, &HashSet::new(), "", &[], None, AdminEntry::Hidden);
+        let rows = flatten_schema(&snap, &HashSet::new(), "");
         assert_eq!(rows, vec![(NodeId::Section("".into(), "Pohledy"), 0, "Pohledy (2)".into(), true)]);
     }
 
@@ -1877,19 +2203,19 @@ mod flatten_tests {
             ..Default::default()
         };
         // Nothing expanded: only the section header.
-        let rows = flatten(&snap, &HashSet::new(), "", &[], None, AdminEntry::Hidden);
+        let rows = flatten_schema(&snap, &HashSet::new(), "");
         assert_eq!(rows.len(), 1);
 
         // Section expanded: table row appears, columns still hidden.
         let mut expanded = HashSet::new();
         expanded.insert(NodeId::Section("".into(), "Tabulky"));
-        let rows = flatten(&snap, &expanded, "", &[], None, AdminEntry::Hidden);
+        let rows = flatten_schema(&snap, &expanded, "");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].0, NodeId::Table("".into(), "users".into()));
 
         // Table also expanded: column row appears too.
         expanded.insert(NodeId::Table("".into(), "users".into()));
-        let rows = flatten(&snap, &expanded, "", &[], None, AdminEntry::Hidden);
+        let rows = flatten_schema(&snap, &expanded, "");
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[2].0, NodeId::Column("".into(), "users".into(), "id".into()));
         assert_eq!(rows[2].2, "id: INTEGER");
@@ -1922,7 +2248,7 @@ mod flatten_tests {
         // "products" (no match anywhere in it) is hidden entirely, and
         // "id" (present on both tables, doesn't match) doesn't show either
         // since "users" itself didn't match by name.
-        let rows = flatten(&snap, &HashSet::new(), "EMAIL", &[], None, AdminEntry::Hidden);
+        let rows = flatten_schema(&snap, &HashSet::new(), "EMAIL");
         assert_eq!(
             rows,
             vec![
@@ -1939,7 +2265,7 @@ mod flatten_tests {
             tables: vec![table(None, "users", TableKind::Table, vec![col("id", "INTEGER"), col("email", "TEXT")])],
             ..Default::default()
         };
-        let rows = flatten(&snap, &HashSet::new(), "users", &[], None, AdminEntry::Hidden);
+        let rows = flatten_schema(&snap, &HashSet::new(), "users");
         // The table itself matched by name, so both columns show, not just
         // ones whose own name happens to contain "users".
         let col_labels: Vec<&str> = rows
@@ -1958,7 +2284,7 @@ mod flatten_tests {
 
         let mut expanded = HashSet::new();
         expanded.insert(NodeId::Section("".into(), "Indexy"));
-        let rows = flatten(&snap, &expanded, "", &[], None, AdminEntry::Hidden);
+        let rows = flatten_schema(&snap, &expanded, "");
         assert!(rows.iter().any(|(id, depth, label, _)| {
             *id == NodeId::Index("".into(), "users".into(), "users_pkey".into())
                 && *depth == 1
@@ -1969,7 +2295,7 @@ mod flatten_tests {
     #[test]
     fn empty_snapshot_flattens_to_no_rows() {
         let snap = SchemaSnapshot::default();
-        assert!(flatten(&snap, &HashSet::new(), "", &[], None, AdminEntry::Hidden).is_empty());
+        assert!(flatten_schema(&snap, &HashSet::new(), "").is_empty());
     }
 
     // --- review Issue 3: same-connection refresh state preservation ---
@@ -2047,156 +2373,6 @@ mod flatten_tests {
         assert_eq!(pruned_expanded, expanded);
         assert_eq!(pruned_selected, selected);
     }
-
-    // --- G3 Task 4: favourites section ---
-
-    fn fav(connection_id: &str, schema: Option<&str>, name: &str, kind: &str) -> FavouriteObject {
-        FavouriteObject {
-            connection_id: connection_id.into(),
-            schema: schema.map(str::to_string),
-            name: name.into(),
-            kind: kind.into(),
-            database: None,
-        }
-    }
-
-    #[test]
-    fn favourites_section_hidden_when_no_active_connection() {
-        let snap = SchemaSnapshot {
-            tables: vec![table(None, "users", TableKind::Table, vec![])],
-            ..Default::default()
-        };
-        let favourites = vec![fav("c1", None, "users", "table")];
-        // No active connection id at all (e.g. the CLI-arg URL path) — the
-        // section can't be built (nothing to stamp a new toggle with
-        // either), so it's hidden even though `favourites` is non-empty.
-        let rows = flatten(&snap, &HashSet::new(), "", &favourites, None, AdminEntry::Hidden);
-        assert!(!rows.iter().any(|(id, ..)| matches!(id, NodeId::FavouriteSection)));
-    }
-
-    #[test]
-    fn favourites_section_hidden_when_none_belong_to_active_connection() {
-        let snap = SchemaSnapshot {
-            tables: vec![table(None, "users", TableKind::Table, vec![])],
-            ..Default::default()
-        };
-        let favourites = vec![fav("other-conn", None, "users", "table")];
-        let rows = flatten(&snap, &HashSet::new(), "", &favourites, Some("c1"), AdminEntry::Hidden);
-        assert!(!rows.iter().any(|(id, ..)| matches!(id, NodeId::FavouriteSection)));
-    }
-
-    #[test]
-    fn favourites_section_renders_first_before_schemas() {
-        let snap = SchemaSnapshot {
-            tables: vec![
-                table(Some("public"), "t1", TableKind::Table, vec![]),
-                table(Some("audit"), "t2", TableKind::Table, vec![]),
-            ],
-            ..Default::default()
-        };
-        let favourites = vec![fav("c1", Some("public"), "t1", "table")];
-        let rows = flatten(&snap, &HashSet::new(), "", &favourites, Some("c1"), AdminEntry::Hidden);
-        assert_eq!(rows[0].0, NodeId::FavouriteSection);
-        assert_eq!(rows[0].2, "Oblíbené (1)");
-        // The Schema headers still follow, unaffected.
-        assert!(rows.iter().any(|(id, ..)| *id == NodeId::Schema("audit".into())));
-        assert!(rows.iter().any(|(id, ..)| *id == NodeId::Schema("public".into())));
-    }
-
-    #[test]
-    fn favourites_section_only_shows_active_connection_items_cross_schema() {
-        let snap = SchemaSnapshot::default();
-        let favourites = vec![
-            fav("c1", Some("public"), "t1", "table"),
-            fav("c1", Some("audit"), "f1", "routine"),
-            fav("c2", Some("public"), "other", "table"),
-        ];
-        let mut expanded = HashSet::new();
-        expanded.insert(NodeId::FavouriteSection);
-        let rows = flatten(&snap, &expanded, "", &favourites, Some("c1"), AdminEntry::Hidden);
-        assert_eq!(rows[0], (NodeId::FavouriteSection, 0, "Oblíbené (2)".into(), true));
-        let items: Vec<&NodeId> = rows.iter().skip(1).map(|(id, ..)| id).collect();
-        assert_eq!(
-            items,
-            vec![
-                &NodeId::Favourite("table".into(), "public".into(), "t1".into()),
-                &NodeId::Favourite("routine".into(), "audit".into(), "f1".into()),
-            ]
-        );
-        // "c2"'s favourite never shows, and no dangling reference to it.
-        assert!(!rows.iter().any(|(id, ..)| *id == NodeId::Favourite("table".into(), "public".into(), "other".into())));
-    }
-
-    #[test]
-    fn favourites_section_labels_schema_dot_name_or_bare_name() {
-        let snap = SchemaSnapshot::default();
-        let favourites = vec![fav("c1", Some("public"), "t1", "table"), fav("c1", None, "seq1", "sequence")];
-        let mut expanded = HashSet::new();
-        expanded.insert(NodeId::FavouriteSection);
-        let rows = flatten(&snap, &expanded, "", &favourites, Some("c1"), AdminEntry::Hidden);
-        let labels: Vec<&str> = rows.iter().skip(1).map(|(_, _, l, _)| l.as_str()).collect();
-        assert_eq!(labels, vec!["public.t1", "seq1"]);
-    }
-
-    #[test]
-    fn favourites_section_stays_collapsed_until_expanded() {
-        let snap = SchemaSnapshot::default();
-        let favourites = vec![fav("c1", Some("public"), "t1", "table")];
-        let rows = flatten(&snap, &HashSet::new(), "", &favourites, Some("c1"), AdminEntry::Hidden);
-        // Header only — not expanded, so the item row is hidden.
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, NodeId::FavouriteSection);
-    }
-
-    /// The favourites section's `NodeId::Favourite(kind, schema, name)`
-    /// carries whatever `kind` the `FavouriteObject` was stored under —
-    /// this is exactly the data `handle_double_click`'s `NodeId::Favourite`
-    /// arm switches on to decide OpenPreview (table/view) vs OpenDdl
-    /// (routine/trigger) vs no-op (sequence), so asserting it round-trips
-    /// unchanged through `flatten` is what makes that dispatch correct.
-    #[test]
-    fn favourites_section_node_ids_carry_kind_for_double_click_dispatch() {
-        let snap = SchemaSnapshot::default();
-        let favourites = vec![
-            fav("c1", Some("s"), "a_table", "table"),
-            fav("c1", Some("s"), "a_view", "view"),
-            fav("c1", Some("s"), "a_routine", "routine"),
-            fav("c1", Some("s"), "a_trigger", "trigger"),
-            fav("c1", Some("s"), "a_sequence", "sequence"),
-        ];
-        let mut expanded = HashSet::new();
-        expanded.insert(NodeId::FavouriteSection);
-        let rows = flatten(&snap, &expanded, "", &favourites, Some("c1"), AdminEntry::Hidden);
-        let ids: Vec<&NodeId> = rows.iter().skip(1).map(|(id, ..)| id).collect();
-        assert_eq!(
-            ids,
-            vec![
-                &NodeId::Favourite("table".into(), "s".into(), "a_table".into()),
-                &NodeId::Favourite("view".into(), "s".into(), "a_view".into()),
-                &NodeId::Favourite("routine".into(), "s".into(), "a_routine".into()),
-                &NodeId::Favourite("trigger".into(), "s".into(), "a_trigger".into()),
-                &NodeId::Favourite("sequence".into(), "s".into(), "a_sequence".into()),
-            ]
-        );
-    }
-
-    // G10 T4: the pinned "Správa serveru" row renders first (even ahead of
-    // "Oblíbené") whenever `AdminEntry` isn't `Hidden`, and never appears
-    // at all when it is.
-    #[test]
-    fn admin_root_renders_first_when_not_hidden_and_never_when_hidden() {
-        let snapshot = SchemaSnapshot::default();
-        let expanded = HashSet::new();
-        let out = flatten(&snapshot, &expanded, "", &[], None, AdminEntry::Enabled);
-        assert_eq!(
-            out.first().map(|(id, depth, label, _)| (id.clone(), *depth, label.clone())),
-            Some((NodeId::AdminRoot, 0, "Správa serveru".to_string()))
-        );
-        let out = flatten(&snapshot, &expanded, "", &[], None, AdminEntry::Disabled);
-        assert!(matches!(out.first(), Some((NodeId::AdminRoot, ..))));
-        let out = flatten(&snapshot, &expanded, "", &[], None, AdminEntry::Hidden);
-        assert!(out.iter().all(|(id, ..)| *id != NodeId::AdminRoot));
-    }
 }
 
 #[cfg(test)]
@@ -2239,7 +2415,6 @@ mod sidebar_tests {
     fn loaded_states(conn_id: &str, db: &str) -> HashMap<String, ConnNode> {
         let mut m = HashMap::new();
         m.insert(conn_id.to_string(), ConnNode {
-            id: conn_id.to_string(),
             dbs: DbListState::Loaded {
                 dbs: vec![DbNode {
                     name: db.to_string(), is_default: true,
@@ -2314,7 +2489,7 @@ mod sidebar_tests {
             (DbListState::Error("kaput".into()), "error: kaput", true),
         ] {
             let mut states = HashMap::new();
-            states.insert("c1".into(), ConnNode { id: "c1".into(), dbs: state });
+            states.insert("c1".into(), ConnNode { dbs: state });
             let rows = flatten_sidebar(&grouped(&conns), &states, None,
                 &outer, "", None, &[], AdminEntry::Hidden);
             assert!(matches!(&rows[1], (SidebarRow::Notice { conn_id, db: None, text, retry }, 1, _, false)
@@ -2390,6 +2565,41 @@ mod sidebar_tests {
             if label == "Oblíbené (1)"));
         assert!(matches!(&rows[2], (SidebarRow::Pinned(NodeId::Favourite(..)), 1, label, false)
             if label == "public.orders"));
+    }
+
+    /// Moved from the deleted single-root `flatten` tests (T5): the pinned
+    /// favourite rows' `NodeId::Favourite(kind, schema, name)` carries the
+    /// stored `kind` unchanged — exactly the data `handle_double_click`'s
+    /// `Pinned(Favourite)` arm switches on (OpenPreview for table/view,
+    /// OpenDdl for routine/trigger, no-op for sequence).
+    #[test]
+    fn pinned_favourite_node_ids_carry_kind_for_double_click_dispatch() {
+        let conns = vec![conn_cfg("c1", "prod", &[], Engine::Postgres, "sales")];
+        let favs: Vec<FavouriteObject> = ["table", "view", "routine", "trigger", "sequence"]
+            .iter()
+            .map(|kind| FavouriteObject {
+                connection_id: "c1".into(),
+                schema: Some("s".into()),
+                name: format!("a_{kind}"),
+                kind: kind.to_string(),
+                database: None,
+            })
+            .collect();
+        let scope = ActiveScope { conn_id: "c1".into(), db: "sales".into(), default_db: "sales".into() };
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Favourites);
+        let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+            &outer, "", Some(&scope), &favs, AdminEntry::Hidden);
+        // rows[0] = the section header; the connection root follows the
+        // favourite items — take exactly the five item rows.
+        let ids: Vec<&SidebarRow> = rows.iter().skip(1).take(5).map(|(id, ..)| id).collect();
+        let want: Vec<SidebarRow> = ["table", "view", "routine", "trigger", "sequence"]
+            .iter()
+            .map(|kind| {
+                SidebarRow::Pinned(NodeId::Favourite(kind.to_string(), "s".into(), format!("a_{kind}")))
+            })
+            .collect();
+        assert_eq!(ids, want.iter().collect::<Vec<_>>());
     }
 
     /// Design §5 row 1's REQUIRED "active-scope gating of icon
@@ -2488,7 +2698,7 @@ mod sidebar_tests {
 
     #[test]
     fn db_list_result_marks_default_and_truncation() {
-        let mut node = ConnNode { id: "c1".into(), dbs: DbListState::NotLoaded };
+        let mut node = ConnNode { dbs: DbListState::NotLoaded };
         begin_db_list_load(&mut node, 3);
         apply_db_list_result(&mut node, 3,
             Ok((vec!["inventory".into(), "sales".into()], true)), "sales");
@@ -2506,7 +2716,6 @@ mod sidebar_tests {
         // Load CAP + 2 slots on one connection.
         let db_names: Vec<String> = (0..LOADED_SNAPSHOT_CAP + 2).map(|i| format!("db{i}")).collect();
         states.insert("c1".into(), ConnNode {
-            id: "c1".into(),
             dbs: DbListState::Loaded {
                 dbs: db_names.iter().map(|n| DbNode {
                     name: n.clone(), is_default: n == "db0",

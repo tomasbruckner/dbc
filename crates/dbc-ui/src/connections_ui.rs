@@ -1040,6 +1040,18 @@ mod form_data_mssql_tests {
 #[derive(Clone)]
 pub enum PendingAfterUnlock {
     Connect(String),
+    /// Sidebar rework: resume an expand-triggered `LoadDatabases` for this
+    /// connection id (`AppView::start_db_list_fetch`). Cancel collapses the
+    /// row back (`SchemaTree::collapse_connection`, design §1.3).
+    ExpandConnection(String),
+    /// Sidebar rework (resolved deviation 9): resume a `LoadSchema` for one
+    /// `(conn, db)` slot — the vault can lock BETWEEN expanding a
+    /// connection and later expanding one of its databases, and no path
+    /// may fetch metadata with an empty-secret fallback (design §4.4).
+    LoadDbSchema { conn_id: String, db: String },
+    /// Sidebar rework: resume a `switch_to_database` (`db: None` = the
+    /// saved default). Cancel leaves the previous context untouched.
+    SwitchDatabase { conn_id: String, db: Option<String> },
     SaveConnection(Box<ConnectionFormData>),
     /// Security follow-up #6 (final-review.md): the Test button used to
     /// test WITHOUT the stored secret when the vault was locked (a
@@ -1325,8 +1337,15 @@ impl AppView {
     /// Called on dropdown-open and after any config mutation, rather than
     /// per render frame (`render_dropdown_overlay` may be re-invoked many
     /// times per second while the dropdown stays open, e.g. on hover).
-    pub(crate) fn refresh_grouped_cache(&mut self) {
+    ///
+    /// Sidebar rework: also re-syncs the multi-root sidebar's connection
+    /// roots (`SchemaTree::sync_connections`) — connections added/renamed/
+    /// deleted must never leave a stale root behind. One write-through
+    /// point rather than a per-call-site pair.
+    pub(crate) fn refresh_grouped_cache(&mut self, cx: &mut Context<Self>) {
         self.grouped_cache = group_connections(&self.config.connections);
+        let grouped = self.grouped_cache.clone();
+        self.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
     }
 
     pub(crate) fn render_top_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1345,7 +1364,7 @@ impl AppView {
             .on_click(cx.listener(|view, _, _, cx| {
                 view.dropdown_open = !view.dropdown_open;
                 if view.dropdown_open {
-                    view.refresh_grouped_cache();
+                    view.refresh_grouped_cache(cx);
                 }
                 cx.notify();
             }))
@@ -1747,7 +1766,7 @@ impl AppView {
         if self.modal.is_some() {
             return;
         }
-        self.refresh_grouped_cache();
+        self.refresh_grouped_cache(cx);
         self.modal = Some(ModalState::CompareDialog { conn_a: None, conn_b: None, error: None });
         // UX-polish §1.4: no-input modal, cx-only opener — defer focus to
         // `AppView::render` via `modal_needs_focus` (grounding correction 2).
@@ -1803,7 +1822,7 @@ impl AppView {
     /// new vault API/unlock step), closes the dialog immediately (design §3:
     /// "the modal itself closes as soon as the request is dispatched"), and
     /// dispatches `QueryRunner::fetch_schema_pair` — fire-and-forget with a
-    /// generation guard, mirroring `AppView::trigger_schema_fetch`'s exact
+    /// generation guard, mirroring `AppView::start_schema_slot_fetch`'s exact
     /// shape. `on_compare_schema_pair_ready` (T7 fills in the real body)
     /// picks the result up and opens the Compare tab.
     pub(crate) fn confirm_compare_dialog(&mut self, cx: &mut Context<Self>) {
@@ -2097,7 +2116,7 @@ impl AppView {
             Ok(()) => "Uloženo".to_string(),
             Err(e) => format!("error saving config: {}", e.message),
         };
-        self.refresh_grouped_cache();
+        self.refresh_grouped_cache(cx);
         self.modal = None;
         self.dropdown_open = false;
         cx.notify();
@@ -2121,7 +2140,7 @@ impl AppView {
             Ok(()) => "Uloženo".to_string(),
             Err(e) => format!("error saving config: {}", e.message),
         };
-        self.refresh_grouped_cache();
+        self.refresh_grouped_cache(cx);
         cx.notify();
     }
 
@@ -2186,87 +2205,29 @@ impl AppView {
         self.switch_to_connection(&id, cx);
     }
 
-    /// Dispatches the dropdown connection-switch's validating connect off
-    /// the UI thread via `QueryRunner::test_connect` (Task 8 review issue
-    /// #1, same as `on_test_clicked`). Shows the existing "connecting…"
-    /// status synchronously, then flips to the connected/error status and
-    /// (only on success) switches `active_connection_id` once the result
-    /// comes back.
+    /// Sidebar rework (resolved deviation 10): the dropdown/palette/
+    /// `PendingAfterUnlock::Connect` switch is now a thin wrapper over
+    /// `switch_to_database` with default-db semantics (`db: None`) — the
+    /// old body surviving past the introduction of `active_database` would
+    /// have left a stale `active_database` behind on a cross-connection
+    /// switch (a wrong-database dispatch window).
     /// `pub(crate)` (rather than private) so the command palette's
-    /// `Connection` item (G3 Task 5, main.rs) can route through this exact
-    /// switch path — brief contract #4: "no new execution logic".
+    /// `Connection` item (G3 Task 5, main.rs) keeps routing through this
+    /// exact switch path — brief contract #4: "no new execution logic".
     pub(crate) fn switch_to_connection(&mut self, id: &str, cx: &mut Context<Self>) {
-        // G11 T6 binding carry-forward: defensive — see
-        // `cancel_active_backup_if_running`'s doc comment (main.rs) for why
-        // this path isn't reachable while a backup/restore modal is open
-        // today, and why the call stays here anyway.
-        self.cancel_active_backup_if_running();
-        let Some(cfg) = self.config.connections.iter().find(|c| c.id == id).cloned() else { return };
-        let secret = crate::connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
-        let engine_lbl = engine_label(cfg.engine);
-        let target_id = cfg.id.clone();
-        self.dropdown_open = false;
-
-        match test_connect_spec(cfg, secret) {
-            Err(msg) => {
-                self.status = format!("error: {msg}");
-                cx.notify();
-            }
-            Ok(spec) => {
-                self.status = "connecting…".into();
-                self.switch_generation += 1;
-                let my_generation = self.switch_generation;
-                cx.notify();
-
-                let rx = self.runner.test_connect(spec);
-                cx.spawn(async move |this, cx| {
-                    let result = rx.await;
-                    let _ = this.update(cx, |view, cx| {
-                        // A newer switch was dispatched meanwhile — this
-                        // result is stale, drop it (last-dispatched wins).
-                        if view.switch_generation != my_generation {
-                            return;
-                        }
-                        match result {
-                            Ok(Ok(())) => {
-                                view.status = format!("Připojeno ({engine_lbl})");
-                                view.active_connection_id = Some(target_id.clone());
-                                view.conn_url = None;
-                                // G6 T7 review round 3, MAJOR 1: close any
-                                // open autocomplete popup RIGHT HERE, at the
-                                // moment the active connection identity
-                                // itself changes — don't wait for the
-                                // (async) schema fetch below to land.
-                                // `trigger_schema_fetch`'s own success arm
-                                // closes it again once the NEW schema
-                                // actually arrives, covering the window in
-                                // between (and same-connection refreshes,
-                                // which don't go through this switch path
-                                // at all).
-                                view.close_autocomplete(cx);
-                                // G2 Task 6: re-fetch the schema tree for the
-                                // newly active connection. Rebuilt from
-                                // `view.config`/`view.vault` rather than
-                                // reusing the (already-consumed) `spec` this
-                                // test_connect dispatched with.
-                                if let Some(spec) = view.active_conn_spec() {
-                                    view.trigger_schema_fetch(spec, cx);
-                                }
-                            }
-                            Ok(Err(e)) => view.status = format!("error: {e}"),
-                            Err(_) => view.status = "error: connect zrušen".into(),
-                        }
-                        cx.notify();
-                    });
-                })
-                .detach();
-            }
-        }
+        self.switch_to_database(id, None, cx);
     }
 
     fn resume_pending(&mut self, pending: PendingAfterUnlock, window: &mut Window, cx: &mut Context<Self>) {
         match pending {
             PendingAfterUnlock::Connect(id) => self.switch_to_connection(&id, cx),
+            PendingAfterUnlock::ExpandConnection(id) => self.start_db_list_fetch(id, cx),
+            PendingAfterUnlock::LoadDbSchema { conn_id, db } => {
+                self.start_schema_slot_fetch(conn_id, db, cx)
+            }
+            PendingAfterUnlock::SwitchDatabase { conn_id, db } => {
+                self.switch_to_database(&conn_id, db, cx)
+            }
             PendingAfterUnlock::SaveConnection(data) => self.finish_save(*data, cx),
             PendingAfterUnlock::TestConnection(ui) => {
                 self.modal = Some(ModalState::ConnectionDialog(*ui));
@@ -2305,6 +2266,18 @@ impl AppView {
         match self.modal.take() {
             Some(ModalState::MasterPasswordPrompt { pending: PendingAfterUnlock::TestConnection(ui), .. }) => {
                 self.modal = Some(ModalState::ConnectionDialog(*ui));
+            }
+            // Sidebar rework (design §1.3): cancel = the user declined —
+            // collapse the connection row back; its state stays NotLoaded,
+            // no error row. (`LoadDbSchema`/`SwitchDatabase` cancels take
+            // the default arm — the db row simply stays NotLoaded /
+            // unswitched.)
+            Some(ModalState::MasterPasswordPrompt {
+                pending: PendingAfterUnlock::ExpandConnection(id),
+                ..
+            }) => {
+                self.modal = None;
+                self.tree.update(cx, |t, cx| t.collapse_connection(&id, cx));
             }
             _ => self.modal = None,
         }

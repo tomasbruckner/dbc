@@ -187,7 +187,7 @@ impl MonitorView {
         match ev {
             runner::MonitorEvent::Data { generation, mut snapshot } => {
                 // Last-dispatched-wins, same convention as
-                // AppView::switch_generation / schema_fetch_generation.
+                // AppView::switch_generation / sidebar_fetch_generation.
                 if generation != self.refresh_generation {
                     return None;
                 }

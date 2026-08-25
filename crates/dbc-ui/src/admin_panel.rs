@@ -845,7 +845,7 @@ pub struct AdminPanel {
     staged_role_actions: Vec<WriteStatement>,
 
     /// T5: distinct schema names, pushed in by `main.rs::set_schemas`
-    /// (`open_fresh_admin_tab` at open time, `trigger_schema_fetch` on
+    /// (`open_fresh_admin_tab` at open time, the active-slot schema fetch on
     /// every subsequent refresh) — feeds the Privileges sub-view's schema
     /// selector.
     schemas: Vec<String>,

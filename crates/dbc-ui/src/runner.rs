@@ -393,12 +393,8 @@ impl QueryRunner {
     /// CLI root never lists (design §3.4).
     ///
     /// Ok((database names, truncated)) — truncated = server had more than
-    /// `DB_LIST_CAP` databases.
-    ///
-    /// Allow dead_code: T2 lands ahead of T5's UI consumer (the sidebar's
-    /// `LoadDatabases` handler in `main.rs`) — exercised directly by this
-    /// file's `db_list_tests` until then. Remove once T5 wires it in.
-    #[allow(dead_code)]
+    /// `DB_LIST_CAP` databases. Consumed by `main.rs`'s
+    /// `start_db_list_fetch` (the sidebar's `LoadDatabases` handler, T5).
     pub fn fetch_database_list(
         &self,
         spec: ConnectSpec,
