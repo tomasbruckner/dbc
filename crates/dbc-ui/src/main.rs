@@ -1258,6 +1258,12 @@ struct AppView {
     /// only; a bare Enter from the modal's own focus still reaches the
     /// `ModalConfirmKind::Ignore` policy, so §W4's "no default button"
     /// rule holds.
+    ///
+    /// T4 re-verify carry-forward: Enter only became true when the buttons
+    /// gained the `WorkspaceChoice` key context and the `ActivateChoice`
+    /// binding — a keymap binding is dispatched before any `on_key_down`
+    /// listener, so the ancestor `ModalForm`'s `enter → ModalConfirm` was
+    /// swallowing it. See `connections_ui::WORKSPACE_CHOICE_CONTEXT`.
     workspace_choice_focus: [FocusHandle; 3],
     /// T4 review NIT-11: the `WorkspaceMissing` panel's own focus handle,
     /// which makes the panel a gpui TAB GROUP. Focused when the modal
@@ -1267,7 +1273,9 @@ struct AppView {
     /// documents exactly this "focus the container, then `focus_next`"
     /// contract on `InteractiveElement::tab_stop`. Focus lands on the
     /// CONTAINER, not on a button, so a bare Enter still reaches
-    /// `ModalConfirmKind::Ignore`: §W4's "no default button" holds.
+    /// `ModalConfirmKind::Ignore`: §W4's "no default button" holds — the
+    /// `WorkspaceChoice` key context that claims `enter` is only on the
+    /// dispatch path once a choice has actually been tabbed to.
     workspace_panel_focus: FocusHandle,
     /// Unlocked vault, kept for the session once the user has entered the
     /// master password once (brief: prompt on first use, not at startup).

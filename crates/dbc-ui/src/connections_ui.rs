@@ -239,6 +239,26 @@ actions!(
 // there, so Enter is dead by construction — the §3-novela list).
 actions!(modal_form, [ModalConfirm, ModalFocusNext, ModalFocusPrev]);
 
+/// Key context carried by EACH of the `WorkspaceMissing` panel's three
+/// choice buttons (T4 re-verify carry-forward). It exists purely so
+/// `enter` can be bound DEEPER than the `ModalForm` ancestor that owns
+/// `ModalConfirm`: the pinned gpui's `Keymap::bindings_for_input` ranks a
+/// matching binding by `KeyBindingContextPredicate::depth_of`, so the
+/// leaf-most context wins. See `WORKSPACE_CHOICE_CONTEXT`'s test.
+pub(crate) const WORKSPACE_CHOICE_CONTEXT: &str = "WorkspaceChoice";
+
+// T4 re-verify carry-forward: the §W4 choice buttons activated on Space
+// but NOT on Enter, and three doc comments plus the T4 commit message
+// claimed otherwise. Root cause: `Window::dispatch_key_event` dispatches
+// KEYMAP BINDINGS before `on_key_down` listeners and returns the moment an
+// action handler consumes the event. A bare `enter` matched
+// `ModalConfirm` on the `ModalForm` ancestor; `on_modal_confirm`'s
+// `Ignore` arm is a HANDLED no-op that never calls `cx.propagate()`, so
+// the button's own `on_key_down` was unreachable. Space worked only
+// because nothing binds a bare `space`. The fix is to give the buttons
+// their own, deeper key context and bind `enter` inside it.
+actions!(workspace_choice, [ActivateChoice]);
+
 /// Bind TextField's editing keys, scoped to key context "TextField" so they
 /// never contend with SqlInput's (unscoped) or ResultGrid's bindings — same
 /// reasoning as grid.rs's scoped `ctrl-c` binding.
@@ -270,6 +290,16 @@ pub fn bind_keys(cx: &mut App) {
         // path and consumes Enter — the multiline exemption is structural,
         // not special-cased. Do not "fix" that.
         KeyBinding::new("enter", ModalConfirm, Some("ModalForm")),
+        // T4 re-verify carry-forward: `enter` for the FOCUSED §W4 choice
+        // button. Scoped to `WORKSPACE_CHOICE_CONTEXT`, which sits BELOW
+        // "ModalForm" on the dispatch path, so `depth_of` ranks it above
+        // the `ModalConfirm` binding on the line before — and only while a
+        // choice actually holds focus. With focus on the panel CONTAINER
+        // (the state the modal opens in) that context is not on the stack
+        // at all, `ModalConfirm` wins again, and §W4's "Enter is inert / no
+        // default button" rule holds unchanged. Both halves are pinned by
+        // `enter_outranks_modal_confirm_only_on_a_focused_choice`.
+        KeyBinding::new("enter", ActivateChoice, Some(WORKSPACE_CHOICE_CONTEXT)),
         // UX-polish §2: Tab order IS paint order (all tab_index 0 →
         // TabStopMap falls back to insertion order): ConnectionDialog runs
         // Název → Host → Port → Databáze → Uživatel → Heslo → Složka →
@@ -3772,6 +3802,13 @@ fn render_workspace_missing_panel(
     // untouched: initial focus is the modal's own handle, not a button, so
     // a bare Enter still lands on `ModalConfirmKind::Ignore` — there is no
     // default button, only a deliberately tabbed-to one.
+    //
+    // T4 re-verify carry-forward: Enter reaches the button through the
+    // `WORKSPACE_CHOICE_CONTEXT` key context + the `ActivateChoice`
+    // binding (`on_action` below), NOT through `on_key_down` — a keymap
+    // binding is dispatched first and `ModalConfirm`'s `Ignore` arm would
+    // otherwise consume the keystroke before any listener ran. `space`
+    // has no binding anywhere, so it still arrives as a plain key event.
     let button = |idx: usize,
                   id: &'static str,
                   label: &'static str,
@@ -3782,6 +3819,7 @@ fn render_workspace_missing_panel(
         div()
             .id(id)
             .track_focus(&focus[idx])
+            .key_context(WORKSPACE_CHOICE_CONTEXT)
             .tab_index(idx as isize)
             .px_3()
             .py_1()
@@ -3823,6 +3861,9 @@ fn render_workspace_missing_panel(
         .child(
             button(0, "workspace-missing-find", WORKSPACE_MISSING_FIND, &focus, cx)
                 .on_click(cx.listener(|this, _, _, cx| this.pick_workspace_for_recovery(cx)))
+                .on_action(cx.listener(|this, _: &ActivateChoice, _, cx| {
+                    this.pick_workspace_for_recovery(cx)
+                }))
                 .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
                     if activates_focused_choice(ev) {
                         cx.stop_propagation();
@@ -3834,6 +3875,9 @@ fn render_workspace_missing_panel(
         .child(
             button(1, "workspace-missing-profile", WORKSPACE_MISSING_PROFILE, &focus, cx)
                 .on_click(cx.listener(|this, _, _, cx| this.use_local_profile(cx)))
+                .on_action(
+                    cx.listener(|this, _: &ActivateChoice, _, cx| this.use_local_profile(cx)),
+                )
                 .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
                     if activates_focused_choice(ev) {
                         cx.stop_propagation();
@@ -3844,6 +3888,7 @@ fn render_workspace_missing_panel(
         .child(
             button(2, "workspace-missing-quit", WORKSPACE_MISSING_QUIT, &focus, cx)
                 .on_click(cx.listener(|_this, _, _, cx| cx.quit()))
+                .on_action(cx.listener(|_this, _: &ActivateChoice, _, cx| cx.quit()))
                 .on_key_down(cx.listener(|_this, ev: &KeyDownEvent, _, cx| {
                     if activates_focused_choice(ev) {
                         cx.stop_propagation();
@@ -3859,6 +3904,15 @@ fn render_workspace_missing_panel(
 /// convention for "press the focused button". Pure, so the §W4 keyboard
 /// contract is unit-pinned; the modifier check is what keeps Ctrl+Enter
 /// (`RunQuery`) and friends from being swallowed by a focused choice.
+///
+/// T4 re-verify carry-forward: in practice only `space` reaches this
+/// predicate. `enter` is claimed by the `ActivateChoice` KEY BINDING
+/// (`WORKSPACE_CHOICE_CONTEXT`), which the pinned gpui dispatches BEFORE
+/// any `on_key_down` listener, so the `enter` arm here is an unreachable
+/// belt-and-braces fallback should that binding ever be out-ranked. It is
+/// kept — not deleted — because "Enter or Space presses the focused
+/// button" is the contract this predicate names, and the two paths must
+/// agree on it.
 pub(crate) fn choice_key_activates(key: &str, mods: &Modifiers) -> bool {
     if mods.control || mods.platform || mods.alt || mods.shift || mods.function {
         return false;
@@ -5043,6 +5097,57 @@ mod modal_confirm_kind_tests {
             assert!(!choice_key_activates("enter", &m));
             assert!(!choice_key_activates("space", &m));
         }
+    }
+
+    /// T4 re-verify carry-forward — THE bug this fix exists for, pinned
+    /// against the real `gpui::Keymap` (a pure resolver; no window, no
+    /// platform). Before the fix the §W4 choices activated on Space but
+    /// NOT on Enter: `Window::dispatch_key_event` dispatches keymap
+    /// bindings BEFORE `on_key_down` listeners and returns as soon as one
+    /// is consumed, and a bare `enter` matched `ModalConfirm` on the
+    /// `ModalForm` ancestor, whose `Ignore` arm is a handled no-op.
+    ///
+    /// BOTH halves are asserted, because the fix must not cost §W4 its
+    /// "Enter is inert / no default button" rule:
+    ///   1. focus ON a choice (its context is on the stack) ⇒ the deeper
+    ///      `ActivateChoice` binding out-ranks `ModalConfirm`;
+    ///   2. focus on the PANEL CONTAINER (the state the modal opens in) ⇒
+    ///      `ModalConfirm` is the only match, i.e. `Ignore`.
+    #[test]
+    fn enter_outranks_modal_confirm_only_on_a_focused_choice() {
+        use gpui::{KeyContext, Keymap, Keystroke};
+
+        // The two bindings exactly as `bind_keys` registers them, in the
+        // same order (the tie-break is registration order, so order is
+        // part of what is being pinned).
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("enter", ModalConfirm, Some("ModalForm")),
+            KeyBinding::new("enter", ActivateChoice, Some(WORKSPACE_CHOICE_CONTEXT)),
+        ]);
+        let enter = [Keystroke::parse("enter").unwrap()];
+        let modal_form = KeyContext::parse("ModalForm").unwrap();
+        let choice = KeyContext::parse(WORKSPACE_CHOICE_CONTEXT).unwrap();
+
+        // 1. A tabbed-to choice: root → leaf is [ModalForm, WorkspaceChoice].
+        let (bindings, _pending) =
+            keymap.bindings_for_input(&enter, &[modal_form.clone(), choice]);
+        assert!(
+            bindings
+                .first()
+                .expect("a focused choice must match some enter binding")
+                .action()
+                .as_any()
+                .is::<ActivateChoice>(),
+            "the deeper WorkspaceChoice binding must out-rank ModalForm's ModalConfirm"
+        );
+
+        // 2. The panel container: no WorkspaceChoice on the stack at all.
+        let (bindings, _pending) = keymap.bindings_for_input(&enter, &[modal_form]);
+        assert_eq!(bindings.len(), 1, "no default button exists on the panel itself");
+        assert!(
+            bindings[0].action().as_any().is::<ModalConfirm>(),
+            "a bare Enter on the panel must still reach ModalConfirmKind::Ignore"
+        );
     }
 
     /// Workspace T4 (design §W4): the wrong-context guard. Enter must be a
