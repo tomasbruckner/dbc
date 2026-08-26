@@ -1355,6 +1355,50 @@ fn script_binding_affected(binding: &Path, target: &Path, is_dir: bool) -> bool 
     is_dir && path_starts_with_ci(binding, target)
 }
 
+/// „Does the editor's binding point AT this tree entry (or inside it)?" —
+/// as a FREE fn over the three pieces of state it depends on, so the
+/// question can be asked at any instant without an `AppView` and, above
+/// all, so it can never be answered by a bool captured earlier.
+///
+/// FINAL-REVIEW MAJOR-1. `confirm_script_delete` used to compute
+/// `was_bound` BEFORE dispatching the background delete and hand it to
+/// `finish_script_delete`, which applied it blind. That is the phase's own
+/// banned shape — a check performed before an `await` is a statement about
+/// the PAST — and it lost data in the resurrection direction:
+///
+/// 1. Editor UNBOUND. Double-click `trzby.sql` → `read_script` dispatched.
+/// 2. Right-click → Smazat → confirm. `was_bound == false`. Delete
+///    dispatched.
+/// 3. The read lands FIRST. `script_open_abort_reason` passes all three
+///    legs (root unchanged; generation unchanged, because an unbound
+///    editor never called `set_script_binding` so nothing bumped it;
+///    buffer untouched) → `bind_script` binds the doomed `trzby.sql`.
+/// 4. The delete lands. `was_bound == false`, so the binding is NOT
+///    cleared: the caption still names a file that no longer exists.
+/// 5. Ctrl+S — `script_save_allowed` passes, the modal is long closed —
+///    and the irreversibly deleted file is silently back on disk.
+///
+/// The symmetric direction is milder but equally wrong: bound to `a.sql`,
+/// an in-flight open of `b.sql` lands during a confirmed delete of
+/// `a.sql`, `was_bound == true`, and the NEW `b.sql` binding is dropped so
+/// the next Ctrl+S silently becomes a save-as.
+///
+/// Both are the same asymmetry T9 review MINOR-2 established between
+/// `set_script_name_error` (synchronous, sound) and `land_script_name_error`
+/// (post-await, must re-verify), and the fix is the same: the landing
+/// re-ASKS. `retarget_binding_after_rename` — the delete's sibling — was
+/// already written this way, which is why rename never had the bug.
+fn binding_targets_entry(
+    binding: Option<&Path>,
+    root: Option<&Path>,
+    rel: &str,
+    is_dir: bool,
+) -> bool {
+    let (Some(binding), Some(root)) = (binding, root) else { return false };
+    crate::scripts::resolve_entry_rel(root, rel)
+        .is_ok_and(|p| script_binding_affected(binding, &p, is_dir))
+}
+
 /// Where the binding must MOVE to when `old` is renamed to `new`, or
 /// `None` when the binding is not affected at all. For a folder rename the
 /// binding's suffix below `old` is rebased onto `new`, so „rename the
@@ -6306,12 +6350,18 @@ impl AppView {
     /// the delete confirm carries §4's second line. `resolve_entry_rel`
     /// (not `resolve_rel`) deliberately: this asks about a MUTATION
     /// target, and the library root is never one.
+    ///
+    /// A thin wrapper over the free [`binding_targets_entry`] so the answer
+    /// is always computed from state read AT THE MOMENT OF THE QUESTION.
+    /// See that function for the data-loss bug (final-review MAJOR-1) that
+    /// caching this answer across an await caused.
     fn binding_targets(&self, rel: &str, is_dir: bool) -> bool {
-        let (Some(b), Some(root)) = (&self.script_binding, self.effective_scripts_root()) else {
-            return false;
-        };
-        crate::scripts::resolve_entry_rel(&root, rel)
-            .is_ok_and(|p| script_binding_affected(&b.path, &p, is_dir))
+        binding_targets_entry(
+            self.script_binding.as_ref().map(|b| b.path.as_path()),
+            self.effective_scripts_root().as_deref(),
+            rel,
+            is_dir,
+        )
     }
 
     /// Part S §4: opens the ONE name dialog (new script / new folder /
@@ -6361,8 +6411,14 @@ impl AppView {
     }
 
     /// Part S §4/§7.9. `dirty_bound` is computed HERE, at open time, from
-    /// the SAME predicate the fixup uses — so the modal's second line and
-    /// the binding the confirm will clear can never disagree.
+    /// the SAME predicate the fixup uses, so the modal's second line
+    /// describes the binding by the same rule that will later drop it.
+    ///
+    /// It is a WARNING, not a decision: `finish_script_delete` asks the
+    /// predicate AGAIN when the delete lands (final-review MAJOR-1),
+    /// because the binding can move while the background op runs. This
+    /// line is an honest statement about the moment the user is looking
+    /// at it, which is all a confirm dialog can ever be.
     fn open_script_delete_modal(&mut self, rel: String, is_dir: bool, cx: &mut Context<Self>) {
         if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
             return;
@@ -6669,7 +6725,12 @@ impl AppView {
             self.set_script_delete_error(SCRIPT_SAVE_IN_FLIGHT.to_string(), cx);
             return;
         }
-        let was_bound = self.binding_targets(&rel, is_dir);
+        // FINAL-REVIEW MAJOR-1: the binding question is deliberately NOT
+        // asked here. It used to be, and the captured bool was applied
+        // blind at the landing — see `binding_targets_entry` for the
+        // resurrection scenario that cost. `is_dir` travels instead (it is
+        // an immutable property of the confirmed target, not a statement
+        // about the editor) and the landing asks for itself.
         if let Some(connections_ui::ModalState::ScriptDeleteConfirm { running, error, .. }) =
             &mut self.modal
         {
@@ -6686,17 +6747,22 @@ impl AppView {
                 })
                 .await;
             let _ = this.update(cx, |view, cx| match result {
-                Ok(()) => view.finish_script_delete(rel, was_bound, cx),
+                Ok(()) => view.finish_script_delete(rel, is_dir, cx),
                 Err(e) => view.land_script_delete_error(&rel, e, cx),
             });
         })
         .detach();
     }
 
-    /// The delete landed — same own-modal re-check as `finish_script_name`.
-    fn finish_script_delete(&mut self, rel: String, was_bound: bool, cx: &mut Context<Self>) {
+    /// The delete landed — same own-modal re-check as `finish_script_name`,
+    /// and (final-review MAJOR-1) the same re-ASK of the binding.
+    ///
+    /// `is_dir` is threaded from the dispatch because it describes the
+    /// entry that was deleted, which cannot change while the delete runs.
+    /// The BINDING can, so it is read here and nowhere else.
+    fn finish_script_delete(&mut self, rel: String, is_dir: bool, cx: &mut Context<Self>) {
         let mine = self.owns_script_delete_modal(&rel);
-        if was_bound {
+        if self.binding_targets(&rel, is_dir) {
             // §4: the bound file is gone — drop the binding. The editor
             // TEXT stays (the user may still want it, exactly as „Zavřít"
             // has always left it); what must not survive is a caption and
@@ -13803,6 +13869,67 @@ mod script_binding_tests {
         // refuses an empty rel (`resolve_entry_rel`), so the root can never
         // BE a target; this only records that the predicate is honest.
         assert!(script_binding_affected(&bound, &root, true));
+    }
+
+    /// FINAL-REVIEW MAJOR-1, the direction that loses data.
+    ///
+    /// The delete of `trzby.sql` was confirmed while the editor was
+    /// UNBOUND, so a `was_bound` captured at dispatch said `false`. An
+    /// in-flight `open_script` of the very same file then landed first and
+    /// bound it (nothing in `script_open_abort_reason` stops that: an
+    /// unbound editor never bumped the generation, the root did not move
+    /// and the buffer was not typed into). The state that decides whether
+    /// the binding must be dropped is therefore the state at the LANDING,
+    /// and `binding_targets_entry` has no parameter that could carry the
+    /// dispatch-time answer — which is the point of it being a free fn.
+    ///
+    /// If this ever answers `false`, the caption keeps naming a file the
+    /// user irreversibly deleted and the next Ctrl+S recreates it.
+    #[test]
+    fn a_delete_landing_after_an_open_bound_its_own_target_still_clears_the_binding() {
+        let root = PathBuf::from(r"D:\ws\scripts");
+        let doomed = root.join("trzby.sql");
+        // At DISPATCH the editor was unbound — the stale answer.
+        assert!(!binding_targets_entry(None, Some(&root), "trzby.sql", false));
+        // At the LANDING the racing open has bound the doomed file.
+        assert!(binding_targets_entry(Some(&doomed), Some(&root), "trzby.sql", false));
+        // Same story one level up: the open bound a file inside the folder
+        // whose delete was confirmed while nothing was bound.
+        let inside = root.join("prod").join("trzby.sql");
+        assert!(binding_targets_entry(Some(&inside), Some(&root), "prod", true));
+    }
+
+    /// …and the symmetric direction, which is milder but equally wrong:
+    /// bound to `a.sql`, an in-flight open of `b.sql` lands during the
+    /// confirmed delete of `a.sql`. A `was_bound == true` captured at
+    /// dispatch would drop the brand-new `b.sql` binding, silently turning
+    /// the next Ctrl+S into a save-as over a file that still exists.
+    #[test]
+    fn a_delete_landing_after_the_binding_moved_elsewhere_keeps_the_new_binding() {
+        let root = PathBuf::from(r"D:\ws\scripts");
+        let a = root.join("a.sql");
+        let b = root.join("b.sql");
+        // At DISPATCH: bound to the doomed file — the stale answer.
+        assert!(binding_targets_entry(Some(&a), Some(&root), "a.sql", false));
+        // At the LANDING: the editor has moved on to `b.sql`, which the
+        // delete does not touch.
+        assert!(!binding_targets_entry(Some(&b), Some(&root), "a.sql", false));
+    }
+
+    /// The two „no answer is possible" arms, so neither degrades to a
+    /// destructive `true`: no binding at all, and no scripts root (the
+    /// workspace was swapped out from under the delete).
+    #[test]
+    fn the_binding_question_is_false_without_a_binding_or_a_root() {
+        let root = PathBuf::from(r"D:\ws\scripts");
+        let bound = root.join("a.sql");
+        assert!(!binding_targets_entry(None, Some(&root), "a.sql", false));
+        assert!(!binding_targets_entry(Some(&bound), None, "a.sql", false));
+        // And the library ROOT is never a mutation target, so an empty rel
+        // is `false` rather than „everything is affected"
+        // (`resolve_entry_rel`'s rail, asked here so the free fn inherits
+        // it as visibly as the method did).
+        assert!(!binding_targets_entry(Some(&bound), Some(&root), "", true));
     }
 
     /// Part S §1.3, recorded as a TEST because it is the kind of
