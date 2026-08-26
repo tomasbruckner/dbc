@@ -13412,16 +13412,52 @@ mod script_binding_tests {
 /// restructure, not a Task 8 fix.
 #[cfg(test)]
 mod editor_clobber_audit {
-    const SOURCES: &[(&str, &str)] = &[
-        ("main.rs", include_str!("main.rs")),
-        ("history_panel.rs", include_str!("history_panel.rs")),
-        ("palette.rs", include_str!("palette.rs")),
-        ("connections_ui.rs", include_str!("connections_ui.rs")),
-        ("schema_tree.rs", include_str!("schema_tree.rs")),
-        ("grid.rs", include_str!("grid.rs")),
-        ("tabs.rs", include_str!("tabs.rs")),
-        ("sql_input.rs", include_str!("sql_input.rs")),
-    ];
+    use std::path::PathBuf;
+
+    /// EVERY `.rs` file in this crate, read at TEST TIME from
+    /// `CARGO_MANIFEST_DIR` — deliberately never a hand-written list.
+    ///
+    /// T8 re-verify MAJOR-3 / G1: the previous version enumerated 8 of the
+    /// crate's 33 files, and the other 25 were invisible to it. Privacy
+    /// does NOT cover them: `main.rs` is the CRATE ROOT, so every module is
+    /// a descendant, and Rust grants a descendant access to a private
+    /// ancestor item. `AppView.sql`, `open_script` and
+    /// `perform_script_action` are private-but-reachable crate-wide, and
+    /// `bind_script` / `editor_load_guarded` are `pub(crate)` outright — so
+    /// an `impl crate::AppView` block in ANY module could replace the
+    /// editor's buffer with all three tests green. That is not theoretical:
+    /// Task 9 added the scripts-tree mutation handlers, and a „Nový
+    /// skript" handler that loads the created file into the editor is
+    /// exactly the code that would want to.
+    ///
+    /// Reading the directory also means a NEW file is covered the moment it
+    /// exists, with nobody having to remember this list.
+    fn sources() -> Vec<(String, String)> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let rd = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("audit cannot read {}: {e}", dir.display()));
+            for ent in rd {
+                let path = ent.expect("readable directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let rel = path
+                        .strip_prefix(&root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("audit cannot read {rel}: {e}"));
+                    out.push((rel, text));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
 
     /// Strips line comments so a prose mention is neither a call site nor
     /// an alibi (`config_save_guard_audit`'s lesson: its first draft was
@@ -13433,42 +13469,74 @@ mod editor_clobber_audit {
         }
     }
 
-    /// The enclosing `fn`'s signature line, or `""` at file scope.
-    fn owner_of<'a>(lines: &[&'a str], i: usize) -> &'a str {
-        lines[..i]
-            .iter()
-            .rposition(|l| {
-                let t = l.trim_start();
-                t.starts_with("fn ")
-                    || t.starts_with("pub fn ")
-                    || t.starts_with("pub(crate) fn ")
-                    || t.starts_with("pub(super) fn ")
-            })
-            .map(|p| lines[p])
-            .unwrap_or("")
+    /// The NAME of the function a line defines, or `None` if it defines
+    /// none.
+    ///
+    /// T8 re-verify MAJOR-3 / G2, both halves. Sanctioning used to be
+    /// `owner.contains(name)`, so a helper called `bind_script_and_focus`
+    /// or `perform_script_action_inner` — ordinary refactor names, not
+    /// adversarial ones — was silently sanctioned; the caller now compares
+    /// the extracted name EXACTLY. And the old detector recognised only
+    /// `fn` / `pub fn` / `pub(crate) fn` / `pub(super) fn`, so a call under
+    /// an `async fn`, `unsafe fn`, `const fn` or `pub(in path) fn` was
+    /// attributed to the PREVIOUS function — possibly a sanctioned one.
+    /// This strips an arbitrary visibility and any order of qualifiers.
+    fn defined_fn_name(line: &str) -> Option<&str> {
+        let mut t = code_of(line).trim_start();
+        if let Some(rest) = t.strip_prefix("pub") {
+            let rest = rest.trim_start();
+            t = match rest.strip_prefix('(') {
+                // `pub(crate)`, `pub(super)`, `pub(in a::b)`
+                Some(inner) => inner[inner.find(')')? + 1..].trim_start(),
+                None => rest,
+            };
+        }
+        loop {
+            let before = t.len();
+            for q in ["default ", "const ", "async ", "unsafe ", "extern "] {
+                if let Some(rest) = t.strip_prefix(q) {
+                    t = rest.trim_start();
+                }
+            }
+            // `extern "C"`'s ABI string.
+            if let Some(rest) = t.strip_prefix('"') {
+                if let Some(end) = rest.find('"') {
+                    t = rest[end + 1..].trim_start();
+                }
+            }
+            if t.len() == before {
+                break;
+            }
+        }
+        let rest = t.strip_prefix("fn ")?.trim_start();
+        let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+        (end > 0).then(|| &rest[..end])
     }
 
-    /// Every CALL of `needle` must sit inside one of `sanctioned`, and
-    /// there must be exactly `expected` of them. Definition lines
-    /// (`fn <needle>`) are skipped — they are not call sites.
+    /// The name of the function textually enclosing line `i`.
+    fn owner_fn<'a>(lines: &[&'a str], i: usize) -> Option<&'a str> {
+        lines[..i].iter().rev().find_map(|l| defined_fn_name(l))
+    }
+
+    /// Every CALL of `needle` must sit inside a function named EXACTLY one
+    /// of `sanctioned`, and there must be exactly `expected` of them. The
+    /// definition itself is not a call site.
     fn audit(needle: &str, sanctioned: &[&str], expected: usize, why: &str) {
         let call = format!("{needle}(");
-        let define = format!("fn {needle}");
         let mut sites = 0usize;
-        for (name, src) in SOURCES {
+        for (name, src) in sources() {
             let lines: Vec<&str> = src.lines().collect();
             for (i, line) in lines.iter().enumerate() {
-                let code = code_of(line);
-                if !code.contains(&call) || code.contains(&define) {
+                if !code_of(line).contains(&call) || defined_fn_name(line) == Some(needle) {
                     continue;
                 }
                 sites += 1;
-                let owner = owner_of(&lines, i);
+                let owner = owner_fn(&lines, i);
                 assert!(
-                    sanctioned.iter().any(|f| owner.contains(f)),
+                    owner.is_some_and(|o| sanctioned.contains(&o)),
                     "unguarded `{needle}` call at {name}:{} (in `{}`) — {why}",
                     i + 1,
-                    owner.trim()
+                    owner.unwrap_or("<file scope>")
                 );
             }
         }
@@ -13476,6 +13544,58 @@ mod editor_clobber_audit {
             sites, expected,
             "`{needle}` call-site count changed — re-audit deliberately, do not just bump"
         );
+    }
+
+    /// The audit's own non-vacuity rail: if `sources()` ever came back
+    /// short — a moved `src`, a wrong `CARGO_MANIFEST_DIR`, a read that
+    /// quietly failed — the three tests below would pass by scanning
+    /// nothing. `main.rs`'s neighbours are named explicitly because they
+    /// are precisely the files the hand-written list used to omit.
+    #[test]
+    fn the_audit_actually_reads_the_whole_crate() {
+        let files = sources();
+        assert!(
+            files.len() >= 30,
+            "expected the crate's ~33 sources, got {} — the audit would be vacuous",
+            files.len()
+        );
+        for expected in ["main.rs", "plan.rs", "scripts.rs", "sql_input.rs", "runner.rs"] {
+            assert!(files.iter().any(|(n, _)| n == expected), "{expected} not scanned");
+        }
+        assert!(
+            files.iter().any(|(_, s)| s.contains("fn editor_load_guarded")),
+            "the scanned text is not this crate's source"
+        );
+    }
+
+    /// The parser everything above rests on. Probe lines are ASSEMBLED at
+    /// runtime, never written as literals: this module's own source is one
+    /// of the files `sources()` scans, so a literal `bind_script(` here
+    /// would be counted as a real, unguarded call site — verified, it fails
+    /// exactly that way. (Which is itself a nice proof the scan is live.)
+    #[test]
+    fn the_owner_parser_handles_every_fn_spelling_in_use() {
+        let guarded = "bind_script";
+        let vis = format!("    pub(crate) fn {guarded}(&mut self) {{");
+        assert_eq!(defined_fn_name(&vis), Some(guarded));
+        let asy = format!("async fn open_{}(rel: String) {{", "script");
+        assert_eq!(defined_fn_name(&asy), Some("open_script"));
+        // Qualifiers in combination, and a restricted-path visibility —
+        // the four spellings the old detector attributed to the PREVIOUS
+        // function instead.
+        assert_eq!(defined_fn_name("    pub(in crate::a) const unsafe fn x() {}"), Some("x"));
+        assert_eq!(defined_fn_name("    pub async unsafe fn y() {}"), Some("y"));
+        assert_eq!(defined_fn_name("    unsafe extern \"C\" fn z() {}"), Some("z"));
+        // Not definitions.
+        assert_eq!(defined_fn_name("    /// fn not_a_definition(&self)"), None);
+        let call = format!("        self.{guarded}(p, t, cx);");
+        assert_eq!(defined_fn_name(&call), None);
+        assert_eq!(defined_fn_name("        cx.spawn(async move |this, cx| {"), None);
+        // A near-miss name must NOT be read as the sanctioned one — the
+        // exact-match half of G2.
+        let near = format!("    fn {guarded}_and_focus(&mut self) {{");
+        assert_ne!(defined_fn_name(&near), Some(guarded));
+        assert_eq!(defined_fn_name(&near), Some("bind_script_and_focus"));
     }
 
     /// Shape-independent: whatever expression reaches the editor entity,
