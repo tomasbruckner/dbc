@@ -7145,6 +7145,28 @@ impl AppView {
                     cx.notify();
                     return;
                 }
+                // FINAL-REVIEW NIT-1, the third leg. `open_script` re-asks
+                // root + generation + BUFFER TEXT
+                // (`script_open_abort_reason`); this path asked only the
+                // first two. The generation is structurally blind to
+                // typing — `set_script_binding` bumps on a PATH change and
+                // nothing else — and the picker is not app-modal on every
+                // platform, so keystrokes during it are invisible here.
+                //
+                // The consequence is milder than the open's (no data is
+                // destroyed: the file gets the pre-picker text, the „ •"
+                // stays up and a second Ctrl+S fixes it) but it is still a
+                // silent divergence — `saved_text` would be bound to text
+                // the user can no longer see anywhere. Refuse instead, in
+                // the same words the open uses, so the two paths do not
+                // teach the user two different stories about the same
+                // event. Nothing is lost: the editor is untouched, no file
+                // is created, and Ctrl+S re-opens the picker.
+                if view.sql.read(cx).text() != text {
+                    view.status = "uložení zrušeno — mezitím jste psali do editoru".to_string();
+                    cx.notify();
+                    return;
+                }
                 // T9 RE-VERIFY FAIL-1. The generation check above is NOT
                 // enough, and MAJOR-1's own scenario walks straight through
                 // the gap: `on_save_script` asked `script_save_allowed`
@@ -13885,6 +13907,45 @@ mod script_binding_tests {
         // refuses an empty rel (`resolve_entry_rel`), so the root can never
         // BE a target; this only records that the predicate is honest.
         assert!(script_binding_affected(&bound, &root, true));
+    }
+
+    /// FINAL-REVIEW NIT-1. `save_script_as` resumes after a file picker
+    /// that is not app-modal on every platform, so it owes the SAME
+    /// three-part re-check `script_open_abort_reason` performs for an open
+    /// — and it was missing the buffer leg, which is precisely the leg the
+    /// generation counter is structurally blind to (`set_script_binding`
+    /// bumps on a PATH change; typing changes no path).
+    ///
+    /// Source-pinned, the `run_script_from_library` precedent: the three
+    /// legs are `if` statements in a GPUI continuation that no headless
+    /// test can drive. Non-vacuous — the slice is proved to be the real
+    /// function before anything is required of it.
+    #[test]
+    fn the_save_as_continuation_re_asks_all_three_things_it_captured() {
+        let src = include_str!("main.rs");
+        let body = src.split("fn save_script_as(").nth(1).expect("save_script_as exists");
+        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
+        // The slice really is the picker continuation.
+        assert!(body.contains("prompt_for_new_path"), "the sliced body is not the real one");
+        assert!(body.contains("with_sql_extension"), "the sliced body is not the real one");
+        // Leg 1: the binding must not have moved (T9 re-verify FAIL-1's
+        // generation check).
+        assert!(
+            body.contains("script_binding_generation != dispatched"),
+            "the binding leg is gone — a save-as landing after the editor was bound elsewhere \
+             would write the old text and re-bind on top of it"
+        );
+        // Leg 2: the dialog predicate, re-asked continuation-side.
+        assert!(
+            body.contains("script_save_allowed"),
+            "the guard leg is gone — T9 re-verify FAIL-1's delete/save-as race is back"
+        );
+        // Leg 3: the captured buffer, the one this finding added.
+        assert!(
+            body.contains(".text() != text"),
+            "the BUFFER leg is gone — keystrokes during a non-app-modal picker would be \
+             written to disk as text nobody can see, with `saved_text` bound to them"
+        );
     }
 
     /// FINAL-REVIEW MAJOR-1, the direction that loses data.
