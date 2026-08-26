@@ -6954,6 +6954,26 @@ impl AppView {
     /// The BINDING can, so it is read here and nowhere else.
     fn finish_script_delete(&mut self, rel: String, is_dir: bool, cx: &mut Context<Self>) {
         let mine = self.owns_script_delete_modal(&rel);
+        // RE-VERIFY MINOR-A. UNCONDITIONAL, and it must stay that way.
+        //
+        // Re-asking the binding above closed MAJOR-1's ordering (open
+        // lands, THEN delete lands). The mirror survived: with the editor
+        // UNBOUND at the landing, `binding_targets` is false, nothing is
+        // called, and `script_binding_generation` is therefore never
+        // bumped — so an `open_script` dispatched BEFORE this delete lands
+        // AFTER it, passes all three legs of `script_open_abort_reason`
+        // (root unmoved, generation unmoved, buffer untouched) and binds
+        // the file that was just irreversibly deleted. Windows opens the
+        // read with `FILE_SHARE_DELETE`, so the read completes across the
+        // delete and there is not even an error to notice. The next Ctrl+S
+        // recreates the file.
+        //
+        // The fix is the lesson `apply_context` already learned and wrote
+        // down: supersede in-flight continuations ALWAYS, not only when
+        // the state you happen to be looking at changed. A conditional
+        // bump is a bump that is missing precisely in the case where
+        // nothing local looks wrong.
+        self.supersede_script_continuations();
         if self.binding_targets(&rel, is_dir) {
             // §4: the bound file is gone — drop the binding. The editor
             // TEXT stays (the user may still want it, exactly as „Zavřít"
@@ -14372,6 +14392,49 @@ mod script_binding_tests {
             "the BUFFER leg is gone — keystrokes during a non-app-modal picker would be \
              written to disk as text nobody can see, with `saved_text` bound to them"
         );
+    }
+
+    /// RE-VERIFY MINOR-A — MAJOR-1's resurrection in the MIRRORED
+    /// ordering, which the first fix left open.
+    ///
+    /// MAJOR-1 was „the open lands, then the delete lands". The mirror is
+    /// „the delete lands, then the open lands", and with the editor
+    /// UNBOUND at the landing the re-asked `binding_targets` is false, so
+    /// `set_script_binding` is never called and the generation is never
+    /// bumped. An `open_script` dispatched before the delete then passes
+    /// all three legs of `script_open_abort_reason` and binds a file that
+    /// no longer exists; the next Ctrl+S recreates it. (Windows opens the
+    /// read with `FILE_SHARE_DELETE`, so it completes across the delete
+    /// and raises no error to notice.)
+    ///
+    /// Source-pinned because the whole point is that the call is
+    /// UNCONDITIONAL — a behavioural test can only show that some path
+    /// bumps, not that every path does. The indentation check is the
+    /// assertion: at the function body's own level (8 spaces) it cannot be
+    /// inside an `if`, which is exactly how it was missing before.
+    #[test]
+    fn a_landed_delete_supersedes_in_flight_opens_even_with_nothing_bound() {
+        let src = include_str!("main.rs");
+        let body = src.split("fn finish_script_delete(").nth(1).expect("it exists");
+        let body = &body[..body.find("
+    fn ").unwrap_or(body.len())];
+        // Non-vacuity: the slice is the real landing.
+        assert!(body.contains("owns_script_delete_modal"), "the sliced body is not the real one");
+        assert!(body.contains("binding_targets"), "the sliced body is not the real one");
+
+        let code = editor_clobber_audit::code_lines(body);
+        let bump: Vec<&String> =
+            code.iter().filter(|l| l.contains("supersede_script_continuations")).collect();
+        assert_eq!(bump.len(), 1, "expected exactly one bump, found {}", bump.len());
+        assert_eq!(
+            bump[0], "        self.supersede_script_continuations();",
+            "the bump must sit at the function body's own indentation — anything deeper is              inside a conditional, which is how re-verify MINOR-A's data loss survived the              first fix"
+        );
+        // …and it must come BEFORE the binding is dropped, so a bump is
+        // never skipped by an early return added later.
+        let bump_at = code.iter().position(|l| l.contains("supersede_script_continuations"));
+        let drop_at = code.iter().position(|l| l.contains("set_script_binding"));
+        assert!(bump_at < drop_at, "supersede first, then adjust the binding");
     }
 
     /// FINAL-REVIEW MAJOR-1, the direction that loses data.
