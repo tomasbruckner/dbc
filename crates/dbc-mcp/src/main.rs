@@ -251,7 +251,7 @@ USAGE:
     dbc-mcp [--config <path>] [--vault <path>]          Run the server (stdio transport)
     dbc-mcp setup [--vault <path>]                       Store the vault's derived key in the OS credential store
     dbc-mcp setup --remove                               Remove the stored key (revocation)
-    dbc-mcp --help                                       Show this message
+    dbc-mcp --help | -h                                  Show this message
 
     Cesty se ve výchozím stavu řídí pracovním prostorem nastaveným v aplikaci dbc
     (ukazatel %APPDATA%\\dbc\\workspace.toml). --config/--vault mají vždy přednost.
@@ -512,6 +512,29 @@ mod parse_args_tests {
         // help needs neither.
         let a = parse_args_from(&raw(&["--help"]), broken());
         assert!(matches!(a.command, Command::Help));
+    }
+
+    /// FINAL-REVIEW NIT-4. `-h` has been accepted since the first draft
+    /// and appeared in no usage line, so the only way to learn it existed
+    /// was to read the parser. Both halves are pinned: it still behaves
+    /// exactly like `--help`, and it is now written down.
+    #[test]
+    fn the_short_help_flag_works_and_is_documented() {
+        let a = parse_args_from(&raw(&["-h"]), broken());
+        assert!(matches!(a.command, Command::Help), "-h must be the same exemption as --help");
+        // …and, like `--help`, it stops exempting once the argv is wrong.
+        let a = parse_args_from(&raw(&["-h", "--confg", "x"]), broken());
+        assert!(matches!(a.command, Command::Fail(_)));
+
+        let src = include_str!("main.rs");
+        let usage = src.split("fn print_usage()").nth(1).expect("print_usage exists");
+        let usage = &usage[..usage.find("\nfn ").unwrap_or(usage.len())];
+        assert!(usage.contains("USAGE:"), "the sliced body is not the real usage text");
+        // Every OTHER flag the parser accepts was already documented; the
+        // loop is what keeps the next one from not being.
+        for flag in ["setup", "--remove", "--config", "--vault", "--help | -h"] {
+            assert!(usage.contains(flag), "`{flag}` is accepted by the parser but undocumented");
+        }
     }
 
     #[test]
