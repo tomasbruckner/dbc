@@ -1288,6 +1288,40 @@ fn script_binding_target_changed(old: Option<&Path>, new: Option<&Path>) -> bool
     }
 }
 
+/// Part S §4: is the editor's binding touched by a mutation of `target`?
+///
+/// Exact hit, OR — when `target` is a FOLDER — anywhere beneath it. The
+/// second arm is the one the plan text did not have and the Task 9 brief
+/// demanded: `rename_entry` renames folders too, so „only an exact match
+/// counts" would leave the binding pointing at a path that no longer
+/// exists the moment a parent folder is renamed. `is_dir` gates it
+/// because a FILE whose path happens to be a prefix of the binding's is
+/// not an ancestor of it.
+fn script_binding_affected(binding: &Path, target: &Path, is_dir: bool) -> bool {
+    if binding == target {
+        return true;
+    }
+    is_dir && binding.starts_with(target)
+}
+
+/// Where the binding must MOVE to when `old` is renamed to `new`, or
+/// `None` when the binding is not affected at all. For a folder rename the
+/// binding's suffix below `old` is rebased onto `new`, so „rename the
+/// folder containing the open script" keeps the caption honest instead of
+/// silently stranding it on a dead path.
+fn script_binding_retarget(
+    binding: &Path,
+    old: &Path,
+    new: &Path,
+    is_dir: bool,
+) -> Option<PathBuf> {
+    if !script_binding_affected(binding, old, is_dir) {
+        return None;
+    }
+    let suffix = binding.strip_prefix(old).ok()?;
+    Some(if suffix.as_os_str().is_empty() { new.to_path_buf() } else { new.join(suffix) })
+}
+
 /// T8 review MAJOR-2: the refusal when a save of this editor is already in
 /// flight. Not an „error:" — nothing failed; the user's keystroke simply
 /// arrived while the previous write was still fsyncing, and the „ •" stays
@@ -3243,6 +3277,90 @@ impl AppView {
         cx.notify();
     }
 
+    /// Part S §6: the library's „▶". Same entry gates as
+    /// `start_script_pick`, same `conn_identity` captured BEFORE the
+    /// pre-scan, then the SHARED continuation — so the scripts library
+    /// reuses the G12 confirm policy rather than forking it, and
+    /// everything downstream (`confirm_script_run`'s re-checks,
+    /// `script_run_dispatch_allowed`, the tx/error radios, the runner's
+    /// per-statement read-only gate, the progress tab, history's
+    /// `[skript]` entry) is untouched by construction.
+    ///
+    /// Runs the file ON DISK — never the editor buffer, and never a save
+    /// first (§1.3: auto-saving before a run would be a silent write the
+    /// user never asked for). A dirty binding means editor and disk
+    /// differ; the „ •" is what discloses that, and the confirm modal's
+    /// statement count is the from-disk truth.
+    fn run_script_from_library(&mut self, rel: String, cx: &mut Context<Self>) {
+        if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
+            return;
+        }
+        if self.cancel.is_some() {
+            return;
+        }
+        let Some(root) = self.effective_scripts_root() else {
+            self.status = "error: nastavte složku skriptů v Nastavení".to_string();
+            cx.notify();
+            return;
+        };
+        let Some((read_only, timeout_secs, engine, _spec)) = self.resolve_spec_for_explain(cx)
+        else {
+            return; // resolve_spec_for_explain already set self.status
+        };
+        let Some(dialect) = dialect_for_engine(engine) else {
+            self.status = "error: skripty nejsou podporovány pro tento engine".to_string();
+            cx.notify();
+            return;
+        };
+        let conn_label = self.current_connection_label();
+        // Captured HERE, before the background pre-scan — the connection
+        // dropdown stays clickable throughout (see `current_conn_identity`).
+        let conn_identity = self.current_conn_identity();
+        cx.spawn(async move |this, cx| {
+            let result: Result<(String, PathBuf, usize), String> = cx
+                .background_spawn(async move {
+                    let path = crate::scripts::resolve_rel(&root, &rel)?;
+                    let is_sql = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("sql"));
+                    if !is_sql {
+                        return Err("vyberte soubor .sql".to_string());
+                    }
+                    // A stale tree (an external delete since the last scan)
+                    // is a Czech error plus a rescan, never a corruption.
+                    if !path.is_file() {
+                        return Err("soubor už neexistuje".to_string());
+                    }
+                    let count = count_statements_in_file(&path, dialect)?;
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    Ok((name, path, count))
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| match result {
+                Ok((label, path, count)) => view.open_script_run_modal(
+                    label,
+                    vec![path],
+                    vec![count],
+                    conn_label,
+                    conn_identity,
+                    read_only,
+                    timeout_secs,
+                    cx,
+                ),
+                Err(e) => {
+                    view.status = format!("error: {e}");
+                    view.start_scripts_scan(cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// The modal's „Transakce“ radio — a click on an option that would
     /// violate `script_options_valid` (whole-run scope + continue policy)
     /// is a structural no-op, per the design §2 matrix's UI rule.
@@ -4603,6 +4721,16 @@ impl AppView {
                 // `connections_ui::workspace_confirm_esc_closable`.
                 connections_ui::ModalState::WorkspaceConfirm { running, .. } => {
                     connections_ui::workspace_confirm_esc_closable(*running)
+                }
+                // T9: nothing secret is typed into either scripts dialog
+                // and nothing is dispatched until its button is clicked —
+                // so Esc cancels freely, BUT never while the background
+                // op is in flight, the same reasoning as `BackupRestore`'s
+                // `!session.is_running()`. Truth table:
+                // `connections_ui::script_modal_esc_closable`.
+                connections_ui::ModalState::ScriptName { running, .. }
+                | connections_ui::ModalState::ScriptDeleteConfirm { running, .. } => {
+                    connections_ui::script_modal_esc_closable(*running)
                 }
                 // `WorkspaceMissing` never reaches this match — the
                 // `modal_is_blocking` guard above returns first.
@@ -6061,6 +6189,367 @@ impl AppView {
     // -----------------------------------------------------------------
     // Workspace T8 — the script editor binding (Part S §5).
     // -----------------------------------------------------------------
+
+    // -----------------------------------------------------------------
+    // Workspace T9 — the scripts library's fs mutations (Part S §4).
+    // Every op goes through `crate::scripts`, off the UI thread; the
+    // component validator, the ONE Unicode-aware collision probe and the
+    // empty-rel mutation rail all live inside those ops and are never
+    // re-implemented here.
+    // -----------------------------------------------------------------
+
+    /// Part S §4: is the CURRENT binding touched by a mutation of `rel`?
+    /// The fixup predicate for rename and delete, and what decides whether
+    /// the delete confirm carries §4's second line. `resolve_entry_rel`
+    /// (not `resolve_rel`) deliberately: this asks about a MUTATION
+    /// target, and the library root is never one.
+    fn binding_targets(&self, rel: &str, is_dir: bool) -> bool {
+        let (Some(b), Some(root)) = (&self.script_binding, self.effective_scripts_root()) else {
+            return false;
+        };
+        crate::scripts::resolve_entry_rel(&root, rel)
+            .is_ok_and(|p| script_binding_affected(&b.path, &p, is_dir))
+    }
+
+    /// Part S §4: opens the ONE name dialog (new script / new folder /
+    /// rename). Same single-modal invariant every other opener applies.
+    fn open_script_name_modal(
+        &mut self,
+        mode: connections_ui::ScriptNameMode,
+        parent_rel: String,
+        target_rel: String,
+        is_dir: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
+            return;
+        }
+        if self.effective_scripts_root().is_none() {
+            self.status = "error: nastavte složku skriptů v Nastavení".to_string();
+            cx.notify();
+            return;
+        }
+        // Rename prefills the CURRENT name, extension included: the
+        // effective name is what `validate_script_name` will see, so
+        // showing anything less would make „trzby.sql" → „trzby-2025"
+        // look like it drops the suffix when it does not.
+        let prefill = match mode {
+            connections_ui::ScriptNameMode::Rename => {
+                target_rel.rsplit('/').next().unwrap_or("").to_string()
+            }
+            _ => String::new(),
+        };
+        let field = cx.new(|cx| {
+            let mut f = connections_ui::TextField::form_field(cx, "např. trzby", false);
+            f.set_text(&prefill, cx);
+            f
+        });
+        self.modal = Some(connections_ui::ModalState::ScriptName {
+            mode,
+            parent_rel,
+            target_rel,
+            is_dir,
+            field,
+            error: None,
+            running: false,
+        });
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    /// Part S §4/§7.9. `dirty_bound` is computed HERE, at open time, from
+    /// the SAME predicate the fixup uses — so the modal's second line and
+    /// the binding the confirm will clear can never disagree.
+    fn open_script_delete_modal(&mut self, rel: String, is_dir: bool, cx: &mut Context<Self>) {
+        if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
+            return;
+        }
+        if self.effective_scripts_root().is_none() {
+            self.status = "error: nastavte složku skriptů v Nastavení".to_string();
+            cx.notify();
+            return;
+        }
+        let dirty_bound = self.binding_targets(&rel, is_dir) && self.script_dirty_flag;
+        self.modal = Some(connections_ui::ModalState::ScriptDeleteConfirm {
+            rel,
+            is_dir,
+            dirty_bound,
+            error: None,
+            running: false,
+        });
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    /// The Skript/Složka radio. Inert for `Rename` (an entry's kind cannot
+    /// change) and while `running`, the same structural-no-op rule the
+    /// ScriptRun radios follow.
+    pub(crate) fn set_script_name_mode(
+        &mut self,
+        value: connections_ui::ScriptNameMode,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(connections_ui::ModalState::ScriptName { mode, is_dir, running, .. }) =
+            &mut self.modal
+        {
+            if *running || *mode == connections_ui::ScriptNameMode::Rename {
+                return;
+            }
+            *mode = value;
+            *is_dir = value == connections_ui::ScriptNameMode::NewFolder;
+            cx.notify();
+        }
+    }
+
+    /// „Zrušit" on either scripts modal — inert while the background fs op
+    /// is in flight, exactly as Esc is (`script_modal_esc_closable`), so a
+    /// click cannot abandon a modal whose continuation is about to close
+    /// it and fix the editor binding up.
+    pub(crate) fn cancel_script_modal(&mut self, cx: &mut Context<Self>) {
+        let running = match &self.modal {
+            Some(connections_ui::ModalState::ScriptName { running, .. })
+            | Some(connections_ui::ModalState::ScriptDeleteConfirm { running, .. }) => *running,
+            _ => return,
+        };
+        if !connections_ui::script_modal_esc_closable(running) {
+            return;
+        }
+        self.close_modal(cx);
+    }
+
+    /// A failed name op: the message goes back INTO the dialog (the field
+    /// keeps its text, so the user edits rather than retypes) and clears
+    /// `running` so they can retry. If the dialog is somehow no longer
+    /// there, the message still reaches the status line — never nowhere.
+    fn set_script_name_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::ScriptName { error, running, .. }) = &mut self.modal
+        {
+            *running = false;
+            *error = Some(message);
+        } else {
+            self.status = format!("error: {message}");
+        }
+        cx.notify();
+    }
+
+    /// The delete confirm's equivalent — „složka není prázdná — smažte
+    /// nejdřív její obsah" has to be readable against the folder named
+    /// right above it, so it stays in the modal too.
+    fn set_script_delete_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::ScriptDeleteConfirm { error, running, .. }) =
+            &mut self.modal
+        {
+            *running = false;
+            *error = Some(message);
+        } else {
+            self.status = format!("error: {message}");
+        }
+        cx.notify();
+    }
+
+    /// „Vytvořit"/„Přejmenovat" (and Enter — policy clause (a)).
+    pub(crate) fn confirm_script_name(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::ScriptName {
+            mode,
+            parent_rel,
+            target_rel,
+            is_dir,
+            field,
+            running,
+            ..
+        }) = &self.modal
+        else {
+            return;
+        };
+        if *running {
+            return;
+        }
+        let (mode, parent_rel, target_rel, is_dir, field) =
+            (*mode, parent_rel.clone(), target_rel.clone(), *is_dir, field.clone());
+        let name = field.read(cx).text();
+        let Some(root) = self.effective_scripts_root() else {
+            self.set_script_name_error("nastavte složku skriptů v Nastavení".to_string(), cx);
+            return;
+        };
+        // SINGLE WRITER PER PATH (T8's `fsutil::write_atomic` contract):
+        // `create_script` writes through the very same fixed-`<path>.tmp`
+        // rail Ctrl+S uses, and a rename can move a file out from under an
+        // in-flight save. Serialize against the editor's save exactly the
+        // way `save_script` serializes against itself — this is a refusal
+        // the user can retry, not an error, so it reuses that wording.
+        if self.script_save_in_flight {
+            self.set_script_name_error(SCRIPT_SAVE_IN_FLIGHT.to_string(), cx);
+            return;
+        }
+        if let Some(connections_ui::ModalState::ScriptName { running, error, .. }) = &mut self.modal
+        {
+            *running = true;
+            *error = None;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let job = (root, parent_rel, target_rel.clone(), name);
+            let result: Result<String, String> = cx
+                .background_spawn(async move {
+                    let (root, parent_rel, target_rel, name) = job;
+                    match mode {
+                        connections_ui::ScriptNameMode::NewScript => {
+                            crate::scripts::create_script(&root, &parent_rel, &name)
+                        }
+                        connections_ui::ScriptNameMode::NewFolder => {
+                            crate::scripts::create_folder(&root, &parent_rel, &name)
+                        }
+                        connections_ui::ScriptNameMode::Rename => {
+                            crate::scripts::rename_entry(&root, &target_rel, &name, is_dir)
+                        }
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| match result {
+                Ok(new_rel) => view.finish_script_name(mode, target_rel, is_dir, new_rel, cx),
+                Err(e) => view.set_script_name_error(e, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// The name op landed. RE-CHECKS that the modal it is about to close
+    /// is still ITS OWN dialog: the op ran in the background, so closing
+    /// „the modal" blindly would close whatever the user has since opened
+    /// — the silent-context-change class this phase has already paid for
+    /// five times. `running` makes that unreachable in practice (Esc, both
+    /// buttons and the radio are all inert while it holds), but a
+    /// continuation must re-verify its promise, not assume it. If the
+    /// dialog IS gone, the op still happened, so the status still says so.
+    fn finish_script_name(
+        &mut self,
+        mode: connections_ui::ScriptNameMode,
+        target_rel: String,
+        is_dir: bool,
+        new_rel: String,
+        cx: &mut Context<Self>,
+    ) {
+        let mine = matches!(
+            &self.modal,
+            Some(connections_ui::ModalState::ScriptName {
+                mode: m, target_rel: t, running: true, ..
+            }) if *m == mode && *t == target_rel
+        );
+        if mode == connections_ui::ScriptNameMode::Rename {
+            self.retarget_binding_after_rename(&target_rel, &new_rel, is_dir);
+        }
+        let name = new_rel.rsplit('/').next().unwrap_or(&new_rel).to_string();
+        // DEVIATION from the plan snippet, recorded: it statused
+        // „skript vytvořen: {name}" for BOTH create modes, which says
+        // „script" over a folder. A false noun in the one line confirming
+        // a filesystem mutation is not a nit.
+        self.status = match mode {
+            connections_ui::ScriptNameMode::Rename => format!("přejmenováno: {name}"),
+            connections_ui::ScriptNameMode::NewFolder => format!("složka vytvořena: {name}"),
+            connections_ui::ScriptNameMode::NewScript => format!("skript vytvořen: {name}"),
+        };
+        if mine {
+            self.close_modal(cx);
+        }
+        self.start_scripts_scan(cx);
+        cx.notify();
+    }
+
+    /// §4's rename fixup. A rename moves the file the editor is bound to —
+    /// or the FOLDER above it — so the binding must follow it, or the
+    /// caption names a path that no longer exists and the next Ctrl+S
+    /// silently recreates the old file.
+    ///
+    /// Routed through `set_script_binding`, THE only writer of the field
+    /// (DEVIATION from the plan snippet, which poked `binding.path`
+    /// directly): the generation bump is exactly what tells an in-flight
+    /// save/open that its target moved. `saved_text` is carried across
+    /// unchanged, so a clean binding stays clean — the caption follows the
+    /// rename without sprouting a „ •".
+    fn retarget_binding_after_rename(&mut self, old_rel: &str, new_rel: &str, is_dir: bool) {
+        let Some(root) = self.effective_scripts_root() else { return };
+        let Some(b) = self.script_binding.as_ref() else { return };
+        let (Ok(old), Ok(new)) = (
+            crate::scripts::resolve_entry_rel(&root, old_rel),
+            crate::scripts::resolve_entry_rel(&root, new_rel),
+        ) else {
+            return;
+        };
+        let Some(moved) = script_binding_retarget(&b.path, &old, &new, is_dir) else { return };
+        let saved_text = b.saved_text.clone();
+        self.set_script_binding(Some(ScriptBinding { path: moved, saved_text }));
+    }
+
+    /// „Smazat". Enter never reaches here (`ModalConfirmKind::Ignore`) —
+    /// the button is the last gate before an unrecoverable disk delete.
+    pub(crate) fn confirm_script_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::ScriptDeleteConfirm { rel, is_dir, running, .. }) =
+            &self.modal
+        else {
+            return;
+        };
+        if *running {
+            return;
+        }
+        let (rel, is_dir) = (rel.clone(), *is_dir);
+        let Some(root) = self.effective_scripts_root() else {
+            self.set_script_delete_error("nastavte složku skriptů v Nastavení".to_string(), cx);
+            return;
+        };
+        // Same single-writer serialization as the name dialog: removing a
+        // file whose atomic save is still fsyncing would race the rename
+        // half of that write and could resurrect it a moment later.
+        if self.script_save_in_flight {
+            self.set_script_delete_error(SCRIPT_SAVE_IN_FLIGHT.to_string(), cx);
+            return;
+        }
+        let was_bound = self.binding_targets(&rel, is_dir);
+        if let Some(connections_ui::ModalState::ScriptDeleteConfirm { running, error, .. }) =
+            &mut self.modal
+        {
+            *running = true;
+            *error = None;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let job = (root, rel.clone());
+            let result = cx
+                .background_spawn(async move {
+                    let (root, rel) = job;
+                    crate::scripts::delete_entry(&root, &rel, is_dir)
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| match result {
+                Ok(()) => view.finish_script_delete(rel, was_bound, cx),
+                Err(e) => view.set_script_delete_error(e, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// The delete landed — same own-modal re-check as `finish_script_name`.
+    fn finish_script_delete(&mut self, rel: String, was_bound: bool, cx: &mut Context<Self>) {
+        let mine = matches!(
+            &self.modal,
+            Some(connections_ui::ModalState::ScriptDeleteConfirm { rel: r, running: true, .. })
+                if *r == rel
+        );
+        if was_bound {
+            // §4: the bound file is gone — drop the binding. The editor
+            // TEXT stays (the user may still want it, exactly as „Zavřít"
+            // has always left it); what must not survive is a caption and
+            // a „ •" claiming a file that no longer exists, and a Ctrl+S
+            // that would silently RECREATE it.
+            self.set_script_binding(None);
+        }
+        let name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+        self.status = format!("smazáno: {name}");
+        if mine {
+            self.close_modal(cx);
+        }
+        self.start_scripts_scan(cx);
+        cx.notify();
+    }
 
     /// Part S §5: does the editor differ from what is on disk? `false`
     /// whenever nothing is bound — the guard NEVER protects unbound ad-hoc
@@ -8802,17 +9291,30 @@ impl AppView {
             TreeEvent::ScriptOpen { rel } => {
                 self.editor_load_guarded(PendingScriptAction::Open { rel: rel.clone() }, cx)
             }
-            // Task 9 fills these in — they land here now only because
-            // `TreeEvent`'s match is exhaustive and its variants must be
-            // emitted and handled in one task. Each is an HONEST "not yet"
-            // (a Czech status, no silent swallow), and each is replaced —
-            // not extended — by its owning task's step.
-            TreeEvent::ScriptRunFile { .. }
-            | TreeEvent::ScriptCreate { .. }
-            | TreeEvent::ScriptRename { .. }
-            | TreeEvent::ScriptDelete { .. } => {
-                self.status = "error: tato akce zatím není dostupná".to_string();
-                cx.notify();
+            // Part S §6: „▶" runs the file ON DISK through the SHARED G12
+            // confirm continuation — never the editor buffer, never a save
+            // first.
+            TreeEvent::ScriptRunFile { rel } => self.run_script_from_library(rel.clone(), cx),
+            // Part S §4: the ONE name dialog, three flavours. Nothing is
+            // written until its confirm; `validate_script_name`, the
+            // Unicode-aware collision probe and the empty-rel mutation
+            // rail all live inside the `scripts.rs` ops it dispatches.
+            TreeEvent::ScriptCreate { parent_rel } => self.open_script_name_modal(
+                connections_ui::ScriptNameMode::NewScript,
+                parent_rel.clone(),
+                String::new(),
+                false,
+                cx,
+            ),
+            TreeEvent::ScriptRename { rel, is_dir } => self.open_script_name_modal(
+                connections_ui::ScriptNameMode::Rename,
+                String::new(),
+                rel.clone(),
+                *is_dir,
+                cx,
+            ),
+            TreeEvent::ScriptDelete { rel, is_dir } => {
+                self.open_script_delete_modal(rel.clone(), *is_dir, cx)
             }
         }
     }
@@ -10375,6 +10877,12 @@ impl Render for AppView {
                 // — focus its field, same end state as the window-having
                 // openers (dropdown/test).
                 let focus = input.focus_handle(cx);
+                window.focus(&focus, cx);
+            } else if let Some(connections_ui::ModalState::ScriptName { field, .. }) = &self.modal {
+                // T9: an input-owning dialog opened from a cx-only tree
+                // subscription — focus its name field, same end state as
+                // the window-having openers.
+                let focus = field.focus_handle(cx);
                 window.focus(&focus, cx);
             } else if matches!(
                 self.modal,
@@ -12784,6 +13292,78 @@ mod script_binding_tests {
     fn the_second_concurrent_save_is_refused_in_plain_words() {
         assert_eq!(SCRIPT_SAVE_IN_FLIGHT, "ukládání skriptu už probíhá");
         assert!(!SCRIPT_SAVE_IN_FLIGHT.starts_with("error:"));
+    }
+
+    // ---------- T9: the binding stays coherent with the filesystem ----------
+
+    /// Part S §4's binding fixup, as a pure decision. The three cases the
+    /// Task 9 brief demanded be pinned: rename the bound file, delete the
+    /// bound file, and — the one the plan text did not cover — rename or
+    /// delete a FOLDER that CONTAINS the bound file. `rename_entry` renames
+    /// folders too, so „only the exact path matters" would have left the
+    /// binding pointing at a path that no longer exists.
+    #[test]
+    fn a_folder_rename_moves_the_binding_with_it_not_just_an_exact_hit() {
+        let root = PathBuf::from(r"D:\ws\scripts");
+        let bound = root.join("prod").join("trzby.sql");
+
+        // The bound FILE itself is renamed.
+        assert_eq!(
+            script_binding_retarget(
+                &bound,
+                &root.join("prod").join("trzby.sql"),
+                &root.join("prod").join("trzby-2025.sql"),
+                false
+            ),
+            Some(root.join("prod").join("trzby-2025.sql"))
+        );
+        // The folder ABOVE it is renamed — the suffix is rebased.
+        assert_eq!(
+            script_binding_retarget(&bound, &root.join("prod"), &root.join("produkce"), true),
+            Some(root.join("produkce").join("trzby.sql"))
+        );
+        // A folder rename must NOT rebase when `is_dir` is false: a FILE
+        // whose name happens to be a path prefix of the binding is not an
+        // ancestor of it.
+        assert_eq!(script_binding_retarget(&bound, &root.join("prod"), &root.join("p2"), false), None);
+        // An unrelated entry leaves the binding alone.
+        assert_eq!(
+            script_binding_retarget(&bound, &root.join("dev"), &root.join("dev2"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn the_delete_fixup_covers_the_bound_file_and_its_ancestors() {
+        let root = PathBuf::from(r"D:\ws\scripts");
+        let bound = root.join("prod").join("trzby.sql");
+        assert!(script_binding_affected(&bound, &bound, false));
+        assert!(script_binding_affected(&bound, &root.join("prod"), true));
+        assert!(!script_binding_affected(&bound, &root.join("prod"), false));
+        assert!(!script_binding_affected(&bound, &root.join("dev"), true));
+        // The root itself is an ancestor of everything — but `delete_entry`
+        // refuses an empty rel (`resolve_entry_rel`), so the root can never
+        // BE a target; this only records that the predicate is honest.
+        assert!(script_binding_affected(&bound, &root, true));
+    }
+
+    /// Part S §1.3, recorded as a TEST because it is the kind of
+    /// "helpful" behaviour a future edit adds by accident: ▶ runs what
+    /// is on DISK. The pre-scan reads the file; nothing writes it.
+    /// CARGO_MANIFEST_DIR, not `file!()`: cargo runs tests with the
+    /// PACKAGE dir as CWD while `file!()` is workspace-relative.
+    #[test]
+    fn running_a_library_script_never_auto_saves_first() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+        let run_fn = src
+            .split("fn run_script_from_library")
+            .nth(1)
+            .expect("run_script_from_library exists");
+        let body = &run_fn[..run_fn.find("\n    fn ").unwrap_or(run_fn.len())];
+        for banned in ["save_script", "write_script", "replace_buffer", "bind_script"] {
+            assert!(!body.contains(banned), "▶ must not {banned}: it runs the DISK content");
+        }
     }
 }
 

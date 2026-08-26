@@ -1403,6 +1403,84 @@ pub enum ModalState {
         /// (`workspace_confirm_esc_closable`).
         running: bool,
     },
+    /// Part S §4: ONE dialog for new script / new folder / rename. The
+    /// Skript↔Složka choice is a radio inside the NewScript/NewFolder pair
+    /// (`mode` is what the radio flips; it is inert for `Rename`).
+    /// `parent_rel` is `""` at the root; `target_rel` is the entry being
+    /// renamed (empty for creates).
+    ///
+    /// `running` mirrors `WorkspaceConfirm`'s, and it is NOT decoration:
+    /// `create_script` writes through `fsutil::write_atomic`, whose tmp
+    /// path is a pure function of the target (T8's single-writer
+    /// contract), so two Enter presses racing into the same new file would
+    /// collide in the same `<path>.tmp`. It also freezes the dialog's
+    /// identity while the background op runs, which is what lets the
+    /// continuation know it is closing ITS OWN modal.
+    ScriptName {
+        mode: ScriptNameMode,
+        parent_rel: String,
+        target_rel: String,
+        is_dir: bool,
+        field: Entity<TextField>,
+        error: Option<String>,
+        running: bool,
+    },
+    /// Part S §4/§7.9: irreversible, and folders only when empty.
+    /// `dirty_bound` adds the §4 second line when the target IS the
+    /// dirty-bound script — one modal, both facts, instead of a discard
+    /// confirm stacked in front of a delete confirm. `running` is the same
+    /// double-dispatch/identity freeze as `ScriptName`'s.
+    ScriptDeleteConfirm {
+        rel: String,
+        is_dir: bool,
+        dirty_bound: bool,
+        error: Option<String>,
+        running: bool,
+    },
+}
+
+/// Which flavour of the ONE name dialog is open (Part S §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScriptNameMode {
+    NewScript,
+    NewFolder,
+    Rename,
+}
+
+pub(crate) fn script_name_title(mode: ScriptNameMode) -> &'static str {
+    match mode {
+        ScriptNameMode::NewScript => "Nový skript",
+        ScriptNameMode::NewFolder => "Nová složka",
+        ScriptNameMode::Rename => "Přejmenovat",
+    }
+}
+
+pub(crate) fn script_delete_text(name: &str, is_dir: bool) -> String {
+    let kind = if is_dir { "složku" } else { "skript" };
+    format!("Smazat {kind} {name}? Akce je nevratná (maže se z disku, ne do koše).")
+}
+
+/// Part S §4's resolved simplification: when the target IS the dirty-bound
+/// file, the delete confirm carries a second line instead of stacking a
+/// discard confirm in front of it — one modal, both facts.
+pub(crate) fn script_delete_dirty_line() -> &'static str {
+    "Skript má neuložené změny v editoru."
+}
+
+/// The Enter policy for `ModalState::ScriptName`, factored out so it can be
+/// asserted without constructing the variant's `Entity<TextField>`.
+pub(crate) fn script_name_confirm_kind() -> ModalConfirmKind {
+    ModalConfirmKind::ScriptName
+}
+
+/// Esc for BOTH scripts modals: free while nothing is dispatched, refused
+/// once the background fs op is in flight. Same shape (and same reason) as
+/// `workspace_confirm_esc_closable` — a modal whose continuation is about
+/// to close it, rescan the tree and possibly re-point or clear the editor
+/// binding must not be dismissable out from under that continuation.
+/// Neither dialog holds secret state, so `running` is the only question.
+pub(crate) fn script_modal_esc_closable(running: bool) -> bool {
+    !running
 }
 
 /// UX-polish §1.2: what Enter does per open modal — THE policy table as
@@ -1427,6 +1505,10 @@ pub(crate) enum ModalConfirmKind {
     /// pwchange: Enter = „Změnit heslo" (`AppView::confirm_pw_change`,
     /// self-guarding — validace + running-guard v těle).
     ChangeServerPw,
+    /// T9, policy clause (a): confirm creates/renames a FILE and runs
+    /// NOTHING against the database (`AppView::confirm_script_name`,
+    /// self-guarding — the `running` check is in its body).
+    ScriptName,
     Ignore,
 }
 
@@ -1440,6 +1522,10 @@ pub(crate) fn modal_confirm_kind(modal: &ModalState) -> ModalConfirmKind {
         ModalState::Settings => ModalConfirmKind::CloseSettings,
         ModalState::ChartPicker { .. } => ModalConfirmKind::ChartConfirm,
         ModalState::ChangeServerPassword { .. } => ModalConfirmKind::ChangeServerPw,
+        // Policy clause (a): confirm creates/renames a FILE and runs
+        // nothing against the database. Routed through the free fn so the
+        // table and its test share ONE source.
+        ModalState::ScriptName { .. } => script_name_confirm_kind(),
         // §3-novela Ignore arms — kept as explicit variants (not a `_`
         // catch-all) so a NEW ModalState variant is a compile error here
         // and must consciously pick a side of the policy table.
@@ -1455,7 +1541,11 @@ pub(crate) fn modal_confirm_kind(modal: &ModalState) -> ModalConfirmKind {
         // §W3.2: the LAST gate before an init writes into a folder / a
         // pointer replaces the whole working context. Same posture as
         // ScriptRun — the button is the gate, for all three modes.
-        | ModalState::WorkspaceConfirm { .. } => ModalConfirmKind::Ignore,
+        | ModalState::WorkspaceConfirm { .. }
+        // §3-novela's substance is IRREVERSIBILITY, not SQL: the button is
+        // the last gate before an unrecoverable disk delete (there is no
+        // recycle bin here, and no recursive-delete undo we could offer).
+        | ModalState::ScriptDeleteConfirm { .. } => ModalConfirmKind::Ignore,
     }
 }
 
@@ -1495,6 +1585,11 @@ pub(crate) fn modal_is_blocking(modal: &ModalState) -> bool {
         // write is running, which is the narrower per-variant question
         // this predicate deliberately does not answer.
         | ModalState::WorkspaceConfirm { .. }
+        // T9: nothing secret is typed and the app behind them is fully
+        // live — the narrower "is a job running?" question is
+        // `script_modal_esc_closable`, which `on_cancel_query` asks next.
+        | ModalState::ScriptName { .. }
+        | ModalState::ScriptDeleteConfirm { .. }
         | ModalState::CsvImport { .. } => false,
     }
 }
@@ -1738,6 +1833,20 @@ impl AppView {
             }
             ModalState::WorkspaceConfirm { mode, root, error, running } => {
                 render_workspace_confirm_panel(mode, &root, &error, running, cx)
+            }
+            ModalState::ScriptName { mode, parent_rel, target_rel, field, error, running, .. } => {
+                render_script_name_panel(
+                    mode,
+                    &parent_rel,
+                    &target_rel,
+                    field,
+                    &error,
+                    running,
+                    cx,
+                )
+            }
+            ModalState::ScriptDeleteConfirm { rel, is_dir, dirty_bound, error, running } => {
+                render_script_delete_panel(&rel, is_dir, dirty_bound, &error, running, cx)
             }
         };
         Some(
@@ -2060,6 +2169,7 @@ impl AppView {
             ModalConfirmKind::CloseSettings => self.close_modal(cx),
             ModalConfirmKind::ChartConfirm => self.confirm_chart_picker(cx),
             ModalConfirmKind::ChangeServerPw => self.confirm_pw_change(cx),
+            ModalConfirmKind::ScriptName => self.confirm_script_name(cx),
             // Handled no-op: propagation already stopped, Enter dies here.
             ModalConfirmKind::Ignore => {}
         }
@@ -4284,6 +4394,12 @@ pub(crate) fn modal_blocks_context_switch(modal: Option<&ModalState>) -> bool {
         | Some(ModalState::BackupRestore(_))
         | Some(ModalState::ScriptRun { .. })
         | Some(ModalState::CsvImport { .. })
+        // T9: a swap changes `effective_scripts_root` under these dialogs,
+        // and both hold a rel that would then resolve against a DIFFERENT
+        // root — the „never a silent context change" rail, applied to the
+        // one thing these modals are about.
+        | Some(ModalState::ScriptName { .. })
+        | Some(ModalState::ScriptDeleteConfirm { .. })
         | Some(ModalState::WorkspaceMissing { .. }) => true,
     }
 }
@@ -4930,6 +5046,186 @@ mod top_bar_label_tests {
         assert_eq!(compare_side_label("prod", Engine::Postgres, None), "prod (pg)");
         assert_eq!(compare_side_label("prod", Engine::Mssql, Some("staging")), "prod (mssql) / staging");
     }
+}
+
+/// Part S §4: the ONE name dialog — new script / new folder / rename.
+///
+/// The Skript/Složka radio is rendered ONLY for the create modes (it is
+/// what flips `mode` between `NewScript` and `NewFolder`); a rename cannot
+/// change an entry's kind, so offering the choice there would be a lie.
+/// Errors land INSIDE the panel (the „error stays in the modal" precedent
+/// — the user needs to read „název už existuje" against the name they just
+/// typed, and the field keeps its text so they can edit rather than
+/// retype). While `running`, both buttons and the radio go inert and Esc
+/// is refused (`script_modal_esc_closable`).
+#[allow(clippy::too_many_arguments)]
+fn render_script_name_panel(
+    mode: ScriptNameMode,
+    parent_rel: &str,
+    target_rel: &str,
+    field: Entity<TextField>,
+    error: &Option<String>,
+    running: bool,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let theme = *cx.theme();
+    let context_line = match mode {
+        ScriptNameMode::Rename => format!("původní název: {target_rel}"),
+        _ if parent_rel.is_empty() => "v kořeni knihovny".to_string(),
+        _ => format!("ve složce: {parent_rel}"),
+    };
+    let mut panel = div()
+        .id("script-name-panel")
+        .w(px(420.))
+        .bg(theme.bg_panel)
+        .border_1()
+        .border_color(theme.border)
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(theme.text_primary)
+        .child(div().text_size(px(16.)).child(script_name_title(mode)))
+        .child(div().text_color(theme.text_muted).child(context_line));
+
+    if mode != ScriptNameMode::Rename {
+        let kind_option = |id: &'static str, label: &'static str, value: ScriptNameMode| {
+            let selected = value == mode;
+            let base = div().id(id).px_2().py_1().rounded_md().child(label);
+            if running {
+                base.text_color(theme.border)
+            } else if selected {
+                base.cursor_pointer()
+                    .bg(theme.bg_selected)
+                    .text_color(theme.text_primary)
+                    .on_click(cx.listener(move |v, _, _, cx| v.set_script_name_mode(value, cx)))
+            } else {
+                base.cursor_pointer()
+                    .bg(theme.bg_hover)
+                    .text_color(theme.text_muted)
+                    .on_click(cx.listener(move |v, _, _, cx| v.set_script_name_mode(value, cx)))
+            }
+        };
+        panel = panel.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(kind_option("script-kind-file", "Skript", ScriptNameMode::NewScript))
+                .child(kind_option("script-kind-dir", "Složka", ScriptNameMode::NewFolder)),
+        );
+    }
+
+    panel = panel.child(field_row("Název", field, theme));
+    if let Some(e) = error {
+        panel = panel.child(div().text_color(theme.danger).child(e.clone()));
+    }
+    let confirm_label = match mode {
+        ScriptNameMode::Rename => "Přejmenovat",
+        _ => "Vytvořit",
+    };
+    panel
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .justify_end()
+                .mt_2()
+                .child(
+                    div()
+                        .id("script-name-cancel")
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme.bg_hover)
+                        .when(!running, |d| d.cursor_pointer())
+                        .when(running, |d| d.text_color(theme.text_muted))
+                        .child("Zrušit")
+                        .on_click(cx.listener(|v, _, _, cx| v.cancel_script_modal(cx))),
+                )
+                .child(
+                    div()
+                        .id("script-name-ok")
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(if running { theme.bg_selected } else { theme.bg_hover })
+                        .when(!running, |d| d.cursor_pointer())
+                        .child(if running { "Pracuji…" } else { confirm_label })
+                        .on_click(cx.listener(|v, _, _, cx| v.confirm_script_name(cx))),
+                ),
+        )
+        .into_any_element()
+}
+
+/// Part S §4/§7.9: the irreversible-delete gate. Enter is INERT here
+/// (`modal_confirm_kind`) — the button is the last thing between the user
+/// and a file that no undo, no recycle bin and no app-side history can
+/// bring back. The `dirty_bound` line is §4's resolved simplification.
+fn render_script_delete_panel(
+    rel: &str,
+    is_dir: bool,
+    dirty_bound: bool,
+    error: &Option<String>,
+    running: bool,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let theme = *cx.theme();
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let mut panel = div()
+        .id("script-delete-panel")
+        .w(px(420.))
+        .bg(theme.bg_panel)
+        .border_1()
+        .border_color(theme.border)
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(theme.text_primary)
+        .child(div().text_size(px(16.)).child(script_delete_text(name, is_dir)));
+    if dirty_bound {
+        panel = panel.child(div().text_color(theme.warn).child(script_delete_dirty_line()));
+    }
+    if let Some(e) = error {
+        panel = panel.child(div().text_color(theme.danger).child(e.clone()));
+    }
+    panel
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .justify_end()
+                .mt_2()
+                .child(
+                    div()
+                        .id("script-delete-cancel")
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme.bg_hover)
+                        .when(!running, |d| d.cursor_pointer())
+                        .when(running, |d| d.text_color(theme.text_muted))
+                        .child("Zrušit")
+                        .on_click(cx.listener(|v, _, _, cx| v.cancel_script_modal(cx))),
+                )
+                .child(
+                    div()
+                        .id("script-delete-ok")
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(if running { theme.bg_selected } else { theme.bg_hover })
+                        .when(!running, |d| d.cursor_pointer())
+                        .child(if running { "Pracuji…" } else { "Smazat" })
+                        .on_click(cx.listener(|v, _, _, cx| v.confirm_script_delete(cx))),
+                ),
+        )
+        .into_any_element()
 }
 
 /// G12 T3: `ModalState::ScriptRun`'s confirm panel — file list (with the
@@ -5747,6 +6043,98 @@ mod modal_confirm_kind_tests {
                 assert!(matches!(modal_confirm_kind(&m), ModalConfirmKind::Ignore));
             }
         }
+    }
+
+    // ---------- Scripts library modals (workspace T9) ----------
+
+    #[test]
+    fn script_name_modal_titles_follow_the_designed_copy() {
+        assert_eq!(script_name_title(ScriptNameMode::NewScript), "Nový skript");
+        assert_eq!(script_name_title(ScriptNameMode::NewFolder), "Nová složka");
+        assert_eq!(script_name_title(ScriptNameMode::Rename), "Přejmenovat");
+    }
+
+    #[test]
+    fn the_delete_confirm_text_names_the_kind_and_the_irreversibility() {
+        assert_eq!(
+            script_delete_text("trzby.sql", false),
+            "Smazat skript trzby.sql? Akce je nevratná (maže se z disku, ne do koše)."
+        );
+        assert_eq!(
+            script_delete_text("prod", true),
+            "Smazat složku prod? Akce je nevratná (maže se z disku, ne do koše)."
+        );
+    }
+
+    #[test]
+    fn deleting_a_dirty_bound_file_says_so_in_the_same_modal() {
+        // Part S §4's resolved simplification: ONE modal, both facts — no
+        // discard-confirm stacked in front of a delete-confirm.
+        assert_eq!(script_delete_dirty_line(), "Skript má neuložené změny v editoru.");
+    }
+
+    #[test]
+    fn a_delete_confirm_never_takes_enter() {
+        // §3-novela's substance is IRREVERSIBILITY, not SQL: the button is
+        // the last gate before an unrecoverable disk delete.
+        for running in [false, true] {
+            assert_eq!(
+                modal_confirm_kind(&ModalState::ScriptDeleteConfirm {
+                    rel: "a.sql".into(),
+                    is_dir: false,
+                    dirty_bound: false,
+                    error: None,
+                    running,
+                }),
+                ModalConfirmKind::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn the_name_dialog_does_take_enter() {
+        // Policy clause (a): confirm creates/renames a FILE and runs
+        // NOTHING against the database. `ModalState::ScriptName` holds an
+        // `Entity<TextField>`, which cannot be built without a GPUI
+        // context — so the policy is pinned through the same free fn
+        // `modal_confirm_kind`'s arm calls, giving the table and the test
+        // ONE source instead of two.
+        assert_eq!(script_name_confirm_kind(), ModalConfirmKind::ScriptName);
+    }
+
+    /// T9: neither scripts modal is BLOCKING (§W4 is the only one), but
+    /// the delete confirm must still refuse Esc while its `fs::remove_*`
+    /// is in flight — the `BackupRestore`/`WorkspaceConfirm` posture, so a
+    /// keystroke cannot abandon a modal whose continuation is about to
+    /// clear the editor binding.
+    #[test]
+    fn the_scripts_modals_are_not_blocking_but_refuse_esc_while_running() {
+        let del = |running| ModalState::ScriptDeleteConfirm {
+            rel: "a.sql".into(),
+            is_dir: false,
+            dirty_bound: true,
+            error: None,
+            running,
+        };
+        assert!(!modal_is_blocking(&del(false)));
+        assert!(!modal_is_blocking(&del(true)));
+        assert!(script_modal_esc_closable(false));
+        assert!(!script_modal_esc_closable(true));
+    }
+
+    /// A scripts modal must block a context switch: the swap changes
+    /// `effective_scripts_root` under it, so a dialog holding a rel from
+    /// the OLD root would resolve against the NEW one.
+    #[test]
+    fn a_scripts_modal_blocks_a_context_switch() {
+        let del = ModalState::ScriptDeleteConfirm {
+            rel: "a.sql".into(),
+            is_dir: false,
+            dirty_bound: false,
+            error: None,
+            running: false,
+        };
+        assert!(modal_blocks_context_switch(Some(&del)));
     }
 }
 

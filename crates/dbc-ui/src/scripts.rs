@@ -4,20 +4,18 @@
 //! components onto the root; symlinks are skipped at scan; nothing here
 //! ever executes SQL or touches a database connection.
 //!
-//! Landed dark in scripts T2. Workspace T7 lit the FIRST consumers —
-//! `scan_scripts`/`ScriptEntry`/`ScriptScan` drive the „Skripty" sidebar
-//! section — and workspace T8 lit the editor binding's four:
-//! `resolve_rel`, `read_script`, `write_script` and (transitively, inside
-//! `read_script`) `SCRIPT_OPEN_CAP`. What is still dark is exactly the 10
-//! items **Task 9** owns — the fs mutations and their rails:
-//! `resolve_entry_rel`, `create_script`, `create_folder`, `rename_entry`,
-//! `delete_entry`, `validate_script_name`, `conflicting_name`,
-//! `joined_rel`, `RESERVED_NAMES`, `SCRIPT_NAME_CAP`. (`resolve_entry_rel`
-//! moved from T8's list to T9's deliberately: it is the MUTATION rail, and
-//! T8 only reads and overwrites an already-resolved path.) Removal owner:
-//! the workspace plan `2026-08-25-workspace-folder.md`'s Task 9, which
-//! deletes this attribute outright (admin_sql.rs precedent).
-#![allow(dead_code)]
+//! Landed dark in scripts T2; lit incrementally. Workspace T7 lit the
+//! first consumers (`scan_scripts`/`ScriptEntry`/`ScriptScan` drive the
+//! „Skripty" sidebar section), T8 lit the editor binding's
+//! `resolve_rel`/`read_script`/`write_script`/`SCRIPT_OPEN_CAP`, and
+//! **T9 lit the last ten** — the fs mutations and their rails
+//! (`resolve_entry_rel`, `create_script`, `create_folder`,
+//! `rename_entry`, `delete_entry`, `validate_script_name`,
+//! `conflicting_name`, `joined_rel`, `RESERVED_NAMES`,
+//! `SCRIPT_NAME_CAP`). The module-level `#![allow(dead_code)]` that
+//! carried them is GONE as of T9: nothing here is dark any more, so a
+//! future unused item is a warning again rather than something this
+//! attribute would have hidden.
 
 use std::fs;
 use std::path::{Path, PathBuf};
