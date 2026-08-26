@@ -1702,3 +1702,231 @@ gate; verified by mutation during T10.
   or an Esc-anyway hatch) reintroduces a second writer on
   `write_atomic`'s fixed `<path>.tmp`, which is silent data loss instead
   of a visible wedge.
+
+# Jak to nakonec je (as-built) — final-review pass, v0.22.0
+
+Written after the FINAL WHOLE-BRANCH REVIEW of the workspace-folder +
+scripts-library phase. Everything in §A–§H above still stands; this
+section records what that review changed and why. Where it and §A–§H
+disagree, this section wins.
+
+## I. The data-loss fix (MAJOR-1)
+
+`confirm_script_delete` computed `was_bound = binding_targets(rel, is_dir)`
+BEFORE dispatching the background delete, and `finish_script_delete`
+applied that boolean blind. This is the phase's own banned shape — *a
+check performed before an `await` is a statement about the past* — and it
+lost data in one direction:
+
+1. Editor UNBOUND. Double-click `trzby.sql` → `read_script` dispatched.
+2. Right-click → Smazat → confirm. `was_bound == false`. Delete dispatched.
+3. The READ lands first. `script_open_abort_reason` passes all three legs
+   — the root did not move, the buffer was not typed into, and the
+   generation did not change *because an unbound editor never called
+   `set_script_binding`, so nothing bumped it* — and `bind_script` binds
+   the doomed file.
+4. The delete lands. `was_bound == false`, so the binding is NOT cleared;
+   the caption still names a file that no longer exists.
+5. Ctrl+S — `script_save_allowed` passes, the modal is long closed — and
+   the irreversibly deleted file is silently back on disk.
+
+The symmetric direction was milder and equally wrong: bound to `a.sql`,
+an in-flight open of `b.sql` landing during a confirmed delete of `a.sql`
+dropped the brand-new `b.sql` binding, so the next Ctrl+S silently became
+a save-as.
+
+**Fixed by re-ASKING at the landing.** The question is now the free fn
+`binding_targets_entry(binding, root, rel, is_dir)`, so no parameter can
+carry a dispatch-time answer; `binding_targets` is a thin wrapper; `is_dir`
+travels instead of the bool, because it describes the deleted entry, which
+cannot change while the op runs. `retarget_binding_after_rename` — the
+delete's sibling — was already written this way, which is why rename never
+had this bug. Both directions pinned, plus the no-binding / no-root /
+empty-rel arms.
+
+The delete confirm's second line is now explicitly a WARNING about the
+moment the user is looking at it, not the decision. The decision is made
+when the delete lands.
+
+## J. The audits stopped being the primary rail (MAJOR-2)
+
+The reviewer defeated two of the four source audits on a LIVE production
+path (`perform_script_action`'s `Unbind` arm) with **zero warnings and
+11/11 audits passing** — reproduced independently on `93b7d87` during this
+pass, 950 passed / 0 failed. Root cause both times: *the audit pinned the
+mention, not every path to the thing.*
+
+- `config_save_guard_audit` keyed on the literal `.config.save(`, so
+  `let cfg = &self.config; cfg.save(&self.config_path);` was invisible.
+- `script_write_audit` keyed on `.save_script(` **with the leading dot**,
+  and its doc comment argued at length for the dot. UFCS puts a colon
+  there: `AppView::save_script(self, …)` contains `::save_script(`.
+
+That is five separate defeats of a text audit across this phase, this one
+by the most ordinary alternative call syntax in Rust. So the rule moved
+into the type system, and the audits became the belt rather than the
+braces.
+
+**`save_guard::SaveAllowed`** — a witness with a private tuple field,
+demanded by value by `AppView::save_script`. Rust's finest privacy
+granularity is the module and `main.rs` is the CRATE ROOT, so a private
+field declared there is visible crate-wide and proves nothing; the witness
+therefore lives in a CHILD module, because a parent cannot see a child's
+private items. That asymmetry is the whole mechanism. The only mint is
+`save_guard::save_allowed_now(&AppView)`, which reads the three facts off
+the live view — a three-boolean mint would let a caller pass whichever
+three suited it. `SaveAllowed` is deliberately neither `Copy` nor `Clone`,
+so `on_save_script`'s witness cannot be carried across `save_script_as`'s
+file picker even on purpose: the „check before an await" rule, made
+structural.
+
+**`dbc_state::ConfigSaveGuard`** — demanded by `AppConfig::save`. A
+cross-crate witness cannot have a private constructor (the minting code
+lives in the other crate), so this one proves the PRECONDITION instead of
+proving that a function was called: the only mint is
+`AppConfig::verify_savable(path)`, which re-reads the file and refuses
+when it does not parse. That is stronger, because it holds however the
+writer is reached. Six `dbc-ui` call sites threaded, plus `dbc-state`'s
+own.
+
+Consequence worth recording: **`guard_corrupt_config` stopped trusting
+`config_load_error` for the decision.** That flag is set at STARTUP, and
+the phase's own rule applies to it too — a `config.toml` corrupted by an
+external editor *after* launch used to be overwritten with no backup.
+The flag is still cleared (so the startup banner stops nagging), but the
+question „will this save destroy something" is now asked of the disk,
+every time. Cost: one small read per save, on a user gesture.
+
+The sentinel-folder comment's over-claim was corrected in the same spirit
+(MINOR-3): „every store open and every save against it fails loudly" was
+half false — all four store savers `create_dir_all` their own parent, so a
+stray save SUCCEEDS and leaves debris. The comment was corrected rather
+than the behaviour, because the alternatives are a platform-specific
+unusable name (`NUL` fails on Windows and succeeds on Linux — a rail that
+silently stops working on one target is worse than an honest comment) or
+stripping `create_dir_all` from four pre-existing savers, which is what
+makes a first run work and is the §C refactor already declined. The
+security invariant — never the profile's real files — is structural and
+unaffected.
+
+### The scanner, three structural gaps
+
+- **`sources()` walked `dbc-ui/src` only.** `crates/dbc-ui/tests`, a
+  future `build.rs` and every other crate were invisible — notably
+  `dbc-state`'s FOUR `write_atomic` callers (`workspace.rs:265, 394, 433,
+  445`), which write real bytes into the user's folder and were audited by
+  nothing while `the_shared_atomic_writer_has_exactly_one_funnel` asserted
+  "exactly one caller". It now walks every workspace member's
+  `src`/`tests`/`build.rs` — 79 files, up from 33 — and that audit was
+  re-audited honestly: 10 sites, 5 production owners named individually.
+- **`code_of()` truncated at the first `//` anywhere**, including inside a
+  string literal, where it swallowed the rest of a real statement (a
+  hiding place, not merely a false positive: put a URL first and the call
+  vanished); block comments were never stripped at all. Replaced by
+  `code_lines()`, a scanner over nested multi-line block comments, `"…"`
+  with escapes, `r"…"`/`r#"…"#` raw strings, and char literals told apart
+  from lifetimes (`'/'` and `'"'` are both real code here).
+- **`owner_fn()` did no brace balancing**, so a call at file scope after a
+  sanctioned function CLOSED inherited its sanction. `owners()` tracks
+  depth; closures do not steal ownership, which is the answer these audits
+  want.
+
+Both broken needles are receiver-independent now: `save_script(` through
+the new `audit_excluding` (naming `on_save_script` as the false positive
+instead of dodging it with punctuation — the punctuation *was* the
+bypass), and the config write keyed on the ARGUMENT `config_path` rather
+than on any receiver.
+
+### The injection, re-run
+
+Verified by mutation in both directions rather than by argument:
+
+| Tree | Injection | Build | Audits |
+|---|---|---|---|
+| `93b7d87` (pre-fix) | reviewer's exact two | zero warnings | **950 passed, 0 failed — 11/11 green** |
+| fixed | reviewer's exact two | **2 compile errors** (`&ConfigSaveGuard` missing, `SaveAllowed` missing) | not reached |
+| fixed | same, but minting both witnesses legitimately | zero warnings | **3 FAILED**, each naming the injected line |
+
+The third row is why the text audits were kept: a caller that satisfies
+the type rail honestly and still writes from the wrong place is caught by
+`every_config_toml_write_passes_the_corrupt_config_guard`,
+`the_writer_itself_is_reachable_only_through_the_guarded_entry_points`
+and `the_save_witness_is_minted_at_every_stoppable_point_and_nowhere_else`.
+Reverted afterwards; `git diff --quiet` clean.
+
+## K. The recovery modal is an ADOPT, and now says so (MINOR-1)
+
+`pick_workspace_for_recovery` accepted any folder with a valid
+`dbc-workspace.toml`, wrote the pointer and called `apply_context` the
+instant the folder dialog returned. Settings' adopt has always shown
+„Trezor tohoto prostoru se odemyká jeho vlastním master heslem." and
+`WORKSPACE_GIT_WARNING` first (§W3.3/§W6.3, *"renders STATICALLY wherever
+the folder-pick flow is offered"*); recovery showed neither, so the user
+took on a foreign encrypted vault and a versioned-secrets decision
+uninformed.
+
+The confirm is a **SECOND STATE of the blocking modal**
+(`WorkspaceMissing.pending`), NOT a `ModalState::WorkspaceConfirm`.
+`WorkspaceMissing` is the one modal with no Esc and no close path, and
+handing the screen to an Esc-closable confirm would let the user cancel
+their way into an app with no context and no dialog — strictly worse than
+the bug being fixed. „Zpět" returns to the three choices; nothing closes
+this modal but a committed decision.
+
+The copy is not duplicated: the panel renders
+`workspace_confirm_lines(WorkspaceConfirmMode::Adopt)`, the same vector
+Settings renders, so the two adopt paths cannot drift apart.
+
+Side effect worth having: the pick now persists NOTHING at all (a
+strengthening of T4 review MAJOR-1's guard, which only promised "nothing
+until the UI-thread guard passes"), and the one write left is synchronous
+with no await near it, so it needs no re-verification.
+
+**The startup three-choice panel stays warning-free** (§W6.3: never on
+startup — the user has not chosen a folder at that screen) and
+back-to-profile is untouched. Both are negatively pinned.
+
+## L. Smaller corrections
+
+- **MINOR-2 — a blocked start's paths are now always ABSOLUTE.** A
+  hand-edited `path = ""` walked past every guard in `blocked_paths`
+  (`"" != profile`, and `Path::new("").canonicalize()` errors on Windows
+  so `is_same_dir` said false), leaving `base = ""`; `workspace_paths("")`
+  then yields the bare RELATIVE names `config.toml`, `vault.bin`, …,
+  resolved by the OS against the process CWD — which, if the app was
+  launched from `%APPDATA%\dbc`, are the profile's real files. The rule is
+  now absolute-or-sentinel, in the testable `blocked_base`. Deliberately
+  STRICTER than the review's "relative and non-canonicalizable": `..`
+  canonicalizes fine and still resolves against a CWD this app does not
+  set. `write_pointer` already refuses to WRITE a relative root for this
+  exact reason; this is the matching refusal on the way in, where a
+  hand-edited pointer never passed that rail.
+- **NIT-1 — `save_script_as` re-checks the captured buffer too.**
+  `open_script` re-asks root + generation + text; save-as asked only the
+  first two, and the generation is structurally blind to typing. The
+  picker is not app-modal on every platform, so keystrokes during it were
+  invisible and the file got the pre-picker text with `saved_text` bound
+  to text the user could no longer see. It now refuses, in the open path's
+  own words.
+- **NIT-3 — the last unfolded path comparison.**
+  `script_open_abort_reason` compared roots with an exact `!=` on
+  `Option<&Path>` while every other comparison goes through `same_path_ci`
+  — the exact shape T10 carry-forward 6 existed to eliminate.
+- **NIT-4 — `dbc-mcp`'s `-h`** was accepted since the first draft and
+  documented nowhere. Now in the usage text, and every accepted flag is
+  asserted present there so the next one cannot go undocumented either.
+- **NIT-2 — the §C `read_dir` inventory** was completed; see the note
+  added there.
+
+## M. Confirmed correct, do not "improve"
+
+Re-verified during this pass and deliberately left alone: the three rails
+of `editor_clobber_audit`; `confirm_workspace`'s success arm having no
+post-await check (sound, not lucky — the modal is latched while
+`running`); `fsutil::fold_name` being `to_uppercase` with the sigma pin on
+a DIRECTORY component; `history.sqlite` not travelling; git staying
+permanently external (no dep, no subprocess, nothing under `.git/` ever
+opened). The two release-only `chart_data` failures
+(`prepare_ragged_y_column_trips_debug_assert`,
+`scale_to_non_finite_value_trips_debug_assert`) remain the only two, and
+remain pre-existing backlog.
