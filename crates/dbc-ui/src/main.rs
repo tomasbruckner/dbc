@@ -1520,28 +1520,60 @@ pub(crate) const SCRIPT_SAVE_BLOCKED: &str = "nejprve zavřete otevřený dialog
 /// ROOT — a private field declared there would be visible crate-wide and
 /// prove nothing — so the witness and its only mint live in this small
 /// child module. A parent cannot see a child's private items, which makes
-/// `SaveAllowed(())` unspellable everywhere in `dbc-ui` except the twenty
-/// lines below. There is no receiver to rebind, no path spelling to vary
-/// and no macro to hide it in: without a call to
-/// [`save_allowed_now`][save_guard::save_allowed_now] there is no
-/// value to pass, and the crate does not compile.
+/// `SaveAllowed(..)` unspellable everywhere in `dbc-ui` except the lines
+/// below. There is no receiver to rebind, no path spelling to vary and no
+/// macro to hide it in.
+///
+/// **RE-VERIFY FAIL-2 — the first version was a VALUE, and this comment
+/// claimed more than the type delivered.** It said a witness „cannot be
+/// re-used after an await… stashing the first one across the picker would
+/// not compile", resting that on `!Copy + !Clone`. Those forbid a second
+/// USE of one value; they do not forbid a MOVE. The re-verifier gave
+/// `save_script_as` the witness as a parameter, captured it in the
+/// `async move` block, dropped the re-mint — clean build, 961 green — and
+/// so restored T9 re-verify FAIL-1 whole: Ctrl+S → picker opens → user
+/// deletes `trzby.sql` and confirms → picker completes naming
+/// `trzby.sql` → the irreversibly deleted file is silently back.
+///
+/// The permission is therefore no longer a value handed out at all.
+/// [`save_guard::with_save_permission`] is a SCOPE: the witness carries a
+/// generative brand (`SaveAllowed<'brand>` over an INVARIANT
+/// `PhantomData`), the closure is `for<'brand> FnOnce(..) -> R`, and `R`
+/// is one type chosen before `'brand` exists — so the witness cannot be
+/// returned from the scope, cannot be stored in anything that outlives
+/// it, and above all cannot be captured by `cx.spawn`, whose future must
+/// be `'static`. The closure is synchronous, so there is no await inside
+/// the scope to hold it across either.
+///
+/// Stated precisely, because over-claiming is exactly what let the last
+/// round through: this makes the permission unable to LEAVE the
+/// synchronous scope in which the predicate was checked. That is the
+/// property „a check before an await is a statement about the past"
+/// actually needs.
 ///
 /// The text audits are KEPT and were widened (belt and braces), but they
-/// are no longer the thing holding this invariant up.
+/// are not what holds this invariant up.
 mod save_guard {
     use crate::AppView;
+    use gpui::Context;
+    use std::marker::PhantomData;
 
-    /// Proof that a save was permitted at the moment the predicate ran.
+    /// Proof that a save was permitted, valid ONLY inside the
+    /// [`with_save_permission`] scope that produced it.
     ///
-    /// Deliberately NOT `Copy` and NOT `Clone`: a witness is consumed by
-    /// the write it authorises, so a post-await path cannot re-use the
-    /// answer it got before the await — the phase's own rule („a check
-    /// performed before an `await` is a statement about the past") made
-    /// structural. `save_script_as` re-asks and gets a FRESH witness;
-    /// stashing the first one across the picker would not compile.
+    /// `'brand` is generative and INVARIANT — `fn(&'brand ()) -> &'brand ()`
+    /// rather than `&'brand ()`, so subtyping can neither shorten nor
+    /// lengthen it. It is introduced by the `for<'brand>` bound on the
+    /// scope's closure, so no type nameable outside that closure can
+    /// mention it: the witness cannot be returned, stored in a field, or
+    /// captured by a `'static` future.
+    ///
+    /// Still `!Copy` and `!Clone`, but that is now a detail rather than
+    /// the argument. Re-verify FAIL-2 showed those forbid a second USE and
+    /// not a MOVE, and a move was all the escape needed.
     #[must_use = "this witness IS the permission — dropping it and saving anyway is \
                   the bug it exists to prevent"]
-    pub(crate) struct SaveAllowed(());
+    pub(crate) struct SaveAllowed<'brand>(PhantomData<fn(&'brand ()) -> &'brand ()>);
 
     /// T9 review MAJOR-1: may a Ctrl+S dispatch right now? A pure
     /// predicate so the rule is unit-pinned — `on_save_script` takes a
@@ -1559,29 +1591,42 @@ mod save_guard {
         !(modal_open || apply_open || discard_open)
     }
 
-    /// THE only mint of [`SaveAllowed`], and it reads the LIVE state
-    /// itself.
+    /// THE only mint of [`SaveAllowed`] — a SCOPE, not a value.
     ///
-    /// Taking `&AppView` rather than three booleans is the difference
-    /// between a rail and a formality: a caller handed
-    /// `script_save_allowed(false, false, false)` could mint a witness
-    /// over a screen full of dialogs without lying about anything the
-    /// compiler can see. Here there is nothing to lie WITH — the three
-    /// facts come straight off the view. (This module is a DESCENDANT of
-    /// the crate root, where `AppView` lives, so it can read fields that
-    /// are private there; the reverse — the crate root reaching into this
-    /// module's private tuple field — is what Rust forbids, and that
-    /// asymmetry is the whole mechanism.)
-    pub(crate) fn save_allowed_now(view: &AppView) -> Option<SaveAllowed> {
-        script_save_allowed(
+    /// Reading `&AppView` rather than taking three booleans is the
+    /// difference between a rail and a formality: a caller handed
+    /// `script_save_allowed(false, false, false)` could mint over a screen
+    /// full of dialogs without lying about anything the compiler can see.
+    /// Here there is nothing to lie WITH — the three facts come straight
+    /// off the view. (This module is a DESCENDANT of the crate root, where
+    /// `AppView` lives, so it can read fields private there; the reverse —
+    /// the crate root reaching into this module's private tuple field — is
+    /// what Rust forbids, and that asymmetry is the whole mechanism.)
+    ///
+    /// ALIASING THIS BUYS NOTHING, and that is the point of a scope over a
+    /// bare token: however it is spelled — `use … as go;`, a fn-pointer
+    /// binding, a macro — calling it RUNS the predicate. Re-verify FAIL-1
+    /// walked past four name-based audits with exactly that trick; the
+    /// writers that sit behind a real precondition were untouched by it.
+    ///
+    /// `None` — the closure never ran — is the refusal; callers report
+    /// [`SCRIPT_SAVE_BLOCKED`](crate::SCRIPT_SAVE_BLOCKED).
+    pub(crate) fn with_save_permission<R>(
+        view: &mut AppView,
+        cx: &mut Context<AppView>,
+        f: impl for<'brand> FnOnce(&mut AppView, &mut Context<AppView>, SaveAllowed<'brand>) -> R,
+    ) -> Option<R> {
+        if !script_save_allowed(
             view.modal.is_some(),
             view.apply_dialog.is_some(),
             view.discard_confirm.is_some(),
-        )
-        .then_some(SaveAllowed(()))
+        ) {
+            return None;
+        }
+        Some(f(view, cx, SaveAllowed(PhantomData)))
     }
 }
-use save_guard::{save_allowed_now, SaveAllowed};
+use save_guard::{with_save_permission, SaveAllowed};
 
 /// T8 review MAJOR-2: the refusal when a save of this editor is already in
 /// flight. Not an „error:" — nothing failed; the user's keystroke simply
@@ -7159,7 +7204,7 @@ impl AppView {
     /// user folder.
     ///
     /// FINAL-REVIEW MAJOR-2: `_allowed` is a [`SaveAllowed`] witness,
-    /// mintable ONLY by `save_guard::save_allowed_now`. It is unused at
+    /// mintable ONLY by `save_guard::with_save_permission`. It is unused at
     /// runtime and load-bearing at compile time — no caller can reach this
     /// writer, by any call syntax, without having asked the predicate. The
     /// reviewer's UFCS bypass (`AppView::save_script(self, p, t, false, cx)`)
@@ -7169,7 +7214,7 @@ impl AppView {
         path: PathBuf,
         text: String,
         rescan: bool,
-        _allowed: SaveAllowed,
+        _allowed: SaveAllowed<'_>,
         cx: &mut Context<Self>,
     ) {
         if self.script_save_in_flight {
@@ -7348,20 +7393,26 @@ impl AppView {
                 // `land_script_name_error` (post-await, must re-verify): a
                 // check performed before an await is a check about the past.
                 //
-                // FINAL-REVIEW MAJOR-2: the witness makes this structural.
-                // `SaveAllowed` is neither `Copy` nor `Clone`, so the one
-                // `on_save_script` minted before the picker cannot be
-                // carried across the await even deliberately — the only
-                // way to reach `save_script` from here is to ask again.
-                let Some(allowed) = save_allowed_now(view) else {
-                    view.status = SCRIPT_SAVE_BLOCKED.to_string();
-                    cx.notify();
-                    return;
-                };
+                // FINAL-REVIEW MAJOR-2 + RE-VERIFY FAIL-2: the SCOPE is
+                // what makes this structural. `on_save_script`'s
+                // permission is branded to its own synchronous scope, so
+                // it cannot be captured by this `'static` spawned future
+                // even deliberately — the re-verifier's carried-witness
+                // refactor no longer compiles. The only way to reach
+                // `save_script` from here is to ask again, here.
+                //
                 // Rescan when the save lands INSIDE the library; outside is
                 // allowed (it is the user's disk) but the tree honestly
                 // won't show it.
-                view.save_script(path, text.clone(), true, allowed, cx);
+                let text = text.clone();
+                if with_save_permission(view, cx, move |view, cx, allowed| {
+                    view.save_script(path, text, true, allowed, cx);
+                })
+                .is_none()
+                {
+                    view.status = SCRIPT_SAVE_BLOCKED.to_string();
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -7385,23 +7436,24 @@ impl AppView {
         // Refused OUT LOUD (a silent `return` is the other thing this phase
         // bans) and not as an „error:" — nothing failed; the keystroke
         // simply arrived while another decision was still on screen.
-        let Some(allowed) = save_allowed_now(self) else {
+        let bound = self.script_binding.as_ref().map(|b| b.path.clone());
+        let permitted = with_save_permission(self, cx, |view, cx, allowed| match bound {
+            Some(path) => {
+                let text = view.sql.read(cx).text();
+                view.save_script(path, text, false, allowed, cx);
+            }
+            // The permission ENDS with this scope, deliberately.
+            // `save_script_as` resumes after a file picker, so this answer
+            // will be stale by the time it has a path to write, and it
+            // opens its own scope there. Re-verify FAIL-2: handing the
+            // witness over used to COMPILE (a move is not a re-use), which
+            // restored the delete/save-as race whole; the generative brand
+            // is what makes it impossible rather than merely discouraged.
+            None => view.save_script_as(cx),
+        });
+        if permitted.is_none() {
             self.status = SCRIPT_SAVE_BLOCKED.to_string();
             cx.notify();
-            return;
-        };
-        match &self.script_binding {
-            Some(b) => {
-                let (path, text) = (b.path.clone(), self.sql.read(cx).text());
-                self.save_script(path, text, false, allowed, cx);
-            }
-            // The witness is DROPPED here on purpose: `save_script_as`
-            // resumes after a file picker, so this answer will be stale by
-            // the time it has a path to write, and it asks again for a
-            // fresh one. Handing it over would be exactly the „a check
-            // before an await is about the past" mistake — which is why
-            // `SaveAllowed` is not `Clone`.
-            None => self.save_script_as(cx),
         }
     }
 
@@ -14123,7 +14175,7 @@ mod script_binding_tests {
     #[test]
     fn ctrl_s_is_refused_whenever_any_dialog_owns_the_screen() {
         // Final-review MAJOR-2: the pure RULE stays a bool and stays
-        // unit-pinned here; `save_guard::save_allowed_now` is what turns
+        // unit-pinned here; `save_guard::with_save_permission` is what turns
         // it into the `SaveAllowed` witness `save_script` demands — and it
         // reads the three facts off the live `AppView`, so nobody can mint
         // one by passing three convenient `false`s.
@@ -15241,10 +15293,10 @@ mod script_write_audit {
     ///
     /// FINAL-REVIEW MAJOR-2 split the predicate in two.
     /// `script_save_allowed` is the pure RULE, still unit-pinned, and it
-    /// now has exactly one production caller: `save_guard::save_allowed_now`,
+    /// now has exactly one production caller: `save_guard::with_save_permission`,
     /// which is the only MINT of the `SaveAllowed` witness and which reads
     /// the three facts off the live `AppView` instead of accepting three
-    /// booleans a caller could choose. `save_allowed_now` is audited
+    /// booleans a caller could choose. `with_save_permission` is audited
     /// separately below, at the two entry points.
     #[test]
     fn the_ctrl_s_dialog_guard_is_asked_at_every_stoppable_point() {
@@ -15252,9 +15304,9 @@ mod script_write_audit {
             "script_save_allowed",
             // The predicate's own unit test is a real call site; naming it
             // here is what makes the exact count meaningful.
-            &["save_allowed_now", "ctrl_s_is_refused_whenever_any_dialog_owns_the_screen"],
+            &["with_save_permission", "ctrl_s_is_refused_whenever_any_dialog_owns_the_screen"],
             6,
-            "the pure Ctrl+S rule belongs to `save_guard::save_allowed_now`, which reads the \
+            "the pure Ctrl+S rule belongs to `save_guard::with_save_permission`, which reads the \
              live view - a caller that asks it with its own three booleans has bought \
              nothing, because it can pass whichever three suit it",
         );
@@ -15272,9 +15324,9 @@ mod script_write_audit {
     /// first answer across the picker impossible rather than merely
     /// discouraged.
     #[test]
-    fn the_save_witness_is_minted_at_every_stoppable_point_and_nowhere_else() {
+    fn the_save_permission_is_opened_at_every_stoppable_point_and_nowhere_else() {
         audit(
-            "save_allowed_now",
+            "with_save_permission",
             &["on_save_script", "save_script_as"],
             2,
             "every Ctrl+S entry point must mint the witness HERE - `.occlude()` blocks \
