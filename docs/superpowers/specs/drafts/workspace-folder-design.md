@@ -484,9 +484,9 @@ it is the user's file from the moment it exists):
 # dbc workspace — pracovní prostor aplikace dbc.
 # Git zde spravujete výhradně vy; aplikace s gitem nikdy nepracuje.
 
-# Dočasné soubory atomických zápisů (po pádu aplikace mohou zůstat):
-*.toml.tmp
-*.bin.tmp
+# Dočasné soubory atomických zápisů (po pádu aplikace mohou zůstat).
+# Aplikace je vždy pojmenuje <soubor>.tmp, proto jediné pravidlo:
+*.tmp
 
 # DOPORUČENÍ: vault.bin je šifrovaný trezor hesel (Argon2id).
 # Pokud ho NECHCETE verzovat (bezpečnější volba), odkomentujte
@@ -495,9 +495,21 @@ it is the user's file from the moment it exists):
 # vault.bin
 ```
 
+**AS-BUILT ADDENDUM (workspace T8 re-verify) — this block was STALE and is
+now corrected.** It enumerated `*.toml.tmp` / `*.bin.tmp`; the shipped
+`dbc_state::workspace::GITIGNORE_TEMPLATE` has been a blanket `*.tmp` since
+commit `6036961`, because `fsutil::write_atomic` names its scratch file
+`<path>.tmp` for whatever it is handed — so `*.sql.tmp` (a crash during
+Ctrl+S in the scripts library, by far the most frequent) and even
+`.gitignore.tmp` are possible, and an enumeration silently stops covering
+the next store that is added. The constant is byte-pinned by its own test;
+this block is now a copy of it, not a rival source. Recorded because the
+stale text was read as authoritative during Task 8 and produced a
+factually wrong justification in code, since corrected.
+
 Rationale: the commented-out `vault.bin` line makes the opt-out a
 one-character-delete discovery at exactly the place a git user looks;
-the active `*.tmp` lines are pure hygiene (crash leftovers of the
+the active `*.tmp` line is pure hygiene (crash leftovers of the
 tmp+rename writers); comments change no git behavior, so shipping the
 template carries zero risk of overriding user intent. Not shipping it
 would make the "trivially possible" requirement depend on the user

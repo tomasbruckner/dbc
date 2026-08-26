@@ -6798,15 +6798,18 @@ impl AppView {
     /// later-completing update sets `saved_text` to text the disk does not
     /// hold and the „ •" disappears over an unsaved file.
     ///
-    /// The fix is here rather than in the shared rail, deliberately.
-    /// Making `write_atomic`'s tmp name unique would stop matching the
-    /// shipped `.gitignore`'s `*.toml.tmp` / `*.bin.tmp` lines (§W6.2) —
-    /// gitignore has no pattern that survives inserting a nonce, and init
-    /// never overwrites an existing `.gitignore`, so every ALREADY-created
-    /// workspace would silently stop ignoring the app's temp files. A
-    /// per-path single-writer discipline in the caller is the smaller,
-    /// safer half of the same guarantee; `write_atomic`'s doc comment now
-    /// states that contract for every other writer over a user folder.
+    /// The fix is here rather than in the shared rail, and the reason is
+    /// NOT the one this comment first gave (T8 re-verify MINOR — that
+    /// version argued from a stale copy of the `.gitignore` template in
+    /// the spec draft; the shipped `GITIGNORE_TEMPLATE` is a blanket
+    /// `*.tmp` and would cover a nonce perfectly well). The real reason:
+    /// a unique tmp name fixes the first two failures above but NOT the
+    /// third. With two writes in flight the `rename` that wins on disk
+    /// need not belong to the continuation that runs last, so phantom-clean
+    /// survives a nonce untouched. Only per-path serialization closes it —
+    /// and once the caller has that, a nonce buys nothing. `write_atomic`'s
+    /// doc comment now states the contract for every other writer over a
+    /// user folder.
     fn save_script(&mut self, path: PathBuf, text: String, rescan: bool, cx: &mut Context<Self>) {
         if self.script_save_in_flight {
             self.status = SCRIPT_SAVE_IN_FLIGHT.to_string();

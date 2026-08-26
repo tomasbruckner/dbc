@@ -127,6 +127,14 @@ pub fn entry_exists_ci(parent: &Path, name: &str) -> Result<bool, StateError> {
 /// exactly BECAUSE this is a pure function of `path` that two overlapping
 /// writes to one target collide. Keep the `.tmp` ending: §W6.2's shipped
 /// `.gitignore` matches on it.
+///
+/// HONEST SCOPE (T8 re-verify): no caller outside this module uses this
+/// today, and it will not help the five stores `write_atomic`'s own module
+/// doc names as beneficiaries — `config.rs`, `params.rs`, `view_prefs.rs`,
+/// `vault.rs` and `dbc-ui`'s `grid.rs` all roll their own tmp+rename and
+/// never reach `write_atomic` at all. Its value is the determinism test
+/// beside it, which pins the property the contract rests on; do not read
+/// the export as leverage it does not currently have.
 pub fn tmp_path_for(path: &Path) -> PathBuf {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
@@ -152,11 +160,20 @@ pub fn tmp_path_for(path: &Path) -> PathBuf {
 /// Every caller must serialize its own writes per path; `AppView::
 /// save_script`'s `script_save_in_flight` flag is the worked example.
 ///
-/// The tmp name is deliberately NOT made unique to sidestep this: the
-/// shipped `.gitignore` (§W6.2) ignores `*.toml.tmp` / `*.bin.tmp`, no
-/// gitignore pattern survives inserting a nonce, and `init_contents` never
-/// overwrites an existing `.gitignore` — so a rename here would silently
-/// stop every ALREADY-created workspace from ignoring these files.
+/// A unique tmp name would NOT be a substitute for that discipline — this
+/// is the corrected reason (T8 re-verify MINOR; the first version of this
+/// paragraph argued from a stale copy of the `.gitignore` template in the
+/// spec draft rather than from [`crate::workspace::GITIGNORE_TEMPLATE`],
+/// which ships a blanket `*.tmp` and would happily cover a nonce). A nonce
+/// fixes the first two failures — no shared tmp to truncate, no ENOENT
+/// rename — but NOT the third and most dangerous: with two writes in
+/// flight the `rename` that wins on disk still need not belong to the
+/// continuation that runs last, so a caller recording „saved" from its own
+/// completion can still end up believing bytes are on disk that never got
+/// there. Only per-path serialization closes that, and once you have it a
+/// nonce buys nothing. Keeping `<path>.tmp` also keeps the shipped
+/// `.gitignore` — which `init_contents` never rewrites for an existing
+/// workspace — matching without anyone re-editing their copy.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
     use std::io::Write as _;
     let tmp = tmp_path_for(path);
