@@ -1540,20 +1540,50 @@ mutation confirmed that changing the `Command::Usage` arm from
 `ExitCode::FAILURE` to `ExitCode::SUCCESS` survives the entire `dbc-mcp`
 suite green. **Re-run this matrix whenever `main`'s match arms change.**
 
+> **RUN AND PASSED at v0.22.0 (T10, 2026-08-26)** — unlike the rest of §F,
+> this section is a CLI and needs no GPUI, so the sweep executed it rather
+> than merely writing it down. `%APPDATA%\dbc\workspace.toml` was created
+> for the run and deleted afterwards; `%APPDATA%\dbc\config.toml` was
+> `md5sum`-verified byte-identical before and after
+> (`f5912efe4833765e20e1b89bde1410c1`). Results below, and three extra
+> cases worth keeping:
+>
+> * **A broken pointer whose `path` contains a TOML `\n` escape** rendered
+>   as `D:: eexistuje-t10-smoke` on ONE line — the carry-forward-3 fix
+>   confirmed in the wild (it was reached by accident, writing `"D:\n…"`
+>   into the pointer, which is exactly the hand-edit the fix is for).
+> * **An UNPARSABLE pointer** (`path = "D:\wrong-escape"`) printed
+>   `ukazatel na pracovní prostor je nečitelný (ukazatel na pracovní
+>   prostor je poškozený: TOML parse error at line 1, column 12: missing
+>   escaped value, expected …)` — two lines, the `|`/`^` art gone AND the
+>   pointer's own source text not echoed. That is carry-forward 5 working
+>   out of process; the GUI half (§F.1 item 6) is still owed.
+> * **`--vault <real> --bogus` against a broken pointer** still diagnosed
+>   the workspace, out of process. That is carry-forward 2 — the
+>   `needs_config` arm nothing used to pin.
+>
+> Also confirmed: `--config <real> --vault <real>` against a broken
+> pointer gets PAST workspace resolution entirely and fails for its own
+> unrelated reason (no credential in the store), i.e. §W7's scope rule
+> holds.
+
 With `%APPDATA%\dbc\workspace.toml` pointing at a NON-EXISTENT folder:
 
-29. `cargo run -p dbc-mcp -- --help 1>NUL` — exits **0**, usage text on
-    stderr, and that text mentions the pointer and `--config`/`--vault`.
-30. `cargo run -p dbc-mcp 1>NUL` — exits **non-zero**, and the Czech
-    refusal appears on stderr as **exactly two lines**: the diagnosis and
-    the escape hatch. `1>NUL` must swallow NOTHING of it — a single byte
-    of this on stdout corrupts the JSON-RPC stream.
-31. `cargo run -p dbc-mcp -- --nonsense 1>NUL` — exits **non-zero**
-    (`Usage`), naming the bad argument AND diagnosing the workspace.
-32. `cargo run -p dbc-mcp -- --config <real> --vault <real>` against a
-    healthy pair — starts and serves; the broken pointer does not stop it.
+29. `dbc-mcp --help 1>NUL` — exits **0**, stdout EMPTY, 27 lines of usage
+    on stderr naming the pointer and `--config`/`--vault`. **PASSED.**
+30. `dbc-mcp 1>NUL` — exits **1**, stdout **0 bytes**, and the Czech
+    refusal on stderr as **exactly two lines**: the diagnosis and the
+    escape hatch. A single byte of this on stdout would corrupt the
+    JSON-RPC stream. **PASSED.**
+31. `dbc-mcp --nonsense 1>NUL` — exits **1** (`Usage`), stdout 0 bytes,
+    naming the bad argument AND diagnosing the workspace. **PASSED.**
+32. `dbc-mcp --config <real> --vault <real>` against a broken pointer —
+    gets past workspace resolution entirely. **PASSED** (it then failed on
+    its own unrelated missing credential, which is the point).
 33. With the pointer aimed at a REAL workspace: a bare run uses the
     workspace's `config.toml` and `vault.bin`, not the profile's.
+    **STILL OWED** — needs a real initialized workspace, which needs the
+    GUI.
 
 ### F.7 End-to-end multi-machine smoke (T10 Step 9)
 
