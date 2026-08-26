@@ -1370,6 +1370,27 @@ emptiness check, names only, never descends). `dbc-ui/src/scripts.rs` has
 two more (`list_dir_sorted`, `delete_entry`'s emptiness check), both
 outside `dbc-state` and both in scope for that crate's own rails.
 
+**Final-review NIT-2 — the dbc-ui count is THREE, not two.** The
+inventory above omitted `main.rs`'s `list_sql_files`, the pre-existing
+G12 „spustit složku" pre-scan (one `read_dir`, non-recursive, reached
+from the run-folder picker). It is not a scripts-library site — it lists
+a folder the user typed into a dialog, and it is the only `read_dir` in
+`dbc-ui` outside `scripts.rs` — but this branch DID touch it (T9 NIT-3
+routed its extension test onto the shared `scripts::is_sql_path` rail),
+so leaving it out made the count read as complete when it was not.
+
+**Why it stays out of scope, stated rather than implied.** Unlike
+`list_dir_sorted`, which filters with `entry.file_type()` and therefore
+does NOT follow links, `list_sql_files` filters with `path.is_file()`,
+which follows symlinks and NTFS junctions. A junction inside a picked
+folder can therefore contribute a target the user did not see in that
+folder. That is a pre-existing G12 behaviour on a path where the user
+types the folder every time and nothing is written — the run is
+read-only (`running_a_library_script_never_auto_saves_first`) — so it is
+recorded, not changed: hardening it is a G12 decision about the run
+feature, not a workspace-phase one, and doing it here would alter which
+files an existing user's saved folder-run picks up.
+
 ## D. Git stays external — permanently
 
 No `git2`, no `notify`, no `walkdir`, no `rfd` in any `Cargo.toml`. No
