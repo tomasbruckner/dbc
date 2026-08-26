@@ -13361,6 +13361,11 @@ mod script_binding_tests {
             .nth(1)
             .expect("run_script_from_library exists");
         let body = &run_fn[..run_fn.find("\n    fn ").unwrap_or(run_fn.len())];
+        // Non-vacuity: a slice that stopped early would pass the bans by
+        // containing nothing at all. These two are the load-bearing halves
+        // of the fn — the from-disk pre-scan and the SHARED continuation.
+        assert!(body.contains("count_statements_in_file"), "the sliced body is not the real one");
+        assert!(body.contains("open_script_run_modal"), "the sliced body is not the real one");
         for banned in ["save_script", "write_script", "replace_buffer", "bind_script"] {
             assert!(!body.contains(banned), "▶ must not {banned}: it runs the DISK content");
         }
