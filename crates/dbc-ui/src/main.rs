@@ -13580,12 +13580,12 @@ mod config_save_guard_audit {
         let files: Vec<String> = sources().into_iter().map(|(n, _)| n).collect();
         assert!(files.len() > 20, "the tree walk collapsed to {} files: {files:?}", files.len());
         for expected in [
-            "dbc-ui/src/main.rs",
-            "dbc-ui/src/connections_ui.rs",
-            "dbc-ui/src/scripts.rs",
-            "dbc-ui/src/schema_tree.rs",
+            "crates/dbc-ui/src/main.rs",
+            "crates/dbc-ui/src/connections_ui.rs",
+            "crates/dbc-ui/src/scripts.rs",
+            "crates/dbc-ui/src/schema_tree.rs",
             // Final-review MAJOR-2: and past dbc-ui altogether.
-            "dbc-state/src/config.rs",
+            "crates/dbc-state/src/config.rs",
         ] {
             assert!(files.iter().any(|f| f == expected), "{expected} missing from {files:?}");
         }
@@ -14591,58 +14591,78 @@ mod editor_clobber_audit {
     /// user's folder and were audited by nothing at all. Names are now
     /// `<crate>/<src|tests>/<path>` so a report says WHICH crate.
     pub(super) fn sources() -> Vec<(String, String)> {
-        // `CARGO_MANIFEST_DIR` is `<repo>/crates/dbc-ui`; its parent is
-        // `crates/`, which holds every workspace member.
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let crates = manifest.parent().expect("crates/ is the manifest's parent").to_path_buf();
-        let mut roots: Vec<(String, PathBuf)> = Vec::new();
-        let rd = std::fs::read_dir(&crates)
-            .unwrap_or_else(|e| panic!("audit cannot read {}: {e}", crates.display()));
-        for ent in rd {
-            let dir = ent.expect("readable directory entry").path();
-            if !dir.is_dir() {
+        let root = workspace_root();
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(path) = stack.pop() {
+            if path.is_dir() {
+                let name = path.file_name().map(|n| n.to_string_lossy().to_string());
+                // Build output and VCS metadata only. Everything else —
+                // `benches/`, `examples/`, generated dirs, a member
+                // outside `crates/` — is in scope by construction, which
+                // is the point of walking the root instead of a list.
+                if name.as_deref().is_some_and(|n| {
+                    n.starts_with("target") || n == ".git" || n == ".claude" || n == "node_modules"
+                }) {
+                    continue;
+                }
+                let rd = std::fs::read_dir(&path)
+                    .unwrap_or_else(|e| panic!("audit cannot read {}: {e}", path.display()));
+                for ent in rd {
+                    stack.push(ent.expect("readable directory entry").path());
+                }
                 continue;
             }
-            let krate = dir.file_name().expect("crate dir name").to_string_lossy().to_string();
-            for sub in ["src", "tests"] {
-                let p = dir.join(sub);
-                if p.is_dir() {
-                    roots.push((format!("{krate}/{sub}"), p));
-                }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
             }
-            let build = dir.join("build.rs");
-            if build.is_file() {
-                roots.push((format!("{krate}/build.rs"), build));
-            }
-        }
-        let mut out: Vec<(String, String)> = Vec::new();
-        for (label, root) in roots {
-            let mut stack = vec![root.clone()];
-            while let Some(path) = stack.pop() {
-                if path.is_dir() {
-                    let rd = std::fs::read_dir(&path)
-                        .unwrap_or_else(|e| panic!("audit cannot read {}: {e}", path.display()));
-                    for ent in rd {
-                        stack.push(ent.expect("readable directory entry").path());
-                    }
-                    continue;
-                }
-                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                    continue;
-                }
-                let rel = match path.strip_prefix(&root) {
-                    Ok(r) if !r.as_os_str().is_empty() => {
-                        format!("{label}/{}", r.to_string_lossy().replace('\\', "/"))
-                    }
-                    // `build.rs`: the root IS the file.
-                    _ => label.clone(),
-                };
-                let text = std::fs::read_to_string(&path)
-                    .unwrap_or_else(|e| panic!("audit cannot read {rel}: {e}"));
-                out.push((rel, text));
-            }
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("audit cannot read {rel}: {e}"));
+            out.push((rel, text));
         }
         out.sort();
+        out
+    }
+
+    /// The workspace root — `CARGO_MANIFEST_DIR` is `<root>/crates/dbc-ui`.
+    pub(super) fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("<root>/crates/dbc-ui")
+            .to_path_buf()
+    }
+
+    /// The workspace members, read from the root `Cargo.toml` at TEST
+    /// TIME rather than hard-coded.
+    ///
+    /// RE-VERIFY FAIL-4: the coverage test used to carry a literal list of
+    /// ten crate names, so it could not notice a new member — and could
+    /// not notice that the walk itself was list-shaped either. Deriving
+    /// both from the manifest means a member added tomorrow is audited
+    /// tomorrow, with nobody remembering anything.
+    pub(super) fn workspace_members() -> Vec<String> {
+        let manifest = std::fs::read_to_string(workspace_root().join("Cargo.toml"))
+            .expect("workspace Cargo.toml");
+        let list = manifest
+            .split("members")
+            .nth(1)
+            .and_then(|t| t.split('[').nth(1))
+            .and_then(|t| t.split(']').next())
+            .expect("[workspace] members list");
+        let out: Vec<String> = list
+            .split(',')
+            .filter_map(|m| {
+                let m = m.trim().trim_matches('"').trim();
+                (!m.is_empty()).then(|| m.to_string())
+            })
+            .collect();
+        assert!(out.len() >= 10, "member list parse looks wrong: {out:?}");
         out
     }
 
@@ -14944,19 +14964,47 @@ mod editor_clobber_audit {
         audit_excluding(needle, &[], sanctioned, expected, why);
     }
 
-    /// [`audit`], plus tokens that must NOT count as a match.
+    /// [`audit`], plus tokens that must NOT count as a mention.
     ///
-    /// FINAL-REVIEW MAJOR-2. `audit` matches `needle + "("` as a plain
-    /// substring, which is what forced `script_write_audit` to write its
-    /// needle as `.save_script` — with a leading DOT, to keep
-    /// `on_save_script(` out of the count — and the dot is precisely what
-    /// the reviewer's UFCS bypass (`AppView::save_script(self, …)`, which
-    /// spells a COLON there) walked around. The needle can now be
-    /// receiver-independent because the false positive is named
-    /// explicitly instead of being excluded by punctuation.
+    /// FINAL-REVIEW MAJOR-2 named the false positive instead of dodging it
+    /// with punctuation: the needle used to be `.save_script`, WITH a
+    /// leading dot, purely to keep `on_save_script(` out of the count, and
+    /// the dot is exactly what the UFCS bypass (`AppView::save_script(..)`,
+    /// which spells a colon there) walked around.
+    ///
+    /// **RE-VERIFY FAIL-1 finished the job: this no longer looks for a
+    /// CALL at all. It looks for the NAME.** Matching `needle + "("` still
+    /// assumes a call syntax, and the re-verifier simply stopped using one:
+    ///
+    /// ```ignore
+    /// use crate::scripts::write_script as persist_bytes;   // no `(`
+    /// let _ = persist_bytes(&doomed, "-- truncated by the run");  // no name
+    ///
+    /// let clobber = crate::sql_input::SqlInput::replace_buffer;
+    /// self.sql.update(cx, |s, cx| clobber(s, "", cx));
+    /// ```
+    ///
+    /// Zero warnings, 961 green, `script_write_audit` and
+    /// `editor_clobber_audit` both passing over a truncating write and an
+    /// unguarded buffer clobber.
+    ///
+    /// The rebuttal is that **the alias has to be introduced somewhere,
+    /// and introducing it NAMES the thing.** A `use … as`, a fn-pointer
+    /// binding, a re-export, a qualified path, a trait-dispatched call —
+    /// every one of them writes the identifier down. So a mention of the
+    /// identifier as a WHOLE WORD, anywhere in code, is now a site, and it
+    /// must sit inside a sanctioned function exactly as a call did. There
+    /// is no call syntax left to vary.
+    ///
+    /// The word test is what keeps this honest: without it,
+    /// `on_save_script` would match `save_script`, and the whole reason
+    /// the dot existed would come back. Boundaries are Rust identifier
+    /// characters, so `save_script_as` and `bind_script_and_focus` do not
+    /// match either — the same exact-name rule T8 re-verify MAJOR-3/G2
+    /// established for owners.
     ///
     /// Excluded tokens are blanked in place, so a line holding BOTH an
-    /// excluded call and a real one still reports the real one.
+    /// excluded mention and a real one still reports the real one.
     pub(super) fn audit_excluding(
         needle: &str,
         exclude: &[&str],
@@ -14964,7 +15012,6 @@ mod editor_clobber_audit {
         expected: usize,
         why: &str,
     ) {
-        let call = format!("{needle}(");
         let mut sites = 0usize;
         for (name, src) in sources() {
             let code = code_lines(&src);
@@ -14976,14 +15023,17 @@ mod editor_clobber_audit {
                         line.replace_range(at..at + ex.len(), &" ".repeat(ex.len()));
                     }
                 }
-                if !line.contains(&call) || defined_fn_name(&line).as_deref() == Some(needle) {
+                if !mentions_word(&line, needle)
+                    || defined_fn_name(&line).as_deref() == Some(needle)
+                    || plain_import(&line, needle)
+                {
                     continue;
                 }
                 sites += 1;
                 let owner = who[i].as_deref();
                 assert!(
                     owner.is_some_and(|o| sanctioned.contains(&o)),
-                    "unguarded `{needle}` call at {name}:{} (in `{}`) — {why}",
+                    "unsanctioned mention of `{needle}` at {name}:{} (in `{}`) — {why}",
                     i + 1,
                     owner.unwrap_or("<file scope>")
                 );
@@ -14991,8 +15041,70 @@ mod editor_clobber_audit {
         }
         assert_eq!(
             sites, expected,
-            "`{needle}` call-site count changed — re-audit deliberately, do not just bump"
+            "`{needle}` mention count changed — re-audit deliberately, do not just bump"
         );
+    }
+
+    /// Is this line a `use` item that imports `needle` UNDER ITS OWN
+    /// NAME? Those are not sites; a RENAME is.
+    ///
+    /// RE-VERIFY FAIL-1's whole shape is the rename: `use … as
+    /// persist_bytes;` detaches the identifier from the call, so the call
+    /// no longer spells it. But a plain `use crate::scripts::write_script;`
+    /// detaches nothing — every call through it still says `write_script`,
+    /// and the audit still sees those. Re-exports (`pub use …;`) are plain
+    /// for the same reason: they carry the name forward, and whoever
+    /// eventually renames it is the line that gets flagged.
+    ///
+    /// So the rule is narrow and mechanical: inside a `use` item, an
+    /// occurrence followed by `as` is a rename and stays a site;
+    /// everything else in a `use` item is import bookkeeping.
+    pub(super) fn plain_import(line: &str, needle: &str) -> bool {
+        let t = line.trim_start();
+        let t = t.strip_prefix("pub").map_or(t, |r| {
+            // `pub(crate)`, `pub(super)`, `pub(in a::b)`
+            let r = r.trim_start();
+            r.strip_prefix('(').map_or(r, |i| i.find(')').map_or(r, |e| i[e + 1..].trim_start()))
+        });
+        if !t.starts_with("use ") {
+            return false;
+        }
+        // `needle` immediately followed by `as` is a rename, not an import.
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find(needle) {
+            let at = from + rel;
+            let end = at + needle.len();
+            if line[end..].trim_start().starts_with("as ") {
+                return false;
+            }
+            from = end;
+        }
+        true
+    }
+
+    /// Does `line` mention `needle` as a WHOLE Rust identifier?
+    ///
+    /// The boundary test is what stops `save_script` matching inside
+    /// `on_save_script` now that the trailing `(` is gone — see
+    /// [`audit_excluding`]. Rust identifier characters are alphanumerics
+    /// and `_`; everything else (`.`, `:`, `(`, `,`, a space, end of line)
+    /// is a boundary, which is precisely why every alias spelling the
+    /// re-verifier used still counts.
+    pub(super) fn mentions_word(line: &str, needle: &str) -> bool {
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        let bytes = line.as_bytes();
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find(needle) {
+            let at = from + rel;
+            let before_ok = at == 0 || !line[..at].chars().next_back().is_some_and(is_ident);
+            let end = at + needle.len();
+            let after_ok = end >= bytes.len() || !line[end..].chars().next().is_some_and(is_ident);
+            if before_ok && after_ok {
+                return true;
+            }
+            from = at + needle.len();
+        }
+        false
     }
 
     /// The audit's own non-vacuity rail: if `sources()` ever came back
@@ -15009,30 +15121,35 @@ mod editor_clobber_audit {
             files.len()
         );
         for expected in [
-            "dbc-ui/src/main.rs",
-            "dbc-ui/src/plan.rs",
-            "dbc-ui/src/scripts.rs",
-            "dbc-ui/src/sql_input.rs",
-            "dbc-ui/src/runner.rs",
-            // Final-review MAJOR-2: the walk is WORKSPACE-wide now, and
-            // these two are the reason it had to be — `dbc-state` holds
-            // four `write_atomic` callers that write into the user's
-            // folder and were audited by nothing, and `dbc-mcp` reaches
-            // the same vault and config this app does.
-            "dbc-state/src/workspace.rs",
-            "dbc-mcp/src/main.rs",
+            "crates/dbc-ui/src/main.rs",
+            "crates/dbc-ui/src/plan.rs",
+            "crates/dbc-ui/src/scripts.rs",
+            "crates/dbc-ui/src/sql_input.rs",
+            "crates/dbc-ui/src/runner.rs",
+            // Final-review MAJOR-2: the walk reaches past dbc-ui — these
+            // two are the reason it had to. `dbc-state` holds four
+            // `write_atomic` callers that write into the user's folder and
+            // were audited by nothing; `dbc-mcp` reaches the same vault
+            // and config this app does.
+            "crates/dbc-state/src/workspace.rs",
+            "crates/dbc-mcp/src/main.rs",
+            // RE-VERIFY FAIL-4: and past `src`/`tests`. This one is a
+            // BENCH, invisible to the previous walk, which enumerated
+            // `<crate>/{src,tests,build.rs}` and therefore also missed
+            // `examples/`, generated trees, and anything a `#[path]`
+            // attribute pulls in from outside the crate directory.
+            "crates/dbc-buffer/benches/push_1m.rs",
         ] {
             assert!(files.iter().any(|(n, _)| n == expected), "{expected} not scanned");
         }
-        // Every workspace member is represented, so a NEW crate cannot
-        // quietly start outside the audits' field of view.
-        for krate in [
-            "dbc-buffer", "dbc-core", "dbc-diff", "dbc-driver-duckdb", "dbc-driver-mssql",
-            "dbc-driver-postgres", "dbc-driver-sqlite", "dbc-mcp", "dbc-state", "dbc-ui",
-        ] {
+        // Every workspace member is represented — and the list is READ
+        // FROM THE MANIFEST, not written here, so a crate added tomorrow
+        // is covered tomorrow. The hard-coded version of this loop could
+        // not notice a new member, which is half of why FAIL-4 worked.
+        for member in workspace_members() {
             assert!(
-                files.iter().any(|(n, _)| n.starts_with(&format!("{krate}/"))),
-                "crate {krate} not scanned"
+                files.iter().any(|(n, _)| n.starts_with(&format!("{member}/"))),
+                "workspace member {member} not scanned"
             );
         }
         assert!(
@@ -15124,6 +15241,44 @@ more();");
         let quote_ch = format!("    let q = '\"'; self.{call};");
         assert!(code_lines(&quote_ch)[0].contains(&call), "`'\"'` must not open a string");
         assert!(code_lines("fn f<'a>(x: &'a str) -> &'a str { x }")[0].contains("'a"));
+    }
+
+    /// RE-VERIFY FAIL-1: the matcher looks for the NAME, not for a call,
+    /// and a whole-word one — so every way of detaching an identifier from
+    /// its call site is a site, while the near-miss names the exact-match
+    /// rule exists to protect stay out.
+    #[test]
+    fn an_alias_or_a_fn_pointer_cannot_detach_a_name_from_its_audit() {
+        let guarded = format!("{}_{}", "write", "script");
+
+        // The two shapes the re-verifier used. Neither is a call of the
+        // guarded name; both NAME it, which is the point.
+        let aliased = format!("    use crate::scripts::{guarded} as persist_bytes;");
+        assert!(mentions_word(&aliased, &guarded));
+        assert!(!plain_import(&aliased, &guarded), "a RENAME is a site, not bookkeeping");
+        let ptr = format!("    let clobber = crate::sql_input::SqlInput::{guarded};");
+        assert!(mentions_word(&ptr, &guarded), "a fn-pointer binding names it too");
+
+        // A plain import (and a re-export) carries the name forward, so
+        // every call through it still spells it — bookkeeping, not a site.
+        let plain = format!("    use crate::scripts::{guarded};");
+        assert!(plain_import(&plain, &guarded));
+        let grouped = format!("use dbc_state::fsutil::{{join_component, {guarded}}};");
+        assert!(plain_import(&grouped, &guarded));
+        let reexport = format!("    pub(crate) use crate::scripts::{guarded};");
+        assert!(plain_import(&reexport, &guarded));
+        // …but a rename hidden inside a group is still a rename.
+        let sneaky = format!("use crate::scripts::{{a, {guarded} as p}};");
+        assert!(!plain_import(&sneaky, &guarded));
+
+        // Whole-word, or `on_save_script` would match `save_script` and
+        // the leading dot that FINAL-REVIEW MAJOR-2 removed would have to
+        // come back. Same exact-name rule as T8 re-verify MAJOR-3/G2.
+        let save = format!("{}_{}", "save", "script");
+        assert!(!mentions_word(&format!("self.on_{save}(cx);"), &save));
+        assert!(!mentions_word(&format!("self.{save}_as(cx);"), &save));
+        assert!(mentions_word(&format!("self.{save}(p, t, false, a, cx);"), &save));
+        assert!(mentions_word(&format!("AppView::{save}(self, p, t, false, a, cx)"), &save));
     }
 
     /// FINAL-REVIEW MAJOR-2, structural gap 3: attribution is now BRACE
