@@ -2730,29 +2730,66 @@ impl AppView {
     /// the bare call is a `deny`-level warning, i.e. a build failure under
     /// this repo's zero-warning gate. (`let _ = …` still defeats it — but
     /// that is now an explicit, greppable act, not a reflex.)
-    #[must_use = "the `false` verdict ABORTS the save — dropping it overwrites a corrupt \
-                  config.toml with defaults and destroys every connection"]
-    pub(crate) fn guard_corrupt_config(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.config_load_error.is_some() {
-            let backup = self.config_path.with_extension("toml.corrupt-bak");
-            match std::fs::rename(&self.config_path, &backup) {
-                Ok(()) => self.config_load_error = None,
-                Err(e) => {
-                    self.status = format!(
-                        "error: nelze zálohovat poškozený config.toml ({e}) – uložení zrušeno"
-                    );
-                    cx.notify();
-                    return false;
-                }
+    ///
+    /// FINAL-REVIEW MAJOR-2 — now the COMPILER's rail, not a regex's. The
+    /// reviewer defeated `config_save_guard_audit` by rebinding the
+    /// receiver (`let cfg = &self.config; cfg.save(&self.config_path);`)
+    /// on a live production path, with zero warnings and every audit
+    /// green; the audit keyed on the literal `.config.save(`.
+    ///
+    /// `dbc_state::AppConfig::save` now demands a
+    /// [`dbc_state::ConfigSaveGuard`], mintable only by
+    /// `AppConfig::verify_savable`, which re-reads the file and refuses
+    /// when it does not parse. So this function returns the witness rather
+    /// than a bool, and there is no call syntax — receiver rebinding,
+    /// UFCS, a macro — that reaches the writer without it.
+    ///
+    /// It also stopped trusting `config_load_error` for the DECISION.
+    /// That flag was set at STARTUP, and this phase's own rule is that a
+    /// check performed earlier is a statement about the past: a
+    /// `config.toml` corrupted by an external editor after launch used to
+    /// be overwritten without a backup. The flag is still cleared here, so
+    /// the startup banner stops nagging once the file is dealt with, but
+    /// the question „will this save destroy something" is now asked of the
+    /// disk, every time.
+    #[must_use = "the `None` verdict ABORTS the save — and the witness is the only way to \
+                  reach `AppConfig::save` at all"]
+    pub(crate) fn guard_corrupt_config(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<dbc_state::ConfigSaveGuard> {
+        // The file parses (or is not there yet): nothing to rescue.
+        if let Ok(guard) = dbc_state::AppConfig::verify_savable(&self.config_path) {
+            self.config_load_error = None;
+            return Some(guard);
+        }
+        // It does not. Move it aside BEFORE anything overwrites it; if
+        // that fails (permissions, file vanished), abort the whole save
+        // rather than risk clobbering data the user may still recover by
+        // hand.
+        let backup = self.config_path.with_extension("toml.corrupt-bak");
+        if let Err(e) = std::fs::rename(&self.config_path, &backup) {
+            self.status =
+                format!("error: nelze zálohovat poškozený config.toml ({e}) – uložení zrušeno");
+            cx.notify();
+            return None;
+        }
+        self.config_load_error = None;
+        // The path is now empty, so this normally cannot fail. If the
+        // filesystem is still refusing, say so instead of guessing.
+        match dbc_state::AppConfig::verify_savable(&self.config_path) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                self.status =
+                    format!("error: config.toml nelze zapsat ({}) – uložení zrušeno", e.message);
+                cx.notify();
+                None
             }
         }
-        true
     }
 
     fn finish_save(&mut self, data: ConnectionFormData, cx: &mut Context<Self>) {
-        if !self.guard_corrupt_config(cx) {
-            return;
-        }
+        let Some(guard) = self.guard_corrupt_config(cx) else { return };
         if !data.password.is_empty() {
             let Some(vault) = self.vault.as_mut() else {
                 // finish_save is only reached with a non-empty password once
@@ -2775,7 +2812,7 @@ impl AppView {
         } else {
             self.config.connections.push(cfg);
         }
-        self.status = match self.config.save(&self.config_path) {
+        self.status = match self.config.save(&self.config_path, &guard) {
             Ok(()) => "Uloženo".to_string(),
             Err(e) => format!("error saving config: {}", e.message),
         };
@@ -2792,14 +2829,12 @@ impl AppView {
     /// dropdown's favourites-first ordering (G1) picks up the change
     /// immediately rather than waiting for the next dropdown-open.
     pub(crate) fn toggle_connection_favourite(&mut self, id: &str, cx: &mut Context<Self>) {
-        if !self.guard_corrupt_config(cx) {
-            return;
-        }
+        let Some(guard) = self.guard_corrupt_config(cx) else { return };
         let Some(c) = self.config.connections.iter_mut().find(|c| c.id == id) else {
             return; // connection vanished meanwhile — nothing to toggle/save
         };
         c.favourite = !c.favourite;
-        self.status = match self.config.save(&self.config_path) {
+        self.status = match self.config.save(&self.config_path, &guard) {
             Ok(()) => "Uloženo".to_string(),
             Err(e) => format!("error saving config: {}", e.message),
         };

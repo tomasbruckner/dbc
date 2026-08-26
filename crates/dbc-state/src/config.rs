@@ -144,13 +144,57 @@ pub struct AppConfig {
     pub scripts_dir: Option<String>,
 }
 
+/// FINAL-REVIEW MAJOR-2 — proof that overwriting `config.toml` will not
+/// destroy anything, demanded BY TYPE by [`AppConfig::save`].
+///
+/// The invariant is `dbc-ui`'s `guard_corrupt_config`: a `config.toml`
+/// that failed to parse holds the user's entire connection list in a form
+/// the app could not read, and saving defaults over it destroys data that
+/// was still recoverable by hand. That rule was enforced by a text audit
+/// keyed on the literal `.config.save(` — and a reviewer walked around it
+/// by rebinding the receiver (`let cfg = &self.config; cfg.save(…)`) with
+/// zero warnings and every audit green.
+///
+/// A witness whose constructor is merely private to `dbc-state` would not
+/// help: `dbc-ui` could not mint it, and any `pub fn new()` we added would
+/// be mintable by exactly the code the rail is aimed at. So this witness
+/// is not proof that a FUNCTION was called — it is proof of the
+/// PRECONDITION, established here, on disk, by [`AppConfig::verify_savable`].
+/// There is no other constructor, in this crate or any other, and the
+/// check it performs is the real one rather than a token gesture.
+///
+/// A borrow (`&ConfigSaveGuard`) is enough: the guard says something about
+/// the FILE, not about a one-shot permission, and a caller that saves the
+/// same path twice in a row has not lied. Contrast `dbc-ui`'s
+/// `SaveAllowed`, which is consumed because it is about a MOMENT.
+#[derive(Debug)]
+pub struct ConfigSaveGuard(());
+
 impl AppConfig {
     pub fn load(path: &Path) -> Result<AppConfig, StateError> {
         if !path.exists() { return Ok(AppConfig::default()); }
         Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
     }
 
-    pub fn save(&self, path: &Path) -> Result<(), StateError> {
+    /// THE only mint of [`ConfigSaveGuard`]. Succeeds when the file at
+    /// `path` is absent (a first save destroys nothing) or parses (an
+    /// overwrite loses nothing the app could not already read).
+    ///
+    /// Deliberately re-reads rather than trusting a flag captured at
+    /// startup: this crate has no way to know how old such a flag is, and
+    /// this phase has paid five times for checks that describe the past.
+    /// `config.toml` is a handful of kilobytes and a save is a user
+    /// gesture, so the read costs nothing anyone can perceive.
+    pub fn verify_savable(path: &Path) -> Result<ConfigSaveGuard, StateError> {
+        AppConfig::load(path).map(|_| ConfigSaveGuard(()))
+    }
+
+    /// `guard` is unused at runtime and load-bearing at compile time: it
+    /// cannot be obtained except from [`AppConfig::verify_savable`], so no
+    /// call syntax — receiver rebinding, UFCS, a macro — reaches this
+    /// writer without the corrupt-config question having been asked and
+    /// answered against the actual file.
+    pub fn save(&self, path: &Path, _guard: &ConfigSaveGuard) -> Result<(), StateError> {
         if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
         let tmp = path.with_extension("toml.tmp");
         {
@@ -216,9 +260,42 @@ mod tests {
     fn roundtrip_save_load() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.toml");
-        sample().save(&p).unwrap();
+        sample().save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
         let loaded = AppConfig::load(&p).unwrap();
         assert_eq!(loaded, sample());
+    }
+
+    /// FINAL-REVIEW MAJOR-2: the rail behind `dbc-ui`'s
+    /// `guard_corrupt_config`, now enforced by the type system rather than
+    /// by a text audit keyed on one spelling of the receiver.
+    ///
+    /// `save` cannot be called without a `ConfigSaveGuard`, and there is
+    /// exactly one way to obtain one: prove the file on disk is absent or
+    /// parses. So „defaults written over a config.toml the app could not
+    /// read" is not merely audited against — it does not compile, and if
+    /// someone routes around the audit some sixth way, the write still
+    /// cannot happen.
+    #[test]
+    fn the_save_witness_can_only_be_minted_over_an_intact_or_absent_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+
+        // Absent: a first save destroys nothing.
+        assert!(AppConfig::verify_savable(&p).is_ok());
+        sample().save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
+        // Intact: an overwrite loses nothing the app could not read.
+        assert!(AppConfig::verify_savable(&p).is_ok());
+
+        // Corrupt — the case the whole rail exists for. This is the user's
+        // entire connection list in a form only a human can rescue.
+        std::fs::write(&p, b"connections = [ this is not toml").unwrap();
+        assert!(
+            AppConfig::verify_savable(&p).is_err(),
+            "an unparsable config.toml must not yield a save witness"
+        );
+        // And the corrupt bytes are still there: refusing to mint is not a
+        // side-effecting operation.
+        assert!(std::fs::read_to_string(&p).unwrap().contains("this is not toml"));
     }
 
     #[test]
@@ -241,7 +318,7 @@ mod tests {
     fn no_password_field_serialized() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.toml");
-        sample().save(&p).unwrap();
+        sample().save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
         assert!(!raw.to_lowercase().contains("password"));
     }
@@ -266,7 +343,7 @@ mod tests {
         assert_eq!(config.is_favourite(&fav), true);
 
         // Save and load
-        config.save(&p).unwrap();
+        config.save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
         let loaded = AppConfig::load(&p).unwrap();
         assert_eq!(loaded.is_favourite(&fav), true);
 
@@ -277,7 +354,7 @@ mod tests {
         assert_eq!(config2.is_favourite(&fav), false);
 
         // Save and load again
-        config2.save(&p).unwrap();
+        config2.save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
         let loaded2 = AppConfig::load(&p).unwrap();
         assert_eq!(loaded2.is_favourite(&fav), false);
     }
@@ -321,7 +398,7 @@ kind = "table"
 
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.toml");
-        config.save(&p).unwrap();
+        config.save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
         assert!(!raw.contains("database = ") || raw.matches("database = ").count() == 1,
             "favourite must not serialize a database key when None (only the connection's own): {raw}");
@@ -341,7 +418,7 @@ kind = "table"
         });
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.toml");
-        config.save(&p).unwrap();
+        config.save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
         let reloaded = AppConfig::load(&p).unwrap();
         assert_eq!(reloaded.favourite_objects[0].database.as_deref(), Some("inventory"));
     }
@@ -386,7 +463,7 @@ user = "postgres"
         let p = dir.path().join("config.toml");
         let mut config = sample();
         config.theme = ThemeMode::Light;
-        config.save(&p).unwrap();
+        config.save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
         let loaded = AppConfig::load(&p).unwrap();
         assert_eq!(loaded.theme, ThemeMode::Light);
     }
@@ -405,7 +482,7 @@ user = "postgres"
     fn tool_paths_roundtrip_save_load() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.toml");
-        sample_with_tools().save(&p).unwrap();
+        sample_with_tools().save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
         let loaded = AppConfig::load(&p).unwrap();
         assert_eq!(loaded, sample_with_tools());
     }
@@ -501,7 +578,7 @@ user = "postgres"
         config.connections[0].database = r"D:\data\analytics.duckdb".into();
         config.connections[0].read_only = true;
         config.connections[0].ssh = None;
-        config.save(&p).unwrap();
+        config.save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
         let loaded = AppConfig::load(&p).unwrap();
         assert_eq!(loaded, config);
     }
@@ -525,7 +602,7 @@ user = ""
 
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.toml");
-        config.save(&p).unwrap();
+        config.save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
         assert!(raw.contains(r#"engine = "duckdb""#), "raw: {raw}");
     }
@@ -541,7 +618,7 @@ user = ""
             trust_server_certificate: true,
             driver: Some("ODBC Driver 17 for SQL Server".into()),
         });
-        config.save(&p).unwrap();
+        config.save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
         let loaded = AppConfig::load(&p).unwrap();
         assert_eq!(loaded, config);
     }
@@ -571,7 +648,7 @@ trust_server_certificate = true
     fn non_mssql_config_serializes_no_mssql_table() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.toml");
-        sample().save(&p).unwrap();
+        sample().save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
         assert!(!raw.contains("mssql"));
     }

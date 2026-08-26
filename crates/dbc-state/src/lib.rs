@@ -1,7 +1,7 @@
 mod config;
 pub use config::{
-    default_config_path, AppConfig, ConnectionConfig, Engine, FavouriteObject, MssqlOptions,
-    SshTunnelConfig, StateError, ThemeMode,
+    default_config_path, AppConfig, ConfigSaveGuard, ConnectionConfig, Engine, FavouriteObject,
+    MssqlOptions, SshTunnelConfig, StateError, ThemeMode,
 };
 
 pub mod fsutil;

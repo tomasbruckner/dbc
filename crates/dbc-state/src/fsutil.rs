@@ -252,7 +252,11 @@ mod tests {
         // The other half, in the crate that owns both: `AppConfig::save`
         // creates the parent, so the same path SUCCEEDS through it.
         let cfg = crate::AppConfig::default();
-        cfg.save(&missing.join("config.toml")).unwrap();
+        let target = missing.join("config.toml");
+        // The file does not exist, so a first save destroys nothing and the
+        // witness mints (final-review MAJOR-2).
+        let guard = crate::AppConfig::verify_savable(&target).unwrap();
+        cfg.save(&target, &guard).unwrap();
         assert!(missing.join("config.toml").is_file());
     }
 

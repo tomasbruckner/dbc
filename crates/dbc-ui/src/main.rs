@@ -1523,12 +1523,14 @@ pub(crate) const SCRIPT_SAVE_BLOCKED: &str = "nejprve zavřete otevřený dialog
 /// `SaveAllowed(())` unspellable everywhere in `dbc-ui` except the twenty
 /// lines below. There is no receiver to rebind, no path spelling to vary
 /// and no macro to hide it in: without a call to
-/// [`script_save_allowed`][save_guard::script_save_allowed] there is no
+/// [`save_allowed_now`][save_guard::save_allowed_now] there is no
 /// value to pass, and the crate does not compile.
 ///
 /// The text audits are KEPT and were widened (belt and braces), but they
 /// are no longer the thing holding this invariant up.
 mod save_guard {
+    use crate::AppView;
+
     /// Proof that a save was permitted at the moment the predicate ran.
     ///
     /// Deliberately NOT `Copy` and NOT `Clone`: a witness is consumed by
@@ -1549,17 +1551,37 @@ mod save_guard {
     /// `.occlude()`, so this is the ONLY thing standing between a habitual
     /// Ctrl+S and a write that races the rename/delete the user is
     /// currently confirming.
-    ///
-    /// `None` = refused. THE only mint of [`SaveAllowed`].
     pub(crate) fn script_save_allowed(
         modal_open: bool,
         apply_open: bool,
         discard_open: bool,
-    ) -> Option<SaveAllowed> {
-        (!(modal_open || apply_open || discard_open)).then_some(SaveAllowed(()))
+    ) -> bool {
+        !(modal_open || apply_open || discard_open)
+    }
+
+    /// THE only mint of [`SaveAllowed`], and it reads the LIVE state
+    /// itself.
+    ///
+    /// Taking `&AppView` rather than three booleans is the difference
+    /// between a rail and a formality: a caller handed
+    /// `script_save_allowed(false, false, false)` could mint a witness
+    /// over a screen full of dialogs without lying about anything the
+    /// compiler can see. Here there is nothing to lie WITH — the three
+    /// facts come straight off the view. (This module is a DESCENDANT of
+    /// the crate root, where `AppView` lives, so it can read fields that
+    /// are private there; the reverse — the crate root reaching into this
+    /// module's private tuple field — is what Rust forbids, and that
+    /// asymmetry is the whole mechanism.)
+    pub(crate) fn save_allowed_now(view: &AppView) -> Option<SaveAllowed> {
+        script_save_allowed(
+            view.modal.is_some(),
+            view.apply_dialog.is_some(),
+            view.discard_confirm.is_some(),
+        )
+        .then_some(SaveAllowed(()))
     }
 }
-use save_guard::{script_save_allowed, SaveAllowed};
+use save_guard::{save_allowed_now, SaveAllowed};
 
 /// T8 review MAJOR-2: the refusal when a save of this editor is already in
 /// flight. Not an „error:" — nothing failed; the user's keystroke simply
@@ -5379,8 +5401,8 @@ impl AppView {
             // a refusal to persist is a save failure like any other.
             // `guard_corrupt_config` sets its own status when it refuses,
             // so nothing here overwrites it.
-            if self.guard_corrupt_config(cx) {
-                self.status = match self.config.save(&self.config_path) {
+            if let Some(guard) = self.guard_corrupt_config(cx) {
+                self.status = match self.config.save(&self.config_path, &guard) {
                     Ok(()) => format!(
                         "motiv: {}",
                         match mode {
@@ -6412,11 +6434,9 @@ impl AppView {
                 // `config.toml` the in-memory `config` is `default()`, so an
                 // unguarded save would write a file with a `scripts_dir` and
                 // NO connections over the user's real one.
-                if !view.guard_corrupt_config(cx) {
-                    return;
-                }
+                let Some(guard) = view.guard_corrupt_config(cx) else { return };
                 view.config.scripts_dir = Some(picked_str.to_string());
-                view.status = match view.config.save(&view.config_path) {
+                view.status = match view.config.save(&view.config_path, &guard) {
                     Ok(()) => format!("složka skriptů: {picked_str}"),
                     Err(e) => format!("error: nastavení se nepodařilo uložit ({e})"),
                 };
@@ -6450,11 +6470,9 @@ impl AppView {
             return;
         }
         // See `start_scripts_dir_pick` — same corrupt-config gate.
-        if !self.guard_corrupt_config(cx) {
-            return;
-        }
+        let Some(guard) = self.guard_corrupt_config(cx) else { return };
         self.config.scripts_dir = None;
-        self.status = match self.config.save(&self.config_path) {
+        self.status = match self.config.save(&self.config_path, &guard) {
             Ok(()) => "složka skriptů odebrána".to_string(),
             Err(e) => format!("error: nastavení se nepodařilo uložit ({e})"),
         };
@@ -7141,7 +7159,7 @@ impl AppView {
     /// user folder.
     ///
     /// FINAL-REVIEW MAJOR-2: `_allowed` is a [`SaveAllowed`] witness,
-    /// mintable ONLY by `save_guard::script_save_allowed`. It is unused at
+    /// mintable ONLY by `save_guard::save_allowed_now`. It is unused at
     /// runtime and load-bearing at compile time — no caller can reach this
     /// writer, by any call syntax, without having asked the predicate. The
     /// reviewer's UFCS bypass (`AppView::save_script(self, p, t, false, cx)`)
@@ -7335,11 +7353,7 @@ impl AppView {
                 // `on_save_script` minted before the picker cannot be
                 // carried across the await even deliberately — the only
                 // way to reach `save_script` from here is to ask again.
-                let Some(allowed) = script_save_allowed(
-                    view.modal.is_some(),
-                    view.apply_dialog.is_some(),
-                    view.discard_confirm.is_some(),
-                ) else {
+                let Some(allowed) = save_allowed_now(view) else {
                     view.status = SCRIPT_SAVE_BLOCKED.to_string();
                     cx.notify();
                     return;
@@ -7371,11 +7385,7 @@ impl AppView {
         // Refused OUT LOUD (a silent `return` is the other thing this phase
         // bans) and not as an „error:" — nothing failed; the keystroke
         // simply arrived while another decision was still on screen.
-        let Some(allowed) = script_save_allowed(
-            self.modal.is_some(),
-            self.apply_dialog.is_some(),
-            self.discard_confirm.is_some(),
-        ) else {
+        let Some(allowed) = save_allowed_now(self) else {
             self.status = SCRIPT_SAVE_BLOCKED.to_string();
             cx.notify();
             return;
@@ -9824,14 +9834,12 @@ impl AppView {
             // `connections_ui::AppView::toggle_connection_favourite`'s
             // guarded-save shape for the dropdown's connection stars.
             TreeEvent::ToggleFavourite(fav) => {
-                if !self.guard_corrupt_config(cx) {
-                    return;
-                }
+                let Some(guard) = self.guard_corrupt_config(cx) else { return };
                 // Full-struct equality in `toggle_favourite` means the same
                 // table in two databases is two distinct favourites (T1's
                 // `toggle_favourite_distinguishes_databases` pin).
                 self.config.toggle_favourite(fav.clone());
-                self.status = match self.config.save(&self.config_path) {
+                self.status = match self.config.save(&self.config_path, &guard) {
                     Ok(()) => "Uloženo".to_string(),
                     Err(e) => format!("error saving config: {}", e.message),
                 };
@@ -13425,35 +13433,65 @@ mod autocomplete_handles_action_tests {
 /// attribute proves its verdict is not thrown away.
 #[cfg(test)]
 mod config_save_guard_audit {
-    use super::editor_clobber_audit::{code_of, defined_fn_name, sources};
+    use super::editor_clobber_audit::{code_lines, defined_fn_name, sources};
 
     /// Every writer's ENCLOSING fn must call the guard above the write.
+    ///
+    /// FINAL-REVIEW MAJOR-2: **the needle is receiver-independent now.**
+    /// It used to be the literal `.config.save(`, which sees only one
+    /// spelling of one receiver — and the reviewer walked around it in two
+    /// lines on a live production path:
+    ///
+    /// ```ignore
+    /// let cfg = &self.config;
+    /// let _ = cfg.save(&self.config_path);   // invisible to `.config.save(`
+    /// ```
+    ///
+    /// Zero warnings, every audit green. `AppConfig::save(&self.config, …)`
+    /// would have done the same job.
+    ///
+    /// The fix keys on the ARGUMENT instead of the receiver: a config
+    /// write is a `.save(`/`::save(` call whose line names `config_path`.
+    /// Rebinding the receiver, spelling the call UFCS-style or wrapping it
+    /// in a macro all leave that argument in place, because it is the
+    /// thing being written to. (`dbc-state`'s own `config.save(&p, …)`
+    /// tests use a different variable and are correctly not matched.)
+    ///
+    /// This is the belt; the braces are `dbc_state::ConfigSaveGuard`,
+    /// which `AppConfig::save` demands by type and which only
+    /// `AppConfig::verify_savable` can mint.
     #[test]
     fn every_config_toml_write_passes_the_corrupt_config_guard() {
-        // Built at runtime — written as a literal, this needle would match
-        // its own source text and report a phantom unguarded call site.
-        let needle = format!(".{}.{}(", "config", "save");
+        // Built at runtime — written as literals, these would match this
+        // test's own source and report phantom call sites.
+        let field = format!("{}_{}", "config", "path");
+        let call = format!(".{}(", "save");
+        let ufcs = format!("::{}(", "save");
+        let guard = format!("guard_corrupt_{}", "config");
         let mut sites = 0usize;
         for (name, src) in sources() {
-            let lines: Vec<&str> = src.lines().collect();
-            // Comments (incl. `///`) count neither as a call site NOR as
-            // the guard: this check was vacuous in its first draft because
-            // `set_theme`'s new explanatory comment MENTIONS the guard, and
-            // a prose mention satisfied it.
+            // Comments (incl. `///`) and string literals count neither as
+            // a call site NOR as the guard: this check was vacuous in its
+            // first draft because `set_theme`'s explanatory comment
+            // MENTIONS the guard, and a prose mention satisfied it.
+            let lines = code_lines(&src);
             for (i, line) in lines.iter().enumerate() {
-                if !code_of(line).contains(&needle) {
+                if !line.contains(&field) || !(line.contains(&call) || line.contains(&ufcs)) {
                     continue;
                 }
                 sites += 1;
                 let start =
                     lines[..i].iter().rposition(|l| defined_fn_name(l).is_some()).unwrap_or(0);
                 assert!(
-                    lines[start..i].iter().any(|l| code_of(l).contains("guard_corrupt_config")),
+                    lines[start..i].iter().any(|l| l.contains(&guard)),
                     "unguarded config.toml write at {name}:{} (in `{}`) — a config that \
-                     failed to parse at startup would be overwritten with defaults, \
-                     destroying every connection (T7 review MAJOR-1)",
+                     failed to parse would be overwritten with defaults, destroying every \
+                     connection (T7 review MAJOR-1)",
                     i + 1,
-                    lines.get(start).and_then(|l| defined_fn_name(l)).unwrap_or("<file scope>")
+                    lines
+                        .get(start)
+                        .and_then(|l| defined_fn_name(l))
+                        .unwrap_or_else(|| "<file scope>".to_string())
                 );
             }
         }
@@ -13469,7 +13507,14 @@ mod config_save_guard_audit {
     fn the_audit_reads_the_whole_crate_not_a_pair_of_files() {
         let files: Vec<String> = sources().into_iter().map(|(n, _)| n).collect();
         assert!(files.len() > 20, "the tree walk collapsed to {} files: {files:?}", files.len());
-        for expected in ["main.rs", "connections_ui.rs", "scripts.rs", "schema_tree.rs"] {
+        for expected in [
+            "dbc-ui/src/main.rs",
+            "dbc-ui/src/connections_ui.rs",
+            "dbc-ui/src/scripts.rs",
+            "dbc-ui/src/schema_tree.rs",
+            // Final-review MAJOR-2: and past dbc-ui altogether.
+            "dbc-state/src/config.rs",
+        ] {
             assert!(files.iter().any(|f| f == expected), "{expected} missing from {files:?}");
         }
     }
@@ -14077,14 +14122,16 @@ mod script_binding_tests {
     /// same reason: occlusion stops clicks, not keystrokes.
     #[test]
     fn ctrl_s_is_refused_whenever_any_dialog_owns_the_screen() {
-        // Final-review MAJOR-2: the predicate now MINTS the `SaveAllowed`
-        // witness `save_script` demands, so „allowed" is a value rather
-        // than a bool anyone can decline to look at.
-        assert!(script_save_allowed(false, false, false).is_some());
-        assert!(script_save_allowed(true, false, false).is_none(), "a modal blocks it");
-        assert!(script_save_allowed(false, true, false).is_none(), "the Apply dialog blocks it");
-        assert!(script_save_allowed(false, false, true).is_none(), "a discard prompt blocks it");
-        assert!(script_save_allowed(true, true, true).is_none());
+        // Final-review MAJOR-2: the pure RULE stays a bool and stays
+        // unit-pinned here; `save_guard::save_allowed_now` is what turns
+        // it into the `SaveAllowed` witness `save_script` demands — and it
+        // reads the three facts off the live `AppView`, so nobody can mint
+        // one by passing three convenient `false`s.
+        assert!(save_guard::script_save_allowed(false, false, false));
+        assert!(!save_guard::script_save_allowed(true, false, false), "a modal blocks it");
+        assert!(!save_guard::script_save_allowed(false, true, false), "the Apply dialog blocks it");
+        assert!(!save_guard::script_save_allowed(false, false, true), "a discard prompt blocks it");
+        assert!(!save_guard::script_save_allowed(true, true, true));
         // Refused out loud, and not as an „error:" — nothing failed.
         assert_eq!(SCRIPT_SAVE_BLOCKED, "nejprve zavřete otevřený dialog");
         assert!(!SCRIPT_SAVE_BLOCKED.starts_with("error:"));
@@ -14421,41 +14468,221 @@ mod editor_clobber_audit {
     ///
     /// Reading the directory also means a NEW file is covered the moment it
     /// exists, with nobody having to remember this list.
+    /// FINAL-REVIEW MAJOR-2 (structural gap 1): it now walks the WHOLE
+    /// WORKSPACE, not `dbc-ui/src`. `crates/dbc-ui/tests/`, a future
+    /// `build.rs` (which runs at BUILD time with full filesystem access)
+    /// and every other crate were invisible — notably `dbc-state`'s four
+    /// `fsutil::write_atomic` callers, which write real bytes into the
+    /// user's folder and were audited by nothing at all. Names are now
+    /// `<crate>/<src|tests>/<path>` so a report says WHICH crate.
     pub(super) fn sources() -> Vec<(String, String)> {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut out: Vec<(String, String)> = Vec::new();
-        let mut stack = vec![root.clone()];
-        while let Some(dir) = stack.pop() {
-            let rd = std::fs::read_dir(&dir)
-                .unwrap_or_else(|e| panic!("audit cannot read {}: {e}", dir.display()));
-            for ent in rd {
-                let path = ent.expect("readable directory entry").path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                    let rel = path
-                        .strip_prefix(&root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    let text = std::fs::read_to_string(&path)
-                        .unwrap_or_else(|e| panic!("audit cannot read {rel}: {e}"));
-                    out.push((rel, text));
+        // `CARGO_MANIFEST_DIR` is `<repo>/crates/dbc-ui`; its parent is
+        // `crates/`, which holds every workspace member.
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let crates = manifest.parent().expect("crates/ is the manifest's parent").to_path_buf();
+        let mut roots: Vec<(String, PathBuf)> = Vec::new();
+        let rd = std::fs::read_dir(&crates)
+            .unwrap_or_else(|e| panic!("audit cannot read {}: {e}", crates.display()));
+        for ent in rd {
+            let dir = ent.expect("readable directory entry").path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let krate = dir.file_name().expect("crate dir name").to_string_lossy().to_string();
+            for sub in ["src", "tests"] {
+                let p = dir.join(sub);
+                if p.is_dir() {
+                    roots.push((format!("{krate}/{sub}"), p));
                 }
+            }
+            let build = dir.join("build.rs");
+            if build.is_file() {
+                roots.push((format!("{krate}/build.rs"), build));
+            }
+        }
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (label, root) in roots {
+            let mut stack = vec![root.clone()];
+            while let Some(path) = stack.pop() {
+                if path.is_dir() {
+                    let rd = std::fs::read_dir(&path)
+                        .unwrap_or_else(|e| panic!("audit cannot read {}: {e}", path.display()));
+                    for ent in rd {
+                        stack.push(ent.expect("readable directory entry").path());
+                    }
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let rel = match path.strip_prefix(&root) {
+                    Ok(r) if !r.as_os_str().is_empty() => {
+                        format!("{label}/{}", r.to_string_lossy().replace('\\', "/"))
+                    }
+                    // `build.rs`: the root IS the file.
+                    _ => label.clone(),
+                };
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("audit cannot read {rel}: {e}"));
+                out.push((rel, text));
             }
         }
         out.sort();
         out
     }
 
-    /// Strips line comments so a prose mention is neither a call site nor
-    /// an alibi (`config_save_guard_audit`'s lesson: its first draft was
+    /// The source's lines with every COMMENT and every STRING LITERAL
+    /// blanked out, so a needle can only match real code. One line in, one
+    /// line out — indices still name the file's real line numbers.
+    ///
+    /// FINAL-REVIEW MAJOR-2 (structural gap 2). The old `code_of`
+    /// truncated at the first `//` ANYWHERE on the line, including inside
+    /// a string literal, where it silently swallowed the rest of a real
+    /// statement; and block comments were not stripped at all, so
+    /// `/* … */` was an invisibility cloak over any call an audit was
+    /// looking for. Both are now handled by a scanner rather than a
+    /// `find`:
+    ///
+    /// * `/* … */`, NESTED (Rust allows it) and spanning lines;
+    /// * `"…"` with `\` escapes, and `r"…"` / `r#"…"#` raw strings, which
+    ///   have no escapes at all and are how every Windows path literal in
+    ///   this crate is written;
+    /// * `'x'` / `'\n'` char literals, told apart from LIFETIMES
+    ///   (`'static`, `'a`) by requiring the closing quote — which matters
+    ///   because `'/'` and `'"'` both appear in this crate's real code.
+    ///
+    /// Blanking rather than deleting keeps a prose mention from being an
+    /// alibi too (`config_save_guard_audit`'s lesson: its first draft was
     /// vacuous because an explanatory comment satisfied it).
-    pub(super) fn code_of(l: &str) -> &str {
-        match l.find("//") {
-            Some(x) => &l[..x],
-            None => l,
+    pub(super) fn code_lines(src: &str) -> Vec<String> {
+        let chars: Vec<char> = src.chars().collect();
+        let mut out: Vec<String> = Vec::new();
+        let mut line = String::new();
+        let mut block_depth = 0usize;
+        let mut i = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\n' {
+                out.push(std::mem::take(&mut line));
+                i += 1;
+                continue;
+            }
+            if block_depth > 0 {
+                if c == '*' && chars.get(i + 1) == Some(&'/') {
+                    block_depth -= 1;
+                    line.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                if c == '/' && chars.get(i + 1) == Some(&'*') {
+                    block_depth += 1;
+                    line.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                line.push(' ');
+                i += 1;
+                continue;
+            }
+            if c == '/' && chars.get(i + 1) == Some(&'*') {
+                block_depth = 1;
+                line.push_str("  ");
+                i += 2;
+                continue;
+            }
+            if c == '/' && chars.get(i + 1) == Some(&'/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    line.push(' ');
+                    i += 1;
+                }
+                continue;
+            }
+            // Raw string: `r"…"`, `r#"…"#`, `br"…"`. The preceding char
+            // must not be identifier-ish, or this is just a name ending
+            // in `r`.
+            if c == 'r' && !line.chars().next_back().is_some_and(|p| p.is_alphanumeric() || p == '_')
+            {
+                let mut j = i + 1;
+                let mut hashes = 0usize;
+                while chars.get(j) == Some(&'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if chars.get(j) == Some(&'"') {
+                    for _ in 0..=hashes + 1 {
+                        line.push(' ');
+                    }
+                    j += 1;
+                    while j < chars.len() {
+                        if chars[j] == '"' && (1..=hashes).all(|k| chars.get(j + k) == Some(&'#')) {
+                            for _ in 0..=hashes {
+                                line.push(' ');
+                            }
+                            j += hashes + 1;
+                            break;
+                        }
+                        if chars[j] == '\n' {
+                            out.push(std::mem::take(&mut line));
+                        } else {
+                            line.push(' ');
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            if c == '"' {
+                line.push(' ');
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == '\\' {
+                        line.push(' ');
+                        if chars.get(i + 1) == Some(&'\n') {
+                            out.push(std::mem::take(&mut line));
+                        } else if i + 1 < chars.len() {
+                            line.push(' ');
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if chars[i] == '"' {
+                        line.push(' ');
+                        i += 1;
+                        break;
+                    }
+                    if chars[i] == '\n' {
+                        out.push(std::mem::take(&mut line));
+                    } else {
+                        line.push(' ');
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '\'' {
+                // A char literal closes; a lifetime does not.
+                let close = if chars.get(i + 1) == Some(&'\\') { i + 3 } else { i + 2 };
+                if chars.get(close) == Some(&'\'') {
+                    for _ in i..=close {
+                        line.push(' ');
+                    }
+                    i = close + 1;
+                    continue;
+                }
+            }
+            line.push(c);
+            i += 1;
         }
+        out.push(line);
+        out
+    }
+
+    /// Single-line convenience over [`code_lines`]. A line handed here in
+    /// isolation cannot know it is inside a block comment — `code_lines`
+    /// is what knows that, and every audit goes through it.
+    pub(super) fn code_of(l: &str) -> String {
+        code_lines(l).into_iter().next().unwrap_or_default()
     }
 
     /// The NAME of the function a line defines, or `None` if it defines
@@ -14470,8 +14697,9 @@ mod editor_clobber_audit {
     /// an `async fn`, `unsafe fn`, `const fn` or `pub(in path) fn` was
     /// attributed to the PREVIOUS function — possibly a sanctioned one.
     /// This strips an arbitrary visibility and any order of qualifiers.
-    pub(super) fn defined_fn_name(line: &str) -> Option<&str> {
-        let mut t = code_of(line).trim_start();
+    pub(super) fn defined_fn_name(line: &str) -> Option<String> {
+        let stripped = code_of(line);
+        let mut t = stripped.trim_start();
         if let Some(rest) = t.strip_prefix("pub") {
             let rest = rest.trim_start();
             t = match rest.strip_prefix('(') {
@@ -14499,28 +14727,118 @@ mod editor_clobber_audit {
         }
         let rest = t.strip_prefix("fn ")?.trim_start();
         let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
-        (end > 0).then(|| &rest[..end])
+        (end > 0).then(|| rest[..end].to_string())
     }
 
-    /// The name of the function textually enclosing line `i`.
-    fn owner_fn<'a>(lines: &[&'a str], i: usize) -> Option<&'a str> {
-        lines[..i].iter().rev().find_map(|l| defined_fn_name(l))
+    /// The function ENCLOSING each line, by index — `None` where a line is
+    /// not inside any function body.
+    ///
+    /// FINAL-REVIEW MAJOR-2 (structural gap 3). The old `owner_fn` was
+    /// „the nearest `fn` definition ABOVE this line", with no brace
+    /// balancing at all, so a call at file scope (a `static` initializer,
+    /// a `lazy_static!`, a macro invocation at module level) after a
+    /// sanctioned function had CLOSED was attributed to that closed
+    /// function and silently sanctioned. This tracks brace depth over the
+    /// comment- and string-stripped text, so a function owns exactly its
+    /// own body and nothing after it.
+    ///
+    /// Closures do not disturb it: they are extra `{}` inside the body,
+    /// and the innermost still-open `fn` remains the owner — which is the
+    /// answer these audits want (`cx.spawn(async move |…| { … })` is the
+    /// enclosing function's own code).
+    pub(super) fn owners(code: &[String]) -> Vec<Option<String>> {
+        let mut depth = 0usize;
+        // (depth at which this fn's body opened, name)
+        let mut stack: Vec<(usize, String)> = Vec::new();
+        let mut pending: Option<String> = None;
+        let mut out: Vec<Option<String>> = Vec::with_capacity(code.len());
+        for line in code {
+            let defines = defined_fn_name(line);
+            let scan = |depth: &mut usize,
+                            stack: &mut Vec<(usize, String)>,
+                            pending: &mut Option<String>| {
+                for ch in line.chars() {
+                    match ch {
+                        '{' => {
+                            *depth += 1;
+                            if let Some(n) = pending.take() {
+                                stack.push((*depth, n));
+                            }
+                        }
+                        '}' => {
+                            if stack.last().is_some_and(|(d, _)| *d == *depth) {
+                                stack.pop();
+                            }
+                            *depth = depth.saturating_sub(1);
+                        }
+                        _ => {}
+                    }
+                }
+            };
+            match defines {
+                // A definition line belongs to the function it opens, so
+                // its braces are consumed BEFORE the owner is recorded.
+                Some(name) => {
+                    pending = Some(name);
+                    scan(&mut depth, &mut stack, &mut pending);
+                    out.push(stack.last().map(|(_, n)| n.clone()));
+                }
+                // Every other line belongs to whatever was open when it
+                // STARTED — a lone `}` closing a function is still that
+                // function's line.
+                None => {
+                    out.push(stack.last().map(|(_, n)| n.clone()));
+                    scan(&mut depth, &mut stack, &mut pending);
+                }
+            }
+        }
+        out
     }
 
     /// Every CALL of `needle` must sit inside a function named EXACTLY one
     /// of `sanctioned`, and there must be exactly `expected` of them. The
     /// definition itself is not a call site.
     pub(super) fn audit(needle: &str, sanctioned: &[&str], expected: usize, why: &str) {
+        audit_excluding(needle, &[], sanctioned, expected, why);
+    }
+
+    /// [`audit`], plus tokens that must NOT count as a match.
+    ///
+    /// FINAL-REVIEW MAJOR-2. `audit` matches `needle + "("` as a plain
+    /// substring, which is what forced `script_write_audit` to write its
+    /// needle as `.save_script` — with a leading DOT, to keep
+    /// `on_save_script(` out of the count — and the dot is precisely what
+    /// the reviewer's UFCS bypass (`AppView::save_script(self, …)`, which
+    /// spells a COLON there) walked around. The needle can now be
+    /// receiver-independent because the false positive is named
+    /// explicitly instead of being excluded by punctuation.
+    ///
+    /// Excluded tokens are blanked in place, so a line holding BOTH an
+    /// excluded call and a real one still reports the real one.
+    pub(super) fn audit_excluding(
+        needle: &str,
+        exclude: &[&str],
+        sanctioned: &[&str],
+        expected: usize,
+        why: &str,
+    ) {
         let call = format!("{needle}(");
         let mut sites = 0usize;
         for (name, src) in sources() {
-            let lines: Vec<&str> = src.lines().collect();
-            for (i, line) in lines.iter().enumerate() {
-                if !code_of(line).contains(&call) || defined_fn_name(line) == Some(needle) {
+            let code = code_lines(&src);
+            let who = owners(&code);
+            for (i, line) in code.iter().enumerate() {
+                let mut line = line.clone();
+                for ex in exclude {
+                    while let Some(at) = line.find(ex) {
+                        line.replace_range(at..at + ex.len(), &" ".repeat(ex.len()));
+                    }
+                }
+                if !line.contains(&call) || defined_fn_name(&line).as_deref() == Some(needle) {
                     continue;
                 }
                 sites += 1;
-                let owner = owner_fn(&lines, i);
+                let owner = who[i].as_deref();
                 assert!(
                     owner.is_some_and(|o| sanctioned.contains(&o)),
                     "unguarded `{needle}` call at {name}:{} (in `{}`) — {why}",
@@ -14544,17 +14862,122 @@ mod editor_clobber_audit {
     fn the_audit_actually_reads_the_whole_crate() {
         let files = sources();
         assert!(
-            files.len() >= 30,
-            "expected the crate's ~33 sources, got {} — the audit would be vacuous",
+            files.len() >= 60,
+            "expected the workspace's ~79 sources, got {} — the audit would be vacuous",
             files.len()
         );
-        for expected in ["main.rs", "plan.rs", "scripts.rs", "sql_input.rs", "runner.rs"] {
+        for expected in [
+            "dbc-ui/src/main.rs",
+            "dbc-ui/src/plan.rs",
+            "dbc-ui/src/scripts.rs",
+            "dbc-ui/src/sql_input.rs",
+            "dbc-ui/src/runner.rs",
+            // Final-review MAJOR-2: the walk is WORKSPACE-wide now, and
+            // these two are the reason it had to be — `dbc-state` holds
+            // four `write_atomic` callers that write into the user's
+            // folder and were audited by nothing, and `dbc-mcp` reaches
+            // the same vault and config this app does.
+            "dbc-state/src/workspace.rs",
+            "dbc-mcp/src/main.rs",
+        ] {
             assert!(files.iter().any(|(n, _)| n == expected), "{expected} not scanned");
+        }
+        // Every workspace member is represented, so a NEW crate cannot
+        // quietly start outside the audits' field of view.
+        for krate in [
+            "dbc-buffer", "dbc-core", "dbc-diff", "dbc-driver-duckdb", "dbc-driver-mssql",
+            "dbc-driver-postgres", "dbc-driver-sqlite", "dbc-mcp", "dbc-state", "dbc-ui",
+        ] {
+            assert!(
+                files.iter().any(|(n, _)| n.starts_with(&format!("{krate}/"))),
+                "crate {krate} not scanned"
+            );
         }
         assert!(
             files.iter().any(|(_, s)| s.contains("fn editor_load_guarded")),
             "the scanned text is not this crate's source"
         );
+    }
+
+    /// FINAL-REVIEW MAJOR-2, structural gap 2 — the three ways the old
+    /// one-line `code_of` could be walked past, each pinned.
+    ///
+    /// Probe sources are ASSEMBLED at runtime, never written as literals:
+    /// this module's own file is one of the files `sources()` scans, so a
+    /// literal `write_atomic(` here would be counted as a real, unguarded
+    /// call site.
+    #[test]
+    fn comments_and_string_literals_cannot_hide_or_invent_a_call() {
+        let call = format!("{}_{}(x)", "write", "atomic");
+
+        // 1. A BLOCK comment used to hide nothing at all, because block
+        //    comments were not stripped — so this call was VISIBLE and
+        //    would have been reported. Now it is code_lines' job.
+        let hidden = format!("    /* {call} */");
+        assert_eq!(code_lines(&hidden)[0].trim(), "", "a block comment is not code");
+
+        // …including a NESTED one spanning lines, which Rust allows.
+        let multi = format!("a();\n/* one /* two */ still-comment\n{call}\n*/\nb();");
+        let out = code_lines(&multi);
+        assert_eq!(out.len(), 5, "one line in, one line out — line numbers must survive");
+        assert!(out[0].contains("a()"));
+        assert!(!out[2].contains(&call), "a nested block comment must still be a comment");
+        assert!(out[4].contains("b()"));
+
+        // 2. A `//` INSIDE A STRING used to truncate the line, so the real
+        //    code after it disappeared. That is a hiding place, not a
+        //    false positive: put the URL first and the call vanished.
+        let after = format!("    let u = \"http://x\"; self.{call};");
+        assert!(
+            code_lines(&after)[0].contains(&call),
+            "a `//` inside a string must not swallow the rest of the line"
+        );
+        // …and the string's own contents must not be readable AS code.
+        let inside = format!("    let s = \"{call}\";");
+        assert!(
+            !code_lines(&inside)[0].contains(&call),
+            "text inside a string literal is not a call site"
+        );
+        // Raw strings too — how every Windows path literal here is written.
+        let raw = format!("    let s = r\"{call}\"; done();");
+        assert!(!code_lines(&raw)[0].contains(&call));
+        assert!(code_lines(&raw)[0].contains("done()"));
+        let hashed = format!("    let s = r#\"{call} \"quoted\" \"#; done();");
+        assert!(!code_lines(&hashed)[0].contains(&call));
+        assert!(code_lines(&hashed)[0].contains("done()"));
+
+        // 3. Char literals must not be mistaken for string openers — `'/'`
+        //    and `'"'` are both real code in this crate — while LIFETIMES
+        //    must survive untouched.
+        let ch = format!("    rel.split('/').for_each(|_| {{}}); self.{call};");
+        assert!(code_lines(&ch)[0].contains(&call), "`'/'` must not open a string");
+        let quote_ch = format!("    let q = '\"'; self.{call};");
+        assert!(code_lines(&quote_ch)[0].contains(&call), "`'\"'` must not open a string");
+        assert!(code_lines("fn f<'a>(x: &'a str) -> &'a str { x }")[0].contains("'a"));
+    }
+
+    /// FINAL-REVIEW MAJOR-2, structural gap 3: attribution is now BRACE
+    /// BALANCED. The old owner detector was „the nearest `fn` above",
+    /// full stop, so anything at file scope after a sanctioned function
+    /// closed inherited that function's sanction.
+    #[test]
+    fn a_call_after_a_function_closes_is_not_attributed_to_it() {
+        let guarded = format!("{}_{}", "bind", "script");
+        let src = format!(
+            "fn {guarded}() {{\n    inner();\n}}\n\nstatic X: u8 = danger();\n\nfn other() {{\n    more();\n}}\n"
+        );
+        let code = code_lines(&src);
+        let who = owners(&code);
+        assert_eq!(who[1].as_deref(), Some(guarded.as_str()), "the body belongs to its fn");
+        assert_eq!(who[2].as_deref(), Some(guarded.as_str()), "so does its closing brace");
+        assert_eq!(who[4], None, "FILE SCOPE — the old detector said `{guarded}` here");
+        assert_eq!(who[7].as_deref(), Some("other"));
+
+        // A closure inside a body does not steal ownership: the innermost
+        // still-open `fn` is the answer these audits want.
+        let nested = "fn outer() {\n    spawn(move || {\n        danger();\n    });\n}\n";
+        let who = owners(&code_lines(nested));
+        assert_eq!(who[2].as_deref(), Some("outer"));
     }
 
     /// The parser everything above rests on. Probe lines are ASSEMBLED at
@@ -14566,15 +14989,15 @@ mod editor_clobber_audit {
     fn the_owner_parser_handles_every_fn_spelling_in_use() {
         let guarded = "bind_script";
         let vis = format!("    pub(crate) fn {guarded}(&mut self) {{");
-        assert_eq!(defined_fn_name(&vis), Some(guarded));
+        assert_eq!(defined_fn_name(&vis).as_deref(), Some(guarded));
         let asy = format!("async fn open_{}(rel: String) {{", "script");
-        assert_eq!(defined_fn_name(&asy), Some("open_script"));
+        assert_eq!(defined_fn_name(&asy).as_deref(), Some("open_script"));
         // Qualifiers in combination, and a restricted-path visibility —
         // the four spellings the old detector attributed to the PREVIOUS
         // function instead.
-        assert_eq!(defined_fn_name("    pub(in crate::a) const unsafe fn x() {}"), Some("x"));
-        assert_eq!(defined_fn_name("    pub async unsafe fn y() {}"), Some("y"));
-        assert_eq!(defined_fn_name("    unsafe extern \"C\" fn z() {}"), Some("z"));
+        assert_eq!(defined_fn_name("    pub(in crate::a) const unsafe fn x() {}").as_deref(), Some("x"));
+        assert_eq!(defined_fn_name("    pub async unsafe fn y() {}").as_deref(), Some("y"));
+        assert_eq!(defined_fn_name("    unsafe extern \"C\" fn z() {}").as_deref(), Some("z"));
         // Not definitions.
         assert_eq!(defined_fn_name("    /// fn not_a_definition(&self)"), None);
         let call = format!("        self.{guarded}(p, t, cx);");
@@ -14583,8 +15006,8 @@ mod editor_clobber_audit {
         // A near-miss name must NOT be read as the sanctioned one — the
         // exact-match half of G2.
         let near = format!("    fn {guarded}_and_focus(&mut self) {{");
-        assert_ne!(defined_fn_name(&near), Some(guarded));
-        assert_eq!(defined_fn_name(&near), Some("bind_script_and_focus"));
+        assert_ne!(defined_fn_name(&near).as_deref(), Some(guarded));
+        assert_eq!(defined_fn_name(&near).as_deref(), Some("bind_script_and_focus"));
     }
 
     /// Shape-independent: whatever expression reaches the editor entity,
@@ -14684,20 +15107,49 @@ mod editor_clobber_audit {
 /// and a `#[cfg(test)]`-region filter would be one more thing to defeat.
 #[cfg(test)]
 mod script_write_audit {
-    use super::editor_clobber_audit::audit;
+    use super::editor_clobber_audit::{audit, audit_excluding};
 
     /// The ONE funnel from this crate into
     /// `dbc_state::fsutil::write_atomic`, whose tmp path is a pure
     /// function of the target (T8's single-writer contract). A second
     /// caller would be a second writer over a path this crate believes
     /// only one function can touch.
+    ///
+    /// FINAL-REVIEW MAJOR-2, structural gap 1: this used to scan
+    /// `dbc-ui/src` alone and could therefore assert „exactly one caller"
+    /// while `dbc-state` held FOUR more — `write_pointer`, `copy_one`,
+    /// `init_contents` and `write_marker`, every one of them writing real
+    /// bytes into the user's chosen folder, audited by nothing. The count
+    /// is honest now, and the sanction list is the inventory: a NEW
+    /// atomic write anywhere in the workspace fails here.
+    ///
+    /// The five `dbc-state` production owners are legitimate and named
+    /// individually rather than waved through by crate: each writes ONE
+    /// well-known file (the pointer, one copied store file, the
+    /// `.gitignore`, the marker) and none of them can be aimed at a
+    /// script, which is the single-writer contract this test protects.
     #[test]
     fn the_shared_atomic_writer_has_exactly_one_funnel() {
         audit(
             "write_atomic",
-            &["write_script"],
-            1,
-            "`crate::scripts::write_script` is the ONE funnel into the shared atomic              writer - a second caller forks T8's single-writer-per-path contract",
+            &[
+                // dbc-ui: THE funnel, and the only one.
+                "write_script",
+                // dbc-state: the workspace lane's own writers (§W3.2).
+                "write_pointer",
+                "copy_one",
+                "init_contents",
+                "write_marker",
+                // dbc-state: the rail's own tests.
+                "write_atomic_refuses_a_missing_parent_while_the_store_savers_create_one",
+                "write_atomic_leaves_no_tmp_file_and_writes_bytes",
+                "write_atomic_overwrites_in_place",
+                "write_atomic_failure_leaves_no_tmp_behind",
+            ],
+            10,
+            "`crate::scripts::write_script` is the ONE funnel from dbc-ui into the shared \
+             atomic writer, and dbc-state's own callers each own exactly one well-known \
+             file - a new caller forks T8's single-writer-per-path contract",
         );
     }
 
@@ -14736,17 +15188,35 @@ mod script_write_audit {
     /// `save_script_as`, which re-asks the predicate itself because its
     /// check sits after an await.
     ///
-    /// **The needle is `.save_script`, with the dot.** `audit` matches
-    /// `needle + "("` as a plain SUBSTRING, so a bare `save_script` would
-    /// also match `on_save_script(` and count the entry point's own three
-    /// call sites as writes. The leading dot is the receiver, which every
-    /// real call has (`self.` / `view.`) and which `.on_save_script(` does
-    /// not put in front of `save_script` — and it also keeps the `fn
-    /// save_script(` definition line out of the count for free.
+    /// **FINAL-REVIEW MAJOR-2: the needle no longer carries a receiver.**
+    /// It used to be `.save_script`, WITH THE DOT, and the paragraph that
+    /// stood here argued for the dot at length: `audit` matches
+    /// `needle + "("` as a plain substring, a bare `save_script` also
+    /// matches `on_save_script(`, and the dot excluded that for free while
+    /// keeping the definition line out of the count.
+    ///
+    /// The argument was sound and the conclusion was wrong, because the
+    /// dot is a claim about CALL SYNTAX. UFCS spells a colon:
+    /// `AppView::save_script(self, path, text, false, cx)` contains
+    /// `::save_script(`, not `.save_script(`. The reviewer put exactly
+    /// that on a live production path — inside `perform_script_action`'s
+    /// `Unbind` arm — and got zero warnings and 11/11 audits green.
+    ///
+    /// So the false positive is now NAMED instead of dodged
+    /// (`audit_excluding`), and the needle matches any receiver, any path
+    /// qualification, and no receiver at all. The definitive rail is no
+    /// longer here in any case — `save_script` demands a
+    /// `save_guard::SaveAllowed` witness the crate root cannot construct
+    /// — but this stays as the belt to those braces, and it is what would
+    /// catch a future caller that mints the witness legitimately and still
+    /// writes from somewhere it should not.
     #[test]
     fn the_writer_itself_is_reachable_only_through_the_guarded_entry_points() {
-        audit(
-            ".save_script",
+        audit_excluding(
+            "save_script",
+            // The ENTRY POINT is not the writer. Named, not punctuated
+            // around.
+            &["on_save_script"],
             &["on_save_script", "save_script_as"],
             2,
             "`AppView::save_script` is the WRITER - reaching it around `on_save_script` \
@@ -14768,20 +15238,48 @@ mod script_write_audit {
     /// platform and the entry-point check is, by then, a statement about
     /// the past. (The test name used to say „exactly once" and was the
     /// clearest statement of the bug.)
+    ///
+    /// FINAL-REVIEW MAJOR-2 split the predicate in two.
+    /// `script_save_allowed` is the pure RULE, still unit-pinned, and it
+    /// now has exactly one production caller: `save_guard::save_allowed_now`,
+    /// which is the only MINT of the `SaveAllowed` witness and which reads
+    /// the three facts off the live `AppView` instead of accepting three
+    /// booleans a caller could choose. `save_allowed_now` is audited
+    /// separately below, at the two entry points.
     #[test]
     fn the_ctrl_s_dialog_guard_is_asked_at_every_stoppable_point() {
         audit(
             "script_save_allowed",
             // The predicate's own unit test is a real call site; naming it
             // here is what makes the exact count meaningful.
-            &[
-                "on_save_script",
-                "save_script_as",
-                "ctrl_s_is_refused_whenever_any_dialog_owns_the_screen",
-            ],
-            7,
-            "every Ctrl+S entry point must ask this - `.occlude()` blocks clicks, not keys - \
-             and a path that awaits between the check and the write must ask it AGAIN",
+            &["save_allowed_now", "ctrl_s_is_refused_whenever_any_dialog_owns_the_screen"],
+            6,
+            "the pure Ctrl+S rule belongs to `save_guard::save_allowed_now`, which reads the \
+             live view - a caller that asks it with its own three booleans has bought \
+             nothing, because it can pass whichever three suit it",
+        );
+    }
+
+    /// …and the MINT is asked at every point where a save can still be
+    /// stopped (final-review MAJOR-2). This is the test that used to be
+    /// the one above: two production sites, and only two.
+    ///
+    /// `on_save_script` asks synchronously, before anything is dispatched;
+    /// `save_script_as` asks AGAIN in its post-await continuation, because
+    /// the file picker is not app-modal on every platform and the
+    /// entry-point answer is, by then, a statement about the past. The
+    /// witness being neither `Copy` nor `Clone` is what makes carrying the
+    /// first answer across the picker impossible rather than merely
+    /// discouraged.
+    #[test]
+    fn the_save_witness_is_minted_at_every_stoppable_point_and_nowhere_else() {
+        audit(
+            "save_allowed_now",
+            &["on_save_script", "save_script_as"],
+            2,
+            "every Ctrl+S entry point must mint the witness HERE - `.occlude()` blocks \
+             clicks, not keys - and a path that awaits between the mint and the write must \
+             mint a fresh one",
         );
     }
 }
