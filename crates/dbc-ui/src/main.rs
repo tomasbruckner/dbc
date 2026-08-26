@@ -14596,8 +14596,9 @@ mod script_binding_tests {
 mod editor_clobber_audit {
     use std::path::PathBuf;
 
-    /// EVERY `.rs` file in this crate, read at TEST TIME from
-    /// `CARGO_MANIFEST_DIR` — deliberately never a hand-written list.
+    /// EVERY `.rs` file in the WORKSPACE, read at TEST TIME by walking
+    /// the repository root — deliberately never a hand-written list, and
+    /// (re-verify FAIL-4) never a list of directories either.
     ///
     /// T8 re-verify MAJOR-3 / G1: the previous version enumerated 8 of the
     /// crate's 33 files, and the other 25 were invisible to it. Privacy
@@ -15473,17 +15474,49 @@ more();");
 /// certifies an unaudited region is on the path.
 ///
 /// The fix is the mechanism that has now survived attack twice rather than
-/// a longer ban list: audit the WRITER crate-wide, by identifier, with an
-/// exact-name owner check — `editor_clobber_audit`'s scanner, reused
-/// wholesale (it already walks every `.rs` under `src`, so a new file is
-/// covered the moment it exists). A ban list only ever covers the regions
-/// someone remembered to list; this covers the crate.
+/// a longer ban list: audit the WRITER workspace-wide, by identifier, with
+/// an exact-name owner check — `editor_clobber_audit`'s scanner, reused
+/// wholesale (it walks every `.rs` under the workspace root, so a new
+/// file is covered the moment it exists). A ban list only ever covers the
+/// regions someone remembered to list; this covers the tree.
 ///
-/// Together the needles mean NO BYTE reaches THE SCRIPTS LIBRARY from this
-/// crate except through `AppView::save_script` — guarded, serialized,
-/// generation-checked — or `scripts::create_script`, which probes for a
-/// collision through the Unicode-aware rail first. The library's run
-/// cannot write at all, from any function, however it is reached.
+/// **RE-VERIFY FAIL-1: what this actually promises, stated honestly.**
+/// The sentence here used to read „NO BYTE reaches THE SCRIPTS LIBRARY
+/// from this crate except through `AppView::save_script` … or
+/// `scripts::create_script`", and that was FALSE as written. These are
+/// TEXT audits. They had no type behind them, and the re-verifier walked
+/// past them with an alias:
+///
+/// ```ignore
+/// use crate::scripts::write_script as persist_bytes;
+/// let _ = persist_bytes(&doomed, "-- truncated by the run");
+/// ```
+///
+/// Zero warnings, 961 green, a truncating write into the library.
+///
+/// What the audits promise NOW, and no more: **every MENTION of these
+/// identifiers, anywhere in the workspace's source, sits inside a
+/// sanctioned function, and the count is pinned.** Since an alias, a
+/// re-export, a fn-pointer or a macro must all write the identifier down
+/// to detach it, that covers the detachment tricks — but it is a property
+/// of the SOURCE TEXT, not of the type system, and it holds only over
+/// files the walk can see (which is why `#[path]` and `include!` are
+/// banned outright by `no_module_may_be_pulled_in_from_outside_the_audited_tree`).
+///
+/// The genuinely compiler-enforced rails in this phase are two, and they
+/// are named precisely so nobody mistakes their scope: the Ctrl+S
+/// permission (`save_guard::with_save_permission`, a generative-brand
+/// scope in front of `AppView::save_script`) and the config write
+/// (`dbc_state::ConfigSaveGuard`, mintable only by a real parse of the
+/// very file about to be overwritten). `write_script`, `write_atomic`,
+/// `replace_buffer` and `bind_script` have NO type rail — see the
+/// as-built note for why a witness on them would be theatre — and are
+/// held up by these audits alone. That is worth knowing when reading a
+/// count assertion below.
+///
+/// The library's run still cannot write at all, from any function,
+/// however it is reached — that one is `run_script_from_library`'s own
+/// ban list plus these mention counts.
 ///
 /// **T9 re-verify NIT-A: "the scripts library", NOT "a user-chosen
 /// folder".** The older, wider sentence was false and it is worth knowing
