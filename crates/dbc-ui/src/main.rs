@@ -1503,16 +1503,63 @@ fn script_binding_retarget(
 /// „error:" — nothing failed, and the way out is one Esc away.
 pub(crate) const SCRIPT_SAVE_BLOCKED: &str = "nejprve zavřete otevřený dialog";
 
-/// T9 review MAJOR-1: may a Ctrl+S dispatch right now? A pure predicate so
-/// the rule is unit-pinned — `on_save_script` takes a `Window` and so has
-/// no test harness, which is exactly how it went unguarded in the first
-/// place. `SaveScript` is bound with context `None`, i.e. it fires
-/// straight through an open modal's `.occlude()`, so this is the ONLY
-/// thing standing between a habitual Ctrl+S and a write that races the
-/// rename/delete the user is currently confirming.
-fn script_save_allowed(modal_open: bool, apply_open: bool, discard_open: bool) -> bool {
-    !(modal_open || apply_open || discard_open)
+/// FINAL-REVIEW MAJOR-2 — the Ctrl+S guard, as a TYPE the compiler
+/// enforces instead of a regex a reviewer can walk around.
+///
+/// `script_write_audit` pinned this rule textually and the reviewer beat
+/// it with the most ordinary alternative call syntax in Rust: the needle
+/// was `.save_script(` — with the leading dot, and its doc comment argued
+/// at length for the dot — and UFCS puts a COLON there, so
+/// `AppView::save_script(self, path, text, false, cx)` sailed past both
+/// the audit and the zero-warning gate. That is the fifth time a text
+/// audit in this phase has been defeated.
+///
+/// So the rule moved into the type system. [`SaveAllowed`] is a witness
+/// with a PRIVATE field, and `save_script` demands one by value. Rust's
+/// finest privacy granularity is the module, and `main.rs` is the crate
+/// ROOT — a private field declared there would be visible crate-wide and
+/// prove nothing — so the witness and its only mint live in this small
+/// child module. A parent cannot see a child's private items, which makes
+/// `SaveAllowed(())` unspellable everywhere in `dbc-ui` except the twenty
+/// lines below. There is no receiver to rebind, no path spelling to vary
+/// and no macro to hide it in: without a call to
+/// [`script_save_allowed`][save_guard::script_save_allowed] there is no
+/// value to pass, and the crate does not compile.
+///
+/// The text audits are KEPT and were widened (belt and braces), but they
+/// are no longer the thing holding this invariant up.
+mod save_guard {
+    /// Proof that a save was permitted at the moment the predicate ran.
+    ///
+    /// Deliberately NOT `Copy` and NOT `Clone`: a witness is consumed by
+    /// the write it authorises, so a post-await path cannot re-use the
+    /// answer it got before the await — the phase's own rule („a check
+    /// performed before an `await` is a statement about the past") made
+    /// structural. `save_script_as` re-asks and gets a FRESH witness;
+    /// stashing the first one across the picker would not compile.
+    #[must_use = "this witness IS the permission — dropping it and saving anyway is \
+                  the bug it exists to prevent"]
+    pub(crate) struct SaveAllowed(());
+
+    /// T9 review MAJOR-1: may a Ctrl+S dispatch right now? A pure
+    /// predicate so the rule is unit-pinned — `on_save_script` takes a
+    /// `Window` and so has no test harness, which is exactly how it went
+    /// unguarded in the first place. `SaveScript` is bound with context
+    /// `None`, i.e. it fires straight through an open modal's
+    /// `.occlude()`, so this is the ONLY thing standing between a habitual
+    /// Ctrl+S and a write that races the rename/delete the user is
+    /// currently confirming.
+    ///
+    /// `None` = refused. THE only mint of [`SaveAllowed`].
+    pub(crate) fn script_save_allowed(
+        modal_open: bool,
+        apply_open: bool,
+        discard_open: bool,
+    ) -> Option<SaveAllowed> {
+        (!(modal_open || apply_open || discard_open)).then_some(SaveAllowed(()))
+    }
 }
+use save_guard::{script_save_allowed, SaveAllowed};
 
 /// T8 review MAJOR-2: the refusal when a save of this editor is already in
 /// flight. Not an „error:" — nothing failed; the user's keystroke simply
@@ -7092,7 +7139,21 @@ impl AppView {
     /// and once the caller has that, a nonce buys nothing. `write_atomic`'s
     /// doc comment now states the contract for every other writer over a
     /// user folder.
-    fn save_script(&mut self, path: PathBuf, text: String, rescan: bool, cx: &mut Context<Self>) {
+    ///
+    /// FINAL-REVIEW MAJOR-2: `_allowed` is a [`SaveAllowed`] witness,
+    /// mintable ONLY by `save_guard::script_save_allowed`. It is unused at
+    /// runtime and load-bearing at compile time — no caller can reach this
+    /// writer, by any call syntax, without having asked the predicate. The
+    /// reviewer's UFCS bypass (`AppView::save_script(self, p, t, false, cx)`)
+    /// no longer type-checks.
+    fn save_script(
+        &mut self,
+        path: PathBuf,
+        text: String,
+        rescan: bool,
+        _allowed: SaveAllowed,
+        cx: &mut Context<Self>,
+    ) {
         if self.script_save_in_flight {
             self.status = SCRIPT_SAVE_IN_FLIGHT.to_string();
             cx.notify();
@@ -7268,19 +7329,25 @@ impl AppView {
                 // between `set_script_name_error` (synchronous, sound) and
                 // `land_script_name_error` (post-await, must re-verify): a
                 // check performed before an await is a check about the past.
-                if !script_save_allowed(
+                //
+                // FINAL-REVIEW MAJOR-2: the witness makes this structural.
+                // `SaveAllowed` is neither `Copy` nor `Clone`, so the one
+                // `on_save_script` minted before the picker cannot be
+                // carried across the await even deliberately — the only
+                // way to reach `save_script` from here is to ask again.
+                let Some(allowed) = script_save_allowed(
                     view.modal.is_some(),
                     view.apply_dialog.is_some(),
                     view.discard_confirm.is_some(),
-                ) {
+                ) else {
                     view.status = SCRIPT_SAVE_BLOCKED.to_string();
                     cx.notify();
                     return;
-                }
+                };
                 // Rescan when the save lands INSIDE the library; outside is
                 // allowed (it is the user's disk) but the tree honestly
                 // won't show it.
-                view.save_script(path, text.clone(), true, cx);
+                view.save_script(path, text.clone(), true, allowed, cx);
             });
         })
         .detach();
@@ -7304,20 +7371,26 @@ impl AppView {
         // Refused OUT LOUD (a silent `return` is the other thing this phase
         // bans) and not as an „error:" — nothing failed; the keystroke
         // simply arrived while another decision was still on screen.
-        if !script_save_allowed(
+        let Some(allowed) = script_save_allowed(
             self.modal.is_some(),
             self.apply_dialog.is_some(),
             self.discard_confirm.is_some(),
-        ) {
+        ) else {
             self.status = SCRIPT_SAVE_BLOCKED.to_string();
             cx.notify();
             return;
-        }
+        };
         match &self.script_binding {
             Some(b) => {
                 let (path, text) = (b.path.clone(), self.sql.read(cx).text());
-                self.save_script(path, text, false, cx);
+                self.save_script(path, text, false, allowed, cx);
             }
+            // The witness is DROPPED here on purpose: `save_script_as`
+            // resumes after a file picker, so this answer will be stale by
+            // the time it has a path to write, and it asks again for a
+            // fresh one. Handing it over would be exactly the „a check
+            // before an await is about the past" mistake — which is why
+            // `SaveAllowed` is not `Clone`.
             None => self.save_script_as(cx),
         }
     }
@@ -14004,11 +14077,14 @@ mod script_binding_tests {
     /// same reason: occlusion stops clicks, not keystrokes.
     #[test]
     fn ctrl_s_is_refused_whenever_any_dialog_owns_the_screen() {
-        assert!(script_save_allowed(false, false, false));
-        assert!(!script_save_allowed(true, false, false), "a modal blocks it");
-        assert!(!script_save_allowed(false, true, false), "the Apply dialog blocks it");
-        assert!(!script_save_allowed(false, false, true), "a discard prompt blocks it");
-        assert!(!script_save_allowed(true, true, true));
+        // Final-review MAJOR-2: the predicate now MINTS the `SaveAllowed`
+        // witness `save_script` demands, so „allowed" is a value rather
+        // than a bool anyone can decline to look at.
+        assert!(script_save_allowed(false, false, false).is_some());
+        assert!(script_save_allowed(true, false, false).is_none(), "a modal blocks it");
+        assert!(script_save_allowed(false, true, false).is_none(), "the Apply dialog blocks it");
+        assert!(script_save_allowed(false, false, true).is_none(), "a discard prompt blocks it");
+        assert!(script_save_allowed(true, true, true).is_none());
         // Refused out loud, and not as an „error:" — nothing failed.
         assert_eq!(SCRIPT_SAVE_BLOCKED, "nejprve zavřete otevřený dialog");
         assert!(!SCRIPT_SAVE_BLOCKED.starts_with("error:"));
