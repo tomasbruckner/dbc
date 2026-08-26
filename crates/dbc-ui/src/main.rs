@@ -15274,6 +15274,57 @@ more();");
         assert!(code_lines("fn f<'a>(x: &'a str) -> &'a str { x }")[0].contains("'a"));
     }
 
+    /// THE FIFTH BYPASS, found while looking for it rather than reported.
+    ///
+    /// Re-verify FAIL-4 was `#[path = "../gen/evil.rs"]`, and widening
+    /// `sources()` to the workspace ROOT answered it. It does not answer
+    /// the same trick aimed OUTSIDE the root:
+    ///
+    /// ```ignore
+    /// #[path = "../../../../outside-tree/evil.rs"]
+    /// mod evil;
+    /// ```
+    ///
+    /// Verified: that compiles, and 963 tests pass with a truncating
+    /// `write_script` and an unguarded `replace_buffer` sitting in a file
+    /// no audit can reach. No walk can fix this — the file is not in the
+    /// tree — so the rail has to be aimed at the ESCAPE HATCH instead of
+    /// at the destination.
+    ///
+    /// Two hatches move CODE from an arbitrary path into this workspace,
+    /// and neither is used anywhere in it:
+    ///
+    /// * `#[path = …]` on a `mod`, in any spelling including via
+    ///   `cfg_attr`;
+    /// * `include!(…)`, which splices tokens — the `OUT_DIR` idiom.
+    ///
+    /// `include_str!` and `include_bytes!` are deliberately NOT banned:
+    /// they carry DATA, cannot introduce a call site, and this crate uses
+    /// `include_str!("main.rs")` for its own source pins.
+    ///
+    /// Banning the class beats chasing the instance. If a generated module
+    /// is ever genuinely needed, this test is the conversation about where
+    /// it may live.
+    #[test]
+    fn no_module_may_be_pulled_in_from_outside_the_audited_tree() {
+        let mut hatches: Vec<String> = Vec::new();
+        let files = sources();
+        assert!(files.len() >= 60, "vacuous: only {} files scanned", files.len());
+        for (name, src) in &files {
+            for (i, line) in code_lines(src).iter().enumerate() {
+                let attr_path = line.contains("#[") && line.contains("path =");
+                let splice = mentions_word(line, "include") && line.contains("include!(");
+                if attr_path || splice {
+                    hatches.push(format!("{name}:{}", i + 1));
+                }
+            }
+        }
+        assert!(
+            hatches.is_empty(),
+            "`#[path]` / `include!` move CODE from an arbitrary file into the workspace, and              the audits can only see files inside it — a module pulled in from outside the              root is invisible to every one of them. Found: {hatches:?}"
+        );
+    }
+
     /// RE-VERIFY FAIL-1: the matcher looks for the NAME, not for a call,
     /// and a whole-word one — so every way of detaching an identifier from
     /// its call site is a site, while the near-miss names the exact-match
