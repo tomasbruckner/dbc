@@ -14661,7 +14661,12 @@ mod editor_clobber_audit {
     /// * `/* … */`, NESTED (Rust allows it) and spanning lines;
     /// * `"…"` with `\` escapes, and `r"…"` / `r#"…"#` raw strings, which
     ///   have no escapes at all and are how every Windows path literal in
-    ///   this crate is written;
+    ///   this crate is written — INCLUDING the byte and C prefixes
+    ///   (`b"…"`, `c"…"`, `br#"…"#`, `cr#"…"#`), which re-verify FAIL-3
+    ///   caught this scanner mis-parsing: a `br#"…"#` fell through to the
+    ///   ordinary-`"` branch, took the first quote in its payload as the
+    ///   terminator, and with an odd quote count desynced into
+    ///   „inside a string" and blanked the rest of the FILE;
     /// * `'x'` / `'\n'` char literals, told apart from LIFETIMES
     ///   (`'static`, `'a`) by requiring the closing quote — which matters
     ///   because `'/'` and `'"'` both appear in this crate's real code.
@@ -14712,29 +14717,79 @@ mod editor_clobber_audit {
                 }
                 continue;
             }
-            // Raw string: `r"…"`, `r#"…"#`, `br"…"`. The preceding char
-            // must not be identifier-ish, or this is just a name ending
-            // in `r`.
-            if c == 'r' && !line.chars().next_back().is_some_and(|p| p.is_alphanumeric() || p == '_')
-            {
-                let mut j = i + 1;
+            // A STRING LITERAL, prefix and all.
+            //
+            // RE-VERIFY FAIL-3. This used to be two branches — one for a
+            // bare `r`, one for a bare `"` — and the raw branch demanded
+            // that the character before the `r` not be identifier-ish. A
+            // BYTE raw string spells a `b` there, so `br#"…"#` failed the
+            // raw test and fell into the ordinary-`"` branch, which then
+            // took the FIRST `"` inside the payload as its terminator. With
+            // an odd number of quotes in the payload the scanner desynced
+            // into "inside a string" and blanked every following character,
+            // ACROSS LINES — hiding real calls from every audit (the
+            // re-verifier hid a `write_script(` this way, zero warnings,
+            // 961 green) and, mid-file, blanking legitimate ones so counts
+            // silently dropped. Live `br#"…"#` literals already exist at
+            // `dbc-driver-postgres/src/types.rs:201,208,227`; they survived
+            // only because their quote counts happen to be even.
+            //
+            // So the prefix is parsed properly: `b`, `c`, `r`, `br`, `cr`
+            // (and none). Anything with an `r` is RAW — no escapes, `#`
+            // hashes delimit; anything else is an ordinary escaped string.
+            // The not-identifier-ish test now applies to the START of the
+            // prefix, which is the only place it was ever meaningful.
+            let prefix = ["br", "cr", "b", "c", "r", ""]
+                .into_iter()
+                .find(|p| p.chars().enumerate().all(|(k, pc)| chars.get(i + k) == Some(&pc)));
+            if let Some(prefix) = prefix {
+                let plen = prefix.len();
+                let raw = prefix.contains('r');
+                let after_prefix = i + plen;
+                let mut j = after_prefix;
                 let mut hashes = 0usize;
-                while chars.get(j) == Some(&'#') {
-                    hashes += 1;
-                    j += 1;
+                if raw {
+                    while chars.get(j) == Some(&'#') {
+                        hashes += 1;
+                        j += 1;
+                    }
                 }
-                if chars.get(j) == Some(&'"') {
-                    for _ in 0..=hashes + 1 {
+                let opens = chars.get(j) == Some(&'"');
+                // A prefix is only a prefix if it starts a token.
+                let token_start =
+                    !line.chars().next_back().is_some_and(|p| p.is_alphanumeric() || p == '_');
+                if opens && (plen == 0 || token_start) {
+                    for _ in 0..=(plen + hashes) {
                         line.push(' ');
                     }
                     j += 1;
                     while j < chars.len() {
-                        if chars[j] == '"' && (1..=hashes).all(|k| chars.get(j + k) == Some(&'#')) {
-                            for _ in 0..=hashes {
-                                line.push(' ');
+                        if raw {
+                            if chars[j] == '"'
+                                && (1..=hashes).all(|k| chars.get(j + k) == Some(&'#'))
+                            {
+                                for _ in 0..=hashes {
+                                    line.push(' ');
+                                }
+                                j += hashes + 1;
+                                break;
                             }
-                            j += hashes + 1;
-                            break;
+                        } else {
+                            if chars[j] == '\\' {
+                                line.push(' ');
+                                if chars.get(j + 1) == Some(&'\n') {
+                                    out.push(std::mem::take(&mut line));
+                                } else if j + 1 < chars.len() {
+                                    line.push(' ');
+                                }
+                                j += 2;
+                                continue;
+                            }
+                            if chars[j] == '"' {
+                                line.push(' ');
+                                j += 1;
+                                break;
+                            }
                         }
                         if chars[j] == '\n' {
                             out.push(std::mem::take(&mut line));
@@ -14746,34 +14801,6 @@ mod editor_clobber_audit {
                     i = j;
                     continue;
                 }
-            }
-            if c == '"' {
-                line.push(' ');
-                i += 1;
-                while i < chars.len() {
-                    if chars[i] == '\\' {
-                        line.push(' ');
-                        if chars.get(i + 1) == Some(&'\n') {
-                            out.push(std::mem::take(&mut line));
-                        } else if i + 1 < chars.len() {
-                            line.push(' ');
-                        }
-                        i += 2;
-                        continue;
-                    }
-                    if chars[i] == '"' {
-                        line.push(' ');
-                        i += 1;
-                        break;
-                    }
-                    if chars[i] == '\n' {
-                        out.push(std::mem::take(&mut line));
-                    } else {
-                        line.push(' ');
-                    }
-                    i += 1;
-                }
-                continue;
             }
             if c == '\'' {
                 // A char literal closes; a lifetime does not.
@@ -15061,7 +15088,35 @@ mod editor_clobber_audit {
         assert!(!code_lines(&hashed)[0].contains(&call));
         assert!(code_lines(&hashed)[0].contains("done()"));
 
-        // 3. Char literals must not be mistaken for string openers — `'/'`
+        // 3. RE-VERIFY FAIL-3: a BYTE raw string with an ODD number of
+        //    quotes in its payload. The old scanner rejected the `b` as a
+        //    raw prefix, fell into the ordinary-`"` branch, terminated on
+        //    the payload's first quote and then desynced into
+        //    "inside a string" — blanking every subsequent character,
+        //    across lines, for the rest of the FILE. That HID real calls
+        //    from every audit and silently lowered legitimate counts.
+        //    Live `br#"…"#` literals already exist in
+        //    `dbc-driver-postgres/src/types.rs`.
+        let odd = format!("    let _p: &[u8] = br#\"a\"b\"#; self.{call};");
+        let got = code_lines(&odd);
+        assert!(got[0].contains(&call), "a byte raw string must not swallow the line");
+        assert!(!got[0].contains("a\"b"), "its payload is not code either");
+        // The desync was the dangerous half: prove nothing leaks past the
+        // literal's own line.
+        let after = format!("let _p = br#\"a\"b\"#;
+self.{call};
+more();");
+        let got = code_lines(&after);
+        assert!(got[1].contains(&call), "the NEXT line must survive a byte raw string");
+        assert!(got[2].contains("more()"));
+        // The other prefixes, since the fix generalised over all of them.
+        for pre in ["b", "c", "br", "cr", "r", ""] {
+            let hashed = format!("    let _s = {pre}#\"x\"#; done();");
+            let hashed = if pre.contains('r') { hashed } else { format!("    let _s = {pre}\"x\"; done();") };
+            assert!(code_lines(&hashed)[0].contains("done()"), "prefix {pre:?} desynced");
+        }
+
+        // 4. Char literals must not be mistaken for string openers — `'/'`
         //    and `'"'` are both real code in this crate — while LIFETIMES
         //    must survive untouched.
         let ch = format!("    rel.split('/').for_each(|_| {{}}); self.{call};");
