@@ -14628,14 +14628,7 @@ mod editor_clobber_audit {
         let mut stack = vec![root.clone()];
         while let Some(path) = stack.pop() {
             if path.is_dir() {
-                let name = path.file_name().map(|n| n.to_string_lossy().to_string());
-                // Build output and VCS metadata only. Everything else —
-                // `benches/`, `examples/`, generated dirs, a member
-                // outside `crates/` — is in scope by construction, which
-                // is the point of walking the root instead of a list.
-                if name.as_deref().is_some_and(|n| {
-                    n.starts_with("target") || n == ".git" || n == ".claude" || n == "node_modules"
-                }) {
+                if is_pruned(&path) {
                     continue;
                 }
                 let rd = std::fs::read_dir(&path)
@@ -14659,6 +14652,35 @@ mod editor_clobber_audit {
         }
         out.sort();
         out
+    }
+
+    /// Is this directory outside the audits' remit?
+    ///
+    /// RE-VERIFY FAIL-6. This used to be `n.starts_with("target")`, a
+    /// PREFIX match — so a plain `mod targets;` in
+    /// `crates/dbc-ui/src/targets/` was invisible to every audit, and so
+    /// were `target_picker/` and `targeting/`. No trick was needed: the
+    /// re-verifier put verbatim `replace_buffer` and `write_script` calls
+    /// there, called them from the live `Unbind` arm, and got 0 warnings
+    /// and 964 passing. `targets` is a name somebody could add innocently,
+    /// which makes it the worst of the three bypasses that round.
+    ///
+    /// So nothing is pruned by NAME SHAPE any more:
+    ///
+    /// * VCS and tooling metadata by EXACT name — these are not Rust
+    ///   source trees and never contain a module of this workspace;
+    /// * a cargo build directory by CONTENT — cargo writes `CACHEDIR.TAG`
+    ///   into every target dir, so this recognises build output wherever
+    ///   it is and whatever it is called, and recognises nothing else.
+    ///
+    /// A directory a developer names is therefore always scanned.
+    pub(super) fn is_pruned(dir: &std::path::Path) -> bool {
+        let name = dir.file_name().map(|n| n.to_string_lossy().to_string());
+        if name.as_deref().is_some_and(|n| matches!(n, ".git" | ".claude" | "node_modules")) {
+            return true;
+        }
+        // Cargo's own marker, not a name we guessed.
+        dir.join("CACHEDIR.TAG").is_file()
     }
 
     /// The workspace root — `CARGO_MANIFEST_DIR` is `<root>/crates/dbc-ui`.
@@ -14727,7 +14749,17 @@ mod editor_clobber_audit {
     /// alibi too (`config_save_guard_audit`'s lesson: its first draft was
     /// vacuous because an explanatory comment satisfied it).
     pub(super) fn code_lines(src: &str) -> Vec<String> {
-        let chars: Vec<char> = src.chars().collect();
+        // RE-VERIFY FAIL-9: the carriage return is DROPPED, so a line
+        // here is a LOGICAL line. This scanner split on the newline and
+        // kept the CR, so on a CRLF
+        // checkout every returned line ended in an invisible carriage
+        // return — and `a_landed_delete_supersedes_in_flight_opens_even_
+        // with_nothing_bound` compares a line with `assert_eq!`. That pin
+        // was RED on a fresh `git checkout` of this branch (this machine
+        // has `core.autocrlf = true` globally) while passing in the
+        // worktree where the file had been written by an editor. Every
+        // consumer here wants logical lines; none wants the terminator.
+        let chars: Vec<char> = src.chars().filter(|c| *c != '\r').collect();
         let mut out: Vec<String> = Vec::new();
         let mut line = String::new();
         let mut block_depth = 0usize;
@@ -15062,6 +15094,22 @@ mod editor_clobber_audit {
                     continue;
                 }
                 sites += 1;
+                // RE-VERIFY FAIL-8: a mention must be a CALL. The name rule
+                // bounds where the identifier appears; it does not bound
+                // where the CAPABILITY goes. The re-verifier rewrote
+                // `save_script`'s single existing mention - inside a
+                // SANCTIONED owner, leaving the count at 5 - as
+                // `let w = crate::scripts::write_script;`, stashed `w` in a
+                // thread-local and called it from `Unbind`. 0 warnings, 964
+                // green. Binding a function ITEM is the escape, and it is
+                // visible right here: a call is followed by `(`, a binding
+                // by `;` or `,` or `)`.
+                assert!(
+                    is_call_mention(&line, needle),
+                    "`{needle}` is MENTIONED but not CALLED at {name}:{} (in `{}`) - binding it                      as a value (`let f = ...;`, a rename, an argument) hands the capability to                      code this audit cannot see, which is exactly how it was defeated. Call it,                      or import it plainly",
+                    i + 1,
+                    who[i].as_deref().unwrap_or("<file scope>")
+                );
                 let owner = who[i].as_deref();
                 assert!(
                     owner.is_some_and(|o| sanctioned.contains(&o)),
@@ -15112,6 +15160,41 @@ mod editor_clobber_audit {
             from = end;
         }
         true
+    }
+
+    /// Is every whole-word occurrence of `needle` on this line
+    /// immediately (modulo spaces) followed by `(`?
+    ///
+    /// RE-VERIFY FAIL-8. A call SPENDS the capability here, where the audit
+    /// can see the owner; a binding MOVES it somewhere the audit cannot.
+    /// `let w = crate::scripts::write_script;` is the whole bypass, and it
+    /// differs from the legitimate line by exactly this character.
+    ///
+    /// An identifier that ENDS the line counts as not-a-call. That is
+    /// deliberate and slightly conservative: a call whose `(` sits on the
+    /// next line is not something rustfmt produces, while a binding
+    /// continued on the next line is easy to write. A false positive here
+    /// is a named line in a failing assertion, which is cheap; a false
+    /// negative is a leaked writer.
+    pub(super) fn is_call_mention(line: &str, needle: &str) -> bool {
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        let mut from = 0usize;
+        let mut saw = false;
+        while let Some(rel) = line[from..].find(needle) {
+            let at = from + rel;
+            let end = at + needle.len();
+            let before_ok = at == 0 || !line[..at].chars().next_back().is_some_and(is_ident);
+            let rest = &line[end..];
+            let after_ident = rest.chars().next().is_some_and(is_ident);
+            if before_ok && !after_ident {
+                saw = true;
+                if !rest.trim_start().starts_with('(') {
+                    return false;
+                }
+            }
+            from = end;
+        }
+        saw
     }
 
     /// Does `line` mention `needle` as a WHOLE Rust identifier?
@@ -15308,22 +15391,153 @@ more();");
     /// it may live.
     #[test]
     fn no_module_may_be_pulled_in_from_outside_the_audited_tree() {
-        let mut hatches: Vec<String> = Vec::new();
         let files = sources();
         assert!(files.len() >= 60, "vacuous: only {} files scanned", files.len());
+        let mut hatches: Vec<String> = Vec::new();
         for (name, src) in &files {
-            for (i, line) in code_lines(src).iter().enumerate() {
-                let attr_path = line.contains("#[") && line.contains("path =");
-                let splice = mentions_word(line, "include") && line.contains("include!(");
-                if attr_path || splice {
-                    hatches.push(format!("{name}:{}", i + 1));
+            // RE-VERIFY FAIL-7. The first version of this test asked
+            // whether ONE LINE contained both "#[" and "path =", and
+            // whether it contained "include!(" verbatim. Three ordinary
+            // spellings walked straight past that, each verified against a
+            // real out-of-tree module holding verbatim `replace_buffer`
+            // and `write_script`, each 0 warnings / 964 green:
+            //
+            //   1. `#[path="x.rs"]`      - one missing space around `=`
+            //   2. the attribute split over two lines, so neither line
+            //      holds both substrings
+            //   3. `include!{"x.rs"}`    - a brace delimiter (and
+            //      `include! ("x.rs")`, with a space)
+            //
+            // A ban that a formatter can defeat is a spelling test, not a
+            // ban. So the whole file's CODE is flattened with ALL
+            // whitespace removed - which makes spacing and line breaks
+            // irrelevant by construction - and the needles are matched
+            // against that. `where_from` maps a hit back to its real line,
+            // so the report still points at something.
+            let (flat, where_from) = flatten_code(src);
+            for needle in [
+                // The module-path attribute, inner and outer.
+                "#[path=",
+                "#![path=",
+                // `cfg_attr` can carry `path` too, and this workspace does
+                // not use `cfg_attr` for anything - so it is banned whole
+                // rather than parsed. If it is ever needed, that is a
+                // conversation, which is the point of a pinned ban.
+                "#[cfg_attr(",
+                "#![cfg_attr(",
+                // Token splicing, all three macro delimiters. `include_str!`
+                // and `include_bytes!` are deliberately absent: they carry
+                // DATA, cannot introduce a call site, and this crate uses
+                // `include_str!` for its own source pins.
+                "include!(",
+                "include!{",
+                "include![",
+            ] {
+                let mut from = 0usize;
+                while let Some(rel) = flat[from..].find(needle) {
+                    let at = from + rel;
+                    hatches.push(format!("{name}:{} ({needle})", where_from[at] + 1));
+                    from = at + needle.len();
                 }
             }
         }
         assert!(
             hatches.is_empty(),
-            "`#[path]` / `include!` move CODE from an arbitrary file into the workspace, and              the audits can only see files inside it — a module pulled in from outside the              root is invisible to every one of them. Found: {hatches:?}"
+            "`#[path]` / `cfg_attr(path)` / `include!` move CODE from an arbitrary file into              the workspace, and the audits can only see files inside it - a module pulled in              from outside the root is invisible to every one of them. Found: {hatches:?}"
         );
+    }
+
+    /// A file's CODE with every whitespace character removed, plus, for
+    /// each retained character, the index of the line it came from.
+    ///
+    /// RE-VERIFY FAIL-7's lesson in one function: any check that reads a
+    /// line at a time, or that assumes a particular spacing, is a check
+    /// about FORMATTING. Flattening first makes `#[path = "x"]`,
+    /// `#[path="x"]` and an attribute split across three lines the same
+    /// string, so there is nothing left for a formatter to vary.
+    pub(super) fn flatten_code(src: &str) -> (String, Vec<usize>) {
+        let mut flat = String::new();
+        let mut where_from: Vec<usize> = Vec::new();
+        for (i, line) in code_lines(src).iter().enumerate() {
+            for ch in line.chars().filter(|c| !c.is_whitespace()) {
+                flat.push(ch);
+                where_from.push(i);
+            }
+        }
+        (flat, where_from)
+    }
+
+
+    /// RE-VERIFY FAIL-6 / FAIL-7 / FAIL-8 / FAIL-9, the four predicates
+    /// the last round walked past, each pinned at the shape that beat it.
+    #[test]
+    fn the_scanner_predicates_survive_the_spellings_that_beat_them() {
+        // FAIL-6: pruning by NAME SHAPE. `starts_with("target")` hid a
+        // plain `mod targets;` from every audit — a name someone could
+        // add innocently, which is what made it the worst of the three.
+        let td = tempfile::tempdir().unwrap();
+        for plausible in ["targets", "target_picker", "targeting", "targetsomething"] {
+            let d = td.path().join(plausible);
+            std::fs::create_dir(&d).unwrap();
+            assert!(!is_pruned(&d), "{plausible} must be scanned");
+        }
+        // Build output is recognised by cargo's OWN marker, not by a name
+        // we guessed — so it is pruned whatever it is called…
+        let odd = td.path().join("not-called-target");
+        std::fs::create_dir(&odd).unwrap();
+        std::fs::write(odd.join("CACHEDIR.TAG"), b"Signature: 8a477f597d28d172").unwrap();
+        assert!(is_pruned(&odd));
+        // …and metadata by exact name.
+        for meta in [".git", ".claude", "node_modules"] {
+            let d = td.path().join(meta);
+            std::fs::create_dir(&d).unwrap();
+            assert!(is_pruned(&d));
+        }
+
+        // FAIL-7: the escape-hatch ban was a spelling test. Flattening the
+        // code removes every formatting degree of freedom the three
+        // bypasses used.
+        let attr = "#[path=\"x.rs\"]".to_string();
+        let (flat, _) = flatten_code(&(attr + " mod evil;"));
+        assert!(flat.contains("#[path="), "no-space spelling");
+        let split = "#[".to_string() + &chr_nl() + "    path = \"x.rs\"" + &chr_nl() + "]";
+        let (flat, _) = flatten_code(&split);
+        assert!(flat.contains("#[path="), "attribute split across lines");
+        let braced = "include!{\"x.rs\"}".to_string();
+        let (flat, _) = flatten_code(&braced);
+        assert!(flat.contains("include!{"), "brace delimiter");
+        let spaced = "include! (\"x.rs\")".to_string();
+        let (flat, _) = flatten_code(&spaced);
+        assert!(flat.contains("include!("), "space before the delimiter");
+        // …and the DATA macros stay legal, which this crate depends on.
+        let (flat, _) = flatten_code("include_str!(\"main.rs\")");
+        assert!(!flat.contains("include!("), "include_str! is not token splicing");
+
+        // FAIL-8: a mention must SPEND the capability, not move it.
+        let w = format!("{}_{}", "write", "script");
+        assert!(is_call_mention(&format!("let _ = crate::scripts::{w}(&p, &t);"), &w));
+        assert!(is_call_mention(&format!("    {w} (&p, &t)"), &w), "a space before `(` is a call");
+        assert!(!is_call_mention(&format!("let f = crate::scripts::{w};"), &w), "fn-item binding");
+        assert!(!is_call_mention(&format!("takes_fn(crate::scripts::{w}, x)"), &w), "as an argument");
+        assert!(!is_call_mention(&format!("let f = crate::scripts::{w}"), &w), "end of line");
+        // A near-miss name is not a mention at all, so it is vacuously
+        // fine — the exact-name rule still does that job.
+        assert!(!is_call_mention(&format!("self.on_{w}(cx);"), &w));
+
+        // FAIL-9: logical lines. A CRLF checkout must produce byte-identical
+        // lines to an LF one, or every exact-match assertion is a coin flip
+        // depending on how the file arrived on disk.
+        let lf = "fn f() {".to_string() + &chr_nl() + "    a();" + &chr_nl() + "}";
+        let crlf = lf.replace(&chr_nl(), &(chr_cr() + &chr_nl()));
+        assert_eq!(code_lines(&lf), code_lines(&crlf), "CRLF must not change a logical line");
+        assert_eq!(code_lines(&crlf)[1], "    a();");
+    }
+
+    fn chr_nl() -> String {
+        String::from_utf8(vec![10]).unwrap()
+    }
+    fn chr_cr() -> String {
+        String::from_utf8(vec![13]).unwrap()
     }
 
     /// RE-VERIFY FAIL-1: the matcher looks for the NAME, not for a call,
