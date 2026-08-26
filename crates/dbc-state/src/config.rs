@@ -249,11 +249,22 @@ impl AppConfig {
     /// writer without the corrupt-config question having been asked and
     /// answered against the actual file.
     pub fn save(&self, path: &Path, guard: &ConfigSaveGuard) -> Result<(), StateError> {
-        // RE-VERIFY NIT-1: the guard is proof about ONE file. Comparing
-        // the spelling is enough here — every caller passes the very same
-        // `&self.config_path` to both calls — and a mismatch means the
-        // caller proved something about a file it is not writing, which is
-        // a bug worth refusing rather than papering over.
+        // RE-VERIFY NIT-1: the guard is proof about ONE file.
+        //
+        // The compare is EXACT BYTES, deliberately, and re-verify's own NIT
+        // is right that this is a second path-comparison convention beside
+        // `dbc-ui`'s `same_path_ci` / `fsutil::fold_name`. It is not a
+        // second rail for the same job, though: `same_path_ci` answers
+        // „do these two names reach the same file on disk", which is a
+        // question about the FILESYSTEM and needs the Unicode fold. This
+        // asks „is this the same `PathBuf` value the caller proved
+        // something about", which is a question about ONE CALLER'S OWN
+        // BOOKKEEPING — every live site passes the very same
+        // `&self.config_path` expression to both calls. Folding here would
+        // make the check LOOSER (two spellings of one file would pass) for
+        // a caller that has no business using two spellings, and would
+        // drag `dbc-state` into owning a case-fold policy it currently
+        // does not. Fail-safe either way: a mismatch refuses.
         if guard.0 != path {
             return Err(StateError {
                 message: format!(

@@ -2103,22 +2103,31 @@ with reasons:
   the library" is answered upstream by the Ctrl+S guard and by
   `create_script`'s collision probe; a token on `write_script` minted by
   `fn permit() -> Permit { Permit(()) }` would add a type and no guarantee.
-- `fsutil::write_atomic` is worse: cross-crate, so a private constructor is
-  impossible on the minting side, and its four `dbc-state` callers are
-  legitimate writers of one well-known file each.
-- `replace_buffer` is the case the codebase has already declined twice in
-  writing (`editor_clobber_audit`'s own doc): a real rail means moving
-  `AppView.sql` and both guard functions into a separate module, splitting
-  `impl AppView` across files and dragging the autocomplete plumbing with
-  it. That is a `main.rs` restructure, not a review fix — and doing it badly
-  at this point is a larger risk than the audit it would replace.
+- `fsutil::write_atomic`: `dbc-state` cannot run `dbc-ui`'s precondition,
+  and `write_atomic` has none of its own — its four `dbc-state` callers are
+  legitimate writers of one well-known file each, sharing nothing a mint
+  could check.
 
-So the honest statement, which the doc comment on `script_write_audit` now
-makes: these four are held up by **source-text** audits that pin every
-mention of the identifier and its count, over the files the walk can see —
-which is why the `#[path]` / `include!` ban is load-bearing rather than
-decorative. If a future round wants braces here, the module restructure is
-the price.
+  **Correction (third re-verify).** The sentence here previously read
+  „cross-crate, so a private constructor is impossible on the minting
+  side". That is literally false, and falsified by this very phase:
+  `dbc_state::ConfigSaveGuard` is a cross-crate witness with a private
+  constructor, in that same crate. The argument above is the one that was
+  meant, and it is the one that holds.
+- `replace_buffer` — **this decline was WRONG and has been reversed;
+  see §S.** The claim that „the codebase has already declined this twice
+  in writing" was also false: there is exactly ONE prior decline
+  (`editor_clobber_audit`'s doc, from Task 8, unchanged across the whole
+  history of `main.rs`). The „second" was this sentence, added in the same
+  pass that cited it. A doc citing itself as corroboration is how a weak
+  decision becomes load-bearing, and it is recorded here rather than
+  quietly deleted because that is the failure mode worth remembering.
+
+So the honest statement, which the doc comment on `script_write_audit`
+also makes: the three remaining declines are held up by **source-text**
+audits that pin every mention of the identifier and its count, over the
+files the walk can see. §T sets out what those audits can and cannot
+promise, and it is less than this section originally implied.
 
 ## Q. Smaller corrections in this pass
 

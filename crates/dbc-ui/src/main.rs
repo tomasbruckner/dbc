@@ -14579,9 +14579,25 @@ mod script_binding_tests {
         let bump: Vec<&String> =
             code.iter().filter(|l| l.contains("supersede_script_continuations")).collect();
         assert_eq!(bump.len(), 1, "expected exactly one bump, found {}", bump.len());
+        // UNCONDITIONAL, expressed as BRACE DEPTH rather than as
+        // indentation. Re-verify's NIT is right that the old `assert_eq!`
+        // on the literal line was positional: it broke on a CRLF checkout
+        // (FAIL-9) and would break again on a `tab_spaces` change. Depth
+        // is the property actually meant — depth 1 is the function body,
+        // and anything deeper is inside an `if`/`match`/closure, which is
+        // exactly how MINOR-A's data loss survived the first fix.
+        let mut depth = 0i32;
+        let mut depth_at_bump = None;
+        for line in &code {
+            if line.contains("supersede_script_continuations") {
+                depth_at_bump = Some(depth);
+            }
+            depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        }
         assert_eq!(
-            bump[0], "        self.supersede_script_continuations();",
-            "the bump must sit at the function body's own indentation — anything deeper is              inside a conditional, which is how re-verify MINOR-A's data loss survived the              first fix"
+            depth_at_bump,
+            Some(1),
+            "the bump must sit at the function body's own brace depth — anything deeper is              inside a conditional, which is how re-verify MINOR-A's data loss survived the              first fix"
         );
         // …and it must come BEFORE the binding is dropped, so a bump is
         // never skipped by an early return added later.

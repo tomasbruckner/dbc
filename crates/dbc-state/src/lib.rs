@@ -1,3 +1,15 @@
+// RE-VERIFY NIT: `ConfigSaveGuard`'s private constructor is only a rail
+// while this crate cannot spell `unsafe` — `mem::zeroed` forges any
+// witness in one line with no warning. dbc-ui already forbids it; the
+// witness is DEFINED here, so the forge was reachable here even though
+// no dbc-ui code could trigger it.
+//
+// `forbid`, not `deny`: `deny` is undone by an `#[allow(unsafe_code)]` on
+// the offending item, which is one line and no warning. dbc-state
+// contains no `unsafe` today, so this costs nothing and makes adding any
+// later a deliberate, visible act.
+#![forbid(unsafe_code)]
+
 mod config;
 pub use config::{
     default_config_path, AppConfig, ConfigSaveGuard, ConfigVerdict, ConnectionConfig, Engine,

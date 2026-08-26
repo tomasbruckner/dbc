@@ -2781,17 +2781,22 @@ impl AppView {
                 cx.notify();
                 return None;
             }
-            dbc_state::ConfigVerdict::Unparsable(e) => e,
+            // The message is not shown — the user is about to be told the
+            // file was moved aside, which is the actionable half — but it
+            // is worth naming in the status when the rename then FAILS,
+            // where „nelze zálohovat poškozený config.toml" would
+            // otherwise say nothing about WHY it was thought poškozený.
+            dbc_state::ConfigVerdict::Unparsable(e) => e.message,
         };
-        let _ = defect;
         // Genuinely corrupt. Move it aside BEFORE anything overwrites it;
         // if that fails (permissions, file vanished), abort the whole save
         // rather than risk clobbering data the user may still recover by
         // hand.
         let backup = self.config_path.with_extension("toml.corrupt-bak");
         if let Err(e) = std::fs::rename(&self.config_path, &backup) {
-            self.status =
-                format!("error: nelze zálohovat poškozený config.toml ({e}) – uložení zrušeno");
+            self.status = format!(
+                "error: nelze zálohovat poškozený config.toml ({e}) – uložení zrušeno                  (důvod: {defect})"
+            );
             cx.notify();
             return None;
         }
