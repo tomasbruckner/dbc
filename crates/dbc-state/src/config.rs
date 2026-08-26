@@ -167,8 +167,32 @@ pub struct AppConfig {
 /// the FILE, not about a one-shot permission, and a caller that saves the
 /// same path twice in a row has not lied. Contrast `dbc-ui`'s
 /// `SaveAllowed`, which is consumed because it is about a MOMENT.
+///
+/// RE-VERIFY NIT-1: the guard NAMES ITS PATH, and [`AppConfig::save`]
+/// refuses a guard minted for a different one. Without that, the type
+/// proved less than this doc claimed — `verify_savable(a)` followed by
+/// `save(b, &g)` type-checked cleanly, so „you proved the file you are
+/// about to overwrite parses" was really only „you proved SOME file
+/// parses". All six live call sites were already correct; the point is
+/// that the compiler now agrees with the sentence.
 #[derive(Debug)]
-pub struct ConfigSaveGuard(());
+pub struct ConfigSaveGuard(std::path::PathBuf);
+
+/// What [`AppConfig::verify_config`] found. The two failure arms are
+/// deliberately NOT one (re-verify NIT-2): only `Unparsable` means the
+/// bytes on disk are unusable, and only `Unparsable` may be moved aside.
+#[derive(Debug)]
+pub enum ConfigVerdict {
+    /// Absent (a first save destroys nothing) or it parses.
+    Savable(ConfigSaveGuard),
+    /// Present but could not be READ right now — locked, permissions, a
+    /// share that blinked. Says nothing about the content, so the caller
+    /// must refuse rather than rescue.
+    Unreadable(StateError),
+    /// Present, readable, and NOT valid TOML. The case the corrupt-config
+    /// guard exists for.
+    Unparsable(StateError),
+}
 
 impl AppConfig {
     pub fn load(path: &Path) -> Result<AppConfig, StateError> {
@@ -186,7 +210,37 @@ impl AppConfig {
     /// `config.toml` is a handful of kilobytes and a save is a user
     /// gesture, so the read costs nothing anyone can perceive.
     pub fn verify_savable(path: &Path) -> Result<ConfigSaveGuard, StateError> {
-        AppConfig::load(path).map(|_| ConfigSaveGuard(()))
+        match AppConfig::verify_config(path) {
+            ConfigVerdict::Savable(g) => Ok(g),
+            ConfigVerdict::Unreadable(e) | ConfigVerdict::Unparsable(e) => Err(e),
+        }
+    }
+
+    /// [`verify_savable`](AppConfig::verify_savable) with the REASON kept
+    /// apart, in ONE read so the two cannot race each other.
+    ///
+    /// RE-VERIFY NIT-2. `dbc-ui`'s `guard_corrupt_config` treated any
+    /// refusal as corruption and renamed `config.toml` to
+    /// `.corrupt-bak` — so a file that was merely unreadable for a moment
+    /// (locked by an editor, an antivirus scan, a network share
+    /// hiccupping) got moved aside and replaced, even though it was
+    /// perfectly good. Nothing is destroyed, but it manufactures
+    /// `.corrupt-bak` files out of transient conditions and tells the user
+    /// their config was corrupt when it was not.
+    ///
+    /// „Absent" is [`ConfigVerdict::Savable`], matching
+    /// [`AppConfig::load`]: a first save destroys nothing.
+    pub fn verify_config(path: &Path) -> ConfigVerdict {
+        if !path.exists() {
+            return ConfigVerdict::Savable(ConfigSaveGuard(path.to_path_buf()));
+        }
+        match std::fs::read_to_string(path) {
+            Err(e) => ConfigVerdict::Unreadable(e.into()),
+            Ok(text) => match toml::from_str::<AppConfig>(&text) {
+                Ok(_) => ConfigVerdict::Savable(ConfigSaveGuard(path.to_path_buf())),
+                Err(e) => ConfigVerdict::Unparsable(e.into()),
+            },
+        }
     }
 
     /// `guard` is unused at runtime and load-bearing at compile time: it
@@ -194,7 +248,20 @@ impl AppConfig {
     /// call syntax — receiver rebinding, UFCS, a macro — reaches this
     /// writer without the corrupt-config question having been asked and
     /// answered against the actual file.
-    pub fn save(&self, path: &Path, _guard: &ConfigSaveGuard) -> Result<(), StateError> {
+    pub fn save(&self, path: &Path, guard: &ConfigSaveGuard) -> Result<(), StateError> {
+        // RE-VERIFY NIT-1: the guard is proof about ONE file. Comparing
+        // the spelling is enough here — every caller passes the very same
+        // `&self.config_path` to both calls — and a mismatch means the
+        // caller proved something about a file it is not writing, which is
+        // a bug worth refusing rather than papering over.
+        if guard.0 != path {
+            return Err(StateError {
+                message: format!(
+                    "interní chyba: potvrzení o config.toml patří jinému souboru ({})",
+                    guard.0.display()
+                ),
+            });
+        }
         if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
         let tmp = path.with_extension("toml.tmp");
         {
@@ -296,6 +363,56 @@ mod tests {
         // And the corrupt bytes are still there: refusing to mint is not a
         // side-effecting operation.
         assert!(std::fs::read_to_string(&p).unwrap().contains("this is not toml"));
+    }
+
+    /// RE-VERIFY NIT-1: the guard is proof about ONE file, and `save`
+    /// enforces that. Before this, `verify_savable(a)` + `save(b, &g)`
+    /// type-checked — so the doc's promise („you proved the file you are
+    /// about to overwrite parses") was really only „you proved some file
+    /// parses".
+    #[test]
+    fn a_guard_minted_for_one_path_cannot_authorise_a_write_to_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("config.toml");
+        let b = dir.path().join("jiny.toml");
+        let guard = AppConfig::verify_savable(&a).unwrap();
+        let err = sample().save(&b, &guard).unwrap_err();
+        assert!(err.message.contains("jinému souboru"), "{}", err.message);
+        assert!(!b.exists(), "the refused write must not have happened");
+        // …and the guard still works for the path it was minted for.
+        sample().save(&a, &guard).unwrap();
+        assert!(a.is_file());
+    }
+
+    /// RE-VERIFY NIT-2: „I could not read it" and „it is not TOML" are
+    /// different facts, and only the second licenses moving the file
+    /// aside. Collapsing them made `dbc-ui` rename a perfectly good
+    /// `config.toml` to `.corrupt-bak` whenever a read failed for a
+    /// moment — a lock, an antivirus scan, a share blinking.
+    #[test]
+    fn the_verdict_tells_unreadable_apart_from_unparsable() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        // Absent — a first save destroys nothing.
+        assert!(matches!(AppConfig::verify_config(&p), ConfigVerdict::Savable(_)));
+        // Present and valid.
+        sample().save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
+        assert!(matches!(AppConfig::verify_config(&p), ConfigVerdict::Savable(_)));
+        // Present and not TOML — the only arm that may be rescued.
+        std::fs::write(&p, b"connections = [ this is not toml").unwrap();
+        assert!(matches!(AppConfig::verify_config(&p), ConfigVerdict::Unparsable(_)));
+        // Present but unreadable. A DIRECTORY at the path is the portable
+        // way to make `read_to_string` fail while `exists()` is true.
+        let d = dir.path().join("as_dir.toml");
+        std::fs::create_dir(&d).unwrap();
+        assert!(
+            matches!(AppConfig::verify_config(&d), ConfigVerdict::Unreadable(_)),
+            "a read failure must not be reported as corruption"
+        );
+        // The convenience wrapper still collapses both into `Err`, which
+        // is all its callers need.
+        assert!(AppConfig::verify_savable(&d).is_err());
+        assert!(AppConfig::verify_savable(&p).is_err());
     }
 
     #[test]

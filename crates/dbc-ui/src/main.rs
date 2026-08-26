@@ -1,3 +1,18 @@
+// RE-VERIFY MINOR-C. Every witness in this crate — `save_guard::SaveAllowed`
+// and anything that follows it — rests on a private constructor, and
+// `unsafe { std::mem::zeroed() }` forges any of them in one line, from
+// anywhere, with no warning. A private field is only a rail while the
+// crate cannot spell `unsafe`.
+//
+// `forbid` rather than `deny`: `deny` can be turned off again by an
+// `#[allow(unsafe_code)]` on the offending item, which is one line and no
+// warning — exactly the escape this is meant to close. `forbid` cannot be
+// overridden anywhere below it. dbc-ui contains no `unsafe` today (the
+// only occurrences are the word in comments and in the audit's own
+// `fn`-spelling probes), so this costs nothing now and makes adding any
+// later a deliberate, visible act.
+#![forbid(unsafe_code)]
+
 mod admin_panel;
 mod admin_sql;
 mod autocomplete;
@@ -14371,24 +14386,40 @@ mod script_binding_tests {
         let src = include_str!("main.rs");
         let body = src.split("fn save_script_as(").nth(1).expect("save_script_as exists");
         let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
+        // RE-VERIFY MINOR-B: assert on CODE, never on the raw body. Leg 2
+        // below looked for `script_save_allowed` in the RAW text, where it
+        // occurs only in a COMMENT — the code calls the mint, not the pure
+        // rule — so the leg was satisfied by prose about itself. That is
+        // the exact failure `config_save_guard_audit`'s own doc warns
+        // about, reproduced two hundred lines from the warning.
+        let code = editor_clobber_audit::code_lines(body).join("\n");
         // The slice really is the picker continuation.
-        assert!(body.contains("prompt_for_new_path"), "the sliced body is not the real one");
-        assert!(body.contains("with_sql_extension"), "the sliced body is not the real one");
+        assert!(code.contains("prompt_for_new_path"), "the sliced body is not the real one");
+        assert!(code.contains("with_sql_extension"), "the sliced body is not the real one");
         // Leg 1: the binding must not have moved (T9 re-verify FAIL-1's
         // generation check).
         assert!(
-            body.contains("script_binding_generation != dispatched"),
+            code.contains("script_binding_generation != dispatched"),
             "the binding leg is gone — a save-as landing after the editor was bound elsewhere \
              would write the old text and re-bind on top of it"
         );
-        // Leg 2: the dialog predicate, re-asked continuation-side.
+        // Leg 2: the dialog predicate, re-asked continuation-side. The
+        // needle is the MINT, because that is what the code calls — and
+        // the OLD needle is asserted ABSENT from the code, which is both
+        // the real invariant (this path must go through the permission
+        // scope, never the bare rule) and the standing proof that the
+        // previous version of this leg was satisfied by a comment.
         assert!(
-            body.contains("script_save_allowed"),
+            !code.contains("script_save_allowed"),
+            "this path must ask the permission SCOPE, not the pure rule"
+        );
+        assert!(
+            code.contains("with_save_permission"),
             "the guard leg is gone — T9 re-verify FAIL-1's delete/save-as race is back"
         );
         // Leg 3: the captured buffer, the one this finding added.
         assert!(
-            body.contains(".text() != text"),
+            code.contains(".text() != text"),
             "the BUFFER leg is gone — keystrokes during a non-app-modal picker would be \
              written to disk as text nobody can see, with `saved_text` bound to them"
         );

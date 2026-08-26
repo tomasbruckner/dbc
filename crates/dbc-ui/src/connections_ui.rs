@@ -2758,13 +2758,34 @@ impl AppView {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<dbc_state::ConfigSaveGuard> {
-        // The file parses (or is not there yet): nothing to rescue.
-        if let Ok(guard) = dbc_state::AppConfig::verify_savable(&self.config_path) {
-            self.config_load_error = None;
-            return Some(guard);
-        }
-        // It does not. Move it aside BEFORE anything overwrites it; if
-        // that fails (permissions, file vanished), abort the whole save
+        // RE-VERIFY NIT-2: three outcomes, not two. Treating every
+        // refusal as corruption renamed a PERFECTLY GOOD `config.toml` to
+        // `.corrupt-bak` whenever the read merely failed for a moment — a
+        // file lock, an antivirus scan, a network share blinking — and
+        // then told the user it had been corrupt. Nothing was destroyed,
+        // but manufacturing `.corrupt-bak` files out of transient
+        // conditions is its own defect.
+        let defect = match dbc_state::AppConfig::verify_config(&self.config_path) {
+            dbc_state::ConfigVerdict::Savable(guard) => {
+                self.config_load_error = None;
+                return Some(guard);
+            }
+            // Unreadable says NOTHING about the content, so nothing may be
+            // moved aside on the strength of it. Refuse and let the user
+            // retry once whatever holds the file lets go.
+            dbc_state::ConfigVerdict::Unreadable(e) => {
+                self.status = format!(
+                    "error: config.toml se nepodařilo přečíst ({}) – uložení zrušeno",
+                    e.message
+                );
+                cx.notify();
+                return None;
+            }
+            dbc_state::ConfigVerdict::Unparsable(e) => e,
+        };
+        let _ = defect;
+        // Genuinely corrupt. Move it aside BEFORE anything overwrites it;
+        // if that fails (permissions, file vanished), abort the whole save
         // rather than risk clobbering data the user may still recover by
         // hand.
         let backup = self.config_path.with_extension("toml.corrupt-bak");
