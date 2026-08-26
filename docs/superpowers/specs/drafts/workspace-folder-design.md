@@ -1845,7 +1845,14 @@ Verified by mutation in both directions rather than by argument:
 |---|---|---|---|
 | `93b7d87` (pre-fix) | reviewer's exact two | zero warnings | **950 passed, 0 failed — 11/11 green** |
 | fixed | reviewer's exact two | **2 compile errors** (`&ConfigSaveGuard` missing, `SaveAllowed` missing) | not reached |
-| fixed | same, but minting both witnesses legitimately | zero warnings | **3 FAILED**, each naming the injected line |
+| fixed | same, but minting both witnesses legitimately | zero warnings | **3 FAILED** — see the correction below |
+
+Re-verify NIT-3 corrects that last cell: only TWO of the three named the
+injected line. The third failed on a COUNT assertion, because the
+injected block happened to mention `guard_corrupt_config` and thereby
+satisfied `config_save_guard_audit`'s „the guard is mentioned above the
+write" rule. A mention-based rule is exactly what keeps getting beaten,
+so reporting it as a clean catch hid the thing worth knowing.
 
 The third row is why the text audits were kept: a caller that satisfies
 the type rail honestly and still writes from the wrong place is caught by
@@ -1930,3 +1937,226 @@ opened). The two release-only `chart_data` failures
 (`prepare_ragged_y_column_trips_debug_assert`,
 `scale_to_non_finite_value_trips_debug_assert`) remain the only two, and
 remain pre-existing backlog.
+
+# Jak to nakonec je (as-built) — scoped re-verify pass, v0.22.0
+
+Written after the SCOPED RE-VERIFY of §I–§M returned FAIL. Sections I–M
+stand except where corrected below; where they and this section disagree,
+this wins.
+
+The re-verifier reproduced all three rows of §J's injection table and
+confirmed MAJOR-1, MINOR-1/2/3 and every NIT — and then found **four
+fresh bypasses that compiled with zero warnings and passed 961/961
+including all 11 audits**, one live data-loss path, and one claim in §J
+that was false about the shipped code. A fifth bypass was found by this
+pass while deliberately hunting for one.
+
+## N. The false claim, and the live bug behind it
+
+**§J said `SaveAllowed` could not cross `save_script_as`'s picker. It
+could.** The claim rested on `!Copy + !Clone`, which forbid a second USE
+of one value and say nothing about a MOVE. `SaveAllowed` was `Send +
+'static`, so `async move` captured it happily: give `save_script_as` the
+witness as a parameter, drop the re-mint, and T9 re-verify FAIL-1 is back
+whole — Ctrl+S → picker opens → the user deletes `trzby.sql` and confirms
+→ the picker completes naming `trzby.sql` → the irreversibly deleted file
+is silently on disk again. Clean build, 961 green. The only thing catching
+the honest version of that refactor was the text audit's site count — the
+belt, not the braces §J credited.
+
+**Fixed by making the permission a SCOPE rather than a value.**
+`save_guard::with_save_permission` hands `SaveAllowed<'brand>` to a
+`for<'brand> FnOnce(..) -> R` closure. `'brand` is generative and
+invariant, and `R` is one type chosen before `'brand` exists, so the
+witness cannot be returned, stored, or captured by `cx.spawn`'s `'static`
+future; the closure is synchronous, so there is no await inside to hold it
+across. Re-running the re-verifier's exact refactor now yields E0521,
+*borrowed data escapes outside of method*.
+
+The doc comment now claims only what the type delivers: **the permission
+cannot leave the synchronous scope in which the predicate ran.** Nothing
+about awaits in general, nothing about `!Clone`.
+
+**MINOR-A — MAJOR-1's resurrection survived in the mirrored ordering, and
+that was live data loss.** §I fixed „the open lands, then the delete
+lands". The mirror: with the editor UNBOUND at the landing, the re-asked
+`binding_targets` is false, so `set_script_binding` is never called and
+`script_binding_generation` is never bumped — so an `open_script`
+dispatched BEFORE the delete lands AFTER it, passes all three legs of
+`script_open_abort_reason`, and binds the file that was just irreversibly
+deleted. The next Ctrl+S recreates it. Windows opens the read with
+`FILE_SHARE_DELETE`, so it completes across the delete and raises no error
+to notice. `finish_script_delete` now calls
+`supersede_script_continuations()` **unconditionally** — the lesson
+`apply_context` had already learned and written down. A conditional bump is
+missing precisely in the case where nothing local looks wrong.
+
+## O. Text audits die to the next call syntax — seven times now
+
+§J said the audits were „the belt" and named two type rails as the braces.
+That was right about `save_script` and the config write and wrong about
+everything else, and the re-verifier proved it in one line:
+
+```rust
+use crate::scripts::write_script as persist_bytes;
+let _ = persist_bytes(&doomed, "-- truncated by the run");
+let clobber = crate::sql_input::SqlInput::replace_buffer;
+self.sql.update(cx, |s, cx| clobber(s, "", cx));
+```
+
+The needle was `ident + "("`, which still assumes a call syntax; an alias
+binding puts a space or a `;` after the identifier and the call site never
+names it. Zero warnings, 961 green, a truncating write into the library and
+an unguarded editor clobber.
+
+**The audits no longer look for a CALL. They look for the NAME.** An alias
+has to be *introduced* somewhere, and introducing it writes the identifier
+down — `use … as`, a fn-pointer binding, a re-export, a qualified path, a
+`macro_rules!` body, all of them. So a whole-word mention of the identifier
+anywhere in code is a site and must sit inside a sanctioned function. There
+is no call syntax left to vary. A plain `use` (and a re-export) is
+bookkeeping rather than a site, because it carries the name forward so every
+call through it still spells it; a RENAME inside a `use`, group included, is
+a site. Whole-word boundaries are what keep `on_save_script` from matching
+`save_script` — the job the deleted leading dot used to do.
+
+### The scanner's own two holes
+
+**`code_lines` mis-parsed byte raw strings and HID real code.** The raw
+branch required the character before the `r` not be identifier-ish, so the
+`b` of `br#"…"#` failed the test and the literal fell into the ordinary-`"`
+branch, which took the first quote in the payload as its terminator. With an
+odd number of quotes the scanner desynced into „inside a string" and blanked
+every subsequent character **across lines, to end of file** — hiding a
+`write_script(` call from every audit, and mid-file silently blanking
+*legitimate* calls so counts dropped (`replace_buffer` 2→1, `bind_script`
+1→0). Live `br#"…"#` literals already existed at
+`dbc-driver-postgres/src/types.rs:201,208,227`; they survived only because
+their quote counts happen to be even. The prefix is now parsed properly —
+`b`, `c`, `r`, `br`, `cr` — with the not-identifier-ish test applied to the
+START of the prefix, which is the only place it was ever meaningful. §J's
+claim that `br"…"` was handled was false and is corrected.
+
+**`sources()` enumerated `crates/<crate>/{src,tests,build.rs}`**, so
+`#[path = "../gen/evil.rs"] mod evil;` was invisible — as were
+`crates/dbc-buffer/benches/` (which exists), `examples/`, generated trees,
+and any member outside `crates/`. It now walks the workspace ROOT, skipping
+only build output and VCS metadata, and the coverage test derives its member
+list from the root `Cargo.toml` instead of hard-coding ten crate names — a
+list that could not notice a new member, which was half of why the bypass
+worked.
+
+### The fifth bypass, found rather than reported
+
+Widening the walk does not answer the same trick aimed OUTSIDE the root:
+
+```rust
+#[path = "../../../../outside-tree/evil.rs"]
+mod evil;
+```
+
+Verified before fixing: it compiles, and 963 tests pass with a truncating
+`write_script` and an unguarded `replace_buffer` in a file no walk can
+reach. No amount of widening fixes it, because the file is not in the tree.
+
+So the rail is aimed at the **escape hatch**. Two constructs move CODE from
+an arbitrary path into this workspace and neither is used anywhere in it:
+`#[path = …]` on a `mod` (any spelling, `cfg_attr` included) and
+`include!(…)`, which splices tokens. Both are banned workspace-wide.
+`include_str!` / `include_bytes!` are deliberately not banned — they carry
+data, cannot introduce a call site, and this crate uses `include_str!` for
+its own source pins. Banning the class beats chasing the instance.
+
+A `macro_rules!` wrapper was also tried and is caught by the existing rails:
+the macro body still names the identifier.
+
+## P. What is compiler-enforced, and what is not
+
+Stated plainly, because §J blurred it and that is how the round passed.
+
+**Compiler-enforced (two):**
+- The Ctrl+S permission — `save_guard::with_save_permission`, a
+  generative-brand scope in front of `AppView::save_script`.
+- The config write — `dbc_state::ConfigSaveGuard`, mintable only by a real
+  parse of the very file about to be overwritten, and (re-verify NIT-1) now
+  carrying that path so `verify_savable(a)` + `save(b, &g)` no longer
+  type-checks.
+
+Both are backed by `#![forbid(unsafe_code)]` on `dbc-ui` (re-verify
+MINOR-C): every witness rests on a private constructor, and
+`unsafe { std::mem::zeroed() }` forges any of them in one line with no
+warning. `forbid`, not `deny`, because `deny` is undone by an `#[allow]` on
+the offending item. The crate contains no `unsafe` today, so it costs
+nothing.
+
+**Audit-only (four): `write_script`, `write_atomic`, `replace_buffer`,
+`bind_script`.** The re-verifier asked for witnesses on these. Declined,
+with reasons:
+
+- A witness is only as strong as the check its MINT performs. Rust privacy
+  is module-scoped and `main.rs` is the crate root, so a token in a child
+  module is unspellable elsewhere — but its mint function is callable from
+  anywhere, and an unconditional mint is theatre: the attacker calls the
+  mint and proceeds. That is precisely why `with_save_permission` works — it
+  is a scope that RUNS the predicate — and aliasing it buys nothing.
+- For these four there is no precondition to run. „May this code write into
+  the library" is answered upstream by the Ctrl+S guard and by
+  `create_script`'s collision probe; a token on `write_script` minted by
+  `fn permit() -> Permit { Permit(()) }` would add a type and no guarantee.
+- `fsutil::write_atomic` is worse: cross-crate, so a private constructor is
+  impossible on the minting side, and its four `dbc-state` callers are
+  legitimate writers of one well-known file each.
+- `replace_buffer` is the case the codebase has already declined twice in
+  writing (`editor_clobber_audit`'s own doc): a real rail means moving
+  `AppView.sql` and both guard functions into a separate module, splitting
+  `impl AppView` across files and dragging the autocomplete plumbing with
+  it. That is a `main.rs` restructure, not a review fix — and doing it badly
+  at this point is a larger risk than the audit it would replace.
+
+So the honest statement, which the doc comment on `script_write_audit` now
+makes: these four are held up by **source-text** audits that pin every
+mention of the identifier and its count, over the files the walk can see —
+which is why the `#[path]` / `include!` ban is load-bearing rather than
+decorative. If a future round wants braces here, the module restructure is
+the price.
+
+## Q. Smaller corrections in this pass
+
+- **MINOR-B — a source pin was vacuous.**
+  `the_save_as_continuation_re_asks_all_three_things_it_captured` asserted
+  Leg 2 against the RAW body, where `script_save_allowed` occurs only in a
+  COMMENT; the code calls the mint. That is the prose-satisfies-the-
+  assertion failure `config_save_guard_audit`'s own doc warns about,
+  reproduced two hundred lines from the warning. Every leg now asserts
+  against `code_lines` output, and the old needle is asserted ABSENT from
+  the code — both the real invariant and a standing proof the old version
+  proved nothing.
+- **NIT-2 — `guard_corrupt_config` treated any refusal as corruption.**
+  `AppConfig::verify_config` now returns a three-way `ConfigVerdict` in ONE
+  read. Only `Unparsable` may be moved aside; `Unreadable` (a file lock, an
+  antivirus scan, a share blinking) refuses the save and says so. Before
+  this, a transient read failure renamed a perfectly good `config.toml` to
+  `.corrupt-bak` and told the user it had been corrupt.
+- **NIT-3 — §J's injection table said row 3 was „3 audits FAILED", and
+  that was imprecise in a way that matters.** Only TWO named the injected
+  line. The third failed on a COUNT assertion, because the injected block
+  happened to mention `guard_corrupt_config` and thereby satisfied
+  `config_save_guard_audit`'s „the guard is mentioned above the write"
+  rule. A mention-based rule is exactly what keeps getting beaten, and
+  reporting it as a clean catch hid that.
+
+## R. The bypass table, re-run
+
+| Bypass | Before | After |
+|---|---|---|
+| Reviewer's exact two (UFCS + receiver rebind) | zero warnings, 950 green on `93b7d87` | **2 compile errors** |
+| FAIL-1 alias / fn-pointer | zero warnings, 961 green | audit FAILS, names `main.rs:7116`; fn-pointer trips the count |
+| FAIL-2 carried witness across the picker | zero warnings, 961 green | **E0521**, borrowed data escapes |
+| FAIL-3 odd-quote `br#"…"#` hiding a write | zero warnings, 961 green | audit FAILS, names the hidden call |
+| FAIL-4 `#[path]` inside the crate dir | zero warnings, 961 green | audit FAILS, names `crates/dbc-ui/gen/evil.rs:5` and `:6` |
+| MINOR-C `unsafe { zeroed() }` forge | (not tried) | **compile error**, `forbid(unsafe_code)` |
+| FIFTH: `#[path]` OUTSIDE the root | zero warnings, 963 green | audit FAILS, names the attribute line |
+| `macro_rules!` wrapper | (not tried) | audit FAILS, the macro body names it |
+
+Every row was run in this worktree, reverted afterwards, and the tree
+confirmed clean.
