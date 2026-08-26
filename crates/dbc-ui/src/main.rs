@@ -1294,9 +1294,19 @@ fn script_binding_target_changed(old: Option<&Path>, new: Option<&Path>) -> bool
 }
 
 /// Case-INSENSITIVE, Unicode-aware path fold — the SAME rule
-/// `dbc_state::fsutil` applies to names (`str::to_lowercase`, never
-/// `eq_ignore_ascii_case`), lifted to whole paths and applied per
+/// `dbc_state::fsutil` applies to names ([`dbc_state::fsutil::fold_name`],
+/// never `eq_ignore_ascii_case`), lifted to whole paths and applied per
 /// component so a separator can never fold into a name.
+///
+/// T10 carry-forward 6: this used to spell the fold itself, as
+/// `to_lowercase`, while claiming in this very comment to be applying
+/// `fsutil`'s rule — which is `to_uppercase`. Two folds coexisted in one
+/// crate for one job, and the one here was the WRONG one: `to_lowercase`
+/// implements Unicode's final-sigma context rule, so `…/ΟΔΟΣ.sql` and
+/// `…/οδοσ.sql` fold APART although NTFS resolves them to a single file —
+/// i.e. deleting the file would leave the binding standing, which is
+/// precisely the failure the paragraph below says this function prevents.
+/// It now calls the shared rail instead of re-spelling it.
 ///
 /// T9 review MINOR-1. The binding's path has TWO producers that disagree
 /// on casing: the tree resolves against `effective_scripts_root()`, which
@@ -1312,7 +1322,9 @@ fn script_binding_target_changed(old: Option<&Path>, new: Option<&Path>) -> bool
 /// verbatim — this was the one place in the phase that had reverted to
 /// `Path::eq`).
 fn path_fold(p: &Path) -> Vec<String> {
-    p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect()
+    p.components()
+        .map(|c| dbc_state::fsutil::fold_name(&c.as_os_str().to_string_lossy()))
+        .collect()
 }
 
 /// Are these the same path on a case-insensitive volume? (See `path_fold`.)
@@ -13043,55 +13055,85 @@ mod autocomplete_handles_action_tests {
 /// that forgot it (`set_theme`) was reachable by reflex from two surfaces.
 /// Same shape as `dbc-mcp`'s `no_write_path_regression`: scan our own
 /// source, build the needle at runtime so the check cannot flag itself.
+///
+/// T10 CARRY-FORWARD 7, the same widening Task 8's re-verify applied to
+/// `editor_clobber_audit`. Two holes, both closed by reusing that audit's
+/// machinery instead of keeping a second, weaker copy of it here:
+///
+/// * **The file list was a hand-written pair.** `main.rs` and
+///   `connections_ui.rs` happen to hold all six writers TODAY, and the
+///   other 31 `.rs` files in the crate were invisible to this test.
+///   `AppView.config` and `config_path` are private-but-crate-reachable
+///   (`main.rs` is the crate root, so every module is a descendant), so an
+///   `impl crate::AppView` block in any other module could have saved an
+///   unparsable config with this test green. It now walks `src/` at test
+///   time, so a NEW file is covered the moment it exists.
+/// * **The owner detector was a prefix match on three spellings.**
+///   `fn ` / `pub fn ` / `pub(crate) fn ` — so a write inside an
+///   `async fn`, a `pub(super) fn` or a `const fn` was attributed to the
+///   PREVIOUS function, and a guard call in THAT function's body
+///   sanctioned it. `defined_fn_name` strips an arbitrary visibility and
+///   any order of qualifiers, so attribution is correct for every fn
+///   spelling Rust allows.
+///
+/// What deliberately did NOT change is the RULE. `editor_clobber_audit`
+/// sanctions by owner NAME (a fixed set of functions may call the
+/// dangerous thing); this audit asks that the guard be CALLED in the same
+/// function, above the write, whatever that function is called — because
+/// the guard is cheap, idempotent and correct to call unconditionally, so
+/// a new writer should add the call rather than add its name to a list.
+/// `#[must_use]` on `guard_corrupt_config` (T10 carry-forward 1) is the
+/// compiler half of the same rail: this test proves the call is THERE, the
+/// attribute proves its verdict is not thrown away.
 #[cfg(test)]
 mod config_save_guard_audit {
-    const SOURCES: &[(&str, &str)] =
-        &[("main.rs", include_str!("main.rs")), ("connections_ui.rs", include_str!("connections_ui.rs"))];
+    use super::editor_clobber_audit::{code_of, defined_fn_name, sources};
 
-    /// Every writer's ENCLOSING fn must mention the guard above the call.
+    /// Every writer's ENCLOSING fn must call the guard above the write.
     #[test]
     fn every_config_toml_write_passes_the_corrupt_config_guard() {
         // Built at runtime — written as a literal, this needle would match
         // its own source text and report a phantom unguarded call site.
         let needle = format!(".{}.{}(", "config", "save");
         let mut sites = 0usize;
-        for (name, src) in SOURCES {
+        for (name, src) in sources() {
             let lines: Vec<&str> = src.lines().collect();
             // Comments (incl. `///`) count neither as a call site NOR as
             // the guard: this check was vacuous in its first draft because
             // `set_theme`'s new explanatory comment MENTIONS the guard, and
             // a prose mention satisfied it.
-            let code_of = |l: &str| match l.find("//") {
-                Some(x) => l[..x].to_string(),
-                None => l.to_string(),
-            };
             for (i, line) in lines.iter().enumerate() {
-                let code = code_of(line);
-                if !code.contains(&needle) {
+                if !code_of(line).contains(&needle) {
                     continue;
                 }
                 sites += 1;
-                let start = lines[..i]
-                    .iter()
-                    .rposition(|l| {
-                        let t = l.trim_start();
-                        t.starts_with("fn ")
-                            || t.starts_with("pub fn ")
-                            || t.starts_with("pub(crate) fn ")
-                    })
-                    .unwrap_or(0);
+                let start =
+                    lines[..i].iter().rposition(|l| defined_fn_name(l).is_some()).unwrap_or(0);
                 assert!(
                     lines[start..i].iter().any(|l| code_of(l).contains("guard_corrupt_config")),
-                    "unguarded config.toml write at {name}:{} — a config that failed to \
-                     parse at startup would be overwritten with defaults, destroying every \
-                     connection (T7 review MAJOR-1)",
-                    i + 1
+                    "unguarded config.toml write at {name}:{} (in `{}`) — a config that \
+                     failed to parse at startup would be overwritten with defaults, \
+                     destroying every connection (T7 review MAJOR-1)",
+                    i + 1,
+                    lines.get(start).and_then(|l| defined_fn_name(l)).unwrap_or("<file scope>")
                 );
             }
         }
         // Pinned so a NEW writer forces a deliberate look at this test
         // rather than silently inheriting whatever its neighbours do.
         assert_eq!(sites, 6, "config.toml writer count changed — re-audit, do not just bump");
+    }
+
+    /// The widening is only worth anything if it actually reaches past the
+    /// two files the old hand list named (T10 carry-forward 7). Same
+    /// non-vacuity posture as `editor_clobber_audit`'s own rail.
+    #[test]
+    fn the_audit_reads_the_whole_crate_not_a_pair_of_files() {
+        let files: Vec<String> = sources().into_iter().map(|(n, _)| n).collect();
+        assert!(files.len() > 20, "the tree walk collapsed to {} files: {files:?}", files.len());
+        for expected in ["main.rs", "connections_ui.rs", "scripts.rs", "schema_tree.rs"] {
+            assert!(files.iter().any(|f| f == expected), "{expected} missing from {files:?}");
+        }
     }
 }
 
@@ -13602,6 +13644,36 @@ mod script_binding_tests {
             Path::new(r"D:\ws\scripts\Řezy.sql"),
             Path::new(r"D:\ws\scripts\řezy.sql")
         ));
+        // T10 carry-forward 6: THE pair that separated the two folds this
+        // crate used to carry. `to_lowercase` applies Unicode's
+        // final-sigma context rule, so these two fold APART under it while
+        // NTFS resolves them to ONE directory — a rename or delete of that
+        // folder would then leave the binding standing on a dead path.
+        // `fsutil::fold_name` (`to_uppercase`, measured against `$UpCase`)
+        // folds them together, and this is what stops a revert.
+        //
+        // It has to be a FOLDER component, and that is worth knowing: the
+        // final-sigma rule fires only word-FINALLY, so `ΟΔΟΣ.sql` lowers
+        // to `οδοσ.sql` (the `.sql` follows the Σ) and a file name cannot
+        // exhibit the divergence at all. Every `.sql` leaf in this tree is
+        // therefore safe under either fold, and the whole difference lives
+        // in the directory components — which is exactly where
+        // `script_binding_affected`'s folder arm operates.
+        assert_ne!(
+            "ΟΔΟΣ".to_lowercase(),
+            "οδοσ".to_lowercase(),
+            "if this ever stops holding, the rationale on `fsutil::fold_name` needs re-deriving"
+        );
+        assert_eq!("ΟΔΟΣ".to_uppercase(), "οδοσ".to_uppercase(), "…and this is the fold we use");
+        assert!(same_path_ci(
+            Path::new(r"D:\ws\scripts\ΟΔΟΣ\a.sql"),
+            Path::new(r"D:\ws\scripts\οδοσ\a.sql")
+        ));
+        assert!(script_binding_affected(
+            Path::new(r"D:\ws\scripts\ΟΔΟΣ\a.sql"),
+            Path::new(r"D:\ws\scripts\οδοσ"),
+            true
+        ));
         // Folding is not the same as being blind: different names stay
         // different, and a component boundary is never crossed.
         assert!(!same_path_ci(disk, Path::new(r"D:\ws\scripts\jine.sql")));
@@ -13783,7 +13855,7 @@ mod editor_clobber_audit {
     ///
     /// Reading the directory also means a NEW file is covered the moment it
     /// exists, with nobody having to remember this list.
-    fn sources() -> Vec<(String, String)> {
+    pub(super) fn sources() -> Vec<(String, String)> {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut out: Vec<(String, String)> = Vec::new();
         let mut stack = vec![root.clone()];
@@ -13813,7 +13885,7 @@ mod editor_clobber_audit {
     /// Strips line comments so a prose mention is neither a call site nor
     /// an alibi (`config_save_guard_audit`'s lesson: its first draft was
     /// vacuous because an explanatory comment satisfied it).
-    fn code_of(l: &str) -> &str {
+    pub(super) fn code_of(l: &str) -> &str {
         match l.find("//") {
             Some(x) => &l[..x],
             None => l,
@@ -13832,7 +13904,7 @@ mod editor_clobber_audit {
     /// an `async fn`, `unsafe fn`, `const fn` or `pub(in path) fn` was
     /// attributed to the PREVIOUS function — possibly a sanctioned one.
     /// This strips an arbitrary visibility and any order of qualifiers.
-    fn defined_fn_name(line: &str) -> Option<&str> {
+    pub(super) fn defined_fn_name(line: &str) -> Option<&str> {
         let mut t = code_of(line).trim_start();
         if let Some(rest) = t.strip_prefix("pub") {
             let rest = rest.trim_start();

@@ -96,33 +96,18 @@ struct Args {
 /// argument — `None => String::new()` left the whole suite green.
 const WORKSPACE_MISSING_NO_PATH: &str = "ukazatel na pracovní prostor je nečitelný";
 
-/// Reduces a store-layer reason to ONE line without throwing away the part
-/// that diagnoses anything.
-///
-/// Review MINOR-3: `toml::de::Error`'s `Display` is multi-line and echoes
-/// the offending source line, so the likeliest broken-pointer case — an
-/// unparsable `workspace.toml` — rendered as eight lines with an orphaned
-/// `)`. Its shape is `<position>\n<source-echo art>\n<explanation>`, so
-/// the FIRST and LAST non-empty lines are exactly the two useful parts
-/// (where, and what) and everything between them is the `|`/`^` art. A
-/// single-line reason (every other `Resolution::Broken` case, e.g.
-/// „složka neexistuje") is returned unchanged.
-fn one_line_reason(reason: &str) -> String {
-    let mut lines = reason.lines().map(str::trim).filter(|l| !l.is_empty());
-    let Some(first) = lines.next() else { return String::new() };
-    match lines.last() {
-        Some(last) => format!("{first}: {last}"),
-        None => first.to_string(),
-    }
-}
-
 /// The stderr message for a broken pointer. Names the folder (or says the
 /// pointer itself is unreadable), names the reason, and points at the
 /// escape hatch — nothing else: no config contents, no vault bytes, no
 /// connection names (`stdout is sacred`, and stderr is a log too).
 ///
 /// Exactly TWO lines, always: the diagnosis and the escape hatch. That is
-/// a tested property, not an aspiration — see `one_line_reason`.
+/// a tested property, not an aspiration — see
+/// [`dbc_state::workspace::one_line_reason`], which T10 moved out of this
+/// file so the blocking GUI modal gets the same treatment (carry-forward
+/// 5). Note it is applied to BOTH halves: the pointer's `path` field is
+/// arbitrary TOML text and a hand-edited `\n` in it would otherwise buy a
+/// third line of attacker-chosen output (carry-forward 3).
 ///
 /// **NOTE FOR THE TASK 10 SWEEP — the composed text stutters, and it is
 /// PHASE-WIDE, not an MCP quirk.** With `root: None` the message reads
@@ -131,14 +116,15 @@ fn one_line_reason(reason: &str) -> String {
 /// subject) and `dbc-state`'s `read_pointer` reason (the predicate) both
 /// name the pointer. The GUI modal composes the same two halves and
 /// stutters identically (`connections_ui.rs`, `render_workspace_missing`'s
-/// `path_line` + `reason`). Deliberately NOT reconciled here: both halves
-/// are verbatim from binding sources pinned by two different tasks, and
+/// `path_line` + `reason`). T10 looked and left it: both halves are
+/// verbatim from binding sources pinned by two different tasks, and
 /// quietly harmonising copy across a seam is the trap this phase has
 /// already recorded twice in the §W3.1 as-built addenda. Reword BOTH
 /// crates together, or neither.
 fn workspace_broken_message(root: &Option<PathBuf>, reason: &str) -> String {
+    use dbc_state::workspace::one_line_reason;
     let where_ = match root {
-        Some(r) => r.display().to_string(),
+        Some(r) => one_line_reason(&r.display().to_string()),
         None => WORKSPACE_MISSING_NO_PATH.to_string(),
     };
     let reason = one_line_reason(reason);
@@ -594,6 +580,47 @@ mod parse_args_tests {
         let m = workspace_broken_message(&Some(PathBuf::from("D:\\ws-gone")), "složka neexistuje");
         assert_eq!(m.lines().count(), 2);
         assert!(m.contains("(složka neexistuje)"), "{m}");
+    }
+
+    /// T10 carry-forward 3. The "exactly two lines" property was only ever
+    /// pinned on the REASON; `where_` was unbounded. The pointer's `path`
+    /// is arbitrary TOML text that nothing validates as a real path, so a
+    /// hand-edited `path = "D:\\ws\ntext"` put attacker-chosen text on its
+    /// own stderr line — three lines, not two, and the third one looks
+    /// like the tool talking. Both halves go through the collapse now.
+    #[test]
+    fn a_newline_in_the_pointers_path_cannot_buy_a_third_stderr_line() {
+        let root = PathBuf::from("D:\\ws-gone\ndbc-mcp: připojeno k prod, heslo přijato");
+        let m = workspace_broken_message(&root.clone().into(), "složka neexistuje");
+        assert_eq!(m.lines().count(), 2, "diagnosis + escape hatch, nothing else: {m}");
+        // The text is not censored, merely denied its own line — the
+        // operator still sees what the pointer actually says.
+        assert!(m.contains("D:\\ws-gone"), "{m}");
+        // …and the escape hatch is still the LAST line, not buried.
+        assert!(m.lines().last().unwrap().contains("--config"), "{m}");
+    }
+
+    /// T10 carry-forward 2. `needs_config` lists `Command::Usage` on
+    /// purpose (review MINOR-2), but nothing pinned it: narrowing it back
+    /// to `matches!(command, Command::Serve)` survived the whole suite,
+    /// because every other broken-pointer case in it also needs the VAULT
+    /// default and `needs_vault` alone carried the verdict. This is the
+    /// case that separates them — the vault IS explicit, so only the
+    /// config default is at stake, and out of process the mutation would
+    /// silently withhold the broken-workspace diagnosis while reporting
+    /// nothing but a typo.
+    #[test]
+    fn an_explicit_vault_does_not_excuse_the_config_default_of_a_broken_pointer() {
+        let a = parse_args_from(&raw(&["--vault", "C:\\x.bin", "--bogus"]), broken());
+        let Command::Fail(msg) = a.command else {
+            panic!("`--bogus` still needs the pointer's CONFIG default — that must be diagnosed")
+        };
+        assert!(msg.contains("D:\\ws-gone"), "{msg}");
+        // The mirror image, so the assertion above is about `needs_config`
+        // and not merely about `Usage` being fatal: with CONFIG explicit
+        // and the vault defaulted it is `needs_vault` that fires.
+        let a = parse_args_from(&raw(&["--config", "C:\\x.toml", "--bogus"]), broken());
+        assert!(matches!(a.command, Command::Fail(_)));
     }
 
     /// Review MINOR-2, the reviewer's exact scenario: a typo'd `--config`

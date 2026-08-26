@@ -1547,6 +1547,46 @@ pub(crate) fn script_name_confirm_kind() -> ModalConfirmKind {
 /// to close it, rescan the tree and possibly re-point or clear the editor
 /// binding must not be dismissable out from under that continuation.
 /// Neither dialog holds secret state, so `running` is the only question.
+///
+/// **THE ACCEPTED TRADE, T9 review NIT-1, written out in full because T10
+/// found the previous record of it too thin to act on.** `running` has
+/// exactly one clearing path: the continuation in
+/// `AppView::confirm_script_name` / `confirm_script_delete`, whose
+/// `this.update(cx, …)` lands `finish_script_*` or `land_script_*_error`.
+/// If the background closure PANICKED instead of returning, that update
+/// never runs and `running` stays `true` forever. The dialog is then
+/// wedged for the rest of the process: Esc is refused here, „Zrušit" and
+/// the confirm button are both rendered inert, `context_switch_blocked`
+/// refuses a workspace swap while a modal is up, and the only escape is
+/// killing the app. Unsaved editor text would go with it.
+///
+/// Accepted, for three reasons:
+///
+/// 1. **The blast radius of the alternative is worse.** A timeout or an
+///    Esc-anyway escape hatch reintroduces exactly what `running` exists
+///    to prevent — a second dispatch into `fsutil::write_atomic`'s FIXED
+///    `<path>.tmp` (its tmp name is a pure function of the target), i.e.
+///    two writers on one scratch file, which is silent data loss rather
+///    than a visible wedge.
+/// 2. **The panic surface is empty.** The closures call only
+///    `scripts::{create_script, create_folder, rename_entry, delete_entry}`,
+///    every one of which returns `Result<_, String>`; neither that
+///    production half of `scripts.rs` nor the `dbc_state::fsutil` rails
+///    they delegate to (`join_component`, `conflicting_entry_ci`,
+///    `write_atomic`) contains a single `unwrap`, `expect` or `panic!`,
+///    and every fallible step is a `?` on a `StateError`. What remains is
+///    an allocation failure, which aborts the process anyway, so there is
+///    no reachable state where this trade actually costs the user
+///    something.
+/// 3. **It is the house posture, not a local shortcut.**
+///    `workspace_confirm_esc_closable` and `BackupRestore`'s
+///    `!session.is_running()` make the identical trade over strictly
+///    bigger operations (a whole folder init; a restore). A scripts modal
+///    getting its own escape hatch would be the inconsistent choice.
+///
+/// If a future op on this path CAN panic — anything that unwraps, or any
+/// third-party call — this reasoning expires and the latch needs a real
+/// failure path, not a longer comment.
 pub(crate) fn script_modal_esc_closable(running: bool) -> bool {
     !running
 }
@@ -2625,6 +2665,22 @@ impl AppView {
     /// no-op returning `true` once there's no `config_load_error` left to
     /// guard against, so callers can call it unconditionally before every
     /// save.
+    ///
+    /// T10 carry-forward 1 (T7-review follow-up). `#[must_use]` is the
+    /// COMPILER half of the rail `config_save_guard_audit` pins textually.
+    /// The audit only asks that the enclosing fn MENTION the guard above
+    /// the write, so `self.guard_corrupt_config(cx);` — called for its
+    /// side effect, verdict thrown away — passes the audit while doing
+    /// exactly the thing the guard exists to prevent: the `false` return
+    /// (rename-aside failed) is the abort signal, and dropping it means
+    /// the save proceeds and overwrites an unparsable `config.toml` with
+    /// defaults, destroying every connection. A reviewer's mutation proved
+    /// that hole came back green with zero warnings. With this attribute
+    /// the bare call is a `deny`-level warning, i.e. a build failure under
+    /// this repo's zero-warning gate. (`let _ = …` still defeats it — but
+    /// that is now an explicit, greppable act, not a reflex.)
+    #[must_use = "the `false` verdict ABORTS the save — dropping it overwrites a corrupt \
+                  config.toml with defaults and destroys every connection"]
     pub(crate) fn guard_corrupt_config(&mut self, cx: &mut Context<Self>) -> bool {
         if self.config_load_error.is_some() {
             let backup = self.config_path.with_extension("toml.corrupt-bak");
@@ -4138,10 +4194,18 @@ fn render_workspace_missing_panel(
     focus: &[FocusHandle; 3],
     cx: &mut Context<AppView>,
 ) -> AnyElement {
+    // T10 carry-forward 5: BOTH halves through the shared collapse.
+    // `reason` is very often `toml::de::Error`'s `Display` — eight lines
+    // of `|`/`^` art that also echo the pointer's own source text — and
+    // this panel is ONE unwrapped flex column with no text wrapping, so it
+    // rendered as garbage in the one dialog the user cannot Esc out of.
+    // `path_line` goes through it for the same reason `dbc-mcp`'s
+    // `where_` does: the pointer's `path` is arbitrary TOML text.
     let path_line = root
         .as_ref()
-        .map(|r| r.display().to_string())
+        .map(|r| dbc_state::workspace::one_line_reason(&r.display().to_string()))
         .unwrap_or_else(|| WORKSPACE_MISSING_NO_PATH.to_string());
+    let reason = dbc_state::workspace::one_line_reason(reason);
     // T4 review NIT-11: a BLOCKING dialog must be operable without a
     // mouse — otherwise a keyboard-only user's only exit from an app with
     // no context is the window close button. Each choice is a real tab

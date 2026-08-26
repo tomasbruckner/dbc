@@ -114,6 +114,41 @@ pub enum Resolution {
     },
 }
 
+/// Collapse a [`Resolution::Broken`] `reason` to ONE line: its first and
+/// last non-empty lines, joined — everything between them dropped.
+///
+/// T10 carry-forward 5. This lived in `dbc-mcp` only, so the two surfaces
+/// that display a broken pointer disagreed: the server printed two tidy
+/// stderr lines while the BLOCKING GUI modal (`connections_ui`'s
+/// `render_workspace_missing_panel`, §W4 — the one dialog the user cannot
+/// Esc out of) rendered the raw reason. It now lives beside the
+/// `Resolution` that PRODUCES the reason, which is the only place that
+/// knows what shapes a reason can take, and both consumers call it.
+///
+/// Why it is needed at all: the likeliest broken-pointer case is an
+/// unparsable `workspace.toml`, and `toml::de::Error`'s `Display` is
+/// multi-line — `<position>\n<source-echo art>\n<explanation>`, eight
+/// lines ending in an orphaned `)`. The FIRST and LAST non-empty lines are
+/// exactly the two useful parts (where, and what); everything between is
+/// the `|`/`^` art, which also ECHOES THE POINTER'S SOURCE TEXT — so
+/// dropping it is a small privacy win as well as a legibility one. A
+/// single-line reason (every other `Broken` case, e.g. „složka
+/// neexistuje") is returned unchanged.
+///
+/// Also applied to the DISPLAYED PATH by both callers: the pointer's
+/// `path` field is arbitrary TOML text that is never validated as a real
+/// path, so a hand-edited pointer containing a `\n` escape would otherwise
+/// put attacker-chosen text on its own line — falsifying `dbc-mcp`'s
+/// "exactly two lines on stderr" property (T10 carry-forward 3).
+pub fn one_line_reason(reason: &str) -> String {
+    let mut lines = reason.lines().map(str::trim).filter(|l| !l.is_empty());
+    let Some(first) = lines.next() else { return String::new() };
+    match lines.last() {
+        Some(last) => format!("{first}: {last}"),
+        None => first.to_string(),
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Marker {
     format: u32,
@@ -422,6 +457,36 @@ pub fn init_workspace(root: &Path, from: &Paths) -> Result<(), StateError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T10 carry-forward 5 — the tests that moved here with the function.
+    /// Both display surfaces (`dbc-mcp`'s stderr, the §W4 blocking modal)
+    /// now depend on this shape, so it is pinned in the crate that owns it
+    /// rather than in one of the two consumers.
+    #[test]
+    fn one_line_reason_keeps_where_and_what_and_drops_the_toml_art() {
+        // Verbatim shape of a real `toml` parse error.
+        let reason = "TOML parse error at line 1, column 12\n  \
+                      |\n1 | path = \"D:\\ws-gone\"\n  |            ^\n\
+                      missing escaped value, expected `b`";
+        let out = one_line_reason(reason);
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.contains("TOML parse error at line 1, column 12"), "keeps WHERE: {out}");
+        assert!(out.contains("missing escaped value, expected `b`"), "keeps WHAT: {out}");
+        // The dropped art ECHOES THE POINTER SOURCE — worth its own line.
+        assert!(!out.contains("path = "), "drops toml's source echo: {out}");
+        assert!(!out.contains('^'), "drops the ascii art: {out}");
+    }
+
+    #[test]
+    fn one_line_reason_passes_a_single_line_through_and_survives_the_empty_case() {
+        assert_eq!(one_line_reason("složka neexistuje"), "složka neexistuje");
+        // Trimmed, but not reworded.
+        assert_eq!(one_line_reason("  složka neexistuje  "), "složka neexistuje");
+        assert_eq!(one_line_reason(""), "");
+        assert_eq!(one_line_reason("\n\n   \n"), "");
+        // Exactly two useful lines: nothing is between them to drop.
+        assert_eq!(one_line_reason("a\nb"), "a: b");
+    }
 
     /// A fake "profile" directory with all four copyable files present.
     fn fake_profile(dir: &Path) -> Paths {

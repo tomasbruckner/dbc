@@ -141,34 +141,35 @@ pub enum TreeEvent {
     /// editor and bind it (Part S §5.1, Task 8). Opening NEVER runs
     /// anything.
     ///
-    /// PAYLOAD DARK UNTIL TASK 8 — removal owner: Task 8 (the editor
-    /// binding), whose `on_tree_event` arm reads `rel` to resolve and load
-    /// the file. Until then the handler is the honest grouped „not yet"
-    /// placeholder, which matches with `..`.
-    #[allow(dead_code)]
+    /// T10 sweep: the `#[allow(dead_code)]` this payload carried named
+    /// Task 8 as its removal owner. Task 8 landed (`on_tree_event`'s arm
+    /// resolves `rel` through `effective_scripts_root()` and calls
+    /// `open_script`), so the attribute is gone — the phase's own rule is
+    /// that an allow naming a task in this phase means that task did not
+    /// finish.
     ScriptOpen { rel: String },
     /// The `▶` icon on a `ScriptFile` row — the unchanged G12 confirm
     /// flow over the file on DISK (Part S §6, Task 9).
     ///
-    /// PAYLOAD DARK UNTIL TASK 9 — removal owner: Task 9 (run + mutations).
-    #[allow(dead_code)]
+    /// T10 sweep: allow removed, owner Task 9 landed
+    /// (`run_script_from_library`).
     ScriptRunFile { rel: String },
     /// The `+` icon on the root or a folder row — the create dialog
     /// (Task 9). `parent_rel` is `""` for the root itself.
     ///
-    /// PAYLOAD DARK UNTIL TASK 9 — removal owner: Task 9.
-    #[allow(dead_code)]
+    /// T10 sweep: allow removed, owner Task 9 landed
+    /// (`start_script_create`).
     ScriptCreate { parent_rel: String },
     /// The `✎` icon — the rename dialog (Task 9).
     ///
-    /// PAYLOAD DARK UNTIL TASK 9 — removal owner: Task 9.
-    #[allow(dead_code)]
+    /// T10 sweep: allow removed, owner Task 9 landed
+    /// (`start_script_rename`).
     ScriptRename { rel: String, is_dir: bool },
     /// The `✕` icon — the delete confirm (Task 9). Folders only when
     /// empty (Part S §7.9: no recursive delete in v1).
     ///
-    /// PAYLOAD DARK UNTIL TASK 9 — removal owner: Task 9.
-    #[allow(dead_code)]
+    /// T10 sweep: allow removed, owner Task 9 landed
+    /// (`start_script_delete`).
     ScriptDelete { rel: String, is_dir: bool },
 }
 

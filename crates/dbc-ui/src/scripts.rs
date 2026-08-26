@@ -106,12 +106,13 @@ fn list_dir_sorted(dir: &Path, rel_prefix: &str, depth: usize) -> Result<Vec<Scr
         }
     }
     // Display-only ordering, but it uses the SAME fold as the collision
-    // probe (`fsutil::conflicting_entry_ci`, `to_uppercase`). Two names
-    // the probe calls identical must not sort apart here, and one file
-    // with two disagreeing folds is how the next reader learns the wrong
-    // rule.
-    folders.sort_by_key(|n| n.to_uppercase());
-    files.sort_by_key(|n| n.to_uppercase());
+    // probe (`fsutil::conflicting_entry_ci`). Two names the probe calls
+    // identical must not sort apart here, and one file with two
+    // disagreeing folds is how the next reader learns the wrong rule.
+    // T10 carry-forward 6: calls the shared rail rather than re-spelling
+    // `to_uppercase`, so there is exactly one fold in the workspace.
+    folders.sort_by_key(|n| dbc_state::fsutil::fold_name(n));
+    files.sort_by_key(|n| dbc_state::fsutil::fold_name(n));
     let make = |name: String, is_dir: bool| {
         let rel = if rel_prefix.is_empty() { name } else { format!("{rel_prefix}/{name}") };
         ScriptEntry { rel, is_dir, depth }

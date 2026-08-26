@@ -47,11 +47,39 @@ pub fn join_component(base: &Path, component: &str) -> Result<PathBuf, StateErro
     Ok(base.join(component))
 }
 
+/// THE case fold for on-disk names — ONE implementation, workspace-wide.
+///
+/// T10 carry-forward 6. Three places in two crates were folding names for
+/// the same purpose ("would NTFS call these one file?") and they did not
+/// agree: this probe and `scripts::list_dir_sorted`'s ordering key used
+/// `to_uppercase`, while Task 9's `dbc_ui::path_fold` (the editor
+/// binding's affected-by-a-mutation test) used `to_lowercase` — and its
+/// own doc comment claimed to be applying "the SAME rule
+/// `dbc_state::fsutil` applies to names", naming `to_lowercase`, which was
+/// simply false. The disagreement is not cosmetic: `to_lowercase`'s
+/// final-sigma FALSE NEGATIVE (below) meant a delete of `…/ΟΔΟΣ.sql` did
+/// not clear a binding on `…/οδοσ.sql`, although NTFS resolves both to one
+/// file — the caption would go on naming a file that is gone and the next
+/// Ctrl+S would silently recreate it, which is the exact bug `path_fold`
+/// was introduced to prevent. Unified onto the measured fold, and made a
+/// named function so a fourth site cannot quietly pick the other one.
+///
+/// Callers: [`conflicting_entry_ci`] (this file), `dbc_ui::path_fold`,
+/// `dbc_ui::scripts::list_dir_sorted`.
+///
+/// Case folding is UNICODE-aware and uses `str::to_uppercase`, NOT
+/// `eq_ignore_ascii_case` and NOT `str::to_lowercase`, for the reasons
+/// measured against NTFS on [`conflicting_entry_ci`].
+pub fn fold_name(name: &str) -> String {
+    name.to_uppercase()
+}
+
 /// Case-INSENSITIVE collision probe inside ONE directory — the single
 /// `read_dir` loop this workspace is allowed to have for the purpose.
 /// Returns the EXACT on-disk name that would collide with `name`.
 ///
-/// Case folding is UNICODE-aware and uses `str::to_uppercase`, NOT
+/// Case folding is UNICODE-aware and uses [`fold_name`], i.e.
+/// `str::to_uppercase`, NOT
 /// `eq_ignore_ascii_case` (which misses `Č`/`č` and every other
 /// non-ASCII pair) and NOT `str::to_lowercase`. The uppercase fold is a
 /// deliberate T1-review decision, measured against NTFS rather than
@@ -98,7 +126,7 @@ pub fn conflicting_entry_ci(
 ) -> Result<Option<String>, StateError> {
     let rd = fs::read_dir(parent)
         .map_err(|e| err(format!("nelze číst složku {}: {e}", parent.display())))?;
-    let want = name.to_uppercase();
+    let want = fold_name(name);
     for ent in rd {
         let ent =
             ent.map_err(|e| err(format!("nelze číst složku {}: {e}", parent.display())))?;
@@ -106,7 +134,7 @@ pub fn conflicting_entry_ci(
         if ignore_exact.is_some_and(|ex| ex == existing.as_str()) {
             continue;
         }
-        if existing.to_uppercase() == want {
+        if fold_name(&existing) == want {
             return Ok(Some(existing));
         }
     }
