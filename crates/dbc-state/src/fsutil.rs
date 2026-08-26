@@ -233,6 +233,29 @@ mod tests {
         assert_eq!(join_component(base, "config.toml").unwrap(), base.join("config.toml"));
     }
 
+    /// FINAL-REVIEW MINOR-3, the asymmetry `dbc-ui`'s
+    /// `BLOCKED_WORKSPACE_SENTINEL` comment now states as a fact instead
+    /// of over-claiming past it. `write_atomic` does NOT conjure its
+    /// parent directory — a write into a folder that was never created
+    /// FAILS, which is what makes a path aimed at a non-existent sentinel
+    /// meaningful — while the pre-existing profile-store savers all
+    /// `create_dir_all` first, which is what makes a first run work and is
+    /// therefore why the sentinel is not, and cannot cheaply be made,
+    /// unwritable.
+    #[test]
+    fn write_atomic_refuses_a_missing_parent_while_the_store_savers_create_one() {
+        let td = tempfile::tempdir().unwrap();
+        let missing = td.path().join("nikdy-nevytvoreno");
+        assert!(write_atomic(&missing.join("a.sql"), b"x").is_err());
+        assert!(!missing.exists(), "a failed write must not leave the folder behind");
+
+        // The other half, in the crate that owns both: `AppConfig::save`
+        // creates the parent, so the same path SUCCEEDS through it.
+        let cfg = crate::AppConfig::default();
+        cfg.save(&missing.join("config.toml")).unwrap();
+        assert!(missing.join("config.toml").is_file());
+    }
+
     #[test]
     fn entry_exists_ci_is_unicode_aware_not_ascii_only() {
         let td = tempfile::tempdir().unwrap();

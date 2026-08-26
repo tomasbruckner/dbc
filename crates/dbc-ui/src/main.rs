@@ -288,10 +288,37 @@ fn engine_from_url(url: &str) -> dbc_state::Engine {
 // Workspace T4 — startup context resolution (design §W4).
 // ---------------------------------------------------------------------
 
-/// Folder name used for the BLOCKED start's paths when the pointer itself
-/// is unreadable, so there is no target folder to name. Deliberately not a
-/// real directory: nothing creates it, so every store open and every save
-/// against it fails loudly.
+/// Folder name used for the BLOCKED start's paths when the pointer names
+/// nothing we can trust, so there is no target folder to name.
+///
+/// Deliberately not a real directory: nothing in this app ever creates it
+/// deliberately, so every store OPEN against it fails and finds nothing —
+/// which is the half that carries design §W4's never-a-silent-fallback
+/// rule.
+///
+/// FINAL-REVIEW MINOR-3: an earlier version of this comment also claimed
+/// „every SAVE against it fails loudly", and that was FALSE. All four
+/// store savers `create_dir_all` their own parent first
+/// (`config.rs:154`, `vault.rs:216`, `view_prefs.rs:65`, `params.rs:53` —
+/// `fsutil::write_atomic` correctly does not), so a stray save would
+/// SUCCEED and leave `%APPDATA%\dbc\__pracovni-prostor-nenalezen__\config.toml`
+/// on disk. Debris in a folder nobody reads, not a data loss — the
+/// invariant that actually matters, „never the profile's real files", is
+/// structural (see [`blocked_base`]) and pinned — but the stated property
+/// was not the real one, so it is corrected rather than quietly relied on.
+///
+/// The comment was corrected rather than the behaviour made to match it.
+/// Making the sentinel genuinely unwritable means either a
+/// platform-specific unusable name (`NUL` fails `create_dir_all` on
+/// Windows and succeeds on Linux — a rail that silently stops working on
+/// one target is worse than an honest comment) or removing
+/// `create_dir_all` from four PRE-EXISTING profile-store savers, which is
+/// what makes a first run work at all and is a `dbc-state` refactor this
+/// phase has already declined once (as-built §C). Neither buys anything:
+/// nothing can reach a save on a blocked start
+/// (`StartupContext::loads` opens no store, and the modal cannot be
+/// dismissed), and if something ever could, the file it would create is
+/// not one the app will read back.
 const BLOCKED_WORKSPACE_SENTINEL: &str = "__pracovni-prostor-nenalezen__";
 
 /// Paths for a BLOCKED start (design §W4). They point INTO the unusable
