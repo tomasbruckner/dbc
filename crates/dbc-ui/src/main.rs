@@ -1235,10 +1235,15 @@ fn script_text_is_dirty(editor: &str, saved: &str) -> bool {
 /// holds an ABSOLUTE path (resolved rejected alternative: storing a rel
 /// breaks the moment the root changes) — this is only the label.
 fn script_caption_rel(path: &Path, root: Option<&Path>) -> String {
+    // T9 review MINOR-1: the SAME fold as every other binding comparison.
+    // A byte-exact `strip_prefix` here silently degraded to the bare file
+    // name whenever the configured root's casing differed from disk — the
+    // reason that whole bug class had no visible tell.
     if let Some(root) = root {
-        if let Ok(rel) = path.strip_prefix(root) {
-            return rel
+        if path_starts_with_ci(path, root) {
+            return path
                 .components()
+                .skip(root.components().count())
                 .map(|c| c.as_os_str().to_string_lossy().to_string())
                 .collect::<Vec<_>>()
                 .join("/");
@@ -1282,10 +1287,47 @@ fn with_sql_extension(path: &Path) -> PathBuf {
 /// „the user moved on".
 fn script_binding_target_changed(old: Option<&Path>, new: Option<&Path>) -> bool {
     match (old, new) {
-        (Some(a), Some(b)) => a != b,
+        // T9 review MINOR-1: folded, so a re-save of the SAME file reached
+        // through a differently-cased root is not mistaken for the user
+        // moving on (which would strand a phantom „ •" over a saved file).
+        (Some(a), Some(b)) => !same_path_ci(a, b),
         (None, None) => false,
         _ => true,
     }
+}
+
+/// Case-INSENSITIVE, Unicode-aware path fold — the SAME rule
+/// `dbc_state::fsutil` applies to names (`str::to_lowercase`, never
+/// `eq_ignore_ascii_case`), lifted to whole paths and applied per
+/// component so a separator can never fold into a name.
+///
+/// T9 review MINOR-1. The binding's path has TWO producers that disagree
+/// on casing: the tree resolves against `effective_scripts_root()`, which
+/// is the CONFIGURED string and is never canonicalized, while save-as
+/// receives the OS dialog's true on-disk casing (GPUI pushes a
+/// `root.canonicalize()` through `SetFolder`). Byte-exact comparison then
+/// makes a root configured `D:\ws\Scripts` over an on-disk `D:\ws\scripts`
+/// answer FALSE for the very file being deleted: the binding survives, the
+/// caption goes on naming a file that is gone, and the next Ctrl+S
+/// silently recreates it — exactly what `finish_script_delete` says the
+/// rule prevents. NTFS is case-insensitive across all of Unicode, which is
+/// why the fold has to be too (`scripts::conflicting_name`'s rationale,
+/// verbatim — this was the one place in the phase that had reverted to
+/// `Path::eq`).
+fn path_fold(p: &Path) -> Vec<String> {
+    p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect()
+}
+
+/// Are these the same path on a case-insensitive volume? (See `path_fold`.)
+fn same_path_ci(a: &Path, b: &Path) -> bool {
+    path_fold(a) == path_fold(b)
+}
+
+/// Is `a` at or below `b`? The `Path::starts_with` component semantics,
+/// with `path_fold`'s casing rule.
+fn path_starts_with_ci(a: &Path, b: &Path) -> bool {
+    let (fa, fb) = (path_fold(a), path_fold(b));
+    fa.len() >= fb.len() && fa[..fb.len()] == fb[..]
 }
 
 /// Part S §4: is the editor's binding touched by a mutation of `target`?
@@ -1298,10 +1340,10 @@ fn script_binding_target_changed(old: Option<&Path>, new: Option<&Path>) -> bool
 /// because a FILE whose path happens to be a prefix of the binding's is
 /// not an ancestor of it.
 fn script_binding_affected(binding: &Path, target: &Path, is_dir: bool) -> bool {
-    if binding == target {
+    if same_path_ci(binding, target) {
         return true;
     }
-    is_dir && binding.starts_with(target)
+    is_dir && path_starts_with_ci(binding, target)
 }
 
 /// Where the binding must MOVE to when `old` is renamed to `new`, or
@@ -1318,8 +1360,14 @@ fn script_binding_retarget(
     if !script_binding_affected(binding, old, is_dir) {
         return None;
     }
-    let suffix = binding.strip_prefix(old).ok()?;
-    Some(if suffix.as_os_str().is_empty() { new.to_path_buf() } else { new.join(suffix) })
+    // By component COUNT, not `strip_prefix`: the prefix may differ from
+    // `old` in casing (that is the whole point of `path_fold`), and the
+    // suffix must keep the casing it actually has on disk.
+    let mut out = new.to_path_buf();
+    for c in binding.components().skip(old.components().count()) {
+        out.push(c.as_os_str());
+    }
+    Some(out)
 }
 
 /// T9 review MAJOR-1: the refusal when Ctrl+S arrives while a dialog owns
@@ -6868,7 +6916,9 @@ impl AppView {
                         // the tree, with a status that talks only about the
                         // binding, is a silently incomplete result.
                         if rescan
-                            && view.effective_scripts_root().is_some_and(|r| path.starts_with(&r))
+                            && view
+                                .effective_scripts_root()
+                                .is_some_and(|r| path_starts_with_ci(&path, &r))
                         {
                             view.start_scripts_scan(cx);
                         }
@@ -13476,6 +13526,68 @@ mod script_binding_tests {
     }
 
     // ---------- T9: the binding stays coherent with the filesystem ----------
+
+    /// T9 review MINOR-1: the binding comparison folds case the same way
+    /// the rest of the phase does. The failure it closes is concrete — a
+    /// root configured with different casing than the disk made the `✕` on
+    /// the bound file leave the binding in place, so the caption kept
+    /// naming a deleted file and the next Ctrl+S recreated it.
+    #[test]
+    fn the_binding_comparison_is_unicode_case_insensitive_like_every_other_probe() {
+        let disk = Path::new(r"D:\ws\scripts\trzby.sql");
+        let configured = Path::new(r"D:\ws\Scripts\Trzby.sql");
+        assert!(same_path_ci(disk, configured), "ASCII casing must fold");
+        assert!(script_binding_affected(disk, configured, false));
+        // Non-ASCII is the pair `eq_ignore_ascii_case` would miss, and
+        // Czech script names make it routine rather than exotic.
+        assert!(same_path_ci(
+            Path::new(r"D:\ws\scripts\Řezy.sql"),
+            Path::new(r"D:\ws\scripts\řezy.sql")
+        ));
+        // Folding is not the same as being blind: different names stay
+        // different, and a component boundary is never crossed.
+        assert!(!same_path_ci(disk, Path::new(r"D:\ws\scripts\jine.sql")));
+        assert!(!path_starts_with_ci(
+            Path::new(r"D:\ws\scriptsX\a.sql"),
+            Path::new(r"D:\ws\scripts")
+        ));
+        assert!(path_starts_with_ci(
+            Path::new(r"D:\ws\Scripts\prod\a.sql"),
+            Path::new(r"D:\ws\scripts")
+        ));
+        // …and a re-save through a differently-cased root is NOT the user
+        // moving on, so it must not bump the generation.
+        assert!(!script_binding_target_changed(Some(disk), Some(configured)));
+    }
+
+    /// The suffix of a folder rename keeps its REAL on-disk casing even
+    /// when the prefix that matched did not — `strip_prefix` could not do
+    /// this, which is why the split is by component count.
+    #[test]
+    fn a_case_mismatched_prefix_still_rebases_and_preserves_the_suffix() {
+        assert_eq!(
+            script_binding_retarget(
+                Path::new(r"D:\ws\scripts\prod\Trzby.SQL"),
+                Path::new(r"D:\ws\Scripts\PROD"),
+                Path::new(r"D:\ws\Scripts\produkce"),
+                true
+            ),
+            Some(PathBuf::from(r"D:\ws\Scripts\produkce\Trzby.SQL"))
+        );
+    }
+
+    /// And the caption relativizes under the same rule, so the mismatch
+    /// that used to hide this whole bug class is now visible.
+    #[test]
+    fn the_caption_relativizes_across_a_casing_mismatch() {
+        assert_eq!(
+            script_caption_rel(
+                Path::new(r"D:\ws\scripts\prod\trzby.sql"),
+                Some(Path::new(r"D:\ws\Scripts"))
+            ),
+            "prod/trzby.sql"
+        );
+    }
 
     /// Part S §4's binding fixup, as a pure decision. The three cases the
     /// Task 9 brief demanded be pinned: rename the bound file, delete the
