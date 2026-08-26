@@ -1483,7 +1483,14 @@ fn script_open_abort_reason(
     text_now: &str,
     text_dispatched: &str,
 ) -> Option<&'static str> {
-    if root_now != Some(root_dispatched) {
+    // FINAL-REVIEW NIT-3: `same_path_ci`, not `!=`. This was the ONE path
+    // comparison in the crate still done by exact bytes while every other
+    // one goes through `path_fold` — the exact shape T10 carry-forward 6
+    // existed to eliminate. Harmless in practice today (the root is copied
+    // out of the same `effective_scripts_root` on both sides, so a casing
+    // difference needs a re-pick that spells the same folder differently),
+    // but „harmless today" is how the last fold divergence started.
+    if !root_now.is_some_and(|r| same_path_ci(r, root_dispatched)) {
         return Some("otevření skriptu zrušeno — složka skriptů se mezitím změnila");
     }
     if binding_now != binding_dispatched {
@@ -13672,6 +13679,15 @@ mod script_binding_tests {
         // The root is reported FIRST: it is the coarsest change, and
         // blaming the editor for a workspace swap would be a lie.
         assert_eq!(ok(Some(&other), 5, "typed"), Some(swapped));
+
+        // FINAL-REVIEW NIT-3: the root leg folds like every other path
+        // comparison in this crate. A re-pick that spells the SAME folder
+        // with different casing is not a swap, and aborting the open there
+        // would be a refusal the user cannot act on.
+        let same_folder_other_casing = PathBuf::from(r"D:\WS\Scripts");
+        assert_eq!(ok(Some(&same_folder_other_casing), 4, "SELECT 1"), None);
+        // …and the fold does not make two DIFFERENT folders equal.
+        assert_eq!(ok(Some(&PathBuf::from(r"D:\ws\scripts2")), 4, "SELECT 1"), Some(swapped));
     }
 
     /// T8 re-verify NEW MAJOR, the half no pure function can express: the
