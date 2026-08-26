@@ -640,11 +640,9 @@ fn list_sql_files(dir: &std::path::Path) -> Result<Vec<PathBuf>, String> {
         if !path.is_file() {
             continue;
         }
-        let is_sql = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("sql"));
-        if is_sql {
+        // T9 review NIT-3: THE extension rail (design §1.5), shared with
+        // the scan, the editor's save-as and the library's run.
+        if crate::scripts::is_sql_path(&path) {
             files.push(path);
         }
     }
@@ -1265,9 +1263,8 @@ fn script_caption(rel: &str, dirty: bool) -> String {
 /// Part S §5.4 / fact 0.6: `.sql` is enforced client-side because the
 /// pinned GPUI rev's `prompt_for_new_path` has no extension filter.
 fn with_sql_extension(path: &Path) -> PathBuf {
-    let is_sql =
-        path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("sql"));
-    if is_sql {
+    // T9 review NIT-3: THE extension rail, not a fourth spelling of it.
+    if crate::scripts::is_sql_path(path) {
         path.to_path_buf()
     } else {
         let mut s = path.as_os_str().to_owned();
@@ -3277,11 +3274,7 @@ impl AppView {
                         let label = format!("{name}/ ({} souborů)", files.len());
                         Ok((label, files, counts))
                     } else {
-                        let is_sql = picked
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .is_some_and(|e| e.eq_ignore_ascii_case("sql"));
-                        if !is_sql {
+                        if !crate::scripts::is_sql_path(&picked) {
                             return Err("vyberte soubor .sql".to_string());
                         }
                         let count = count_statements_in_file(&picked, dialect)?;
@@ -3422,11 +3415,7 @@ impl AppView {
             let result: Result<(String, PathBuf, usize), String> = cx
                 .background_spawn(async move {
                     let path = crate::scripts::resolve_rel(&root, &rel)?;
-                    let is_sql = path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|e| e.eq_ignore_ascii_case("sql"));
-                    if !is_sql {
+                    if !crate::scripts::is_sql_path(&path) {
                         return Err("vyberte soubor .sql".to_string());
                     }
                     // A stale tree (an external delete since the last scan)

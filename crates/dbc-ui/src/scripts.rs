@@ -58,11 +58,20 @@ pub const SCRIPT_OPEN_CAP: u64 = 1_048_576;
 /// Max characters of a created/renamed name (after `.sql` append).
 pub const SCRIPT_NAME_CAP: usize = 80;
 
+/// THE `.sql` test (design §1.5) — one rail, ASCII-case-insensitive
+/// because an extension is not a user-facing name (`TRZBY.SQL` and
+/// `trzby.sql` are both scripts, and no Unicode extension exists to fold).
+///
+/// T9 review NIT-3: this used to be private, and three call sites had each
+/// re-spelled the same `extension().and_then(..).is_some_and(..)` chain —
+/// the scan, the editor's save-as and the library's run. §6 says one rail,
+/// so they all come here now.
+pub fn is_sql_path(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("sql"))
+}
+
 fn is_sql_name(name: &str) -> bool {
-    Path::new(name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("sql"))
+    is_sql_path(Path::new(name))
 }
 
 /// Lists ONE directory in display order (folders first, then `.sql`
