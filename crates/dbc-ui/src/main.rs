@@ -3169,47 +3169,16 @@ impl AppView {
                 .await;
 
             let _ = this.update(cx, |view, cx| match result {
-                Ok((source_label, files, file_counts)) => {
-                    // Review fix (MINOR 4): a modal the user opened WHILE
-                    // this picker/pre-scan was in flight wins — don't
-                    // clobber it with a stale script-run pick.
-                    if view.modal.is_some() {
-                        view.status =
-                            "výběr skriptu zahozen — je otevřený jiný dialog".to_string();
-                        cx.notify();
-                        return;
-                    }
-                    // Review fix (MAJOR 1), defense in depth (same posture
-                    // as CSV's `start_csv_import`): the picker + pre-scan
-                    // didn't block the connection dropdown — if it already
-                    // changed, don't even open the modal with a stale
-                    // file/folder selection; `confirm_script_run` re-checks
-                    // this same identity again regardless (the actual
-                    // guard), so this is purely a faster/friendlier
-                    // refusal.
-                    if !conn_identity_matches(&conn_identity, &view.current_conn_identity()) {
-                        view.status =
-                            "připojení se během výběru změnilo — spuštění zrušeno".to_string();
-                        cx.notify();
-                        return;
-                    }
-                    view.status = String::new();
-                    view.modal = Some(connections_ui::ModalState::ScriptRun {
-                        files,
-                        file_counts,
-                        tx_scope: runner::TxScope::PerFile,
-                        error_policy: runner::ErrorPolicy::Stop,
-                        source_label,
-                        conn_label,
-                        read_only,
-                        timeout_secs,
-                        conn_identity,
-                    });
-                    // UX-polish §1.4: no-input modal, cx-only continuation —
-                    // defer focus to `AppView::render` via `modal_needs_focus`.
-                    view.modal_needs_focus = true;
-                    cx.notify();
-                }
+                Ok((source_label, files, file_counts)) => view.open_script_run_modal(
+                    source_label,
+                    files,
+                    file_counts,
+                    conn_label,
+                    conn_identity,
+                    read_only,
+                    timeout_secs,
+                    cx,
+                ),
                 Err(e) => {
                     view.status = format!("error: {e}");
                     cx.notify();
@@ -3217,6 +3186,61 @@ impl AppView {
             });
         })
         .detach();
+    }
+
+    /// Part S §6 step 3: the SHARED post-pre-scan continuation of the G12
+    /// script-run flow. Both the ad-hoc picker (`start_script_pick`) and the
+    /// library's `▶` (`run_script_from_library`) end here, so there is
+    /// exactly ONE place that decides the modal races and the connection
+    /// identity re-check. Moving a single line of this into a caller forks
+    /// the confirm policy — that is the defect this factoring prevents.
+    #[allow(clippy::too_many_arguments)]
+    fn open_script_run_modal(
+        &mut self,
+        source_label: String,
+        files: Vec<PathBuf>,
+        file_counts: Vec<usize>,
+        conn_label: String,
+        conn_identity: String,
+        read_only: bool,
+        timeout_secs: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        // Review fix (MINOR 4), carried verbatim: a modal the user opened
+        // WHILE the pick/pre-scan was in flight wins — don't clobber it
+        // with a stale script-run pick.
+        if self.modal.is_some() {
+            self.status = "výběr skriptu zahozen — je otevřený jiný dialog".to_string();
+            cx.notify();
+            return;
+        }
+        // Review fix (MAJOR 1), carried verbatim (same posture as CSV's
+        // `start_csv_import`): the pick + pre-scan didn't block the
+        // connection dropdown — if it already changed, don't even open the
+        // modal with a stale selection. `confirm_script_run` re-checks this
+        // same identity again regardless (the actual guard), so this is
+        // purely the faster/friendlier refusal.
+        if !conn_identity_matches(&conn_identity, &self.current_conn_identity()) {
+            self.status = "připojení se během výběru změnilo — spuštění zrušeno".to_string();
+            cx.notify();
+            return;
+        }
+        self.status = String::new();
+        self.modal = Some(connections_ui::ModalState::ScriptRun {
+            files,
+            file_counts,
+            tx_scope: runner::TxScope::PerFile,
+            error_policy: runner::ErrorPolicy::Stop,
+            source_label,
+            conn_label,
+            read_only,
+            timeout_secs,
+            conn_identity,
+        });
+        // UX-polish §1.4: no-input modal, cx-only continuation — defer
+        // focus to `AppView::render` via `modal_needs_focus`.
+        self.modal_needs_focus = true;
+        cx.notify();
     }
 
     /// The modal's „Transakce“ radio — a click on an option that would
