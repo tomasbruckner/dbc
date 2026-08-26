@@ -1330,24 +1330,52 @@ pub(crate) const SCRIPT_SAVE_IN_FLIGHT: &str = "ukládání skriptu už probíh�
 
 /// May an in-flight `open_script` still replace the editor's buffer?
 ///
-/// T8 review BLOCKER-1. `editor_load_guarded` answers „is it safe" at
-/// DISPATCH; `read_script` then yields the UI thread, so by the time the
-/// text arrives the answer may have expired. TWO things must still hold:
-/// the binding must not have moved (`script_binding_generation`) AND the
-/// buffer must be byte-identical to what the guard actually looked at.
+/// `editor_load_guarded` answers „is it safe" at DISPATCH; `read_script`
+/// then yields the UI thread, so by the time the text arrives the answer
+/// may have expired. THREE independent things must still hold, and each
+/// was a real hole:
 ///
-/// The second half is the load-bearing one, and it is not redundant with
-/// the first: `set_script_binding` bumps the generation only when the
-/// bound PATH changes, so typing — the exact thing the guard protects —
-/// leaves the generation untouched. `SqlInput` has no undo, so a
-/// replacement that lands over fresh keystrokes destroys them for good.
-fn script_open_may_land(
+/// * **The buffer** must be byte-identical to what the guard looked at
+///   (T8 review BLOCKER-1). Not redundant with the generation:
+///   `set_script_binding` bumps only when the bound PATH changes, so
+///   typing — the exact thing the guard protects — leaves it untouched,
+///   and `SqlInput` has no undo, so a replacement over fresh keystrokes
+///   destroys them for good.
+/// * **The binding** must not have moved (`script_binding_generation`),
+///   or the open would clobber whatever the user moved on to.
+/// * **The scripts root** must still be the one the `rel` was resolved
+///   against (T8 re-verify NEW MAJOR, generalised). `apply_context`'s
+///   unconditional `supersede_script_continuations` covers the workspace
+///   swap, but the root also changes in profile mode via
+///   `start_scripts_dir_pick` / `clear_scripts_dir` — and there the
+///   generation deliberately stays put, because an in-flight SAVE holds an
+///   absolute path and is not invalidated by a root change. Comparing the
+///   root directly is exact where a shared counter would be a blunt proxy:
+///   it supersedes the open and nothing else, and it needs no future
+///   root-changing site to remember to bump anything.
+/// `None` means „land it". Otherwise the Czech status naming WHICH of the
+/// three moved — the `context_switch_refusal` idiom, for the same reason:
+/// one refusal that covers three different causes teaches the user
+/// nothing, and „editor se mezitím změnil" would be a lie for a swapped
+/// workspace nobody typed into.
+fn script_open_abort_reason(
+    root_now: Option<&Path>,
+    root_dispatched: &Path,
     binding_now: u64,
     binding_dispatched: u64,
     text_now: &str,
     text_dispatched: &str,
-) -> bool {
-    binding_now == binding_dispatched && text_now == text_dispatched
+) -> Option<&'static str> {
+    if root_now != Some(root_dispatched) {
+        return Some("otevření skriptu zrušeno — složka skriptů se mezitím změnila");
+    }
+    if binding_now != binding_dispatched {
+        return Some("otevření skriptu zrušeno — editor se mezitím změnil");
+    }
+    if text_now != text_dispatched {
+        return Some("otevření skriptu zrušeno — mezitím jste psali do editoru");
+    }
+    None
 }
 
 /// The discard prompt's question line. `script_rel` is `Some` only for a
@@ -6577,6 +6605,10 @@ impl AppView {
     /// „the user moved on", and counting it as one would make two quick
     /// Ctrl+S presses report a spurious „editor se mezitím změnil" and
     /// leave a phantom „ •" over a file that is in fact saved.
+    ///
+    /// That heuristic is about SAVES, and it is not a general „did anything
+    /// invalidate the in-flight work" test — see
+    /// `supersede_script_continuations` for the case where it is wrong.
     fn set_script_binding(&mut self, binding: Option<ScriptBinding>) {
         let changed = script_binding_target_changed(
             self.script_binding.as_ref().map(|b| b.path.as_path()),
@@ -6584,8 +6616,33 @@ impl AppView {
         );
         self.script_binding = binding;
         if changed {
-            self.script_binding_generation = self.script_binding_generation.wrapping_add(1);
+            self.supersede_script_continuations();
         }
+    }
+
+    /// Invalidates EVERY in-flight script continuation, unconditionally.
+    ///
+    /// T8 re-verify NEW MAJOR. `set_script_binding`'s path-changed
+    /// heuristic bumps nothing for a `None -> None` transition, so
+    /// `apply_context`'s unbind was a no-op whenever the editor was
+    /// UNBOUND — and an unbound editor is `script_is_dirty == false` by
+    /// construction, so `context_switch_blocked` waves the swap through.
+    /// The hole: open `trzby.sql`, the read goes to the background
+    /// executor (seconds on a OneDrive/network-backed root), switch
+    /// workspace, the read lands with the generation and the buffer both
+    /// unchanged — both gates pass — and `bind_script` silently installs
+    /// the OLD workspace's file under a path beneath the OLD root, with
+    /// the status cleared. The next Ctrl+S then writes into the old
+    /// workspace folder: precisely the cross-context leak the swap-unbind
+    /// was added to close. Same shape in `save_script_as`.
+    ///
+    /// A context swap is not „did the binding change" — it is „everything
+    /// dispatched before this instant belongs to a context that no longer
+    /// exists". So it bumps directly rather than going through the
+    /// heuristic. Still the ONE counter and the ONE meaning; only the
+    /// trigger is broader.
+    fn supersede_script_continuations(&mut self) {
+        self.script_binding_generation = self.script_binding_generation.wrapping_add(1);
     }
 
     /// Sets the editor text AND the binding in one place, so the two can
@@ -6696,13 +6753,15 @@ impl AppView {
                 // opened something else, closed the binding, or typed
                 // meanwhile. Landing now would be a silent context change —
                 // and it would clobber whatever they moved on to.
-                if !script_open_may_land(
+                if let Some(reason) = script_open_abort_reason(
+                    view.effective_scripts_root().as_deref(),
+                    &root,
                     view.script_binding_generation,
                     dispatched,
                     &view.sql.read(cx).text(),
                     &dispatched_text,
                 ) {
-                    view.status = "otevření skriptu zrušeno — editor se mezitím změnil".to_string();
+                    view.status = reason.to_string();
                     cx.notify();
                     return;
                 }
@@ -7417,7 +7476,18 @@ impl AppView {
         // exists to prevent. The editor TEXT stays, exactly as „Zavřít"
         // leaves it (§5.3): it is the binding that belongs to the old
         // context, not the buffer.
+        //
+        // T8 re-verify NEW MAJOR: the unbind alone was NOT enough, and the
+        // claim that it "supersedes any in-flight open/save" was false
+        // whenever there was nothing bound — `set_script_binding`'s
+        // path-changed heuristic bumps nothing for `None -> None`, and an
+        // unbound editor is never dirty, so the gate lets the swap through
+        // in exactly that state. An `open_script` dispatched against the
+        // OLD root would then land, pass both re-checks unchanged, and
+        // bind the old workspace's file. The bump is therefore explicit and
+        // unconditional; see `supersede_script_continuations`.
         self.set_script_binding(None);
+        self.supersede_script_continuations();
         self.status = match &root {
             Some(r) => format!("pracovní prostor: {}", r.display()),
             None => "lokální profil obnoven".to_string(),
@@ -13271,20 +13341,69 @@ mod script_binding_tests {
     /// permanently (`SqlInput` has no undo) and silently (`bind_script`
     /// clears the status). Both halves are load-bearing.
     #[test]
-    fn an_open_may_only_land_while_both_the_binding_and_the_buffer_stand_still() {
-        assert!(script_open_may_land(4, 4, "SELECT 1", "SELECT 1"));
-        // The half that used to be missing: same binding, typed buffer.
-        assert!(
-            !script_open_may_land(4, 4, "SELECT 1 -- rozepsáno", "SELECT 1"),
-            "typing under a stable binding must abort the open"
+    fn an_open_may_only_land_while_the_root_the_binding_and_the_buffer_all_stand_still() {
+        let root = PathBuf::from(r"D:\ws\scripts");
+        let other = PathBuf::from(r"D:\jiny-ws\scripts");
+        let ok = |root_now: Option<&Path>, g: u64, t: &str| {
+            script_open_abort_reason(root_now, &root, g, 4, t, "SELECT 1")
+        };
+        assert_eq!(ok(Some(&root), 4, "SELECT 1"), None);
+
+        // BLOCKER-1's half: same binding, typed buffer.
+        assert_eq!(
+            ok(Some(&root), 4, "SELECT 1 -- rozepsáno"),
+            Some("otevření skriptu zrušeno — mezitím jste psali do editoru")
         );
-        // Even one character, and even from an EMPTY start — the unbound
-        // ad-hoc case the guard itself deliberately does not protect is
-        // still protected against a background write landing on it.
-        assert!(!script_open_may_land(0, 0, "s", ""));
+        // Even one character from an EMPTY start — the unbound ad-hoc text
+        // the guard deliberately does not protect from USER actions is
+        // still protected from a background read landing on it.
+        assert_eq!(
+            script_open_abort_reason(Some(&root), &root, 0, 0, "s", ""),
+            Some("otevření skriptu zrušeno — mezitím jste psali do editoru")
+        );
         // The half that already existed: the binding moved.
-        assert!(!script_open_may_land(5, 4, "SELECT 1", "SELECT 1"));
-        assert!(!script_open_may_land(5, 4, "typed", "SELECT 1"));
+        assert_eq!(
+            ok(Some(&root), 5, "SELECT 1"),
+            Some("otevření skriptu zrušeno — editor se mezitím změnil")
+        );
+
+        // NEW MAJOR's half: the ROOT moved under an open that resolved its
+        // rel against the old one. Both other checks pass here — nothing
+        // was bound, nobody typed — which is exactly why the generation
+        // alone could not see it.
+        let swapped = "otevření skriptu zrušeno — složka skriptů se mezitím změnila";
+        assert_eq!(ok(Some(&other), 4, "SELECT 1"), Some(swapped));
+        // …including „Odebrat" in profile mode, which leaves no root at all.
+        assert_eq!(ok(None, 4, "SELECT 1"), Some(swapped));
+        // The root is reported FIRST: it is the coarsest change, and
+        // blaming the editor for a workspace swap would be a lie.
+        assert_eq!(ok(Some(&other), 5, "typed"), Some(swapped));
+    }
+
+    /// T8 re-verify NEW MAJOR, the half no pure function can express: the
+    /// swap must NOT rely on `set_script_binding`'s path-changed heuristic,
+    /// because the case that matters is the one where the heuristic is
+    /// silent — and an unbound editor is never dirty, so the gate lets that
+    /// exact state through. Source-pinned (T9's `run_script_from_library`
+    /// precedent), non-vacuously: the load-bearing markers are asserted
+    /// present before the requirement is asserted at all.
+    #[test]
+    fn a_context_swap_supersedes_in_flight_opens_even_with_nothing_bound() {
+        // The trap, restated as a fact this test depends on.
+        assert!(!script_binding_target_changed(None, None), "the heuristic is silent here");
+
+        let src = include_str!("main.rs");
+        let body = src.split("fn apply_context(").nth(1).expect("apply_context exists");
+        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
+        for marker in ["clear_active_connection", "reset_scripts", "set_script_binding(None)"] {
+            assert!(body.contains(marker), "the sliced body is not the real apply_context");
+        }
+        assert!(
+            body.contains("supersede_script_continuations()"),
+            "a context swap must invalidate in-flight script continuations OUTRIGHT — \
+             `set_script_binding(None)` bumps nothing when nothing was bound, so an \
+             `open_script` dispatched against the OLD root would land and bind it"
+        );
     }
 
     /// T8 review MAJOR-2's refusal text: not an „error:" — nothing failed.
