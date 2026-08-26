@@ -1322,6 +1322,22 @@ fn script_binding_retarget(
     Some(if suffix.as_os_str().is_empty() { new.to_path_buf() } else { new.join(suffix) })
 }
 
+/// T9 review MAJOR-1: the refusal when Ctrl+S arrives while a dialog owns
+/// the screen. Like [`SCRIPT_SAVE_IN_FLIGHT`] it is deliberately NOT an
+/// „error:" — nothing failed, and the way out is one Esc away.
+pub(crate) const SCRIPT_SAVE_BLOCKED: &str = "nejprve zavřete otevřený dialog";
+
+/// T9 review MAJOR-1: may a Ctrl+S dispatch right now? A pure predicate so
+/// the rule is unit-pinned — `on_save_script` takes a `Window` and so has
+/// no test harness, which is exactly how it went unguarded in the first
+/// place. `SaveScript` is bound with context `None`, i.e. it fires
+/// straight through an open modal's `.occlude()`, so this is the ONLY
+/// thing standing between a habitual Ctrl+S and a write that races the
+/// rename/delete the user is currently confirming.
+fn script_save_allowed(modal_open: bool, apply_open: bool, discard_open: bool) -> bool {
+    !(modal_open || apply_open || discard_open)
+}
+
 /// T8 review MAJOR-2: the refusal when a save of this editor is already in
 /// flight. Not an „error:" — nothing failed; the user's keystroke simply
 /// arrived while the previous write was still fsyncing, and the „ •" stays
@@ -6948,6 +6964,30 @@ impl AppView {
     /// Ctrl+S / the caption strip's „Uložit" / the palette's „Uložit
     /// skript" — one entry point for all three (Part S §5.2/§5.4).
     fn on_save_script(&mut self, _: &SaveScript, _window: &mut Window, cx: &mut Context<Self>) {
+        // T9 review MAJOR-1. `.occlude()` blocks CLICKS, not KEYS — the
+        // trap `run_query_with`'s guard already documents — and `ctrl-s` is
+        // registered with context `None`, so nothing shadows it while a
+        // dialog is up. Unguarded, a Ctrl+S pressed out of habit while
+        // „Pracuji…" shows RACES the rename/delete running underneath it:
+        // `script_save_in_flight` is one-directional (it is read at
+        // dispatch, and the UI thread is free for the whole background op),
+        // so the delete lands, the binding is cleared, the rescan finishes
+        // — and THEN the save recreates the file the user just
+        // irreversibly deleted, invisibly, because the tree already
+        // refreshed without it. A rename can leave BOTH names on disk.
+        //
+        // Refused OUT LOUD (a silent `return` is the other thing this phase
+        // bans) and not as an „error:" — nothing failed; the keystroke
+        // simply arrived while another decision was still on screen.
+        if !script_save_allowed(
+            self.modal.is_some(),
+            self.apply_dialog.is_some(),
+            self.discard_confirm.is_some(),
+        ) {
+            self.status = SCRIPT_SAVE_BLOCKED.to_string();
+            cx.notify();
+            return;
+        }
         match &self.script_binding {
             Some(b) => {
                 let (path, text) = (b.path.clone(), self.sql.read(cx).text());
@@ -13416,6 +13456,25 @@ mod script_binding_tests {
         assert!(!SCRIPT_SAVE_IN_FLIGHT.starts_with("error:"));
     }
 
+    /// T9 review MAJOR-1. Ctrl+S must be refused whenever a dialog is on
+    /// screen — a modal, the Apply dialog, or a discard prompt. The
+    /// scripts case is the sharp one (a save landing after a delete
+    /// recreates an irreversibly deleted file), but the rule is the same
+    /// one `run_query_with` already applies to Ctrl+Enter, and for the
+    /// same reason: occlusion stops clicks, not keystrokes.
+    #[test]
+    fn ctrl_s_is_refused_whenever_any_dialog_owns_the_screen() {
+        assert!(script_save_allowed(false, false, false));
+        assert!(!script_save_allowed(true, false, false), "a modal blocks it");
+        assert!(!script_save_allowed(false, true, false), "the Apply dialog blocks it");
+        assert!(!script_save_allowed(false, false, true), "a discard prompt blocks it");
+        assert!(!script_save_allowed(true, true, true));
+        // Refused out loud, and not as an „error:" — nothing failed.
+        assert_eq!(SCRIPT_SAVE_BLOCKED, "nejprve zavřete otevřený dialog");
+        assert!(!SCRIPT_SAVE_BLOCKED.starts_with("error:"));
+        assert!(!SCRIPT_SAVE_BLOCKED.is_empty(), "a silent refusal is the banned shape");
+    }
+
     // ---------- T9: the binding stays coherent with the filesystem ----------
 
     /// Part S §4's binding fixup, as a pure decision. The three cases the
@@ -13643,7 +13702,7 @@ mod editor_clobber_audit {
     /// Every CALL of `needle` must sit inside a function named EXACTLY one
     /// of `sanctioned`, and there must be exactly `expected` of them. The
     /// definition itself is not a call site.
-    fn audit(needle: &str, sanctioned: &[&str], expected: usize, why: &str) {
+    pub(super) fn audit(needle: &str, sanctioned: &[&str], expected: usize, why: &str) {
         let call = format!("{needle}(");
         let mut sites = 0usize;
         for (name, src) in sources() {
@@ -13759,6 +13818,90 @@ mod editor_clobber_audit {
             1,
             "binding replaces the editor's buffer — go through \
              `AppView::editor_load_guarded(PendingScriptAction::Open { .. })`",
+        );
+    }
+}
+
+/// T9 REVIEW MAJOR-2: the same audit shape, aimed at the FILESYSTEM.
+///
+/// `running_a_library_script_never_auto_saves_first` bans four identifiers
+/// inside `run_script_from_library`'s own body — and the review defeated
+/// it with a real `cargo test` by putting a `crate::scripts` write call at
+/// the top of `open_script_run_modal` instead: the library's run
+/// truncating its target immediately before running it, using a banned
+/// identifier verbatim, green. No alias or macro was needed, because
+/// `open_script_run_modal` is BY DESIGN the shared continuation both run
+/// paths funnel through — and that audit's own non-vacuity assertion
+/// certifies an unaudited region is on the path.
+///
+/// The fix is the mechanism that has now survived attack twice rather than
+/// a longer ban list: audit the WRITER crate-wide, by identifier, with an
+/// exact-name owner check — `editor_clobber_audit`'s scanner, reused
+/// wholesale (it already walks every `.rs` under `src`, so a new file is
+/// covered the moment it exists). A ban list only ever covers the regions
+/// someone remembered to list; this covers the crate.
+///
+/// Together the two needles mean NO BYTE reaches a user-chosen folder from
+/// this crate except through `AppView::save_script` — guarded, serialized,
+/// generation-checked — or `scripts::create_script`, which probes for a
+/// collision through the Unicode-aware rail first. The library's run
+/// cannot write at all, from any function, however it is reached.
+///
+/// The test call sites are sanctioned BY NAME rather than skipped: the
+/// exact-count assertion is what makes a new one a deliberate decision,
+/// and a `#[cfg(test)]`-region filter would be one more thing to defeat.
+#[cfg(test)]
+mod script_write_audit {
+    use super::editor_clobber_audit::audit;
+
+    /// The ONE funnel from this crate into
+    /// `dbc_state::fsutil::write_atomic`, whose tmp path is a pure
+    /// function of the target (T8's single-writer contract). A second
+    /// caller would be a second writer over a path this crate believes
+    /// only one function can touch.
+    #[test]
+    fn the_shared_atomic_writer_has_exactly_one_funnel() {
+        audit(
+            "write_atomic",
+            &["write_script"],
+            1,
+            "`crate::scripts::write_script` is the ONE funnel into the shared atomic              writer - a second caller forks T8's single-writer-per-path contract",
+        );
+    }
+
+    /// ...and that funnel itself has exactly two production callers.
+    #[test]
+    fn nothing_but_the_guarded_save_and_create_may_write_a_script() {
+        audit(
+            "write_script",
+            &[
+                // Production: the guarded, serialized Ctrl+S / save-as.
+                "save_script",
+                // Production: creation, which probes `conflicting_name`
+                // first because the writer REPLACES by design.
+                "create_script",
+                // Tests of the writer itself (scripts.rs).
+                "write_and_read_script_roundtrip_and_caps",
+                "write_script_replaces_an_existing_target",
+            ],
+            5,
+            "writing into the user's scripts folder is `AppView::save_script`'s job (guarded              by `script_save_allowed` + `script_save_in_flight`) or `scripts::create_script`'s              - the library's run serves DISK content and must never write, from any function              on its path",
+        );
+    }
+
+    /// MAJOR-1's guard, pinned structurally as well as behaviourally: the
+    /// predicate exists, and it is called from `on_save_script` and
+    /// nowhere else. A future "quick" save path that skips it fails here
+    /// rather than silently racing a delete.
+    #[test]
+    fn the_ctrl_s_dialog_guard_is_wired_exactly_once() {
+        audit(
+            "script_save_allowed",
+            // The predicate's own unit test is a real call site; naming it
+            // here is what makes the exact count meaningful.
+            &["on_save_script", "ctrl_s_is_refused_whenever_any_dialog_owns_the_screen"],
+            6,
+            "every Ctrl+S entry point must ask this - `.occlude()` blocks clicks, not keys",
         );
     }
 }
