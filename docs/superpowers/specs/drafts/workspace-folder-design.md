@@ -1208,3 +1208,446 @@ merge time, house convention).
   for filtered dialogs (client-side `.sql` checks are the established
   workaround); storing rel paths in the binding (breaks on root
   change).
+
+---
+
+# Jak to nakonec je (as-built) — v0.22.0
+
+Written by Task 10 (the sweep) once T1–T9 had landed and been reviewed.
+Everything above is the INTENT; this section is the TRUTH. Where the two
+disagree, this section wins, and the next phase should read it first.
+
+Landed on `feature/scripts-library` as **v0.22.0** (`[workspace.package]`
+in the root `Cargo.toml`; the window title reads `dbc v0.22.0`).
+
+## A. Deviations from the design text
+
+1. **Task ordering inverted.** The workspace lane went in before the
+   scripts flip, so `effective_scripts_root` landed COMPLETE (both arms)
+   in one seam instead of §W9's profile-only stub.
+2. **`Resolution::Broken` carries `{ root: Option<PathBuf>, reason: String }`**,
+   not §W2's sketch `{ pointer, root, reason }`. The pointer path is a
+   process-wide constant (`workspace::pointer_path()`), and `root` must be
+   optional because an unparsable pointer names no folder.
+3. **The blocked start uses `blocked_paths`**, not profile paths. §W4 said
+   "starts with an EMPTY default config" without saying which paths
+   `AppView` then holds. Answer: paths inside the unusable workspace, or —
+   when the pointer named nothing usable, or named the profile dir itself —
+   inside a never-created sentinel folder
+   (`%APPDATA%\dbc\__pracovni-prostor-nenalezen__`), so a stray save fails
+   loudly instead of overwriting a profile the user did not choose.
+4. **`apply_context` also clears `conn_url`** (the CLI-arg root). §W3.1 said
+   only "the active connection is disconnected"; the CLI session belongs to
+   the old context, so it goes with it — and per the sidebar design it
+   cannot come back.
+5. **Result tabs SURVIVE a context swap.** §W3.4 enumerates what the swap
+   replaces and does not list tabs; they hold results already produced,
+   exactly like after a connection switch today. Recorded rather than
+   silently decided.
+6. **Init always copies from the PROFILE**, never from an active workspace
+   — consistent, because §W3 offers no folder picker in workspace mode (the
+   route to a second workspace is profile-and-back).
+7. **`ModalState::WorkspaceConfirm` is ONE variant with a
+   `WorkspaceConfirmMode`** covering init / adopt / back-to-profile, so the
+   gate, the „Aktivní připojení bude odpojeno." line and the Enter-inert
+   policy exist once.
+8. **dbc-mcp's broken-pointer refusal is scoped to the paths the command
+   needs** (`--help` needs none, `setup --remove` needs none, `setup` needs
+   the vault, `serve` needs both). §W7 said "exits with the error" without
+   saying whether explicit overrides rescue it. **They do.** An
+   unparseable argv (`Command::Usage`) is treated as needing BOTH defaults,
+   because a typo'd `--confg` means config is NOT explicit and the broken
+   pointer's default is exactly what would have been used.
+9. **`context_switch_blocked` grew its dirty-script arm in Task 8**, not
+   Task 5, because `script_binding` did not exist yet. One gate function
+   throughout.
+10. **`ScriptsListState::Loading` is a UNIT variant**, not the plan's
+    `Loading { generation: u64 }`. The generation lives beside it on
+    `SchemaTree::scripts_generation`; a copy inside the variant was pure
+    redundancy and was never read.
+11. **`ModalState::ScriptName` DOES carry a `mode` field**
+    (`ScriptNameMode::{NewScript, NewFolder, Rename}`), contradicting the
+    scripts-plan's deviation 5 — three modes do not collapse into
+    `target_rel: Option<String>`, because create-file and create-folder
+    share an empty `target_rel`.
+
+## B. The shared fs rails, as they actually ended up
+
+`dbc_state::fsutil` owns them (`join_component`, the
+`conflicting_entry_ci` / `entry_exists_ci` probe, `write_atomic`), plus a
+fourth added by the T10 sweep:
+
+- **`fsutil::fold_name` is THE case fold** (`str::to_uppercase`, measured
+  against NTFS's real `$UpCase` relation over 62,474 BMP names). T10
+  carry-forward 6: three sites in two crates were folding names for the
+  same question and did not agree — `conflicting_entry_ci` and
+  `scripts::list_dir_sorted` used `to_uppercase`, while Task 9's
+  `dbc_ui::path_fold` used `to_lowercase` while its own doc comment
+  claimed to be applying `fsutil`'s rule. The disagreement was not
+  cosmetic: `to_lowercase` implements Unicode's final-sigma context rule,
+  so a folder `ΟΔΟΣ` and a folder `οδοσ` fold APART under it although NTFS
+  resolves them to one directory — renaming or deleting that folder would
+  have left the editor binding standing on a dead path, which is the exact
+  bug `path_fold` was introduced to prevent. Unified onto `to_uppercase`
+  and turned into a named function so a fourth site cannot quietly pick
+  the other one. Measured, not argued (T9 re-verify FAIL-2, standalone
+  `rustc` probe over the four interesting pairs):
+
+  | Pair | `to_lowercase` | `to_uppercase` |
+  |---|---|---|
+  | `D:\ws\scripts\ΟΔΟΣ.sql` vs `…\οδοσ.sql` | true | true |
+  | `D:\ws\ΟΔΟΣ\a.sql` vs `D:\ws\οδοσ\a.sql` | **FALSE** | true |
+  | `D:\ws\scripts\Σ.sql` vs `…\ς.sql` | **FALSE** | true |
+  | `D:\ws\straße.sql` vs `…\STRASSE.sql` | false | true |
+
+  Row 2 is the killer, and it is the ANCESTOR arm of
+  `script_binding_affected` / `path_starts_with_ci`. Row 1 explains why
+  nobody noticed: `.sql` is Case_Ignorable-then-cased, so Final Sigma
+  never fires on a FILE name — only on a DIRECTORY component. The five
+  file-level sites looked fine and the ancestor site did not, and the
+  suite discriminated nothing (the pre-existing `Řezy`/`řezy` pin folds
+  identically under both folds; the reviewer flipped the one word and got
+  948 passed / 0 failed). Now pinned by a directory-component sigma
+  assertion in
+  `the_binding_comparison_is_unicode_case_insensitive_like_every_other_probe`,
+  mirroring `fsutil.rs`'s own `create_dir`-backed regression pin.
+- **`.sql` extension tests are `dbc_ui::scripts::is_sql_path`**, one rail,
+  four call sites, and it is `eq_ignore_ascii_case` on purpose: an
+  extension is not a user-facing name and no Unicode extension exists.
+- **`dbc_state::workspace::one_line_reason` is THE reason collapse.** T10
+  carry-forward 5 moved it out of `dbc-mcp`, where it lived alone, into
+  the crate that produces the `Resolution::Broken` reason — because the
+  BLOCKING GUI modal (§W4, the one dialog the user cannot Esc out of) was
+  rendering the raw multi-line `toml::de::Error` art. Both consumers apply
+  it to the displayed PATH as well as to the reason, because the pointer's
+  `path` field is arbitrary TOML text that nothing validates (T10
+  carry-forward 3: a hand-edited `\n` in it otherwise bought a third
+  stderr line of attacker-chosen text, falsifying `dbc-mcp`'s promoted
+  "exactly two lines" property).
+
+## C. Atomic writers — the honest count
+
+The §W6.2 gate asked for exactly one tmp+`sync_all`+rename block. The
+truth is **one NEW one plus four pre-existing ones**, and the fifth is
+worth writing down rather than leaving as a surprise:
+
+| Writer | Target | Status |
+|---|---|---|
+| `fsutil::write_atomic` | anything (scripts, marker, `.gitignore`) | THE phase's rail; `dbc-ui` reaches it only through `scripts::write_script`, pinned by `script_write_audit` |
+| `grid.rs`'s CSV/JSON export | a path the user typed | pre-existing; **independently derives `<path>.tmp`**, byte-identical to `fsutil::tmp_path_for` |
+| `er_diagram_view.rs`'s SVG export | a path the user typed | pre-existing; plain `fs::write`, no tmp |
+| `AppConfig::save` | `config.toml` | pre-existing, explicitly sanctioned by the plan |
+| `ParamStore::save` | `params.toml` | pre-existing, NOT migrated |
+| `ViewPrefs::save` | `views.toml` | pre-existing, NOT migrated |
+| `Vault::save` | `vault.bin` | pre-existing, NOT migrated; note it does tmp+rename with **no `sync_all`** |
+
+The three store writers travel INTO the workspace folder in workspace
+mode, so strictly they are "workspace-touching" and the plan's wording did
+not anticipate them. They were deliberately left alone: migrating the
+profile store layer is a `dbc-state` refactor, not a workspace-phase
+change, and each writes one file nothing else writes. **The tmp NAMES
+already agree** by accident of construction —
+`path.with_extension("toml.tmp")` on `config.toml` and
+`fsutil::tmp_path_for(config.toml)` both yield `config.toml.tmp` — so the
+shipped `.gitignore`'s blanket `*.tmp` covers every one of them, which is
+the property that actually mattered.
+
+The two EXPORT writers (T9 re-verify NIT-A) reach folders the user chose,
+but never the scripts library behind the user's back: both open
+`prompt_for_new_path` with an EMPTY start directory, so the destination is
+typed every time and no automatic path leads into the library. `grid.rs`'s
+independent `<path>.tmp` derivation is nevertheless a second writer over a
+convention whose single-writer contract `write_atomic`'s doc states as if
+it were universal. Recorded, not fixed: it is pre-existing, it is only
+reachable by exporting a grid onto the exact path of an in-flight script
+save, and the blanket `*.tmp` covers it. The over-claiming sentence on
+`script_write_audit` was narrowed to "into the scripts library" so the
+doc no longer promises coverage it does not have.
+
+Production `read_dir` in `dbc-state` is exactly TWO sites:
+`fsutil::conflicting_entry_ci` (the probe) and `workspace::classify` (the
+emptiness check, names only, never descends). `dbc-ui/src/scripts.rs` has
+two more (`list_dir_sorted`, `delete_entry`'s emptiness check), both
+outside `dbc-state` and both in scope for that crate's own rails.
+
+## D. Git stays external — permanently
+
+No `git2`, no `notify`, no `walkdir`, no `rfd` in any `Cargo.toml`. No
+subprocess. **Nothing under `.git/` is opened, read, or parsed** — `.git`
+appears in the source only as a name being SKIPPED (`classify`'s
+dot-entry rule, `list_dir_sorted`'s dot-directory rule) and in comments
+and tests. §W6.4 is permanent, not "not yet".
+
+## E. Release-notes disclosures (§W7)
+
+The repo keeps no separate release-notes file, so per Task 10 Step 6 they
+live here:
+
+1. **`vault.bin` cannot be merged by git.** It is an encrypted Argon2id
+   envelope; a conflict is resolved by taking one side wholesale, and the
+   losing side's newly-added passwords must be re-entered by hand. The app
+   cannot and deliberately does not help. The shipped `.gitignore` carries
+   a COMMENTED-OUT `vault.bin` line so excluding it is one uncomment away.
+2. **Git history is permanent.** A `vault.bin` committed once cannot be
+   reliably removed from history afterwards; the security of the whole
+   repository then equals the strength of the master password. This is
+   said in-app too (`WORKSPACE_GIT_WARNING`, §W6.3), at every decision
+   point and never on startup.
+3. **`tool_paths` travels with the workspace** and may name machine-A
+   paths. Backup/restore then errors clearly until fixed in Nastavení.
+4. **`history.sqlite` does NOT travel** — it stays machine-local by
+   design (§W5) and is not among the files init copies.
+5. **There is no app-exit dirty guard for a bound script.** No exit
+   interception exists app-wide; this is the same posture as today's
+   editor text, not a regression. A dirty binding DOES block a workspace
+   swap and a script open (`context_switch_blocked`), just not app exit.
+6. **A wedged scripts modal needs an app restart, and takes the unsaved
+   buffer with it.** If a background fs op ever panicked, `running` would
+   stay latched and the dialog would refuse Esc, „Zrušit", confirm and any
+   workspace swap. Since T9 MAJOR-1 it also wedges **Ctrl+S**, because
+   `script_save_allowed` refuses a save while any modal owns the screen —
+   so the unsaved editor buffer cannot be saved at all before the process
+   is killed. Accepted trade, argued in full on
+   `connections_ui::script_modal_esc_closable`; the panic surface on that
+   path is empty today (no `unwrap` / `expect` / `panic!` in `scripts.rs`'s
+   production half or in the `fsutil` rails it calls), which is the
+   assumption the whole trade rests on and must be re-checked if anything
+   fallible is ever added to that path.
+
+## F. What is NOT verified headlessly — the manual checklist
+
+**Read this before believing the phase is done.** Everything below was
+implemented and unit-tested where a unit test was possible, but was never
+observed running. In particular **the „Skripty" sidebar section has never
+been seen on screen**: it renders through GPUI, which has no headless
+harness in this repo, so Tasks 7, 8 and 9's GUI passes are all still owed.
+Collected here — numbered, ordered and reproducible — instead of scattered
+across agent reports.
+
+Build once: `%USERPROFILE%\.cargo\bin\cargo.exe run -p dbc-ui`.
+Back up `%APPDATA%\dbc\` before starting; several items hand-edit it.
+
+### F.1 Blocking „Pracovní prostor nenalezen" modal (T4 Step 8)
+
+Hand-write `%APPDATA%\dbc\workspace.toml` and run TWICE:
+
+1. `path = "D:\\neexistuje"` — the missing-folder case. Expect the modal
+   titled „Pracovní prostor nenalezen", the path on its own line, and
+   „error: složka neexistuje".
+2. `path = "<%APPDATA%>\\dbc"` — the pointer aimed at the PROFILE DIR
+   ITSELF (T4 review MAJOR-2). `certutil -hashfile %APPDATA%\dbc\config.toml`
+   before and after must MATCH, and
+   `%APPDATA%\dbc\__pracovni-prostor-nenalezen__` must NOT be created.
+3. Per run: the connection dropdown behind the modal lists NOTHING, and
+   the status bar reads „error: pracovní prostor nenalezen — vyberte
+   složku, nebo použijte lokální profil" (NOT „ready").
+4. Per run: Tab moves a visible focus ring across the three choices;
+   Enter/Space activates the FOCUSED one; a bare Enter with the panel
+   itself focused does nothing; Esc does nothing.
+5. „Použít lokální profil" deletes the pointer, restores the real
+   connection list, status „lokální profil obnoven", and
+   `%APPDATA%\dbc\config.toml` is byte-identical to before the run.
+6. **T10 addition.** Hand-write a pointer whose TOML does not parse (e.g.
+   `path = "D:\ws"` — a lone `\w` is an invalid TOML escape) and confirm
+   the modal's reason line is ONE line, not eight lines of `|`/`^` art
+   echoing the pointer's own source text. (This is the carry-forward-5
+   fix. `dbc_state::workspace::one_line_reason` is unit-tested; that it
+   reaches the rendered panel is not.)
+
+### F.2 Settings „Pracovní prostor" block (T5 Step 9)
+
+7. Nastavení → „Použít složku…" → pick a NON-empty folder (e.g.
+   `Documents`). Expect the refusal „error: složka není pracovní prostor
+   dbc a není prázdná — …" and **not one file created** in it (`dir /a`
+   before/after).
+8. Pick a fresh EMPTY folder. The confirm modal shows the path, the copy
+   line, „Aktivní připojení bude odpojeno." and the full §W6.3 warning →
+   „Rozumím, vytvořit". Expect `dbc-workspace.toml`, `config.toml`,
+   `vault.bin`, `views.toml`, `params.toml`, `scripts\` and `.gitignore`
+   to exist; the profile files byte-identical (`certutil -hashfile`); the
+   status „pracovní prostor: {path}"; the same connections in the
+   dropdown; and the first connect re-prompting for the master password.
+9. Nastavení → „Přejít na lokální profil" → „Přejít". Expect the
+   workspace folder untouched, `%APPDATA%\dbc\workspace.toml` gone, status
+   „lokální profil obnoven".
+10. `findstr /S /I "<a real saved password>" <workspace>\*.toml <workspace>\.gitignore`
+    finds NOTHING (the §W6.5 rail, by hand once).
+
+### F.3 The „Skripty" sidebar, both arms (T7 Step 8) — NEVER SEEN
+
+11. Profile mode with no `scripts_dir`: „Skripty" expands to „složka
+    skriptů není nastavena — klikněte pro Nastavení"; the click opens
+    Nastavení.
+12. Pick a folder holding `a.sql` and `sub\b.sql`: the tree shows `sub`
+    then `a.sql` (folders first); expanding `sub` shows `b.sql`; `⟳`
+    re-scans after an external `copy` into the folder.
+13. Switch to a workspace: the Settings block becomes the fixed
+    „Skripty: {workspace}\scripts" line with NO picker, and the tree
+    re-roots to the (empty) workspace `scripts\` — „žádné skripty (*.sql)".
+14. Hand-edit `scripts_dir` into the WORKSPACE `config.toml` and restart:
+    the tree still shows `<workspace>\scripts` (§W8 inertness).
+
+### F.4 Editor binding (T8 Step 9) — NEVER SEEN
+
+15. Double-click `a.sql` → the caption strip reads „Skript: a.sql", the
+    editor holds the file, and NOTHING ran. (This is the whole
+    double-click → `TreeEvent::ScriptOpen` path; nothing about it has been
+    observed end to end.)
+16. Type a character → the caption becomes „Skript: a.sql •" and „Uložit"
+    brightens out of its dimmed-when-clean state. Ctrl+S → „skript
+    uložen: a.sql", the „ •" disappears, and no `*.tmp` remains.
+17. With a dirty buffer, double-click `b.sql` → the discard confirm names
+    „Neuložené změny skriptu a.sql budou zahozeny."; „Zrušit" leaves
+    `a.sql` bound and dirty; „Zahodit" opens `b.sql`.
+18. „Zavřít" unbinds and the editor TEXT STAYS. Ctrl+S then opens save-as,
+    defaulting into the library; saving `dotaz` writes `dotaz.sql` and the
+    tree shows it.
+19. With a dirty binding, Nastavení → „Přejít na lokální profil" refuses
+    with „error: skript má neuložené změny — nejprve jej uložte nebo
+    zavřete".
+20. Open a >1 MiB `.sql` → „error: soubor je příliš velký pro editor
+    (limit 1 MiB) — spusťte jej jako skript".
+21. Ctrl+S while ANY dialog is open → „nejprve zavřete otevřený dialog",
+    rendered in `warn`, not `danger` (T9 MAJOR-1; `.occlude()` blocks
+    clicks, not keys, so this refusal is the only thing standing there).
+
+### F.5 Create / rename / delete / run (T9) — THREE ITEMS ONLY
+
+The T9 re-verify swept this task and confirmed the manual debt is
+**exactly three items**: the two panels' layout, the focus arm, and
+`running`-inertness rendering. Everything else about T9 — the fold, the
+identity re-checks, the run-confirm disclosure, the notice colouring, the
+delete/rename binding fixups, the pinned copy — is automated now. Do not
+re-verify those by hand, and do not read their unit tests as a substitute
+for the three below.
+
+22. The two script modals' LAYOUT: `ScriptName` (create file / create
+    folder / rename) and `ScriptDeleteConfirm`. Each renders a title, the
+    text field or the target name, the notice slot, and two buttons.
+23. The FOCUS ARM: opening `ScriptName` puts the caret in its text field,
+    so typing works without a click.
+24. `running`-INERTNESS RENDERING: while a background fs op is in flight
+    both buttons and the mode radio must LOOK disabled (no
+    `cursor_pointer`, no hover), matching `WorkspaceConfirm`. This is the
+    only visual cue that Esc is being refused — see §E.6 for why a stuck
+    latch is expensive.
+
+### F.6 dbc-mcp out-of-process matrix (T6 Step 5) — THE ONLY PIN ON THE EXIT CODES
+
+**This matrix is the only thing that pins `main`'s exit codes at all.**
+`async fn main() -> ExitCode` is not unit-testable, and a reviewer's
+mutation confirmed that changing the `Command::Usage` arm from
+`ExitCode::FAILURE` to `ExitCode::SUCCESS` survives the entire `dbc-mcp`
+suite green. **Re-run this matrix whenever `main`'s match arms change.**
+
+With `%APPDATA%\dbc\workspace.toml` pointing at a NON-EXISTENT folder:
+
+29. `cargo run -p dbc-mcp -- --help 1>NUL` — exits **0**, usage text on
+    stderr, and that text mentions the pointer and `--config`/`--vault`.
+30. `cargo run -p dbc-mcp 1>NUL` — exits **non-zero**, and the Czech
+    refusal appears on stderr as **exactly two lines**: the diagnosis and
+    the escape hatch. `1>NUL` must swallow NOTHING of it — a single byte
+    of this on stdout corrupts the JSON-RPC stream.
+31. `cargo run -p dbc-mcp -- --nonsense 1>NUL` — exits **non-zero**
+    (`Usage`), naming the bad argument AND diagnosing the workspace.
+32. `cargo run -p dbc-mcp -- --config <real> --vault <real>` against a
+    healthy pair — starts and serves; the broken pointer does not stop it.
+33. With the pointer aimed at a REAL workspace: a bare run uses the
+    workspace's `config.toml` and `vault.bin`, not the profile's.
+
+### F.7 End-to-end multi-machine smoke (T10 Step 9)
+
+34. Start in profile mode with real connections and a saved password.
+    Settings → „Použít složku…" → fresh empty folder → „Rozumím, vytvořit".
+35. `git init`, `git add -A`, `git commit` **in a terminal, outside the
+    app**. Confirm the app noticed nothing and offers nothing git-related
+    anywhere in its UI.
+36. Add a script via `+`, save it with Ctrl+S, run it with `▶`.
+37. Close the app; `git clone` the folder to a second path; restart;
+    Settings → „Přejít na lokální profil", then „Použít složku…" → the
+    CLONE → classified as adopt („Otevřít pracovní prostor") → the same
+    connections, favourites, theme and scripts tree appear, and the first
+    connect prompts for the SAME master password.
+38. Rename the clone folder on disk while the app is closed; restart.
+    Expect the blocking modal, Esc/Enter inert, an empty connection list
+    behind it, and „Najít složku…" recovering it.
+
+## G. Source audits — what they pin, and their exact counts
+
+Three `#[cfg(test)]` audits read this crate's own source. **Each asserts
+an exact count; changing one is a deliberate act, not a bump.**
+
+| Audit | Needle(s) | Count | Scope |
+|---|---|---|---|
+| `config_save_guard_audit` | `.config.save(` | 6 | whole `src` tree |
+| `editor_clobber_audit` | `replace_buffer`, `perform_script_action`, `bind_script` | per test | whole `src` tree |
+| `script_write_audit` | `write_atomic` (1), `write_script` (5), `.save_script` (2), `script_save_allowed` (7) | as listed | whole `src` tree |
+
+`script_write_audit` gained a FOURTH test in T10 (`the_writer_itself_is_reachable_only_through_the_guarded_entry_points`),
+closing T9 re-verify FAIL-1. The `write_script` audit sanctions the OWNER
+`save_script` unconditionally, so the chain stopped there and
+`save_script`'s own callers were audited by nothing: the re-verify added a
+plausible future handler calling `self.save_script(..)` directly, around
+`script_save_allowed`, and got the whole suite green — the only signal a
+dead-code warning that vanishes the moment it is wired to a listener. The
+new test pins the writer's callers to `{on_save_script, save_script_as}`.
+Its needle is `.save_script` **with the leading dot**, because `audit`
+matches `needle + "("` as a plain substring and a bare `save_script` would
+also swallow `on_save_script(`.
+
+`script_save_allowed`'s count went 6 → 7 in the same fix: the predicate is
+now asked TWICE in production. `on_save_script` asks it synchronously, and
+`save_script_as` asks it AGAIN in its post-await continuation. That second
+ask is the behavioural half of FAIL-1 — the file picker is not app-modal
+on every platform, so the entry-point check is a statement about the past.
+The concrete hole it closes: editor unbound and dirty → Ctrl+S → picker
+opens → the user deletes `trzby.sql` from the tree and confirms (nothing
+stops it: no write was dispatched, so `script_save_in_flight` is false;
+and `was_bound == false`, so the binding generation is never bumped) →
+the user completes the picker naming `trzby.sql` → the generation check
+passes → the irreversibly deleted file is silently back. That is T9
+MAJOR-1's own scenario, through the one entry point its fix did not
+re-check.
+
+T10 carry-forward 7 widened `config_save_guard_audit` onto
+`editor_clobber_audit`'s machinery. It had been reading a HAND LIST of two
+files with a prefix-match owner detector, so (a) the other 31 `.rs` files
+in the crate were invisible to it although `AppView.config` is
+crate-reachable from every one of them (`main.rs` is the crate root, so
+every module is a descendant), and (b) a write inside an `async fn` /
+`pub(super) fn` / `const fn` was attributed to the PREVIOUS function and
+could be sanctioned by ITS guard call. It now walks `src/` at test time
+and uses the exact-name `defined_fn_name` parser, with its own
+non-vacuity test (`the_audit_reads_the_whole_crate_not_a_pair_of_files`).
+
+The RULE deliberately still differs from the other two: this audit asks
+that the guard be CALLED in the same function above the write, whatever
+that function is named, because the guard is cheap, idempotent and correct
+to call unconditionally — a new writer should add the call rather than add
+its name to a list. The other two sanction by owner NAME.
+
+`AppView::guard_corrupt_config` is additionally `#[must_use]` (T10
+carry-forward 1). The audit only proves the call is THERE; a reviewer's
+mutation showed that `self.guard_corrupt_config(cx);` — verdict called and
+discarded — passes the audit while doing exactly what the guard exists to
+prevent (the `false` return IS the abort signal). The attribute makes the
+bare call a warning, i.e. a build failure under this repo's zero-warning
+gate; verified by mutation during T10.
+
+## H. Deliberately declined by the T10 sweep
+
+- **The stuttering broken-pointer subject.** With `root: None` both the
+  MCP stderr line and the GUI modal read „…: ukazatel na pracovní prostor
+  je nečitelný (ukazatel na pracovní prostor je poškozený: …)", because
+  the subject (`WORKSPACE_MISSING_NO_PATH`, byte-pinned in two crates) and
+  the predicate (`read_pointer`'s reason) both name the pointer. Left
+  alone: both halves are verbatim from binding sources pinned by different
+  tasks, and quietly harmonising copy across a seam is the trap this phase
+  has recorded twice already. Reword BOTH crates together, or neither.
+- **Migrating `ParamStore` / `ViewPrefs` / `Vault` onto `write_atomic`** —
+  see §C. A `dbc-state` store-layer refactor, not a workspace-phase change.
+- **A real failure path for a panicked background fs op** — see §E.6 and
+  the argument on `script_modal_esc_closable`. The alternative (a timeout,
+  or an Esc-anyway hatch) reintroduces a second writer on
+  `write_atomic`'s fixed `<path>.tmp`, which is silent data loss instead
+  of a visible wedge.

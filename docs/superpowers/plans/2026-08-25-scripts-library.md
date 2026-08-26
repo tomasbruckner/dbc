@@ -1,6 +1,23 @@
 # Scripts Library (Bruno model) Implementation Plan
 
-> **SCOPE WIDENED 2026-08-25 — do not execute this plan as-is.** The phase now covers a full git-versioned **workspace folder** (connections, settings, vault, prefs, scripts); the binding design is `docs/superpowers/specs/drafts/workspace-folder-design.md`. T1/T2 below are DONE (branches `sc-t1-config`, `sc-t2-fsmod`); T3–T6 remain valid with the `effective_scripts_root` seam (design §W8); a rewritten plan will supersede this file after design review.
+> **SUPERSEDED — DO NOT EXECUTE.** This plan was replaced in full by
+> **`docs/superpowers/plans/2026-08-25-workspace-folder.md`**, which
+> shipped as **v0.22.0** on 2026-08-26. The phase widened to a
+> git-versioned **workspace folder** (connections, settings, vault, prefs,
+> scripts) and the scripts library landed inside it, over the
+> `effective_scripts_root` seam, in that plan's Tasks 7–9.
+>
+> Kept for history only. Its T1/T2 are the only parts that ever ran as
+> written (branches `sc-t1-config`, `sc-t2-fsmod`); its T3–T6 were
+> redirected and renumbered by the superseding plan, and several of its
+> stated deviations were then contradicted in the as-built — deviation 5
+> in particular (`ModalState::ScriptName` DOES carry a `mode` field).
+>
+> Read instead: the superseding plan above, and the binding design
+> `docs/superpowers/specs/drafts/workspace-folder-design.md` — **including
+> its „Jak to nakonec je (as-built)" section**, which is the truth where
+> the design text and the shipped code disagree, and which carries the
+> manual-verification checklist this phase still owes.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Recommend **sonnet** implementers per task, a **sonnet** adversarial review per task, and a **default-model** final review once all tasks land (house staffing convention). NO docker, NO external server anywhere in this phase: every test is a pure `#[test]` over plain data or a `tempfile` directory.
 
