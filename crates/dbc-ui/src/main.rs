@@ -3351,6 +3351,15 @@ impl AppView {
             cx.notify();
             return;
         }
+        // T9 review MINOR-3. Computed HERE, in the SHARED continuation, so
+        // both run paths disclose it: `▶` on the bound-and-dirty script,
+        // and the ad-hoc picker when the user happens to pick that same
+        // file. Folded comparison for the reason `path_fold` documents.
+        let dirty_bound = self.script_dirty_flag
+            && self
+                .script_binding
+                .as_ref()
+                .is_some_and(|b| files.iter().any(|f| same_path_ci(f, &b.path)));
         self.status = String::new();
         self.modal = Some(connections_ui::ModalState::ScriptRun {
             files,
@@ -3361,6 +3370,7 @@ impl AppView {
             conn_label,
             read_only,
             timeout_secs,
+            dirty_bound,
             conn_identity,
         });
         // UX-polish §1.4: no-input modal, cx-only continuation — defer
@@ -6409,10 +6419,78 @@ impl AppView {
         self.close_modal(cx);
     }
 
+    /// Is `self.modal` still the SAME latched name dialog this
+    /// continuation was dispatched from? THE identity rule — one source,
+    /// used by both the success and the failure landing (T9 review
+    /// MINOR-2: they used to disagree, and the failure side matched on the
+    /// VARIANT alone).
+    fn owns_script_name_modal(
+        &self,
+        mode: connections_ui::ScriptNameMode,
+        target_rel: &str,
+    ) -> bool {
+        matches!(
+            &self.modal,
+            Some(connections_ui::ModalState::ScriptName {
+                mode: m, target_rel: t, running: true, ..
+            }) if *m == mode && *t == target_rel
+        )
+    }
+
+    /// The delete confirm's equivalent.
+    fn owns_script_delete_modal(&self, rel: &str) -> bool {
+        matches!(
+            &self.modal,
+            Some(connections_ui::ModalState::ScriptDeleteConfirm { rel: r, running: true, .. })
+                if *r == rel
+        )
+    }
+
+    /// Continuation-side failure landing for the name dialog.
+    ///
+    /// T9 review MINOR-2. `set_script_name_error` below is sound where it
+    /// is used — synchronously inside `confirm_script_name`, with no await
+    /// between destructuring the modal and stamping it. This path is not:
+    /// it resumes AFTER a background step, so it must re-verify identity
+    /// for exactly the reason `finish_script_name` does. Stamping a
+    /// different dialog of the same kind would not merely misplace a
+    /// message — it would clear THAT dialog's `running` latch, which is
+    /// the one thing making a double-dispatch into a shared `<path>.tmp`
+    /// unreachable.
+    fn land_script_name_error(
+        &mut self,
+        mode: connections_ui::ScriptNameMode,
+        target_rel: &str,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.owns_script_name_modal(mode, target_rel) {
+            self.set_script_name_error(message, cx);
+        } else {
+            self.status = format!("error: {message}");
+            cx.notify();
+        }
+    }
+
+    /// The delete confirm's equivalent — same asymmetry, same fix.
+    fn land_script_delete_error(&mut self, rel: &str, message: String, cx: &mut Context<Self>) {
+        if self.owns_script_delete_modal(rel) {
+            self.set_script_delete_error(message, cx);
+        } else {
+            self.status = format!("error: {message}");
+            cx.notify();
+        }
+    }
+
     /// A failed name op: the message goes back INTO the dialog (the field
     /// keeps its text, so the user edits rather than retypes) and clears
     /// `running` so they can retry. If the dialog is somehow no longer
     /// there, the message still reaches the status line — never nowhere.
+    ///
+    /// SYNCHRONOUS callers only (`confirm_script_name`'s pre-dispatch
+    /// refusals): the variant-only match is sound there because nothing
+    /// can have replaced the modal between the destructure and this call.
+    /// A continuation must use `land_script_name_error` instead.
     fn set_script_name_error(&mut self, message: String, cx: &mut Context<Self>) {
         if let Some(connections_ui::ModalState::ScriptName { error, running, .. }) = &mut self.modal
         {
@@ -6499,7 +6577,7 @@ impl AppView {
                 .await;
             let _ = this.update(cx, |view, cx| match result {
                 Ok(new_rel) => view.finish_script_name(mode, target_rel, is_dir, new_rel, cx),
-                Err(e) => view.set_script_name_error(e, cx),
+                Err(e) => view.land_script_name_error(mode, &target_rel, e, cx),
             });
         })
         .detach();
@@ -6521,12 +6599,7 @@ impl AppView {
         new_rel: String,
         cx: &mut Context<Self>,
     ) {
-        let mine = matches!(
-            &self.modal,
-            Some(connections_ui::ModalState::ScriptName {
-                mode: m, target_rel: t, running: true, ..
-            }) if *m == mode && *t == target_rel
-        );
+        let mine = self.owns_script_name_modal(mode, &target_rel);
         if mode == connections_ui::ScriptNameMode::Rename {
             self.retarget_binding_after_rename(&target_rel, &new_rel, is_dir);
         }
@@ -6613,7 +6686,7 @@ impl AppView {
                 .await;
             let _ = this.update(cx, |view, cx| match result {
                 Ok(()) => view.finish_script_delete(rel, was_bound, cx),
-                Err(e) => view.set_script_delete_error(e, cx),
+                Err(e) => view.land_script_delete_error(&rel, e, cx),
             });
         })
         .detach();
@@ -6621,11 +6694,7 @@ impl AppView {
 
     /// The delete landed — same own-modal re-check as `finish_script_name`.
     fn finish_script_delete(&mut self, rel: String, was_bound: bool, cx: &mut Context<Self>) {
-        let mine = matches!(
-            &self.modal,
-            Some(connections_ui::ModalState::ScriptDeleteConfirm { rel: r, running: true, .. })
-                if *r == rel
-        );
+        let mine = self.owns_script_delete_modal(&rel);
         if was_bound {
             // §4: the bound file is gone — drop the binding. The editor
             // TEXT stays (the user may still want it, exactly as „Zavřít"

@@ -1280,6 +1280,12 @@ pub enum ModalState {
         conn_label: String,
         read_only: bool,
         timeout_secs: Option<u64>,
+        /// T9 review MINOR-3: this run's target IS the editor's bound
+        /// script and that binding is dirty, so the file on disk is not
+        /// what the user is looking at. Computed in `open_script_run_modal`
+        /// — the SHARED continuation — so the ad-hoc picker discloses it
+        /// too when it happens to pick the bound file.
+        dirty_bound: bool,
         /// Review fix (MAJOR 1, same pattern as `CsvImport.conn_identity`
         /// below): the STABLE identity (`AppView::current_conn_identity`)
         /// captured at `start_script_pick` dispatch time, BEFORE the file
@@ -1416,6 +1422,15 @@ pub enum ModalState {
     /// collide in the same `<path>.tmp`. It also freezes the dialog's
     /// identity while the background op runs, which is what lets the
     /// continuation know it is closing ITS OWN modal.
+    ///
+    /// KNOWN LIMIT (T9 review NIT-1), recorded rather than hidden: every
+    /// LANDING path clears the latch — success closes the modal, both
+    /// failure paths reset it — but a PANIC inside the background fs op
+    /// has no landing, so the dialog would stay latched with Esc, both
+    /// buttons and a context swap all refused. Deliberately not given an
+    /// escape hatch: any hatch is also a way to abandon a modal whose
+    /// continuation is about to fix the editor binding up, which is the
+    /// larger risk. Same posture, and same trade, as `WorkspaceConfirm`.
     ScriptName {
         mode: ScriptNameMode,
         parent_rel: String,
@@ -1465,6 +1480,59 @@ pub(crate) fn script_delete_text(name: &str, is_dir: bool) -> String {
 /// discard confirm in front of it — one modal, both facts.
 pub(crate) fn script_delete_dirty_line() -> &'static str {
     "Skript má neuložené změny v editoru."
+}
+
+/// The name dialog's PRIMARY BUTTON — distinct from its title (a rename's
+/// title and button happen to coincide; a create's do not).
+pub(crate) fn script_name_confirm_label(mode: ScriptNameMode) -> &'static str {
+    match mode {
+        ScriptNameMode::Rename => "Přejmenovat",
+        ScriptNameMode::NewScript | ScriptNameMode::NewFolder => "Vytvořit",
+    }
+}
+
+/// The Skript/Složka radio's labels. `Rename` never renders the radio, so
+/// its arm exists only to keep the match total.
+pub(crate) fn script_kind_label(mode: ScriptNameMode) -> &'static str {
+    match mode {
+        ScriptNameMode::NewFolder => "Složka",
+        ScriptNameMode::NewScript | ScriptNameMode::Rename => "Skript",
+    }
+}
+
+/// Shown on the primary button while the background fs op is in flight —
+/// `running` is VISIBLE, not merely enforced (the `WorkspaceConfirm`
+/// precedent).
+pub(crate) const SCRIPT_MODAL_RUNNING: &str = "Pracuji…";
+/// Both scripts modals' secondary button.
+pub(crate) const SCRIPT_MODAL_CANCEL: &str = "Zrušit";
+/// The delete confirm's primary button — the last gate before an
+/// unrecoverable disk delete, so it names the act rather than saying „OK".
+pub(crate) const SCRIPT_DELETE_CONFIRM: &str = "Smazat";
+
+/// T9 review MINOR-3: the run confirm's disclosure when its target is the
+/// script the editor holds with UNSAVED changes.
+///
+/// `▶` running the DISK content is correct and spec'd (Part S §1.3) — this
+/// does not change that, it states it. `ModalState::ScriptRun` is the one
+/// surface designed to say what is about to run against a DATABASE, and
+/// staying silent about editor ≠ disk there — while `ScriptDeleteConfirm`
+/// carries `script_delete_dirty_line()` for an action whose blast radius
+/// is a single file — was the inconsistency. Same „one modal, both facts"
+/// reasoning, applied to the bigger blast radius.
+pub(crate) const SCRIPT_RUN_DIRTY_LINE: &str =
+    "Editor má neuložené změny — spustí se obsah na disku.";
+
+/// Is an in-modal notice an ERROR, or a REFUSAL?
+///
+/// T9 review NIT-2. `SCRIPT_SAVE_IN_FLIGHT` and `SCRIPT_SAVE_BLOCKED` are
+/// deliberately not „error:" — each is pinned by its own test saying so —
+/// yet they share the scripts modals' single notice slot. Painting that
+/// slot unconditionally in `danger` contradicted the very semantics those
+/// pins exist to protect. A refusal is „try again in a moment", and reads
+/// as `warn`.
+pub(crate) fn script_modal_notice_is_error(message: &str) -> bool {
+    message != crate::SCRIPT_SAVE_IN_FLIGHT && message != crate::SCRIPT_SAVE_BLOCKED
 }
 
 /// The Enter policy for `ModalState::ScriptName`, factored out so it can be
@@ -1795,6 +1863,7 @@ impl AppView {
                 conn_label,
                 read_only,
                 timeout_secs,
+                dirty_bound,
                 ..
             } => render_script_run_confirm_panel(
                 &files,
@@ -1805,6 +1874,7 @@ impl AppView {
                 &conn_label,
                 read_only,
                 timeout_secs,
+                dirty_bound,
                 cx,
             ),
             ModalState::CsvImport {
@@ -5048,6 +5118,11 @@ mod top_bar_label_tests {
     }
 }
 
+/// The notice slot's colour, from `script_modal_notice_is_error`.
+fn script_modal_notice_color(message: &str, theme: Theme) -> gpui::Hsla {
+    if script_modal_notice_is_error(message) { theme.danger } else { theme.warn }
+}
+
 /// Part S §4: the ONE name dialog — new script / new folder / rename.
 ///
 /// The Skript/Složka radio is rendered ONLY for the create modes (it is
@@ -5112,19 +5187,24 @@ fn render_script_name_panel(
                 .flex()
                 .flex_row()
                 .gap_2()
-                .child(kind_option("script-kind-file", "Skript", ScriptNameMode::NewScript))
-                .child(kind_option("script-kind-dir", "Složka", ScriptNameMode::NewFolder)),
+                .child(kind_option(
+                    "script-kind-file",
+                    script_kind_label(ScriptNameMode::NewScript),
+                    ScriptNameMode::NewScript,
+                ))
+                .child(kind_option(
+                    "script-kind-dir",
+                    script_kind_label(ScriptNameMode::NewFolder),
+                    ScriptNameMode::NewFolder,
+                )),
         );
     }
 
     panel = panel.child(field_row("Název", field, theme));
     if let Some(e) = error {
-        panel = panel.child(div().text_color(theme.danger).child(e.clone()));
+        panel = panel.child(div().text_color(script_modal_notice_color(e, theme)).child(e.clone()));
     }
-    let confirm_label = match mode {
-        ScriptNameMode::Rename => "Přejmenovat",
-        _ => "Vytvořit",
-    };
+    let confirm_label = script_name_confirm_label(mode);
     panel
         .child(
             div()
@@ -5142,7 +5222,7 @@ fn render_script_name_panel(
                         .bg(theme.bg_hover)
                         .when(!running, |d| d.cursor_pointer())
                         .when(running, |d| d.text_color(theme.text_muted))
-                        .child("Zrušit")
+                        .child(SCRIPT_MODAL_CANCEL)
                         .on_click(cx.listener(|v, _, _, cx| v.cancel_script_modal(cx))),
                 )
                 .child(
@@ -5153,7 +5233,7 @@ fn render_script_name_panel(
                         .rounded_md()
                         .bg(if running { theme.bg_selected } else { theme.bg_hover })
                         .when(!running, |d| d.cursor_pointer())
-                        .child(if running { "Pracuji…" } else { confirm_label })
+                        .child(if running { SCRIPT_MODAL_RUNNING } else { confirm_label })
                         .on_click(cx.listener(|v, _, _, cx| v.confirm_script_name(cx))),
                 ),
         )
@@ -5191,7 +5271,7 @@ fn render_script_delete_panel(
         panel = panel.child(div().text_color(theme.warn).child(script_delete_dirty_line()));
     }
     if let Some(e) = error {
-        panel = panel.child(div().text_color(theme.danger).child(e.clone()));
+        panel = panel.child(div().text_color(script_modal_notice_color(e, theme)).child(e.clone()));
     }
     panel
         .child(
@@ -5210,7 +5290,7 @@ fn render_script_delete_panel(
                         .bg(theme.bg_hover)
                         .when(!running, |d| d.cursor_pointer())
                         .when(running, |d| d.text_color(theme.text_muted))
-                        .child("Zrušit")
+                        .child(SCRIPT_MODAL_CANCEL)
                         .on_click(cx.listener(|v, _, _, cx| v.cancel_script_modal(cx))),
                 )
                 .child(
@@ -5221,7 +5301,11 @@ fn render_script_delete_panel(
                         .rounded_md()
                         .bg(if running { theme.bg_selected } else { theme.bg_hover })
                         .when(!running, |d| d.cursor_pointer())
-                        .child(if running { "Pracuji…" } else { "Smazat" })
+                        .child(if running {
+                            SCRIPT_MODAL_RUNNING
+                        } else {
+                            SCRIPT_DELETE_CONFIRM
+                        })
                         .on_click(cx.listener(|v, _, _, cx| v.confirm_script_delete(cx))),
                 ),
         )
@@ -5246,6 +5330,7 @@ fn render_script_run_confirm_panel(
     conn_label: &str,
     read_only: bool,
     timeout_secs: Option<u64>,
+    dirty_bound: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     use crate::runner::{ErrorPolicy, TxScope};
@@ -5318,6 +5403,11 @@ fn render_script_run_confirm_panel(
         .child(conn_line)
         .child(file_list)
         .child(div().text_color(cx.theme().text_muted).child(format!("celkem: {total} příkazů")))
+        // T9 review MINOR-3: only when it is true, so an unbound or clean
+        // editor renders exactly as before.
+        .when(dirty_bound, |d| {
+            d.child(div().text_color(cx.theme().warn).child(SCRIPT_RUN_DIRTY_LINE))
+        })
         .child(
             div()
                 .flex()
@@ -5794,6 +5884,7 @@ mod modal_confirm_kind_tests {
             conn_label: String::new(),
             read_only: false,
             timeout_secs: None,
+            dirty_bound: false,
             conn_identity: "cfg:x".into(),
         }
     }
@@ -6120,6 +6211,58 @@ mod modal_confirm_kind_tests {
         assert!(!modal_is_blocking(&del(true)));
         assert!(script_modal_esc_closable(false));
         assert!(!script_modal_esc_closable(true));
+    }
+
+    /// T9 review MINOR-4: the panels' remaining copy, factored out of the
+    /// inline literals precisely so it CAN be byte-pinned — the same move
+    /// `script_name_title`/`script_delete_text` already made. The panels
+    /// themselves still need a GPUI window and stay on the manual list;
+    /// their words no longer do.
+    #[test]
+    fn the_scripts_modal_buttons_are_byte_pinned() {
+        assert_eq!(script_name_confirm_label(ScriptNameMode::NewScript), "Vytvořit");
+        assert_eq!(script_name_confirm_label(ScriptNameMode::NewFolder), "Vytvořit");
+        // The rename's button matches its title; that coincidence is
+        // asserted, not assumed, so changing one cannot silently split them.
+        assert_eq!(script_name_confirm_label(ScriptNameMode::Rename), "Přejmenovat");
+        assert_eq!(
+            script_name_confirm_label(ScriptNameMode::Rename),
+            script_name_title(ScriptNameMode::Rename)
+        );
+        assert_eq!(script_kind_label(ScriptNameMode::NewScript), "Skript");
+        assert_eq!(script_kind_label(ScriptNameMode::NewFolder), "Složka");
+        assert_eq!(SCRIPT_MODAL_RUNNING, "Pracuji…");
+        assert_eq!(SCRIPT_MODAL_CANCEL, "Zrušit");
+        assert_eq!(SCRIPT_DELETE_CONFIRM, "Smazat");
+    }
+
+    /// T9 review NIT-2: the notice slot carries both errors and REFUSALS,
+    /// and the refusals are pinned elsewhere as deliberately not „error:".
+    /// Painting them in the error colour contradicted those pins.
+    #[test]
+    fn a_refusal_is_not_painted_as_an_error() {
+        assert!(!script_modal_notice_is_error(crate::SCRIPT_SAVE_IN_FLIGHT));
+        assert!(!script_modal_notice_is_error(crate::SCRIPT_SAVE_BLOCKED));
+        // Real failures from the fs ops still read as errors.
+        for e in ["název už existuje", "složka není prázdná — smažte nejdřív její obsah"] {
+            assert!(script_modal_notice_is_error(e), "{e}");
+        }
+    }
+
+    /// T9 review MINOR-3: the run confirm names the divergence it is about
+    /// to act against. It must NOT promise a save — the whole point is
+    /// that the disk content is what runs.
+    #[test]
+    fn the_run_confirm_discloses_that_the_editor_and_the_disk_differ() {
+        assert_eq!(
+            SCRIPT_RUN_DIRTY_LINE,
+            "Editor má neuložené změny — spustí se obsah na disku."
+        );
+        assert!(SCRIPT_RUN_DIRTY_LINE.contains("na disku"));
+        assert!(!SCRIPT_RUN_DIRTY_LINE.starts_with("error:"));
+        for promise in ["uloží", "uložit"] {
+            assert!(!SCRIPT_RUN_DIRTY_LINE.contains(promise), "must not promise a save");
+        }
     }
 
     /// A scripts modal must block a context switch: the swap changes
