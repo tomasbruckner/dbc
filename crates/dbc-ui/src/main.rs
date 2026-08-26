@@ -7335,8 +7335,12 @@ impl AppView {
         reason: String,
         cx: &mut Context<Self>,
     ) {
-        self.modal =
-            Some(connections_ui::ModalState::WorkspaceMissing { root, reason, error: None });
+        self.modal = Some(connections_ui::ModalState::WorkspaceMissing {
+            root,
+            reason,
+            error: None,
+            pending: None,
+        });
         // UX-polish §1.4: no-input modal, cx-only opener.
         self.modal_needs_focus = true;
         cx.notify();
@@ -7425,22 +7429,78 @@ impl AppView {
                     // this guard exists to stop.
                     return;
                 }
-                // Only now, and only on the UI thread behind the guard, is
-                // anything persisted. A small atomic TOML write — the same
-                // deliberately-synchronous posture as `apply_context`'s
-                // `AppConfig::load`.
-                if let Err(e) = dbc_state::workspace::write_pointer(
-                    &dbc_state::workspace::pointer_path(),
-                    &picked,
-                ) {
-                    view.set_workspace_missing_error(e.message, cx);
-                    return;
+                // FINAL-REVIEW MINOR-1: still nothing is persisted here.
+                // The folder is a valid workspace, but pointing the app at
+                // a folder it did not previously own is an ADOPT, and
+                // Settings' adopt states the two things this one did not —
+                // that the trezor there has its OWN master password, and
+                // §W6.3's git warning — BEFORE it commits. So the pick
+                // moves the blocking modal to its confirm STATE and the
+                // user decides; `confirm_workspace_recovery` does the
+                // write, synchronously, with no await anywhere near it.
+                if let Some(connections_ui::ModalState::WorkspaceMissing { pending, error, .. }) =
+                    &mut view.modal
+                {
+                    *pending = Some(picked);
+                    // A previous refusal's message is about the previous
+                    // folder; carrying it onto this screen would read as a
+                    // complaint about the one just picked.
+                    *error = None;
                 }
-                view.close_modal(cx);
-                view.apply_context(Some(picked), cx);
+                // The confirm state's buttons are new elements, so the
+                // panel must take focus again for Tab to reach them.
+                view.modal_needs_focus = true;
+                cx.notify();
             });
         })
         .detach();
+    }
+
+    /// The confirm button of the recovery modal's adopt state
+    /// (final-review MINOR-1).
+    ///
+    /// Synchronous end to end — `write_pointer` is a small atomic TOML
+    /// write, the same deliberately-synchronous posture `apply_context`
+    /// takes with `AppConfig::load` — so there is no await between reading
+    /// `pending` and acting on it, and therefore nothing to re-verify.
+    /// That is the whole reason the confirm lives here rather than in
+    /// another background task.
+    fn confirm_workspace_recovery(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::WorkspaceMissing { pending: Some(root), .. }) =
+            &self.modal
+        else {
+            return;
+        };
+        let root = root.clone();
+        if let Err(e) =
+            dbc_state::workspace::write_pointer(&dbc_state::workspace::pointer_path(), &root)
+        {
+            // Back to the confirm screen with the failure in place: the
+            // pointer is untouched, so „Zpět" and „Použít lokální profil"
+            // both still mean exactly what they did.
+            self.set_workspace_missing_error(e.message, cx);
+            return;
+        }
+        self.close_modal(cx);
+        self.apply_context(Some(root), cx);
+    }
+
+    /// „Zpět" on the recovery modal's adopt state — returns to the three
+    /// choices. NOT a close: `WorkspaceMissing` is the one modal the user
+    /// cannot dismiss (§W4), and the whole point of putting the confirm
+    /// INSIDE it rather than handing the screen to an Esc-closable
+    /// `WorkspaceConfirm` is that cancelling can never leave the app with
+    /// no context and no dialog. The picked folder is dropped; nothing was
+    /// written, so there is nothing to undo.
+    fn cancel_workspace_recovery(&mut self, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::WorkspaceMissing { pending, error, .. }) =
+            &mut self.modal
+        {
+            *pending = None;
+            *error = None;
+        }
+        self.modal_needs_focus = true;
+        cx.notify();
     }
 
     /// Replaces the `WorkspaceMissing` modal's in-place error line. A no-op
@@ -13676,6 +13736,72 @@ mod recovery_pick_guard_tests {
         {
             assert!(!recovery_pick_may_commit(open, dispatched, current));
         }
+    }
+
+    /// FINAL-REVIEW MINOR-1, the STRUCTURE of the fix rather than its
+    /// copy (which `connections_ui` pins): the picker continuation must
+    /// stage the folder and stop, and the pointer write must live behind
+    /// the user's confirmation.
+    ///
+    /// This is also, incidentally, a strengthening of T4 review MAJOR-1's
+    /// own rule — „nothing is persisted until the UI-thread guard passes"
+    /// becomes „nothing is persisted in this function at all", and the one
+    /// write that remains has no await anywhere near it, so it needs no
+    /// re-verification.
+    #[test]
+    fn the_recovery_pick_stages_a_folder_and_only_the_confirm_writes_the_pointer() {
+        let src = include_str!("main.rs");
+        // The body ends at the next item OR its doc comment — stopping
+        // only at `\n    fn ` would swallow the NEXT function's `///`
+        // block, and these assertions are about code, not about prose that
+        // happens to name it. (Found the honest way: the first draft of
+        // this test failed on `confirm_workspace_recovery`'s own doc
+        // comment mentioning `write_pointer`.)
+        let slice = |marker: &str| -> String {
+            let b = src.split(marker).nth(1).unwrap_or_else(|| panic!("{marker} exists"));
+            let end = ["\n    fn ", "\n    /// ", "\n    pub"]
+                .iter()
+                .filter_map(|m| b.find(m))
+                .min()
+                .unwrap_or(b.len());
+            b[..end].to_string()
+        };
+
+        let pick = slice("fn pick_workspace_for_recovery(");
+        // Non-vacuity: the slice is the real continuation.
+        assert!(pick.contains("prompt_for_paths"), "the sliced body is not the real one");
+        assert!(pick.contains("recovery_pick_may_commit"), "the sliced body is not the real one");
+        assert!(
+            !pick.contains("write_pointer"),
+            "the pick must not persist anything — adopting a workspace is the user's call, \
+             and they have not been shown the vault line or the git warning yet"
+        );
+        assert!(
+            !pick.contains("apply_context"),
+            "the pick must not swap the context either — that is the confirm's job"
+        );
+        assert!(pick.contains("pending"), "the pick must stage the folder for the confirm");
+
+        let confirm = slice("fn confirm_workspace_recovery(");
+        assert!(confirm.contains("write_pointer"), "the confirm is what commits");
+        assert!(confirm.contains("apply_context"), "…and what swaps the context");
+        // The reason no post-await re-check is needed here: there is no
+        // await. If one is ever added, this fails and the author has to
+        // decide what to re-verify — the phase's own repeated lesson.
+        assert!(
+            !confirm.contains(".await") && !confirm.contains("cx.spawn"),
+            "the confirm is synchronous by design; an await here needs a re-check"
+        );
+
+        // „Zpět" returns to the choices; it must never close the one modal
+        // the design says cannot be closed, or the app is left with no
+        // context and no dialog.
+        let back = slice("fn cancel_workspace_recovery(");
+        assert!(back.contains("pending"), "the sliced body is not the real one");
+        assert!(
+            !back.contains("close_modal"),
+            "cancelling the adopt must return to the three choices, not dismiss the blocking modal"
+        );
     }
 }
 

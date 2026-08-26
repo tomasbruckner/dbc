@@ -1383,8 +1383,33 @@ pub enum ModalState {
         /// A FAILED „Najít složku…" attempt's message, shown in place under
         /// `reason` so the modal never has to close to report a refusal.
         /// `None` until the user tries and it fails; a successful pick
-        /// closes the modal instead.
+        /// moves to the confirm STEP below instead.
         error: Option<String>,
+        /// FINAL-REVIEW MINOR-1 — the folder a successful „Najít složku…"
+        /// picked, awaiting the user's confirmation.
+        ///
+        /// „Najít složku…" is an ADOPT: it points the app at a workspace
+        /// folder it did not previously own, exactly like Settings' adopt,
+        /// which shows „Trezor tohoto prostoru se odemyká jeho vlastním
+        /// master heslem." and [`WORKSPACE_GIT_WARNING`] before committing
+        /// (§W3.3/§W6.3 — „renders STATICALLY wherever the folder-pick flow
+        /// is offered"). Recovery used to write the pointer and swap the
+        /// context the instant the picker returned, so the user adopted a
+        /// foreign vault having been told neither thing.
+        ///
+        /// It is a SECOND STATE OF THIS MODAL rather than a
+        /// [`ModalState::WorkspaceConfirm`], deliberately: `WorkspaceMissing`
+        /// is the one BLOCKING modal (Esc inert, no `close_modal` path),
+        /// and handing the screen to an Esc-closable confirm would let the
+        /// user cancel their way into an app with no context and no dialog
+        /// — a strictly worse failure than the one being fixed. „Zrušit"
+        /// here returns to the three choices; nothing can close this modal
+        /// but a committed decision.
+        ///
+        /// The COPY is not duplicated: the panel renders
+        /// `workspace_confirm_lines(WorkspaceConfirmMode::Adopt)`, so the
+        /// two adopt paths physically cannot drift apart.
+        pending: Option<std::path::PathBuf>,
     },
     /// Design §W3.2/§W3.3/§W3.4: the ONE confirm gate in front of a context
     /// change. `root` is the picked folder (`None` only for `ToProfile`).
@@ -1946,10 +1971,26 @@ impl AppView {
             ModalState::ChartPicker { source_title, columns, kind, x_col, y_selected, edit_tab, .. } => {
                 render_chart_picker_panel(source_title, columns, kind, x_col, y_selected, edit_tab, cx)
             }
-            ModalState::WorkspaceMissing { root, reason, error } => {
+            ModalState::WorkspaceMissing { root, reason, error, pending } => {
                 let panel_focus = self.workspace_panel_focus.clone();
                 let focus = self.workspace_choice_focus.clone();
-                render_workspace_missing_panel(&root, &reason, &error, &panel_focus, &focus, cx)
+                match pending {
+                    Some(p) => render_workspace_recovery_confirm_panel(
+                        &p,
+                        &error,
+                        &panel_focus,
+                        &focus,
+                        cx,
+                    ),
+                    None => render_workspace_missing_panel(
+                        &root,
+                        &reason,
+                        &error,
+                        &panel_focus,
+                        &focus,
+                        cx,
+                    ),
+                }
             }
             ModalState::WorkspaceConfirm { mode, root, error, running } => {
                 render_workspace_confirm_panel(mode, &root, &error, running, cx)
@@ -4196,6 +4237,40 @@ pub(crate) const WORKSPACE_MISSING_STATUS: &str =
 /// the overlay `.occlude()`s everything behind it. The app underneath is
 /// deliberately EMPTY (no config, no vault, no view prefs were loaded), so
 /// there is nothing here to fall back to by accident.
+/// One choice button of the §W4 blocking modal — shared by the panel's
+/// three-choice state and by its recovery-confirm state (final-review
+/// MINOR-1), so both keep the tab-stop, key-context and focus-ring
+/// treatment T4 review NIT-11 established without a second copy of it.
+///
+/// `idx` indexes `AppView::workspace_choice_focus`; the confirm state uses
+/// slots 0 and 1 of the same three, which is why the array is not sized by
+/// the number of buttons any one state happens to show.
+fn workspace_choice_button(
+    idx: usize,
+    id: &'static str,
+    label: &'static str,
+    focus: &[FocusHandle; 3],
+    cx: &mut Context<AppView>,
+) -> gpui::Stateful<gpui::Div> {
+    let ring = cx.theme().accent;
+    let base = cx.theme().bg_hover;
+    div()
+        .id(id)
+        .track_focus(&focus[idx])
+        .key_context(WORKSPACE_CHOICE_CONTEXT)
+        .tab_index(idx as isize)
+        .px_3()
+        .py_1()
+        .rounded_md()
+        .bg(base)
+        .border_1()
+        .border_color(base)
+        // Keyboard users must SEE which choice Enter/Space would take.
+        .focus(|s| s.border_color(ring))
+        .cursor_pointer()
+        .child(label)
+}
+
 fn render_workspace_missing_panel(
     root: &Option<std::path::PathBuf>,
     reason: &str,
@@ -4231,29 +4306,7 @@ fn render_workspace_missing_panel(
     // binding is dispatched first and `ModalConfirm`'s `Ignore` arm would
     // otherwise consume the keystroke before any listener ran. `space`
     // has no binding anywhere, so it still arrives as a plain key event.
-    let button = |idx: usize,
-                  id: &'static str,
-                  label: &'static str,
-                  focus: &[FocusHandle; 3],
-                  cx: &mut Context<AppView>| {
-        let ring = cx.theme().accent;
-        let base = cx.theme().bg_hover;
-        div()
-            .id(id)
-            .track_focus(&focus[idx])
-            .key_context(WORKSPACE_CHOICE_CONTEXT)
-            .tab_index(idx as isize)
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .bg(base)
-            .border_1()
-            .border_color(base)
-            // Keyboard users must SEE which choice Enter/Space would take.
-            .focus(|s| s.border_color(ring))
-            .cursor_pointer()
-            .child(label)
-    };
+    let button = workspace_choice_button;
     let mut panel = div()
         .id("workspace-missing-panel")
         // T4 review NIT-11: the panel is a TAB GROUP tracking its own
@@ -4317,6 +4370,110 @@ fn render_workspace_missing_panel(
                         cx.quit();
                     }
                 })),
+        )
+        .into_any_element()
+}
+
+/// „Zpět", not „Zrušit": this button does not abandon anything — it
+/// returns to the three choices of the panel above. `WorkspaceMissing` is
+/// the one modal that cannot be closed, and a cancel label that suggests
+/// otherwise would be a promise the design deliberately does not keep.
+pub(crate) const WORKSPACE_RECOVERY_BACK: &str = "Zpět";
+
+/// FINAL-REVIEW MINOR-1 — the SECOND state of the §W4 blocking modal: a
+/// workspace folder has been picked and classified, and the user is being
+/// told what adopting it means before anything is written.
+///
+/// „Najít složku…" is an ADOPT. Settings' adopt shows „Trezor tohoto
+/// prostoru se odemyká jeho vlastním master heslem." and the git warning
+/// before it commits (§W3.3/§W6.3); recovery used to write the pointer and
+/// swap the context the instant the folder dialog returned, so the user
+/// took on a foreign vault and a versioned-secrets decision having been
+/// told neither thing. §W6.3's wording is „renders STATICALLY wherever the
+/// folder-pick flow is offered", and this is one of the two places it is
+/// offered.
+///
+/// The copy is `workspace_confirm_lines(Adopt)` — the SAME vector Settings
+/// renders, not a second spelling of it — minus nothing: even „Aktivní
+/// připojení bude odpojeno." is true here in the sense that matters (a
+/// blocked start has no connection, and the line costs one row).
+///
+/// The panel stays BLOCKING. There is no Esc path, no `close_modal`, and
+/// „Zpět" returns to the choices rather than dismissing anything; the only
+/// exits from this modal remain the three the design enumerates.
+fn render_workspace_recovery_confirm_panel(
+    picked: &std::path::Path,
+    error: &Option<String>,
+    panel_focus: &FocusHandle,
+    focus: &[FocusHandle; 3],
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    // Same collapse as the panel above, and for the same reason: this is
+    // one unwrapped flex column with no text wrapping, and a picked path
+    // can carry anything the filesystem allows.
+    let path_line = dbc_state::workspace::one_line_reason(&picked.display().to_string());
+    let mut panel = div()
+        .id("workspace-recovery-confirm-panel")
+        .track_focus(panel_focus)
+        .tab_group()
+        .w(px(460.))
+        .bg(cx.theme().bg_panel)
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(cx.theme().text_primary)
+        .child(
+            div().text_size(px(16.)).child(workspace_confirm_title(WorkspaceConfirmMode::Adopt)),
+        )
+        .child(div().text_color(cx.theme().text_muted).child(path_line));
+    for line in workspace_confirm_lines(WorkspaceConfirmMode::Adopt) {
+        panel = panel.child(div().text_color(cx.theme().text_muted).child(line));
+    }
+    if let Some(e) = error {
+        panel = panel.child(div().text_color(cx.theme().danger).child(format!("error: {e}")));
+    }
+    panel
+        .child(
+            workspace_choice_button(
+                0,
+                "workspace-recovery-confirm",
+                workspace_confirm_button(WorkspaceConfirmMode::Adopt),
+                focus,
+                cx,
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.confirm_workspace_recovery(cx)))
+            .on_action(
+                cx.listener(|this, _: &ActivateChoice, _, cx| this.confirm_workspace_recovery(cx)),
+            )
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                if activates_focused_choice(ev) {
+                    cx.stop_propagation();
+                    this.confirm_workspace_recovery(cx);
+                }
+            })),
+        )
+        .child(
+            workspace_choice_button(
+                1,
+                "workspace-recovery-back",
+                WORKSPACE_RECOVERY_BACK,
+                focus,
+                cx,
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.cancel_workspace_recovery(cx)))
+            .on_action(
+                cx.listener(|this, _: &ActivateChoice, _, cx| this.cancel_workspace_recovery(cx)),
+            )
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                if activates_focused_choice(ev) {
+                    cx.stop_propagation();
+                    this.cancel_workspace_recovery(cx);
+                }
+            })),
         )
         .into_any_element()
 }
@@ -6056,11 +6213,18 @@ mod modal_confirm_kind_tests {
     fn workspace_missing_is_the_only_blocking_modal() {
         for root in [None, Some(std::path::PathBuf::from("D:\\ws-gone"))] {
             for error in [None, Some("nelze zapsat ukazatel".to_string())] {
-                assert!(modal_is_blocking(&ModalState::WorkspaceMissing {
-                    root: root.clone(),
-                    reason: "chybí dbc-workspace.toml".to_string(),
-                    error: error.clone(),
-                }));
+                // …in EVERY shape, the final-review MINOR-1 adopt-confirm
+                // state included: putting that confirm INSIDE this modal
+                // rather than handing the screen to an Esc-closable
+                // `WorkspaceConfirm` is only safe while it blocks too.
+                for pending in [None, Some(std::path::PathBuf::from("D:\\ws-nalezeny"))] {
+                    assert!(modal_is_blocking(&ModalState::WorkspaceMissing {
+                        root: root.clone(),
+                        reason: "chybí dbc-workspace.toml".to_string(),
+                        error: error.clone(),
+                        pending,
+                    }));
+                }
             }
         }
         for m in [
@@ -6200,12 +6364,18 @@ mod modal_confirm_kind_tests {
     fn workspace_missing_is_ignored_in_every_shape() {
         for root in [None, Some(std::path::PathBuf::from("D:\\ws-gone"))] {
             for error in [None, Some("nelze zapsat ukazatel".to_string())] {
-                let m = ModalState::WorkspaceMissing {
-                    root: root.clone(),
-                    reason: "složka neexistuje".to_string(),
-                    error: error.clone(),
-                };
-                assert!(matches!(modal_confirm_kind(&m), ModalConfirmKind::Ignore));
+                // …and the final-review MINOR-1 confirm state, whose button
+                // ADOPTS a foreign vault — the newest shape of this modal
+                // and the last one that may become Enter-reachable.
+                for pending in [None, Some(std::path::PathBuf::from("D:\\ws-nalezeny"))] {
+                    let m = ModalState::WorkspaceMissing {
+                        root: root.clone(),
+                        reason: "složka neexistuje".to_string(),
+                        error: error.clone(),
+                        pending,
+                    };
+                    assert!(matches!(modal_confirm_kind(&m), ModalConfirmKind::Ignore));
+                }
             }
         }
     }
@@ -6509,6 +6679,63 @@ mod workspace_confirm_tests {
             .any(|l| *l == WORKSPACE_GIT_WARNING));
     }
 
+    /// FINAL-REVIEW MINOR-1. „Najít složku…" in the §W4 blocking modal is
+    /// an ADOPT — it points the app at a workspace folder it did not
+    /// previously own — and it used to write the pointer and swap the
+    /// context the instant the folder dialog returned. Settings' adopt has
+    /// always shown the foreign-vault line and §W6.3's git warning first;
+    /// recovery showed neither, so the user took on someone else's
+    /// encrypted vault and a versioned-secrets decision uninformed.
+    /// §W6.3's own wording is „renders STATICALLY wherever the folder-pick
+    /// flow is offered", and recovery is one of the two places it is.
+    ///
+    /// Source-pinned, both halves, because a GPUI panel cannot be rendered
+    /// headlessly. Non-vacuous: each slice is proved to be the real
+    /// function before anything is required of it.
+    #[test]
+    fn the_recovery_confirm_shows_the_adopt_disclosures_and_the_panel_behind_it_does_not() {
+        let src = include_str!("connections_ui.rs");
+        // Ends at the next top-level item OR its doc comment: stopping
+        // only at `\nfn ` would swallow the next function's `///` block
+        // and let prose satisfy — or falsify — a claim about code.
+        let slice = |marker: &str| -> String {
+            let b = src.split(marker).nth(1).unwrap_or_else(|| panic!("{marker} exists"));
+            let end = ["\nfn ", "\n/// ", "\npub ", "\n// ---"]
+                .iter()
+                .filter_map(|m| b.find(m))
+                .min()
+                .unwrap_or(b.len());
+            b[..end].to_string()
+        };
+
+        // The confirm state renders the SAME vector Settings renders, so
+        // the two adopt paths physically cannot drift apart. Asserting on
+        // the call, not on the copy, is the point.
+        let confirm = slice("fn render_workspace_recovery_confirm_panel(");
+        assert!(confirm.contains("workspace_choice_button"), "the sliced body is not the real one");
+        assert!(
+            confirm.contains("workspace_confirm_lines(WorkspaceConfirmMode::Adopt)"),
+            "the recovery confirm must render the adopt lines, not a second copy of the copy"
+        );
+        // And that vector is the one carrying both disclosures.
+        let lines = workspace_confirm_lines(WorkspaceConfirmMode::Adopt);
+        assert!(lines.iter().any(|l| *l == WORKSPACE_GIT_WARNING));
+        assert!(lines
+            .iter()
+            .any(|l| *l == "Trezor tohoto prostoru se odemyká jeho vlastním master heslem."));
+
+        // The NEGATIVE half, and it is not an oversight: the three-choice
+        // panel is what the user meets ON STARTUP, and §W6.3 is explicit
+        // that the warning appears at decision points and never on
+        // startup. The user has not chosen a folder yet at that screen.
+        let panel = slice("fn render_workspace_missing_panel(");
+        assert!(panel.contains("WORKSPACE_MISSING_FIND"), "the sliced body is not the real one");
+        assert!(
+            !panel.contains("WORKSPACE_GIT_WARNING"),
+            "the startup panel must stay warning-free (§W6.3: never on startup)"
+        );
+    }
+
     /// §W3.2's never-destructive promise and §W3.4's "the folder is not
     /// touched" promise, each stated to the user BEFORE the write.
     #[test]
@@ -6529,6 +6756,7 @@ mod workspace_confirm_tests {
                 root: None,
                 reason: String::new(),
                 error: None,
+                pending: None,
             }),
             ModalConfirmKind::Ignore
         );
@@ -6700,6 +6928,7 @@ mod workspace_confirm_tests {
                 root: None,
                 reason: String::new(),
                 error: None,
+                pending: None,
             },
         ] {
             assert!(modal_blocks_context_switch(Some(&m)), "must block a context switch");
