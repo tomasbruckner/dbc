@@ -1558,7 +1558,17 @@ pub(crate) fn script_name_confirm_kind() -> ModalConfirmKind {
 /// wedged for the rest of the process: Esc is refused here, „Zrušit" and
 /// the confirm button are both rendered inert, `context_switch_blocked`
 /// refuses a workspace swap while a modal is up, and the only escape is
-/// killing the app. Unsaved editor text would go with it.
+/// killing the app.
+///
+/// **AND — T9 re-verify, the consequence worth spelling out — since
+/// MAJOR-1 a wedged dialog wedges Ctrl+S too.** `script_save_allowed`
+/// refuses a save while ANY modal owns the screen, so a latched dialog
+/// means the unsaved editor buffer cannot be saved AT ALL before the
+/// process is killed. Still the right call: the alternative is letting a
+/// Ctrl+S race the mutation running underneath, which recreates a file the
+/// user just irreversibly deleted. But it raises the cost of the trade
+/// from „one dialog is stuck" to „the buffer is unrecoverable", which is
+/// why reason 2 below has to keep being TRUE, not merely plausible.
 ///
 /// Accepted, for three reasons:
 ///

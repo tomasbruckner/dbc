@@ -7072,6 +7072,41 @@ impl AppView {
                     cx.notify();
                     return;
                 }
+                // T9 RE-VERIFY FAIL-1. The generation check above is NOT
+                // enough, and MAJOR-1's own scenario walks straight through
+                // the gap: `on_save_script` asked `script_save_allowed`
+                // BEFORE the picker opened, and the picker is not app-modal
+                // on every platform, so the whole dialog-open window is
+                // unguarded on this branch.
+                //
+                // 1. Editor UNBOUND and dirty. Ctrl+S → guard passes →
+                //    `save_script_as` → the picker opens.
+                // 2. The user deletes `trzby.sql` from the tree and
+                //    confirms. `script_save_in_flight` is still false (no
+                //    write was dispatched), so the serialization check does
+                //    not fire; the delete lands. `finish_script_delete`
+                //    runs with `was_bound == false` — the editor is
+                //    unbound, that is why we are in save-AS — so
+                //    `set_script_binding` is never called and the
+                //    generation is NEVER BUMPED.
+                // 3. The user completes the picker naming `trzby.sql`. The
+                //    generation check passes, the write lands, and the
+                //    irreversibly deleted file is silently back.
+                //
+                // So the predicate is re-asked HERE, continuation-side,
+                // exactly the asymmetry T9 review MINOR-2 established
+                // between `set_script_name_error` (synchronous, sound) and
+                // `land_script_name_error` (post-await, must re-verify): a
+                // check performed before an await is a check about the past.
+                if !script_save_allowed(
+                    view.modal.is_some(),
+                    view.apply_dialog.is_some(),
+                    view.discard_confirm.is_some(),
+                ) {
+                    view.status = SCRIPT_SAVE_BLOCKED.to_string();
+                    cx.notify();
+                    return;
+                }
                 // Rescan when the save lands INSIDE the library; outside is
                 // allowed (it is the user's disk) but the tree honestly
                 // won't show it.
@@ -14083,11 +14118,35 @@ mod editor_clobber_audit {
 /// covered the moment it exists). A ban list only ever covers the regions
 /// someone remembered to list; this covers the crate.
 ///
-/// Together the two needles mean NO BYTE reaches a user-chosen folder from
-/// this crate except through `AppView::save_script` — guarded, serialized,
+/// Together the needles mean NO BYTE reaches THE SCRIPTS LIBRARY from this
+/// crate except through `AppView::save_script` — guarded, serialized,
 /// generation-checked — or `scripts::create_script`, which probes for a
 /// collision through the Unicode-aware rail first. The library's run
 /// cannot write at all, from any function, however it is reached.
+///
+/// **T9 re-verify NIT-A: "the scripts library", NOT "a user-chosen
+/// folder".** The older, wider sentence was false and it is worth knowing
+/// exactly how, so nobody re-widens it. Two other writers in this crate do
+/// reach folders the user chose:
+///
+/// * `grid.rs`'s CSV/JSON export (`File::create` + rename)
+/// * `er_diagram_view.rs`'s SVG export (`fs::write`)
+///
+/// Neither can silently reach the library: both are user-directed through
+/// `prompt_for_new_path` opened with an EMPTY start directory, so the user
+/// types the destination every time and no automatic path leads there. The
+/// invariant this audit actually protects — nothing writes into the
+/// scripts library behind the user's back — holds; the sentence claiming
+/// coverage of every user folder did not.
+///
+/// **Recorded, not fixed (pre-existing, out of this phase's scope):**
+/// `grid.rs`'s exporter independently derives `<path>.tmp`, byte-identical
+/// to `fsutil::tmp_path_for`. That is a second writer over the same tmp
+/// convention whose single-writer contract `write_atomic`'s doc states as
+/// if it covered every writer over a user folder. It is only reachable by
+/// exporting a grid onto the exact path of an in-flight script save, which
+/// takes deliberate effort, and the blanket `*.tmp` in the shipped
+/// `.gitignore` covers it either way. See the as-built §C table.
 ///
 /// The test call sites are sanctioned BY NAME rather than skipped: the
 /// exact-count assertion is what makes a new one a deliberate decision,
@@ -14131,19 +14190,67 @@ mod script_write_audit {
         );
     }
 
-    /// MAJOR-1's guard, pinned structurally as well as behaviourally: the
-    /// predicate exists, and it is called from `on_save_script` and
-    /// nowhere else. A future "quick" save path that skips it fails here
-    /// rather than silently racing a delete.
+    /// T9 RE-VERIFY FAIL-1, the missing link in the chain. The audit above
+    /// sanctions the OWNER `save_script` unconditionally, so the chain
+    /// stopped there: `save_script`'s own callers were audited by nothing,
+    /// and the re-verify added a plausible future handler calling
+    /// `self.save_script(..)` directly — straight past `script_save_allowed`
+    /// — and got the whole suite green, all three audits included. The only
+    /// signal was a dead-code warning, which disappears the moment the
+    /// handler is wired to a listener.
+    ///
+    /// Two legal callers, and only two: `on_save_script` (the ONE entry
+    /// point for Ctrl+S, the caption strip's „Uložit" and the palette
+    /// action — all three verified to route through it) and
+    /// `save_script_as`, which re-asks the predicate itself because its
+    /// check sits after an await.
+    ///
+    /// **The needle is `.save_script`, with the dot.** `audit` matches
+    /// `needle + "("` as a plain SUBSTRING, so a bare `save_script` would
+    /// also match `on_save_script(` and count the entry point's own three
+    /// call sites as writes. The leading dot is the receiver, which every
+    /// real call has (`self.` / `view.`) and which `.on_save_script(` does
+    /// not put in front of `save_script` — and it also keeps the `fn
+    /// save_script(` definition line out of the count for free.
     #[test]
-    fn the_ctrl_s_dialog_guard_is_wired_exactly_once() {
+    fn the_writer_itself_is_reachable_only_through_the_guarded_entry_points() {
+        audit(
+            ".save_script",
+            &["on_save_script", "save_script_as"],
+            2,
+            "`AppView::save_script` is the WRITER - reaching it around `on_save_script` \
+             skips `script_save_allowed` entirely, and MAJOR-1's scenario (a Ctrl+S racing \
+             a confirmed delete, recreating the file the user just irreversibly removed) \
+             is back. A new save path asks the predicate first, then calls this",
+        );
+    }
+
+    /// MAJOR-1's guard, pinned structurally as well as behaviourally: the
+    /// predicate exists, and it is asked at every point where a save can
+    /// still be stopped. A future "quick" save path that skips it fails
+    /// here rather than silently racing a delete.
+    ///
+    /// T9 re-verify FAIL-1 made this TWO production sites, not one.
+    /// `on_save_script` asks it synchronously, before anything is
+    /// dispatched; `save_script_as` asks it AGAIN in its post-await
+    /// continuation, because the file picker is not app-modal on every
+    /// platform and the entry-point check is, by then, a statement about
+    /// the past. (The test name used to say „exactly once" and was the
+    /// clearest statement of the bug.)
+    #[test]
+    fn the_ctrl_s_dialog_guard_is_asked_at_every_stoppable_point() {
         audit(
             "script_save_allowed",
             // The predicate's own unit test is a real call site; naming it
             // here is what makes the exact count meaningful.
-            &["on_save_script", "ctrl_s_is_refused_whenever_any_dialog_owns_the_screen"],
-            6,
-            "every Ctrl+S entry point must ask this - `.occlude()` blocks clicks, not keys",
+            &[
+                "on_save_script",
+                "save_script_as",
+                "ctrl_s_is_refused_whenever_any_dialog_owns_the_screen",
+            ],
+            7,
+            "every Ctrl+S entry point must ask this - `.occlude()` blocks clicks, not keys - \
+             and a path that awaits between the check and the write must ask it AGAIN",
         );
     }
 }
