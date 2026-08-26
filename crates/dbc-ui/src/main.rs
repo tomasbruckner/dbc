@@ -1568,6 +1568,81 @@ pub(crate) const SCRIPT_SAVE_BLOCKED: &str = "nejprve zavřete otevřený dialog
 ///
 /// The text audits are KEPT and were widened (belt and braces), but they
 /// are not what holds this invariant up.
+/// RE-VERIFY: the SECOND compiler-enforced rail, and the one the previous
+/// round declined on the wrong grounds.
+///
+/// `SqlInput::replace_buffer` is the only mutating text API on the editor,
+/// and Part S §5.5 says exactly one guard stands in front of it. That was
+/// held up by `editor_clobber_audit` alone — a source-text audit — and the
+/// last two rounds walked past it three separate ways: an aliased
+/// fn-pointer, a module directory the walk pruned by prefix, and an
+/// out-of-tree `#[path]` module. Every one of those clobbered a bound
+/// script's unsaved changes with no undo.
+///
+/// The previous round declined a witness here, citing the Task 8 note on
+/// `editor_clobber_audit`: a real rail would mean moving `AppView.sql`
+/// behind a private accessor, splitting `impl AppView` across files and
+/// dragging the autocomplete plumbing with it. That is a fair objection to
+/// the shape Task 8 proposed and IRRELEVANT to this one. A scope needs no
+/// accessor and no module move: the editor entity stays exactly where it
+/// is, and what changes is that `replace_buffer` will not compile without
+/// a permit only this module can mint.
+///
+/// The precondition is real, which is what separates this from the three
+/// witnesses still declined (see the as-built note): the editor holds
+/// nothing unsaved, OR the user has just answered „Zahodit" for the very
+/// action being performed. `editor_load_guarded` already computes exactly
+/// that; this module simply refuses to let anyone else decide it.
+mod editor_guard {
+    use crate::AppView;
+    use gpui::Context;
+    use std::marker::PhantomData;
+
+    /// Permission to destroy the editor's buffer, valid only inside the
+    /// [`with_editor_replaceable`] scope that produced it.
+    ///
+    /// Same generative invariant brand as `save_guard::SaveAllowed`, for
+    /// the same reason and with the same guarantee: it cannot be returned,
+    /// stored, or captured by a `'static` future, so a permission checked
+    /// before an await cannot be spent after one. (Re-verify FAIL-2 is why
+    /// that is spelled `fn(&'brand ()) -> &'brand ()` and not `&'brand ()`.)
+    #[must_use = "this permit IS the permission to destroy unsaved editor text"]
+    pub(crate) struct BufferReplace<'brand>(PhantomData<fn(&'brand ()) -> &'brand ()>);
+
+    /// THE mint. `None` — the closure never runs — means the editor holds
+    /// unsaved changes nobody has agreed to lose.
+    ///
+    /// Two ways to be allowed, and they are the two `editor_load_guarded`
+    /// already distinguishes:
+    ///
+    /// * **Nothing is at stake.** `script_is_dirty` is a live read of the
+    ///   buffer against `saved_text`, so this cannot be stale.
+    /// * **The user said „Zahodit".** That is a fact about the past which
+    ///   no later read can recover, so `on_discard_confirm_yes` records it
+    ///   — STAMPED WITH THE GENERATION it was granted at, and consumed
+    ///   once. Every path that moves the binding bumps that generation
+    ///   (`set_script_binding`, `supersede_script_continuations`), so a
+    ///   grant cannot be spent on a different editor state than the one
+    ///   the user was asked about. That is the same reasoning
+    ///   `script_open_abort_reason` applies to the read it guards.
+    pub(crate) fn with_editor_replaceable<R>(
+        view: &mut AppView,
+        cx: &mut Context<AppView>,
+        f: impl for<'brand> FnOnce(&mut AppView, &mut Context<AppView>, BufferReplace<'brand>) -> R,
+    ) -> Option<R> {
+        if !view.script_is_dirty(cx) {
+            return Some(f(view, cx, BufferReplace(PhantomData)));
+        }
+        if view.editor_discard_grant == Some(view.script_binding_generation) {
+            // One shot. A second replacement needs a second answer.
+            view.editor_discard_grant = None;
+            return Some(f(view, cx, BufferReplace(PhantomData)));
+        }
+        None
+    }
+}
+use editor_guard::with_editor_replaceable;
+
 mod save_guard {
     use crate::AppView;
     use gpui::Context;
@@ -1648,6 +1723,15 @@ use save_guard::{with_save_permission, SaveAllowed};
 /// arrived while the previous write was still fsyncing, and the „ •" stays
 /// up so they can see the buffer is not yet on disk.
 pub(crate) const SCRIPT_SAVE_IN_FLIGHT: &str = "ukládání skriptu už probíhá";
+
+/// RE-VERIFY: the refusal when something tries to replace the editor's
+/// buffer while it holds unsaved changes nobody agreed to lose.
+///
+/// Unreachable through `editor_load_guarded`, which is the point — this is
+/// what a NEW path that forgot the guard now hits instead of silently
+/// destroying the user's text. Not an „error:": nothing failed.
+pub(crate) const SCRIPT_LOAD_BLOCKED: &str =
+    "editor má neuložené změny — nejprve je uložte nebo zahoďte";
 
 /// May an in-flight `open_script` still replace the editor's buffer?
 ///
@@ -2047,6 +2131,18 @@ struct AppView {
     /// `start_csv_import`, `pick_workspace_for_recovery`,
     /// `open_workspace_confirm` are the precedents).
     script_binding_generation: u64,
+    /// „The user answered „Zahodit" for the action about to run" — the one
+    /// fact `editor_guard::with_editor_replaceable` cannot re-derive from
+    /// live state, stamped with the `script_binding_generation` it was
+    /// granted at and consumed once.
+    ///
+    /// Written by exactly two functions and read by one; pinned by
+    /// `the_discard_grant_is_written_only_where_the_user_answered`. Any
+    /// third writer is a way to fake the user's answer, which is why the
+    /// grant is a generation rather than a bool: every path that moves the
+    /// binding bumps it, so a stale grant expires on its own instead of
+    /// waiting to be spent.
+    editor_discard_grant: Option<u64>,
     /// T8 review MAJOR-2: is a `save_script` write still in flight? The
     /// shared `fsutil::write_atomic` rail derives ONE tmp path per target,
     /// so two overlapping writes to the same file corrupt each other's tmp
@@ -7076,9 +7172,21 @@ impl AppView {
     /// never drift (a `set_text` without a matching `saved_text` update is
     /// exactly how a phantom „ •" appears).
     pub(crate) fn bind_script(&mut self, path: PathBuf, text: String, cx: &mut Context<Self>) {
-        self.sql.update(cx, |s, cx| s.replace_buffer(&text, cx));
-        self.set_script_binding(Some(ScriptBinding { path, saved_text: text }));
-        self.status = String::new();
+        // RE-VERIFY: the buffer replacement is behind the compiler now.
+        // `editor_load_guarded` said this was safe at DISPATCH and
+        // `script_open_abort_reason` has just re-checked that root,
+        // binding and buffer all stood still — so the permission asked for
+        // here is the same one, asked again, at the instant it is spent.
+        let permitted = with_editor_replaceable(self, cx, |view, cx, permit| {
+            view.sql.update(cx, |s, cx| s.replace_buffer(&text, cx, permit));
+            view.set_script_binding(Some(ScriptBinding { path, saved_text: text }));
+            view.status = String::new();
+        });
+        if permitted.is_none() {
+            // Unreachable through the guard, and a silent no-op is the
+            // shape this phase keeps banning, so it says so.
+            self.status = SCRIPT_LOAD_BLOCKED.to_string();
+        }
         cx.notify();
     }
 
@@ -7134,8 +7242,13 @@ impl AppView {
                 cx.notify();
             }
             PendingScriptAction::LoadText { sql } => {
-                self.sql.update(cx, |s, cx| s.replace_buffer(&sql, cx));
-                self.set_script_binding(None);
+                let permitted = with_editor_replaceable(self, cx, |view, cx, permit| {
+                    view.sql.update(cx, |s, cx| s.replace_buffer(&sql, cx, permit));
+                    view.set_script_binding(None);
+                });
+                if permitted.is_none() {
+                    self.status = SCRIPT_LOAD_BLOCKED.to_string();
+                }
                 cx.notify();
             }
         }
@@ -8954,7 +9067,15 @@ impl AppView {
             }
             // Workspace T8 (Part S §5.5): the user confirmed dropping the
             // script's unsaved changes — perform what was parked.
-            PendingDiscard::Script(action) => self.perform_script_action(action, cx),
+            // RE-VERIFY: the user has just agreed to lose the script's
+            // unsaved changes. That answer is the one thing
+            // `editor_guard::with_editor_replaceable` cannot read off live
+            // state, so it is recorded here — stamped with the generation
+            // it was given at, so it expires the moment the binding moves.
+            PendingDiscard::Script(action) => {
+                self.editor_discard_grant = Some(self.script_binding_generation);
+                self.perform_script_action(action, cx);
+            }
         }
         cx.notify();
     }
@@ -12220,6 +12341,7 @@ fn main() {
                             script_binding: None,
                             script_dirty_flag: false,
                             script_binding_generation: 0,
+                            editor_discard_grant: None,
                             script_save_in_flight: false,
                             modal_focus_handle: cx.focus_handle(),
                             modal_needs_focus: false,
@@ -15028,6 +15150,16 @@ mod editor_clobber_audit {
         audit_excluding(needle, &[], sanctioned, expected, why);
     }
 
+    /// [`audit`] for a FIELD rather than a function.
+    ///
+    /// A field is never „called", so re-verify FAIL-8's call-shape rule
+    /// does not apply — and must not, or every read of the field is a
+    /// finding. Everything else is identical: whole-word mentions, exact
+    /// owner names, pinned count.
+    pub(super) fn audit_field(needle: &str, sanctioned: &[&str], expected: usize, why: &str) {
+        audit_inner(needle, &[], sanctioned, expected, why, false);
+    }
+
     /// [`audit`], plus tokens that must NOT count as a mention.
     ///
     /// FINAL-REVIEW MAJOR-2 named the false positive instead of dodging it
@@ -15076,6 +15208,19 @@ mod editor_clobber_audit {
         expected: usize,
         why: &str,
     ) {
+        audit_inner(needle, exclude, sanctioned, expected, why, true);
+    }
+
+    /// The shared body. `require_call` is re-verify FAIL-8's rule, which
+    /// applies to functions and not to fields.
+    fn audit_inner(
+        needle: &str,
+        exclude: &[&str],
+        sanctioned: &[&str],
+        expected: usize,
+        why: &str,
+        require_call: bool,
+    ) {
         let mut sites = 0usize;
         for (name, src) in sources() {
             let code = code_lines(&src);
@@ -15093,6 +15238,17 @@ mod editor_clobber_audit {
                 {
                     continue;
                 }
+                let owner = who[i].as_deref();
+                // A struct FIELD DECLARATION is not a write. It sits at
+                // file scope inside the `struct` body, so it is told apart
+                // by having no owning function and by being `name:` at the
+                // start of its line — a shape no assignment has.
+                if !require_call
+                    && owner.is_none()
+                    && line.trim_start().starts_with(&format!("{needle}:"))
+                {
+                    continue;
+                }
                 sites += 1;
                 // RE-VERIFY FAIL-8: a mention must be a CALL. The name rule
                 // bounds where the identifier appears; it does not bound
@@ -15105,10 +15261,10 @@ mod editor_clobber_audit {
                 // visible right here: a call is followed by `(`, a binding
                 // by `;` or `,` or `)`.
                 assert!(
-                    is_call_mention(&line, needle),
+                    !require_call || is_call_mention(&line, needle),
                     "`{needle}` is MENTIONED but not CALLED at {name}:{} (in `{}`) - binding it                      as a value (`let f = ...;`, a rename, an argument) hands the capability to                      code this audit cannot see, which is exactly how it was defeated. Call it,                      or import it plainly",
                     i + 1,
-                    who[i].as_deref().unwrap_or("<file scope>")
+                    owner.unwrap_or("<file scope>")
                 );
                 let owner = who[i].as_deref();
                 assert!(
@@ -15642,6 +15798,42 @@ more();");
             2,
             "route it through `AppView::editor_load_guarded` (Part S §5.5) or a bound \
              script's unsaved changes are destroyed silently, with no undo",
+        );
+    }
+
+    /// RE-VERIFY: the editor permit is a real rail only while the DISCARD
+    /// GRANT is honest, so the grant's writers are audited by name.
+    ///
+    /// `with_editor_replaceable` refuses a dirty editor unless the user
+    /// has just answered „Zahodit". That answer cannot be re-derived from
+    /// live state, so it is recorded in `AppView::editor_discard_grant` —
+    /// and anything that could SET that field is a way to fake the user's
+    /// answer and clobber unsaved text. There are exactly three legal
+    /// mentions: where the user answers, where it is spent, and the field
+    /// declaration itself; plus the struct literal that initialises it.
+    ///
+    /// This is a name audit, with all the limits the as-built note spells
+    /// out — but the thing it guards is a single `Option<u64>` written in
+    /// one place, which is about the smallest surface a name audit can be
+    /// asked to cover.
+    #[test]
+    fn the_discard_grant_is_written_only_where_the_user_answered() {
+        audit_field(
+            "editor_discard_grant",
+            &[
+                // The user's answer, recorded.
+                "on_discard_confirm_yes",
+                // …and spent, once.
+                "with_editor_replaceable",
+                // `AppView`'s one construction site, which must name every
+                // field. `None` is the only value it may start at, and a
+                // grant minted before the window exists would be spent by
+                // the first load — so this one is sanctioned by NAME and
+                // pinned by the count, not waved through by shape.
+                "main",
+            ],
+            4,
+            "setting this fakes the user's answer to the discard prompt, which is the one              thing standing between a background load and a bound script's unsaved changes",
         );
     }
 

@@ -472,7 +472,12 @@ impl SqlInput {
     /// must mention this identifier. Only `AppView::bind_script` and
     /// `AppView::perform_script_action` may call it — both sit behind
     /// `AppView::editor_load_guarded` (Part S §5.5).
-    pub fn replace_buffer(&mut self, text: &str, cx: &mut Context<Self>) {
+    pub fn replace_buffer(
+        &mut self,
+        text: &str,
+        cx: &mut Context<Self>,
+        _permit: crate::editor_guard::BufferReplace<'_>,
+    ) {
         self.buffer.set_text(text);
         self.marked_range = None;
         self.scroll_offset_lines = 0;
