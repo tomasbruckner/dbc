@@ -314,11 +314,59 @@ pub(crate) fn blocked_paths(root: Option<&Path>) -> dbc_state::workspace::Paths 
     // failure mode is an empty default config written over the user's real
     // connections. So the promise is now STRUCTURAL: a root that resolves
     // to the profile dir falls through to the sentinel.
-    let base = match root {
-        Some(r) if !is_same_dir(r, &profile) => r.to_path_buf(),
-        _ => profile.join(BLOCKED_WORKSPACE_SENTINEL),
+    //
+    // FINAL-REVIEW MINOR-2, the residual the structural promise still had.
+    // The pointer's `path` is arbitrary TOML text that nothing validates
+    // on the way IN (`write_pointer` demands an absolute path, but a
+    // hand-edited `workspace.toml` never goes through it and
+    // `read_pointer` hands back whatever string it finds). A `path = ""`
+    // therefore reached here as `Some("")`, and every guard above missed
+    // it: `"" != profile`, and `Path::new("").canonicalize()` ERRORS on
+    // Windows, so `is_same_dir` answered `false` and `base` became `""`.
+    // `workspace_paths("")` then yields the bare RELATIVE names
+    // `config.toml`, `vault.bin`, … which the OS resolves against the
+    // process CWD — and if the app was launched from `%APPDATA%\dbc`,
+    // those ARE the profile's real files, i.e. exactly what the doc
+    // comment above promises can never happen.
+    //
+    // Not reachable today (a blocked start disables every store, see
+    // `StartupContext::loads`), and that is deliberately not the standard
+    // this function is held to — the T4 review MAJOR-2 note two paragraphs
+    // up says so in as many words. So: a root we cannot name ABSOLUTELY is
+    // not a root at all, and falls through to the sentinel with everything
+    // else we cannot trust.
+    let base = match blocked_base(root, &profile) {
+        Some(r) => r,
+        None => profile.join(BLOCKED_WORKSPACE_SENTINEL),
     };
     dbc_state::workspace::workspace_paths(&base)
+}
+
+/// The folder a BLOCKED start's paths may point into, or `None` for „use
+/// the sentinel". Split out so [`blocked_paths`]'s rule is testable
+/// against a supplied profile dir rather than the real one.
+///
+/// Three ways to fail, all meaning the same thing — we do not know where
+/// this pointer meant, so we must name somewhere that does not exist:
+/// the pointer named nothing (`""`); it named something RELATIVE; or it
+/// named the profile directory itself.
+///
+/// The relative arm is deliberately absolute-or-nothing rather than the
+/// review's narrower „relative and non-canonicalizable". Canonicalizing
+/// `..` succeeds — and resolves against the process CWD, which this app
+/// does not set and an installer shortcut may well point at the profile
+/// dir. That is the same CWD dependence the empty path had, just harder
+/// to see. `write_pointer` already refuses to WRITE a relative root, for
+/// this exact reason spelled out in its own doc („a relative path would
+/// round-trip into a DIFFERENT folder"); this is the matching refusal on
+/// the way back IN, where a hand-edited pointer arrives without ever
+/// having passed that rail.
+fn blocked_base(root: Option<&Path>, profile: &Path) -> Option<PathBuf> {
+    let r = root?;
+    if !r.is_absolute() {
+        return None;
+    }
+    (!is_same_dir(r, profile)).then(|| r.to_path_buf())
 }
 
 /// "Do these two paths name the same directory?" — exact match first (works
@@ -13369,6 +13417,56 @@ mod workspace_startup_tests {
         // A genuine workspace root is still used as-is.
         let real_ws = prof.join("nekde-jinde-workspace");
         assert_eq!(blocked_paths(Some(&real_ws)).config, real_ws.join("config.toml"));
+    }
+
+    /// FINAL-REVIEW MINOR-2, the residual the test above did not cover.
+    /// The pointer's `path` is arbitrary TOML text — `read_pointer` hands
+    /// back whatever string it finds, and a hand-edited pointer never goes
+    /// through `write_pointer`'s absolute-path rail. A `path = ""` walked
+    /// past every guard (`"" != profile`; `Path::new("").canonicalize()`
+    /// errors on Windows, so `is_same_dir` said `false`) and `base` became
+    /// `""` — whereupon `workspace_paths` returned the bare RELATIVE names
+    /// `config.toml`, `vault.bin`, …, which the OS resolves against the
+    /// process CWD. Launch the app from `%APPDATA%\dbc` and those are the
+    /// profile's real files: precisely the promise `blocked_paths` makes.
+    #[test]
+    fn a_root_that_cannot_be_named_absolutely_falls_through_to_the_sentinel() {
+        let sentinel = blocked_paths(None);
+        // The empty pointer.
+        assert_eq!(blocked_paths(Some(Path::new(""))), sentinel);
+        // Any relative spelling at all — including `..`, which
+        // canonicalizes just fine and is therefore the SUBTLE half: it
+        // still resolves against the process CWD, which this app does not
+        // set. All of these used to produce CWD-relative store paths.
+        for rel in ["config", "..", "./nekde", "a/b"] {
+            let got = blocked_paths(Some(Path::new(rel)));
+            assert_eq!(got, sentinel, "relative root {rel:?} must not survive");
+        }
+        // The property that actually matters, stated directly: whatever a
+        // blocked start's paths are, they are ABSOLUTE, so nothing about
+        // them depends on the process working directory.
+        for root in [None, Some(Path::new("")), Some(Path::new("a/b"))] {
+            let p = blocked_paths(root);
+            for path in [&p.config, &p.vault, &p.views, &p.params] {
+                assert!(path.is_absolute(), "{} is CWD-relative", path.display());
+            }
+        }
+    }
+
+    /// The rule [`blocked_paths`] rests on, in isolation and against a
+    /// SUPPLIED profile dir, so the three „we do not know where this
+    /// meant" cases are pinned without depending on the machine's real
+    /// `%APPDATA%`.
+    #[test]
+    fn the_blocked_base_accepts_only_an_absolute_non_profile_folder() {
+        let prof = PathBuf::from(r"C:\Users\x\AppData\Roaming\dbc");
+        assert_eq!(blocked_base(None, &prof), None, "no root at all");
+        assert_eq!(blocked_base(Some(Path::new("")), &prof), None, "the empty pointer");
+        assert_eq!(blocked_base(Some(Path::new("nekde")), &prof), None, "relative, unresolvable");
+        assert_eq!(blocked_base(Some(Path::new("..")), &prof), None, "relative, but resolvable");
+        assert_eq!(blocked_base(Some(&prof), &prof), None, "the profile dir itself");
+        let ws = PathBuf::from(r"D:\ws");
+        assert_eq!(blocked_base(Some(&ws), &prof), Some(ws.clone()), "a real root is kept");
     }
 
     /// T4 review MINOR-3: the rail's ENFORCEMENT, not just its paths. The
