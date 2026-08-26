@@ -2067,6 +2067,10 @@ an arbitrary path into this workspace and neither is used anywhere in it:
 data, cannot introduce a call site, and this crate uses `include_str!` for
 its own source pins. Banning the class beats chasing the instance.
 
+**Correction (second re-verify, FAIL-7):** as first written that ban was a
+SPELLING TEST, not a ban — three ordinary spellings walked past it. See
+§U. It is a real check now, and §T states what it is worth.
+
 A `macro_rules!` wrapper was also tried and is caught by the existing rails:
 the macro body still names the identifier.
 
@@ -2169,3 +2173,176 @@ promise, and it is less than this section originally implied.
 
 Every row was run in this worktree, reverted afterwards, and the tree
 confirmed clean.
+
+# Jak to nakonec je (as-built) — second scoped re-verify, v0.22.0
+
+Written after the second scoped re-verify of §N–§R returned FAIL. Those
+sections stand except where corrected here and in §J/§P, which this pass
+edited in place.
+
+The generative brand survived a serious attack — twelve shapes, including
+a `RefCell` stash, a `thread_local`, `Box<dyn Any>`,
+`Box<dyn FnOnce + 'static>`, a `cx.spawn` capture, returning it as `R`, an
+fn *item* taking `SaveAllowed<'static>`, explicit variance both ways,
+forging from the crate root, and `#[allow(unsafe_code)]` + `mem::zeroed`.
+It held every time. Everything else in that round needed work.
+
+## S. `replace_buffer` — the decline that was wrong
+
+§P declined a witness on `SqlInput::replace_buffer`, citing the Task 8
+note: a real rail would mean moving `AppView.sql` behind a private
+accessor, splitting `impl AppView` across files, and dragging the
+autocomplete plumbing with it.
+
+**That is a fair objection to the shape Task 8 proposed and irrelevant to
+a scope.** No accessor, no module move: the editor entity stays exactly
+where it is. What changed is that `replace_buffer` does not compile
+without a `BufferReplace<'brand>` that only `editor_guard` can mint.
+
+The precondition is real — which is the whole test for whether a witness
+is a rail or theatre. The editor holds nothing unsaved, **or** the user
+has just answered „Zahodit" for the action being performed.
+`editor_load_guarded` already computed exactly that; now nobody else can
+decide it.
+
+The second arm is a fact about the PAST that no later read recovers, so
+`on_discard_confirm_yes` records it in `AppView::editor_discard_grant` —
+**stamped with the `script_binding_generation` it was granted at, and
+consumed once**. Every path that moves the binding bumps that generation,
+so a stale grant expires on its own instead of waiting to be spent; the
+same reasoning `script_open_abort_reason` applies to the read it guards.
+The grant's writers are name-audited (4 mentions, 3 owners) — a small
+surface for a name audit, and the smallest this one could be given.
+
+Verified: a `replace_buffer` call injected into `perform_script_action` —
+an explicitly SANCTIONED owner, where every text audit passes — is now a
+**compile error**. This closes the clobber half of FAIL-6, FAIL-7 and the
+round-2 fn-pointer bypass structurally rather than by inspection.
+
+## T. What the audits can and cannot promise
+
+§P blurred this and §O overstated it. Precisely:
+
+**Compiler-enforced (three now):**
+
+| Rail | Precondition it runs |
+|---|---|
+| `save_guard::with_save_permission` → `AppView::save_script` | no dialog owns the screen |
+| `editor_guard::with_editor_replaceable` → `SqlInput::replace_buffer` | editor not dirty, or the user just discarded |
+| `dbc_state::ConfigSaveGuard` → `AppConfig::save` | the file about to be overwritten parses |
+
+All three are backed by `#![forbid(unsafe_code)]` — on `dbc-ui` since the
+last round, and now on `dbc-state` too, because `ConfigSaveGuard` is
+DEFINED there and `mem::zeroed` could forge it there.
+
+**Audit-only (three): `write_script`, `write_atomic`, `bind_script`.**
+The re-verifier accepted these declines, and this round found the reason
+the write ones cannot be fixed the way the editor one was — by running it
+rather than asserting it:
+
+> Giving `scripts::write_script` a brand-bound permit does not compile.
+> The write is dispatched into `cx.spawn` / `background_spawn`, whose
+> future must be `'static`, and the compiler says
+> **„lifetime may not live long enough"** at the spawn. A permit that
+> COULD cross that boundary would have to be `'static` — and a `'static`
+> permit is exactly as leakable as the fn pointer it would replace.
+
+That is the structural difference between the two writers: `replace_buffer`
+runs synchronously on the UI thread, so its permit can be brand-bound;
+`write_script` runs on a background thread, so its permit cannot be.
+`bind_script`'s precondition is `open_script`'s and is enforced upstream.
+`write_atomic` has no precondition of its own, and `dbc-state` cannot run
+`dbc-ui`'s. (§P previously said a cross-crate private constructor was
+impossible — false, and falsified by `ConfigSaveGuard` in that same crate.
+Corrected in place.)
+
+**The ninth bypass, found by this pass, and NOT closed.** A closure
+wrapper at a sanctioned site:
+
+```rust
+// inside `save_script` — a sanctioned owner, mention count unchanged
+let w = |p: &Path, t: &str| crate::scripts::write_script(p, t);
+PROBE.with(|c| c.set(Some(w as fn(&Path, &str) -> Result<(), String>)));
+w(&job_path, &job_text)
+```
+
+0 warnings, 966 passing. The mention IS a call, so re-verify FAIL-8's rule
+is satisfied; the owner IS sanctioned; the count is unchanged. The
+capability escapes inside the closure, which names nothing.
+
+The same trick against `replace_buffer` **fails to compile** (`E0521`,
+borrowed data escapes outside of closure), which is the clearest possible
+statement of what a type rail buys over an audit.
+
+It is recorded rather than patched because no source-text rule closes it:
+a closure body is legitimate code at a legitimate site, and any heuristic
+that flagged it would flag the real call too. What it means in practice:
+**these audits defend against an accidental new writer and against
+refactors that detach a name — they are not a defence against a
+deliberate leak from inside a sanctioned function.** Anyone who can edit
+`save_script` can also just call the writer. The type rails are what stop
+even that, and there are three.
+
+## U. The predicates the scanner got wrong
+
+Four, each beaten by an ordinary spelling rather than a trick.
+
+- **FAIL-9 was RED on a fresh checkout of this branch** — not theoretical.
+  `code_lines` split on the newline and KEPT the carriage return, so on a
+  CRLF checkout every logical line ended in an invisible `\r`, and the §N
+  pin compares one with `assert_eq!`. This machine has
+  `core.autocrlf = true` globally, so a fresh worktree gave
+  **963 passed / 1 failed** and the release run **961 / 3** — the two known
+  `chart_data` failures plus this one — while the live worktree passed
+  because its `main.rs` had been written by an editor as LF. §J's counts
+  and its „exactly the two known failures" were therefore false as
+  delivered. `code_lines` now drops `\r`; every consumer wants logical
+  lines and none wants the terminator. **Lesson recorded: a worktree whose
+  files were written rather than checked out cannot reproduce this class
+  of bug, so the gates are now run in a freshly checked-out tree.**
+- **FAIL-6 — `sources()` pruned by PREFIX** (`starts_with("target")`), so a
+  plain `mod targets;` was invisible to every audit, as were
+  `target_picker/` and `targeting/`. No trick, and `targets` is a name
+  somebody could add innocently. Nothing is pruned by name shape now:
+  metadata by EXACT name, build output by cargo's own `CACHEDIR.TAG`
+  marker. A directory a developer names is always scanned.
+- **FAIL-7 — the `#[path]` / `include!` ban was a spelling test.** It asked
+  whether ONE LINE held both `#[` and `path =`. Three spellings walked
+  past: no spaces around `=`, the attribute split over two lines, and
+  `include!{…}` with a brace. A ban a formatter can defeat is not a ban.
+  The file's code is now flattened with all whitespace removed before
+  matching, which makes spacing and line breaks irrelevant by
+  construction, with a map back to real line numbers for the report.
+  `cfg_attr` is banned whole (unused anywhere here); `include_str!` and
+  `include_bytes!` stay legal because they carry data, not call sites.
+- **FAIL-8 — the name rule bounds the identifier, not the capability.**
+  Rewriting `save_script`'s single existing mention — sanctioned owner,
+  count unchanged — as `let w = crate::scripts::write_script;` leaked the
+  writer as a fn pointer. Every mention must now be a CALL or a plain
+  import; a binding, a rename, or passing it as an argument is flagged
+  where it happens. (This is what the ninth bypass then goes around, by
+  making the mention a real call inside a closure.)
+
+## V. Smaller corrections
+
+- `AppConfig::save`'s exact-bytes path compare is deliberate and now says
+  why: `same_path_ci` answers „do these two names reach the same file on
+  disk", a filesystem question needing the Unicode fold; this asks „is
+  this the same value the caller proved something about", one caller's own
+  bookkeeping, where every live site passes the same expression twice.
+  Folding would make it LOOSER and would drag `dbc-state` into owning a
+  case-fold policy it does not have.
+- `let _ = defect;` discarded the `Unparsable` reason. It is now carried
+  into the rename-failure status, where „nelze zálohovat poškozený
+  config.toml" otherwise said nothing about why it was thought poškozený.
+- The §N pin is BRACE DEPTH rather than literal indentation. The
+  positional version broke on a CRLF checkout and would break again on a
+  `tab_spaces` change; depth 1 is the property actually meant. Verified
+  non-vacuous — moving the call inside the `if` reports `Some(2)`.
+- **§P cited „the codebase has already declined this twice in writing".
+  There is exactly ONE prior decline** (Task 8's, on
+  `editor_clobber_audit`, unchanged across the whole history of
+  `main.rs`). The „second" was the sentence making the claim, added in the
+  same pass that cited it. Recorded rather than quietly deleted, because a
+  doc citing itself as corroboration is how a weak decision becomes
+  load-bearing — and it is what this decline then rested on.
