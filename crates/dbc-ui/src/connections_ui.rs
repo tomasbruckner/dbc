@@ -2533,9 +2533,9 @@ impl AppView {
         cx.notify();
     }
 
-    fn cycle_engine(&mut self, cx: &mut Context<Self>) {
+    fn set_engine(&mut self, engine: Engine, cx: &mut Context<Self>) {
         if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
-            ui.engine = next_engine(ui.engine);
+            ui.engine = engine;
         }
         cx.notify();
     }
@@ -3158,19 +3158,24 @@ pub(crate) fn compare_side_label(name: &str, engine: Engine, db: Option<&str>) -
     }
 }
 
-fn next_engine(e: Engine) -> Engine {
-    match e {
-        Engine::Postgres => Engine::Mssql,
-        Engine::Mssql => Engine::Sqlite,
-        // G16 T6 ON-flip: Duckdb enters the picker cycle only after the
-        // embedded live tier (runner.rs duckdb_runner_tests +
-        // duckdb_backup_restore_tests, plan.rs duckdb fixtures/capture,
-        // connect.rs duckdb_connect_tests, dbc-mcp duckdb test) went green
-        // on this branch — the G15 flip discipline, embedded edition.
-        Engine::Sqlite => Engine::Duckdb,
-        Engine::Duckdb => Engine::Postgres,
-    }
-}
+/// Every engine the connection dialog offers, in display order.
+///
+/// This replaced a `next_engine` CYCLE (user, 2026-08-28: „přepínání enginu
+/// ve vytváření připojení je špatný"). A cycle button showed one engine at a
+/// time and made DuckDB three clicks from Postgres with no way to see that
+/// DuckDB existed at all. The picker now renders this list as a segmented
+/// row — every option visible, any of them one click away.
+///
+/// It is also the reason adding a fifth engine cannot silently skip the UI:
+/// `the_picker_offers_every_engine` matches this against `Engine`'s own
+/// variants, so a new engine fails the test until it is listed here.
+///
+/// G16 T6 ON-flip: Duckdb is in the list only because the embedded live tier
+/// (runner.rs duckdb_runner_tests + duckdb_backup_restore_tests, plan.rs
+/// duckdb fixtures/capture, connect.rs duckdb_connect_tests, dbc-mcp duckdb
+/// test) went green — the G15 flip discipline, embedded edition.
+pub(crate) const ALL_ENGINES: [Engine; 4] =
+    [Engine::Postgres, Engine::Mssql, Engine::Sqlite, Engine::Duckdb];
 
 /// G16 §2: the two file-based engines share the "database = file path, no
 /// host/port/password, no vault secret" convention. ONE predicate — a
@@ -3298,20 +3303,26 @@ mod test_vault_prompt_tests {
         assert!(!test_needs_vault_prompt(true, Engine::Duckdb, false, true));
     }
 
-    /// G16 T6 ON-flip (rewrites the T3 pre-flip pin): the dialog's engine
-    /// cycle visits all four engines exactly once and returns to start —
-    /// Duckdb is now creatable from the picker.
+    /// Rewrites `next_engine_cycles_through_all_four` for the segmented
+    /// picker. The cycle version could only assert that stepping four times
+    /// came back to the start; this asserts the stronger property the user
+    /// actually cares about — every engine is ON SCREEN, no duplicates.
+    ///
+    /// `engine_label` is exhaustive over `Engine`, so a fifth variant fails to
+    /// compile there; this test then catches the second half of that
+    /// mistake — adding the variant but not listing it in `ALL_ENGINES`,
+    /// which would leave it unreachable from the dialog with no other signal.
     #[test]
-    fn next_engine_cycles_through_all_four() {
-        let mut seen = vec![Engine::Postgres];
-        let mut e = Engine::Postgres;
-        for _ in 0..3 {
-            e = next_engine(e);
-            assert!(!seen.contains(&e), "cycle revisited {e:?} early");
+    fn the_picker_offers_every_engine() {
+        let mut seen: Vec<Engine> = vec![];
+        for &e in ALL_ENGINES.iter() {
+            assert!(!seen.contains(&e), "{e:?} listed twice in the picker");
             seen.push(e);
         }
-        assert!(seen.contains(&Engine::Duckdb), "Duckdb must be reachable from the picker");
-        assert_eq!(next_engine(e), Engine::Postgres, "cycle must close back to the start");
+        for e in [Engine::Postgres, Engine::Mssql, Engine::Sqlite, Engine::Duckdb] {
+            assert!(seen.contains(&e), "{e:?} is not offered by the picker");
+        }
+        assert_eq!(seen.len(), 4, "picker must offer exactly the four known engines");
     }
 
     /// G16: the shared file-based predicate itself, all four engines.
@@ -3644,17 +3655,28 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
                 .items_center()
                 .gap_2()
                 .child(div().w(px(130.)).text_color(cx.theme().text_muted).child("Engine"))
-                .child(
-                    div()
-                        .id("engine-cycle")
-                        .px_2()
-                        .py_1()
-                        .bg(cx.theme().bg_hover)
-                        .rounded_md()
-                        .cursor_pointer()
-                        .child(engine_label(ui.engine))
-                        .on_click(cx.listener(|view, _, _, cx| view.cycle_engine(cx))),
-                ),
+                // Segmented row, not a dropdown: with four options a popup
+                // costs an extra click and an overlay to dismiss, and hides
+                // the very thing the user complained was hidden.
+                .child(ALL_ENGINES.iter().fold(div().flex().gap_1(), |row, &e| {
+                    let selected = ui.engine == e;
+                    row.child(
+                        div()
+                            .id(SharedString::from(format!("engine-{}", engine_label(e))))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(if selected { cx.theme().accent } else { cx.theme().bg_hover })
+                            .text_color(if selected {
+                                cx.theme().bg_panel
+                            } else {
+                                cx.theme().text_muted
+                            })
+                            .cursor_pointer()
+                            .child(engine_label(e))
+                            .on_click(cx.listener(move |view, _, _, cx| view.set_engine(e, cx))),
+                    )
+                })),
         )
         .child(field_row("Host", ui.host.clone(), *cx.theme()))
         .child(field_row("Port", ui.port.clone(), *cx.theme()))

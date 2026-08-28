@@ -142,6 +142,44 @@ pub struct AppConfig {
     /// there either. The seam is `dbc-ui`'s `scripts_root_for`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scripts_dir: Option<String>,
+    /// Sidebar width in logical pixels. Global chrome, like `theme` — it
+    /// describes the window, not a connection, so it does NOT belong in
+    /// `views.toml` (which is keyed per connection+database).
+    ///
+    /// `None` = never resized, use the built-in default, so a future default
+    /// change still reaches users who never touched the splitter.
+    ///
+    /// Whole logical pixels (`u16`, not `f32`): a width of 273.42 px is not a
+    /// thing a user can express or perceive, and `AppConfig` derives `Eq` —
+    /// which a float would forbid — so the dirty check that decides whether
+    /// to write `config.toml` at all stays exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_width: Option<u16>,
+    /// How the schema tree groups objects under a database. Global by user
+    /// decision (2026-08-28) — one setting for the whole app rather than
+    /// per connection.
+    #[serde(default)]
+    pub tree_grouping: TreeGrouping,
+}
+
+/// The schema tree's two shapes.
+///
+/// [`TreeGrouping::Schema`] is the original: database → schema → kind →
+/// objects. [`TreeGrouping::Kind`] inverts the middle two levels: database →
+/// kind → every object of that kind from ALL schemas, each labelled
+/// `[schema].[name]`.
+///
+/// It is a REGROUPING of the snapshot the app already has, not a different
+/// query — `SchemaSnapshot` carries each object's schema already, so the two
+/// modes are the same data drawn twice and switching costs no round trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TreeGrouping {
+    /// database → schema → kind → objects (the original shape).
+    #[default]
+    Schema,
+    /// database → kind → `[schema].[name]` across every schema.
+    Kind,
 }
 
 /// FINAL-REVIEW MAJOR-2 — proof that overwriting `config.toml` will not
@@ -331,7 +369,25 @@ mod tests {
             theme: ThemeMode::Dark,
             tool_paths: ToolPaths::default(),
             scripts_dir: None,
+            // Non-default on purpose: `roundtrip_save_load` compares the
+            // loaded value against this one, so a field left at its default
+            // would round-trip even if `save` dropped it entirely.
+            sidebar_width: Some(317),
+            tree_grouping: TreeGrouping::Kind,
         }
+    }
+
+    /// Both new fields are `#[serde(default)]`, so a `config.toml` written
+    /// before they existed must still load — and must come back as the
+    /// documented defaults rather than as an error.
+    #[test]
+    fn a_config_from_before_the_sidebar_fields_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "theme = \"dark\"\n").unwrap();
+        let loaded = AppConfig::load(&p).unwrap();
+        assert_eq!(loaded.sidebar_width, None, "never resized = no stored width");
+        assert_eq!(loaded.tree_grouping, TreeGrouping::Schema, "the original tree shape");
     }
 
     #[test]
