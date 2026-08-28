@@ -1,3 +1,18 @@
+// RE-VERIFY MINOR-C. Every witness in this crate — `save_guard::SaveAllowed`
+// and anything that follows it — rests on a private constructor, and
+// `unsafe { std::mem::zeroed() }` forges any of them in one line, from
+// anywhere, with no warning. A private field is only a rail while the
+// crate cannot spell `unsafe`.
+//
+// `forbid` rather than `deny`: `deny` can be turned off again by an
+// `#[allow(unsafe_code)]` on the offending item, which is one line and no
+// warning — exactly the escape this is meant to close. `forbid` cannot be
+// overridden anywhere below it. dbc-ui contains no `unsafe` today (the
+// only occurrences are the word in comments and in the audit's own
+// `fn`-spelling probes), so this costs nothing now and makes adding any
+// later a deliberate, visible act.
+#![forbid(unsafe_code)]
+
 mod admin_panel;
 mod admin_sql;
 mod autocomplete;
@@ -23,6 +38,7 @@ mod row_view;
 mod runner;
 mod sandbox;
 mod schema_tree;
+mod scripts;
 mod sql_highlight;
 mod sql_input;
 mod tabs;
@@ -31,7 +47,7 @@ mod theme;
 mod tunnel;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use dbc_buffer::ResultBuffer;
@@ -46,7 +62,8 @@ use dbc_state::{
 };
 use gpui::{
     actions, div, prelude::*, px, size, uniform_list, AnyElement, App, Bounds, ClipboardItem,
-    Context, Entity, Focusable, KeyBinding, PathPromptOptions, ScrollDelta, ScrollWheelEvent,
+    Context, Entity, FocusHandle, Focusable, KeyBinding, PathPromptOptions, ScrollDelta,
+    ScrollWheelEvent,
     Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
@@ -66,7 +83,18 @@ use theme::ActiveTheme;
 
 actions!(
     dbc,
-    [RunQuery, RunQueryUnlimited, CancelQuery, ToggleTree, ToggleHistory, OpenPalette, OpenAutocomplete]
+    [
+        RunQuery,
+        RunQueryUnlimited,
+        CancelQuery,
+        ToggleTree,
+        ToggleHistory,
+        OpenPalette,
+        OpenAutocomplete,
+        // Workspace T8 (Part S §5.2/§5.4): bound => save, unbound =>
+        // save-as. Global, context `None`, same posture as `RunQuery`.
+        SaveScript
+    ]
 );
 
 /// G3 Task 5: Ctrl+K command palette state — created on `OpenPalette`,
@@ -139,12 +167,29 @@ fn autocomplete_handles_action(popup_open: bool) -> bool {
 /// text. This is intentional (review round 3 NIT): matching most editors'
 /// "complete up to the cursor" model rather than attempting to also
 /// understand/replace a suffix the user hasn't necessarily finished typing.
-fn completion_edit(text: &str, cursor: usize, insert: &str) -> (std::ops::Range<usize>, String) {
+///
+/// RE-VERIFY: the RANGE half is now the shared rail, because
+/// `SqlInput::accept_completion` uses it too. That function used to be
+/// handed a `prefix_len` by its caller, which is what let a caller pass
+/// `text().len()` and wipe the whole unsaved buffer with no permit and no
+/// audited identifier. There is one definition of „the identifier prefix
+/// ending at the cursor" and both the pure test and the live buffer
+/// surgery read it.
+pub(crate) fn completion_range(text: &str, cursor: usize) -> std::ops::Range<usize> {
     let ctx = autocomplete::cursor_context(text, cursor);
     let start = cursor - ctx.prefix.len();
+    start..cursor
+}
+
+/// The pure whole-string form, kept for the unit tests that pin the
+/// mid-word behaviour described above. Production goes through
+/// [`completion_range`] and splices in the buffer.
+#[cfg(test)]
+fn completion_edit(text: &str, cursor: usize, insert: &str) -> (std::ops::Range<usize>, String) {
+    let range = completion_range(text, cursor);
     let mut new_text = text.to_string();
-    new_text.replace_range(start..cursor, insert);
-    (start..cursor, new_text)
+    new_text.replace_range(range.clone(), insert);
+    (range, new_text)
 }
 
 /// G2 Task 7 (G15 §2d: dialect-aware): SQL builder for `TreeEvent::
@@ -269,6 +314,302 @@ fn engine_from_url(url: &str) -> dbc_state::Engine {
     } else {
         dbc_state::Engine::Sqlite
     }
+}
+
+// ---------------------------------------------------------------------
+// Workspace T4 — startup context resolution (design §W4).
+// ---------------------------------------------------------------------
+
+/// Folder name used for the BLOCKED start's paths when the pointer names
+/// nothing we can trust, so there is no target folder to name.
+///
+/// Deliberately not a real directory: nothing in this app ever creates it
+/// deliberately, so every store OPEN against it fails and finds nothing —
+/// which is the half that carries design §W4's never-a-silent-fallback
+/// rule.
+///
+/// FINAL-REVIEW MINOR-3: an earlier version of this comment also claimed
+/// „every SAVE against it fails loudly", and that was FALSE. All four
+/// store savers `create_dir_all` their own parent first
+/// (`config.rs:154`, `vault.rs:216`, `view_prefs.rs:65`, `params.rs:53` —
+/// `fsutil::write_atomic` correctly does not), so a stray save would
+/// SUCCEED and leave `%APPDATA%\dbc\__pracovni-prostor-nenalezen__\config.toml`
+/// on disk. Debris in a folder nobody reads, not a data loss — the
+/// invariant that actually matters, „never the profile's real files", is
+/// structural (see [`blocked_base`]) and pinned — but the stated property
+/// was not the real one, so it is corrected rather than quietly relied on.
+///
+/// The comment was corrected rather than the behaviour made to match it.
+/// Making the sentinel genuinely unwritable means either a
+/// platform-specific unusable name (`NUL` fails `create_dir_all` on
+/// Windows and succeeds on Linux — a rail that silently stops working on
+/// one target is worse than an honest comment) or removing
+/// `create_dir_all` from four PRE-EXISTING profile-store savers, which is
+/// what makes a first run work at all and is a `dbc-state` refactor this
+/// phase has already declined once (as-built §C). Neither buys anything:
+/// nothing can reach a save on a blocked start
+/// (`StartupContext::loads` opens no store, and the modal cannot be
+/// dismissed), and if something ever could, the file it would create is
+/// not one the app will read back.
+const BLOCKED_WORKSPACE_SENTINEL: &str = "__pracovni-prostor-nenalezen__";
+
+/// Paths for a BLOCKED start (design §W4). They point INTO the unusable
+/// workspace (or, when the pointer is unreadable, into a sentinel folder
+/// that does not exist) — NEVER at the profile's real files. Two reasons,
+/// both binding: (a) never a silent fallback — a bug that dismissed the
+/// blocking modal must find nothing to connect to; (b) never destructive —
+/// an empty default config saved over `%APPDATA%\dbc\config.toml` would
+/// erase connections the user never agreed to lose.
+pub(crate) fn blocked_paths(root: Option<&Path>) -> dbc_state::workspace::Paths {
+    let profile = dbc_state::workspace::profile_dir();
+    // T4 review MAJOR-2: the doc comment above promises "NEVER at the
+    // profile's real files", but `workspace_paths(root)` was handed
+    // whatever the POINTER said — and a `workspace.toml` containing
+    // `path = "…\AppData\Roaming\dbc"` resolves to exactly the profile's
+    // real `config.toml`/`vault.bin`/`views.toml`/`params.toml`. The app
+    // cannot write such a pointer itself (init demands `Empty`, adopt
+    // demands a marker) and no writer is reachable while the blocking
+    // modal is up — but "not reachable today" is not an invariant, and the
+    // failure mode is an empty default config written over the user's real
+    // connections. So the promise is now STRUCTURAL: a root that resolves
+    // to the profile dir falls through to the sentinel.
+    //
+    // FINAL-REVIEW MINOR-2, the residual the structural promise still had.
+    // The pointer's `path` is arbitrary TOML text that nothing validates
+    // on the way IN (`write_pointer` demands an absolute path, but a
+    // hand-edited `workspace.toml` never goes through it and
+    // `read_pointer` hands back whatever string it finds). A `path = ""`
+    // therefore reached here as `Some("")`, and every guard above missed
+    // it: `"" != profile`, and `Path::new("").canonicalize()` ERRORS on
+    // Windows, so `is_same_dir` answered `false` and `base` became `""`.
+    // `workspace_paths("")` then yields the bare RELATIVE names
+    // `config.toml`, `vault.bin`, … which the OS resolves against the
+    // process CWD — and if the app was launched from `%APPDATA%\dbc`,
+    // those ARE the profile's real files, i.e. exactly what the doc
+    // comment above promises can never happen.
+    //
+    // Not reachable today (a blocked start disables every store, see
+    // `StartupContext::loads`), and that is deliberately not the standard
+    // this function is held to — the T4 review MAJOR-2 note two paragraphs
+    // up says so in as many words. So: a root we cannot name ABSOLUTELY is
+    // not a root at all, and falls through to the sentinel with everything
+    // else we cannot trust.
+    let base = match blocked_base(root, &profile) {
+        Some(r) => r,
+        None => profile.join(BLOCKED_WORKSPACE_SENTINEL),
+    };
+    dbc_state::workspace::workspace_paths(&base)
+}
+
+/// The folder a BLOCKED start's paths may point into, or `None` for „use
+/// the sentinel". Split out so [`blocked_paths`]'s rule is testable
+/// against a supplied profile dir rather than the real one.
+///
+/// Three ways to fail, all meaning the same thing — we do not know where
+/// this pointer meant, so we must name somewhere that does not exist:
+/// the pointer named nothing (`""`); it named something RELATIVE; or it
+/// named the profile directory itself.
+///
+/// The relative arm is deliberately absolute-or-nothing rather than the
+/// review's narrower „relative and non-canonicalizable". Canonicalizing
+/// `..` succeeds — and resolves against the process CWD, which this app
+/// does not set and an installer shortcut may well point at the profile
+/// dir. That is the same CWD dependence the empty path had, just harder
+/// to see. `write_pointer` already refuses to WRITE a relative root, for
+/// this exact reason spelled out in its own doc („a relative path would
+/// round-trip into a DIFFERENT folder"); this is the matching refusal on
+/// the way back IN, where a hand-edited pointer arrives without ever
+/// having passed that rail.
+fn blocked_base(root: Option<&Path>, profile: &Path) -> Option<PathBuf> {
+    let r = root?;
+    if !r.is_absolute() {
+        return None;
+    }
+    (!is_same_dir(r, profile)).then(|| r.to_path_buf())
+}
+
+/// "Do these two paths name the same directory?" — exact match first (works
+/// for paths that do not exist), then a canonicalised compare, which on
+/// Windows also normalises casing, `.`/`..` segments and short names.
+/// `canonicalize` FAILS on a non-existent path, so a failure means the two
+/// cannot both be the (existing) profile dir and `false` is the right
+/// answer — the exact-match arm above has already covered the identical
+/// spelling case.
+fn is_same_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// THE scripts-root seam (design §W8), as a free fn so both arms are
+/// testable without an `AppView`. Workspace mode always wins and always
+/// resolves to `<workspace>/scripts`: a per-workspace override would
+/// reintroduce absolute paths into a folder whose whole point is
+/// portability, so `AppConfig.scripts_dir` is INERT there — deliberately
+/// not "merged", not "preferred if set". Profile mode is Part S §2's
+/// behavior, unchanged.
+pub(crate) fn scripts_root_for(
+    workspace_root: Option<&Path>,
+    scripts_dir: Option<&str>,
+) -> Option<PathBuf> {
+    match workspace_root {
+        Some(root) => Some(root.join(dbc_state::workspace::SCRIPTS_SUBDIR)),
+        None => scripts_dir.map(PathBuf::from),
+    }
+}
+
+/// Which persistent stores `main()` is ALLOWED to open. Exists so design
+/// §W4's actual enforcement — "a broken pointer loads NOTHING" — is a
+/// pinned unit test instead of three `blocked.is_some()` conditions buried
+/// in `fn main()`, which no test can reach (T4 review MINOR-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StartupLoads {
+    /// `AppConfig::load` — the connection list. NEVER on a blocked start.
+    pub config: bool,
+    /// `ViewPrefsStore::load`.
+    pub view_prefs: bool,
+    /// `ParamValuesStore::load`.
+    pub param_values: bool,
+    /// `HistoryDb::open` — machine-local in BOTH modes (§W5), so it opens
+    /// even on a blocked start: it carries no context-specific connection
+    /// state and losing it would degrade an unrelated feature.
+    pub history: bool,
+}
+
+/// What `main()` needs to know before it opens a single store. Pure over
+/// `Resolution` (workspace T2), so the whole never-silent-fallback rule is
+/// testable without a filesystem.
+pub(crate) struct StartupContext {
+    /// Where every store opens from.
+    pub paths: dbc_state::workspace::Paths,
+    /// `Some(root)` = workspace mode. Drives the Settings block (T5) and
+    /// `effective_scripts_root` (T7). A BROKEN workspace is NOT an active
+    /// workspace, so this stays `None` while `blocked` is `Some`.
+    pub workspace_root: Option<PathBuf>,
+    /// `Some((root, reason))` ⇒ open `ModalState::WorkspaceMissing` and load
+    /// NOTHING (design §W4).
+    pub blocked: Option<(Option<PathBuf>, String)>,
+}
+
+/// Turns a [`dbc_state::workspace::Resolution`] into the three things
+/// `main()` acts on. Pure — no I/O, no GPUI.
+impl StartupContext {
+    /// Design §W4, as a value rather than as control flow. A blocked start
+    /// opens NOTHING that carries context: not the workspace's files (they
+    /// are unusable — that is what "broken" means) and above all not the
+    /// profile's (that would be the silent fallback this design bans).
+    pub(crate) fn loads(&self) -> StartupLoads {
+        let blocked = self.blocked.is_some();
+        StartupLoads {
+            config: !blocked,
+            view_prefs: !blocked,
+            param_values: !blocked,
+            history: true,
+        }
+    }
+}
+
+pub(crate) fn startup_context(res: dbc_state::workspace::Resolution) -> StartupContext {
+    match res {
+        dbc_state::workspace::Resolution::Profile(paths) => {
+            StartupContext { paths, workspace_root: None, blocked: None }
+        }
+        dbc_state::workspace::Resolution::Workspace { root, paths } => {
+            StartupContext { paths, workspace_root: Some(root), blocked: None }
+        }
+        dbc_state::workspace::Resolution::Broken { root, reason } => StartupContext {
+            paths: blocked_paths(root.as_deref()),
+            workspace_root: None,
+            blocked: Some((root, reason)),
+        },
+    }
+}
+
+/// May a „Najít složku…" continuation still commit its pick? (T4 review
+/// MAJOR-1.) Extracted as a pure predicate — the `pwchange::esc_closable`
+/// precedent — because the racing code path lives inside a `cx.spawn`
+/// continuation that no unit test can drive.
+///
+/// TWO independent conditions, and both are load-bearing:
+///
+/// * the `WorkspaceMissing` modal must still be OPEN — if the user has
+///   meanwhile clicked „Použít lokální profil", the app is in profile mode
+///   by their EXPLICIT choice, and a folder pick landing afterwards would
+///   override it silently, which is the whole class of bug §W4 exists to
+///   prevent;
+/// * the pick's generation must still be current — every context swap
+///   (`apply_context`) bumps it, so a superseded pick is inert even in the
+///   window where a new modal has been opened by something else.
+pub(crate) fn recovery_pick_may_commit(
+    workspace_missing_modal_open: bool,
+    dispatched_generation: u64,
+    current_generation: u64,
+) -> bool {
+    workspace_missing_modal_open && dispatched_generation == current_generation
+}
+
+/// What `start_workspace_pick`'s continuation is allowed to do when its
+/// folder classification finally lands (T5 review MAJOR-1).
+///
+/// The race, and why `recovery_pick_may_commit`'s shape is not enough
+/// here: the platform folder picker IS modal to the app, but the
+/// `classify()` that follows it is a `cx.background_spawn` — it yields the
+/// UI thread, and `ModalState::Settings` is Esc-closable. So between the
+/// pick and its result the user can close Settings and reach ANY other
+/// state: a second workspace pick that is already initializing, a running
+/// `BackupRestore`, a half-typed `ConnectionDialog`. `open_workspace_confirm`
+/// used to raw-assign `self.modal` regardless, which meant a stale
+/// continuation could (a) reset a `running: true` confirm's latch and let
+/// the context swap after the user dismissed it, (b) overwrite a running
+/// backup session WITHOUT going through `close_modal` (the one teardown
+/// funnel that cancels the child process), or (c) simply wipe a typed
+/// password.
+///
+/// Two refusals, deliberately distinct, because they deserve different
+/// treatment:
+/// * `Superseded` — a context swap has happened under the task
+///   (`apply_context` bumps the generation). Say NOTHING and change
+///   nothing: the user has already reached a newer, explicit decision, and
+///   even a status line would be a stale write over it. This is
+///   `recovery_pick_may_commit`'s posture, for the same reason.
+/// * `OtherDialog` — the generation is current, but the app is no longer
+///   sitting on the Settings modal this pick started from. A status line
+///   here is safe and informative (`WORKSPACE_PICK_DISCARDED`), matching
+///   `start_script_pick`'s and `start_csv_import`'s „… zahozen — je
+///   otevřený jiný dialog" wording.
+///
+/// The generation is checked FIRST so a superseded pick stays silent even
+/// when it is also in the wrong modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspacePickVerdict {
+    /// Commit: open the confirm modal over the Settings modal.
+    Open,
+    /// A context swap happened under this pick — inert AND silent.
+    Superseded,
+    /// Still current, but some other dialog owns the screen — refuse with
+    /// a status line.
+    OtherDialog,
+}
+
+/// The guard behind [`WorkspacePickVerdict`]. Pure, because the
+/// continuation it protects is a `cx.spawn` no unit test can drive — the
+/// `recovery_pick_may_commit` precedent.
+pub(crate) fn workspace_pick_verdict(
+    settings_modal_open: bool,
+    dispatched_generation: u64,
+    current_generation: u64,
+) -> WorkspacePickVerdict {
+    if dispatched_generation != current_generation {
+        return WorkspacePickVerdict::Superseded;
+    }
+    if !settings_modal_open {
+        return WorkspacePickVerdict::OtherDialog;
+    }
+    WorkspacePickVerdict::Open
 }
 
 /// G12 T5: engine -> splitter dialect for the editor's multi-statement
@@ -406,11 +747,9 @@ fn list_sql_files(dir: &std::path::Path) -> Result<Vec<PathBuf>, String> {
         if !path.is_file() {
             continue;
         }
-        let is_sql = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("sql"));
-        if is_sql {
+        // T9 review NIT-3: THE extension rail (design §1.5), shared with
+        // the scan, the editor's save-as and the library's run.
+        if crate::scripts::is_sql_path(&path) {
             files.push(path);
         }
     }
@@ -981,6 +1320,529 @@ struct ApplyDialogState {
     focus_handle: gpui::FocusHandle,
 }
 
+// -----------------------------------------------------------------
+// Workspace T8 — the script editor binding's pure decisions (Part S §5).
+// Free functions so the dirty rule, the caption and the `.sql` rule are
+// unit-pinned without a GPUI window, the `decide_retrigger_action` /
+// `context_switch_refusal` precedent.
+// -----------------------------------------------------------------
+
+/// Part S §5: dirty = the editor text differs from what was last read from
+/// (or written to) disk. Exact compare, bounded by the 1 MiB open cap;
+/// `str`'s `!=` already short-circuits on length. Whitespace and line
+/// endings COUNT — the file is the truth and „ •" must not lie about it.
+fn script_text_is_dirty(editor: &str, saved: &str) -> bool {
+    editor != saved
+}
+
+/// The binding's display path: relative to the CURRENT scripts root when
+/// it lives under it, otherwise the bare file name. The binding itself
+/// holds an ABSOLUTE path (resolved rejected alternative: storing a rel
+/// breaks the moment the root changes) — this is only the label.
+fn script_caption_rel(path: &Path, root: Option<&Path>) -> String {
+    // T9 review MINOR-1: the SAME fold as every other binding comparison.
+    // A byte-exact `strip_prefix` here silently degraded to the bare file
+    // name whenever the configured root's casing differed from disk — the
+    // reason that whole bug class had no visible tell.
+    if let Some(root) = root {
+        if path_starts_with_ci(path, root) {
+            return path
+                .components()
+                .skip(root.components().count())
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join("/");
+        }
+    }
+    path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+/// The caption strip's label — the EXACT tab-title dirty convention (`" •"`,
+/// see `tabs::collapse_title`'s callers).
+fn script_caption(rel: &str, dirty: bool) -> String {
+    if dirty {
+        format!("Skript: {rel} •")
+    } else {
+        format!("Skript: {rel}")
+    }
+}
+
+/// Part S §5.4 / fact 0.6: `.sql` is enforced client-side because the
+/// pinned GPUI rev's `prompt_for_new_path` has no extension filter.
+fn with_sql_extension(path: &Path) -> PathBuf {
+    // T9 review NIT-3: THE extension rail, not a fourth spelling of it.
+    if crate::scripts::is_sql_path(path) {
+        path.to_path_buf()
+    } else {
+        let mut s = path.as_os_str().to_owned();
+        s.push(".sql");
+        PathBuf::from(s)
+    }
+}
+
+/// Did the editor's binding move to a DIFFERENT target? This is what
+/// `AppView::script_binding_generation` counts, and therefore what every
+/// async open/save continuation asks before it touches the binding.
+///
+/// Refreshing `saved_text` for the SAME path (a successful save) is
+/// deliberately not a change: the user did not move on, so a save that
+/// lands afterwards must still be allowed to update the binding. Only a
+/// different file — or unbinding, or binding where nothing was bound — is
+/// „the user moved on".
+fn script_binding_target_changed(old: Option<&Path>, new: Option<&Path>) -> bool {
+    match (old, new) {
+        // T9 review MINOR-1: folded, so a re-save of the SAME file reached
+        // through a differently-cased root is not mistaken for the user
+        // moving on (which would strand a phantom „ •" over a saved file).
+        (Some(a), Some(b)) => !same_path_ci(a, b),
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+/// Case-INSENSITIVE, Unicode-aware path fold — the SAME rule
+/// `dbc_state::fsutil` applies to names ([`dbc_state::fsutil::fold_name`],
+/// never `eq_ignore_ascii_case`), lifted to whole paths and applied per
+/// component so a separator can never fold into a name.
+///
+/// T10 carry-forward 6: this used to spell the fold itself, as
+/// `to_lowercase`, while claiming in this very comment to be applying
+/// `fsutil`'s rule — which is `to_uppercase`. Two folds coexisted in one
+/// crate for one job, and the one here was the WRONG one: `to_lowercase`
+/// implements Unicode's final-sigma context rule, so `…/ΟΔΟΣ.sql` and
+/// `…/οδοσ.sql` fold APART although NTFS resolves them to a single file —
+/// i.e. deleting the file would leave the binding standing, which is
+/// precisely the failure the paragraph below says this function prevents.
+/// It now calls the shared rail instead of re-spelling it.
+///
+/// T9 review MINOR-1. The binding's path has TWO producers that disagree
+/// on casing: the tree resolves against `effective_scripts_root()`, which
+/// is the CONFIGURED string and is never canonicalized, while save-as
+/// receives the OS dialog's true on-disk casing (GPUI pushes a
+/// `root.canonicalize()` through `SetFolder`). Byte-exact comparison then
+/// makes a root configured `D:\ws\Scripts` over an on-disk `D:\ws\scripts`
+/// answer FALSE for the very file being deleted: the binding survives, the
+/// caption goes on naming a file that is gone, and the next Ctrl+S
+/// silently recreates it — exactly what `finish_script_delete` says the
+/// rule prevents. NTFS is case-insensitive across all of Unicode, which is
+/// why the fold has to be too (`scripts::conflicting_name`'s rationale,
+/// verbatim — this was the one place in the phase that had reverted to
+/// `Path::eq`).
+fn path_fold(p: &Path) -> Vec<String> {
+    p.components()
+        .map(|c| dbc_state::fsutil::fold_name(&c.as_os_str().to_string_lossy()))
+        .collect()
+}
+
+/// Are these the same path on a case-insensitive volume? (See `path_fold`.)
+fn same_path_ci(a: &Path, b: &Path) -> bool {
+    path_fold(a) == path_fold(b)
+}
+
+/// Is `a` at or below `b`? The `Path::starts_with` component semantics,
+/// with `path_fold`'s casing rule.
+fn path_starts_with_ci(a: &Path, b: &Path) -> bool {
+    let (fa, fb) = (path_fold(a), path_fold(b));
+    fa.len() >= fb.len() && fa[..fb.len()] == fb[..]
+}
+
+/// Part S §4: is the editor's binding touched by a mutation of `target`?
+///
+/// Exact hit, OR — when `target` is a FOLDER — anywhere beneath it. The
+/// second arm is the one the plan text did not have and the Task 9 brief
+/// demanded: `rename_entry` renames folders too, so „only an exact match
+/// counts" would leave the binding pointing at a path that no longer
+/// exists the moment a parent folder is renamed. `is_dir` gates it
+/// because a FILE whose path happens to be a prefix of the binding's is
+/// not an ancestor of it.
+fn script_binding_affected(binding: &Path, target: &Path, is_dir: bool) -> bool {
+    if same_path_ci(binding, target) {
+        return true;
+    }
+    is_dir && path_starts_with_ci(binding, target)
+}
+
+/// „Does the editor's binding point AT this tree entry (or inside it)?" —
+/// as a FREE fn over the three pieces of state it depends on, so the
+/// question can be asked at any instant without an `AppView` and, above
+/// all, so it can never be answered by a bool captured earlier.
+///
+/// FINAL-REVIEW MAJOR-1. `confirm_script_delete` used to compute
+/// `was_bound` BEFORE dispatching the background delete and hand it to
+/// `finish_script_delete`, which applied it blind. That is the phase's own
+/// banned shape — a check performed before an `await` is a statement about
+/// the PAST — and it lost data in the resurrection direction:
+///
+/// 1. Editor UNBOUND. Double-click `trzby.sql` → `read_script` dispatched.
+/// 2. Right-click → Smazat → confirm. `was_bound == false`. Delete
+///    dispatched.
+/// 3. The read lands FIRST. `script_open_abort_reason` passes all three
+///    legs (root unchanged; generation unchanged, because an unbound
+///    editor never called `set_script_binding` so nothing bumped it;
+///    buffer untouched) → `bind_script` binds the doomed `trzby.sql`.
+/// 4. The delete lands. `was_bound == false`, so the binding is NOT
+///    cleared: the caption still names a file that no longer exists.
+/// 5. Ctrl+S — `script_save_allowed` passes, the modal is long closed —
+///    and the irreversibly deleted file is silently back on disk.
+///
+/// The symmetric direction is milder but equally wrong: bound to `a.sql`,
+/// an in-flight open of `b.sql` lands during a confirmed delete of
+/// `a.sql`, `was_bound == true`, and the NEW `b.sql` binding is dropped so
+/// the next Ctrl+S silently becomes a save-as.
+///
+/// Both are the same asymmetry T9 review MINOR-2 established between
+/// `set_script_name_error` (synchronous, sound) and `land_script_name_error`
+/// (post-await, must re-verify), and the fix is the same: the landing
+/// re-ASKS. `retarget_binding_after_rename` — the delete's sibling — was
+/// already written this way, which is why rename never had the bug.
+fn binding_targets_entry(
+    binding: Option<&Path>,
+    root: Option<&Path>,
+    rel: &str,
+    is_dir: bool,
+) -> bool {
+    let (Some(binding), Some(root)) = (binding, root) else { return false };
+    crate::scripts::resolve_entry_rel(root, rel)
+        .is_ok_and(|p| script_binding_affected(binding, &p, is_dir))
+}
+
+/// Where the binding must MOVE to when `old` is renamed to `new`, or
+/// `None` when the binding is not affected at all. For a folder rename the
+/// binding's suffix below `old` is rebased onto `new`, so „rename the
+/// folder containing the open script" keeps the caption honest instead of
+/// silently stranding it on a dead path.
+fn script_binding_retarget(
+    binding: &Path,
+    old: &Path,
+    new: &Path,
+    is_dir: bool,
+) -> Option<PathBuf> {
+    if !script_binding_affected(binding, old, is_dir) {
+        return None;
+    }
+    // By component COUNT, not `strip_prefix`: the prefix may differ from
+    // `old` in casing (that is the whole point of `path_fold`), and the
+    // suffix must keep the casing it actually has on disk.
+    let mut out = new.to_path_buf();
+    for c in binding.components().skip(old.components().count()) {
+        out.push(c.as_os_str());
+    }
+    Some(out)
+}
+
+/// T9 review MAJOR-1: the refusal when Ctrl+S arrives while a dialog owns
+/// the screen. Like [`SCRIPT_SAVE_IN_FLIGHT`] it is deliberately NOT an
+/// „error:" — nothing failed, and the way out is one Esc away.
+pub(crate) const SCRIPT_SAVE_BLOCKED: &str = "nejprve zavřete otevřený dialog";
+
+/// FINAL-REVIEW MAJOR-2 — the Ctrl+S guard, as a TYPE the compiler
+/// enforces instead of a regex a reviewer can walk around.
+///
+/// `script_write_audit` pinned this rule textually and the reviewer beat
+/// it with the most ordinary alternative call syntax in Rust: the needle
+/// was `.save_script(` — with the leading dot, and its doc comment argued
+/// at length for the dot — and UFCS puts a COLON there, so
+/// `AppView::save_script(self, path, text, false, cx)` sailed past both
+/// the audit and the zero-warning gate. That is the fifth time a text
+/// audit in this phase has been defeated.
+///
+/// So the rule moved into the type system. [`SaveAllowed`] is a witness
+/// with a PRIVATE field, and `save_script` demands one by value. Rust's
+/// finest privacy granularity is the module, and `main.rs` is the crate
+/// ROOT — a private field declared there would be visible crate-wide and
+/// prove nothing — so the witness and its only mint live in this small
+/// child module. A parent cannot see a child's private items, which makes
+/// `SaveAllowed(..)` unspellable everywhere in `dbc-ui` except the lines
+/// below. There is no receiver to rebind, no path spelling to vary and no
+/// macro to hide it in.
+///
+/// **RE-VERIFY FAIL-2 — the first version was a VALUE, and this comment
+/// claimed more than the type delivered.** It said a witness „cannot be
+/// re-used after an await… stashing the first one across the picker would
+/// not compile", resting that on `!Copy + !Clone`. Those forbid a second
+/// USE of one value; they do not forbid a MOVE. The re-verifier gave
+/// `save_script_as` the witness as a parameter, captured it in the
+/// `async move` block, dropped the re-mint — clean build, 961 green — and
+/// so restored T9 re-verify FAIL-1 whole: Ctrl+S → picker opens → user
+/// deletes `trzby.sql` and confirms → picker completes naming
+/// `trzby.sql` → the irreversibly deleted file is silently back.
+///
+/// The permission is therefore no longer a value handed out at all.
+/// [`save_guard::with_save_permission`] is a SCOPE: the witness carries a
+/// generative brand (`SaveAllowed<'brand>` over an INVARIANT
+/// `PhantomData`), the closure is `for<'brand> FnOnce(..) -> R`, and `R`
+/// is one type chosen before `'brand` exists — so the witness cannot be
+/// returned from the scope, cannot be stored in anything that outlives
+/// it, and above all cannot be captured by `cx.spawn`, whose future must
+/// be `'static`. The closure is synchronous, so there is no await inside
+/// the scope to hold it across either.
+///
+/// Stated precisely, because over-claiming is exactly what let the last
+/// round through: this makes the permission unable to LEAVE the
+/// synchronous scope in which the predicate was checked. That is the
+/// property „a check before an await is a statement about the past"
+/// actually needs.
+///
+/// The text audits are KEPT and were widened (belt and braces), but they
+/// are not what holds this invariant up.
+/// RE-VERIFY: the SECOND compiler-enforced rail, and the one the previous
+/// round declined on the wrong grounds.
+///
+/// `SqlInput::replace_buffer` is the only mutating text API on the editor,
+/// and Part S §5.5 says exactly one guard stands in front of it. That was
+/// held up by `editor_clobber_audit` alone — a source-text audit — and the
+/// last two rounds walked past it three separate ways: an aliased
+/// fn-pointer, a module directory the walk pruned by prefix, and an
+/// out-of-tree `#[path]` module. Every one of those clobbered a bound
+/// script's unsaved changes with no undo.
+///
+/// The previous round declined a witness here, citing the Task 8 note on
+/// `editor_clobber_audit`: a real rail would mean moving `AppView.sql`
+/// behind a private accessor, splitting `impl AppView` across files and
+/// dragging the autocomplete plumbing with it. That is a fair objection to
+/// the shape Task 8 proposed and IRRELEVANT to this one. A scope needs no
+/// accessor and no module move: the editor entity stays exactly where it
+/// is, and what changes is that `replace_buffer` will not compile without
+/// a permit only this module can mint.
+///
+/// The precondition is real, which is what separates this from the three
+/// witnesses still declined (see the as-built note): the editor holds
+/// nothing unsaved, OR the user has just answered „Zahodit" for the very
+/// action being performed. `editor_load_guarded` already computes exactly
+/// that; this module simply refuses to let anyone else decide it.
+mod editor_guard {
+    use crate::AppView;
+    use gpui::Context;
+    use std::marker::PhantomData;
+
+    /// Permission to destroy the editor's buffer, valid only inside the
+    /// [`with_editor_replaceable`] scope that produced it.
+    ///
+    /// Same generative invariant brand as `save_guard::SaveAllowed`, for
+    /// the same reason and with the same guarantee: it cannot be returned,
+    /// stored, or captured by a `'static` future, so a permission checked
+    /// before an await cannot be spent after one. (Re-verify FAIL-2 is why
+    /// that is spelled `fn(&'brand ()) -> &'brand ()` and not `&'brand ()`.)
+    #[must_use = "this permit IS the permission to destroy unsaved editor text"]
+    pub(crate) struct BufferReplace<'brand>(PhantomData<fn(&'brand ()) -> &'brand ()>);
+
+    /// THE mint. `None` — the closure never runs — means the editor holds
+    /// unsaved changes nobody has agreed to lose.
+    ///
+    /// Two ways to be allowed, and they are the two `editor_load_guarded`
+    /// already distinguishes:
+    ///
+    /// * **Nothing is at stake.** `script_is_dirty` is a live read of the
+    ///   buffer against `saved_text`, so this cannot be stale.
+    /// * **The user said „Zahodit".** That is a fact about the past which
+    ///   no later read can recover, so `on_discard_confirm_yes` records it
+    ///   — STAMPED WITH THE GENERATION it was granted at, and consumed
+    ///   once. Every path that moves the binding bumps that generation
+    ///   (`set_script_binding`, `supersede_script_continuations`), so a
+    ///   grant cannot be spent on a different editor state than the one
+    ///   the user was asked about. That is the same reasoning
+    ///   `script_open_abort_reason` applies to the read it guards.
+    pub(crate) fn with_editor_replaceable<R>(
+        view: &mut AppView,
+        cx: &mut Context<AppView>,
+        f: impl for<'brand> FnOnce(&mut AppView, &mut Context<AppView>, BufferReplace<'brand>) -> R,
+    ) -> Option<R> {
+        if !view.script_is_dirty(cx) {
+            return Some(f(view, cx, BufferReplace(PhantomData)));
+        }
+        if view.editor_discard_grant == Some(view.script_binding_generation) {
+            // One shot. A second replacement needs a second answer.
+            view.editor_discard_grant = None;
+            return Some(f(view, cx, BufferReplace(PhantomData)));
+        }
+        None
+    }
+}
+use editor_guard::with_editor_replaceable;
+
+mod save_guard {
+    use crate::AppView;
+    use gpui::Context;
+    use std::marker::PhantomData;
+
+    /// Proof that a save was permitted, valid ONLY inside the
+    /// [`with_save_permission`] scope that produced it.
+    ///
+    /// `'brand` is generative and INVARIANT — `fn(&'brand ()) -> &'brand ()`
+    /// rather than `&'brand ()`, so subtyping can neither shorten nor
+    /// lengthen it. It is introduced by the `for<'brand>` bound on the
+    /// scope's closure, so no type nameable outside that closure can
+    /// mention it: the witness cannot be returned, stored in a field, or
+    /// captured by a `'static` future.
+    ///
+    /// Still `!Copy` and `!Clone`, but that is now a detail rather than
+    /// the argument. Re-verify FAIL-2 showed those forbid a second USE and
+    /// not a MOVE, and a move was all the escape needed.
+    #[must_use = "this witness IS the permission — dropping it and saving anyway is \
+                  the bug it exists to prevent"]
+    pub(crate) struct SaveAllowed<'brand>(PhantomData<fn(&'brand ()) -> &'brand ()>);
+
+    /// T9 review MAJOR-1: may a Ctrl+S dispatch right now? A pure
+    /// predicate so the rule is unit-pinned — `on_save_script` takes a
+    /// `Window` and so has no test harness, which is exactly how it went
+    /// unguarded in the first place. `SaveScript` is bound with context
+    /// `None`, i.e. it fires straight through an open modal's
+    /// `.occlude()`, so this is the ONLY thing standing between a habitual
+    /// Ctrl+S and a write that races the rename/delete the user is
+    /// currently confirming.
+    pub(crate) fn script_save_allowed(
+        modal_open: bool,
+        apply_open: bool,
+        discard_open: bool,
+    ) -> bool {
+        !(modal_open || apply_open || discard_open)
+    }
+
+    /// THE only mint of [`SaveAllowed`] — a SCOPE, not a value.
+    ///
+    /// Reading `&AppView` rather than taking three booleans is the
+    /// difference between a rail and a formality: a caller handed
+    /// `script_save_allowed(false, false, false)` could mint over a screen
+    /// full of dialogs without lying about anything the compiler can see.
+    /// Here there is nothing to lie WITH — the three facts come straight
+    /// off the view. (This module is a DESCENDANT of the crate root, where
+    /// `AppView` lives, so it can read fields private there; the reverse —
+    /// the crate root reaching into this module's private tuple field — is
+    /// what Rust forbids, and that asymmetry is the whole mechanism.)
+    ///
+    /// ALIASING THIS BUYS NOTHING, and that is the point of a scope over a
+    /// bare token: however it is spelled — `use … as go;`, a fn-pointer
+    /// binding, a macro — calling it RUNS the predicate. Re-verify FAIL-1
+    /// walked past four name-based audits with exactly that trick; the
+    /// writers that sit behind a real precondition were untouched by it.
+    ///
+    /// `None` — the closure never ran — is the refusal; callers report
+    /// [`SCRIPT_SAVE_BLOCKED`](crate::SCRIPT_SAVE_BLOCKED).
+    pub(crate) fn with_save_permission<R>(
+        view: &mut AppView,
+        cx: &mut Context<AppView>,
+        f: impl for<'brand> FnOnce(&mut AppView, &mut Context<AppView>, SaveAllowed<'brand>) -> R,
+    ) -> Option<R> {
+        if !script_save_allowed(
+            view.modal.is_some(),
+            view.apply_dialog.is_some(),
+            view.discard_confirm.is_some(),
+        ) {
+            return None;
+        }
+        Some(f(view, cx, SaveAllowed(PhantomData)))
+    }
+}
+use save_guard::{with_save_permission, SaveAllowed};
+
+/// T8 review MAJOR-2: the refusal when a save of this editor is already in
+/// flight. Not an „error:" — nothing failed; the user's keystroke simply
+/// arrived while the previous write was still fsyncing, and the „ •" stays
+/// up so they can see the buffer is not yet on disk.
+pub(crate) const SCRIPT_SAVE_IN_FLIGHT: &str = "ukládání skriptu už probíhá";
+
+/// RE-VERIFY: the refusal when something tries to replace the editor's
+/// buffer while it holds unsaved changes nobody agreed to lose.
+///
+/// Unreachable through `editor_load_guarded`, which is the point — this is
+/// what a NEW path that forgot the guard now hits instead of silently
+/// destroying the user's text. Not an „error:": nothing failed.
+pub(crate) const SCRIPT_LOAD_BLOCKED: &str =
+    "editor má neuložené změny — nejprve je uložte nebo zahoďte";
+
+/// May an in-flight `open_script` still replace the editor's buffer?
+///
+/// `editor_load_guarded` answers „is it safe" at DISPATCH; `read_script`
+/// then yields the UI thread, so by the time the text arrives the answer
+/// may have expired. THREE independent things must still hold, and each
+/// was a real hole:
+///
+/// * **The buffer** must be byte-identical to what the guard looked at
+///   (T8 review BLOCKER-1). Not redundant with the generation:
+///   `set_script_binding` bumps only when the bound PATH changes, so
+///   typing — the exact thing the guard protects — leaves it untouched,
+///   and `SqlInput` has no undo, so a replacement over fresh keystrokes
+///   destroys them for good.
+/// * **The binding** must not have moved (`script_binding_generation`),
+///   or the open would clobber whatever the user moved on to.
+/// * **The scripts root** must still be the one the `rel` was resolved
+///   against (T8 re-verify NEW MAJOR, generalised). `apply_context`'s
+///   unconditional `supersede_script_continuations` covers the workspace
+///   swap, but the root also changes in profile mode via
+///   `start_scripts_dir_pick` / `clear_scripts_dir` — and there the
+///   generation deliberately stays put, because an in-flight SAVE holds an
+///   absolute path and is not invalidated by a root change. Comparing the
+///   root directly is exact where a shared counter would be a blunt proxy:
+///   it supersedes the open and nothing else, and it needs no future
+///   root-changing site to remember to bump anything.
+/// `None` means „land it". Otherwise the Czech status naming WHICH of the
+/// three moved — the `context_switch_refusal` idiom, for the same reason:
+/// one refusal that covers three different causes teaches the user
+/// nothing, and „editor se mezitím změnil" would be a lie for a swapped
+/// workspace nobody typed into.
+fn script_open_abort_reason(
+    root_now: Option<&Path>,
+    root_dispatched: &Path,
+    binding_now: u64,
+    binding_dispatched: u64,
+    text_now: &str,
+    text_dispatched: &str,
+) -> Option<&'static str> {
+    // FINAL-REVIEW NIT-3: `same_path_ci`, not `!=`. This was the ONE path
+    // comparison in the crate still done by exact bytes while every other
+    // one goes through `path_fold` — the exact shape T10 carry-forward 6
+    // existed to eliminate. Harmless in practice today (the root is copied
+    // out of the same `effective_scripts_root` on both sides, so a casing
+    // difference needs a re-pick that spells the same folder differently),
+    // but „harmless today" is how the last fold divergence started.
+    if !root_now.is_some_and(|r| same_path_ci(r, root_dispatched)) {
+        return Some("otevření skriptu zrušeno — složka skriptů se mezitím změnila");
+    }
+    if binding_now != binding_dispatched {
+        return Some("otevření skriptu zrušeno — editor se mezitím změnil");
+    }
+    if text_now != text_dispatched {
+        return Some("otevření skriptu zrušeno — mezitím jste psali do editoru");
+    }
+    None
+}
+
+/// The discard prompt's question line. `script_rel` is `Some` only for a
+/// `PendingDiscard::Script` (Part S §5.5's copy); every other action keeps
+/// the pre-existing staged-rows wording byte for byte, because for those
+/// the count IS the information and „(1)" would be a downgrade.
+fn discard_confirm_question(script_rel: Option<&str>, change_count: usize) -> String {
+    match script_rel {
+        Some(rel) => format!("Neuložené změny skriptu {rel} budou zahozeny."),
+        None => format!("Neuložené změny ({change_count}) — zahodit?"),
+    }
+}
+
+/// Part S §1.3: the app has no editor TABS (fact 0.1) — opening a script
+/// binds the ONE global editor to a file. `path` is ABSOLUTE so the binding
+/// survives a scripts-root change; the caption re-relativizes for display.
+/// `saved_text` is what is on disk as far as this session knows — the
+/// dirty flag is `sql.text() != saved_text`.
+pub(crate) struct ScriptBinding {
+    pub path: PathBuf,
+    pub saved_text: String,
+}
+
+/// Part S §5.5: what a dirty binding is parked on. `LoadText` covers the
+/// two pre-existing "load SQL into the editor" sites (the history panel row
+/// and the palette's history item) — which today clobber the editor with NO
+/// guard at all; this phase strictly improves that for BOUND scripts and
+/// leaves unbound ad-hoc text exactly as (un)guarded as before.
+#[derive(Clone)]
+pub(crate) enum PendingScriptAction {
+    /// Open the library-relative `rel` into the editor (never runs it).
+    Open { rel: String },
+    /// Drop the binding; the editor TEXT stays (§5.3).
+    Unbind,
+    /// Replace the editor text and drop the binding — the history sites.
+    LoadText { sql: String },
+}
+
 /// G5 Task 4 (folded T3 review issue 2 — dirty guard): the action
 /// `discard_confirm` performs on "Zahodit", or undoes (where applicable) on
 /// "Zrušit" — see `DiscardConfirmState`'s doc comment for the three sites
@@ -1009,6 +1871,13 @@ enum PendingDiscard {
     /// MAJOR 2): "Zrušit" drops this whole variant, follow-up included —
     /// a cancelled switch can never leave an armed action behind.
     SwitchDatabase { conn_id: String, db: Option<String>, follow_up: Option<PendingTreeAction> },
+    /// Workspace T8 (Part S §5.5): the editor is bound to a script with
+    /// unsaved changes and the user asked for something that would replace
+    /// its text (or drop the binding). „Zahodit" performs the parked
+    /// action via `perform_script_action`; „Zrušit" drops the whole
+    /// variant, exactly like every other arm — nothing to undo, because
+    /// nothing was applied before the prompt went up.
+    Script(PendingScriptAction),
 }
 
 /// Sidebar rework (design §2.2): the one-shot action a cross-context
@@ -1095,6 +1964,53 @@ struct AppView {
     /// must-fix #2).
     config_load_error: Option<String>,
     vault_path: PathBuf,
+    /// Design §W2: the ACTIVE workspace root, or `None` in profile mode.
+    /// There is no third state — a broken pointer never reaches here (it
+    /// is blocked at startup, §W4). Written ONLY by `apply_context`.
+    workspace_root: Option<PathBuf>,
+    /// T4 review MAJOR-1: bumped by EVERY context swap (`apply_context`),
+    /// captured by each „Najít složku…" dispatch. A pick whose folder
+    /// classification finished after the context already changed under it
+    /// is inert — see `recovery_pick_may_commit`.
+    workspace_pick_generation: u64,
+    /// T5 review MINOR-2: the LAST folder-pick refusal, rendered inside the
+    /// Settings „Pracovní prostor" block. `WORKSPACE_PICK_NONEMPTY` is a
+    /// ~230-character explanation; the status bar is a single unwrapped
+    /// flex row behind the modal backdrop, so its payload half (the
+    /// interrupted-init hint this task exists to deliver) was physically
+    /// unreadable there. The status bar keeps a SHORT sentinel
+    /// (`WORKSPACE_PICK_FAILED_STATUS`); the prose lands here, in the panel
+    /// the user is already looking at. Cleared when a new pick starts and
+    /// when the modal closes (`close_modal`) — it belongs to one Settings
+    /// session, not to the app.
+    workspace_pick_error: Option<String>,
+    /// T4 review NIT-11: tab stops for the `WorkspaceMissing` modal's three
+    /// choices. A BLOCKING dialog whose only exit is a mouse click leaves a
+    /// keyboard-only user with nothing but the window close button, so the
+    /// buttons are real focus targets (`tab_index` requires a tracked
+    /// handle in the pinned gpui). Enter/Space activate the FOCUSED button
+    /// only; a bare Enter from the modal's own focus still reaches the
+    /// `ModalConfirmKind::Ignore` policy, so §W4's "no default button"
+    /// rule holds.
+    ///
+    /// T4 re-verify carry-forward: Enter only became true when the buttons
+    /// gained the `WorkspaceChoice` key context and the `ActivateChoice`
+    /// binding — a keymap binding is dispatched before any `on_key_down`
+    /// listener, so the ancestor `ModalForm`'s `enter → ModalConfirm` was
+    /// swallowing it. See `connections_ui::WORKSPACE_CHOICE_CONTEXT`.
+    workspace_choice_focus: [FocusHandle; 3],
+    /// T4 review NIT-11: the `WorkspaceMissing` panel's own focus handle,
+    /// which makes the panel a gpui TAB GROUP. Focused when the modal
+    /// opens (instead of the shared `modal_focus_handle`), so the first
+    /// Tab descends into the three choices deterministically rather than
+    /// into whatever else the window happens to expose — the pinned gpui
+    /// documents exactly this "focus the container, then `focus_next`"
+    /// contract on `InteractiveElement::tab_stop`. Focus lands on the
+    /// CONTAINER, not on a button, so a bare Enter still reaches
+    /// `ModalConfirmKind::Ignore`: §W4's "no default button" holds — the
+    /// `WorkspaceChoice` key context that claims `enter` is only on the
+    /// dispatch path once a choice has actually been tabbed to.
+    workspace_panel_focus: FocusHandle,
     /// Unlocked vault, kept for the session once the user has entered the
     /// master password once (brief: prompt on first use, not at startup).
     vault: Option<Vault>,
@@ -1138,7 +2054,10 @@ struct AppView {
     /// `sidebar_fetch_generation`/`switch_generation`.
     compare_fetch_generation: u64,
     // --- G3 Task 3: history panel + query recording ---
-    /// Opened from `default_history_path()` at startup; `None` when the open
+    /// Opened at startup from the ACTIVE context's history path
+    /// (`StartupContext::paths.history`, workspace T4) — which is
+    /// `default_history_path()` in BOTH modes, because history is
+    /// deliberately machine-local (§W5); `None` when the open
     /// failed (surfaced once in the startup status — see `main`), in which
     /// case the app stays fully functional, just without recording/search
     /// (`record_history` and the panel's search both no-op gracefully).
@@ -1169,15 +2088,22 @@ struct AppView {
     /// `on_open_palette`/`render_palette_overlay`).
     palette: Option<PaletteState>,
     // --- G4 Task 6: per-table view memory ---
-    /// Opened from `dbc_state::default_view_prefs_path()` at startup;
-    /// `None` when the open failed (surfaced once in the startup status —
-    /// see `main`), in which case the feature is simply off — no apply, no
+    /// Opened at startup from the ACTIVE context's views path
+    /// (`StartupContext::paths.views`, workspace T4 — the profile path in
+    /// profile mode, `<workspace>/views.toml` in workspace mode) and
+    /// rebuilt by `apply_context` on every swap. `None` when the open
+    /// failed (surfaced once in the startup status — see `main`) or when
+    /// the start was BLOCKED (§W4 loads nothing — see `StartupLoads`), in
+    /// which case the feature is simply off — no apply, no
     /// save — the rest of the app is fully functional either way, same
     /// "degrade gracefully" precedent as `history: Option<HistoryDb>`.
     view_prefs: Option<ViewPrefsStore>,
     // --- G6 Task 3: parametrized `:name` query values ---
-    /// Opened from `dbc_state::default_param_values_path()` at startup;
-    /// `None` on a load failure (same "degrade gracefully" posture as
+    /// Opened at startup from the ACTIVE context's params path
+    /// (`StartupContext::paths.params`, workspace T4) and rebuilt by
+    /// `apply_context` on every swap; `None` on a load failure or a
+    /// BLOCKED start (§W4 — see `StartupLoads`), same "degrade
+    /// gracefully" posture as
     /// `view_prefs` — the values dialog still opens and runs queries, it
     /// just won't prefill/remember values across runs). Keyed by
     /// `(connection_id, param name)` — see `open_query_params_dialog`/
@@ -1195,6 +2121,53 @@ struct AppView {
     /// is pending; see `DiscardConfirmState`'s doc comment for the three
     /// trigger sites.
     discard_confirm: Option<DiscardConfirmState>,
+    // --- Workspace T8: the script editor binding (Part S §5) ---
+    /// The `.sql` file the ONE global editor is currently bound to, or
+    /// `None` for ad-hoc text. Every mutation goes through
+    /// `set_script_binding` so `script_binding_generation` cannot drift.
+    script_binding: Option<ScriptBinding>,
+    /// `script_is_dirty`'s answer, recomputed ONCE per frame at the top of
+    /// `AppView::render` — the same lazy-poll idiom `refresh_autocomplete`
+    /// and `history_search`/`last_history_query` already use (see
+    /// history_panel.rs's module doc comment).
+    ///
+    /// It exists because `context_switch_blocked` takes no `cx` and so
+    /// cannot read the editor entity. That makes it at most ONE FRAME
+    /// stale, which is safe in the only direction that matters: every
+    /// path that changes the editor text calls `cx.notify()`, so a frame
+    /// is always drawn between an edit and the next click — the flag can
+    /// linger `true` after an async save lands (the gate then refuses a
+    /// switch it could have allowed, the conservative side) but cannot
+    /// report `false` for text the user has already typed.
+    script_dirty_flag: bool,
+    /// Bumped by `set_script_binding` on EVERY binding change. Async
+    /// continuations (`open_script`, `save_script`, `save_script_as`)
+    /// capture it at dispatch and refuse to touch the binding if it moved
+    /// — the phase's four-MAJOR "a stale background continuation applied
+    /// after the user had moved on" class (`start_script_pick`,
+    /// `start_csv_import`, `pick_workspace_for_recovery`,
+    /// `open_workspace_confirm` are the precedents).
+    script_binding_generation: u64,
+    /// „The user answered „Zahodit" for the action about to run" — the one
+    /// fact `editor_guard::with_editor_replaceable` cannot re-derive from
+    /// live state, stamped with the `script_binding_generation` it was
+    /// granted at and consumed once.
+    ///
+    /// Written by exactly two functions and read by one; pinned by
+    /// `the_discard_grant_is_written_only_where_the_user_answered`. Any
+    /// third writer is a way to fake the user's answer, which is why the
+    /// grant is a generation rather than a bool: every path that moves the
+    /// binding bumps it, so a stale grant expires on its own instead of
+    /// waiting to be spent.
+    editor_discard_grant: Option<u64>,
+    /// T8 review MAJOR-2: is a `save_script` write still in flight? The
+    /// shared `fsutil::write_atomic` rail derives ONE tmp path per target,
+    /// so two overlapping writes to the same file corrupt each other's tmp
+    /// and can leave the caption reading clean over contents the disk does
+    /// not hold. OS key auto-repeat on a held Ctrl+S is enough to trigger
+    /// it. One editor means one flag is enough; a second dispatch is
+    /// refused out loud (`SCRIPT_SAVE_IN_FLIGHT`), never queued silently.
+    script_save_in_flight: bool,
     // --- UX-polish §1.4: modal keyboard-focus plumbing ---
     /// Shared focus target for every overlay that owns no TextField of its
     /// own (KillConfirm, AnalyzeWriteConfirm, CompareDialog, ScriptRun,
@@ -2681,11 +3654,7 @@ impl AppView {
                         let label = format!("{name}/ ({} souborů)", files.len());
                         Ok((label, files, counts))
                     } else {
-                        let is_sql = picked
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .is_some_and(|e| e.eq_ignore_ascii_case("sql"));
-                        if !is_sql {
+                        if !crate::scripts::is_sql_path(&picked) {
                             return Err("vyberte soubor .sql".to_string());
                         }
                         let count = count_statements_in_file(&picked, dialect)?;
@@ -2699,49 +3668,163 @@ impl AppView {
                 .await;
 
             let _ = this.update(cx, |view, cx| match result {
-                Ok((source_label, files, file_counts)) => {
-                    // Review fix (MINOR 4): a modal the user opened WHILE
-                    // this picker/pre-scan was in flight wins — don't
-                    // clobber it with a stale script-run pick.
-                    if view.modal.is_some() {
-                        view.status =
-                            "výběr skriptu zahozen — je otevřený jiný dialog".to_string();
-                        cx.notify();
-                        return;
-                    }
-                    // Review fix (MAJOR 1), defense in depth (same posture
-                    // as CSV's `start_csv_import`): the picker + pre-scan
-                    // didn't block the connection dropdown — if it already
-                    // changed, don't even open the modal with a stale
-                    // file/folder selection; `confirm_script_run` re-checks
-                    // this same identity again regardless (the actual
-                    // guard), so this is purely a faster/friendlier
-                    // refusal.
-                    if !conn_identity_matches(&conn_identity, &view.current_conn_identity()) {
-                        view.status =
-                            "připojení se během výběru změnilo — spuštění zrušeno".to_string();
-                        cx.notify();
-                        return;
-                    }
-                    view.status = String::new();
-                    view.modal = Some(connections_ui::ModalState::ScriptRun {
-                        files,
-                        file_counts,
-                        tx_scope: runner::TxScope::PerFile,
-                        error_policy: runner::ErrorPolicy::Stop,
-                        source_label,
-                        conn_label,
-                        read_only,
-                        timeout_secs,
-                        conn_identity,
-                    });
-                    // UX-polish §1.4: no-input modal, cx-only continuation —
-                    // defer focus to `AppView::render` via `modal_needs_focus`.
-                    view.modal_needs_focus = true;
-                    cx.notify();
-                }
+                Ok((source_label, files, file_counts)) => view.open_script_run_modal(
+                    source_label,
+                    files,
+                    file_counts,
+                    conn_label,
+                    conn_identity,
+                    read_only,
+                    timeout_secs,
+                    cx,
+                ),
                 Err(e) => {
                     view.status = format!("error: {e}");
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Part S §6 step 3: the SHARED post-pre-scan continuation of the G12
+    /// script-run flow. Both the ad-hoc picker (`start_script_pick`) and the
+    /// library's `▶` (`run_script_from_library`) end here, so there is
+    /// exactly ONE place that decides the modal races and the connection
+    /// identity re-check. Moving a single line of this into a caller forks
+    /// the confirm policy — that is the defect this factoring prevents.
+    #[allow(clippy::too_many_arguments)]
+    fn open_script_run_modal(
+        &mut self,
+        source_label: String,
+        files: Vec<PathBuf>,
+        file_counts: Vec<usize>,
+        conn_label: String,
+        conn_identity: String,
+        read_only: bool,
+        timeout_secs: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        // Review fix (MINOR 4), carried verbatim: a modal the user opened
+        // WHILE the pick/pre-scan was in flight wins — don't clobber it
+        // with a stale script-run pick.
+        if self.modal.is_some() {
+            self.status = "výběr skriptu zahozen — je otevřený jiný dialog".to_string();
+            cx.notify();
+            return;
+        }
+        // Review fix (MAJOR 1), carried verbatim (same posture as CSV's
+        // `start_csv_import`): the pick + pre-scan didn't block the
+        // connection dropdown — if it already changed, don't even open the
+        // modal with a stale selection. `confirm_script_run` re-checks this
+        // same identity again regardless (the actual guard), so this is
+        // purely the faster/friendlier refusal.
+        if !conn_identity_matches(&conn_identity, &self.current_conn_identity()) {
+            self.status = "připojení se během výběru změnilo — spuštění zrušeno".to_string();
+            cx.notify();
+            return;
+        }
+        // T9 review MINOR-3. Computed HERE, in the SHARED continuation, so
+        // both run paths disclose it: `▶` on the bound-and-dirty script,
+        // and the ad-hoc picker when the user happens to pick that same
+        // file. Folded comparison for the reason `path_fold` documents.
+        let dirty_bound = self.script_dirty_flag
+            && self
+                .script_binding
+                .as_ref()
+                .is_some_and(|b| files.iter().any(|f| same_path_ci(f, &b.path)));
+        self.status = String::new();
+        self.modal = Some(connections_ui::ModalState::ScriptRun {
+            files,
+            file_counts,
+            tx_scope: runner::TxScope::PerFile,
+            error_policy: runner::ErrorPolicy::Stop,
+            source_label,
+            conn_label,
+            read_only,
+            timeout_secs,
+            dirty_bound,
+            conn_identity,
+        });
+        // UX-polish §1.4: no-input modal, cx-only continuation — defer
+        // focus to `AppView::render` via `modal_needs_focus`.
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    /// Part S §6: the library's „▶". Same entry gates as
+    /// `start_script_pick`, same `conn_identity` captured BEFORE the
+    /// pre-scan, then the SHARED continuation — so the scripts library
+    /// reuses the G12 confirm policy rather than forking it, and
+    /// everything downstream (`confirm_script_run`'s re-checks,
+    /// `script_run_dispatch_allowed`, the tx/error radios, the runner's
+    /// per-statement read-only gate, the progress tab, history's
+    /// `[skript]` entry) is untouched by construction.
+    ///
+    /// Runs the file ON DISK — never the editor buffer, and never a save
+    /// first (§1.3: auto-saving before a run would be a silent write the
+    /// user never asked for). A dirty binding means editor and disk
+    /// differ; the „ •" is what discloses that, and the confirm modal's
+    /// statement count is the from-disk truth.
+    fn run_script_from_library(&mut self, rel: String, cx: &mut Context<Self>) {
+        if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
+            return;
+        }
+        if self.cancel.is_some() {
+            return;
+        }
+        let Some(root) = self.effective_scripts_root() else {
+            self.status = "error: nastavte složku skriptů v Nastavení".to_string();
+            cx.notify();
+            return;
+        };
+        let Some((read_only, timeout_secs, engine, _spec)) = self.resolve_spec_for_explain(cx)
+        else {
+            return; // resolve_spec_for_explain already set self.status
+        };
+        let Some(dialect) = dialect_for_engine(engine) else {
+            self.status = "error: skripty nejsou podporovány pro tento engine".to_string();
+            cx.notify();
+            return;
+        };
+        let conn_label = self.current_connection_label();
+        // Captured HERE, before the background pre-scan — the connection
+        // dropdown stays clickable throughout (see `current_conn_identity`).
+        let conn_identity = self.current_conn_identity();
+        cx.spawn(async move |this, cx| {
+            let result: Result<(String, PathBuf, usize), String> = cx
+                .background_spawn(async move {
+                    let path = crate::scripts::resolve_rel(&root, &rel)?;
+                    if !crate::scripts::is_sql_path(&path) {
+                        return Err("vyberte soubor .sql".to_string());
+                    }
+                    // A stale tree (an external delete since the last scan)
+                    // is a Czech error plus a rescan, never a corruption.
+                    if !path.is_file() {
+                        return Err("soubor už neexistuje".to_string());
+                    }
+                    let count = count_statements_in_file(&path, dialect)?;
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    Ok((name, path, count))
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| match result {
+                Ok((label, path, count)) => view.open_script_run_modal(
+                    label,
+                    vec![path],
+                    vec![count],
+                    conn_label,
+                    conn_identity,
+                    read_only,
+                    timeout_secs,
+                    cx,
+                ),
+                Err(e) => {
+                    view.status = format!("error: {e}");
+                    view.start_scripts_scan(cx);
                     cx.notify();
                 }
             });
@@ -4053,6 +5136,15 @@ impl AppView {
             return;
         }
         if let Some(modal) = self.modal.clone() {
+            // §W4 (T4 review MINOR-4): a BLOCKING modal is never
+            // Esc-closable, whatever its contents — checked before the
+            // per-variant rules below, which all ask the narrower "is there
+            // unsaved secret state / a running job?" question. The property
+            // lives in `connections_ui::modal_is_blocking` so it can be
+            // pinned by a unit test; this handler cannot be.
+            if connections_ui::modal_is_blocking(&modal) {
+                return;
+            }
             let closable = match &modal {
                 connections_ui::ModalState::ConnectionDialog(ui) => ui.password.read(cx).text().is_empty(),
                 // G6 Task 3: no password/unsaved-secret concern here — Esc
@@ -4092,6 +5184,27 @@ impl AppView {
                         && admin_password.read(cx).text().is_empty();
                     pwchange::esc_closable(empty, *running)
                 }
+                // §W3.2: nothing is dispatched until the button is
+                // clicked, and nothing secret is typed here — so Esc
+                // cancels freely, BUT never mid-init (`running`), the same
+                // reasoning as `BackupRestore`'s `!session.is_running()`
+                // above. The truth table is
+                // `connections_ui::workspace_confirm_esc_closable`.
+                connections_ui::ModalState::WorkspaceConfirm { running, .. } => {
+                    connections_ui::workspace_confirm_esc_closable(*running)
+                }
+                // T9: nothing secret is typed into either scripts dialog
+                // and nothing is dispatched until its button is clicked —
+                // so Esc cancels freely, BUT never while the background
+                // op is in flight, the same reasoning as `BackupRestore`'s
+                // `!session.is_running()`. Truth table:
+                // `connections_ui::script_modal_esc_closable`.
+                connections_ui::ModalState::ScriptName { running, .. }
+                | connections_ui::ModalState::ScriptDeleteConfirm { running, .. } => {
+                    connections_ui::script_modal_esc_closable(*running)
+                }
+                // `WorkspaceMissing` never reaches this match — the
+                // `modal_is_blocking` guard above returns first.
                 _ => false,
             };
             if closable {
@@ -4331,9 +5444,22 @@ impl AppView {
             PaletteItem::HistoryEntry { sql, .. } => {
                 // Exactly the history panel's row click: load into the
                 // editor and focus it, never run it.
-                self.sql.update(cx, |s, cx| s.set_text(&sql, cx));
-                let editor_focus = self.sql.focus_handle(cx);
-                window.focus(&editor_focus, cx);
+                //
+                // Workspace T8: LEGACY CLOBBER SITE 1 of 2. Until now this
+                // replaced the editor's text unconditionally; with a bound
+                // script that silently destroyed the user's unsaved file
+                // edits. It now routes through THE guard (Part S §5.5).
+                // Unbound ad-hoc text is deliberately as (un)guarded as it
+                // has always been — zero behavioural regression surface.
+                self.editor_load_guarded(PendingScriptAction::LoadText { sql }, cx);
+                // Focus the editor only if the load actually happened. When
+                // the guard parked it, the discard prompt is what owns
+                // focus (`modal_needs_focus`) and stealing it back would
+                // strand the prompt un-dismissable by keyboard.
+                if self.discard_confirm.is_none() {
+                    let editor_focus = self.sql.focus_handle(cx);
+                    window.focus(&editor_focus, cx);
+                }
             }
             PaletteItem::Connection { id, .. } => {
                 // G3 final-review fix (F3): route through the SAME
@@ -4406,6 +5532,9 @@ impl AppView {
                 }
                 PaletteAction::RunSqlFile => self.start_script_pick(false, cx),
                 PaletteAction::RunSqlFolder => self.start_script_pick(true, cx),
+                // Part S §8: the same entry point Ctrl+S and the caption
+                // strip's „Uložit" use — no second save path.
+                PaletteAction::SaveScript => self.on_save_script(&SaveScript, window, cx),
                 PaletteAction::OpenServerAdmin => self.open_admin_tab(cx),
                 PaletteAction::ToggleTheme => self.toggle_theme(cx),
                 PaletteAction::OpenChart => self.open_chart_picker(None, cx),
@@ -4426,16 +5555,37 @@ impl AppView {
     fn set_theme(&mut self, mode: dbc_state::ThemeMode, cx: &mut Context<Self>) {
         if self.config.theme != mode {
             self.config.theme = mode;
-            self.status = match self.config.save(&self.config_path) {
-                Ok(()) => format!(
-                    "motiv: {}",
-                    match mode {
-                        dbc_state::ThemeMode::Dark => "tmavý",
-                        dbc_state::ThemeMode::Light => "světlý",
-                    }
-                ),
-                Err(e) => format!("error: motiv se nepodařilo uložit ({e})"),
-            };
+            // T7 review MAJOR-1: the SAME corrupt-config gate every other
+            // `config.toml` writer passes (`finish_save`, the two ★
+            // toggles, the scripts-dir pair). Without it, a `config.toml`
+            // that failed to parse at startup — reported only as a status
+            // string, with the UI fully usable and `self.config` replaced
+            // by `AppConfig::default()` — is destroyed by a REFLEX: one
+            // click on the light-theme radio (or the palette's „Přepnout
+            // motiv") writes a file holding `theme = "light"` and nothing
+            // else over every connection, favourite and vault key id.
+            // `AppConfig::save` is tmp + `sync_all` + rename with no
+            // backup; `guard_corrupt_config` is the only thing that keeps
+            // the original, as `config.toml.corrupt-bak`.
+            //
+            // It gates the WRITE only. The session switch below still runs
+            // unconditionally — "a save failure degrades to session-only +
+            // a status message" is this function's documented posture, and
+            // a refusal to persist is a save failure like any other.
+            // `guard_corrupt_config` sets its own status when it refuses,
+            // so nothing here overwrites it.
+            if let Some(guard) = self.guard_corrupt_config(cx) {
+                self.status = match self.config.save(&self.config_path, &guard) {
+                    Ok(()) => format!(
+                        "motiv: {}",
+                        match mode {
+                            dbc_state::ThemeMode::Dark => "tmavý",
+                            dbc_state::ThemeMode::Light => "světlý",
+                        }
+                    ),
+                    Err(e) => format!("error: motiv se nepodařilo uložit ({e})"),
+                };
+            }
         }
         cx.set_global(theme::Theme::from_mode(mode));
         // Re-highlight the editor with the new syntax palette (Task 6's
@@ -4664,12 +5814,12 @@ impl AppView {
         let Some(ac) = &self.autocomplete else { return };
         let Some(candidate) = ac.candidates.get(ac.selected) else { return };
         let insert = candidate.text.clone();
-        let text = self.sql.read(cx).text();
-        let cursor = self.sql.read(cx).cursor();
-        let (range, _) = completion_edit(&text, cursor, &insert);
-        let prefix_len = cursor - range.start;
-
-        self.sql.update(cx, |s, cx| s.accept_completion(prefix_len, &insert, cx));
+        // RE-VERIFY: the range is no longer computed HERE and handed over.
+        // `accept_completion` derives it from its own buffer through the
+        // same `autocomplete::cursor_context` rail `completion_edit` uses,
+        // so the span it deletes is bounded by one identifier prefix by
+        // construction and a caller cannot widen it into a buffer clobber.
+        self.sql.update(cx, |s, cx| s.accept_completion(&insert, cx));
         self.autocomplete = None;
         self.sql.update(cx, |s, _| s.set_autocomplete_active(false));
         // Sync the lazy-diff cache to the post-accept text/cursor so the
@@ -5319,6 +6469,1777 @@ impl AppView {
             t.set_admin_entry(admin_entry, cx);
         });
         self.push_active_scope_to_tree(cx);
+        // Workspace T7: „is there a scripts root at all" travels with the
+        // rest of the tree context. Pushing it never scans by itself —
+        // dispatch is `start_scripts_scan`'s job.
+        let configured = self.effective_scripts_root().is_some();
+        self.tree.update(cx, |t, cx| t.set_scripts_configured(configured, cx));
+    }
+
+    /// The scripts library's root for the ACTIVE context — see
+    /// `scripts_root_for`. Every scan and every fs op in Tasks 8/9 starts
+    /// here; there is no second resolver.
+    pub(crate) fn effective_scripts_root(&self) -> Option<PathBuf> {
+        scripts_root_for(self.workspace_root.as_deref(), self.config.scripts_dir.as_deref())
+    }
+
+    /// Dispatches a bounded background scan into the tree's scripts slot.
+    /// A missing root is NOT an error here — the section renders its
+    /// „složka skriptů není nastavena" pointer row instead (Part S §1.4),
+    /// and in workspace mode `configured` is always true, so a deleted
+    /// `<workspace>/scripts` surfaces honestly as the scan's own error row
+    /// plus its retry click.
+    ///
+    /// The scan itself NEVER executes anything: `scan_scripts` is a bounded
+    /// `read_dir` walk (Part S §7); opening or running a script is a
+    /// separate, explicit user action.
+    pub(crate) fn start_scripts_scan(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.effective_scripts_root() else {
+            self.tree.update(cx, |t, cx| {
+                t.set_scripts_configured(false, cx);
+                t.reset_scripts(cx);
+            });
+            return;
+        };
+        self.tree.update(cx, |t, cx| t.set_scripts_configured(true, cx));
+        // The generation comes from `begin_scripts_scan`'s RETURN value —
+        // `ScriptsListState::Loading` is a unit variant and deliberately
+        // carries no copy (see its doc comment). `finish_scripts_scan`
+        // compares against the tree's own counter, so a result that lands
+        // after a context swap or a newer dispatch is DROPPED, never
+        // applied to the wrong root.
+        let generation = self.tree.update(cx, |t, cx| t.begin_scripts_scan(cx));
+        let tree = self.tree.clone();
+        cx.spawn(async move |_this, cx| {
+            let result =
+                cx.background_spawn(async move { crate::scripts::scan_scripts(&root) }).await;
+            let _ = tree.update(cx, |t, cx| t.finish_scripts_scan(generation, result, cx));
+        })
+        .detach();
+    }
+
+    /// Part S §2 — PROFILE mode only (the caller only renders the button
+    /// there). Stores the absolute path, saves the config, rescans.
+    fn start_scripts_dir_pick(&mut self, cx: &mut Context<Self>) {
+        let dialog = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Vybrat".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            // DEVIATION from the plan snippet's `let … else { return }`: a
+            // swallowed dialog failure is exactly the silence this phase
+            // keeps banning. Same three arms as `start_csv_import` /
+            // `start_workspace_pick`, same strings.
+            let picked = match dialog.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
+                Ok(Ok(_)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "výběr zrušen".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = format!("error: dialog selhal: {e}");
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_canceled) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "error: dialog není dostupný".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let _ = this.update(cx, |view, cx| {
+                // §W8: `scripts_dir` is inert in workspace mode, so the app
+                // must never WRITE it there either.
+                //
+                // T7 review MINOR-2, decided: this stays, but it now
+                // REPORTS. Whether a swap can actually interleave between
+                // the native dialog closing and this continuation is not
+                // something this code can assert across three platforms, so
+                // the guard is kept — and a guard that can fire must not
+                // fire silently. A user who just picked a folder and got
+                // nothing back is the exact shape commit 4c06379 removed
+                // from `start_workspace_pick`.
+                //
+                // No generation guard here, deliberately, and NOT by
+                // analogy-failure with `start_workspace_pick`: that one
+                // needs `workspace_pick_generation` because its
+                // continuation contains a SECONDS-LONG background
+                // classification during which the window stays interactive
+                // and the user can reach a different explicit decision.
+                // This continuation has no background step — it resumes
+                // straight onto the UI thread — and the condition that
+                // actually matters here is not "did anything change" but
+                // "are we in workspace mode", which is exactly what the
+                // check below tests. A generation would be a weaker proxy
+                // for an invariant we can read directly.
+                if view.workspace_root.is_some() {
+                    view.status =
+                        connections_ui::SCRIPTS_PICK_DISCARDED_WORKSPACE.to_string();
+                    cx.notify();
+                    return;
+                }
+                // T7 review MINOR-4: store the path only if it round-trips.
+                // `dbc_state::workspace::write_pointer` refuses a lossy path
+                // at the rail rather than papering over it with
+                // `display().to_string()`; a `scripts_dir` is read back the
+                // same way and deserves the same honesty. Substituting
+                // U+FFFD and reporting SUCCESS would put a path that does
+                // not exist in `config.toml` and then blame the scan for it.
+                let Some(picked_str) = picked.to_str() else {
+                    view.status = format!(
+                        "error: cesta ke složce skriptů obsahuje znaky, které nelze uložit: {}",
+                        picked.display()
+                    );
+                    cx.notify();
+                    return;
+                };
+                // Same corrupt-config gate the connection savers use
+                // (`finish_save`, the ★ toggle): with a poisoned
+                // `config.toml` the in-memory `config` is `default()`, so an
+                // unguarded save would write a file with a `scripts_dir` and
+                // NO connections over the user's real one.
+                let Some(guard) = view.guard_corrupt_config(cx) else { return };
+                view.config.scripts_dir = Some(picked_str.to_string());
+                view.status = match view.config.save(&view.config_path, &guard) {
+                    Ok(()) => format!("složka skriptů: {picked_str}"),
+                    Err(e) => format!("error: nastavení se nepodařilo uložit ({e})"),
+                };
+                // T7 review MINOR-3: the ROOT just changed (A -> B). The
+                // per-folder expand keys are `OuterId::ScriptFolder(rel)`
+                // values naming paths under the OLD root — `reset_scripts`'
+                // own doc says they "name paths that no longer exist" — and
+                // a `reporting/` that happens to exist under B would render
+                // pre-expanded without the user ever opening it.
+                // `apply_context` and „Odebrat" already reset; the re-pick
+                // was the uncovered third context change.
+                //
+                // It is deliberately NOT inside `start_scripts_scan`: that
+                // is also the ⟳/retry path, and a refresh of the SAME root
+                // must PRESERVE expansion (the schema-slot refresh contract,
+                // resolved deviation 13).
+                view.tree.update(cx, |t, cx| t.reset_scripts(cx));
+                view.start_scripts_scan(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Part S §2's „Odebrat": clears the setting and the tree state. It
+    /// deliberately does NOT touch a script binding — the binding holds an
+    /// ABSOLUTE path, so „Uložit" in the caption strip keeps working; the
+    /// resolved §2 note says so explicitly, and there is no guard here.
+    fn clear_scripts_dir(&mut self, cx: &mut Context<Self>) {
+        if self.workspace_root.is_some() {
+            return;
+        }
+        // See `start_scripts_dir_pick` — same corrupt-config gate.
+        let Some(guard) = self.guard_corrupt_config(cx) else { return };
+        self.config.scripts_dir = None;
+        self.status = match self.config.save(&self.config_path, &guard) {
+            Ok(()) => "složka skriptů odebrána".to_string(),
+            Err(e) => format!("error: nastavení se nepodařilo uložit ({e})"),
+        };
+        self.start_scripts_scan(cx); // no root => resets the tree slot
+        cx.notify();
+    }
+
+    // -----------------------------------------------------------------
+    // Workspace T8 — the script editor binding (Part S §5).
+    // -----------------------------------------------------------------
+
+    // -----------------------------------------------------------------
+    // Workspace T9 — the scripts library's fs mutations (Part S §4).
+    // Every op goes through `crate::scripts`, off the UI thread; the
+    // component validator, the ONE Unicode-aware collision probe and the
+    // empty-rel mutation rail all live inside those ops and are never
+    // re-implemented here.
+    // -----------------------------------------------------------------
+
+    /// Part S §4: is the CURRENT binding touched by a mutation of `rel`?
+    /// The fixup predicate for rename and delete, and what decides whether
+    /// the delete confirm carries §4's second line. `resolve_entry_rel`
+    /// (not `resolve_rel`) deliberately: this asks about a MUTATION
+    /// target, and the library root is never one.
+    ///
+    /// A thin wrapper over the free [`binding_targets_entry`] so the answer
+    /// is always computed from state read AT THE MOMENT OF THE QUESTION.
+    /// See that function for the data-loss bug (final-review MAJOR-1) that
+    /// caching this answer across an await caused.
+    fn binding_targets(&self, rel: &str, is_dir: bool) -> bool {
+        binding_targets_entry(
+            self.script_binding.as_ref().map(|b| b.path.as_path()),
+            self.effective_scripts_root().as_deref(),
+            rel,
+            is_dir,
+        )
+    }
+
+    /// Part S §4: opens the ONE name dialog (new script / new folder /
+    /// rename). Same single-modal invariant every other opener applies.
+    fn open_script_name_modal(
+        &mut self,
+        mode: connections_ui::ScriptNameMode,
+        parent_rel: String,
+        target_rel: String,
+        is_dir: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
+            return;
+        }
+        if self.effective_scripts_root().is_none() {
+            self.status = "error: nastavte složku skriptů v Nastavení".to_string();
+            cx.notify();
+            return;
+        }
+        // Rename prefills the CURRENT name, extension included: the
+        // effective name is what `validate_script_name` will see, so
+        // showing anything less would make „trzby.sql" → „trzby-2025"
+        // look like it drops the suffix when it does not.
+        let prefill = match mode {
+            connections_ui::ScriptNameMode::Rename => {
+                target_rel.rsplit('/').next().unwrap_or("").to_string()
+            }
+            _ => String::new(),
+        };
+        let field = cx.new(|cx| {
+            let mut f = connections_ui::TextField::form_field(cx, "např. trzby", false);
+            f.set_text(&prefill, cx);
+            f
+        });
+        self.modal = Some(connections_ui::ModalState::ScriptName {
+            mode,
+            parent_rel,
+            target_rel,
+            is_dir,
+            field,
+            error: None,
+            running: false,
+        });
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    /// Part S §4/§7.9. `dirty_bound` is computed HERE, at open time, from
+    /// the SAME predicate the fixup uses, so the modal's second line
+    /// describes the binding by the same rule that will later drop it.
+    ///
+    /// It is a WARNING, not a decision: `finish_script_delete` asks the
+    /// predicate AGAIN when the delete lands (final-review MAJOR-1),
+    /// because the binding can move while the background op runs. This
+    /// line is an honest statement about the moment the user is looking
+    /// at it, which is all a confirm dialog can ever be.
+    fn open_script_delete_modal(&mut self, rel: String, is_dir: bool, cx: &mut Context<Self>) {
+        if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
+            return;
+        }
+        if self.effective_scripts_root().is_none() {
+            self.status = "error: nastavte složku skriptů v Nastavení".to_string();
+            cx.notify();
+            return;
+        }
+        let dirty_bound = self.binding_targets(&rel, is_dir) && self.script_dirty_flag;
+        self.modal = Some(connections_ui::ModalState::ScriptDeleteConfirm {
+            rel,
+            is_dir,
+            dirty_bound,
+            error: None,
+            running: false,
+        });
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    /// The Skript/Složka radio. Inert for `Rename` (an entry's kind cannot
+    /// change) and while `running`, the same structural-no-op rule the
+    /// ScriptRun radios follow.
+    pub(crate) fn set_script_name_mode(
+        &mut self,
+        value: connections_ui::ScriptNameMode,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(connections_ui::ModalState::ScriptName { mode, is_dir, running, .. }) =
+            &mut self.modal
+        {
+            if *running || *mode == connections_ui::ScriptNameMode::Rename {
+                return;
+            }
+            *mode = value;
+            *is_dir = value == connections_ui::ScriptNameMode::NewFolder;
+            cx.notify();
+        }
+    }
+
+    /// „Zrušit" on either scripts modal — inert while the background fs op
+    /// is in flight, exactly as Esc is (`script_modal_esc_closable`), so a
+    /// click cannot abandon a modal whose continuation is about to close
+    /// it and fix the editor binding up.
+    pub(crate) fn cancel_script_modal(&mut self, cx: &mut Context<Self>) {
+        let running = match &self.modal {
+            Some(connections_ui::ModalState::ScriptName { running, .. })
+            | Some(connections_ui::ModalState::ScriptDeleteConfirm { running, .. }) => *running,
+            _ => return,
+        };
+        if !connections_ui::script_modal_esc_closable(running) {
+            return;
+        }
+        self.close_modal(cx);
+    }
+
+    /// Is `self.modal` still the SAME latched name dialog this
+    /// continuation was dispatched from? THE identity rule — one source,
+    /// used by both the success and the failure landing (T9 review
+    /// MINOR-2: they used to disagree, and the failure side matched on the
+    /// VARIANT alone).
+    fn owns_script_name_modal(
+        &self,
+        mode: connections_ui::ScriptNameMode,
+        target_rel: &str,
+    ) -> bool {
+        matches!(
+            &self.modal,
+            Some(connections_ui::ModalState::ScriptName {
+                mode: m, target_rel: t, running: true, ..
+            }) if *m == mode && *t == target_rel
+        )
+    }
+
+    /// The delete confirm's equivalent.
+    fn owns_script_delete_modal(&self, rel: &str) -> bool {
+        matches!(
+            &self.modal,
+            Some(connections_ui::ModalState::ScriptDeleteConfirm { rel: r, running: true, .. })
+                if *r == rel
+        )
+    }
+
+    /// Continuation-side failure landing for the name dialog.
+    ///
+    /// T9 review MINOR-2. `set_script_name_error` below is sound where it
+    /// is used — synchronously inside `confirm_script_name`, with no await
+    /// between destructuring the modal and stamping it. This path is not:
+    /// it resumes AFTER a background step, so it must re-verify identity
+    /// for exactly the reason `finish_script_name` does. Stamping a
+    /// different dialog of the same kind would not merely misplace a
+    /// message — it would clear THAT dialog's `running` latch, which is
+    /// the one thing making a double-dispatch into a shared `<path>.tmp`
+    /// unreachable.
+    fn land_script_name_error(
+        &mut self,
+        mode: connections_ui::ScriptNameMode,
+        target_rel: &str,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.owns_script_name_modal(mode, target_rel) {
+            self.set_script_name_error(message, cx);
+        } else {
+            self.status = format!("error: {message}");
+            cx.notify();
+        }
+    }
+
+    /// The delete confirm's equivalent — same asymmetry, same fix.
+    fn land_script_delete_error(&mut self, rel: &str, message: String, cx: &mut Context<Self>) {
+        if self.owns_script_delete_modal(rel) {
+            self.set_script_delete_error(message, cx);
+        } else {
+            self.status = format!("error: {message}");
+            cx.notify();
+        }
+    }
+
+    /// A failed name op: the message goes back INTO the dialog (the field
+    /// keeps its text, so the user edits rather than retypes) and clears
+    /// `running` so they can retry. If the dialog is somehow no longer
+    /// there, the message still reaches the status line — never nowhere.
+    ///
+    /// SYNCHRONOUS callers only (`confirm_script_name`'s pre-dispatch
+    /// refusals): the variant-only match is sound there because nothing
+    /// can have replaced the modal between the destructure and this call.
+    /// A continuation must use `land_script_name_error` instead.
+    fn set_script_name_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::ScriptName { error, running, .. }) = &mut self.modal
+        {
+            *running = false;
+            *error = Some(message);
+        } else {
+            self.status = format!("error: {message}");
+        }
+        cx.notify();
+    }
+
+    /// The delete confirm's equivalent — „složka není prázdná — smažte
+    /// nejdřív její obsah" has to be readable against the folder named
+    /// right above it, so it stays in the modal too.
+    fn set_script_delete_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::ScriptDeleteConfirm { error, running, .. }) =
+            &mut self.modal
+        {
+            *running = false;
+            *error = Some(message);
+        } else {
+            self.status = format!("error: {message}");
+        }
+        cx.notify();
+    }
+
+    /// „Vytvořit"/„Přejmenovat" (and Enter — policy clause (a)).
+    pub(crate) fn confirm_script_name(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::ScriptName {
+            mode,
+            parent_rel,
+            target_rel,
+            is_dir,
+            field,
+            running,
+            ..
+        }) = &self.modal
+        else {
+            return;
+        };
+        if *running {
+            return;
+        }
+        let (mode, parent_rel, target_rel, is_dir, field) =
+            (*mode, parent_rel.clone(), target_rel.clone(), *is_dir, field.clone());
+        let name = field.read(cx).text();
+        let Some(root) = self.effective_scripts_root() else {
+            self.set_script_name_error("nastavte složku skriptů v Nastavení".to_string(), cx);
+            return;
+        };
+        // SINGLE WRITER PER PATH (T8's `fsutil::write_atomic` contract):
+        // `create_script` writes through the very same fixed-`<path>.tmp`
+        // rail Ctrl+S uses, and a rename can move a file out from under an
+        // in-flight save. Serialize against the editor's save exactly the
+        // way `save_script` serializes against itself — this is a refusal
+        // the user can retry, not an error, so it reuses that wording.
+        if self.script_save_in_flight {
+            self.set_script_name_error(SCRIPT_SAVE_IN_FLIGHT.to_string(), cx);
+            return;
+        }
+        if let Some(connections_ui::ModalState::ScriptName { running, error, .. }) = &mut self.modal
+        {
+            *running = true;
+            *error = None;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let job = (root, parent_rel, target_rel.clone(), name);
+            let result: Result<String, String> = cx
+                .background_spawn(async move {
+                    let (root, parent_rel, target_rel, name) = job;
+                    match mode {
+                        connections_ui::ScriptNameMode::NewScript => {
+                            crate::scripts::create_script(&root, &parent_rel, &name)
+                        }
+                        connections_ui::ScriptNameMode::NewFolder => {
+                            crate::scripts::create_folder(&root, &parent_rel, &name)
+                        }
+                        connections_ui::ScriptNameMode::Rename => {
+                            crate::scripts::rename_entry(&root, &target_rel, &name, is_dir)
+                        }
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| match result {
+                Ok(new_rel) => view.finish_script_name(mode, target_rel, is_dir, new_rel, cx),
+                Err(e) => view.land_script_name_error(mode, &target_rel, e, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// The name op landed. RE-CHECKS that the modal it is about to close
+    /// is still ITS OWN dialog: the op ran in the background, so closing
+    /// „the modal" blindly would close whatever the user has since opened
+    /// — the silent-context-change class this phase has already paid for
+    /// five times. `running` makes that unreachable in practice (Esc, both
+    /// buttons and the radio are all inert while it holds), but a
+    /// continuation must re-verify its promise, not assume it. If the
+    /// dialog IS gone, the op still happened, so the status still says so.
+    fn finish_script_name(
+        &mut self,
+        mode: connections_ui::ScriptNameMode,
+        target_rel: String,
+        is_dir: bool,
+        new_rel: String,
+        cx: &mut Context<Self>,
+    ) {
+        let mine = self.owns_script_name_modal(mode, &target_rel);
+        if mode == connections_ui::ScriptNameMode::Rename {
+            self.retarget_binding_after_rename(&target_rel, &new_rel, is_dir);
+        }
+        let name = new_rel.rsplit('/').next().unwrap_or(&new_rel).to_string();
+        // DEVIATION from the plan snippet, recorded: it statused
+        // „skript vytvořen: {name}" for BOTH create modes, which says
+        // „script" over a folder. A false noun in the one line confirming
+        // a filesystem mutation is not a nit.
+        self.status = match mode {
+            connections_ui::ScriptNameMode::Rename => format!("přejmenováno: {name}"),
+            connections_ui::ScriptNameMode::NewFolder => format!("složka vytvořena: {name}"),
+            connections_ui::ScriptNameMode::NewScript => format!("skript vytvořen: {name}"),
+        };
+        if mine {
+            self.close_modal(cx);
+        }
+        self.start_scripts_scan(cx);
+        cx.notify();
+    }
+
+    /// §4's rename fixup. A rename moves the file the editor is bound to —
+    /// or the FOLDER above it — so the binding must follow it, or the
+    /// caption names a path that no longer exists and the next Ctrl+S
+    /// silently recreates the old file.
+    ///
+    /// Routed through `set_script_binding`, THE only writer of the field
+    /// (DEVIATION from the plan snippet, which poked `binding.path`
+    /// directly): the generation bump is exactly what tells an in-flight
+    /// save/open that its target moved. `saved_text` is carried across
+    /// unchanged, so a clean binding stays clean — the caption follows the
+    /// rename without sprouting a „ •".
+    fn retarget_binding_after_rename(&mut self, old_rel: &str, new_rel: &str, is_dir: bool) {
+        let Some(root) = self.effective_scripts_root() else { return };
+        let Some(b) = self.script_binding.as_ref() else { return };
+        let (Ok(old), Ok(new)) = (
+            crate::scripts::resolve_entry_rel(&root, old_rel),
+            crate::scripts::resolve_entry_rel(&root, new_rel),
+        ) else {
+            return;
+        };
+        let Some(moved) = script_binding_retarget(&b.path, &old, &new, is_dir) else { return };
+        let saved_text = b.saved_text.clone();
+        self.set_script_binding(Some(ScriptBinding { path: moved, saved_text }));
+    }
+
+    /// „Smazat". Enter never reaches here (`ModalConfirmKind::Ignore`) —
+    /// the button is the last gate before an unrecoverable disk delete.
+    pub(crate) fn confirm_script_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::ScriptDeleteConfirm { rel, is_dir, running, .. }) =
+            &self.modal
+        else {
+            return;
+        };
+        if *running {
+            return;
+        }
+        let (rel, is_dir) = (rel.clone(), *is_dir);
+        let Some(root) = self.effective_scripts_root() else {
+            self.set_script_delete_error("nastavte složku skriptů v Nastavení".to_string(), cx);
+            return;
+        };
+        // Same single-writer serialization as the name dialog: removing a
+        // file whose atomic save is still fsyncing would race the rename
+        // half of that write and could resurrect it a moment later.
+        if self.script_save_in_flight {
+            self.set_script_delete_error(SCRIPT_SAVE_IN_FLIGHT.to_string(), cx);
+            return;
+        }
+        // FINAL-REVIEW MAJOR-1: the binding question is deliberately NOT
+        // asked here. It used to be, and the captured bool was applied
+        // blind at the landing — see `binding_targets_entry` for the
+        // resurrection scenario that cost. `is_dir` travels instead (it is
+        // an immutable property of the confirmed target, not a statement
+        // about the editor) and the landing asks for itself.
+        if let Some(connections_ui::ModalState::ScriptDeleteConfirm { running, error, .. }) =
+            &mut self.modal
+        {
+            *running = true;
+            *error = None;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let job = (root, rel.clone());
+            let result = cx
+                .background_spawn(async move {
+                    let (root, rel) = job;
+                    crate::scripts::delete_entry(&root, &rel, is_dir)
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| match result {
+                Ok(()) => view.finish_script_delete(rel, is_dir, cx),
+                Err(e) => view.land_script_delete_error(&rel, e, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// The delete landed — same own-modal re-check as `finish_script_name`,
+    /// and (final-review MAJOR-1) the same re-ASK of the binding.
+    ///
+    /// `is_dir` is threaded from the dispatch because it describes the
+    /// entry that was deleted, which cannot change while the delete runs.
+    /// The BINDING can, so it is read here and nowhere else.
+    fn finish_script_delete(&mut self, rel: String, is_dir: bool, cx: &mut Context<Self>) {
+        let mine = self.owns_script_delete_modal(&rel);
+        // RE-VERIFY MINOR-A. UNCONDITIONAL, and it must stay that way.
+        //
+        // Re-asking the binding above closed MAJOR-1's ordering (open
+        // lands, THEN delete lands). The mirror survived: with the editor
+        // UNBOUND at the landing, `binding_targets` is false, nothing is
+        // called, and `script_binding_generation` is therefore never
+        // bumped — so an `open_script` dispatched BEFORE this delete lands
+        // AFTER it, passes all three legs of `script_open_abort_reason`
+        // (root unmoved, generation unmoved, buffer untouched) and binds
+        // the file that was just irreversibly deleted. Windows opens the
+        // read with `FILE_SHARE_DELETE`, so the read completes across the
+        // delete and there is not even an error to notice. The next Ctrl+S
+        // recreates the file.
+        //
+        // The fix is the lesson `apply_context` already learned and wrote
+        // down: supersede in-flight continuations ALWAYS, not only when
+        // the state you happen to be looking at changed. A conditional
+        // bump is a bump that is missing precisely in the case where
+        // nothing local looks wrong.
+        self.supersede_script_continuations();
+        if self.binding_targets(&rel, is_dir) {
+            // §4: the bound file is gone — drop the binding. The editor
+            // TEXT stays (the user may still want it, exactly as „Zavřít"
+            // has always left it); what must not survive is a caption and
+            // a „ •" claiming a file that no longer exists, and a Ctrl+S
+            // that would silently RECREATE it.
+            self.set_script_binding(None);
+        }
+        let name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+        self.status = format!("smazáno: {name}");
+        if mine {
+            self.close_modal(cx);
+        }
+        self.start_scripts_scan(cx);
+        cx.notify();
+    }
+
+    /// Part S §5: does the editor differ from what is on disk? `false`
+    /// whenever nothing is bound — the guard NEVER protects unbound ad-hoc
+    /// text (§5.5, deliberate: identical exposure to today).
+    pub(crate) fn script_is_dirty(&self, cx: &App) -> bool {
+        self.script_binding
+            .as_ref()
+            .is_some_and(|b| script_text_is_dirty(&self.sql.read(cx).text(), &b.saved_text))
+    }
+
+    /// The bound script's label, relative to the CURRENT scripts root.
+    pub(crate) fn binding_rel(&self) -> Option<String> {
+        let b = self.script_binding.as_ref()?;
+        Some(script_caption_rel(&b.path, self.effective_scripts_root().as_deref()))
+    }
+
+    /// THE only writer of `script_binding` — it bumps
+    /// `script_binding_generation` so an in-flight open/save continuation
+    /// can tell that the user moved on. Writing the field directly
+    /// anywhere else would silently reintroduce the stale-continuation
+    /// class this phase has already paid for four times.
+    ///
+    /// The bump is keyed on the bound PATH, not on every call: refreshing
+    /// `saved_text` for the same file (what a successful save does) is not
+    /// „the user moved on", and counting it as one would make two quick
+    /// Ctrl+S presses report a spurious „editor se mezitím změnil" and
+    /// leave a phantom „ •" over a file that is in fact saved.
+    ///
+    /// That heuristic is about SAVES, and it is not a general „did anything
+    /// invalidate the in-flight work" test — see
+    /// `supersede_script_continuations` for the case where it is wrong.
+    fn set_script_binding(&mut self, binding: Option<ScriptBinding>) {
+        let changed = script_binding_target_changed(
+            self.script_binding.as_ref().map(|b| b.path.as_path()),
+            binding.as_ref().map(|b| b.path.as_path()),
+        );
+        self.script_binding = binding;
+        if changed {
+            self.supersede_script_continuations();
+        }
+    }
+
+    /// Invalidates EVERY in-flight script continuation, unconditionally.
+    ///
+    /// T8 re-verify NEW MAJOR. `set_script_binding`'s path-changed
+    /// heuristic bumps nothing for a `None -> None` transition, so
+    /// `apply_context`'s unbind was a no-op whenever the editor was
+    /// UNBOUND — and an unbound editor is `script_is_dirty == false` by
+    /// construction, so `context_switch_blocked` waves the swap through.
+    /// The hole: open `trzby.sql`, the read goes to the background
+    /// executor (seconds on a OneDrive/network-backed root), switch
+    /// workspace, the read lands with the generation and the buffer both
+    /// unchanged — both gates pass — and `bind_script` silently installs
+    /// the OLD workspace's file under a path beneath the OLD root, with
+    /// the status cleared. The next Ctrl+S then writes into the old
+    /// workspace folder: precisely the cross-context leak the swap-unbind
+    /// was added to close. Same shape in `save_script_as`.
+    ///
+    /// A context swap is not „did the binding change" — it is „everything
+    /// dispatched before this instant belongs to a context that no longer
+    /// exists". So it bumps directly rather than going through the
+    /// heuristic. Still the ONE counter and the ONE meaning; only the
+    /// trigger is broader.
+    fn supersede_script_continuations(&mut self) {
+        self.script_binding_generation = self.script_binding_generation.wrapping_add(1);
+    }
+
+    /// Sets the editor text AND the binding in one place, so the two can
+    /// never drift (a `set_text` without a matching `saved_text` update is
+    /// exactly how a phantom „ •" appears).
+    pub(crate) fn bind_script(&mut self, path: PathBuf, text: String, cx: &mut Context<Self>) {
+        // RE-VERIFY: the buffer replacement is behind the compiler now.
+        // `editor_load_guarded` said this was safe at DISPATCH and
+        // `script_open_abort_reason` has just re-checked that root,
+        // binding and buffer all stood still — so the permission asked for
+        // here is the same one, asked again, at the instant it is spent.
+        let permitted = with_editor_replaceable(self, cx, |view, cx, permit| {
+            view.sql.update(cx, |s, cx| s.replace_buffer(&text, cx, permit));
+            view.set_script_binding(Some(ScriptBinding { path, saved_text: text }));
+            view.status = String::new();
+        });
+        if permitted.is_none() {
+            // Unreachable through the guard, and a silent no-op is the
+            // shape this phase keeps banning, so it says so.
+            self.status = SCRIPT_LOAD_BLOCKED.to_string();
+        }
+        cx.notify();
+    }
+
+    /// THE guard (Part S §5.5). Every site that would replace the editor's
+    /// text — or drop the binding under it — routes through here; there is
+    /// no second dirty check anywhere.
+    pub(crate) fn editor_load_guarded(
+        &mut self,
+        action: PendingScriptAction,
+        cx: &mut Context<Self>,
+    ) {
+        // T8 review MINOR-1: this used to read
+        // `if dirty && discard_confirm.is_none() { park }`, which fell
+        // THROUGH to performing the destructive action whenever a prompt
+        // was already up — the fail-safe direction inverted. Unreachable
+        // today (the overlay is a full-screen `.occlude()` that also takes
+        // focus, and `on_open_palette` refuses while one is open), but
+        // „another question is already unanswered" must mean REFUSE, never
+        // „do it anyway". Refusing out loud, because a silent no-op is the
+        // other thing this phase keeps banning.
+        if self.discard_confirm.is_some() {
+            self.status = "nejprve dokončete rozpracované úpravy".to_string();
+            cx.notify();
+            return;
+        }
+        if self.script_is_dirty(cx) {
+            self.discard_confirm = Some(DiscardConfirmState {
+                // Scripts are text, not staged rows — the count is „one
+                // file", and `discard_confirm_question`'s script branch is
+                // what actually names it, so the number is never rendered.
+                change_count: 1,
+                action: PendingDiscard::Script(action),
+            });
+            // UX-polish §1.4: no-input prompt, cx-only site — defer focus
+            // to `AppView::render` via `modal_needs_focus`, exactly like
+            // the three pre-existing discard sites.
+            self.modal_needs_focus = true;
+            cx.notify();
+            return;
+        }
+        self.perform_script_action(action, cx);
+    }
+
+    /// The parked action, performed — either straight away (clean editor)
+    /// or from „Zahodit".
+    fn perform_script_action(&mut self, action: PendingScriptAction, cx: &mut Context<Self>) {
+        match action {
+            PendingScriptAction::Open { rel } => self.open_script(rel, cx),
+            PendingScriptAction::Unbind => {
+                // §5.3: the text STAYS — it is simply no longer bound.
+                self.set_script_binding(None);
+                self.status = String::new();
+                cx.notify();
+            }
+            PendingScriptAction::LoadText { sql } => {
+                let permitted = with_editor_replaceable(self, cx, |view, cx, permit| {
+                    view.sql.update(cx, |s, cx| s.replace_buffer(&sql, cx, permit));
+                    view.set_script_binding(None);
+                });
+                if permitted.is_none() {
+                    self.status = SCRIPT_LOAD_BLOCKED.to_string();
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Part S §5.1. Opening NEVER runs anything (the brief's binding rule:
+    /// script files are user content). The stat + 1 MiB cap + symlink +
+    /// UTF-8 decisions all live in `scripts::read_script` — one rail, not a
+    /// second size probe here.
+    fn open_script(&mut self, rel: String, cx: &mut Context<Self>) {
+        let Some(root) = self.effective_scripts_root() else {
+            self.status = "error: nastavte složku skriptů v Nastavení".to_string();
+            cx.notify();
+            return;
+        };
+        let path = match crate::scripts::resolve_rel(&root, &rel) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("error: {e}");
+                cx.notify();
+                return;
+            }
+        };
+        let dispatched = self.script_binding_generation;
+        // T8 review BLOCKER-1. `editor_load_guarded` ran at DISPATCH; the
+        // read below then yields the UI thread, and the buffer is not
+        // replaced until it comes back. The generation rail alone is
+        // structurally BLIND to the one thing the guard exists to protect:
+        // `set_script_binding` bumps only when the bound PATH changes, and
+        // TYPING changes no binding. So a clean (or unbound) editor, a
+        // double-click, a few keystrokes while a OneDrive/network-backed
+        // root answers, and the read landed on top of them — permanently
+        // (`SqlInput` has no undo) and silently (`bind_script` even clears
+        // the status). The buffer gets the same treatment as the binding.
+        let dispatched_text = self.sql.read(cx).text();
+        cx.spawn(async move |this, cx| {
+            let job = path.clone();
+            let result =
+                cx.background_spawn(async move { crate::scripts::read_script(&job) }).await;
+            let _ = this.update(cx, |view, cx| {
+                // The read yielded the UI thread, so the user may have
+                // opened something else, closed the binding, or typed
+                // meanwhile. Landing now would be a silent context change —
+                // and it would clobber whatever they moved on to.
+                if let Some(reason) = script_open_abort_reason(
+                    view.effective_scripts_root().as_deref(),
+                    &root,
+                    view.script_binding_generation,
+                    dispatched,
+                    &view.sql.read(cx).text(),
+                    &dispatched_text,
+                ) {
+                    view.status = reason.to_string();
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok(text) => view.bind_script(path.clone(), text, cx),
+                    Err(e) => {
+                        view.status = format!("error: {e}");
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Part S §5.2. Atomic (the shared `fsutil::write_atomic` rail, via
+    /// `scripts::write_script`). Last-writer-wins on external edits — by
+    /// the user's own model git is the history layer; the app does not
+    /// diff or version.
+    ///
+    /// `rescan` is `true` only for save-as. DEVIATION from the plan
+    /// snippet, recorded: it dispatched the rescan next to `save_script`
+    /// on the UI thread, i.e. BEFORE the background write had landed, so
+    /// the freshly created file was routinely missing from the tree.
+    /// Rescanning in the success arm is the only ordering that can show it.
+    ///
+    /// SERIALIZED (T8 review MAJOR-2). `fsutil::write_atomic` derives a
+    /// FIXED `<path>.tmp`, and `sync_all` holds that window open for tens
+    /// of milliseconds — long enough for OS key auto-repeat on a held
+    /// Ctrl+S to dispatch a second write into the SAME tmp file. That
+    /// races three ways: a truncated tmp mid-`write_all` (a byte-interleaved
+    /// `.sql`), an ENOENT rename reported as „uložení selhalo" over a file
+    /// that is fine, and — worst — a phantom-clean caption, where the
+    /// later-completing update sets `saved_text` to text the disk does not
+    /// hold and the „ •" disappears over an unsaved file.
+    ///
+    /// The fix is here rather than in the shared rail, and the reason is
+    /// NOT the one this comment first gave (T8 re-verify MINOR — that
+    /// version argued from a stale copy of the `.gitignore` template in
+    /// the spec draft; the shipped `GITIGNORE_TEMPLATE` is a blanket
+    /// `*.tmp` and would cover a nonce perfectly well). The real reason:
+    /// a unique tmp name fixes the first two failures above but NOT the
+    /// third. With two writes in flight the `rename` that wins on disk
+    /// need not belong to the continuation that runs last, so phantom-clean
+    /// survives a nonce untouched. Only per-path serialization closes it —
+    /// and once the caller has that, a nonce buys nothing. `write_atomic`'s
+    /// doc comment now states the contract for every other writer over a
+    /// user folder.
+    ///
+    /// FINAL-REVIEW MAJOR-2: `_allowed` is a [`SaveAllowed`] witness,
+    /// mintable ONLY by `save_guard::with_save_permission`. It is unused at
+    /// runtime and load-bearing at compile time — no caller can reach this
+    /// writer, by any call syntax, without having asked the predicate. The
+    /// reviewer's UFCS bypass (`AppView::save_script(self, p, t, false, cx)`)
+    /// no longer type-checks.
+    fn save_script(
+        &mut self,
+        path: PathBuf,
+        text: String,
+        rescan: bool,
+        _allowed: SaveAllowed<'_>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.script_save_in_flight {
+            self.status = SCRIPT_SAVE_IN_FLIGHT.to_string();
+            cx.notify();
+            return;
+        }
+        self.script_save_in_flight = true;
+        let dispatched = self.script_binding_generation;
+        cx.spawn(async move |this, cx| {
+            let (job_path, job_text) = (path.clone(), text.clone());
+            let result = cx
+                .background_spawn(async move { crate::scripts::write_script(&job_path, &job_text) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.script_save_in_flight = false;
+                let name =
+                    path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                match result {
+                    Ok(()) => {
+                        // The WRITE is honoured either way — the user asked
+                        // for this file to hold this text and it now does.
+                        // What must not happen is re-binding the editor to
+                        // it after the user moved on: that would strand a
+                        // different buffer under this file's caption and
+                        // make the next Ctrl+S overwrite the wrong script.
+                        if view.script_binding_generation == dispatched {
+                            view.set_script_binding(Some(ScriptBinding {
+                                path: path.clone(),
+                                saved_text: text.clone(),
+                            }));
+                            view.status = format!("skript uložen: {name}");
+                        } else {
+                            view.status =
+                                format!("skript uložen: {name} — editor se mezitím změnil");
+                        }
+                        // T8 review MINOR-2: the rescan is INDEPENDENT of
+                        // the re-bind decision and lives outside it. A
+                        // save-as that lands after the binding moved still
+                        // created a file in the library; leaving it out of
+                        // the tree, with a status that talks only about the
+                        // binding, is a silently incomplete result.
+                        if rescan
+                            && view
+                                .effective_scripts_root()
+                                .is_some_and(|r| path_starts_with_ci(&path, &r))
+                        {
+                            view.start_scripts_scan(cx);
+                        }
+                    }
+                    Err(e) => view.status = format!("error: {e}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Part S §5.4 — Ctrl+S with no binding.
+    fn save_script_as(&mut self, cx: &mut Context<Self>) {
+        let text = self.sql.read(cx).text();
+        if text.trim().is_empty() {
+            self.status = "editor je prázdný".to_string();
+            cx.notify();
+            return;
+        }
+        let Some(root) = self.effective_scripts_root() else {
+            self.status = "error: nastavte složku skriptů v Nastavení".to_string();
+            cx.notify();
+            return;
+        };
+        let dispatched = self.script_binding_generation;
+        // Verified in the pinned GPUI rev (907ed09,
+        // `gpui_windows/src/platform.rs::file_save_dialog`): a non-empty
+        // `directory` is canonicalized and pushed through
+        // `IFileSaveDialog::SetFolder` — the FORCING call, not
+        // `SetDefaultFolder` — so this really does open in the library,
+        // with `dotaz.sql` prefilled via `SetFileName`. The same function
+        // sets `SetFileTypes` to „All files"/`*.*`, which is why
+        // `with_sql_extension` below is both correct and necessary.
+        //
+        // KNOWN, UNOBSERVABLE FALLBACK: if `root.canonicalize()` fails —
+        // the scripts folder deleted or unmounted between the scan and
+        // this click — GPUI `log_err()`s and opens the dialog at the
+        // PLATFORM DEFAULT instead. The app cannot see that happen, so the
+        // user can land in their home folder with no explanation. Not
+        // fixable from here without duplicating the canonicalize (and then
+        // racing it); recorded so it is not mistaken for our own silence.
+        let dialog = cx.prompt_for_new_path(&root, Some("dotaz.sql"));
+        cx.spawn(async move |this, cx| {
+            // Same three arms as the backup save picker: a swallowed dialog
+            // failure is exactly the silence this phase keeps banning.
+            let picked = match dialog.await {
+                Ok(Ok(Some(p))) => p,
+                Ok(Ok(None)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "uložení zrušeno".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = format!("error: dialog pro uložení selhal ({e})");
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_canceled) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "error: dialog pro uložení není dostupný".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let path = with_sql_extension(&picked);
+            let _ = this.update(cx, |view, cx| {
+                // The picker is not modal to the whole app on every
+                // platform, and the buffer this save-as was started for is
+                // the one the user saw. If the editor has since been bound
+                // to a script (or reloaded from history), writing the OLD
+                // captured text to a NEW path — and then binding to it —
+                // would be a silent context change on both ends.
+                if view.script_binding_generation != dispatched {
+                    view.status = "uložení zrušeno — editor se mezitím změnil".to_string();
+                    cx.notify();
+                    return;
+                }
+                // FINAL-REVIEW NIT-1, the third leg. `open_script` re-asks
+                // root + generation + BUFFER TEXT
+                // (`script_open_abort_reason`); this path asked only the
+                // first two. The generation is structurally blind to
+                // typing — `set_script_binding` bumps on a PATH change and
+                // nothing else — and the picker is not app-modal on every
+                // platform, so keystrokes during it are invisible here.
+                //
+                // The consequence is milder than the open's (no data is
+                // destroyed: the file gets the pre-picker text, the „ •"
+                // stays up and a second Ctrl+S fixes it) but it is still a
+                // silent divergence — `saved_text` would be bound to text
+                // the user can no longer see anywhere. Refuse instead, in
+                // the same words the open uses, so the two paths do not
+                // teach the user two different stories about the same
+                // event. Nothing is lost: the editor is untouched, no file
+                // is created, and Ctrl+S re-opens the picker.
+                if view.sql.read(cx).text() != text {
+                    view.status = "uložení zrušeno — mezitím jste psali do editoru".to_string();
+                    cx.notify();
+                    return;
+                }
+                // T9 RE-VERIFY FAIL-1. The generation check above is NOT
+                // enough, and MAJOR-1's own scenario walks straight through
+                // the gap: `on_save_script` asked `script_save_allowed`
+                // BEFORE the picker opened, and the picker is not app-modal
+                // on every platform, so the whole dialog-open window is
+                // unguarded on this branch.
+                //
+                // 1. Editor UNBOUND and dirty. Ctrl+S → guard passes →
+                //    `save_script_as` → the picker opens.
+                // 2. The user deletes `trzby.sql` from the tree and
+                //    confirms. `script_save_in_flight` is still false (no
+                //    write was dispatched), so the serialization check does
+                //    not fire; the delete lands. `finish_script_delete`
+                //    runs with `was_bound == false` — the editor is
+                //    unbound, that is why we are in save-AS — so
+                //    `set_script_binding` is never called and the
+                //    generation is NEVER BUMPED.
+                // 3. The user completes the picker naming `trzby.sql`. The
+                //    generation check passes, the write lands, and the
+                //    irreversibly deleted file is silently back.
+                //
+                // So the predicate is re-asked HERE, continuation-side,
+                // exactly the asymmetry T9 review MINOR-2 established
+                // between `set_script_name_error` (synchronous, sound) and
+                // `land_script_name_error` (post-await, must re-verify): a
+                // check performed before an await is a check about the past.
+                //
+                // FINAL-REVIEW MAJOR-2 + RE-VERIFY FAIL-2: the SCOPE is
+                // what makes this structural. `on_save_script`'s
+                // permission is branded to its own synchronous scope, so
+                // it cannot be captured by this `'static` spawned future
+                // even deliberately — the re-verifier's carried-witness
+                // refactor no longer compiles. The only way to reach
+                // `save_script` from here is to ask again, here.
+                //
+                // Rescan when the save lands INSIDE the library; outside is
+                // allowed (it is the user's disk) but the tree honestly
+                // won't show it.
+                let text = text.clone();
+                if with_save_permission(view, cx, move |view, cx, allowed| {
+                    view.save_script(path, text, true, allowed, cx);
+                })
+                .is_none()
+                {
+                    view.status = SCRIPT_SAVE_BLOCKED.to_string();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Ctrl+S / the caption strip's „Uložit" / the palette's „Uložit
+    /// skript" — one entry point for all three (Part S §5.2/§5.4).
+    fn on_save_script(&mut self, _: &SaveScript, _window: &mut Window, cx: &mut Context<Self>) {
+        // T9 review MAJOR-1. `.occlude()` blocks CLICKS, not KEYS — the
+        // trap `run_query_with`'s guard already documents — and `ctrl-s` is
+        // registered with context `None`, so nothing shadows it while a
+        // dialog is up. Unguarded, a Ctrl+S pressed out of habit while
+        // „Pracuji…" shows RACES the rename/delete running underneath it:
+        // `script_save_in_flight` is one-directional (it is read at
+        // dispatch, and the UI thread is free for the whole background op),
+        // so the delete lands, the binding is cleared, the rescan finishes
+        // — and THEN the save recreates the file the user just
+        // irreversibly deleted, invisibly, because the tree already
+        // refreshed without it. A rename can leave BOTH names on disk.
+        //
+        // Refused OUT LOUD (a silent `return` is the other thing this phase
+        // bans) and not as an „error:" — nothing failed; the keystroke
+        // simply arrived while another decision was still on screen.
+        let bound = self.script_binding.as_ref().map(|b| b.path.clone());
+        let permitted = with_save_permission(self, cx, |view, cx, allowed| match bound {
+            Some(path) => {
+                let text = view.sql.read(cx).text();
+                view.save_script(path, text, false, allowed, cx);
+            }
+            // The permission ENDS with this scope, deliberately.
+            // `save_script_as` resumes after a file picker, so this answer
+            // will be stale by the time it has a path to write, and it
+            // opens its own scope there. Re-verify FAIL-2: handing the
+            // witness over used to COMPILE (a move is not a re-use), which
+            // restored the delete/save-as race whole; the generative brand
+            // is what makes it impossible rather than merely discouraged.
+            None => view.save_script_as(cx),
+        });
+        if permitted.is_none() {
+            self.status = SCRIPT_SAVE_BLOCKED.to_string();
+            cx.notify();
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Workspace T4 — the §W4 recovery flow + the §W3.4 context swap.
+    // -----------------------------------------------------------------
+
+    /// Design §W4. Opened only from `main()`'s startup wiring — there is no
+    /// other way to reach a broken resolution, and no guard is needed
+    /// (nothing else can be open one frame after the window appears).
+    fn open_workspace_missing_modal(
+        &mut self,
+        root: Option<PathBuf>,
+        reason: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.modal = Some(connections_ui::ModalState::WorkspaceMissing {
+            root,
+            reason,
+            error: None,
+            pending: None,
+        });
+        // UX-polish §1.4: no-input modal, cx-only opener.
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    /// „Najít složku…" — THE WORKSPACE MOVED, not "make a new one": only a
+    /// folder carrying a valid `dbc-workspace.toml` marker is accepted here
+    /// (design §W4). An empty folder is refused with the same honesty as a
+    /// non-workspace one — initialization is a Settings decision with its
+    /// own confirm + security warning (T5), never a recovery side effect.
+    fn pick_workspace_for_recovery(&mut self, cx: &mut Context<Self>) {
+        // T4 review MAJOR-1: capture the generation this pick belongs to.
+        // The picker and the classification below are both slow (a folder
+        // dialog, then a `read_dir` that can take seconds on a network
+        // share) and the window stays interactive throughout, so the user
+        // can reach a DIFFERENT decision — „Použít lokální profil" — while
+        // this task is still running.
+        let my_generation = self.workspace_pick_generation;
+        let dialog = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Otevřít".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = match dialog.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
+                Ok(Ok(_)) => return, // cancelled: the modal stays up
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.set_workspace_missing_error(format!("dialog selhal: {e}"), cx);
+                    });
+                    return;
+                }
+                Err(_canceled) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.set_workspace_missing_error("dialog není dostupný".into(), cx);
+                    });
+                    return;
+                }
+            };
+            // Off the UI thread: classification ONLY. The pointer write
+            // deliberately does NOT happen here (T4 review MAJOR-1): a
+            // stale task that had already rewritten the pointer would leave
+            // the NEXT launch in workspace mode even after being refused
+            // here, and undoing a write after the fact is its own race.
+            // Nothing is persisted until the UI-thread guard below passes.
+            let classified = cx
+                .background_spawn({
+                    let picked = picked.clone();
+                    async move {
+                        match dbc_state::workspace::classify(&picked) {
+                            dbc_state::workspace::Classification::Workspace => Ok(()),
+                            dbc_state::workspace::Classification::FutureFormat(f) => Err(format!(
+                                "pracovní prostor vyžaduje novější verzi aplikace (formát {f})"
+                            )),
+                            dbc_state::workspace::Classification::Unreadable(m) => Err(m),
+                            _ => Err(
+                                "vybraná složka není pracovní prostor dbc — vyberte složku s dbc-workspace.toml"
+                                    .to_string(),
+                            ),
+                        }
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if let Err(e) = classified {
+                    view.set_workspace_missing_error(e, cx);
+                    return;
+                }
+                // THE GUARD (T4 review MAJOR-1). Both halves are pinned by
+                // `recovery_pick_may_commit`'s tests.
+                let modal_open = matches!(
+                    view.modal,
+                    Some(connections_ui::ModalState::WorkspaceMissing { .. })
+                );
+                if !recovery_pick_may_commit(
+                    modal_open,
+                    my_generation,
+                    view.workspace_pick_generation,
+                ) {
+                    // Superseded by the user's own explicit choice. Say
+                    // nothing and change nothing: the pointer was never
+                    // written, so there is no state to undo, and stealing
+                    // the context back now is exactly the silent override
+                    // this guard exists to stop.
+                    return;
+                }
+                // FINAL-REVIEW MINOR-1: still nothing is persisted here.
+                // The folder is a valid workspace, but pointing the app at
+                // a folder it did not previously own is an ADOPT, and
+                // Settings' adopt states the two things this one did not —
+                // that the trezor there has its OWN master password, and
+                // §W6.3's git warning — BEFORE it commits. So the pick
+                // moves the blocking modal to its confirm STATE and the
+                // user decides; `confirm_workspace_recovery` does the
+                // write, synchronously, with no await anywhere near it.
+                if let Some(connections_ui::ModalState::WorkspaceMissing { pending, error, .. }) =
+                    &mut view.modal
+                {
+                    *pending = Some(picked);
+                    // A previous refusal's message is about the previous
+                    // folder; carrying it onto this screen would read as a
+                    // complaint about the one just picked.
+                    *error = None;
+                }
+                // The confirm state's buttons are new elements, so the
+                // panel must take focus again for Tab to reach them.
+                view.modal_needs_focus = true;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The confirm button of the recovery modal's adopt state
+    /// (final-review MINOR-1).
+    ///
+    /// Synchronous end to end — `write_pointer` is a small atomic TOML
+    /// write, the same deliberately-synchronous posture `apply_context`
+    /// takes with `AppConfig::load` — so there is no await between reading
+    /// `pending` and acting on it, and therefore nothing to re-verify.
+    /// That is the whole reason the confirm lives here rather than in
+    /// another background task.
+    fn confirm_workspace_recovery(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::WorkspaceMissing { pending: Some(root), .. }) =
+            &self.modal
+        else {
+            return;
+        };
+        let root = root.clone();
+        if let Err(e) =
+            dbc_state::workspace::write_pointer(&dbc_state::workspace::pointer_path(), &root)
+        {
+            // Back to the confirm screen with the failure in place: the
+            // pointer is untouched, so „Zpět" and „Použít lokální profil"
+            // both still mean exactly what they did.
+            self.set_workspace_missing_error(e.message, cx);
+            return;
+        }
+        self.close_modal(cx);
+        self.apply_context(Some(root), cx);
+    }
+
+    /// „Zpět" on the recovery modal's adopt state — returns to the three
+    /// choices. NOT a close: `WorkspaceMissing` is the one modal the user
+    /// cannot dismiss (§W4), and the whole point of putting the confirm
+    /// INSIDE it rather than handing the screen to an Esc-closable
+    /// `WorkspaceConfirm` is that cancelling can never leave the app with
+    /// no context and no dialog. The picked folder is dropped; nothing was
+    /// written, so there is nothing to undo.
+    fn cancel_workspace_recovery(&mut self, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::WorkspaceMissing { pending, error, .. }) =
+            &mut self.modal
+        {
+            *pending = None;
+            *error = None;
+        }
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    /// Replaces the `WorkspaceMissing` modal's in-place error line. A no-op
+    /// if the modal is gone (the user quit, or an earlier re-pick already
+    /// succeeded) — never reopens it, never writes over another modal.
+    fn set_workspace_missing_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::WorkspaceMissing { error, .. }) = &mut self.modal {
+            *error = Some(message);
+        }
+        cx.notify();
+    }
+
+    /// Design §W3.1 — THE common gate in front of EVERY context change
+    /// (init, adopt, „Přejít na lokální profil"). A context replacement
+    /// demands a quiet app: the same gate style as `start_script_pick`.
+    /// Returns the Czech refusal to show, or `None` to proceed.
+    ///
+    /// This function reads the live state; the DECISION (and its
+    /// precedence) lives in the pure `connections_ui::context_switch_refusal`
+    /// so it can be unit-pinned without a GPUI window — the
+    /// `modal_is_blocking` / `pwchange::esc_closable` precedent. The two
+    /// together are ONE gate, not two: nothing else in the app may answer
+    /// „is it safe to switch".
+    ///
+    /// Workspace T8 filled the EXTENSION POINT this comment used to
+    /// reserve: the dirty-`script_binding` arm (Part S §5.5's guard) is now
+    /// the second parameter below. There remains exactly ONE gate — a
+    /// second „is it safe to switch" predicate is a review-blocking defect.
+    ///
+    /// `script_dirty_flag` (not `script_is_dirty(cx)`) because this
+    /// function takes no `cx` by design — see that field's doc comment for
+    /// why one frame of staleness is safe in the only direction that
+    /// matters.
+    pub(crate) fn context_switch_blocked(&self) -> Option<String> {
+        connections_ui::context_switch_refusal(
+            self.cancel.is_some(),
+            self.script_binding.is_some() && self.script_dirty_flag,
+            self.apply_dialog.is_some() || self.discard_confirm.is_some(),
+            // The switch flow's OWN modals (Settings, and the confirm
+            // itself) do not count as "some other dialog" — see
+            // `modal_blocks_context_switch`. Every other open dialog does
+            // (single-modal invariant, app-wide).
+            connections_ui::modal_blocks_context_switch(self.modal.as_ref()),
+        )
+        .map(str::to_string)
+    }
+
+    /// §W3: „Použít složku…". Gates first, then picks, then classifies in
+    /// the background, then opens the confirm modal. NOTHING is written
+    /// before the user clicks the confirm button — the classification is a
+    /// read-only `read_dir` (§W6.4: nothing under `.git/` is ever opened).
+    fn start_workspace_pick(&mut self, cx: &mut Context<Self>) {
+        if let Some(reason) = self.context_switch_blocked() {
+            self.status = format!("error: {reason}");
+            cx.notify();
+            return;
+        }
+        // A new attempt supersedes the previous one's refusal text.
+        self.workspace_pick_error = None;
+        // T5 review MAJOR-1/MINOR-3: capture the generation this pick
+        // belongs to, exactly as `pick_workspace_for_recovery` does. The
+        // picker is modal to the app but the `classify()` below is NOT —
+        // it yields the UI thread, and Settings is Esc-closable, so every
+        // continuation arm from here on is a potential STALE write.
+        let my_generation = self.workspace_pick_generation;
+        let dialog = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Použít".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = match dialog.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
+                Ok(Ok(_)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.set_workspace_pick_status(my_generation, "výběr zrušen".into(), cx);
+                    });
+                    return;
+                }
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.set_workspace_pick_status(
+                            my_generation,
+                            format!("error: dialog selhal: {e}"),
+                            cx,
+                        );
+                    });
+                    return;
+                }
+                Err(_canceled) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.set_workspace_pick_status(
+                            my_generation,
+                            "error: dialog není dostupný".into(),
+                            cx,
+                        );
+                    });
+                    return;
+                }
+            };
+            let probe = picked.clone();
+            let outcome = cx
+                .background_spawn(async move {
+                    connections_ui::workspace_pick_outcome(dbc_state::workspace::classify(&probe))
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| match outcome {
+                Ok(mode) => view.open_workspace_confirm(mode, Some(picked), my_generation, cx),
+                // T5 review MINOR-2: the prose goes into the Settings
+                // panel, the status bar keeps a short sentinel.
+                Err(e) => {
+                    if view.workspace_pick_generation != my_generation {
+                        return; // superseded — silent, like the Ok arm
+                    }
+                    view.workspace_pick_error = Some(e);
+                    view.status = connections_ui::WORKSPACE_PICK_FAILED_STATUS.to_string();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// A status write from `start_workspace_pick`'s continuation
+    /// (T5 review MINOR-3). Silent when superseded: a context swap means
+    /// the user has already reached a newer decision, and „výběr zrušen"
+    /// landing over „pracovní prostor: D:\ws" would be a stale write over
+    /// it. Same posture as `set_workspace_missing_error`'s no-op arm.
+    fn set_workspace_pick_status(
+        &mut self,
+        dispatched_generation: u64,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace_pick_generation != dispatched_generation {
+            return;
+        }
+        self.status = message;
+        cx.notify();
+    }
+
+    /// §W3.4's reverse switch — same gate, same confirm shape. Nothing in
+    /// the workspace folder is read or written: only the pointer goes.
+    fn start_leave_workspace(&mut self, cx: &mut Context<Self>) {
+        if let Some(reason) = self.context_switch_blocked() {
+            self.status = format!("error: {reason}");
+            cx.notify();
+            return;
+        }
+        // Synchronous from the Settings click — nothing can have gone
+        // stale, so this pick's generation IS the current one.
+        let my_generation = self.workspace_pick_generation;
+        self.open_workspace_confirm(
+            connections_ui::WorkspaceConfirmMode::ToProfile,
+            None,
+            my_generation,
+            cx,
+        );
+    }
+
+    /// Opens the confirm modal OVER the Settings modal it was started
+    /// from — behind the `workspace_pick_verdict` guard (T5 review
+    /// MAJOR-1). The precondition this function's older comment merely
+    /// ASSERTED is now CHECKED: the raw `self.modal = Some(..)` below is a
+    /// destructive write, and a stale classification landing on a
+    /// `WorkspaceConfirm { running: true }`, a `BackupRestore`, or a
+    /// half-typed `ConnectionDialog` would silently destroy it.
+    fn open_workspace_confirm(
+        &mut self,
+        mode: connections_ui::WorkspaceConfirmMode,
+        root: Option<PathBuf>,
+        dispatched_generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let settings_open = matches!(self.modal, Some(connections_ui::ModalState::Settings));
+        match workspace_pick_verdict(
+            settings_open,
+            dispatched_generation,
+            self.workspace_pick_generation,
+        ) {
+            WorkspacePickVerdict::Open => {}
+            // The user has already reached a newer, explicit decision.
+            WorkspacePickVerdict::Superseded => return,
+            WorkspacePickVerdict::OtherDialog => {
+                self.status = connections_ui::WORKSPACE_PICK_DISCARDED.to_string();
+                cx.notify();
+                return;
+            }
+        }
+        // Now verified: exactly one modal is open and it is Settings, the
+        // one this flow started from — replacing it in place keeps the
+        // single-modal invariant.
+        self.modal = Some(connections_ui::ModalState::WorkspaceConfirm {
+            mode,
+            root,
+            error: None,
+            running: false,
+        });
+        // UX-polish §1.4: no-input modal, cx-only opener.
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    /// The confirm button of `ModalState::WorkspaceConfirm`. The order is
+    /// the design's, and the order MATTERS: files first, marker last
+    /// (inside `init_workspace`), pointer only after that returns `Ok`,
+    /// live swap only after the pointer is on disk. A failure at any step
+    /// leaves the PREVIOUS context fully intact and the error in the modal.
+    fn confirm_workspace(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::WorkspaceConfirm { mode, root, running, .. }) =
+            &mut self.modal
+        else {
+            return;
+        };
+        if *running {
+            return; // double-click guard, `KillConfirm::dispatched`'s role
+        }
+        let (mode, root) = (*mode, root.clone());
+        // Re-run the gate: the pick + classification did not block the app,
+        // so a query or a dialog may have started in the meantime.
+        if let Some(reason) = self.context_switch_blocked() {
+            self.set_workspace_confirm_error(reason, cx);
+            return;
+        }
+        if let Some(connections_ui::ModalState::WorkspaceConfirm { running, .. }) = &mut self.modal
+        {
+            *running = true;
+        }
+        cx.notify();
+        // §W3.2 step 1: init copies from the PROFILE, always — workspace
+        // mode offers no picker (§W3), so the profile is the only possible
+        // origin. `from` is captured here, on the UI thread, and moved into
+        // the background job.
+        let from = dbc_state::workspace::profile_paths();
+        let pointer = dbc_state::workspace::pointer_path();
+        cx.spawn(async move |this, cx| {
+            let job_root = root.clone();
+            let result: Result<(), String> = cx
+                .background_spawn(async move {
+                    match mode {
+                        connections_ui::WorkspaceConfirmMode::Init => {
+                            let root = job_root.ok_or("chybí cílová složka")?;
+                            // Copies + scripts/ + .gitignore + MARKER LAST.
+                            // Every write inside goes through the shared
+                            // rails (`fsutil::write_atomic` /
+                            // `join_component` / `entry_exists_ci`) — this
+                            // call site must NEVER grow its own copy loop.
+                            dbc_state::workspace::init_workspace(&root, &from)
+                                .map_err(|e| e.message)?;
+                            dbc_state::workspace::write_pointer(&pointer, &root)
+                                .map_err(|e| e.message)
+                        }
+                        connections_ui::WorkspaceConfirmMode::Adopt => {
+                            let root = job_root.ok_or("chybí cílová složka")?;
+                            // §W3.3: NOTHING is written but the pointer.
+                            dbc_state::workspace::write_pointer(&pointer, &root)
+                                .map_err(|e| e.message)
+                        }
+                        connections_ui::WorkspaceConfirmMode::ToProfile => {
+                            // §W3.4: the folder is not touched in any way.
+                            dbc_state::workspace::clear_pointer(&pointer).map_err(|e| e.message)
+                        }
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| match result {
+                Ok(()) => {
+                    view.close_modal(cx);
+                    // THE single seam (§W3.4). It bumps
+                    // `workspace_pick_generation`, so any „Najít složku…"
+                    // continuation still in flight is superseded by this.
+                    view.apply_context(root.clone(), cx);
+                }
+                Err(e) => {
+                    // The previous context is untouched: `apply_context`
+                    // was never reached, and nothing partial was pointed
+                    // at (the pointer is written LAST inside the job).
+                    view.set_workspace_confirm_error(e, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// „Zrušit" on `ModalState::WorkspaceConfirm`. Refuses while the
+    /// init/pointer write is in flight, for the same reason Esc does
+    /// (`connections_ui::workspace_confirm_esc_closable`): the background
+    /// job's success arm calls `apply_context`, so letting the modal close
+    /// mid-write would change the whole working context AFTER the user
+    /// asked to cancel — a silent context change, which this design bans.
+    /// Nothing is lost by waiting: the write is a handful of file copies,
+    /// and a FAILED one leaves the previous context fully intact.
+    fn cancel_workspace_confirm(&mut self, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::WorkspaceConfirm { running, .. }) = &self.modal {
+            if !connections_ui::workspace_confirm_esc_closable(*running) {
+                return;
+            }
+        }
+        self.close_modal(cx);
+    }
+
+    /// Replaces the `WorkspaceConfirm` modal's in-place error line and
+    /// releases its `running` guard. A no-op if the modal is gone (the user
+    /// cancelled while the write was still pending) — never reopens it,
+    /// never writes over another modal.
+    fn set_workspace_confirm_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::WorkspaceConfirm { error, running, .. }) =
+            &mut self.modal
+        {
+            *running = false;
+            *error = Some(message);
+        }
+        cx.notify();
+    }
+
+    /// „Použít lokální profil" — the EXPLICIT user action design §W4
+    /// contrasts with a silent fallback: it deletes the pointer (so the
+    /// next start is plain profile mode) and swaps the live context. The
+    /// workspace folder itself is not touched in any way.
+    fn use_local_profile(&mut self, cx: &mut Context<Self>) {
+        if let Err(e) = dbc_state::workspace::clear_pointer(&dbc_state::workspace::pointer_path()) {
+            self.set_workspace_missing_error(e.message, cx);
+            return;
+        }
+        self.close_modal(cx);
+        self.apply_context(None, cx);
+    }
+
+    /// Design §W3.4 — the live, in-place context swap. THE single seam:
+    /// „Najít složku…" (§W4), „Použít lokální profil" (§W4), init (§W3.2),
+    /// adopt (§W3.3) and „Přejít na lokální profil" all end here.
+    ///
+    /// PRECONDITIONS the caller owns: the §W3.1 gates have passed (no run
+    /// in flight, no pending apply/discard, no dirty script — T5's
+    /// `context_switch_blocked`) and the pointer file has already been
+    /// written or cleared. This fn performs no I/O beyond loading the NEW
+    /// context's stores, and never deletes, moves, or rewrites anything in
+    /// the OLD one (never-destructive rail).
+    ///
+    /// `AppConfig::load` runs on the UI thread here, exactly as it does in
+    /// `fn main()` — a small TOML read, deliberately synchronous so the
+    /// swap is atomic from the user's point of view (no frame in which the
+    /// paths are new but the connections are still the old ones).
+    pub(crate) fn apply_context(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        let paths = match &root {
+            Some(r) => dbc_state::workspace::workspace_paths(r),
+            None => dbc_state::workspace::profile_paths(),
+        };
+        // §W3.1: the connection list itself is about to change — keeping a
+        // session from the OLD context alive under the NEW config is
+        // exactly the silent context mixing this design bans.
+        self.clear_active_connection(cx);
+        // §W3.4: a workspace vault is a DIFFERENT file; the session unlock
+        // must not carry over. The existing lazy prompt re-fires on the
+        // next secret use, at most once per run.
+        self.vault = None;
+        self.config_path = paths.config.clone();
+        self.vault_path = paths.vault.clone();
+        let (config, config_load_error) = match AppConfig::load(&paths.config) {
+            Ok(c) => (c, None),
+            Err(e) => (AppConfig::default(), Some(e.to_string())),
+        };
+        self.config = config;
+        self.config_load_error = config_load_error;
+        // Existing degrade-to-None postures, unchanged.
+        self.view_prefs = ViewPrefsStore::load(&paths.views).ok();
+        self.param_values = ParamValuesStore::load(&paths.params).ok();
+        // history: NOT touched — machine-local in both modes (§W5).
+        self.workspace_root = root.clone();
+        // T4 review MAJOR-1: every swap supersedes any „Najít složku…"
+        // continuation still in flight, so a stale pick can never override
+        // the choice the user just made (`recovery_pick_may_commit`).
+        self.workspace_pick_generation = self.workspace_pick_generation.wrapping_add(1);
+        // T4 review MINOR-6 (as-built addendum to §W3.4, which listed only
+        // the scripts tree): drop the OLD context's fetched database lists
+        // and schema snapshots BEFORE `sync_connections` re-seeds the map.
+        // `sync_connections` keeps every cached entry whose connection id
+        // still exists — and because §W3.2 initialises a workspace by
+        // copying `config.toml` verbatim, the two contexts share ids by
+        // construction, so without this the sidebar would render context
+        // A's databases and schemas under context B's identically-id'd
+        // connection. Display-only (queries rebuild from the new config),
+        // but a wrong-context display is still a wrong context.
+        self.tree.update(cx, |t, cx| t.reset_fetched_context(cx));
+        self.refresh_grouped_cache(cx);
+        self.refresh_tree_context(cx);
+        // §W3.4: the scripts root just changed under us. Clear to
+        // `NotLoaded` (dropping stale expand keys and any in-flight scan of
+        // the OLD root — `reset_scripts` bumps the generation), then
+        // rescan the new one.
+        self.tree.update(cx, |t, cx| t.reset_scripts(cx));
+        self.start_scripts_scan(cx);
+        // T8 review MINOR-3: the script binding is context state too, and
+        // nothing else drops it. `context_switch_blocked` refuses a swap
+        // only while the binding is DIRTY, so a CLEAN one would ride into
+        // the new workspace: the caption would silently degrade from
+        // `prod/trzby.sql` to a bare `trzby.sql` (the path no longer sits
+        // under the new root) and the next Ctrl+S would write back into the
+        // OLD workspace folder — precisely the cross-context leak §W3.4
+        // exists to prevent. The editor TEXT stays, exactly as „Zavřít"
+        // leaves it (§5.3): it is the binding that belongs to the old
+        // context, not the buffer.
+        //
+        // T8 re-verify NEW MAJOR: the unbind alone was NOT enough, and the
+        // claim that it "supersedes any in-flight open/save" was false
+        // whenever there was nothing bound — `set_script_binding`'s
+        // path-changed heuristic bumps nothing for `None -> None`, and an
+        // unbound editor is never dirty, so the gate lets the swap through
+        // in exactly that state. An `open_script` dispatched against the
+        // OLD root would then land, pass both re-checks unchanged, and
+        // bind the old workspace's file. The bump is therefore explicit and
+        // unconditional; see `supersede_script_continuations`.
+        self.set_script_binding(None);
+        self.supersede_script_continuations();
+        self.status = match &root {
+            Some(r) => format!("pracovní prostor: {}", r.display()),
+            None => "lokální profil obnoven".to_string(),
+        };
+        if let Some(detail) = self.config_load_error.clone() {
+            self.status =
+                format!("error: config.toml je poškozený – oprav nebo smaž soubor ({detail})");
+        }
+        cx.notify();
+    }
+
+    /// §W3.1's „Aktivní připojení bude odpojeno." made real. The app keeps
+    /// no persistent session (the runner is per-operation — sidebar design
+    /// fact 0.1), so disconnecting IS dropping the active identity and
+    /// bumping `switch_generation` so an in-flight switch's result can
+    /// never land in the NEW context. The CLI-arg root goes too: it belongs
+    /// to the old context and, per the sidebar design, cannot come back.
+    fn clear_active_connection(&mut self, cx: &mut Context<Self>) {
+        self.active_connection_id = None;
+        self.active_database = None;
+        self.conn_url = None;
+        self.switch_generation = self.switch_generation.wrapping_add(1);
+        self.dropdown_open = false;
+        cx.notify();
     }
 
     /// The old trigger_schema_fetch success-arm's M2-guarded admin-schema
@@ -6160,6 +9081,17 @@ impl AppView {
                     self.tabs.close(id);
                 }
                 self.switch_to_database(&conn_id, db, follow_up, cx);
+            }
+            // Workspace T8 (Part S §5.5): the user confirmed dropping the
+            // script's unsaved changes — perform what was parked.
+            // RE-VERIFY: the user has just agreed to lose the script's
+            // unsaved changes. That answer is the one thing
+            // `editor_guard::with_editor_replaceable` cannot read off live
+            // state, so it is recorded here — stamped with the generation
+            // it was given at, so it expires the moment the binding moves.
+            PendingDiscard::Script(action) => {
+                self.editor_discard_grant = Some(self.script_binding_generation);
+                self.perform_script_action(action, cx);
             }
         }
         cx.notify();
@@ -7127,14 +10059,12 @@ impl AppView {
             // `connections_ui::AppView::toggle_connection_favourite`'s
             // guarded-save shape for the dropdown's connection stars.
             TreeEvent::ToggleFavourite(fav) => {
-                if !self.guard_corrupt_config(cx) {
-                    return;
-                }
+                let Some(guard) = self.guard_corrupt_config(cx) else { return };
                 // Full-struct equality in `toggle_favourite` means the same
                 // table in two databases is two distinct favourites (T1's
                 // `toggle_favourite_distinguishes_databases` pin).
                 self.config.toggle_favourite(fav.clone());
-                self.status = match self.config.save(&self.config_path) {
+                self.status = match self.config.save(&self.config_path, &guard) {
                     Ok(()) => "Uloženo".to_string(),
                     Err(e) => format!("error saving config: {}", e.message),
                 };
@@ -7156,6 +10086,39 @@ impl AppView {
             }
             TreeEvent::SwitchToDatabase { conn_id, db } => {
                 self.switch_to_database(conn_id, db.clone(), None, cx)
+            }
+            TreeEvent::ScriptsRefresh => self.start_scripts_scan(cx),
+            TreeEvent::OpenScriptsSettings => self.open_settings(cx),
+            // Part S §5.1: opening binds the ONE global editor to the file
+            // and NEVER runs it. Guarded, so a dirty binding is never
+            // silently clobbered.
+            TreeEvent::ScriptOpen { rel } => {
+                self.editor_load_guarded(PendingScriptAction::Open { rel: rel.clone() }, cx)
+            }
+            // Part S §6: „▶" runs the file ON DISK through the SHARED G12
+            // confirm continuation — never the editor buffer, never a save
+            // first.
+            TreeEvent::ScriptRunFile { rel } => self.run_script_from_library(rel.clone(), cx),
+            // Part S §4: the ONE name dialog, three flavours. Nothing is
+            // written until its confirm; `validate_script_name`, the
+            // Unicode-aware collision probe and the empty-rel mutation
+            // rail all live inside the `scripts.rs` ops it dispatches.
+            TreeEvent::ScriptCreate { parent_rel } => self.open_script_name_modal(
+                connections_ui::ScriptNameMode::NewScript,
+                parent_rel.clone(),
+                String::new(),
+                false,
+                cx,
+            ),
+            TreeEvent::ScriptRename { rel, is_dir } => self.open_script_name_modal(
+                connections_ui::ScriptNameMode::Rename,
+                String::new(),
+                rel.clone(),
+                *is_dir,
+                cx,
+            ),
+            TreeEvent::ScriptDelete { rel, is_dir } => {
+                self.open_script_delete_modal(rel.clone(), *is_dir, cx)
             }
         }
     }
@@ -7460,8 +10423,18 @@ impl AppView {
     /// is needed here (unlike those two) — Esc/click are the only ways to
     /// answer it, and Esc is wired in `on_cancel_query`.
     fn render_discard_confirm_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let dc = self.discard_confirm.as_ref()?;
-        let n = dc.change_count;
+        let (n, is_script) = {
+            let dc = self.discard_confirm.as_ref()?;
+            (dc.change_count, matches!(dc.action, PendingDiscard::Script(_)))
+        };
+        // Workspace T8 (Part S §5.5): a parked script action names the file
+        // it would discard. `binding_rel` is read HERE (not captured when
+        // the prompt went up) so a scripts-root change while the prompt is
+        // open cannot leave a stale label on screen; `None` — a binding
+        // that vanished under an open prompt, which nothing can currently
+        // do — degrades to the generic wording rather than to a blank name.
+        let question =
+            discard_confirm_question(if is_script { self.binding_rel() } else { None }.as_deref(), n);
         let theme = *cx.theme();
 
         let panel = div()
@@ -7476,7 +10449,7 @@ impl AppView {
             .p_2()
             .gap_2()
             .text_color(theme.text_primary)
-            .child(format!("Neuložené změny ({n}) — zahodit?"))
+            .child(question)
             .child(
                 div()
                     .flex()
@@ -8709,6 +11682,22 @@ impl Render for AppView {
                 // openers (dropdown/test).
                 let focus = input.focus_handle(cx);
                 window.focus(&focus, cx);
+            } else if let Some(connections_ui::ModalState::ScriptName { field, .. }) = &self.modal {
+                // T9: an input-owning dialog opened from a cx-only tree
+                // subscription — focus its name field, same end state as
+                // the window-having openers.
+                let focus = field.focus_handle(cx);
+                window.focus(&focus, cx);
+            } else if matches!(
+                self.modal,
+                Some(connections_ui::ModalState::WorkspaceMissing { .. })
+            ) {
+                // T4 review NIT-11: focus the §W4 panel (a tab group), not
+                // the shared overlay handle, so Tab descends into its three
+                // choices. Still a container, not a button — Enter stays
+                // inert (`ModalConfirmKind::Ignore`).
+                let focus = self.workspace_panel_focus.clone();
+                window.focus(&focus, cx);
             } else if self.modal.is_some() || self.discard_confirm.is_some() {
                 window.focus(&self.modal_focus_handle, cx);
             }
@@ -8720,16 +11709,66 @@ impl Render for AppView {
         self.refresh_autocomplete(window, cx);
         let ac_active = self.autocomplete.is_some();
         self.sql.update(cx, |s, _| s.set_autocomplete_active(ac_active));
+        // Workspace T8: the ONE per-frame dirtiness recompute (same lazy-
+        // poll idiom as the line above). It feeds BOTH the caption strip
+        // below and `context_switch_blocked`, which has no `cx` — see
+        // `script_dirty_flag`'s doc comment.
+        self.script_dirty_flag = self.script_is_dirty(cx);
         let theme = *cx.theme();
 
         // The SQL editor + tab strip + tab content column, unchanged from
         // pre-Task-6 except that it's now one column in a horizontal row
         // rather than filling the whole window body.
-        let mut column = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
+        let mut column = div().flex().flex_col().flex_1().min_w_0();
+
+        // Workspace T8 (Part S §5): the caption strip — rendered ONLY while
+        // a script is bound, immediately above the editor, so an unbound
+        // (today's) app is pixel-identical to before.
+        if let Some(rel) = self.binding_rel() {
+            let dirty = self.script_dirty_flag;
+            column = column.child(
+                div()
+                    .h(px(22.))
+                    .px_2()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .bg(theme.bg_app)
+                    .text_color(theme.text_muted)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(script_caption(&rel, dirty)),
+                    )
+                    .child(
+                        div()
+                            .id("script-save")
+                            .px_1()
+                            .cursor_pointer()
+                            // Dim when clean — the save is a no-op then.
+                            .text_color(if dirty { theme.text_primary } else { theme.border })
+                            .child("Uložit")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.on_save_script(&SaveScript, window, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("script-unbind")
+                            .px_1()
+                            .cursor_pointer()
+                            .child("Zavřít")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.editor_load_guarded(PendingScriptAction::Unbind, cx)
+                            })),
+                    ),
+            );
+        }
+
+        column = column
             .child(
                 // Fixed height of 8 lines (SqlInput's own line_height is
                 // px(20.), see sql_input.rs render()); the input scrolls
@@ -8741,6 +11780,11 @@ impl Render for AppView {
                 // keyboard precedence item 3).
                 div()
                     .h(px(20. * 8. + 4. * 2.))
+                    // T8 review: `.h()` is a flex BASE, and the default
+                    // `flex-shrink: 1` lets it collapse below eight lines
+                    // when the column is tight — likelier now that the
+                    // 22px caption strip is a sibling. Pin the height.
+                    .flex_shrink_0()
                     .px_2()
                     .bg(theme.bg_app)
                     .on_action(cx.listener(Self::on_ac_up))
@@ -8796,6 +11840,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_toggle_history))
             .on_action(cx.listener(Self::on_open_palette))
             .on_action(cx.listener(Self::on_open_autocomplete))
+            .on_action(cx.listener(Self::on_save_script))
             .child(self.render_top_bar(cx))
             .child(body);
 
@@ -9118,40 +12163,72 @@ fn main() {
     // when present, otherwise the app starts with no active connection and
     // the user picks one from the top-bar switcher (Task 7).
     let conn_url = std::env::args().nth(1);
-    let config_path = dbc_state::default_config_path();
-    let vault_path = dbc_state::default_vault_path();
+    // Design §W0.1: workspace mode is a PATH-RESOLUTION change at exactly
+    // two call sites; this is one of them (`dbc-mcp::parse_args` is the
+    // other — workspace T6). Everything downstream still takes a `&Path`.
+    let startup = startup_context(dbc_state::workspace::resolve());
+    let config_path = startup.paths.config.clone();
+    let vault_path = startup.paths.vault.clone();
+    let workspace_root = startup.workspace_root.clone();
+    let blocked = startup.blocked.clone();
+    // §W4's enforcement, as a value rather than three scattered
+    // `blocked.is_some()` conditions (T4 review MINOR-3) — pinned by
+    // `workspace_startup_tests::a_broken_start_opens_no_context_store`.
+    let loads = startup.loads();
+    let blocked_start = blocked.is_some();
+    // Design §W4: a broken pointer loads NOTHING. Not the workspace's
+    // files (they are unusable — that is what "broken" means), and above
+    // all not the profile's (that would be the silent fallback this design
+    // bans). The modal opened after the window is the only way forward.
+    //
     // A parse error (as opposed to a missing file, which `AppConfig::load`
     // treats as an empty default) means an existing config.toml is
     // corrupt — surfaced in the status bar below rather than silently
     // discarded (final-review must-fix #2). `finish_save` refuses to
     // overwrite the file until it's been moved aside.
-    let (config, config_load_error) = match AppConfig::load(&config_path) {
-        Ok(cfg) => (cfg, None),
-        Err(e) => (AppConfig::default(), Some(e.to_string())),
+    let (config, config_load_error) = if !loads.config {
+        (AppConfig::default(), None)
+    } else {
+        match AppConfig::load(&config_path) {
+            Ok(cfg) => (cfg, None),
+            Err(e) => (AppConfig::default(), Some(e.to_string())),
+        }
     };
     // G3 Task 3: opened once at startup; a failure (e.g. an unwritable
     // config dir) is surfaced in the status bar below but never blocks the
     // rest of the app — `record_history`/the panel's search both treat
     // `history: None` as "no history available" rather than panicking.
-    let (history, history_open_error) = match HistoryDb::open(&dbc_state::default_history_path()) {
-        Ok(h) => (Some(h), None),
-        Err(e) => (None, Some(e.to_string())),
+    // §W5: history is machine-local in BOTH modes — `workspace_paths`
+    // already resolves it to the profile path, so this line is mode-blind
+    // (and a blocked start still gets its history, which carries no
+    // context-specific connection state).
+    let (history, history_open_error) = if !loads.history {
+        (None, None)
+    } else {
+        match HistoryDb::open(&startup.paths.history) {
+            Ok(h) => (Some(h), None),
+            Err(e) => (None, Some(e.to_string())),
+        }
     };
     // G4 Task 6: opened once at startup; a failure (e.g. a corrupt
     // views.toml) is surfaced in the status bar below but never blocks the
     // rest of the app — the feature is just off (`view_prefs: None`), same
     // "degrade gracefully" precedent `history_open_error` already follows.
-    let (view_prefs, view_prefs_open_error) =
-        match ViewPrefsStore::load(&dbc_state::default_view_prefs_path()) {
+    let (view_prefs, view_prefs_open_error) = if !loads.view_prefs {
+        (None, None)
+    } else {
+        match ViewPrefsStore::load(&startup.paths.views) {
             Ok(v) => (Some(v), None),
             Err(e) => (None, Some(e.to_string())),
-        };
+        }
+    };
     // G6 Task 3: same "open at startup, None on failure, degrade
     // gracefully" posture as `view_prefs` — a load failure here only means
     // the values dialog won't prefill/remember values across runs, not
     // that the feature stops working, so (unlike `view_prefs`/`history`)
     // this isn't surfaced as its own startup status notice.
-    let param_values = ParamValuesStore::load(&dbc_state::default_param_values_path()).ok();
+    let param_values =
+        if !loads.param_values { None } else { ParamValuesStore::load(&startup.paths.params).ok() };
 
     application().run(move |cx: &mut App| {
         cx.bind_keys([
@@ -9164,6 +12241,10 @@ fn main() {
             // G6 T7: force-trigger, same "global, context None" precedent
             // as `RunQuery`/`OpenPalette` above (design §2).
             KeyBinding::new("ctrl-space", OpenAutocomplete, None),
+            // Part S §5.2/§5.4: global, context `None` — the same posture
+            // as `RunQuery`/`OpenPalette`. Bound => save; unbound =>
+            // save-as. The chord was free repo-wide before this line.
+            KeyBinding::new("ctrl-s", SaveScript, None),
         ]);
         sql_input::bind_keys(cx);
         grid::bind_keys(cx);
@@ -9198,7 +12279,15 @@ fn main() {
                         // view-prefs open failure (G4 Task 6) is the least
                         // severe of the three (only per-table grid memory is
                         // affected).
-                        let status = if let Some(detail) = &config_load_error {
+                        // T4 review NIT-9: „ready" behind a modal saying
+                        // the workspace was not found is a lie, and it is
+                        // the line that stays on screen after the modal is
+                        // dealt with. §W4's blocked start outranks every
+                        // other startup notice — there is no config to be
+                        // corrupt and no view prefs to have failed.
+                        let status = if blocked_start {
+                            connections_ui::WORKSPACE_MISSING_STATUS.to_string()
+                        } else if let Some(detail) = &config_load_error {
                             format!("error: config.toml je poškozený – oprav nebo smaž soubor ({detail})")
                         } else if let Some(detail) = &history_open_error {
                             format!("error: historie nedostupná ({detail})")
@@ -9236,6 +12325,15 @@ fn main() {
                             config_path,
                             config_load_error,
                             vault_path,
+                            workspace_root,
+                            workspace_pick_generation: 0,
+                            workspace_pick_error: None,
+                            workspace_choice_focus: [
+                                cx.focus_handle(),
+                                cx.focus_handle(),
+                                cx.focus_handle(),
+                            ],
+                            workspace_panel_focus: cx.focus_handle(),
                             vault: None,
                             active_connection_id: None,
                             active_database: None,
@@ -9257,6 +12355,11 @@ fn main() {
                             param_values,
                             apply_dialog: None,
                             discard_confirm: None,
+                            script_binding: None,
+                            script_dirty_flag: false,
+                            script_binding_generation: 0,
+                            editor_discard_grant: None,
+                            script_save_in_flight: false,
                             modal_focus_handle: cx.focus_handle(),
                             modal_needs_focus: false,
                             autocomplete: None,
@@ -9277,6 +12380,12 @@ fn main() {
             let grouped = view.grouped_cache.clone();
             view.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
             view.refresh_tree_context(cx);
+            // Part S §1.2: scan on startup when a root is configured. It is
+            // a no-op-with-reset when there is none — and a BLOCKED start
+            // has none (`workspace_root` stays `None` and the blocked config
+            // is `AppConfig::default()`), so nothing touches the filesystem
+            // behind the §W4 modal.
+            view.start_scripts_scan(cx);
             if view.conn_url.is_some() {
                 view.start_schema_slot_fetch(CLI_CONN_IDENTITY.to_string(), String::new(), cx);
             }
@@ -9284,6 +12393,11 @@ fn main() {
             // startup (history panel defaults to visible) instead of
             // leaving it empty until the first recorded run/search edit.
             view.refresh_history_cache(cx);
+            // Design §W4: the blocking modal goes up LAST, so it occludes a
+            // fully-constructed (and deliberately empty) app.
+            if let Some((root, reason)) = blocked {
+                view.open_workspace_missing_modal(root, reason, cx);
+            }
         });
     });
 }
@@ -10471,6 +13585,39 @@ mod completion_edit_tests {
         assert_eq!(new_text, "SELECT časovka");
     }
 
+    /// RE-VERIFY: `accept_completion` cannot clear the buffer, whatever it
+    /// is passed. It has no length parameter any more — it reads the span
+    /// from `completion_range`, so what it deletes is one identifier
+    /// prefix ending at the cursor, and everything before that prefix is
+    /// untouchable by it. That is why this mutator needs no `BufferReplace`
+    /// permit: `replace_buffer` can destroy an arbitrary amount of unsaved
+    /// work and this provably cannot.
+    ///
+    /// The worst case is the whole buffer BEING one identifier, and then
+    /// replacing it with the candidate is the completion the user asked
+    /// for, not a clobber.
+    #[test]
+    fn accepting_a_completion_can_only_ever_replace_an_identifier_prefix() {
+        // The shape the bypass used: a caller wanting to wipe everything.
+        // There is no parameter for it, so the most it reaches is `tot`.
+        let text = "SELECT a, b, c FROM orders WHERE tot";
+        let range = completion_range(text, text.len());
+        assert_eq!(&text[range.clone()], "tot");
+        assert_eq!(range.start, text.len() - 3, "everything before the prefix is untouchable");
+
+        // No prefix at the cursor -> an EMPTY range: an accept there
+        // inserts and deletes nothing.
+        let after_space = "SELECT ";
+        assert!(completion_range(after_space, after_space.len()).is_empty());
+
+        // The whole buffer as one identifier is the only case where the
+        // range spans everything, and that is a completion, not a clobber.
+        assert_eq!(completion_range("sel", 3), 0..3);
+
+        // A cursor inside a longer word still only reaches backwards.
+        assert_eq!(completion_range("usXer", 2), 0..2);
+    }
+
     /// NIT: cursor-mid-word behavior is intentional (see `completion_edit`'s
     /// doc comment) — only the prefix BEFORE the cursor is replaced; a
     /// suffix already typed past the cursor (`Xer` here) is left as-is,
@@ -10499,5 +13646,2644 @@ mod autocomplete_handles_action_tests {
         // silently eating Escape and making the global CancelQuery binding
         // unreachable while the editor had focus.
         assert!(!autocomplete_handles_action(false));
+    }
+}
+
+/// Workspace T4 (design §W4): the never-silent-fallback rail, unit-tested
+/// as pure data. `Resolution` is plain data (dbc-state T2), so the whole
+/// "a configured-but-unusable workspace never yields a profile path"
+/// property is provable without GPUI, a filesystem, or a tempdir.
+/// T7 review MAJOR-1, pinned mechanically rather than by hand: EVERY
+/// `config.toml` writer in this crate must pass `guard_corrupt_config`
+/// first. The hazard is not one function's oversight — it is that the
+/// guard is a CONVENTION with no compiler behind it, and the one writer
+/// that forgot it (`set_theme`) was reachable by reflex from two surfaces.
+/// Same shape as `dbc-mcp`'s `no_write_path_regression`: scan our own
+/// source, build the needle at runtime so the check cannot flag itself.
+///
+/// T10 CARRY-FORWARD 7, the same widening Task 8's re-verify applied to
+/// `editor_clobber_audit`. Two holes, both closed by reusing that audit's
+/// machinery instead of keeping a second, weaker copy of it here:
+///
+/// * **The file list was a hand-written pair.** `main.rs` and
+///   `connections_ui.rs` happen to hold all six writers TODAY, and the
+///   other 31 `.rs` files in the crate were invisible to this test.
+///   `AppView.config` and `config_path` are private-but-crate-reachable
+///   (`main.rs` is the crate root, so every module is a descendant), so an
+///   `impl crate::AppView` block in any other module could have saved an
+///   unparsable config with this test green. It now walks `src/` at test
+///   time, so a NEW file is covered the moment it exists.
+/// * **The owner detector was a prefix match on three spellings.**
+///   `fn ` / `pub fn ` / `pub(crate) fn ` — so a write inside an
+///   `async fn`, a `pub(super) fn` or a `const fn` was attributed to the
+///   PREVIOUS function, and a guard call in THAT function's body
+///   sanctioned it. `defined_fn_name` strips an arbitrary visibility and
+///   any order of qualifiers, so attribution is correct for every fn
+///   spelling Rust allows.
+///
+/// What deliberately did NOT change is the RULE. `editor_clobber_audit`
+/// sanctions by owner NAME (a fixed set of functions may call the
+/// dangerous thing); this audit asks that the guard be CALLED in the same
+/// function, above the write, whatever that function is called — because
+/// the guard is cheap, idempotent and correct to call unconditionally, so
+/// a new writer should add the call rather than add its name to a list.
+/// `#[must_use]` on `guard_corrupt_config` (T10 carry-forward 1) is the
+/// compiler half of the same rail: this test proves the call is THERE, the
+/// attribute proves its verdict is not thrown away.
+#[cfg(test)]
+mod config_save_guard_audit {
+    use super::editor_clobber_audit::{code_lines, defined_fn_name, sources};
+
+    /// Every writer's ENCLOSING fn must call the guard above the write.
+    ///
+    /// FINAL-REVIEW MAJOR-2: **the needle is receiver-independent now.**
+    /// It used to be the literal `.config.save(`, which sees only one
+    /// spelling of one receiver — and the reviewer walked around it in two
+    /// lines on a live production path:
+    ///
+    /// ```ignore
+    /// let cfg = &self.config;
+    /// let _ = cfg.save(&self.config_path);   // invisible to `.config.save(`
+    /// ```
+    ///
+    /// Zero warnings, every audit green. `AppConfig::save(&self.config, …)`
+    /// would have done the same job.
+    ///
+    /// The fix keys on the ARGUMENT instead of the receiver: a config
+    /// write is a `.save(`/`::save(` call whose line names `config_path`.
+    /// Rebinding the receiver, spelling the call UFCS-style or wrapping it
+    /// in a macro all leave that argument in place, because it is the
+    /// thing being written to. (`dbc-state`'s own `config.save(&p, …)`
+    /// tests use a different variable and are correctly not matched.)
+    ///
+    /// This is the belt; the braces are `dbc_state::ConfigSaveGuard`,
+    /// which `AppConfig::save` demands by type and which only
+    /// `AppConfig::verify_savable` can mint.
+    #[test]
+    fn every_config_toml_write_passes_the_corrupt_config_guard() {
+        // Built at runtime — written as literals, these would match this
+        // test's own source and report phantom call sites.
+        let field = format!("{}_{}", "config", "path");
+        let call = format!(".{}(", "save");
+        let ufcs = format!("::{}(", "save");
+        let guard = format!("guard_corrupt_{}", "config");
+        let mut sites = 0usize;
+        for (name, src) in sources() {
+            // Comments (incl. `///`) and string literals count neither as
+            // a call site NOR as the guard: this check was vacuous in its
+            // first draft because `set_theme`'s explanatory comment
+            // MENTIONS the guard, and a prose mention satisfied it.
+            let lines = code_lines(&src);
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains(&field) || !(line.contains(&call) || line.contains(&ufcs)) {
+                    continue;
+                }
+                sites += 1;
+                let start =
+                    lines[..i].iter().rposition(|l| defined_fn_name(l).is_some()).unwrap_or(0);
+                assert!(
+                    lines[start..i].iter().any(|l| l.contains(&guard)),
+                    "unguarded config.toml write at {name}:{} (in `{}`) — a config that \
+                     failed to parse would be overwritten with defaults, destroying every \
+                     connection (T7 review MAJOR-1)",
+                    i + 1,
+                    lines
+                        .get(start)
+                        .and_then(|l| defined_fn_name(l))
+                        .unwrap_or_else(|| "<file scope>".to_string())
+                );
+            }
+        }
+        // Pinned so a NEW writer forces a deliberate look at this test
+        // rather than silently inheriting whatever its neighbours do.
+        assert_eq!(sites, 6, "config.toml writer count changed — re-audit, do not just bump");
+    }
+
+    /// The widening is only worth anything if it actually reaches past the
+    /// two files the old hand list named (T10 carry-forward 7). Same
+    /// non-vacuity posture as `editor_clobber_audit`'s own rail.
+    #[test]
+    fn the_audit_reads_the_whole_crate_not_a_pair_of_files() {
+        let files: Vec<String> = sources().into_iter().map(|(n, _)| n).collect();
+        assert!(files.len() > 20, "the tree walk collapsed to {} files: {files:?}", files.len());
+        for expected in [
+            "crates/dbc-ui/src/main.rs",
+            "crates/dbc-ui/src/connections_ui.rs",
+            "crates/dbc-ui/src/scripts.rs",
+            "crates/dbc-ui/src/schema_tree.rs",
+            // Final-review MAJOR-2: and past dbc-ui altogether.
+            "crates/dbc-state/src/config.rs",
+        ] {
+            assert!(files.iter().any(|f| f == expected), "{expected} missing from {files:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_startup_tests {
+    use super::*;
+    use dbc_state::workspace::{profile_paths, workspace_paths, Resolution};
+
+    #[test]
+    fn no_pointer_starts_in_profile_mode_with_todays_paths() {
+        let ctx = startup_context(Resolution::Profile(profile_paths()));
+        assert_eq!(ctx.paths, profile_paths());
+        assert_eq!(ctx.workspace_root, None);
+        assert!(ctx.blocked.is_none());
+    }
+
+    #[test]
+    fn a_valid_pointer_starts_in_workspace_mode_over_the_folder() {
+        let root = PathBuf::from("D:\\ws");
+        let ctx = startup_context(Resolution::Workspace {
+            root: root.clone(),
+            paths: workspace_paths(&root),
+        });
+        assert_eq!(ctx.paths.config, root.join("config.toml"));
+        assert_eq!(ctx.paths.vault, root.join("vault.bin"));
+        // §W5: history stays machine-local even in workspace mode.
+        assert_eq!(ctx.paths.history, profile_paths().history);
+        assert_eq!(ctx.workspace_root, Some(root));
+        assert!(ctx.blocked.is_none());
+    }
+
+    #[test]
+    fn a_broken_pointer_blocks_and_never_yields_a_single_profile_path() {
+        // THE never-silent-fallback rail (design §W4).
+        let root = PathBuf::from("D:\\ws-gone");
+        let ctx = startup_context(Resolution::Broken {
+            root: Some(root.clone()),
+            reason: "složka neexistuje".to_string(),
+        });
+        assert_eq!(ctx.blocked, Some((Some(root.clone()), "složka neexistuje".to_string())));
+        assert_eq!(ctx.workspace_root, None, "a broken workspace is NOT an active workspace");
+        let p = profile_paths();
+        for got in [&ctx.paths.config, &ctx.paths.vault, &ctx.paths.views, &ctx.paths.params] {
+            assert_ne!(got, &p.config);
+            assert_ne!(got, &p.vault);
+            assert_ne!(got, &p.views);
+            assert_ne!(got, &p.params);
+        }
+        assert!(ctx.paths.config.starts_with(&root), "blocked paths stay inside the broken root");
+    }
+
+    #[test]
+    fn a_broken_pointer_with_no_readable_root_still_never_targets_the_profile() {
+        let ctx = startup_context(Resolution::Broken {
+            root: None,
+            reason: "ukazatel na pracovní prostor je poškozený: expected a table".to_string(),
+        });
+        assert!(ctx.blocked.is_some());
+        let p = profile_paths();
+        assert_ne!(ctx.paths.config, p.config);
+        assert_ne!(ctx.paths.vault, p.vault);
+        // The sentinel folder does not exist and is never created, so any
+        // stray save fails LOUDLY instead of overwriting the profile the
+        // user has not chosen (never-destructive rail).
+        assert!(!ctx.paths.config.exists());
+    }
+
+    #[test]
+    fn blocked_paths_never_collide_with_the_profile_dir_itself() {
+        let p = blocked_paths(None);
+        assert_ne!(p.config.parent(), Some(dbc_state::workspace::profile_dir().as_path()));
+    }
+
+    /// T4 review MAJOR-2. `blocked_paths(Some(root))` used to return
+    /// `workspace_paths(root)` for WHATEVER the pointer said — so a
+    /// hand-written `workspace.toml` naming the profile dir yielded the
+    /// profile's real `config.toml`/`vault.bin`/`views.toml`/`params.toml`,
+    /// directly contradicting the fn's own doc comment. Not reachable
+    /// today (no writer runs while the blocking modal is up), but the
+    /// failure mode is an empty default config written over the user's
+    /// real connections, so the promise is now structural.
+    #[test]
+    fn a_pointer_aimed_at_the_profile_dir_falls_through_to_the_sentinel() {
+        let prof = dbc_state::workspace::profile_dir();
+        let sentinel = blocked_paths(None);
+        let real = profile_paths();
+
+        let got = blocked_paths(Some(&prof));
+        assert_eq!(got, sentinel, "the profile dir must resolve to the sentinel");
+        assert_ne!(got.config, real.config);
+        assert_ne!(got.vault, real.vault);
+        assert_ne!(got.views, real.views);
+        assert_ne!(got.params, real.params);
+
+        // A non-canonical spelling of the same directory must not slip
+        // past the exact-match arm. `canonicalize` needs the path to
+        // exist, so this half only runs where the profile dir is real.
+        if prof.is_dir() {
+            let odd = prof.join(".");
+            assert_eq!(blocked_paths(Some(&odd)), sentinel, "{}", odd.display());
+        }
+
+        // A genuine workspace root is still used as-is.
+        let real_ws = prof.join("nekde-jinde-workspace");
+        assert_eq!(blocked_paths(Some(&real_ws)).config, real_ws.join("config.toml"));
+    }
+
+    /// FINAL-REVIEW MINOR-2, the residual the test above did not cover.
+    /// The pointer's `path` is arbitrary TOML text — `read_pointer` hands
+    /// back whatever string it finds, and a hand-edited pointer never goes
+    /// through `write_pointer`'s absolute-path rail. A `path = ""` walked
+    /// past every guard (`"" != profile`; `Path::new("").canonicalize()`
+    /// errors on Windows, so `is_same_dir` said `false`) and `base` became
+    /// `""` — whereupon `workspace_paths` returned the bare RELATIVE names
+    /// `config.toml`, `vault.bin`, …, which the OS resolves against the
+    /// process CWD. Launch the app from `%APPDATA%\dbc` and those are the
+    /// profile's real files: precisely the promise `blocked_paths` makes.
+    #[test]
+    fn a_root_that_cannot_be_named_absolutely_falls_through_to_the_sentinel() {
+        let sentinel = blocked_paths(None);
+        // The empty pointer.
+        assert_eq!(blocked_paths(Some(Path::new(""))), sentinel);
+        // Any relative spelling at all — including `..`, which
+        // canonicalizes just fine and is therefore the SUBTLE half: it
+        // still resolves against the process CWD, which this app does not
+        // set. All of these used to produce CWD-relative store paths.
+        for rel in ["config", "..", "./nekde", "a/b"] {
+            let got = blocked_paths(Some(Path::new(rel)));
+            assert_eq!(got, sentinel, "relative root {rel:?} must not survive");
+        }
+        // The property that actually matters, stated directly: whatever a
+        // blocked start's paths are, they are ABSOLUTE, so nothing about
+        // them depends on the process working directory.
+        for root in [None, Some(Path::new("")), Some(Path::new("a/b"))] {
+            let p = blocked_paths(root);
+            for path in [&p.config, &p.vault, &p.views, &p.params] {
+                assert!(path.is_absolute(), "{} is CWD-relative", path.display());
+            }
+        }
+    }
+
+    /// The rule [`blocked_paths`] rests on, in isolation and against a
+    /// SUPPLIED profile dir, so the three „we do not know where this
+    /// meant" cases are pinned without depending on the machine's real
+    /// `%APPDATA%`.
+    #[test]
+    fn the_blocked_base_accepts_only_an_absolute_non_profile_folder() {
+        let prof = PathBuf::from(r"C:\Users\x\AppData\Roaming\dbc");
+        assert_eq!(blocked_base(None, &prof), None, "no root at all");
+        assert_eq!(blocked_base(Some(Path::new("")), &prof), None, "the empty pointer");
+        assert_eq!(blocked_base(Some(Path::new("nekde")), &prof), None, "relative, unresolvable");
+        assert_eq!(blocked_base(Some(Path::new("..")), &prof), None, "relative, but resolvable");
+        assert_eq!(blocked_base(Some(&prof), &prof), None, "the profile dir itself");
+        let ws = PathBuf::from(r"D:\ws");
+        assert_eq!(blocked_base(Some(&ws), &prof), Some(ws.clone()), "a real root is kept");
+    }
+
+    /// T4 review MINOR-3: the rail's ENFORCEMENT, not just its paths. The
+    /// five tests above all decide where stores would open; this one pins
+    /// that on a blocked start they are not opened at all — the property a
+    /// "simplification" of `fn main()`'s conditions would silently undo.
+    #[test]
+    fn a_broken_start_opens_no_context_store() {
+        let blocked = startup_context(Resolution::Broken {
+            root: Some(PathBuf::from("D:\\ws-gone")),
+            reason: "složka neexistuje".to_string(),
+        })
+        .loads();
+        assert!(!blocked.config, "config.toml is THE silent-fallback vector");
+        assert!(!blocked.view_prefs);
+        assert!(!blocked.param_values);
+        // §W5: history is machine-local in both modes and carries no
+        // context — it is the one store a blocked start may still open.
+        assert!(blocked.history);
+
+        for ok in [
+            startup_context(Resolution::Profile(profile_paths())).loads(),
+            startup_context(Resolution::Workspace {
+                root: PathBuf::from("D:\\ws"),
+                paths: workspace_paths(Path::new("D:\\ws")),
+            })
+            .loads(),
+        ] {
+            assert!(ok.config && ok.view_prefs && ok.param_values && ok.history);
+        }
+    }
+
+    // ---------- The scripts-root seam (workspace T7, design §W8) ----------
+
+    #[test]
+    fn workspace_mode_roots_the_scripts_tree_in_the_folder() {
+        let root = PathBuf::from("D:\\ws");
+        assert_eq!(
+            scripts_root_for(Some(&root), Some("C:\\jinde")),
+            Some(root.join("scripts")),
+        );
+    }
+
+    #[test]
+    fn scripts_dir_is_inert_in_workspace_mode() {
+        // §W8: one root per mode, no precedence question — a hand-edited
+        // `scripts_dir` in a workspace config.toml is ignored, and this is
+        // the test that says so out loud.
+        let root = PathBuf::from("D:\\ws");
+        assert_eq!(scripts_root_for(Some(&root), None), Some(root.join("scripts")));
+        assert_eq!(
+            scripts_root_for(Some(&root), Some("C:\\jinde")),
+            scripts_root_for(Some(&root), None),
+        );
+    }
+
+    #[test]
+    fn profile_mode_uses_the_configured_scripts_dir_or_nothing() {
+        assert_eq!(scripts_root_for(None, Some("C:\\skripty")), Some(PathBuf::from("C:\\skripty")));
+        assert_eq!(scripts_root_for(None, None), None);
+    }
+
+    #[test]
+    fn the_scripts_subdir_name_comes_from_dbc_state_not_a_local_literal() {
+        assert_eq!(dbc_state::workspace::SCRIPTS_SUBDIR, "scripts");
+        let root = PathBuf::from("D:\\ws");
+        assert_eq!(
+            scripts_root_for(Some(&root), None).unwrap(),
+            root.join(dbc_state::workspace::SCRIPTS_SUBDIR),
+        );
+    }
+}
+
+/// T5 review MAJOR-1: `start_workspace_pick`'s continuation guard. The
+/// three scenarios below are all reachable on the pre-fix code, because
+/// `classify()` runs in `cx.background_spawn` (it yields the UI thread)
+/// while `ModalState::Settings` is Esc-closable — so `open_workspace_confirm`
+/// could raw-assign over ANY modal the user reached meanwhile.
+#[cfg(test)]
+mod workspace_pick_guard_tests {
+    use super::*;
+
+    #[test]
+    fn a_current_pick_over_the_settings_modal_opens_the_confirm() {
+        assert_eq!(workspace_pick_verdict(true, 7, 7), WorkspacePickVerdict::Open);
+    }
+
+    /// SCENARIO (A) — the context changing after the user cancelled.
+    /// Pick folder A on a slow share → Esc closes Settings → re-open, pick
+    /// local folder B → confirm → `running = true`, B's init dispatched →
+    /// `classify(A)` finally returns. The generation has NOT bumped yet
+    /// (B's `apply_context` has not run), so it is the MODAL check that has
+    /// to catch this: without it, A's continuation overwrote the running
+    /// confirm with `running: false`, unlatching Esc/„Zrušit" while B's
+    /// init kept going toward an unconditional `apply_context(B)`.
+    #[test]
+    fn a_pick_landing_on_a_running_confirm_is_refused_not_committed() {
+        // Settings is not open — a `WorkspaceConfirm { running: true }` is.
+        assert_eq!(workspace_pick_verdict(false, 7, 7), WorkspacePickVerdict::OtherDialog);
+    }
+
+    /// SCENARIO (B) — a running `BackupRestore`. Same verdict, and the
+    /// point is what does NOT happen: no raw assign, so the one teardown
+    /// funnel that cancels a live `pg_restore` child (`close_modal` →
+    /// `cancel_active_backup_if_running`) is never bypassed.
+    ///
+    /// SCENARIO (C) — a half-typed `ConnectionDialog`. Same verdict; the
+    /// typed host/user/password survive. Both are the same predicate input
+    /// as (A): "the modal is not Settings".
+    #[test]
+    fn a_pick_landing_on_any_other_dialog_is_refused_with_a_status() {
+        for current in [0u64, 7, u64::MAX] {
+            assert_eq!(
+                workspace_pick_verdict(false, current, current),
+                WorkspacePickVerdict::OtherDialog
+            );
+        }
+    }
+
+    /// A superseded pick is refused SILENTLY — not with a status line.
+    /// The generation is checked first precisely so a pick that is both
+    /// stale AND in the wrong modal says nothing: the user has already
+    /// reached a newer explicit decision, and „výběr složky zahozen…"
+    /// landing over „pracovní prostor: D:\\ws" would be a stale write over
+    /// it. This is `recovery_pick_may_commit`'s posture.
+    #[test]
+    fn a_superseded_pick_is_silent_whatever_modal_is_open() {
+        assert_eq!(workspace_pick_verdict(true, 7, 8), WorkspacePickVerdict::Superseded);
+        assert_eq!(workspace_pick_verdict(false, 7, 8), WorkspacePickVerdict::Superseded);
+    }
+
+    /// Pins that the two refusals are DISTINCT states, not one bool. If a
+    /// future edit collapses them, either a superseded pick starts writing
+    /// status over a fresh context, or a wrong-modal pick goes silent and
+    /// the user never learns why nothing happened.
+    #[test]
+    fn the_two_refusals_are_not_interchangeable() {
+        assert_ne!(WorkspacePickVerdict::Superseded, WorkspacePickVerdict::OtherDialog);
+        assert_ne!(WorkspacePickVerdict::Open, WorkspacePickVerdict::OtherDialog);
+        assert_ne!(WorkspacePickVerdict::Open, WorkspacePickVerdict::Superseded);
+    }
+}
+
+/// T4 review MAJOR-1: the „Najít složku…" continuation's commit guard.
+/// The race it closes: broken pointer → modal → „Najít složku…" → the
+/// picker and `classify()` (a `read_dir`, seconds on a network share) run
+/// while the window stays interactive → the user gives up and clicks
+/// „Použít lokální profil" → the stale task lands and swaps them into
+/// workspace mode anyway, overriding an explicit choice.
+#[cfg(test)]
+mod recovery_pick_guard_tests {
+    use super::*;
+
+    #[test]
+    fn a_current_pick_over_the_open_modal_commits() {
+        assert!(recovery_pick_may_commit(true, 7, 7));
+    }
+
+    #[test]
+    fn a_closed_modal_refuses_the_pick() {
+        // „Použít lokální profil" closed it: the user has ALREADY chosen.
+        assert!(!recovery_pick_may_commit(false, 7, 7));
+    }
+
+    #[test]
+    fn a_superseded_generation_refuses_the_pick() {
+        // A context swap happened under the task. Belt to the modal
+        // check's braces: a modal reopened in the meantime must not make a
+        // stale pick look current again.
+        assert!(!recovery_pick_may_commit(true, 7, 8));
+        assert!(!recovery_pick_may_commit(false, 7, 8));
+    }
+
+    #[test]
+    fn both_conditions_are_required_not_either() {
+        // Pins the AND. An OR here would reopen the exact hole: the modal
+        // is closed but the generation happens to match, or vice versa.
+        for (open, dispatched, current) in
+            [(true, 1u64, 2u64), (false, 1, 1), (false, 1, 2)]
+        {
+            assert!(!recovery_pick_may_commit(open, dispatched, current));
+        }
+    }
+
+    /// FINAL-REVIEW MINOR-1, the STRUCTURE of the fix rather than its
+    /// copy (which `connections_ui` pins): the picker continuation must
+    /// stage the folder and stop, and the pointer write must live behind
+    /// the user's confirmation.
+    ///
+    /// This is also, incidentally, a strengthening of T4 review MAJOR-1's
+    /// own rule — „nothing is persisted until the UI-thread guard passes"
+    /// becomes „nothing is persisted in this function at all", and the one
+    /// write that remains has no await anywhere near it, so it needs no
+    /// re-verification.
+    #[test]
+    fn the_recovery_pick_stages_a_folder_and_only_the_confirm_writes_the_pointer() {
+        let src = include_str!("main.rs");
+        // The body ends at the next item OR its doc comment — stopping
+        // only at `\n    fn ` would swallow the NEXT function's `///`
+        // block, and these assertions are about code, not about prose that
+        // happens to name it. (Found the honest way: the first draft of
+        // this test failed on `confirm_workspace_recovery`'s own doc
+        // comment mentioning `write_pointer`.)
+        let slice = |marker: &str| -> String {
+            let b = src.split(marker).nth(1).unwrap_or_else(|| panic!("{marker} exists"));
+            let end = ["\n    fn ", "\n    /// ", "\n    pub"]
+                .iter()
+                .filter_map(|m| b.find(m))
+                .min()
+                .unwrap_or(b.len());
+            b[..end].to_string()
+        };
+
+        let pick = slice("fn pick_workspace_for_recovery(");
+        // Non-vacuity: the slice is the real continuation.
+        assert!(pick.contains("prompt_for_paths"), "the sliced body is not the real one");
+        assert!(pick.contains("recovery_pick_may_commit"), "the sliced body is not the real one");
+        assert!(
+            !pick.contains("write_pointer"),
+            "the pick must not persist anything — adopting a workspace is the user's call, \
+             and they have not been shown the vault line or the git warning yet"
+        );
+        assert!(
+            !pick.contains("apply_context"),
+            "the pick must not swap the context either — that is the confirm's job"
+        );
+        assert!(pick.contains("pending"), "the pick must stage the folder for the confirm");
+
+        let confirm = slice("fn confirm_workspace_recovery(");
+        assert!(confirm.contains("write_pointer"), "the confirm is what commits");
+        assert!(confirm.contains("apply_context"), "…and what swaps the context");
+        // The reason no post-await re-check is needed here: there is no
+        // await. If one is ever added, this fails and the author has to
+        // decide what to re-verify — the phase's own repeated lesson.
+        assert!(
+            !confirm.contains(".await") && !confirm.contains("cx.spawn"),
+            "the confirm is synchronous by design; an await here needs a re-check"
+        );
+
+        // „Zpět" returns to the choices; it must never close the one modal
+        // the design says cannot be closed, or the app is left with no
+        // context and no dialog.
+        let back = slice("fn cancel_workspace_recovery(");
+        assert!(back.contains("pending"), "the sliced body is not the real one");
+        assert!(
+            !back.contains("close_modal"),
+            "cancelling the adopt must return to the three choices, not dismiss the blocking modal"
+        );
+    }
+}
+
+#[cfg(test)]
+mod script_binding_tests {
+    use super::*;
+
+    #[test]
+    fn dirty_is_an_exact_compare_with_a_length_short_circuit() {
+        assert!(!script_text_is_dirty("SELECT 1", "SELECT 1"));
+        assert!(script_text_is_dirty("SELECT 1", "SELECT 2"));
+        assert!(script_text_is_dirty("SELECT 1", "SELECT 1 "), "trailing space counts");
+        // Whitespace-only differences are REAL differences: the file is the
+        // truth and „ •" must not lie about it.
+        assert!(script_text_is_dirty("a\r\nb", "a\nb"), "line endings count");
+    }
+
+    #[test]
+    fn the_caption_relativizes_against_the_current_root_and_falls_back_to_the_name() {
+        let root = PathBuf::from(r"D:\ws\scripts");
+        assert_eq!(
+            script_caption_rel(&root.join("prod").join("trzby.sql"), Some(&root)),
+            "prod/trzby.sql"
+        );
+        // Outside the root (save-as onto the desktop, or the root changed
+        // under a binding that holds an ABSOLUTE path) => bare file name.
+        assert_eq!(
+            script_caption_rel(Path::new(r"C:\jinde\ad-hoc.sql"), Some(&root)),
+            "ad-hoc.sql"
+        );
+        assert_eq!(script_caption_rel(Path::new(r"C:\jinde\ad-hoc.sql"), None), "ad-hoc.sql");
+    }
+
+    #[test]
+    fn the_caption_uses_the_tab_title_dirty_convention_exactly() {
+        assert_eq!(script_caption("prod/trzby.sql", false), "Skript: prod/trzby.sql");
+        assert_eq!(script_caption("prod/trzby.sql", true), "Skript: prod/trzby.sql •");
+    }
+
+    /// DEVIATION from the plan's `script_open_refusal` helper, recorded:
+    /// `crate::scripts::read_script` ALREADY owns the stat + cap + UTF-8
+    /// decision (and the symlink refusal the plan's inline snippet dropped),
+    /// and the plan's own Interfaces list names `read_script` as a Task 8
+    /// consumer. A second size probe in `main.rs` would be exactly the
+    /// duplicate-rail defect the Global Constraints ban, so the refusal is
+    /// pinned where it is produced.
+    #[test]
+    fn the_open_cap_refusal_names_the_limit_and_the_way_out() {
+        let td = tempfile::tempdir().unwrap();
+        let big = td.path().join("velky.sql");
+        std::fs::write(&big, vec![b' '; (crate::scripts::SCRIPT_OPEN_CAP + 1) as usize]).unwrap();
+        assert_eq!(
+            crate::scripts::read_script(&big).unwrap_err(),
+            "soubor je příliš velký pro editor (limit 1 MiB) — spusťte jej jako skript"
+        );
+        let ok = td.path().join("maly.sql");
+        std::fs::write(&ok, vec![b' '; crate::scripts::SCRIPT_OPEN_CAP as usize]).unwrap();
+        assert!(crate::scripts::read_script(&ok).is_ok());
+    }
+
+    #[test]
+    fn save_as_appends_sql_when_missing_and_never_twice() {
+        // Fact 0.6: GPUI file dialogs have no extension filter at the
+        // pinned rev, so the `.sql` rule is client-side, here.
+        assert_eq!(with_sql_extension(Path::new(r"C:\a\dotaz")), PathBuf::from(r"C:\a\dotaz.sql"));
+        assert_eq!(
+            with_sql_extension(Path::new(r"C:\a\dotaz.sql")),
+            PathBuf::from(r"C:\a\dotaz.sql")
+        );
+        assert_eq!(
+            with_sql_extension(Path::new(r"C:\a\dotaz.SQL")),
+            PathBuf::from(r"C:\a\dotaz.SQL")
+        );
+        assert_eq!(
+            with_sql_extension(Path::new(r"C:\a\dotaz.txt")),
+            PathBuf::from(r"C:\a\dotaz.txt.sql")
+        );
+    }
+
+    /// Part S §5.5's copy, and the fallback that keeps the pre-existing
+    /// staged-rows prompt byte-identical for every non-script action.
+    #[test]
+    fn the_discard_prompt_names_the_script_and_leaves_the_row_prompt_alone() {
+        assert_eq!(
+            discard_confirm_question(Some("prod/trzby.sql"), 1),
+            "Neuložené změny skriptu prod/trzby.sql budou zahozeny."
+        );
+        assert_eq!(discard_confirm_question(None, 3), "Neuložené změny (3) — zahodit?");
+    }
+
+    /// The stale-continuation rule (`script_binding_generation`). The
+    /// phase has produced four MAJORs of the „a background step resumed
+    /// after the user had moved on" class; a save-as that lands after the
+    /// user opened a different script must not write to — or bind to —
+    /// the new target, and a plain re-save must not be mistaken for one.
+    #[test]
+    fn only_a_different_target_counts_as_the_user_moving_on() {
+        let a = PathBuf::from(r"D:\ws\scripts\a.sql");
+        let b = PathBuf::from(r"D:\ws\scripts\b.sql");
+        assert!(!script_binding_target_changed(Some(&a), Some(&a)), "a re-save is not a move");
+        assert!(!script_binding_target_changed(None, None));
+        assert!(script_binding_target_changed(Some(&a), Some(&b)));
+        assert!(script_binding_target_changed(Some(&a), None), "unbinding is a move");
+        assert!(script_binding_target_changed(None, Some(&a)), "save-as binds where nothing was");
+    }
+
+    /// T8 review BLOCKER-1. The guard runs at dispatch; `read_script` then
+    /// yields the UI thread. The generation rail alone is structurally
+    /// blind to typing — `set_script_binding` bumps only on a PATH change
+    /// — so an open that lands over fresh keystrokes destroyed them
+    /// permanently (`SqlInput` has no undo) and silently (`bind_script`
+    /// clears the status). Both halves are load-bearing.
+    #[test]
+    fn an_open_may_only_land_while_the_root_the_binding_and_the_buffer_all_stand_still() {
+        let root = PathBuf::from(r"D:\ws\scripts");
+        let other = PathBuf::from(r"D:\jiny-ws\scripts");
+        let ok = |root_now: Option<&Path>, g: u64, t: &str| {
+            script_open_abort_reason(root_now, &root, g, 4, t, "SELECT 1")
+        };
+        assert_eq!(ok(Some(&root), 4, "SELECT 1"), None);
+
+        // BLOCKER-1's half: same binding, typed buffer.
+        assert_eq!(
+            ok(Some(&root), 4, "SELECT 1 -- rozepsáno"),
+            Some("otevření skriptu zrušeno — mezitím jste psali do editoru")
+        );
+        // Even one character from an EMPTY start — the unbound ad-hoc text
+        // the guard deliberately does not protect from USER actions is
+        // still protected from a background read landing on it.
+        assert_eq!(
+            script_open_abort_reason(Some(&root), &root, 0, 0, "s", ""),
+            Some("otevření skriptu zrušeno — mezitím jste psali do editoru")
+        );
+        // The half that already existed: the binding moved.
+        assert_eq!(
+            ok(Some(&root), 5, "SELECT 1"),
+            Some("otevření skriptu zrušeno — editor se mezitím změnil")
+        );
+
+        // NEW MAJOR's half: the ROOT moved under an open that resolved its
+        // rel against the old one. Both other checks pass here — nothing
+        // was bound, nobody typed — which is exactly why the generation
+        // alone could not see it.
+        let swapped = "otevření skriptu zrušeno — složka skriptů se mezitím změnila";
+        assert_eq!(ok(Some(&other), 4, "SELECT 1"), Some(swapped));
+        // …including „Odebrat" in profile mode, which leaves no root at all.
+        assert_eq!(ok(None, 4, "SELECT 1"), Some(swapped));
+        // The root is reported FIRST: it is the coarsest change, and
+        // blaming the editor for a workspace swap would be a lie.
+        assert_eq!(ok(Some(&other), 5, "typed"), Some(swapped));
+
+        // FINAL-REVIEW NIT-3: the root leg folds like every other path
+        // comparison in this crate. A re-pick that spells the SAME folder
+        // with different casing is not a swap, and aborting the open there
+        // would be a refusal the user cannot act on.
+        let same_folder_other_casing = PathBuf::from(r"D:\WS\Scripts");
+        assert_eq!(ok(Some(&same_folder_other_casing), 4, "SELECT 1"), None);
+        // …and the fold does not make two DIFFERENT folders equal.
+        assert_eq!(ok(Some(&PathBuf::from(r"D:\ws\scripts2")), 4, "SELECT 1"), Some(swapped));
+    }
+
+    /// T8 re-verify NEW MAJOR, the half no pure function can express: the
+    /// swap must NOT rely on `set_script_binding`'s path-changed heuristic,
+    /// because the case that matters is the one where the heuristic is
+    /// silent — and an unbound editor is never dirty, so the gate lets that
+    /// exact state through. Source-pinned (T9's `run_script_from_library`
+    /// precedent), non-vacuously: the load-bearing markers are asserted
+    /// present before the requirement is asserted at all.
+    #[test]
+    fn a_context_swap_supersedes_in_flight_opens_even_with_nothing_bound() {
+        // The trap, restated as a fact this test depends on.
+        assert!(!script_binding_target_changed(None, None), "the heuristic is silent here");
+
+        let src = include_str!("main.rs");
+        let body = src.split("fn apply_context(").nth(1).expect("apply_context exists");
+        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
+        for marker in ["clear_active_connection", "reset_scripts", "set_script_binding(None)"] {
+            assert!(body.contains(marker), "the sliced body is not the real apply_context");
+        }
+        assert!(
+            body.contains("supersede_script_continuations()"),
+            "a context swap must invalidate in-flight script continuations OUTRIGHT — \
+             `set_script_binding(None)` bumps nothing when nothing was bound, so an \
+             `open_script` dispatched against the OLD root would land and bind it"
+        );
+    }
+
+    /// T8 review MAJOR-2's refusal text: not an „error:" — nothing failed.
+    #[test]
+    fn the_second_concurrent_save_is_refused_in_plain_words() {
+        assert_eq!(SCRIPT_SAVE_IN_FLIGHT, "ukládání skriptu už probíhá");
+        assert!(!SCRIPT_SAVE_IN_FLIGHT.starts_with("error:"));
+    }
+
+    /// T9 review MAJOR-1. Ctrl+S must be refused whenever a dialog is on
+    /// screen — a modal, the Apply dialog, or a discard prompt. The
+    /// scripts case is the sharp one (a save landing after a delete
+    /// recreates an irreversibly deleted file), but the rule is the same
+    /// one `run_query_with` already applies to Ctrl+Enter, and for the
+    /// same reason: occlusion stops clicks, not keystrokes.
+    #[test]
+    fn ctrl_s_is_refused_whenever_any_dialog_owns_the_screen() {
+        // Final-review MAJOR-2: the pure RULE stays a bool and stays
+        // unit-pinned here; `save_guard::with_save_permission` is what turns
+        // it into the `SaveAllowed` witness `save_script` demands — and it
+        // reads the three facts off the live `AppView`, so nobody can mint
+        // one by passing three convenient `false`s.
+        assert!(save_guard::script_save_allowed(false, false, false));
+        assert!(!save_guard::script_save_allowed(true, false, false), "a modal blocks it");
+        assert!(!save_guard::script_save_allowed(false, true, false), "the Apply dialog blocks it");
+        assert!(!save_guard::script_save_allowed(false, false, true), "a discard prompt blocks it");
+        assert!(!save_guard::script_save_allowed(true, true, true));
+        // Refused out loud, and not as an „error:" — nothing failed.
+        assert_eq!(SCRIPT_SAVE_BLOCKED, "nejprve zavřete otevřený dialog");
+        assert!(!SCRIPT_SAVE_BLOCKED.starts_with("error:"));
+        assert!(!SCRIPT_SAVE_BLOCKED.is_empty(), "a silent refusal is the banned shape");
+    }
+
+    // ---------- T9: the binding stays coherent with the filesystem ----------
+
+    /// T9 review MINOR-1: the binding comparison folds case the same way
+    /// the rest of the phase does. The failure it closes is concrete — a
+    /// root configured with different casing than the disk made the `✕` on
+    /// the bound file leave the binding in place, so the caption kept
+    /// naming a deleted file and the next Ctrl+S recreated it.
+    #[test]
+    fn the_binding_comparison_is_unicode_case_insensitive_like_every_other_probe() {
+        let disk = Path::new(r"D:\ws\scripts\trzby.sql");
+        let configured = Path::new(r"D:\ws\Scripts\Trzby.sql");
+        assert!(same_path_ci(disk, configured), "ASCII casing must fold");
+        assert!(script_binding_affected(disk, configured, false));
+        // Non-ASCII is the pair `eq_ignore_ascii_case` would miss, and
+        // Czech script names make it routine rather than exotic.
+        assert!(same_path_ci(
+            Path::new(r"D:\ws\scripts\Řezy.sql"),
+            Path::new(r"D:\ws\scripts\řezy.sql")
+        ));
+        // T10 carry-forward 6: THE pair that separated the two folds this
+        // crate used to carry. `to_lowercase` applies Unicode's
+        // final-sigma context rule, so these two fold APART under it while
+        // NTFS resolves them to ONE directory — a rename or delete of that
+        // folder would then leave the binding standing on a dead path.
+        // `fsutil::fold_name` (`to_uppercase`, measured against `$UpCase`)
+        // folds them together, and this is what stops a revert.
+        //
+        // It has to be a FOLDER component, and that is worth knowing: the
+        // final-sigma rule fires only word-FINALLY, so `ΟΔΟΣ.sql` lowers
+        // to `οδοσ.sql` (the `.sql` follows the Σ) and a file name cannot
+        // exhibit the divergence at all. Every `.sql` leaf in this tree is
+        // therefore safe under either fold, and the whole difference lives
+        // in the directory components — which is exactly where
+        // `script_binding_affected`'s folder arm operates.
+        assert_ne!(
+            "ΟΔΟΣ".to_lowercase(),
+            "οδοσ".to_lowercase(),
+            "if this ever stops holding, the rationale on `fsutil::fold_name` needs re-deriving"
+        );
+        assert_eq!("ΟΔΟΣ".to_uppercase(), "οδοσ".to_uppercase(), "…and this is the fold we use");
+        assert!(same_path_ci(
+            Path::new(r"D:\ws\scripts\ΟΔΟΣ\a.sql"),
+            Path::new(r"D:\ws\scripts\οδοσ\a.sql")
+        ));
+        assert!(script_binding_affected(
+            Path::new(r"D:\ws\scripts\ΟΔΟΣ\a.sql"),
+            Path::new(r"D:\ws\scripts\οδοσ"),
+            true
+        ));
+        // Folding is not the same as being blind: different names stay
+        // different, and a component boundary is never crossed.
+        assert!(!same_path_ci(disk, Path::new(r"D:\ws\scripts\jine.sql")));
+        assert!(!path_starts_with_ci(
+            Path::new(r"D:\ws\scriptsX\a.sql"),
+            Path::new(r"D:\ws\scripts")
+        ));
+        assert!(path_starts_with_ci(
+            Path::new(r"D:\ws\Scripts\prod\a.sql"),
+            Path::new(r"D:\ws\scripts")
+        ));
+        // …and a re-save through a differently-cased root is NOT the user
+        // moving on, so it must not bump the generation.
+        assert!(!script_binding_target_changed(Some(disk), Some(configured)));
+    }
+
+    /// The suffix of a folder rename keeps its REAL on-disk casing even
+    /// when the prefix that matched did not — `strip_prefix` could not do
+    /// this, which is why the split is by component count.
+    #[test]
+    fn a_case_mismatched_prefix_still_rebases_and_preserves_the_suffix() {
+        assert_eq!(
+            script_binding_retarget(
+                Path::new(r"D:\ws\scripts\prod\Trzby.SQL"),
+                Path::new(r"D:\ws\Scripts\PROD"),
+                Path::new(r"D:\ws\Scripts\produkce"),
+                true
+            ),
+            Some(PathBuf::from(r"D:\ws\Scripts\produkce\Trzby.SQL"))
+        );
+    }
+
+    /// And the caption relativizes under the same rule, so the mismatch
+    /// that used to hide this whole bug class is now visible.
+    #[test]
+    fn the_caption_relativizes_across_a_casing_mismatch() {
+        assert_eq!(
+            script_caption_rel(
+                Path::new(r"D:\ws\scripts\prod\trzby.sql"),
+                Some(Path::new(r"D:\ws\Scripts"))
+            ),
+            "prod/trzby.sql"
+        );
+    }
+
+    /// Part S §4's binding fixup, as a pure decision. The three cases the
+    /// Task 9 brief demanded be pinned: rename the bound file, delete the
+    /// bound file, and — the one the plan text did not cover — rename or
+    /// delete a FOLDER that CONTAINS the bound file. `rename_entry` renames
+    /// folders too, so „only the exact path matters" would have left the
+    /// binding pointing at a path that no longer exists.
+    #[test]
+    fn a_folder_rename_moves_the_binding_with_it_not_just_an_exact_hit() {
+        let root = PathBuf::from(r"D:\ws\scripts");
+        let bound = root.join("prod").join("trzby.sql");
+
+        // The bound FILE itself is renamed.
+        assert_eq!(
+            script_binding_retarget(
+                &bound,
+                &root.join("prod").join("trzby.sql"),
+                &root.join("prod").join("trzby-2025.sql"),
+                false
+            ),
+            Some(root.join("prod").join("trzby-2025.sql"))
+        );
+        // The folder ABOVE it is renamed — the suffix is rebased.
+        assert_eq!(
+            script_binding_retarget(&bound, &root.join("prod"), &root.join("produkce"), true),
+            Some(root.join("produkce").join("trzby.sql"))
+        );
+        // A folder rename must NOT rebase when `is_dir` is false: a FILE
+        // whose name happens to be a path prefix of the binding is not an
+        // ancestor of it.
+        assert_eq!(script_binding_retarget(&bound, &root.join("prod"), &root.join("p2"), false), None);
+        // An unrelated entry leaves the binding alone.
+        assert_eq!(
+            script_binding_retarget(&bound, &root.join("dev"), &root.join("dev2"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn the_delete_fixup_covers_the_bound_file_and_its_ancestors() {
+        let root = PathBuf::from(r"D:\ws\scripts");
+        let bound = root.join("prod").join("trzby.sql");
+        assert!(script_binding_affected(&bound, &bound, false));
+        assert!(script_binding_affected(&bound, &root.join("prod"), true));
+        assert!(!script_binding_affected(&bound, &root.join("prod"), false));
+        assert!(!script_binding_affected(&bound, &root.join("dev"), true));
+        // The root itself is an ancestor of everything — but `delete_entry`
+        // refuses an empty rel (`resolve_entry_rel`), so the root can never
+        // BE a target; this only records that the predicate is honest.
+        assert!(script_binding_affected(&bound, &root, true));
+    }
+
+    /// FINAL-REVIEW NIT-1. `save_script_as` resumes after a file picker
+    /// that is not app-modal on every platform, so it owes the SAME
+    /// three-part re-check `script_open_abort_reason` performs for an open
+    /// — and it was missing the buffer leg, which is precisely the leg the
+    /// generation counter is structurally blind to (`set_script_binding`
+    /// bumps on a PATH change; typing changes no path).
+    ///
+    /// Source-pinned, the `run_script_from_library` precedent: the three
+    /// legs are `if` statements in a GPUI continuation that no headless
+    /// test can drive. Non-vacuous — the slice is proved to be the real
+    /// function before anything is required of it.
+    #[test]
+    fn the_save_as_continuation_re_asks_all_three_things_it_captured() {
+        let src = include_str!("main.rs");
+        let body = src.split("fn save_script_as(").nth(1).expect("save_script_as exists");
+        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
+        // RE-VERIFY MINOR-B: assert on CODE, never on the raw body. Leg 2
+        // below looked for `script_save_allowed` in the RAW text, where it
+        // occurs only in a COMMENT — the code calls the mint, not the pure
+        // rule — so the leg was satisfied by prose about itself. That is
+        // the exact failure `config_save_guard_audit`'s own doc warns
+        // about, reproduced two hundred lines from the warning.
+        let code = editor_clobber_audit::code_lines(body).join("\n");
+        // The slice really is the picker continuation.
+        assert!(code.contains("prompt_for_new_path"), "the sliced body is not the real one");
+        assert!(code.contains("with_sql_extension"), "the sliced body is not the real one");
+        // Leg 1: the binding must not have moved (T9 re-verify FAIL-1's
+        // generation check).
+        assert!(
+            code.contains("script_binding_generation != dispatched"),
+            "the binding leg is gone — a save-as landing after the editor was bound elsewhere \
+             would write the old text and re-bind on top of it"
+        );
+        // Leg 2: the dialog predicate, re-asked continuation-side. The
+        // needle is the MINT, because that is what the code calls — and
+        // the OLD needle is asserted ABSENT from the code, which is both
+        // the real invariant (this path must go through the permission
+        // scope, never the bare rule) and the standing proof that the
+        // previous version of this leg was satisfied by a comment.
+        assert!(
+            !code.contains("script_save_allowed"),
+            "this path must ask the permission SCOPE, not the pure rule"
+        );
+        assert!(
+            code.contains("with_save_permission"),
+            "the guard leg is gone — T9 re-verify FAIL-1's delete/save-as race is back"
+        );
+        // Leg 3: the captured buffer, the one this finding added.
+        assert!(
+            code.contains(".text() != text"),
+            "the BUFFER leg is gone — keystrokes during a non-app-modal picker would be \
+             written to disk as text nobody can see, with `saved_text` bound to them"
+        );
+    }
+
+    /// RE-VERIFY MINOR-A — MAJOR-1's resurrection in the MIRRORED
+    /// ordering, which the first fix left open.
+    ///
+    /// MAJOR-1 was „the open lands, then the delete lands". The mirror is
+    /// „the delete lands, then the open lands", and with the editor
+    /// UNBOUND at the landing the re-asked `binding_targets` is false, so
+    /// `set_script_binding` is never called and the generation is never
+    /// bumped. An `open_script` dispatched before the delete then passes
+    /// all three legs of `script_open_abort_reason` and binds a file that
+    /// no longer exists; the next Ctrl+S recreates it. (Windows opens the
+    /// read with `FILE_SHARE_DELETE`, so it completes across the delete
+    /// and raises no error to notice.)
+    ///
+    /// Source-pinned because the whole point is that the call is
+    /// UNCONDITIONAL — a behavioural test can only show that some path
+    /// bumps, not that every path does. The indentation check is the
+    /// assertion: at the function body's own level (8 spaces) it cannot be
+    /// inside an `if`, which is exactly how it was missing before.
+    #[test]
+    fn a_landed_delete_supersedes_in_flight_opens_even_with_nothing_bound() {
+        let src = include_str!("main.rs");
+        let body = src.split("fn finish_script_delete(").nth(1).expect("it exists");
+        let body = &body[..body.find("
+    fn ").unwrap_or(body.len())];
+        // Non-vacuity: the slice is the real landing.
+        assert!(body.contains("owns_script_delete_modal"), "the sliced body is not the real one");
+        assert!(body.contains("binding_targets"), "the sliced body is not the real one");
+
+        let code = editor_clobber_audit::code_lines(body);
+        let bump: Vec<&String> =
+            code.iter().filter(|l| l.contains("supersede_script_continuations")).collect();
+        assert_eq!(bump.len(), 1, "expected exactly one bump, found {}", bump.len());
+        // UNCONDITIONAL, expressed as BRACE DEPTH rather than as
+        // indentation. Re-verify's NIT is right that the old `assert_eq!`
+        // on the literal line was positional: it broke on a CRLF checkout
+        // (FAIL-9) and would break again on a `tab_spaces` change. Depth
+        // is the property actually meant — depth 1 is the function body,
+        // and anything deeper is inside an `if`/`match`/closure, which is
+        // exactly how MINOR-A's data loss survived the first fix.
+        let mut depth = 0i32;
+        let mut depth_at_bump = None;
+        for line in &code {
+            if line.contains("supersede_script_continuations") {
+                depth_at_bump = Some(depth);
+            }
+            depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        }
+        assert_eq!(
+            depth_at_bump,
+            Some(1),
+            "the bump must sit at the function body's own brace depth — anything deeper is              inside a conditional, which is how re-verify MINOR-A's data loss survived the              first fix"
+        );
+        // …and it must come BEFORE the binding is dropped, so a bump is
+        // never skipped by an early return added later.
+        let bump_at = code.iter().position(|l| l.contains("supersede_script_continuations"));
+        let drop_at = code.iter().position(|l| l.contains("set_script_binding"));
+        assert!(bump_at < drop_at, "supersede first, then adjust the binding");
+    }
+
+    /// FINAL-REVIEW MAJOR-1, the direction that loses data.
+    ///
+    /// The delete of `trzby.sql` was confirmed while the editor was
+    /// UNBOUND, so a `was_bound` captured at dispatch said `false`. An
+    /// in-flight `open_script` of the very same file then landed first and
+    /// bound it (nothing in `script_open_abort_reason` stops that: an
+    /// unbound editor never bumped the generation, the root did not move
+    /// and the buffer was not typed into). The state that decides whether
+    /// the binding must be dropped is therefore the state at the LANDING,
+    /// and `binding_targets_entry` has no parameter that could carry the
+    /// dispatch-time answer — which is the point of it being a free fn.
+    ///
+    /// If this ever answers `false`, the caption keeps naming a file the
+    /// user irreversibly deleted and the next Ctrl+S recreates it.
+    #[test]
+    fn a_delete_landing_after_an_open_bound_its_own_target_still_clears_the_binding() {
+        let root = PathBuf::from(r"D:\ws\scripts");
+        let doomed = root.join("trzby.sql");
+        // At DISPATCH the editor was unbound — the stale answer.
+        assert!(!binding_targets_entry(None, Some(&root), "trzby.sql", false));
+        // At the LANDING the racing open has bound the doomed file.
+        assert!(binding_targets_entry(Some(&doomed), Some(&root), "trzby.sql", false));
+        // Same story one level up: the open bound a file inside the folder
+        // whose delete was confirmed while nothing was bound.
+        let inside = root.join("prod").join("trzby.sql");
+        assert!(binding_targets_entry(Some(&inside), Some(&root), "prod", true));
+    }
+
+    /// …and the symmetric direction, which is milder but equally wrong:
+    /// bound to `a.sql`, an in-flight open of `b.sql` lands during the
+    /// confirmed delete of `a.sql`. A `was_bound == true` captured at
+    /// dispatch would drop the brand-new `b.sql` binding, silently turning
+    /// the next Ctrl+S into a save-as over a file that still exists.
+    #[test]
+    fn a_delete_landing_after_the_binding_moved_elsewhere_keeps_the_new_binding() {
+        let root = PathBuf::from(r"D:\ws\scripts");
+        let a = root.join("a.sql");
+        let b = root.join("b.sql");
+        // At DISPATCH: bound to the doomed file — the stale answer.
+        assert!(binding_targets_entry(Some(&a), Some(&root), "a.sql", false));
+        // At the LANDING: the editor has moved on to `b.sql`, which the
+        // delete does not touch.
+        assert!(!binding_targets_entry(Some(&b), Some(&root), "a.sql", false));
+    }
+
+    /// The two „no answer is possible" arms, so neither degrades to a
+    /// destructive `true`: no binding at all, and no scripts root (the
+    /// workspace was swapped out from under the delete).
+    #[test]
+    fn the_binding_question_is_false_without_a_binding_or_a_root() {
+        let root = PathBuf::from(r"D:\ws\scripts");
+        let bound = root.join("a.sql");
+        assert!(!binding_targets_entry(None, Some(&root), "a.sql", false));
+        assert!(!binding_targets_entry(Some(&bound), None, "a.sql", false));
+        // And the library ROOT is never a mutation target, so an empty rel
+        // is `false` rather than „everything is affected"
+        // (`resolve_entry_rel`'s rail, asked here so the free fn inherits
+        // it as visibly as the method did).
+        assert!(!binding_targets_entry(Some(&bound), Some(&root), "", true));
+    }
+
+    /// Part S §1.3, recorded as a TEST because it is the kind of
+    /// "helpful" behaviour a future edit adds by accident: ▶ runs what
+    /// is on DISK. The pre-scan reads the file; nothing writes it.
+    /// CARGO_MANIFEST_DIR, not `file!()`: cargo runs tests with the
+    /// PACKAGE dir as CWD while `file!()` is workspace-relative.
+    #[test]
+    fn running_a_library_script_never_auto_saves_first() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+        let run_fn = src
+            .split("fn run_script_from_library")
+            .nth(1)
+            .expect("run_script_from_library exists");
+        let body = &run_fn[..run_fn.find("\n    fn ").unwrap_or(run_fn.len())];
+        // Non-vacuity: a slice that stopped early would pass the bans by
+        // containing nothing at all. These two are the load-bearing halves
+        // of the fn — the from-disk pre-scan and the SHARED continuation.
+        assert!(body.contains("count_statements_in_file"), "the sliced body is not the real one");
+        assert!(body.contains("open_script_run_modal"), "the sliced body is not the real one");
+        for banned in ["save_script", "write_script", "replace_buffer", "bind_script"] {
+            assert!(!body.contains(banned), "▶ must not {banned}: it runs the DISK content");
+        }
+    }
+}
+
+/// Workspace T8: the „never destructive" rail for the EDITOR, pinned the
+/// same way `config_save_guard_audit` pins the `config.toml` writers —
+/// as a source audit, because a GPUI click listener cannot be driven
+/// headlessly and the two sites this task fixed were both listeners.
+///
+/// Part S §5.5 says there is ONE dirty guard. That is only true while
+/// `editor_load_guarded` is the ONLY way the editor's text gets replaced:
+/// the two sites this audit was written for (`history_panel.rs`'s row
+/// click and the palette's `HistoryEntry` arm) had clobbered a bound
+/// script's unsaved changes with no guard at all since long before this
+/// phase. A third such site added later would silently reopen the hole,
+/// and nothing else in the test suite would notice.
+///
+/// T8 REVIEW MAJOR-3, rewritten. The first version keyed on
+/// `sql.update(cx, |s,` + `set_text` ON THE SAME LINE, and six shapes
+/// walked straight past it — a rebound local, a method chain, a UFCS call,
+/// a rustfmt-wrapped closure body, a differently-named closure parameter,
+/// and a direct `perform_script_action` call that skipped the guard
+/// entirely. Two of those are ordinary formatting and naming, not
+/// adversarial. This version keys on IDENTIFIERS that are unique
+/// crate-wide instead of on an expression shape, so how the editor entity
+/// is reached and how rustfmt breaks the lines are both irrelevant:
+///
+/// * `SqlInput::set_text` was RENAMED to `replace_buffer` (see its doc
+///   comment) precisely so that the one identifier every buffer
+///   replacement must mention cannot be confused with `TextField`'s or
+///   `TextModel`'s same-named methods.
+/// * `perform_script_action` and `bind_script` are counted too, so a
+///   call of the performer from an unsanctioned owner is REPORTED. (Not
+///   „cannot be bypassed" — that is a text check, and re-verify rounds 2
+///   and 3 walked past text checks six times between them.)
+///
+/// **What actually stops a buffer clobber is now a TYPE**, not this
+/// module: `SqlInput::replace_buffer` demands an
+/// `editor_guard::BufferReplace<'brand>`, and `accept_completion` — the
+/// only other `pub` mutator — was narrowed so it can delete at most one
+/// identifier prefix. These audits remain as the belt: they report a NEW
+/// mutator or a mention that escapes as a value, neither of which a type
+/// can notice.
+///
+/// The structural alternative the review preferred — the editor entity
+/// behind a private accessor whose mutator is unreachable outside the
+/// guard — was NOT taken, and re-verify judged that decline WRONG for the
+/// scope shape (which needs no accessor and no module move; see
+/// `editor_guard`). What follows is the original Task 8 reasoning, kept
+/// because it is still the correct objection to the accessor shape: Rust's finest privacy granularity is the module,
+/// so it would mean moving `AppView.sql` and both guard functions into a
+/// separate module, splitting `impl AppView` across files and dragging the
+/// autocomplete plumbing (`accept_completion`, `set_autocomplete_active`,
+/// `kick_highlight`, the ten `read(cx)` sites) with it. That is a `main.rs`
+/// restructure, not a Task 8 fix.
+#[cfg(test)]
+mod editor_clobber_audit {
+    use std::path::PathBuf;
+
+    /// EVERY `.rs` file in the WORKSPACE, read at TEST TIME by walking
+    /// the repository root — deliberately never a hand-written list, and
+    /// (re-verify FAIL-4) never a list of directories either.
+    ///
+    /// T8 re-verify MAJOR-3 / G1: the previous version enumerated 8 of the
+    /// crate's 33 files, and the other 25 were invisible to it. Privacy
+    /// does NOT cover them: `main.rs` is the CRATE ROOT, so every module is
+    /// a descendant, and Rust grants a descendant access to a private
+    /// ancestor item. `AppView.sql`, `open_script` and
+    /// `perform_script_action` are private-but-reachable crate-wide, and
+    /// `bind_script` / `editor_load_guarded` are `pub(crate)` outright — so
+    /// an `impl crate::AppView` block in ANY module could replace the
+    /// editor's buffer with all three tests green. That is not theoretical:
+    /// Task 9 added the scripts-tree mutation handlers, and a „Nový
+    /// skript" handler that loads the created file into the editor is
+    /// exactly the code that would want to.
+    ///
+    /// Reading the directory also means a NEW file is covered the moment it
+    /// exists, with nobody having to remember this list.
+    /// FINAL-REVIEW MAJOR-2 (structural gap 1): it now walks the WHOLE
+    /// WORKSPACE, not `dbc-ui/src`. `crates/dbc-ui/tests/`, a future
+    /// `build.rs` (which runs at BUILD time with full filesystem access)
+    /// and every other crate were invisible — notably `dbc-state`'s four
+    /// `fsutil::write_atomic` callers, which write real bytes into the
+    /// user's folder and were audited by nothing at all. Names are now
+    /// `<crate>/<src|tests>/<path>` so a report says WHICH crate.
+    pub(super) fn sources() -> Vec<(String, String)> {
+        let root = workspace_root();
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(path) = stack.pop() {
+            if path.is_dir() {
+                if is_pruned(&path) {
+                    continue;
+                }
+                let rd = std::fs::read_dir(&path)
+                    .unwrap_or_else(|e| panic!("audit cannot read {}: {e}", path.display()));
+                for ent in rd {
+                    stack.push(ent.expect("readable directory entry").path());
+                }
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("audit cannot read {rel}: {e}"));
+            out.push((rel, text));
+        }
+        out.sort();
+        out
+    }
+
+    /// Is this directory outside the audits' remit?
+    ///
+    /// RE-VERIFY FAIL-6. This used to be `n.starts_with("target")`, a
+    /// PREFIX match — so a plain `mod targets;` in
+    /// `crates/dbc-ui/src/targets/` was invisible to every audit, and so
+    /// were `target_picker/` and `targeting/`. No trick was needed: the
+    /// re-verifier put verbatim `replace_buffer` and `write_script` calls
+    /// there, called them from the live `Unbind` arm, and got 0 warnings
+    /// and 964 passing. `targets` is a name somebody could add innocently,
+    /// which makes it the worst of the three bypasses that round.
+    ///
+    /// So nothing is pruned by NAME SHAPE any more:
+    ///
+    /// * VCS and tooling metadata by EXACT name — these are not Rust
+    ///   source trees and never contain a module of this workspace;
+    /// * a cargo build directory by CONTENT — cargo writes `CACHEDIR.TAG`
+    ///   into every target dir, so this recognises build output wherever
+    ///   it is and whatever it is called, and recognises nothing else.
+    ///
+    /// A directory a developer names is therefore always scanned.
+    pub(super) fn is_pruned(dir: &std::path::Path) -> bool {
+        let name = dir.file_name().map(|n| n.to_string_lossy().to_string());
+        if name.as_deref().is_some_and(|n| matches!(n, ".git" | ".claude" | "node_modules")) {
+            return true;
+        }
+        // RE-VERIFY FAIL-13: the marker prunes a directory only when there
+        // is no Rust source in it.
+        //
+        // Keying on `CACHEDIR.TAG` alone FAILED OPEN. The tag is an
+        // unsigned, trivially-created file, so dropping one into
+        // `crates/dbc-ui/src/helpers/` next to a `mod.rs` deleted that
+        // directory from every audit - FAIL-6 from the other side, and
+        // strictly worse, because it needs no plausible name at all.
+        //
+        // A cargo target directory contains build artefacts, never crate
+        // sources, so „has the tag AND holds no `.rs` file" recognises
+        // build output without ever hiding code. If someone puts the tag
+        // beside a `.rs` file, the directory is scanned and the audits
+        // speak up - which is the fail-CLOSED direction.
+        if !dir.join("CACHEDIR.TAG").is_file() {
+            return false;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return false };
+        !rd.filter_map(|e| e.ok())
+            .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("rs"))
+    }
+
+    /// The workspace root — `CARGO_MANIFEST_DIR` is `<root>/crates/dbc-ui`.
+    pub(super) fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("<root>/crates/dbc-ui")
+            .to_path_buf()
+    }
+
+    /// The workspace members, read from the root `Cargo.toml` at TEST
+    /// TIME rather than hard-coded.
+    ///
+    /// RE-VERIFY FAIL-4: the coverage test used to carry a literal list of
+    /// ten crate names, so it could not notice a new member — and could
+    /// not notice that the walk itself was list-shaped either. Deriving
+    /// both from the manifest means a member added tomorrow is audited
+    /// tomorrow, with nobody remembering anything.
+    pub(super) fn workspace_members() -> Vec<String> {
+        let manifest = std::fs::read_to_string(workspace_root().join("Cargo.toml"))
+            .expect("workspace Cargo.toml");
+        let list = manifest
+            .split("members")
+            .nth(1)
+            .and_then(|t| t.split('[').nth(1))
+            .and_then(|t| t.split(']').next())
+            .expect("[workspace] members list");
+        let out: Vec<String> = list
+            .split(',')
+            .filter_map(|m| {
+                let m = m.trim().trim_matches('"').trim();
+                (!m.is_empty()).then(|| m.to_string())
+            })
+            .collect();
+        assert!(out.len() >= 10, "member list parse looks wrong: {out:?}");
+        out
+    }
+
+    /// The source's lines with every COMMENT and every STRING LITERAL
+    /// blanked out, so a needle can only match real code. One line in, one
+    /// line out — indices still name the file's real line numbers.
+    ///
+    /// FINAL-REVIEW MAJOR-2 (structural gap 2). The old `code_of`
+    /// truncated at the first `//` ANYWHERE on the line, including inside
+    /// a string literal, where it silently swallowed the rest of a real
+    /// statement; and block comments were not stripped at all, so
+    /// `/* … */` was an invisibility cloak over any call an audit was
+    /// looking for. Both are now handled by a scanner rather than a
+    /// `find`:
+    ///
+    /// * `/* … */`, NESTED (Rust allows it) and spanning lines;
+    /// * `"…"` with `\` escapes, and `r"…"` / `r#"…"#` raw strings, which
+    ///   have no escapes at all and are how every Windows path literal in
+    ///   this crate is written — INCLUDING the byte and C prefixes
+    ///   (`b"…"`, `c"…"`, `br#"…"#`, `cr#"…"#`), which re-verify FAIL-3
+    ///   caught this scanner mis-parsing: a `br#"…"#` fell through to the
+    ///   ordinary-`"` branch, took the first quote in its payload as the
+    ///   terminator, and with an odd quote count desynced into
+    ///   „inside a string" and blanked the rest of the FILE;
+    /// * `'x'` / `'\n'` char literals, told apart from LIFETIMES
+    ///   (`'static`, `'a`) by requiring the closing quote — which matters
+    ///   because `'/'` and `'"'` both appear in this crate's real code.
+    ///
+    /// Blanking rather than deleting keeps a prose mention from being an
+    /// alibi too (`config_save_guard_audit`'s lesson: its first draft was
+    /// vacuous because an explanatory comment satisfied it).
+    pub(super) fn code_lines(src: &str) -> Vec<String> {
+        // RE-VERIFY FAIL-9: the carriage return is DROPPED, so a line
+        // here is a LOGICAL line. This scanner split on the newline and
+        // kept the CR, so on a CRLF
+        // checkout every returned line ended in an invisible carriage
+        // return — and `a_landed_delete_supersedes_in_flight_opens_even_
+        // with_nothing_bound` compares a line with `assert_eq!`. That pin
+        // was RED on a fresh `git checkout` of this branch (this machine
+        // has `core.autocrlf = true` globally) while passing in the
+        // worktree where the file had been written by an editor. Every
+        // consumer here wants logical lines; none wants the terminator.
+        let chars: Vec<char> = src.chars().filter(|c| *c != '\r').collect();
+        let mut out: Vec<String> = Vec::new();
+        let mut line = String::new();
+        let mut block_depth = 0usize;
+        let mut i = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\n' {
+                out.push(std::mem::take(&mut line));
+                i += 1;
+                continue;
+            }
+            if block_depth > 0 {
+                if c == '*' && chars.get(i + 1) == Some(&'/') {
+                    block_depth -= 1;
+                    line.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                if c == '/' && chars.get(i + 1) == Some(&'*') {
+                    block_depth += 1;
+                    line.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                line.push(' ');
+                i += 1;
+                continue;
+            }
+            if c == '/' && chars.get(i + 1) == Some(&'*') {
+                block_depth = 1;
+                line.push_str("  ");
+                i += 2;
+                continue;
+            }
+            if c == '/' && chars.get(i + 1) == Some(&'/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    line.push(' ');
+                    i += 1;
+                }
+                continue;
+            }
+            // A STRING LITERAL, prefix and all.
+            //
+            // RE-VERIFY FAIL-3. This used to be two branches — one for a
+            // bare `r`, one for a bare `"` — and the raw branch demanded
+            // that the character before the `r` not be identifier-ish. A
+            // BYTE raw string spells a `b` there, so `br#"…"#` failed the
+            // raw test and fell into the ordinary-`"` branch, which then
+            // took the FIRST `"` inside the payload as its terminator. With
+            // an odd number of quotes in the payload the scanner desynced
+            // into "inside a string" and blanked every following character,
+            // ACROSS LINES — hiding real calls from every audit (the
+            // re-verifier hid a `write_script(` this way, zero warnings,
+            // 961 green) and, mid-file, blanking legitimate ones so counts
+            // silently dropped. Live `br#"…"#` literals already exist at
+            // `dbc-driver-postgres/src/types.rs:201,208,227`; they survived
+            // only because their quote counts happen to be even.
+            //
+            // So the prefix is parsed properly: `b`, `c`, `r`, `br`, `cr`
+            // (and none). Anything with an `r` is RAW — no escapes, `#`
+            // hashes delimit; anything else is an ordinary escaped string.
+            // The not-identifier-ish test now applies to the START of the
+            // prefix, which is the only place it was ever meaningful.
+            let prefix = ["br", "cr", "b", "c", "r", ""]
+                .into_iter()
+                .find(|p| p.chars().enumerate().all(|(k, pc)| chars.get(i + k) == Some(&pc)));
+            if let Some(prefix) = prefix {
+                let plen = prefix.len();
+                let raw = prefix.contains('r');
+                let after_prefix = i + plen;
+                let mut j = after_prefix;
+                let mut hashes = 0usize;
+                if raw {
+                    while chars.get(j) == Some(&'#') {
+                        hashes += 1;
+                        j += 1;
+                    }
+                }
+                let opens = chars.get(j) == Some(&'"');
+                // A prefix is only a prefix if it starts a token.
+                let token_start =
+                    !line.chars().next_back().is_some_and(|p| p.is_alphanumeric() || p == '_');
+                if opens && (plen == 0 || token_start) {
+                    for _ in 0..=(plen + hashes) {
+                        line.push(' ');
+                    }
+                    j += 1;
+                    while j < chars.len() {
+                        if raw {
+                            if chars[j] == '"'
+                                && (1..=hashes).all(|k| chars.get(j + k) == Some(&'#'))
+                            {
+                                for _ in 0..=hashes {
+                                    line.push(' ');
+                                }
+                                j += hashes + 1;
+                                break;
+                            }
+                        } else {
+                            if chars[j] == '\\' {
+                                line.push(' ');
+                                if chars.get(j + 1) == Some(&'\n') {
+                                    out.push(std::mem::take(&mut line));
+                                } else if j + 1 < chars.len() {
+                                    line.push(' ');
+                                }
+                                j += 2;
+                                continue;
+                            }
+                            if chars[j] == '"' {
+                                line.push(' ');
+                                j += 1;
+                                break;
+                            }
+                        }
+                        if chars[j] == '\n' {
+                            out.push(std::mem::take(&mut line));
+                        } else {
+                            line.push(' ');
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            if c == '\'' {
+                // A char literal closes; a lifetime does not.
+                let close = if chars.get(i + 1) == Some(&'\\') { i + 3 } else { i + 2 };
+                if chars.get(close) == Some(&'\'') {
+                    for _ in i..=close {
+                        line.push(' ');
+                    }
+                    i = close + 1;
+                    continue;
+                }
+            }
+            line.push(c);
+            i += 1;
+        }
+        out.push(line);
+        out
+    }
+
+    /// Single-line convenience over [`code_lines`]. A line handed here in
+    /// isolation cannot know it is inside a block comment — `code_lines`
+    /// is what knows that, and every audit goes through it.
+    pub(super) fn code_of(l: &str) -> String {
+        code_lines(l).into_iter().next().unwrap_or_default()
+    }
+
+    /// The NAME of the function a line defines, or `None` if it defines
+    /// none.
+    ///
+    /// T8 re-verify MAJOR-3 / G2, both halves. Sanctioning used to be
+    /// `owner.contains(name)`, so a helper called `bind_script_and_focus`
+    /// or `perform_script_action_inner` — ordinary refactor names, not
+    /// adversarial ones — was silently sanctioned; the caller now compares
+    /// the extracted name EXACTLY. And the old detector recognised only
+    /// `fn` / `pub fn` / `pub(crate) fn` / `pub(super) fn`, so a call under
+    /// an `async fn`, `unsafe fn`, `const fn` or `pub(in path) fn` was
+    /// attributed to the PREVIOUS function — possibly a sanctioned one.
+    /// This strips an arbitrary visibility and any order of qualifiers.
+    pub(super) fn defined_fn_name(line: &str) -> Option<String> {
+        let stripped = code_of(line);
+        let mut t = stripped.trim_start();
+        if let Some(rest) = t.strip_prefix("pub") {
+            let rest = rest.trim_start();
+            t = match rest.strip_prefix('(') {
+                // `pub(crate)`, `pub(super)`, `pub(in a::b)`
+                Some(inner) => inner[inner.find(')')? + 1..].trim_start(),
+                None => rest,
+            };
+        }
+        loop {
+            let before = t.len();
+            for q in ["default ", "const ", "async ", "unsafe ", "extern "] {
+                if let Some(rest) = t.strip_prefix(q) {
+                    t = rest.trim_start();
+                }
+            }
+            // `extern "C"`'s ABI string.
+            if let Some(rest) = t.strip_prefix('"') {
+                if let Some(end) = rest.find('"') {
+                    t = rest[end + 1..].trim_start();
+                }
+            }
+            if t.len() == before {
+                break;
+            }
+        }
+        let rest = t.strip_prefix("fn ")?.trim_start();
+        let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+        (end > 0).then(|| rest[..end].to_string())
+    }
+
+    /// The function ENCLOSING each line, by index — `None` where a line is
+    /// not inside any function body.
+    ///
+    /// FINAL-REVIEW MAJOR-2 (structural gap 3). The old `owner_fn` was
+    /// „the nearest `fn` definition ABOVE this line", with no brace
+    /// balancing at all, so a call at file scope (a `static` initializer,
+    /// a `lazy_static!`, a macro invocation at module level) after a
+    /// sanctioned function had CLOSED was attributed to that closed
+    /// function and silently sanctioned. This tracks brace depth over the
+    /// comment- and string-stripped text, so a function owns exactly its
+    /// own body and nothing after it.
+    ///
+    /// Closures do not disturb it: they are extra `{}` inside the body,
+    /// and the innermost still-open `fn` remains the owner — which is the
+    /// answer these audits want (`cx.spawn(async move |…| { … })` is the
+    /// enclosing function's own code).
+    pub(super) fn owners(code: &[String]) -> Vec<Option<String>> {
+        let mut depth = 0usize;
+        // (depth at which this fn's body opened, name)
+        let mut stack: Vec<(usize, String)> = Vec::new();
+        let mut pending: Option<String> = None;
+        let mut out: Vec<Option<String>> = Vec::with_capacity(code.len());
+        for line in code {
+            let defines = defined_fn_name(line);
+            let scan = |depth: &mut usize,
+                            stack: &mut Vec<(usize, String)>,
+                            pending: &mut Option<String>| {
+                for ch in line.chars() {
+                    match ch {
+                        '{' => {
+                            *depth += 1;
+                            if let Some(n) = pending.take() {
+                                stack.push((*depth, n));
+                            }
+                        }
+                        '}' => {
+                            if stack.last().is_some_and(|(d, _)| *d == *depth) {
+                                stack.pop();
+                            }
+                            *depth = depth.saturating_sub(1);
+                        }
+                        _ => {}
+                    }
+                }
+            };
+            match defines {
+                // A definition line belongs to the function it opens, so
+                // its braces are consumed BEFORE the owner is recorded.
+                Some(name) => {
+                    pending = Some(name);
+                    scan(&mut depth, &mut stack, &mut pending);
+                    out.push(stack.last().map(|(_, n)| n.clone()));
+                }
+                // Every other line belongs to whatever was open when it
+                // STARTED — a lone `}` closing a function is still that
+                // function's line.
+                None => {
+                    out.push(stack.last().map(|(_, n)| n.clone()));
+                    scan(&mut depth, &mut stack, &mut pending);
+                }
+            }
+        }
+        out
+    }
+
+    /// Every CALL of `needle` must sit inside a function named EXACTLY one
+    /// of `sanctioned`, and there must be exactly `expected` of them. The
+    /// definition itself is not a call site.
+    pub(super) fn audit(needle: &str, sanctioned: &[&str], expected: usize, why: &str) {
+        audit_excluding(needle, &[], sanctioned, expected, why);
+    }
+
+    /// [`audit`] for a FIELD rather than a function.
+    ///
+    /// A field is never „called", so re-verify FAIL-8's call-shape rule
+    /// does not apply — and must not, or every read of the field is a
+    /// finding. Everything else is identical: whole-word mentions, exact
+    /// owner names, pinned count.
+    pub(super) fn audit_field(needle: &str, sanctioned: &[&str], expected: usize, why: &str) {
+        audit_inner(needle, &[], sanctioned, expected, why, false);
+    }
+
+    /// [`audit`], plus tokens that must NOT count as a mention.
+    ///
+    /// FINAL-REVIEW MAJOR-2 named the false positive instead of dodging it
+    /// with punctuation: the needle used to be `.save_script`, WITH a
+    /// leading dot, purely to keep `on_save_script(` out of the count, and
+    /// the dot is exactly what the UFCS bypass (`AppView::save_script(..)`,
+    /// which spells a colon there) walked around.
+    ///
+    /// **RE-VERIFY FAIL-1 finished the job: this no longer looks for a
+    /// CALL at all. It looks for the NAME.** Matching `needle + "("` still
+    /// assumes a call syntax, and the re-verifier simply stopped using one:
+    ///
+    /// ```ignore
+    /// use crate::scripts::write_script as persist_bytes;   // no `(`
+    /// let _ = persist_bytes(&doomed, "-- truncated by the run");  // no name
+    ///
+    /// let clobber = crate::sql_input::SqlInput::replace_buffer;
+    /// self.sql.update(cx, |s, cx| clobber(s, "", cx));
+    /// ```
+    ///
+    /// Zero warnings, 961 green, `script_write_audit` and
+    /// `editor_clobber_audit` both passing over a truncating write and an
+    /// unguarded buffer clobber.
+    ///
+    /// The rebuttal is that **the alias has to be introduced somewhere,
+    /// and introducing it NAMES the thing.** A `use … as`, a fn-pointer
+    /// binding, a re-export, a qualified path, a trait-dispatched call —
+    /// every one of them writes the identifier down. So a mention of the
+    /// identifier as a WHOLE WORD, anywhere in code, is now a site, and it
+    /// must sit inside a sanctioned function exactly as a call did. There
+    /// is no call syntax left to vary.
+    ///
+    /// The word test is what keeps this honest: without it,
+    /// `on_save_script` would match `save_script`, and the whole reason
+    /// the dot existed would come back. Boundaries are Rust identifier
+    /// characters, so `save_script_as` and `bind_script_and_focus` do not
+    /// match either — the same exact-name rule T8 re-verify MAJOR-3/G2
+    /// established for owners.
+    ///
+    /// Excluded tokens are blanked in place, so a line holding BOTH an
+    /// excluded mention and a real one still reports the real one.
+    pub(super) fn audit_excluding(
+        needle: &str,
+        exclude: &[&str],
+        sanctioned: &[&str],
+        expected: usize,
+        why: &str,
+    ) {
+        audit_inner(needle, exclude, sanctioned, expected, why, true);
+    }
+
+    /// The shared body. `require_call` is re-verify FAIL-8's rule, which
+    /// applies to functions and not to fields.
+    fn audit_inner(
+        needle: &str,
+        exclude: &[&str],
+        sanctioned: &[&str],
+        expected: usize,
+        why: &str,
+        require_call: bool,
+    ) {
+        let mut sites = 0usize;
+        for (name, src) in sources() {
+            let code = code_lines(&src);
+            let who = owners(&code);
+            for (i, line) in code.iter().enumerate() {
+                let mut line = line.clone();
+                for ex in exclude {
+                    while let Some(at) = line.find(ex) {
+                        line.replace_range(at..at + ex.len(), &" ".repeat(ex.len()));
+                    }
+                }
+                if !mentions_word(&line, needle)
+                    || defined_fn_name(&line).as_deref() == Some(needle)
+                    || plain_import(&line, needle)
+                {
+                    continue;
+                }
+                let owner = who[i].as_deref();
+                // A struct FIELD DECLARATION is not a write. It sits at
+                // file scope inside the `struct` body, so it is told apart
+                // by having no owning function and by being `name:` at the
+                // start of its line — a shape no assignment has.
+                if !require_call
+                    && owner.is_none()
+                    && line.trim_start().starts_with(&format!("{needle}:"))
+                {
+                    continue;
+                }
+                sites += 1;
+                // RE-VERIFY FAIL-8: a mention must be a CALL. The name rule
+                // bounds where the identifier appears; it does not bound
+                // where the CAPABILITY goes. The re-verifier rewrote
+                // `save_script`'s single existing mention - inside a
+                // SANCTIONED owner, leaving the count at 5 - as
+                // `let w = crate::scripts::write_script;`, stashed `w` in a
+                // thread-local and called it from `Unbind`. 0 warnings, 964
+                // green. Binding a function ITEM is the escape, and it is
+                // visible right here: a call is followed by `(`, a binding
+                // by `;` or `,` or `)`.
+                assert!(
+                    !require_call || is_call_mention(&line, needle),
+                    "`{needle}` is MENTIONED but not CALLED at {name}:{} (in `{}`) - binding it                      as a value (`let f = ...;`, a rename, an argument) hands the capability to                      code this audit cannot see, which is exactly how it was defeated. Call it,                      or import it plainly",
+                    i + 1,
+                    owner.unwrap_or("<file scope>")
+                );
+                let owner = who[i].as_deref();
+                assert!(
+                    owner.is_some_and(|o| sanctioned.contains(&o)),
+                    "unsanctioned mention of `{needle}` at {name}:{} (in `{}`) — {why}",
+                    i + 1,
+                    owner.unwrap_or("<file scope>")
+                );
+            }
+        }
+        assert_eq!(
+            sites, expected,
+            "`{needle}` mention count changed — re-audit deliberately, do not just bump"
+        );
+    }
+
+    /// Is this line a `use` item that imports `needle` UNDER ITS OWN
+    /// NAME? Those are not sites; a RENAME is.
+    ///
+    /// RE-VERIFY FAIL-1's whole shape is the rename: `use … as
+    /// persist_bytes;` detaches the identifier from the call, so the call
+    /// no longer spells it. But a plain `use crate::scripts::write_script;`
+    /// detaches nothing — every call through it still says `write_script`,
+    /// and the audit still sees those. Re-exports (`pub use …;`) are plain
+    /// for the same reason: they carry the name forward, and whoever
+    /// eventually renames it is the line that gets flagged.
+    ///
+    /// So the rule is narrow and mechanical: inside a `use` item, an
+    /// occurrence followed by `as` is a rename and stays a site;
+    /// everything else in a `use` item is import bookkeeping.
+    pub(super) fn plain_import(line: &str, needle: &str) -> bool {
+        let t = line.trim_start();
+        let t = t.strip_prefix("pub").map_or(t, |r| {
+            // `pub(crate)`, `pub(super)`, `pub(in a::b)`
+            let r = r.trim_start();
+            r.strip_prefix('(').map_or(r, |i| i.find(')').map_or(r, |e| i[e + 1..].trim_start()))
+        });
+        if !t.starts_with("use ") {
+            return false;
+        }
+        // RE-VERIFY FAIL-14: the line must be NOTHING BUT the `use` item.
+        //
+        // This used to decide from the PREFIX alone, and `audit_inner` then
+        // skipped the line entirely - not counted, not owner-checked, not
+        // call-checked. Rust is happy to put a `use` item and further
+        // statements on one physical line inside a function body:
+        //
+        //     use crate::scripts::write_script; let _ = write_script(&p, t);
+        //
+        // in the live `Unbind` arm: 0 warnings, 966 green, mention count
+        // unchanged. The needle did not even matter, because the skip was
+        // decided by the prefix - so ANY audited identifier could ride
+        // along, including the one-line form that forges
+        // `editor_discard_grant` behind a `use std::mem as _x;`.
+        //
+        // A `use` item ends at its first `;`. Anything after that `;` is a
+        // statement, and a statement is exactly what these audits exist to
+        // look at.
+        let Some((item, rest)) = t.split_once(';') else {
+            // No terminator on this line: a multi-line `use` group. The
+            // continuation lines are not `use`-prefixed, so they are
+            // examined normally; this first line carries no statement.
+            return true;
+        };
+        if !rest.trim().is_empty() {
+            return false;
+        }
+        // `needle` immediately followed by `as` is a rename, not an import.
+        let mut from = 0usize;
+        while let Some(rel) = item[from..].find(needle) {
+            let at = from + rel;
+            let end = at + needle.len();
+            if item[end..].trim_start().starts_with("as ") {
+                return false;
+            }
+            from = end;
+        }
+        true
+    }
+
+    /// Is every whole-word occurrence of `needle` on this line
+    /// immediately (modulo spaces) followed by `(`?
+    ///
+    /// RE-VERIFY FAIL-8. A call SPENDS the capability here, where the audit
+    /// can see the owner; a binding MOVES it somewhere the audit cannot.
+    /// `let w = crate::scripts::write_script;` is the whole bypass, and it
+    /// differs from the legitimate line by exactly this character.
+    ///
+    /// An identifier that ENDS the line counts as not-a-call. That is
+    /// deliberate and slightly conservative: a call whose `(` sits on the
+    /// next line is not something rustfmt produces, while a binding
+    /// continued on the next line is easy to write. A false positive here
+    /// is a named line in a failing assertion, which is cheap; a false
+    /// negative is a leaked writer.
+    pub(super) fn is_call_mention(line: &str, needle: &str) -> bool {
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        let mut from = 0usize;
+        let mut saw = false;
+        while let Some(rel) = line[from..].find(needle) {
+            let at = from + rel;
+            let end = at + needle.len();
+            let before_ok = at == 0 || !line[..at].chars().next_back().is_some_and(is_ident);
+            let rest = &line[end..];
+            let after_ident = rest.chars().next().is_some_and(is_ident);
+            if before_ok && !after_ident {
+                saw = true;
+                if !rest.trim_start().starts_with('(') {
+                    return false;
+                }
+            }
+            from = end;
+        }
+        saw
+    }
+
+    /// Does `line` mention `needle` as a WHOLE Rust identifier?
+    ///
+    /// The boundary test is what stops `save_script` matching inside
+    /// `on_save_script` now that the trailing `(` is gone — see
+    /// [`audit_excluding`]. Rust identifier characters are alphanumerics
+    /// and `_`; everything else (`.`, `:`, `(`, `,`, a space, end of line)
+    /// is a boundary, which is precisely why every alias spelling the
+    /// re-verifier used still counts.
+    pub(super) fn mentions_word(line: &str, needle: &str) -> bool {
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        let bytes = line.as_bytes();
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find(needle) {
+            let at = from + rel;
+            let before_ok = at == 0 || !line[..at].chars().next_back().is_some_and(is_ident);
+            let end = at + needle.len();
+            let after_ok = end >= bytes.len() || !line[end..].chars().next().is_some_and(is_ident);
+            if before_ok && after_ok {
+                return true;
+            }
+            from = at + needle.len();
+        }
+        false
+    }
+
+    /// The audit's own non-vacuity rail: if `sources()` ever came back
+    /// short — a moved `src`, a wrong `CARGO_MANIFEST_DIR`, a read that
+    /// quietly failed — the three tests below would pass by scanning
+    /// nothing. `main.rs`'s neighbours are named explicitly because they
+    /// are precisely the files the hand-written list used to omit.
+    #[test]
+    fn the_audit_actually_reads_the_whole_crate() {
+        let files = sources();
+        assert!(
+            files.len() >= 60,
+            "expected the workspace's ~79 sources, got {} — the audit would be vacuous",
+            files.len()
+        );
+        for expected in [
+            "crates/dbc-ui/src/main.rs",
+            "crates/dbc-ui/src/plan.rs",
+            "crates/dbc-ui/src/scripts.rs",
+            "crates/dbc-ui/src/sql_input.rs",
+            "crates/dbc-ui/src/runner.rs",
+            // Final-review MAJOR-2: the walk reaches past dbc-ui — these
+            // two are the reason it had to. `dbc-state` holds four
+            // `write_atomic` callers that write into the user's folder and
+            // were audited by nothing; `dbc-mcp` reaches the same vault
+            // and config this app does.
+            "crates/dbc-state/src/workspace.rs",
+            "crates/dbc-mcp/src/main.rs",
+            // RE-VERIFY FAIL-4: and past `src`/`tests`. This one is a
+            // BENCH, invisible to the previous walk, which enumerated
+            // `<crate>/{src,tests,build.rs}` and therefore also missed
+            // `examples/`, generated trees, and anything a `#[path]`
+            // attribute pulls in from outside the crate directory.
+            "crates/dbc-buffer/benches/push_1m.rs",
+        ] {
+            assert!(files.iter().any(|(n, _)| n == expected), "{expected} not scanned");
+        }
+        // Every workspace member is represented — and the list is READ
+        // FROM THE MANIFEST, not written here, so a crate added tomorrow
+        // is covered tomorrow. The hard-coded version of this loop could
+        // not notice a new member, which is half of why FAIL-4 worked.
+        for member in workspace_members() {
+            assert!(
+                files.iter().any(|(n, _)| n.starts_with(&format!("{member}/"))),
+                "workspace member {member} not scanned"
+            );
+        }
+        assert!(
+            files.iter().any(|(_, s)| s.contains("fn editor_load_guarded")),
+            "the scanned text is not this crate's source"
+        );
+    }
+
+    /// FINAL-REVIEW MAJOR-2, structural gap 2 — the three ways the old
+    /// one-line `code_of` could be walked past, each pinned.
+    ///
+    /// Probe sources are ASSEMBLED at runtime, never written as literals:
+    /// this module's own file is one of the files `sources()` scans, so a
+    /// literal `write_atomic(` here would be counted as a real, unguarded
+    /// call site.
+    #[test]
+    fn comments_and_string_literals_cannot_hide_or_invent_a_call() {
+        let call = format!("{}_{}(x)", "write", "atomic");
+
+        // 1. A BLOCK comment used to hide nothing at all, because block
+        //    comments were not stripped — so this call was VISIBLE and
+        //    would have been reported. Now it is code_lines' job.
+        let hidden = format!("    /* {call} */");
+        assert_eq!(code_lines(&hidden)[0].trim(), "", "a block comment is not code");
+
+        // …including a NESTED one spanning lines, which Rust allows.
+        let multi = format!("a();\n/* one /* two */ still-comment\n{call}\n*/\nb();");
+        let out = code_lines(&multi);
+        assert_eq!(out.len(), 5, "one line in, one line out — line numbers must survive");
+        assert!(out[0].contains("a()"));
+        assert!(!out[2].contains(&call), "a nested block comment must still be a comment");
+        assert!(out[4].contains("b()"));
+
+        // 2. A `//` INSIDE A STRING used to truncate the line, so the real
+        //    code after it disappeared. That is a hiding place, not a
+        //    false positive: put the URL first and the call vanished.
+        let after = format!("    let u = \"http://x\"; self.{call};");
+        assert!(
+            code_lines(&after)[0].contains(&call),
+            "a `//` inside a string must not swallow the rest of the line"
+        );
+        // …and the string's own contents must not be readable AS code.
+        let inside = format!("    let s = \"{call}\";");
+        assert!(
+            !code_lines(&inside)[0].contains(&call),
+            "text inside a string literal is not a call site"
+        );
+        // Raw strings too — how every Windows path literal here is written.
+        let raw = format!("    let s = r\"{call}\"; done();");
+        assert!(!code_lines(&raw)[0].contains(&call));
+        assert!(code_lines(&raw)[0].contains("done()"));
+        let hashed = format!("    let s = r#\"{call} \"quoted\" \"#; done();");
+        assert!(!code_lines(&hashed)[0].contains(&call));
+        assert!(code_lines(&hashed)[0].contains("done()"));
+
+        // 3. RE-VERIFY FAIL-3: a BYTE raw string with an ODD number of
+        //    quotes in its payload. The old scanner rejected the `b` as a
+        //    raw prefix, fell into the ordinary-`"` branch, terminated on
+        //    the payload's first quote and then desynced into
+        //    "inside a string" — blanking every subsequent character,
+        //    across lines, for the rest of the FILE. That HID real calls
+        //    from every audit and silently lowered legitimate counts.
+        //    Live `br#"…"#` literals already exist in
+        //    `dbc-driver-postgres/src/types.rs`.
+        let odd = format!("    let _p: &[u8] = br#\"a\"b\"#; self.{call};");
+        let got = code_lines(&odd);
+        assert!(got[0].contains(&call), "a byte raw string must not swallow the line");
+        assert!(!got[0].contains("a\"b"), "its payload is not code either");
+        // The desync was the dangerous half: prove nothing leaks past the
+        // literal's own line.
+        let after = format!("let _p = br#\"a\"b\"#;
+self.{call};
+more();");
+        let got = code_lines(&after);
+        assert!(got[1].contains(&call), "the NEXT line must survive a byte raw string");
+        assert!(got[2].contains("more()"));
+        // The other prefixes, since the fix generalised over all of them.
+        for pre in ["b", "c", "br", "cr", "r", ""] {
+            let hashed = format!("    let _s = {pre}#\"x\"#; done();");
+            let hashed = if pre.contains('r') { hashed } else { format!("    let _s = {pre}\"x\"; done();") };
+            assert!(code_lines(&hashed)[0].contains("done()"), "prefix {pre:?} desynced");
+        }
+
+        // 4. Char literals must not be mistaken for string openers — `'/'`
+        //    and `'"'` are both real code in this crate — while LIFETIMES
+        //    must survive untouched.
+        let ch = format!("    rel.split('/').for_each(|_| {{}}); self.{call};");
+        assert!(code_lines(&ch)[0].contains(&call), "`'/'` must not open a string");
+        let quote_ch = format!("    let q = '\"'; self.{call};");
+        assert!(code_lines(&quote_ch)[0].contains(&call), "`'\"'` must not open a string");
+        assert!(code_lines("fn f<'a>(x: &'a str) -> &'a str { x }")[0].contains("'a"));
+    }
+
+    /// THE SOUND VERSION, and the end of a loop that ran four times.
+    ///
+    /// The property wanted is „no file outside the audited tree was
+    /// compiled". Four rounds tried to get it by BANNING THE SPELLINGS
+    /// that pull one in, and lost every time — first `#[path = "…"]`
+    /// inside the crate, then outside it, then no-space / split-line /
+    /// brace-delimited forms, and finally at the TOKEN level:
+    /// `#[r#path = "…"]` (a raw identifier resolving to the same built-in
+    /// attribute), a `macro_rules!` taking `$a:meta` and expanding to
+    /// `#[$a] mod evil;`, and `use std::include as inc; inc!{"…"}`
+    /// (`include!` is an ordinary `std` macro and can be renamed).
+    ///
+    /// Whitespace flattening made SPACING irrelevant and was described as
+    /// making „spelling irrelevant by construction". That was true of
+    /// whitespace and did not reach the conclusion it was used for. No
+    /// string predicate over Rust source closes this class, because the
+    /// attacker picks the tokens.
+    ///
+    /// So the question is no longer asked of the SOURCE at all. It is
+    /// asked of the COMPILER. Cargo writes a dep-info file next to every
+    /// binary listing every source it actually read — `#[path]` targets,
+    /// `include!` splices, `include_str!` data, whatever the spelling, and
+    /// whatever macro produced it. Comparing that set against the walked
+    /// set answers the real question exactly, and nothing an attacker
+    /// writes changes what rustc had to open.
+    ///
+    /// Fail-CLOSED throughout: an unreadable dep-info, an unparsable
+    /// entry, or a suspiciously short list all fail, because every one of
+    /// those would otherwise pass by checking nothing.
+    ///
+    /// One honest limit: the dep-info sits in a target dir SHARED between
+    /// worktrees of this repo, so in principle it could describe a build
+    /// of a sibling worktree. Its paths are workspace-relative, so it is
+    /// resolved against THIS root, and the crate's own `main.rs` is
+    /// asserted present — which is the best freshness check available from
+    /// inside the test and the reason not to build two worktrees at once.
+    #[test]
+    fn every_source_the_compiler_read_is_inside_the_audited_tree() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let dep = exe.with_extension("d");
+        let text = std::fs::read_to_string(&dep)
+            .unwrap_or_else(|e| panic!("dep-info {} unreadable: {e}", dep.display()));
+
+        let root = workspace_root();
+        let root_c = root.canonicalize().expect("workspace root canonicalizes");
+        let walked: std::collections::HashSet<PathBuf> = sources()
+            .into_iter()
+            .filter_map(|(rel, _)| root.join(&rel).canonicalize().ok())
+            .collect();
+
+        let (mut outside, mut unwalked, mut unresolved) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let mut seen = 0usize;
+        let mut saw_main = false;
+        for line in text.lines() {
+            // `<target>.d: <dep> <dep> …`; the per-dep empty rules that
+            // follow have no `: ` and are skipped.
+            let Some((_, deps)) = line.split_once(".d: ") else { continue };
+            for raw in deps.split(' ').filter(|t| !t.is_empty()) {
+                let p = PathBuf::from(raw.replace('\\', "/"));
+                let abs = if p.is_absolute() { p } else { root.join(p) };
+                let Ok(abs) = abs.canonicalize() else {
+                    unresolved.push(raw.to_string());
+                    continue;
+                };
+                seen += 1;
+                if !abs.starts_with(&root_c) {
+                    outside.push(abs.display().to_string());
+                    continue;
+                }
+                if abs.ends_with("main.rs") {
+                    saw_main = true;
+                }
+                if abs.extension().and_then(|e| e.to_str()) == Some("rs")
+                    && !walked.contains(&abs)
+                {
+                    unwalked.push(abs.display().to_string());
+                }
+            }
+        }
+
+        assert!(seen >= 30, "dep-info listed only {seen} sources — this check would be vacuous");
+        assert!(saw_main, "dep-info does not mention this crate's main.rs — wrong or stale file");
+        assert!(unresolved.is_empty(), "dep-info entries could not be resolved: {unresolved:?}");
+        assert!(
+            outside.is_empty(),
+            "the compiler read source from OUTSIDE the workspace, so no audit in this module              saw it: {outside:?}"
+        );
+        assert!(
+            unwalked.is_empty(),
+            "the compiler read Rust source the audit walk does not visit — it is inside the              tree but pruned, so every audit is blind to it: {unwalked:?}"
+        );
+    }
+
+    /// A file's CODE with every whitespace character removed, plus, for
+    /// each retained character, the index of the line it came from.
+    ///
+    /// RE-VERIFY FAIL-7's lesson in one function: any check that reads a
+    /// line at a time, or that assumes a particular spacing, is a check
+    /// about FORMATTING. Flattening first makes `#[path = "x"]`,
+    /// `#[path="x"]` and an attribute split across three lines the same
+    /// string, so there is nothing left for a formatter to vary.
+    pub(super) fn flatten_code(src: &str) -> (String, Vec<usize>) {
+        let mut flat = String::new();
+        let mut where_from: Vec<usize> = Vec::new();
+        for (i, line) in code_lines(src).iter().enumerate() {
+            for ch in line.chars().filter(|c| !c.is_whitespace()) {
+                flat.push(ch);
+                where_from.push(i);
+            }
+        }
+        (flat, where_from)
+    }
+
+
+    /// RE-VERIFY FAIL-6 / FAIL-7 / FAIL-8 / FAIL-9, the four predicates
+    /// the last round walked past, each pinned at the shape that beat it.
+    #[test]
+    fn the_scanner_predicates_survive_the_spellings_that_beat_them() {
+        // FAIL-6: pruning by NAME SHAPE. `starts_with("target")` hid a
+        // plain `mod targets;` from every audit — a name someone could
+        // add innocently, which is what made it the worst of the three.
+        let td = tempfile::tempdir().unwrap();
+        for plausible in ["targets", "target_picker", "targeting", "targetsomething"] {
+            let d = td.path().join(plausible);
+            std::fs::create_dir(&d).unwrap();
+            assert!(!is_pruned(&d), "{plausible} must be scanned");
+        }
+        // Build output is recognised by cargo's OWN marker, not by a name
+        // we guessed — so it is pruned whatever it is called…
+        let odd = td.path().join("not-called-target");
+        std::fs::create_dir(&odd).unwrap();
+        std::fs::write(odd.join("CACHEDIR.TAG"), b"Signature: 8a477f597d28d172").unwrap();
+        assert!(is_pruned(&odd));
+        // …but RE-VERIFY FAIL-13: the marker must never hide SOURCE. This
+        // assertion used to be the opposite one, and pinned the hole as
+        // desired behaviour: the tag is unsigned and trivially created, so
+        // dropping one beside a `mod.rs` deleted that directory from every
+        // audit. A cargo target dir holds artefacts, never crate sources.
+        let sneaky = td.path().join("helpers");
+        std::fs::create_dir(&sneaky).unwrap();
+        std::fs::write(sneaky.join("CACHEDIR.TAG"), b"Signature: 8a477f597d28d172").unwrap();
+        std::fs::write(sneaky.join("mod.rs"), b"// real code").unwrap();
+        assert!(!is_pruned(&sneaky), "a marker must not hide Rust source");
+        // …and metadata by exact name.
+        for meta in [".git", ".claude", "node_modules"] {
+            let d = td.path().join(meta);
+            std::fs::create_dir(&d).unwrap();
+            assert!(is_pruned(&d));
+        }
+
+        // FAIL-7: the escape-hatch ban was a spelling test. Flattening the
+        // code removes every formatting degree of freedom the three
+        // bypasses used.
+        let attr = "#[path=\"x.rs\"]".to_string();
+        let (flat, _) = flatten_code(&(attr + " mod evil;"));
+        assert!(flat.contains("#[path="), "no-space spelling");
+        let split = "#[".to_string() + &chr_nl() + "    path = \"x.rs\"" + &chr_nl() + "]";
+        let (flat, _) = flatten_code(&split);
+        assert!(flat.contains("#[path="), "attribute split across lines");
+        let braced = "include!{\"x.rs\"}".to_string();
+        let (flat, _) = flatten_code(&braced);
+        assert!(flat.contains("include!{"), "brace delimiter");
+        let spaced = "include! (\"x.rs\")".to_string();
+        let (flat, _) = flatten_code(&spaced);
+        assert!(flat.contains("include!("), "space before the delimiter");
+        // …and the DATA macros stay legal, which this crate depends on.
+        let (flat, _) = flatten_code("include_str!(\"main.rs\")");
+        assert!(!flat.contains("include!("), "include_str! is not token splicing");
+
+        // FAIL-8: a mention must SPEND the capability, not move it.
+        let w = format!("{}_{}", "write", "script");
+        assert!(is_call_mention(&format!("let _ = crate::scripts::{w}(&p, &t);"), &w));
+        assert!(is_call_mention(&format!("    {w} (&p, &t)"), &w), "a space before `(` is a call");
+        assert!(!is_call_mention(&format!("let f = crate::scripts::{w};"), &w), "fn-item binding");
+        assert!(!is_call_mention(&format!("takes_fn(crate::scripts::{w}, x)"), &w), "as an argument");
+        assert!(!is_call_mention(&format!("let f = crate::scripts::{w}"), &w), "end of line");
+        // A near-miss name is not a mention at all, so it is vacuously
+        // fine — the exact-name rule still does that job.
+        assert!(!is_call_mention(&format!("self.on_{w}(cx);"), &w));
+
+        // FAIL-9: logical lines. A CRLF checkout must produce byte-identical
+        // lines to an LF one, or every exact-match assertion is a coin flip
+        // depending on how the file arrived on disk.
+        let lf = "fn f() {".to_string() + &chr_nl() + "    a();" + &chr_nl() + "}";
+        let crlf = lf.replace(&chr_nl(), &(chr_cr() + &chr_nl()));
+        assert_eq!(code_lines(&lf), code_lines(&crlf), "CRLF must not change a logical line");
+        assert_eq!(code_lines(&crlf)[1], "    a();");
+    }
+
+    fn chr_nl() -> String {
+        String::from_utf8(vec![10]).unwrap()
+    }
+    fn chr_cr() -> String {
+        String::from_utf8(vec![13]).unwrap()
+    }
+
+    /// RE-VERIFY FAIL-1: the matcher looks for the NAME, not for a call,
+    /// and a whole-word one — so every way of detaching an identifier from
+    /// its call site is a site, while the near-miss names the exact-match
+    /// rule exists to protect stay out.
+    #[test]
+    fn an_alias_or_a_fn_pointer_cannot_detach_a_name_from_its_audit() {
+        let guarded = format!("{}_{}", "write", "script");
+
+        // The two shapes the re-verifier used. Neither is a call of the
+        // guarded name; both NAME it, which is the point.
+        let aliased = format!("    use crate::scripts::{guarded} as persist_bytes;");
+        assert!(mentions_word(&aliased, &guarded));
+        assert!(!plain_import(&aliased, &guarded), "a RENAME is a site, not bookkeeping");
+        let ptr = format!("    let clobber = crate::sql_input::SqlInput::{guarded};");
+        assert!(mentions_word(&ptr, &guarded), "a fn-pointer binding names it too");
+
+        // A plain import (and a re-export) carries the name forward, so
+        // every call through it still spells it — bookkeeping, not a site.
+        let plain = format!("    use crate::scripts::{guarded};");
+        assert!(plain_import(&plain, &guarded));
+        let grouped = format!("use dbc_state::fsutil::{{join_component, {guarded}}};");
+        assert!(plain_import(&grouped, &guarded));
+        let reexport = format!("    pub(crate) use crate::scripts::{guarded};");
+        assert!(plain_import(&reexport, &guarded));
+        // …but a rename hidden inside a group is still a rename.
+        let sneaky = format!("use crate::scripts::{{a, {guarded} as p}};");
+        assert!(!plain_import(&sneaky, &guarded));
+
+        // Whole-word, or `on_save_script` would match `save_script` and
+        // the leading dot that FINAL-REVIEW MAJOR-2 removed would have to
+        // come back. Same exact-name rule as T8 re-verify MAJOR-3/G2.
+        let save = format!("{}_{}", "save", "script");
+        assert!(!mentions_word(&format!("self.on_{save}(cx);"), &save));
+        assert!(!mentions_word(&format!("self.{save}_as(cx);"), &save));
+        assert!(mentions_word(&format!("self.{save}(p, t, false, a, cx);"), &save));
+        assert!(mentions_word(&format!("AppView::{save}(self, p, t, false, a, cx)"), &save));
+    }
+
+    /// FINAL-REVIEW MAJOR-2, structural gap 3: attribution is now BRACE
+    /// BALANCED. The old owner detector was „the nearest `fn` above",
+    /// full stop, so anything at file scope after a sanctioned function
+    /// closed inherited that function's sanction.
+    #[test]
+    fn a_call_after_a_function_closes_is_not_attributed_to_it() {
+        let guarded = format!("{}_{}", "bind", "script");
+        let src = format!(
+            "fn {guarded}() {{\n    inner();\n}}\n\nstatic X: u8 = danger();\n\nfn other() {{\n    more();\n}}\n"
+        );
+        let code = code_lines(&src);
+        let who = owners(&code);
+        assert_eq!(who[1].as_deref(), Some(guarded.as_str()), "the body belongs to its fn");
+        assert_eq!(who[2].as_deref(), Some(guarded.as_str()), "so does its closing brace");
+        assert_eq!(who[4], None, "FILE SCOPE — the old detector said `{guarded}` here");
+        assert_eq!(who[7].as_deref(), Some("other"));
+
+        // A closure inside a body does not steal ownership: the innermost
+        // still-open `fn` is the answer these audits want.
+        let nested = "fn outer() {\n    spawn(move || {\n        danger();\n    });\n}\n";
+        let who = owners(&code_lines(nested));
+        assert_eq!(who[2].as_deref(), Some("outer"));
+    }
+
+    /// The parser everything above rests on. Probe lines are ASSEMBLED at
+    /// runtime, never written as literals: this module's own source is one
+    /// of the files `sources()` scans, so a literal `bind_script(` here
+    /// would be counted as a real, unguarded call site — verified, it fails
+    /// exactly that way. (Which is itself a nice proof the scan is live.)
+    #[test]
+    fn the_owner_parser_handles_every_fn_spelling_in_use() {
+        let guarded = "bind_script";
+        let vis = format!("    pub(crate) fn {guarded}(&mut self) {{");
+        assert_eq!(defined_fn_name(&vis).as_deref(), Some(guarded));
+        let asy = format!("async fn open_{}(rel: String) {{", "script");
+        assert_eq!(defined_fn_name(&asy).as_deref(), Some("open_script"));
+        // Qualifiers in combination, and a restricted-path visibility —
+        // the four spellings the old detector attributed to the PREVIOUS
+        // function instead.
+        assert_eq!(defined_fn_name("    pub(in crate::a) const unsafe fn x() {}").as_deref(), Some("x"));
+        assert_eq!(defined_fn_name("    pub async unsafe fn y() {}").as_deref(), Some("y"));
+        assert_eq!(defined_fn_name("    unsafe extern \"C\" fn z() {}").as_deref(), Some("z"));
+        // Not definitions.
+        assert_eq!(defined_fn_name("    /// fn not_a_definition(&self)"), None);
+        let call = format!("        self.{guarded}(p, t, cx);");
+        assert_eq!(defined_fn_name(&call), None);
+        assert_eq!(defined_fn_name("        cx.spawn(async move |this, cx| {"), None);
+        // A near-miss name must NOT be read as the sanctioned one — the
+        // exact-match half of G2.
+        let near = format!("    fn {guarded}_and_focus(&mut self) {{");
+        assert_ne!(defined_fn_name(&near).as_deref(), Some(guarded));
+        assert_eq!(defined_fn_name(&near).as_deref(), Some("bind_script_and_focus"));
+    }
+
+    /// Shape-independent: whatever expression reaches the editor entity,
+    /// the replacement itself must name `replace_buffer`.
+    #[test]
+    fn only_the_guarded_sites_may_replace_the_sql_editors_buffer() {
+        audit(
+            "replace_buffer",
+            &["bind_script", "perform_script_action"],
+            2,
+            "route it through `AppView::editor_load_guarded` (Part S §5.5) or a bound \
+             script's unsaved changes are destroyed silently, with no undo",
+        );
+    }
+
+    /// RE-VERIFY: the editor permit is a real rail only while the DISCARD
+    /// GRANT is honest, so the grant's writers are audited by name.
+    ///
+    /// `with_editor_replaceable` refuses a dirty editor unless the user
+    /// has just answered „Zahodit". That answer cannot be re-derived from
+    /// live state, so it is recorded in `AppView::editor_discard_grant` —
+    /// and anything that could SET that field is a way to fake the user's
+    /// answer and clobber unsaved text. There are exactly three legal
+    /// mentions: where the user answers, where it is spent, and the field
+    /// declaration itself; plus the struct literal that initialises it.
+    ///
+    /// This is a name audit, with all the limits the as-built note spells
+    /// out — but the thing it guards is a single `Option<u64>` written in
+    /// one place, which is about the smallest surface a name audit can be
+    /// asked to cover.
+    #[test]
+    fn the_discard_grant_is_written_only_where_the_user_answered() {
+        audit_field(
+            "editor_discard_grant",
+            &[
+                // The user's answer, recorded.
+                "on_discard_confirm_yes",
+                // …and spent, once.
+                "with_editor_replaceable",
+                // `AppView`'s one construction site, which must name every
+                // field. `None` is the only value it may start at, and a
+                // grant minted before the window exists would be spent by
+                // the first load — so this one is sanctioned by NAME and
+                // pinned by the count, not waved through by shape.
+                "main",
+            ],
+            4,
+            "setting this fakes the user's answer to the discard prompt, which is the one              thing standing between a background load and a bound script's unsaved changes",
+        );
+    }
+
+    /// …and the performer must not be reachable around the guard. The two
+    /// legal callers are the guard's own clean-editor fall-through and
+    /// „Zahodit" (`on_discard_confirm_yes`), which is the user answering
+    /// the guard's question.
+    #[test]
+    fn the_parked_action_is_only_performed_by_the_guard_or_its_confirm() {
+        audit(
+            "perform_script_action",
+            &["editor_load_guarded", "on_discard_confirm_yes"],
+            2,
+            "the guard exists to stand in front of this — call \
+             `AppView::editor_load_guarded` instead",
+        );
+    }
+
+    /// `bind_script` replaces the buffer too, so it is guard-territory
+    /// even though it takes text rather than a rel: only `open_script`
+    /// (itself reachable only through `perform_script_action`) may call it.
+    #[test]
+    fn the_binder_is_only_reached_from_the_guarded_open_path() {
+        audit(
+            "bind_script",
+            &["open_script"],
+            1,
+            "binding replaces the editor's buffer — go through \
+             `AppView::editor_load_guarded(PendingScriptAction::Open { .. })`",
+        );
+    }
+}
+
+/// T9 REVIEW MAJOR-2: the same audit shape, aimed at the FILESYSTEM.
+///
+/// `running_a_library_script_never_auto_saves_first` bans four identifiers
+/// inside `run_script_from_library`'s own body — and the review defeated
+/// it with a real `cargo test` by putting a `crate::scripts` write call at
+/// the top of `open_script_run_modal` instead: the library's run
+/// truncating its target immediately before running it, using a banned
+/// identifier verbatim, green. No alias or macro was needed, because
+/// `open_script_run_modal` is BY DESIGN the shared continuation both run
+/// paths funnel through — and that audit's own non-vacuity assertion
+/// certifies an unaudited region is on the path.
+///
+/// The fix is the mechanism that has now survived attack twice rather than
+/// a longer ban list: audit the WRITER workspace-wide, by identifier, with
+/// an exact-name owner check — `editor_clobber_audit`'s scanner, reused
+/// wholesale (it walks every `.rs` under the workspace root, so a new
+/// file is covered the moment it exists). A ban list only ever covers the
+/// regions someone remembered to list; this covers the tree.
+///
+/// **RE-VERIFY FAIL-1: what this actually promises, stated honestly.**
+/// The sentence here used to read „NO BYTE reaches THE SCRIPTS LIBRARY
+/// from this crate except through `AppView::save_script` … or
+/// `scripts::create_script`", and that was FALSE as written. These are
+/// TEXT audits. They had no type behind them, and the re-verifier walked
+/// past them with an alias:
+///
+/// ```ignore
+/// use crate::scripts::write_script as persist_bytes;
+/// let _ = persist_bytes(&doomed, "-- truncated by the run");
+/// ```
+///
+/// Zero warnings, 961 green, a truncating write into the library.
+///
+/// **What these audits check — the whole of it, with no verb stronger
+/// than „check".** Every MENTION of the audited identifiers, in the
+/// source files the walk visits, sits inside a sanctioned function; the
+/// mention is a call rather than a binding; and the count is pinned. That
+/// is a property of SOURCE TEXT. It is not a property of the program.
+///
+/// **It is NOT a guarantee that nothing else writes into the library.**
+/// The demonstration is one line and needs no trick at all:
+///
+/// ```ignore
+/// std::fs::write(root.join("trzby.sql"), "-- truncated");
+/// ```
+///
+/// That truncates a library file, mentions no audited identifier, and
+/// passes every test here. So does a closure wrapper minted at a
+/// sanctioned site and called from somewhere else (see §T/§W of the
+/// as-built note). Neither is closed, and this comment previously implied
+/// both were — three rounds running, an over-claim here is what let the
+/// next round through, so the claim is now bounded to what runs.
+///
+/// The compiler-enforced rails, named precisely so nobody mistakes their
+/// scope, are THREE: the Ctrl+S permission
+/// (`save_guard::with_save_permission` in front of `AppView::save_script`),
+/// the editor buffer (`editor_guard::with_editor_replaceable` in front of
+/// `SqlInput::replace_buffer`) and the config write
+/// (`dbc_state::ConfigSaveGuard`, mintable only by a real parse of the
+/// very file about to be overwritten). `write_script`, `write_atomic` and
+/// `bind_script` have NO type rail — the as-built note gives the reason,
+/// which for the two writers is that their call happens inside a
+/// `'static` background future where a branded permit cannot go. They are
+/// held up by these text audits alone, and the paragraph above says what
+/// that is worth.
+///
+/// The one thing outside the walk is now checked soundly rather than
+/// banned by spelling: `every_source_the_compiler_read_is_inside_the_audited_tree`
+/// reads cargo's dep-info, so „the audit did not see this file" is
+/// answered by the compiler.
+///
+/// The library's RUN is a separate, narrower claim and it still holds:
+/// `run_script_from_library`'s own body bans the four write identifiers,
+/// and the counts here pin their call sites. That is „no audited writer
+/// is on the run path", not „the run cannot write".
+///
+/// **T9 re-verify NIT-A: "the scripts library", NOT "a user-chosen
+/// folder".** The older, wider sentence was false and it is worth knowing
+/// exactly how, so nobody re-widens it. Two other writers in this crate do
+/// reach folders the user chose:
+///
+/// * `grid.rs`'s CSV/JSON export (`File::create` + rename)
+/// * `er_diagram_view.rs`'s SVG export (`fs::write`)
+///
+/// Neither can silently reach the library: both are user-directed through
+/// `prompt_for_new_path` opened with an EMPTY start directory, so the user
+/// types the destination every time and no automatic path leads there. The
+/// invariant this audit actually protects — nothing writes into the
+/// scripts library behind the user's back — holds; the sentence claiming
+/// coverage of every user folder did not.
+///
+/// **Recorded, not fixed (pre-existing, out of this phase's scope):**
+/// `grid.rs`'s exporter independently derives `<path>.tmp`, byte-identical
+/// to `fsutil::tmp_path_for`. That is a second writer over the same tmp
+/// convention whose single-writer contract `write_atomic`'s doc states as
+/// if it covered every writer over a user folder. It is only reachable by
+/// exporting a grid onto the exact path of an in-flight script save, which
+/// takes deliberate effort, and the blanket `*.tmp` in the shipped
+/// `.gitignore` covers it either way. See the as-built §C table.
+///
+/// The test call sites are sanctioned BY NAME rather than skipped: the
+/// exact-count assertion is what makes a new one a deliberate decision,
+/// and a `#[cfg(test)]`-region filter would be one more thing to defeat.
+#[cfg(test)]
+mod script_write_audit {
+    use super::editor_clobber_audit::{audit, audit_excluding};
+
+    /// The ONE funnel from this crate into
+    /// `dbc_state::fsutil::write_atomic`, whose tmp path is a pure
+    /// function of the target (T8's single-writer contract). A second
+    /// caller would be a second writer over a path this crate believes
+    /// only one function can touch.
+    ///
+    /// FINAL-REVIEW MAJOR-2, structural gap 1: this used to scan
+    /// `dbc-ui/src` alone and could therefore assert „exactly one caller"
+    /// while `dbc-state` held FOUR more — `write_pointer`, `copy_one`,
+    /// `init_contents` and `write_marker`, every one of them writing real
+    /// bytes into the user's chosen folder, audited by nothing. The count
+    /// is honest now, and the sanction list is the inventory: a NEW
+    /// atomic write anywhere in the workspace fails here.
+    ///
+    /// The five `dbc-state` production owners are legitimate and named
+    /// individually rather than waved through by crate: each writes ONE
+    /// well-known file (the pointer, one copied store file, the
+    /// `.gitignore`, the marker) and none of them can be aimed at a
+    /// script, which is the single-writer contract this test protects.
+    #[test]
+    fn the_shared_atomic_writer_has_exactly_one_funnel() {
+        audit(
+            "write_atomic",
+            &[
+                // dbc-ui: THE funnel, and the only one.
+                "write_script",
+                // dbc-state: the workspace lane's own writers (§W3.2).
+                "write_pointer",
+                "copy_one",
+                "init_contents",
+                "write_marker",
+                // dbc-state: the rail's own tests.
+                "write_atomic_refuses_a_missing_parent_while_the_store_savers_create_one",
+                "write_atomic_leaves_no_tmp_file_and_writes_bytes",
+                "write_atomic_overwrites_in_place",
+                "write_atomic_failure_leaves_no_tmp_behind",
+            ],
+            10,
+            "`crate::scripts::write_script` is the ONE funnel from dbc-ui into the shared \
+             atomic writer, and dbc-state's own callers each own exactly one well-known \
+             file - a new caller forks T8's single-writer-per-path contract",
+        );
+    }
+
+    /// ...and that funnel itself has exactly two production callers.
+    #[test]
+    fn nothing_but_the_guarded_save_and_create_may_write_a_script() {
+        audit(
+            "write_script",
+            &[
+                // Production: the guarded, serialized Ctrl+S / save-as.
+                "save_script",
+                // Production: creation, which probes `conflicting_name`
+                // first because the writer REPLACES by design.
+                "create_script",
+                // Tests of the writer itself (scripts.rs).
+                "write_and_read_script_roundtrip_and_caps",
+                "write_script_replaces_an_existing_target",
+            ],
+            5,
+            "writing into the user's scripts folder is `AppView::save_script`'s job (guarded              by `script_save_allowed` + `script_save_in_flight`) or `scripts::create_script`'s              - the library's run serves DISK content and must never write, from any function              on its path",
+        );
+    }
+
+    /// T9 RE-VERIFY FAIL-1, the missing link in the chain. The audit above
+    /// sanctions the OWNER `save_script` unconditionally, so the chain
+    /// stopped there: `save_script`'s own callers were audited by nothing,
+    /// and the re-verify added a plausible future handler calling
+    /// `self.save_script(..)` directly — straight past `script_save_allowed`
+    /// — and got the whole suite green, all three audits included. The only
+    /// signal was a dead-code warning, which disappears the moment the
+    /// handler is wired to a listener.
+    ///
+    /// Two legal callers, and only two: `on_save_script` (the ONE entry
+    /// point for Ctrl+S, the caption strip's „Uložit" and the palette
+    /// action — all three verified to route through it) and
+    /// `save_script_as`, which re-asks the predicate itself because its
+    /// check sits after an await.
+    ///
+    /// **FINAL-REVIEW MAJOR-2: the needle no longer carries a receiver.**
+    /// It used to be `.save_script`, WITH THE DOT, and the paragraph that
+    /// stood here argued for the dot at length: `audit` matches
+    /// `needle + "("` as a plain substring, a bare `save_script` also
+    /// matches `on_save_script(`, and the dot excluded that for free while
+    /// keeping the definition line out of the count.
+    ///
+    /// The argument was sound and the conclusion was wrong, because the
+    /// dot is a claim about CALL SYNTAX. UFCS spells a colon:
+    /// `AppView::save_script(self, path, text, false, cx)` contains
+    /// `::save_script(`, not `.save_script(`. The reviewer put exactly
+    /// that on a live production path — inside `perform_script_action`'s
+    /// `Unbind` arm — and got zero warnings and 11/11 audits green.
+    ///
+    /// So the false positive is now NAMED instead of dodged
+    /// (`audit_excluding`), and the needle matches any receiver, any path
+    /// qualification, and no receiver at all. The definitive rail is no
+    /// longer here in any case — `save_script` demands a
+    /// `save_guard::SaveAllowed` witness the crate root cannot construct
+    /// — but this stays as the belt to those braces, and it is what would
+    /// catch a future caller that mints the witness legitimately and still
+    /// writes from somewhere it should not.
+    #[test]
+    fn the_writer_itself_is_reachable_only_through_the_guarded_entry_points() {
+        audit_excluding(
+            "save_script",
+            // The ENTRY POINT is not the writer. Named, not punctuated
+            // around.
+            &["on_save_script"],
+            &["on_save_script", "save_script_as"],
+            2,
+            "`AppView::save_script` is the WRITER - reaching it around `on_save_script` \
+             skips `script_save_allowed` entirely, and MAJOR-1's scenario (a Ctrl+S racing \
+             a confirmed delete, recreating the file the user just irreversibly removed) \
+             is back. A new save path asks the predicate first, then calls this",
+        );
+    }
+
+    /// MAJOR-1's guard, pinned structurally as well as behaviourally: the
+    /// predicate exists, and it is asked at every point where a save can
+    /// still be stopped. A future "quick" save path that skips it fails
+    /// here rather than silently racing a delete.
+    ///
+    /// T9 re-verify FAIL-1 made this TWO production sites, not one.
+    /// `on_save_script` asks it synchronously, before anything is
+    /// dispatched; `save_script_as` asks it AGAIN in its post-await
+    /// continuation, because the file picker is not app-modal on every
+    /// platform and the entry-point check is, by then, a statement about
+    /// the past. (The test name used to say „exactly once" and was the
+    /// clearest statement of the bug.)
+    ///
+    /// FINAL-REVIEW MAJOR-2 split the predicate in two.
+    /// `script_save_allowed` is the pure RULE, still unit-pinned, and it
+    /// now has exactly one production caller: `save_guard::with_save_permission`,
+    /// which is the only MINT of the `SaveAllowed` witness and which reads
+    /// the three facts off the live `AppView` instead of accepting three
+    /// booleans a caller could choose. `with_save_permission` is audited
+    /// separately below, at the two entry points.
+    #[test]
+    fn the_ctrl_s_dialog_guard_is_asked_at_every_stoppable_point() {
+        audit(
+            "script_save_allowed",
+            // The predicate's own unit test is a real call site; naming it
+            // here is what makes the exact count meaningful.
+            &["with_save_permission", "ctrl_s_is_refused_whenever_any_dialog_owns_the_screen"],
+            6,
+            "the pure Ctrl+S rule belongs to `save_guard::with_save_permission`, which reads the \
+             live view - a caller that asks it with its own three booleans has bought \
+             nothing, because it can pass whichever three suit it",
+        );
+    }
+
+    /// …and the MINT is asked at every point where a save can still be
+    /// stopped (final-review MAJOR-2). This is the test that used to be
+    /// the one above: two production sites, and only two.
+    ///
+    /// `on_save_script` asks synchronously, before anything is dispatched;
+    /// `save_script_as` asks AGAIN in its post-await continuation, because
+    /// the file picker is not app-modal on every platform and the
+    /// entry-point answer is, by then, a statement about the past. The
+    /// witness being neither `Copy` nor `Clone` is what makes carrying the
+    /// first answer across the picker impossible rather than merely
+    /// discouraged.
+    #[test]
+    fn the_save_permission_is_opened_at_every_stoppable_point_and_nowhere_else() {
+        audit(
+            "with_save_permission",
+            &["on_save_script", "save_script_as"],
+            2,
+            "every Ctrl+S entry point must mint the witness HERE - `.occlude()` blocks \
+             clicks, not keys - and a path that awaits between the mint and the write must \
+             mint a fresh one",
+        );
     }
 }

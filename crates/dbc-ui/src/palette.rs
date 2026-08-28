@@ -124,6 +124,15 @@ pub enum PaletteAction {
     /// G12 T3: same flow, folder mode — non-recursive `*.sql` listing
     /// (`AppView::start_script_pick(true, ..)`).
     RunSqlFolder,
+    /// Part S §8 (workspace T8): the palette gains exactly ONE scripts
+    /// item — per-script palette rows would require the palette to hold
+    /// the scan, which is a follow-up candidate, not this phase. Dispatches
+    /// `AppView::on_save_script`, i.e. the SAME entry point as Ctrl+S and
+    /// the caption strip's „Uložit": bound => save, unbound => save-as.
+    /// Unconditional, like „Spustit SQL soubor…" — a palette has no
+    /// disabled-row idiom, and the unbound case is a real action, not a
+    /// no-op.
+    SaveScript,
     /// G10 T4: opens (or re-focuses) the "Správa serveru" admin tab
     /// (`AppView::open_admin_tab`) — only ever offered when
     /// `admin_panel::admin_entry_state` is `Enabled` (see `fixed_actions`;
@@ -216,6 +225,10 @@ pub fn fixed_actions(
         ("Porovnat databáze…".to_string(), PaletteAction::OpenCompare),
         ("Spustit SQL soubor…".to_string(), PaletteAction::RunSqlFile),
         ("Spustit SQL složku…".to_string(), PaletteAction::RunSqlFolder),
+        // Part S §8: kept among the LEADING unconditional rows, never
+        // appended — `backup_restore_actions_present_and_last_when_
+        // connection_active` pins the last two rows.
+        ("Uložit skript".to_string(), PaletteAction::SaveScript),
         // G14 T10: unconditional — always listed, kept ahead of the
         // conditional monitor/backup/restore rows below so
         // `backup_restore_actions_present_and_last_when_connection_active`'s
@@ -505,10 +518,11 @@ mod rank_items_tests {
         assert!(matches!(items[5], PaletteItem::Action { .. }));
         // 5 base actions + G8 T6's "ER diagram" (`ShowErDiagram`) + G7's
         // "Porovnat databáze…" (`OpenCompare`) + G12 T3's "Spustit SQL
-        // soubor…"/"Spustit SQL složku…" + G14 T10's "Přepnout motiv"
+        // soubor…"/"Spustit SQL složku…" + workspace T8's "Uložit skript"
+        // (`SaveScript`) + G14 T10's "Přepnout motiv"
         // (`ToggleTheme`) — all unconditional, unlike `OpenMonitor` which is
         // engine-gated (monitor_available=false here).
-        assert_eq!(items.len(), 2 + 2 + 1 + 10);
+        assert_eq!(items.len(), 2 + 2 + 1 + 11);
     }
 
     #[test]
@@ -630,6 +644,33 @@ mod rank_items_tests {
         assert!(items
             .iter()
             .any(|i| matches!(i, PaletteItem::Action { action: PaletteAction::RestoreDatabase, .. })));
+    }
+
+    /// Part S §8 (workspace T8): „Uložit skript" is unconditional — it is
+    /// a real action in BOTH binding states (save, or save-as) — and it
+    /// sits among the LEADING rows, never at the end, so
+    /// `backup_restore_actions_present_and_last_when_connection_active`'s
+    /// "last two rows" assumption keeps holding.
+    #[test]
+    fn save_script_is_unconditional_and_never_one_of_the_last_two_rows() {
+        for connection_active in [false, true] {
+            let actions =
+                fixed_actions(false, AdminEntry::Hidden, connection_active, false, false, false);
+            let idx = actions
+                .iter()
+                .position(|(_, a)| *a == PaletteAction::SaveScript)
+                .expect("the save-script row must always be listed");
+            assert_eq!(actions[idx].0, "Uložit skript");
+            // Wedged INSIDE the leading unconditional block — directly
+            // after „Spustit SQL složku…" (per the plan) and still ahead of
+            // „Přepnout motiv", which is the block's own last row.
+            assert_eq!(actions[idx - 1].1, PaletteAction::RunSqlFolder);
+            assert_eq!(actions[idx + 1].1, PaletteAction::ToggleTheme);
+        }
+        // …so the conditional trailing rows keep their pinned positions.
+        let with_conn = fixed_actions(false, AdminEntry::Hidden, true, false, false, false);
+        assert_eq!(with_conn.last().unwrap().1, PaletteAction::RestoreDatabase);
+        assert_eq!(with_conn[with_conn.len() - 2].1, PaletteAction::BackupDatabase);
     }
 
     // --- G14 T10: theme toggle is an unconditional fixed action ---
