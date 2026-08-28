@@ -71,10 +71,7 @@ fn encode_key(connection_id: &str, name: &str) -> String {
 
 /// `dbc/params.toml` alongside `dbc/views.toml`.
 pub fn default_param_values_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("dbc")
-        .join("params.toml")
+    crate::workspace::profile_dir().join("params.toml")
 }
 
 #[cfg(test)]

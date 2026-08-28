@@ -83,10 +83,7 @@ fn encode_key(connection_id: &str, schema: Option<&str>, table: &str) -> String 
 }
 
 pub fn default_view_prefs_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("dbc")
-        .join("views.toml")
+    crate::workspace::profile_dir().join("views.toml")
 }
 
 #[cfg(test)]

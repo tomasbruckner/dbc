@@ -282,10 +282,7 @@ fn like_escape(q: &str) -> String {
 }
 
 pub fn default_history_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("dbc")
-        .join("history.sqlite")
+    crate::workspace::profile_dir().join("history.sqlite")
 }
 
 #[cfg(test)]

@@ -252,10 +252,18 @@ USAGE:
     dbc-mcp setup [--vault <path>]                       Store the vault's derived key in the OS credential store
     dbc-mcp setup --remove                               Remove the stored key (revocation)
     dbc-mcp --help | -h                                  Show this message
-
-    Cesty se ve výchozím stavu řídí pracovním prostorem nastaveným v aplikaci dbc
-    (ukazatel %APPDATA%\\dbc\\workspace.toml). --config/--vault mají vždy přednost.
-
+"
+    );
+    // The pointer path is COMPUTED, not spelled. `DBC_DATA_DIR` relocates the
+    // profile dir, and a usage text that always said `%APPDATA%\dbc` would
+    // then name a file the user does not have and cannot fix.
+    eprintln!(
+        "    Cesty se ve výchozím stavu řídí pracovním prostorem nastaveným v aplikaci dbc
+    (ukazatel {}). --config/--vault mají vždy přednost.",
+        dbc_state::workspace::pointer_path().display()
+    );
+    eprintln!(
+        "
 SETUP (run once, manually, from a terminal — a TTY exists there, unlike the
 MCP launch path):
     dbc-mcp setup
