@@ -14817,8 +14817,26 @@ mod editor_clobber_audit {
         if name.as_deref().is_some_and(|n| matches!(n, ".git" | ".claude" | "node_modules")) {
             return true;
         }
-        // Cargo's own marker, not a name we guessed.
-        dir.join("CACHEDIR.TAG").is_file()
+        // RE-VERIFY FAIL-13: the marker prunes a directory only when there
+        // is no Rust source in it.
+        //
+        // Keying on `CACHEDIR.TAG` alone FAILED OPEN. The tag is an
+        // unsigned, trivially-created file, so dropping one into
+        // `crates/dbc-ui/src/helpers/` next to a `mod.rs` deleted that
+        // directory from every audit - FAIL-6 from the other side, and
+        // strictly worse, because it needs no plausible name at all.
+        //
+        // A cargo target directory contains build artefacts, never crate
+        // sources, so „has the tag AND holds no `.rs` file" recognises
+        // build output without ever hiding code. If someone puts the tag
+        // beside a `.rs` file, the directory is scanned and the audits
+        // speak up - which is the fail-CLOSED direction.
+        if !dir.join("CACHEDIR.TAG").is_file() {
+            return false;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return false };
+        !rd.filter_map(|e| e.ok())
+            .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("rs"))
     }
 
     /// The workspace root — `CARGO_MANIFEST_DIR` is `<root>/crates/dbc-ui`.
@@ -15321,12 +15339,39 @@ mod editor_clobber_audit {
         if !t.starts_with("use ") {
             return false;
         }
+        // RE-VERIFY FAIL-14: the line must be NOTHING BUT the `use` item.
+        //
+        // This used to decide from the PREFIX alone, and `audit_inner` then
+        // skipped the line entirely - not counted, not owner-checked, not
+        // call-checked. Rust is happy to put a `use` item and further
+        // statements on one physical line inside a function body:
+        //
+        //     use crate::scripts::write_script; let _ = write_script(&p, t);
+        //
+        // in the live `Unbind` arm: 0 warnings, 966 green, mention count
+        // unchanged. The needle did not even matter, because the skip was
+        // decided by the prefix - so ANY audited identifier could ride
+        // along, including the one-line form that forges
+        // `editor_discard_grant` behind a `use std::mem as _x;`.
+        //
+        // A `use` item ends at its first `;`. Anything after that `;` is a
+        // statement, and a statement is exactly what these audits exist to
+        // look at.
+        let Some((item, rest)) = t.split_once(';') else {
+            // No terminator on this line: a multi-line `use` group. The
+            // continuation lines are not `use`-prefixed, so they are
+            // examined normally; this first line carries no statement.
+            return true;
+        };
+        if !rest.trim().is_empty() {
+            return false;
+        }
         // `needle` immediately followed by `as` is a rename, not an import.
         let mut from = 0usize;
-        while let Some(rel) = line[from..].find(needle) {
+        while let Some(rel) = item[from..].find(needle) {
             let at = from + rel;
             let end = at + needle.len();
-            if line[end..].trim_start().starts_with("as ") {
+            if item[end..].trim_start().starts_with("as ") {
                 return false;
             }
             from = end;
@@ -15659,6 +15704,16 @@ more();");
         std::fs::create_dir(&odd).unwrap();
         std::fs::write(odd.join("CACHEDIR.TAG"), b"Signature: 8a477f597d28d172").unwrap();
         assert!(is_pruned(&odd));
+        // …but RE-VERIFY FAIL-13: the marker must never hide SOURCE. This
+        // assertion used to be the opposite one, and pinned the hole as
+        // desired behaviour: the tag is unsigned and trivially created, so
+        // dropping one beside a `mod.rs` deleted that directory from every
+        // audit. A cargo target dir holds artefacts, never crate sources.
+        let sneaky = td.path().join("helpers");
+        std::fs::create_dir(&sneaky).unwrap();
+        std::fs::write(sneaky.join("CACHEDIR.TAG"), b"Signature: 8a477f597d28d172").unwrap();
+        std::fs::write(sneaky.join("mod.rs"), b"// real code").unwrap();
+        assert!(!is_pruned(&sneaky), "a marker must not hide Rust source");
         // …and metadata by exact name.
         for meta in [".git", ".claude", "node_modules"] {
             let d = td.path().join(meta);
