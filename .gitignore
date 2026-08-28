@@ -1,3 +1,7 @@
 /target
 .superpowers/
 .claude/
+
+# local dev: shared cargo target dir + its config
+.cargo/
+target-shared/
