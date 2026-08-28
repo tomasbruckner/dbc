@@ -2069,7 +2069,14 @@ its own source pins. Banning the class beats chasing the instance.
 
 **Correction (second re-verify, FAIL-7):** as first written that ban was a
 SPELLING TEST, not a ban — three ordinary spellings walked past it. See
-§U. It is a real check now, and §T states what it is worth.
+§U.
+
+**Correction (fix round 4): the ban is RETIRED.** It was beaten again at
+the TOKEN level — `#[r#path]`, a `macro_rules!` taking `$a:meta`, and
+`use std::include as inc;` — and no string predicate over Rust source
+closes the class, because the attacker picks the tokens. It is replaced
+by `every_source_the_compiler_read_is_inside_the_audited_tree`, which
+reads cargo's dep-info and is spelling-proof by construction (§W2).
 
 A `macro_rules!` wrapper was also tried and is caught by the existing rails:
 the macro body still names the identifier.
@@ -2131,7 +2138,8 @@ So the honest statement, which the doc comment on `script_write_audit`
 also makes: the three remaining declines are held up by **source-text**
 audits that pin every mention of the identifier and its count, over the
 files the walk can see. §T sets out what those audits can and cannot
-promise, and it is less than this section originally implied.
+promise, and it is less than this section originally implied. §W is the
+final word, including the KNOWN-OPEN list.
 
 ## Q. Smaller corrections in this pass
 
@@ -2221,9 +2229,11 @@ round-2 fn-pointer bypass structurally rather than by inspection.
 
 ## T. What the audits can and cannot promise
 
-§P blurred this and §O overstated it. Precisely:
+§P blurred this and §O overstated it. **Superseded in part by §W**, which
+is the final inventory and adds a fourth rail, the dep-info check and an
+explicit known-open list; read §W first and this for the reasoning.
 
-**Compiler-enforced (three now):**
+**Compiler-enforced (three at the time; four now — see §W1):**
 
 | Rail | Precondition it runs |
 |---|---|
@@ -2346,3 +2356,108 @@ Four, each beaten by an ordinary spelling rather than a trick.
   same pass that cited it. Recorded rather than quietly deleted, because a
   doc citing itself as corroboration is how a weak decision becomes
   load-bearing — and it is what this decline then rested on.
+
+# W. The honest inventory — compiler-enforced, audit-only, KNOWN-OPEN
+
+Written at the end of fix round 4, which is the last one. Read this
+section before trusting any sentence elsewhere in §I–§V: where they
+disagree, this wins, and it is deliberately the shortest thing here.
+
+Three rounds in a row, an over-claiming comment is what let the next round
+pass review. So this section states only what runs.
+
+## W1. Compiler-enforced — four
+
+| Rail | Precondition it actually runs | Guards |
+|---|---|---|
+| `save_guard::with_save_permission` | no dialog owns the screen | `AppView::save_script` |
+| `editor_guard::with_editor_replaceable` | editor not dirty, **or** the user just answered „Zahodit" (grant stamped with the binding generation, consumed once) | `SqlInput::replace_buffer` |
+| `dbc_state::ConfigSaveGuard` | the file about to be overwritten parses, re-read at mint time | `AppConfig::save` |
+| `crate::completion_range` | — (narrowing, not a permit) | `SqlInput::accept_completion` deletes at most one identifier prefix, so it cannot clear the buffer whatever it is passed |
+
+The first three use a generative invariant brand
+(`PhantomData<fn(&'brand ()) -> &'brand ()>`) inside a
+`for<'brand> FnOnce` scope, or a path-bound witness. Both brands were
+attacked in about twenty distinct shapes across two rounds — `RefCell`
+stash, `thread_local`, `Box<dyn Any>`, `Box<dyn FnOnce + 'static>`,
+`cx.spawn` capture, returning as `R`, an fn item taking
+`SaveAllowed<'static>`, explicit variance both directions, forging from
+the crate root, `#[allow(unsafe_code)]` + `mem::zeroed` — and held every
+time. `#![forbid(unsafe_code)]` on both `dbc-ui` and `dbc-state` is what
+closes the `mem::zeroed` forge; it is on `dbc-state` because
+`ConfigSaveGuard` is DEFINED there.
+
+## W2. Sound without being a type — one
+
+`every_source_the_compiler_read_is_inside_the_audited_tree` reads cargo's
+dep-info for the running test binary and requires every source rustc
+opened to be inside the walked tree. It replaced four rounds of banning
+`#[path]` / `include!` spellings, which lost to `#[r#path]`, a
+`macro_rules!` taking `$a:meta`, and `use std::include as inc;`. Nothing
+an author writes changes what the compiler had to open, so this is
+spelling-proof by construction. Fail-closed: an unreadable dep-info, an
+unresolvable entry or a short list all fail.
+
+## W3. Audit-only — three, and what that is worth
+
+`write_script`, `write_atomic`, `bind_script`. What the audits check:
+every MENTION of the identifier, in files the walk visits, sits inside a
+sanctioned function; the mention is a call rather than a binding; the
+count is pinned. That is a property of SOURCE TEXT and not of the
+program.
+
+Why these three have no type rail:
+
+- **`write_script` / `write_atomic`** — the write is dispatched into
+  `cx.spawn` / `background_spawn`, whose future must be `'static`. A
+  branded permit therefore does not compile there; verified by running it,
+  the compiler says *„lifetime may not live long enough"* at the spawn.
+  A permit that COULD cross that boundary would be `'static`, and a
+  `'static` permit is exactly as leakable as the fn pointer it replaces.
+  `replace_buffer` differs only in running synchronously on the UI thread,
+  which is what makes its permit brand-able.
+- **`bind_script`** — its precondition is `open_script`'s, enforced
+  upstream, and its buffer replacement now goes through the
+  `BufferReplace` rail anyway.
+
+## W4. KNOWN-OPEN — nothing here is closed
+
+A future reader must not have to rediscover these.
+
+1. **`std::fs::write` (and any other direct fs API) into the library.**
+   `std::fs::write(root.join("trzby.sql"), "-- truncated")` truncates a
+   library file, mentions no audited identifier, and passes everything.
+   The audits are keyed on OUR writers; the standard library is not one
+   of them. Closing this needs either a linter/`clippy.toml`
+   disallowed-method rule or a `fs`-free module boundary, neither of which
+   was in scope.
+2. **A closure wrapper minted at a sanctioned site.** Inside
+   `save_script` — sanctioned owner, mention count unchanged — a
+   `let w = |p, t| crate::scripts::write_script(p, t);` stashed in a
+   `thread_local` and called from elsewhere. The mention IS a call, so the
+   call-shape rule is satisfied. No source-text rule closes it: a closure
+   body is legitimate code at a legitimate site, and any heuristic
+   flagging it flags the real call too. The same trick against
+   `replace_buffer` fails to COMPILE (`E0521`), which is the clearest
+   available statement of what a type rail buys.
+3. **The audit-spelling class generally.** Reading Rust with string
+   predicates is not soundly doable at this budget. Across three
+   adversarial rounds the text layer was beaten by: UFCS, receiver
+   rebinding, an alias, a fn-pointer binding, an odd-quote `br#"…"#`
+   desync, a prefix-matched directory name, a `CACHEDIR.TAG` dropped
+   beside source, a `use` item sharing a line with a statement, and three
+   token-level attribute spellings. Each is fixed; the CLASS is not. Per
+   the coordinator's stop rule this is **documented backlog, not a merge
+   blocker** — the four compiler-enforced rails and the dep-info check are
+   what carry the invariants that matter.
+4. **`grid.rs`'s independent `<path>.tmp` derivation** — pre-existing, see
+   §C. Unchanged.
+
+## W5. What to do if you are the next round
+
+Do not add a needle. If you find a spelling that walks past an audit, add
+it to W4 and move on unless it reaches something W1 does not already
+cover. The productive direction is the opposite one: find a mutator or a
+writer that has a REAL precondition and does not yet demand a permit —
+that is how `replace_buffer` and `accept_completion` were closed, and it
+is the only kind of fix in this phase that has never been beaten.

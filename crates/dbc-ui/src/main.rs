@@ -14769,12 +14769,25 @@ mod script_binding_tests {
 ///   comment) precisely so that the one identifier every buffer
 ///   replacement must mention cannot be confused with `TextField`'s or
 ///   `TextModel`'s same-named methods.
-/// * `perform_script_action` and `bind_script` are counted too, so the
-///   guard cannot be bypassed by calling the performer directly.
+/// * `perform_script_action` and `bind_script` are counted too, so a
+///   call of the performer from an unsanctioned owner is REPORTED. (Not
+///   „cannot be bypassed" — that is a text check, and re-verify rounds 2
+///   and 3 walked past text checks six times between them.)
+///
+/// **What actually stops a buffer clobber is now a TYPE**, not this
+/// module: `SqlInput::replace_buffer` demands an
+/// `editor_guard::BufferReplace<'brand>`, and `accept_completion` — the
+/// only other `pub` mutator — was narrowed so it can delete at most one
+/// identifier prefix. These audits remain as the belt: they report a NEW
+/// mutator or a mention that escapes as a value, neither of which a type
+/// can notice.
 ///
 /// The structural alternative the review preferred — the editor entity
 /// behind a private accessor whose mutator is unreachable outside the
-/// guard — was NOT taken. Rust's finest privacy granularity is the module,
+/// guard — was NOT taken, and re-verify judged that decline WRONG for the
+/// scope shape (which needs no accessor and no module move; see
+/// `editor_guard`). What follows is the original Task 8 reasoning, kept
+/// because it is still the correct objection to the accessor shape: Rust's finest privacy granularity is the module,
 /// so it would mean moving `AppView.sql` and both guard functions into a
 /// separate module, splitting `impl AppView` across files and dragging the
 /// autocomplete plumbing (`accept_completion`, `set_autocomplete_active`,
@@ -16026,29 +16039,48 @@ more();");
 ///
 /// Zero warnings, 961 green, a truncating write into the library.
 ///
-/// What the audits promise NOW, and no more: **every MENTION of these
-/// identifiers, anywhere in the workspace's source, sits inside a
-/// sanctioned function, and the count is pinned.** Since an alias, a
-/// re-export, a fn-pointer or a macro must all write the identifier down
-/// to detach it, that covers the detachment tricks — but it is a property
-/// of the SOURCE TEXT, not of the type system, and it holds only over
-/// files the walk can see (which is why `#[path]` and `include!` are
-/// banned outright by `no_module_may_be_pulled_in_from_outside_the_audited_tree`).
+/// **What these audits check — the whole of it, with no verb stronger
+/// than „check".** Every MENTION of the audited identifiers, in the
+/// source files the walk visits, sits inside a sanctioned function; the
+/// mention is a call rather than a binding; and the count is pinned. That
+/// is a property of SOURCE TEXT. It is not a property of the program.
 ///
-/// The genuinely compiler-enforced rails in this phase are two, and they
-/// are named precisely so nobody mistakes their scope: the Ctrl+S
-/// permission (`save_guard::with_save_permission`, a generative-brand
-/// scope in front of `AppView::save_script`) and the config write
+/// **It is NOT a guarantee that nothing else writes into the library.**
+/// The demonstration is one line and needs no trick at all:
+///
+/// ```ignore
+/// std::fs::write(root.join("trzby.sql"), "-- truncated");
+/// ```
+///
+/// That truncates a library file, mentions no audited identifier, and
+/// passes every test here. So does a closure wrapper minted at a
+/// sanctioned site and called from somewhere else (see §T/§W of the
+/// as-built note). Neither is closed, and this comment previously implied
+/// both were — three rounds running, an over-claim here is what let the
+/// next round through, so the claim is now bounded to what runs.
+///
+/// The compiler-enforced rails, named precisely so nobody mistakes their
+/// scope, are THREE: the Ctrl+S permission
+/// (`save_guard::with_save_permission` in front of `AppView::save_script`),
+/// the editor buffer (`editor_guard::with_editor_replaceable` in front of
+/// `SqlInput::replace_buffer`) and the config write
 /// (`dbc_state::ConfigSaveGuard`, mintable only by a real parse of the
-/// very file about to be overwritten). `write_script`, `write_atomic`,
-/// `replace_buffer` and `bind_script` have NO type rail — see the
-/// as-built note for why a witness on them would be theatre — and are
-/// held up by these audits alone. That is worth knowing when reading a
-/// count assertion below.
+/// very file about to be overwritten). `write_script`, `write_atomic` and
+/// `bind_script` have NO type rail — the as-built note gives the reason,
+/// which for the two writers is that their call happens inside a
+/// `'static` background future where a branded permit cannot go. They are
+/// held up by these text audits alone, and the paragraph above says what
+/// that is worth.
 ///
-/// The library's run still cannot write at all, from any function,
-/// however it is reached — that one is `run_script_from_library`'s own
-/// ban list plus these mention counts.
+/// The one thing outside the walk is now checked soundly rather than
+/// banned by spelling: `every_source_the_compiler_read_is_inside_the_audited_tree`
+/// reads cargo's dep-info, so „the audit did not see this file" is
+/// answered by the compiler.
+///
+/// The library's RUN is a separate, narrower claim and it still holds:
+/// `run_script_from_library`'s own body bans the four write identifiers,
+/// and the counts here pin their call sites. That is „no audited writer
+/// is on the run path", not „the run cannot write".
 ///
 /// **T9 re-verify NIT-A: "the scripts library", NOT "a user-chosen
 /// folder".** The older, wider sentence was false and it is worth knowing
