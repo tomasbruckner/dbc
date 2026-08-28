@@ -15625,92 +15625,97 @@ more();");
         assert!(code_lines("fn f<'a>(x: &'a str) -> &'a str { x }")[0].contains("'a"));
     }
 
-    /// THE FIFTH BYPASS, found while looking for it rather than reported.
+    /// THE SOUND VERSION, and the end of a loop that ran four times.
     ///
-    /// Re-verify FAIL-4 was `#[path = "../gen/evil.rs"]`, and widening
-    /// `sources()` to the workspace ROOT answered it. It does not answer
-    /// the same trick aimed OUTSIDE the root:
+    /// The property wanted is „no file outside the audited tree was
+    /// compiled". Four rounds tried to get it by BANNING THE SPELLINGS
+    /// that pull one in, and lost every time — first `#[path = "…"]`
+    /// inside the crate, then outside it, then no-space / split-line /
+    /// brace-delimited forms, and finally at the TOKEN level:
+    /// `#[r#path = "…"]` (a raw identifier resolving to the same built-in
+    /// attribute), a `macro_rules!` taking `$a:meta` and expanding to
+    /// `#[$a] mod evil;`, and `use std::include as inc; inc!{"…"}`
+    /// (`include!` is an ordinary `std` macro and can be renamed).
     ///
-    /// ```ignore
-    /// #[path = "../../../../outside-tree/evil.rs"]
-    /// mod evil;
-    /// ```
+    /// Whitespace flattening made SPACING irrelevant and was described as
+    /// making „spelling irrelevant by construction". That was true of
+    /// whitespace and did not reach the conclusion it was used for. No
+    /// string predicate over Rust source closes this class, because the
+    /// attacker picks the tokens.
     ///
-    /// Verified: that compiles, and 963 tests pass with a truncating
-    /// `write_script` and an unguarded `replace_buffer` sitting in a file
-    /// no audit can reach. No walk can fix this — the file is not in the
-    /// tree — so the rail has to be aimed at the ESCAPE HATCH instead of
-    /// at the destination.
+    /// So the question is no longer asked of the SOURCE at all. It is
+    /// asked of the COMPILER. Cargo writes a dep-info file next to every
+    /// binary listing every source it actually read — `#[path]` targets,
+    /// `include!` splices, `include_str!` data, whatever the spelling, and
+    /// whatever macro produced it. Comparing that set against the walked
+    /// set answers the real question exactly, and nothing an attacker
+    /// writes changes what rustc had to open.
     ///
-    /// Two hatches move CODE from an arbitrary path into this workspace,
-    /// and neither is used anywhere in it:
+    /// Fail-CLOSED throughout: an unreadable dep-info, an unparsable
+    /// entry, or a suspiciously short list all fail, because every one of
+    /// those would otherwise pass by checking nothing.
     ///
-    /// * `#[path = …]` on a `mod`, in any spelling including via
-    ///   `cfg_attr`;
-    /// * `include!(…)`, which splices tokens — the `OUT_DIR` idiom.
-    ///
-    /// `include_str!` and `include_bytes!` are deliberately NOT banned:
-    /// they carry DATA, cannot introduce a call site, and this crate uses
-    /// `include_str!("main.rs")` for its own source pins.
-    ///
-    /// Banning the class beats chasing the instance. If a generated module
-    /// is ever genuinely needed, this test is the conversation about where
-    /// it may live.
+    /// One honest limit: the dep-info sits in a target dir SHARED between
+    /// worktrees of this repo, so in principle it could describe a build
+    /// of a sibling worktree. Its paths are workspace-relative, so it is
+    /// resolved against THIS root, and the crate's own `main.rs` is
+    /// asserted present — which is the best freshness check available from
+    /// inside the test and the reason not to build two worktrees at once.
     #[test]
-    fn no_module_may_be_pulled_in_from_outside_the_audited_tree() {
-        let files = sources();
-        assert!(files.len() >= 60, "vacuous: only {} files scanned", files.len());
-        let mut hatches: Vec<String> = Vec::new();
-        for (name, src) in &files {
-            // RE-VERIFY FAIL-7. The first version of this test asked
-            // whether ONE LINE contained both "#[" and "path =", and
-            // whether it contained "include!(" verbatim. Three ordinary
-            // spellings walked straight past that, each verified against a
-            // real out-of-tree module holding verbatim `replace_buffer`
-            // and `write_script`, each 0 warnings / 964 green:
-            //
-            //   1. `#[path="x.rs"]`      - one missing space around `=`
-            //   2. the attribute split over two lines, so neither line
-            //      holds both substrings
-            //   3. `include!{"x.rs"}`    - a brace delimiter (and
-            //      `include! ("x.rs")`, with a space)
-            //
-            // A ban that a formatter can defeat is a spelling test, not a
-            // ban. So the whole file's CODE is flattened with ALL
-            // whitespace removed - which makes spacing and line breaks
-            // irrelevant by construction - and the needles are matched
-            // against that. `where_from` maps a hit back to its real line,
-            // so the report still points at something.
-            let (flat, where_from) = flatten_code(src);
-            for needle in [
-                // The module-path attribute, inner and outer.
-                "#[path=",
-                "#![path=",
-                // `cfg_attr` can carry `path` too, and this workspace does
-                // not use `cfg_attr` for anything - so it is banned whole
-                // rather than parsed. If it is ever needed, that is a
-                // conversation, which is the point of a pinned ban.
-                "#[cfg_attr(",
-                "#![cfg_attr(",
-                // Token splicing, all three macro delimiters. `include_str!`
-                // and `include_bytes!` are deliberately absent: they carry
-                // DATA, cannot introduce a call site, and this crate uses
-                // `include_str!` for its own source pins.
-                "include!(",
-                "include!{",
-                "include![",
-            ] {
-                let mut from = 0usize;
-                while let Some(rel) = flat[from..].find(needle) {
-                    let at = from + rel;
-                    hatches.push(format!("{name}:{} ({needle})", where_from[at] + 1));
-                    from = at + needle.len();
+    fn every_source_the_compiler_read_is_inside_the_audited_tree() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let dep = exe.with_extension("d");
+        let text = std::fs::read_to_string(&dep)
+            .unwrap_or_else(|e| panic!("dep-info {} unreadable: {e}", dep.display()));
+
+        let root = workspace_root();
+        let root_c = root.canonicalize().expect("workspace root canonicalizes");
+        let walked: std::collections::HashSet<PathBuf> = sources()
+            .into_iter()
+            .filter_map(|(rel, _)| root.join(&rel).canonicalize().ok())
+            .collect();
+
+        let (mut outside, mut unwalked, mut unresolved) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let mut seen = 0usize;
+        let mut saw_main = false;
+        for line in text.lines() {
+            // `<target>.d: <dep> <dep> …`; the per-dep empty rules that
+            // follow have no `: ` and are skipped.
+            let Some((_, deps)) = line.split_once(".d: ") else { continue };
+            for raw in deps.split(' ').filter(|t| !t.is_empty()) {
+                let p = PathBuf::from(raw.replace('\\', "/"));
+                let abs = if p.is_absolute() { p } else { root.join(p) };
+                let Ok(abs) = abs.canonicalize() else {
+                    unresolved.push(raw.to_string());
+                    continue;
+                };
+                seen += 1;
+                if !abs.starts_with(&root_c) {
+                    outside.push(abs.display().to_string());
+                    continue;
+                }
+                if abs.ends_with("main.rs") {
+                    saw_main = true;
+                }
+                if abs.extension().and_then(|e| e.to_str()) == Some("rs")
+                    && !walked.contains(&abs)
+                {
+                    unwalked.push(abs.display().to_string());
                 }
             }
         }
+
+        assert!(seen >= 30, "dep-info listed only {seen} sources — this check would be vacuous");
+        assert!(saw_main, "dep-info does not mention this crate's main.rs — wrong or stale file");
+        assert!(unresolved.is_empty(), "dep-info entries could not be resolved: {unresolved:?}");
         assert!(
-            hatches.is_empty(),
-            "`#[path]` / `cfg_attr(path)` / `include!` move CODE from an arbitrary file into              the workspace, and the audits can only see files inside it - a module pulled in              from outside the root is invisible to every one of them. Found: {hatches:?}"
+            outside.is_empty(),
+            "the compiler read source from OUTSIDE the workspace, so no audit in this module              saw it: {outside:?}"
+        );
+        assert!(
+            unwalked.is_empty(),
+            "the compiler read Rust source the audit walk does not visit — it is inside the              tree but pruned, so every audit is blind to it: {unwalked:?}"
         );
     }
 
