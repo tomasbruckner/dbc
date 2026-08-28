@@ -242,7 +242,7 @@ impl Vault {
 }
 
 pub fn default_vault_path() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("dbc").join("vault.bin")
+    crate::workspace::profile_dir().join("vault.bin")
 }
 
 #[cfg(test)]

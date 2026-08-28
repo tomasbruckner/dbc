@@ -300,7 +300,7 @@ impl AppConfig {
 }
 
 pub fn default_config_path() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("dbc").join("config.toml")
+    crate::workspace::profile_dir().join("config.toml")
 }
 
 #[cfg(test)]

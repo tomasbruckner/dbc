@@ -163,13 +163,26 @@ fn err(m: impl Into<String>) -> StateError {
     StateError { message: m.into() }
 }
 
-/// `%APPDATA%\dbc` (or the platform equivalent) — the profile dir every
-/// `default_*_path()` already uses.
+/// The env var that relocates the profile dir. Set for this repo by
+/// `.cargo/config.toml`'s `[env]`, so `cargo run`/`cargo test` keep their
+/// state in `<repo>/data` instead of the real user profile. Unset in a
+/// shipped build, which is why the default below is the platform one.
+pub const PROFILE_DIR_ENV: &str = "DBC_DATA_DIR";
+
+/// THE profile dir — `%APPDATA%\dbc` (or the platform equivalent), or
+/// `DBC_DATA_DIR` when that is set and non-empty.
+///
+/// Every `default_*_path()` is `profile_dir().join(<file>)`. It used to be
+/// the other way round: five functions each rebuilt
+/// `dirs::config_dir().join("dbc")` independently and this one recovered the
+/// directory by taking `default_config_path()`'s parent. Five copies of one
+/// decision is five places to disagree, and relocating the profile would
+/// have had to be written five times.
 pub fn profile_dir() -> PathBuf {
-    crate::config::default_config_path()
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
+    match std::env::var_os(PROFILE_DIR_ENV) {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("dbc"),
+    }
 }
 
 /// `<profile>/workspace.toml`.

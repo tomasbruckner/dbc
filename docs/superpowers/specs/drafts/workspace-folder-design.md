@@ -1446,7 +1446,23 @@ Collected here — numbered, ordered and reproducible — instead of scattered
 across agent reports.
 
 Build once: `%USERPROFILE%\.cargo\bin\cargo.exe run -p dbc-ui`.
-Back up `%APPDATA%\dbc\` before starting; several items hand-edit it.
+Back up the profile dir before starting; several items hand-edit it.
+
+> **WHERE the profile dir is, as of the `DBC_DATA_DIR` change.** Every
+> `%APPDATA%\dbc\…` path named below — and in §F.6's dbc-mcp matrix — means
+> **the profile dir**, which is now whatever
+> `dbc_state::workspace::profile_dir()` returns:
+>
+> * `cargo run` / `cargo test` in this repo → **`<repo>\data\`**, because
+>   `.cargo/config.toml`'s `[env]` sets `DBC_DATA_DIR = "data"` (relative to
+>   the repo root). This is the case for the whole checklist below, since it
+>   is run from a dev build.
+> * a shipped binary with `DBC_DATA_DIR` unset → `%APPDATA%\dbc\` as before.
+>
+> So item 1's hand-written pointer goes in **`<repo>\data\workspace.toml`**,
+> and the „aimed at the PROFILE DIR ITSELF" case in item 2 means aiming it
+> at `<repo>\data`. `dbc-mcp --help` prints the real resolved pointer path
+> rather than a spelled one, so when in doubt, ask it.
 
 ### F.1 Blocking „Pracovní prostor nenalezen" modal (T4 Step 8)
 
