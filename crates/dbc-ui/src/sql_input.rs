@@ -382,10 +382,27 @@ impl SqlInput {
     /// + `buffer.insert`, same shape as `newline`/`backspace`), then
     /// re-kicks highlighting so T5's debounced re-highlight picks up the
     /// inserted text.
-    pub fn accept_completion(&mut self, prefix_len: usize, text: &str, cx: &mut Context<Self>) {
+    /// RE-VERIFY: it DERIVES the replaced range itself, and no longer takes
+    /// a `prefix_len`.
+    ///
+    /// This is the second `pub` mutator on the editor's text, and the
+    /// `BufferReplace` rail did not cover it: with `prefix_len =
+    /// text().len()` and an empty `text` it destroyed the entire unsaved
+    /// buffer, named no audited identifier, and went 966 green. A caller
+    /// supplying the length WAS the hole.
+    ///
+    /// Narrowed rather than permitted, because unlike `replace_buffer`
+    /// there is no legitimate use for an arbitrary span here: the contract
+    /// was always „the identifier prefix ending exactly at the cursor",
+    /// which this now reads off its OWN buffer through the same shared
+    /// rail `completion_edit`'s tests pin (`crate::completion_range`). The
+    /// deletion is therefore bounded by one identifier prefix by
+    /// construction — it cannot clear the buffer, whatever it is passed,
+    /// so it needs no permit and cannot become a clobber.
+    pub fn accept_completion(&mut self, text: &str, cx: &mut Context<Self>) {
         let cursor = self.buffer.cursor();
-        let start = cursor.saturating_sub(prefix_len);
-        self.buffer.select_range(start..cursor);
+        let full = self.buffer.text().to_string();
+        self.buffer.select_range(crate::completion_range(&full, cursor));
         self.buffer.insert(text);
         self.marked_range = None;
         self.follow_cursor = true;

@@ -167,12 +167,29 @@ fn autocomplete_handles_action(popup_open: bool) -> bool {
 /// text. This is intentional (review round 3 NIT): matching most editors'
 /// "complete up to the cursor" model rather than attempting to also
 /// understand/replace a suffix the user hasn't necessarily finished typing.
-fn completion_edit(text: &str, cursor: usize, insert: &str) -> (std::ops::Range<usize>, String) {
+///
+/// RE-VERIFY: the RANGE half is now the shared rail, because
+/// `SqlInput::accept_completion` uses it too. That function used to be
+/// handed a `prefix_len` by its caller, which is what let a caller pass
+/// `text().len()` and wipe the whole unsaved buffer with no permit and no
+/// audited identifier. There is one definition of „the identifier prefix
+/// ending at the cursor" and both the pure test and the live buffer
+/// surgery read it.
+pub(crate) fn completion_range(text: &str, cursor: usize) -> std::ops::Range<usize> {
     let ctx = autocomplete::cursor_context(text, cursor);
     let start = cursor - ctx.prefix.len();
+    start..cursor
+}
+
+/// The pure whole-string form, kept for the unit tests that pin the
+/// mid-word behaviour described above. Production goes through
+/// [`completion_range`] and splices in the buffer.
+#[cfg(test)]
+fn completion_edit(text: &str, cursor: usize, insert: &str) -> (std::ops::Range<usize>, String) {
+    let range = completion_range(text, cursor);
     let mut new_text = text.to_string();
-    new_text.replace_range(start..cursor, insert);
-    (start..cursor, new_text)
+    new_text.replace_range(range.clone(), insert);
+    (range, new_text)
 }
 
 /// G2 Task 7 (G15 §2d: dialect-aware): SQL builder for `TreeEvent::
@@ -5797,12 +5814,12 @@ impl AppView {
         let Some(ac) = &self.autocomplete else { return };
         let Some(candidate) = ac.candidates.get(ac.selected) else { return };
         let insert = candidate.text.clone();
-        let text = self.sql.read(cx).text();
-        let cursor = self.sql.read(cx).cursor();
-        let (range, _) = completion_edit(&text, cursor, &insert);
-        let prefix_len = cursor - range.start;
-
-        self.sql.update(cx, |s, cx| s.accept_completion(prefix_len, &insert, cx));
+        // RE-VERIFY: the range is no longer computed HERE and handed over.
+        // `accept_completion` derives it from its own buffer through the
+        // same `autocomplete::cursor_context` rail `completion_edit` uses,
+        // so the span it deletes is bounded by one identifier prefix by
+        // construction and a caller cannot widen it into a buffer clobber.
+        self.sql.update(cx, |s, cx| s.accept_completion(&insert, cx));
         self.autocomplete = None;
         self.sql.update(cx, |s, _| s.set_autocomplete_active(false));
         // Sync the lazy-diff cache to the post-accept text/cursor so the
@@ -13566,6 +13583,39 @@ mod completion_edit_tests {
         let (range, new_text) = completion_edit("SELECT čas", 11, "časovka");
         assert_eq!(range, 7..11);
         assert_eq!(new_text, "SELECT časovka");
+    }
+
+    /// RE-VERIFY: `accept_completion` cannot clear the buffer, whatever it
+    /// is passed. It has no length parameter any more — it reads the span
+    /// from `completion_range`, so what it deletes is one identifier
+    /// prefix ending at the cursor, and everything before that prefix is
+    /// untouchable by it. That is why this mutator needs no `BufferReplace`
+    /// permit: `replace_buffer` can destroy an arbitrary amount of unsaved
+    /// work and this provably cannot.
+    ///
+    /// The worst case is the whole buffer BEING one identifier, and then
+    /// replacing it with the candidate is the completion the user asked
+    /// for, not a clobber.
+    #[test]
+    fn accepting_a_completion_can_only_ever_replace_an_identifier_prefix() {
+        // The shape the bypass used: a caller wanting to wipe everything.
+        // There is no parameter for it, so the most it reaches is `tot`.
+        let text = "SELECT a, b, c FROM orders WHERE tot";
+        let range = completion_range(text, text.len());
+        assert_eq!(&text[range.clone()], "tot");
+        assert_eq!(range.start, text.len() - 3, "everything before the prefix is untouchable");
+
+        // No prefix at the cursor -> an EMPTY range: an accept there
+        // inserts and deletes nothing.
+        let after_space = "SELECT ";
+        assert!(completion_range(after_space, after_space.len()).is_empty());
+
+        // The whole buffer as one identifier is the only case where the
+        // range spans everything, and that is a completion, not a clobber.
+        assert_eq!(completion_range("sel", 3), 0..3);
+
+        // A cursor inside a longer word still only reaches backwards.
+        assert_eq!(completion_range("usXer", 2), 0..2);
     }
 
     /// NIT: cursor-mid-word behavior is intentional (see `completion_edit`'s
