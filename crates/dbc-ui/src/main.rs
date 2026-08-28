@@ -2042,6 +2042,22 @@ struct AppView {
     /// means the panel isn't rendered at all (0 px), not just visually
     /// hidden.
     tree_visible: bool,
+    /// Current sidebar width in logical px, seeded from
+    /// `AppConfig::sidebar_width` at startup and clamped into
+    /// `SIDEBAR_MIN_W..=SIDEBAR_MAX_W`.
+    ///
+    /// The clamp lives HERE and not in the setter, because the stored value
+    /// is whatever the user dragged: a `config.toml` hand-edited to `5`, or
+    /// written on a wide monitor and reopened on a narrow one, must not be
+    /// able to leave the panel unreachably thin — there would be no handle
+    /// left to grab to undo it.
+    sidebar_width: f32,
+    /// `(mouse x at mouse-down, sidebar width at mouse-down)` while a
+    /// splitter drag is active — the same shape as `grid.rs`'s `resizing`,
+    /// and for the same reason: the delta must be measured against where the
+    /// drag STARTED, not against the previous move event, or rounding
+    /// accumulates and the panel creeps away from the pointer.
+    sidebar_resizing: Option<(f32, f32)>,
     /// Sidebar rework: bumped on every db-list/schema-slot fetch dispatch;
     /// a result only applies if the generation still matches
     /// (last-dispatched wins — the slot state machines in schema_tree.rs
@@ -2200,6 +2216,38 @@ struct AppView {
 /// `AppView::current_conn_identity` use for the CLI-arg back-compat path
 /// (no saved `ConnectionConfig`, hence no stable id to use instead).
 const CLI_CONN_IDENTITY: &str = "cli";
+
+/// The sidebar's built-in width, used until the user drags the splitter.
+/// Was the hard-coded `260.` in `render`.
+pub(crate) const SIDEBAR_DEFAULT_W: f32 = 260.0;
+/// Narrow enough to be useful, wide enough that the 5 px splitter is still
+/// grabbable. A panel dragged to 0 could not be dragged back — Ctrl+B hides
+/// the panel, and that is the control for „I want it gone".
+pub(crate) const SIDEBAR_MIN_W: f32 = 140.0;
+/// Keeps the editor usable on a laptop screen; a user who wants the tree
+/// huge can still hide the history panel with Ctrl+H.
+pub(crate) const SIDEBAR_MAX_W: f32 = 640.0;
+
+/// The ONE clamp. Applied on load, on every drag move, and before saving, so
+/// no path can put a width outside the range into `self` or `config.toml`.
+pub(crate) fn clamp_sidebar_width(w: f32) -> f32 {
+    // `f32::clamp` PANICS on NaN. A NaN can only come from a corrupted drag
+    // start, but a resize must not be able to take the process down.
+    if w.is_nan() {
+        return SIDEBAR_DEFAULT_W;
+    }
+    w.clamp(SIDEBAR_MIN_W, SIDEBAR_MAX_W)
+}
+
+/// `AppConfig::sidebar_width` (whole px, `None` = never resized) → the
+/// working `f32`. Clamped here too, because the stored value may have been
+/// hand-edited or written on a much wider monitor.
+pub(crate) fn sidebar_width_from(stored: Option<u16>) -> f32 {
+    match stored {
+        Some(w) => clamp_sidebar_width(f32::from(w)),
+        None => SIDEBAR_DEFAULT_W,
+    }
+}
 
 /// Design §2.3: the widened connection identity. `\u{1F}` (unit separator)
 /// joins id and database — the same convention dbc-state's
@@ -5271,6 +5319,37 @@ impl AppView {
 
     fn on_toggle_tree(&mut self, _: &ToggleTree, _window: &mut Window, cx: &mut Context<Self>) {
         self.tree_visible = !self.tree_visible;
+        cx.notify();
+    }
+
+    /// Ends a splitter drag and persists the result.
+    ///
+    /// Persisting happens HERE — at the drag END — and never in the move
+    /// handler. A move fires per mouse event, so saving there would rewrite
+    /// `config.toml` (tmp + `sync_all` + rename, over every connection and
+    /// favourite) dozens of times per second for a single gesture. Same
+    /// contract as `grid.rs`'s column widths, which emit `ViewChanged` only
+    /// on `on_mouse_up`.
+    ///
+    /// The equality check is not an optimisation: a plain CLICK on the
+    /// splitter — no movement at all — is a complete down/up pair, so
+    /// without it every stray click would write `config.toml`.
+    fn end_sidebar_resize(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_resizing = None;
+        let width = clamp_sidebar_width(self.sidebar_width) as u16;
+        if self.config.sidebar_width == Some(width) {
+            cx.notify();
+            return;
+        }
+        self.config.sidebar_width = Some(width);
+        // Same posture as `set_theme`: the guard gates the WRITE only. The
+        // in-session width already changed and stays changed — a save
+        // failure degrades to session-only plus the guard's own status.
+        if let Some(guard) = self.guard_corrupt_config(cx) {
+            if let Err(e) = self.config.save(&self.config_path, &guard) {
+                self.status = format!("error: šířku panelu se nepodařilo uložit: {e}");
+            }
+        }
         cx.notify();
     }
 
@@ -11803,19 +11882,47 @@ impl Render for AppView {
         }
         column = column.child(self.render_tab_content(cx));
 
-        // G2 Task 6: the schema tree panel sits LEFT of `column`, fixed
-        // 260 px, collapsible via Ctrl+B (`ToggleTree`) — collapsed means
-        // not rendered at all (width 0), not just visually hidden.
+        // G2 Task 6: the schema tree panel sits LEFT of `column`,
+        // collapsible via Ctrl+B (`ToggleTree`) — collapsed means not
+        // rendered at all (width 0), not just visually hidden. The width was
+        // a fixed 260 px until the user asked for a draggable splitter
+        // (2026-08-28); it is now `sidebar_width`, persisted on drag END.
         let mut body = div().flex().flex_row().flex_1().min_h_0();
         if self.tree_visible {
             body = body.child(
                 div()
-                    .w(px(260.))
+                    .relative()
+                    .w(px(self.sidebar_width))
                     .h_full()
                     .flex_shrink_0()
                     .border_r_1()
                     .border_color(theme.border)
-                    .child(self.tree.clone()),
+                    .child(self.tree.clone())
+                    .child(
+                        // The splitter. A sibling of the tree rather than
+                        // part of its border, so grabbing it can never also
+                        // hit a tree row underneath — the same
+                        // `.occlude()` reasoning as `grid.rs`'s column
+                        // resize handle, which learned it from a bug where
+                        // a drag also toggled the sort.
+                        div()
+                            .id("sidebar-splitter")
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .w(px(5.))
+                            .h_full()
+                            .occlude()
+                            .cursor_col_resize()
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|view, e: &gpui::MouseDownEvent, _w, cx| {
+                                    view.sidebar_resizing =
+                                        Some((f32::from(e.position.x), view.sidebar_width));
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
             );
         }
         body = body.child(column);
@@ -11843,6 +11950,31 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_save_script))
             .child(self.render_top_bar(cx))
             .child(body);
+
+        // Mouse tracking lives on the ROOT, not on the splitter: once the
+        // drag starts the pointer routinely leaves the 5 px handle, and a
+        // handler bound to the handle would stop receiving moves the instant
+        // it did. `on_mouse_up_out` is the other half — releasing outside the
+        // window must also end the drag, or the panel keeps following the
+        // mouse after the button is up. Both learned from `grid.rs`.
+        if self.sidebar_resizing.is_some() {
+            root = root
+                .on_mouse_move(cx.listener(|view, e: &gpui::MouseMoveEvent, _w, cx| {
+                    if let Some((start_x, start_w)) = view.sidebar_resizing {
+                        view.sidebar_width =
+                            clamp_sidebar_width(start_w + (f32::from(e.position.x) - start_x));
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|view, _e, _w, cx| view.end_sidebar_resize(cx)),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|view, _e, _w, cx| view.end_sidebar_resize(cx)),
+                );
+        }
 
         // G5 Task 4, brief contract #1: apply bar sits directly above the
         // status bar (spec mockup: "apply bar (when dirty) / status bar"),
@@ -12312,6 +12444,8 @@ fn main() {
                             async {}
                         })
                         .detach();
+                        // Read before `config` is moved into the struct below.
+                        let sidebar_width = sidebar_width_from(config.sidebar_width);
                         AppView {
                             tabs: Tabs::new(),
                             status,
@@ -12343,6 +12477,8 @@ fn main() {
                             grouped_cache,
                             tree,
                             tree_visible: true,
+                            sidebar_width,
+                            sidebar_resizing: None,
                             sidebar_fetch_generation: 0,
                             compare_fetch_generation: 0,
                             history,
@@ -13691,6 +13827,52 @@ mod autocomplete_handles_action_tests {
 /// compiler half of the same rail: this test proves the call is THERE, the
 /// attribute proves its verdict is not thrown away.
 #[cfg(test)]
+mod sidebar_width_tests {
+    use super::*;
+
+    #[test]
+    fn an_unset_width_is_the_built_in_default() {
+        assert_eq!(sidebar_width_from(None), SIDEBAR_DEFAULT_W);
+    }
+
+    #[test]
+    fn a_stored_width_round_trips_when_it_is_in_range() {
+        assert_eq!(sidebar_width_from(Some(317)), 317.0);
+    }
+
+    /// The reason the clamp is on LOAD and not only on drag: a `config.toml`
+    /// hand-edited to `5`, or written on a wide monitor and reopened on a
+    /// narrow one, would otherwise leave a panel too thin to contain the
+    /// 5 px splitter — with no way to drag it back.
+    #[test]
+    fn a_stored_width_outside_the_range_is_pulled_back_in() {
+        assert_eq!(sidebar_width_from(Some(5)), SIDEBAR_MIN_W, "too thin to grab");
+        assert_eq!(sidebar_width_from(Some(u16::MAX)), SIDEBAR_MAX_W, "wider than any screen");
+        assert_eq!(sidebar_width_from(Some(0)), SIDEBAR_MIN_W, "0 could never be dragged back");
+    }
+
+    /// `f32::clamp` PANICS on NaN, and this runs inside a mouse-move
+    /// handler — a panic there takes the window down mid-gesture.
+    #[test]
+    fn a_nan_width_does_not_panic_and_falls_back_to_the_default() {
+        assert_eq!(clamp_sidebar_width(f32::NAN), SIDEBAR_DEFAULT_W);
+    }
+
+    #[test]
+    fn infinities_clamp_rather_than_escape() {
+        assert_eq!(clamp_sidebar_width(f32::INFINITY), SIDEBAR_MAX_W);
+        assert_eq!(clamp_sidebar_width(f32::NEG_INFINITY), SIDEBAR_MIN_W);
+    }
+
+    /// The drag stores `start_w + dx`, so dragging left past the minimum
+    /// produces a NEGATIVE candidate, not merely a small one.
+    #[test]
+    fn dragging_far_left_stops_at_the_minimum() {
+        assert_eq!(clamp_sidebar_width(SIDEBAR_DEFAULT_W - 9999.0), SIDEBAR_MIN_W);
+    }
+}
+
+#[cfg(test)]
 mod config_save_guard_audit {
     use super::editor_clobber_audit::{code_lines, defined_fn_name, sources};
 
@@ -13756,7 +13938,14 @@ mod config_save_guard_audit {
         }
         // Pinned so a NEW writer forces a deliberate look at this test
         // rather than silently inheriting whatever its neighbours do.
-        assert_eq!(sites, 6, "config.toml writer count changed — re-audit, do not just bump");
+        //
+        // 6 → 7 on 2026-08-28: `end_sidebar_resize` persists the splitter
+        // width. Re-audited rather than bumped — the write is inside the
+        // `if let Some(guard) = self.guard_corrupt_config(cx)` arm (this
+        // test's own loop proves that, since it reports position, not just
+        // count), it runs at drag END only, and an unchanged width returns
+        // before reaching it so a bare click on the splitter writes nothing.
+        assert_eq!(sites, 7, "config.toml writer count changed — re-audit, do not just bump");
     }
 
     /// The widening is only worth anything if it actually reaches past the
