@@ -5322,6 +5322,40 @@ impl AppView {
         cx.notify();
     }
 
+    /// Flips the schema tree between „by schema" and „by object kind" and
+    /// persists the choice.
+    ///
+    /// No fetch: both shapes are the SAME `SchemaSnapshot` flattened
+    /// differently, so this is a re-render, not a round trip — which is why
+    /// it can be a one-click header icon rather than something guarded
+    /// behind a confirm.
+    ///
+    /// The tree does not own this value. It is global config, so the flip,
+    /// the save and the push back into the tree all happen here; letting the
+    /// tree flip its own copy would let the two disagree whenever the save
+    /// is refused.
+    fn toggle_tree_grouping(&mut self, cx: &mut Context<Self>) {
+        let next = match self.config.tree_grouping {
+            dbc_state::TreeGrouping::Schema => dbc_state::TreeGrouping::Kind,
+            dbc_state::TreeGrouping::Kind => dbc_state::TreeGrouping::Schema,
+        };
+        self.config.tree_grouping = next;
+        self.tree.update(cx, |t, cx| t.set_grouping(next, cx));
+        self.status = match next {
+            dbc_state::TreeGrouping::Schema => "strom: podle schémat".to_string(),
+            dbc_state::TreeGrouping::Kind => "strom: podle typu objektu".to_string(),
+        };
+        // Same posture as `set_theme` and `end_sidebar_resize`: the guard
+        // gates the WRITE only, the session already switched above, and a
+        // refusal leaves its own status in place.
+        if let Some(guard) = self.guard_corrupt_config(cx) {
+            if let Err(e) = self.config.save(&self.config_path, &guard) {
+                self.status = format!("error: režim stromu se nepodařilo uložit: {e}");
+            }
+        }
+        cx.notify();
+    }
+
     /// Ends a splitter drag and persists the result.
     ///
     /// Persisting happens HERE — at the drag END — and never in the move
@@ -10121,6 +10155,9 @@ impl AppView {
             // transition carries the slot's expand-set forward — resolved
             // deviation 13). Nothing active → just re-push the (empty)
             // context; there is no whole-panel state to clear any more.
+            TreeEvent::ToggleGroupingRequested => {
+                self.toggle_tree_grouping(cx);
+            }
             TreeEvent::RefreshRequested => {
                 if let Some(id) = self.active_connection_id.clone() {
                     if let Some(db) = self.effective_database() {
@@ -12515,6 +12552,13 @@ fn main() {
         let _ = window_handle.update(cx, |view, _window, cx| {
             let grouped = view.grouped_cache.clone();
             view.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
+            // The tree starts on `TreeGrouping::Schema` and learns the saved
+            // choice here — this is what makes the setting survive a
+            // restart. A blocked start carries a default config, so this
+            // pushes the default, which is the right answer when there is no
+            // trustworthy config to read.
+            let grouping = view.config.tree_grouping;
+            view.tree.update(cx, |t, cx| t.set_grouping(grouping, cx));
             view.refresh_tree_context(cx);
             // Part S §1.2: scan on startup when a root is configured. It is
             // a no-op-with-reset when there is none — and a BLOCKED start
@@ -13945,7 +13989,13 @@ mod config_save_guard_audit {
         // test's own loop proves that, since it reports position, not just
         // count), it runs at drag END only, and an unchanged width returns
         // before reaching it so a bare click on the splitter writes nothing.
-        assert_eq!(sites, 7, "config.toml writer count changed — re-audit, do not just bump");
+        //
+        // 7 → 8 on 2026-08-28: `toggle_tree_grouping` persists the schema
+        // tree's shape. Same re-audit: guarded arm, and it can only run from
+        // a deliberate click on the header icon — there is no continuous
+        // gesture behind it, so it needs no equality check of its own (the
+        // value provably changed, it is a two-state flip).
+        assert_eq!(sites, 8, "config.toml writer count changed — re-audit, do not just bump");
     }
 
     /// The widening is only worth anything if it actually reaches past the
