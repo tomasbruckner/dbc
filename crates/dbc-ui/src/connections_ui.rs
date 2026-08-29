@@ -1801,6 +1801,29 @@ impl AppView {
                     .text_color(cx.theme().text_faint)
                     .child(format!("dbc v{}", env!("CARGO_PKG_VERSION"))),
             )
+            // „Formátovat" (user request 2026-08-28), Ctrl+Shift+F. Dimmed
+            // with no active connection, because the dialect comes from the
+            // engine and formatting by the wrong dialect would reflow the
+            // user's SQL against the wrong lexical rules. Same
+            // `cx.stop_propagation()` as the gear below.
+            .child({
+                let enabled = self.active_engine().is_some();
+                div()
+                    .id("top-bar-format")
+                    .px_1()
+                    .cursor_pointer()
+                    .text_color(if enabled {
+                        cx.theme().text_muted
+                    } else {
+                        cx.theme().border
+                    })
+                    .hover(|s| s.text_color(cx.theme().text_primary))
+                    .child("Formátovat")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        cx.stop_propagation();
+                        view.on_format_sql(&crate::FormatSql, window, cx);
+                    }))
+            })
             // G14 T10: settings gear — same `cx.stop_propagation()` pattern
             // as `dropdown_item`'s ★/✎ icon buttons so this click doesn't
             // also bubble to the row's dropdown-toggle handler above.

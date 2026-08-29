@@ -93,7 +93,9 @@ actions!(
         OpenAutocomplete,
         // Workspace T8 (Part S §5.2/§5.4): bound => save, unbound =>
         // save-as. Global, context `None`, same posture as `RunQuery`.
-        SaveScript
+        SaveScript,
+        /// Pretty-print the editor buffer (user request 2026-08-28).
+        FormatSql
     ]
 );
 
@@ -1657,8 +1659,44 @@ mod editor_guard {
         }
         None
     }
+
+    /// The second, UNCONDITIONAL mint — for rewriting the buffer into a
+    /// transformation of ITS OWN CURRENT TEXT.
+    ///
+    /// What [`with_editor_replaceable`] protects is „content from somewhere
+    /// else must not silently replace unsaved work". A self-rewrite is
+    /// categorically not that: nothing arrives from outside, so there is no
+    /// other content for the user's work to be lost TO, and prompting
+    /// „zahodit neuložené změny?" before formatting the very text they are
+    /// editing would be nonsense.
+    ///
+    /// The API is what keeps that honest: the caller never supplies text, it
+    /// supplies `rewrite: &str -> String` and this function feeds it the
+    /// live buffer. There is no parameter through which foreign content
+    /// could enter, so this cannot be quietly repurposed into a clobber —
+    /// which is why it is safe for it to skip the dirty check that the other
+    /// mint exists to enforce.
+    ///
+    /// It leaves the buffer DIRTY on purpose: a format is an edit like any
+    /// other, so the caption keeps its „ •" and Ctrl+S still has something
+    /// to do.
+    pub(crate) fn rewrite_buffer_in_place(
+        view: &mut AppView,
+        cx: &mut Context<AppView>,
+        rewrite: impl FnOnce(&str) -> String,
+    ) -> bool {
+        let before = view.sql.read(cx).text();
+        let after = rewrite(&before);
+        if after == before {
+            return false;
+        }
+        view.sql.update(cx, |input, cx| {
+            input.replace_buffer(&after, cx, BufferReplace(PhantomData));
+        });
+        true
+    }
 }
-use editor_guard::with_editor_replaceable;
+use editor_guard::{rewrite_buffer_in_place, with_editor_replaceable};
 
 mod save_guard {
     use crate::AppView;
@@ -5322,6 +5360,30 @@ impl AppView {
         cx.notify();
     }
 
+    /// Ctrl+Shift+F / the „Formátovat" button.
+    ///
+    /// Dialect comes from the ACTIVE connection's engine, so the same text
+    /// formats as T-SQL against MSSQL and as Postgres against pg — `[a b]`
+    /// is one identifier in the first and a subscript in the second. With no
+    /// active connection there is nothing to be right about, so it refuses
+    /// rather than guessing a dialect and reflowing the user's SQL by the
+    /// wrong rules.
+    fn on_format_sql(&mut self, _: &FormatSql, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        let Some(engine) = self.active_engine() else {
+            self.status = "error: formátování potřebuje aktivní připojení (určuje dialekt)".into();
+            cx.notify();
+            return;
+        };
+        let dialect = sql_dialect(engine);
+        let changed = rewrite_buffer_in_place(self, cx, |sql| dbc_core::format::format_sql(sql, dialect));
+        self.status =
+            if changed { "SQL naformátováno".into() } else { "SQL už je naformátované".into() };
+        cx.notify();
+    }
+
     /// Flips the schema tree between „by schema" and „by object kind" and
     /// persists the choice.
     ///
@@ -6581,6 +6643,13 @@ impl AppView {
             t.set_read_only(read_only, cx);
             t.set_admin_entry(admin_entry, cx);
         });
+        // The editor's keyword colouring is dialect-specific, so it rides
+        // the same context refresh as everything else that depends on the
+        // active connection — one place where „the context changed" is
+        // acted on, rather than a second hook that could be forgotten on a
+        // future switch path.
+        let dialect = self.active_engine().map(sql_dialect);
+        self.sql.update(cx, |input, cx| input.set_dialect(dialect, cx));
         self.push_active_scope_to_tree(cx);
         // Workspace T7: „is there a scripts root at all" travels with the
         // rest of the tree context. Pushing it never scans by itself —
@@ -11985,6 +12054,8 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_open_palette))
             .on_action(cx.listener(Self::on_open_autocomplete))
             .on_action(cx.listener(Self::on_save_script))
+            .on_action(cx.listener(Self::on_format_sql))
+            .on_action(cx.listener(Self::on_format_sql))
             .child(self.render_top_bar(cx))
             .child(body);
 
@@ -12414,6 +12485,9 @@ fn main() {
             // as `RunQuery`/`OpenPalette`. Bound => save; unbound =>
             // save-as. The chord was free repo-wide before this line.
             KeyBinding::new("ctrl-s", SaveScript, None),
+            // Ctrl+Shift+F: the shape every other editor uses for "format
+            // document". Ctrl+F is left free for a future find.
+            KeyBinding::new("ctrl-shift-f", FormatSql, None),
         ]);
         sql_input::bind_keys(cx);
         grid::bind_keys(cx);
@@ -16172,10 +16246,49 @@ more();");
     fn only_the_guarded_sites_may_replace_the_sql_editors_buffer() {
         audit(
             "replace_buffer",
-            &["bind_script", "perform_script_action"],
-            2,
+            &[
+                "bind_script",
+                "perform_script_action",
+                // 2 → 3 on 2026-08-29 for „Formátovat". Sanctioned after
+                // re-reading what this audit protects: content from
+                // ELSEWHERE must not replace unsaved work.
+                // `rewrite_buffer_in_place` takes no text — it takes
+                // `&str -> String` and feeds it the live buffer — so there
+                // is no parameter through which foreign content could
+                // arrive, and nothing for the user's work to be lost to.
+                // That is why it may skip the dirty check the other mint
+                // exists to enforce, and why sanctioning it is not a
+                // widening of this rail.
+                "rewrite_buffer_in_place",
+            ],
+            3,
             "route it through `AppView::editor_load_guarded` (Part S §5.5) or a bound \
              script's unsaved changes are destroyed silently, with no undo",
+        );
+    }
+
+    /// The sanction above is only sound while `rewrite_buffer_in_place`
+    /// cannot be handed text from outside. If someone ever gives it a
+    /// `&str` parameter, it becomes an unguarded clobber wearing a
+    /// sanctioned name — and the audit above would wave it straight
+    /// through, because the owner is on the list.
+    #[test]
+    fn the_in_place_rewrite_takes_a_transform_and_never_a_string() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("own source");
+        let lines = code_lines(&src);
+        let start = lines
+            .iter()
+            .position(|l| l.contains("fn rewrite_buffer_in_place"))
+            .expect("the function must exist for its sanction to mean anything");
+        let sig: String = lines[start..start + 6].join(" ");
+        assert!(
+            sig.contains("impl FnOnce(&str) -> String"),
+            "the transform parameter is what makes the sanction sound: {sig}"
+        );
+        assert!(
+            !sig.contains("text: &str") && !sig.contains("text: String"),
+            "a text parameter would make this an unguarded clobber: {sig}"
         );
     }
 

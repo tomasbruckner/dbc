@@ -299,6 +299,10 @@ struct CachedLine {
 pub struct SqlInput {
     focus_handle: FocusHandle,
     placeholder: SharedString,
+    /// Dialect of the ACTIVE connection, pushed by `main.rs`. `None` = no
+    /// active connection, so highlighting stays on tree-sitter's generic
+    /// grammar rather than guessing an engine's keyword set.
+    dialect: Option<dbc_core::Dialect>,
     buffer: MultilineBuffer,
     marked_range: Option<Range<usize>>,
     scroll_offset_lines: usize,
@@ -339,6 +343,7 @@ impl SqlInput {
         Self {
             focus_handle: cx.focus_handle(),
             placeholder: placeholder.into(),
+            dialect: None,
             buffer: MultilineBuffer::new(),
             marked_range: None,
             scroll_offset_lines: 0,
@@ -452,12 +457,13 @@ impl SqlInput {
         // background task cannot read a GPUI global. EditorSyntaxTheme is
         // Copy + Send precisely for this hop (grounding correction 2).
         let syntax = cx.theme().syntax;
+        let dialect = self.dialect;
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(60))
                 .await;
             let spans = cx
-                .background_spawn(async move { sql_highlight::highlight(&text, &syntax) })
+                .background_spawn(async move { sql_highlight::highlight(&text, &syntax, dialect) })
                 .await;
             this.update(cx, |this, cx| {
                 if this.highlight_generation == my_generation {
@@ -489,6 +495,17 @@ impl SqlInput {
     /// must mention this identifier. Only `AppView::bind_script` and
     /// `AppView::perform_script_action` may call it — both sit behind
     /// `AppView::editor_load_guarded` (Part S §5.5).
+    /// Pushed by `main.rs` whenever the active connection changes. Re-kicks
+    /// highlighting, because the same text colours differently under a
+    /// different dialect — that is the whole point.
+    pub fn set_dialect(&mut self, dialect: Option<dbc_core::Dialect>, cx: &mut Context<Self>) {
+        if self.dialect != dialect {
+            self.dialect = dialect;
+            self.kick_highlight(cx);
+            cx.notify();
+        }
+    }
+
     pub fn replace_buffer(
         &mut self,
         text: &str,

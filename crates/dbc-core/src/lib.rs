@@ -3,6 +3,7 @@ mod connection;
 mod ddl;
 pub mod erd;
 mod error;
+pub mod format;
 mod guards;
 mod params;
 mod schema;
