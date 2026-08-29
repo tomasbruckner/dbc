@@ -16,6 +16,7 @@ pub use config::{
     FavouriteObject, MssqlOptions, SshTunnelConfig, StateError, ThemeMode, TreeGrouping,
 };
 
+pub mod applog;
 pub mod fsutil;
 pub mod workspace;
 

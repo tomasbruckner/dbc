@@ -2651,6 +2651,18 @@ impl SchemaTree {
     }
 }
 
+/// The variant name of a [`TreeEvent`], for the diagnostic log.
+///
+/// Takes only the leading run of identifier characters from the `Debug`
+/// rendering, which for an enum is always the variant name — everything
+/// after it is payload, and payload is exactly what must not be logged
+/// (`InsertAtCursor` carries generated SQL, `CopyText` carries whatever was
+/// copied). Reading the name off `Debug` rather than hand-writing a 40-arm
+/// match means a new variant cannot be forgotten here.
+pub(crate) fn event_name(ev: &TreeEvent) -> String {
+    format!("{ev:?}").chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect()
+}
+
 impl Render for SchemaTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Sidebar rework: the multi-root flatten, fresh every frame (brief
@@ -3097,6 +3109,33 @@ macro_rules! flatten_sidebar_g {
 mod flatten_tests {
     use super::*;
     use dbc_core::{FkRef, IndexInfo};
+
+    /// The log records the NAME of a tree event and never its payload —
+    /// these pin that the extraction really does stop at the variant name,
+    /// including for the variants whose payload is generated SQL or copied
+    /// text.
+    #[test]
+    fn an_event_name_is_only_ever_an_identifier() {
+        let events = [
+            TreeEvent::RefreshRequested,
+            TreeEvent::InsertAtCursor { text: "SELECT * FROM [dbo].[t] -- {x}".into() },
+            TreeEvent::CopyText { what: "jméno".into(), text: "a b { c } \" d".into() },
+            TreeEvent::OpenErDiagram { schema: Some("dbo".into()) },
+        ];
+        for ev in events {
+            let name = event_name(&ev);
+            assert!(!name.is_empty(), "{ev:?} produced no name");
+            assert!(
+                name.chars().all(|c| c.is_alphanumeric() || c == '_'),
+                "{name:?} is not an identifier"
+            );
+        }
+        assert_eq!(event_name(&TreeEvent::RefreshRequested), "RefreshRequested");
+        assert_eq!(
+            event_name(&TreeEvent::InsertAtCursor { text: "SELECT 1".into() }),
+            "InsertAtCursor"
+        );
+    }
 
     fn col(name: &str, ty: &str) -> ColumnInfo {
         ColumnInfo { name: name.into(), data_type: ty.into(), nullable: false, default: None, is_pk: false, fk: None }

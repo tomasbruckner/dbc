@@ -358,6 +358,38 @@ const JOIN_MODIFIER: &[&str] = &["LEFT", "RIGHT", "INNER", "FULL", "CROSS", "NAT
 /// Anything it does not recognise is passed through with normalised
 /// spacing rather than reordered, which is why an unparseable fragment
 /// comes back intact instead of mangled.
+/// The kind of statement `sql` is, as one of a CLOSED set of keywords.
+///
+/// Exists for the diagnostic log, which records WHAT kind of statement ran
+/// but never the statement itself. The `&'static str` return is the
+/// mechanism, not a detail: every value it can produce is a literal in this
+/// function, so no fragment of the user's SQL — a table name, a WHERE
+/// literal, a password in an UPDATE — can reach the log through here. An
+/// unrecognised leading word is `"OTHER"`, deliberately, rather than being
+/// passed through.
+///
+/// Comments and whitespace before the statement are skipped; a leading
+/// `(SELECT …)` or a CTE reports `OTHER`/`WITH` rather than guessing.
+pub fn statement_kind(sql: &str) -> &'static str {
+    const KINDS: &[&str] = &[
+        "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH", "CREATE", "ALTER", "DROP",
+        "TRUNCATE", "GRANT", "REVOKE", "EXEC", "EXECUTE", "CALL", "BEGIN", "COMMIT", "ROLLBACK",
+        "SET", "SHOW", "EXPLAIN", "ANALYZE", "VACUUM", "PRAGMA", "USE", "DECLARE", "COPY",
+        "REFRESH", "REINDEX", "COMMENT", "VALUES", "TABLE",
+    ];
+    // Postgres is a neutral choice here: the three dialects agree on
+    // comment and whitespace syntax, which is all that is skipped before
+    // the first bare word.
+    let first = lex(sql, Dialect::Postgres)
+        .into_iter()
+        .find(|t| matches!(t.kind, TokKind::Word))
+        .map(|t| t.text.to_uppercase());
+    match first {
+        Some(w) => KINDS.iter().find(|k| **k == w).copied().unwrap_or("OTHER"),
+        None => "OTHER",
+    }
+}
+
 pub fn format_sql(sql: &str, dialect: Dialect) -> String {
     let toks = lex(sql, dialect);
     let sig: Vec<&Tok> = toks.iter().filter(|t| t.kind != TokKind::Ws).collect();
@@ -482,6 +514,50 @@ fn needs_space_before(t: &Tok, prev: Option<&Tok>) -> bool {
 /// The next significant WORD after `idx`, uppercased.
 fn next_word(sig: &[&Tok], idx: usize) -> Option<String> {
     sig.get(idx + 1).and_then(|t| t.word_upper())
+}
+
+#[cfg(test)]
+mod statement_kind_tests {
+    use super::statement_kind;
+
+    #[test]
+    fn it_names_the_leading_keyword() {
+        assert_eq!(statement_kind("select 1"), "SELECT");
+        assert_eq!(statement_kind("  
+	UPDATE t SET a = 1"), "UPDATE");
+        assert_eq!(statement_kind("-- a note
+/* another */ insert into t values (1)"), "INSERT");
+    }
+
+    /// The property the diagnostic log depends on: nothing the user typed
+    /// can come out of this function.
+    #[test]
+    fn an_unrecognised_statement_is_other_and_never_the_users_text() {
+        for sql in [
+            "",
+            "   ",
+            "-- only a comment",
+            "'a string literal'",
+            "\"quoted ident\"",
+            "s3cret_table_name",
+            "sp_who2",
+        ] {
+            let k = statement_kind(sql);
+            assert!(
+                !sql.to_uppercase().contains(k) || k == "OTHER",
+                "{sql:?} leaked {k:?}"
+            );
+        }
+        assert_eq!(statement_kind("s3cret_table_name"), "OTHER");
+        assert_eq!(statement_kind("'literal'"), "OTHER");
+    }
+
+    #[test]
+    fn a_password_in_an_update_cannot_reach_the_kind() {
+        let k = statement_kind("UPDATE users SET pw = 'hunter2' WHERE id = 1");
+        assert_eq!(k, "UPDATE");
+        assert!(!k.contains("hunter2"));
+    }
 }
 
 #[cfg(test)]

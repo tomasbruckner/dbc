@@ -286,7 +286,23 @@ impl AppConfig {
     /// call syntax — receiver rebinding, UFCS, a macro — reaches this
     /// writer without the corrupt-config question having been asked and
     /// answered against the actual file.
+    /// Persist the config, and record a failure in the diagnostic log.
+    ///
+    /// The logging lives HERE rather than at the six call sites because a
+    /// failed settings save is invisible until a restart quietly loses the
+    /// change — the exact class of problem the log exists for — and one
+    /// wrapper cannot be forgotten the way six call sites can.
     pub fn save(&self, path: &Path, guard: &ConfigSaveGuard) -> Result<(), StateError> {
+        let result = self.save_inner(path, guard);
+        if let Err(e) = &result {
+            crate::applog::log(crate::applog::Event::ConfigSaveFailed {
+                error: e.message.clone(),
+            });
+        }
+        result
+    }
+
+    fn save_inner(&self, path: &Path, guard: &ConfigSaveGuard) -> Result<(), StateError> {
         // RE-VERIFY NIT-1: the guard is proof about ONE file.
         //
         // The compare is EXACT BYTES, deliberately, and re-verify's own NIT

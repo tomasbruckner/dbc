@@ -5703,6 +5703,7 @@ impl AppView {
                         }
                     }
                 }
+                PaletteAction::ShowLog => self.open_log_tab(cx),
                 PaletteAction::OpenCompare => self.open_compare_dialog(cx),
                 PaletteAction::BackupDatabase => {
                     if let Some(id) = self.active_connection_id.clone() {
@@ -8539,6 +8540,7 @@ impl AppView {
         };
         self.tree.update(cx, |t, cx| t.begin_schema(&conn_id, &db, my_generation, cx));
         let rx = self.runner.fetch_schema(spec);
+        let started = std::time::Instant::now();
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |view, cx| {
@@ -8548,6 +8550,22 @@ impl AppView {
                     Err(_) => Err("fetch zrušen".to_string()),
                 };
                 let ok = result.is_ok();
+                {
+                    use dbc_state::applog::{log, Event};
+                    match &result {
+                        Ok(s) => log(Event::SchemaLoaded {
+                            conn: conn_id.clone(),
+                            db: Some(db.clone()),
+                            tables: s.tables.len(),
+                            ms: started.elapsed().as_millis() as u64,
+                        }),
+                        Err(e) => log(Event::SchemaFailed {
+                            conn: conn_id.clone(),
+                            db: Some(db.clone()),
+                            error: e.clone(),
+                        }),
+                    }
+                }
                 view.tree
                     .update(cx, |t, cx| t.finish_schema(&conn_id, &db, my_generation, result, cx));
                 // The old trigger_schema_fetch success-arm side effects,
@@ -9623,9 +9641,48 @@ impl AppView {
     /// `schema` is `None` for an engine/snapshot with no schema concept
     /// (SQLite) — matches every other `Option<String>` schema field in this
     /// codebase (strict, no "public" guessing).
+    /// Opens the tail of the diagnostic log as a text tab.
+    ///
+    /// The tail rather than the whole file: the cap is 2 MiB and the answer
+    /// to „what just happened" is always at the end. The path is the first
+    /// line so the file can be opened outside the app too — which is the
+    /// only way to read it after a crash.
+    fn open_log_tab(&mut self, cx: &mut Context<Self>) {
+        const TAIL_BYTES: usize = 64 * 1024;
+        let where_ = dbc_state::applog::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(log není k dispozici)".to_string());
+        let tail = dbc_state::applog::tail(TAIL_BYTES);
+        let body = if tail.trim().is_empty() {
+            format!("{where_}
+
+(zatím prázdný)")
+        } else {
+            format!("{where_}
+
+{tail}")
+        };
+        self.tabs.open(ResultTab {
+            id: 0,
+            title: "Log".to_string(),
+            pinned: false,
+            // Keyed, so repeatedly opening it reuses one tab instead of
+            // stacking copies of a file that changes under you.
+            preview_key: Some("applog".to_string()),
+            conn_identity: self.current_conn_identity(),
+            content: TabContent::Text { text: body, scroll_lines: 0 },
+        });
+        self.status = format!("Log: {where_}");
+        cx.notify();
+    }
+
     fn open_er_diagram(&mut self, schema: Option<String>, cx: &mut Context<Self>) {
         let Some(snapshot) = self.tree.read(cx).snapshot() else {
             self.status = "Nejprve načtěte schéma".to_string();
+            dbc_state::applog::log(dbc_state::applog::Event::Refused {
+                what: "er_diagram".into(),
+                reason: "no schema snapshot loaded".into(),
+            });
             cx.notify();
             return;
         };
@@ -9634,6 +9691,14 @@ impl AppView {
         // A diagram of nothing is a blank tab, and a blank tab reads as „the
         // click did nothing" (user report, 2026-08-29). Say so instead.
         if scoped.is_empty() {
+            dbc_state::applog::log(dbc_state::applog::Event::Refused {
+                what: "er_diagram".into(),
+                reason: format!(
+                    "no tables in schema {:?} ({} in snapshot)",
+                    schema,
+                    snapshot.tables.len()
+                ),
+            });
             self.status = match &schema {
                 Some(s) => format!("Schéma {s} nemá žádné tabulky — není co nakreslit"),
                 None => "Snímek schématu nemá žádné tabulky — není co nakreslit".to_string(),
@@ -10229,6 +10294,14 @@ impl AppView {
     /// tree header's "DDL" button via `SchemaTree::handle_generate_ddl`)
     /// just opens a read-only `Text` tab — no DB round-trip either way.
     fn on_tree_event(&mut self, _emitter: Entity<SchemaTree>, event: &TreeEvent, cx: &mut Context<Self>) {
+        // One line per tree/context-menu action, before it runs. This is
+        // the entry that answers „did my click even arrive?" — the question
+        // the log was added for. Only the variant NAME is recorded; the
+        // payload can carry generated SQL.
+        dbc_state::applog::log(dbc_state::applog::Event::Action {
+            action: crate::schema_tree::event_name(event),
+            target: String::new(),
+        });
         match event {
             // Sidebar rework (design §5 row 1): scope-checked — an
             // active-scope open runs directly (including its dirty-preview
@@ -12609,6 +12682,19 @@ mod plan_restore_tests {
 }
 
 fn main() {
+    // The log goes in the PROFILE directory, not the workspace: it
+    // describes what this machine did, and a workspace folder is meant to
+    // be shared. Same reasoning as `history.sqlite`, which also stays put.
+    //
+    // First statement in `main` on purpose — the panic hook is worth having
+    // installed before anything that can panic runs, since a GPUI app that
+    // panics leaves no window and no message behind.
+    dbc_state::applog::init(&dbc_state::workspace::profile_dir());
+    dbc_state::applog::install_panic_hook();
+    dbc_state::applog::log(dbc_state::applog::Event::Startup {
+        version: env!("CARGO_PKG_VERSION"),
+    });
+
     // CLI arg is now optional: back-compat direct-connect path (phase 0-2)
     // when present, otherwise the app starts with no active connection and
     // the user picks one from the top-bar switcher (Task 7).

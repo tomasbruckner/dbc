@@ -113,6 +113,21 @@ pub fn format_meta_line(entry: &HistoryEntry) -> (String, bool) {
     }
 }
 
+/// Both history recorders funnel through here, so every run that reaches
+/// history reaches the log too — and with the same information minus the
+/// SQL text.
+fn log_run(kind: &str, duration_ms: Option<i64>, row_count: Option<i64>, error: Option<&str>) {
+    use dbc_state::applog::{log, Event};
+    match error {
+        Some(e) => log(Event::QueryFailed { kind: kind.to_string(), error: e.to_string() }),
+        None => log(Event::QueryOk {
+            kind: kind.to_string(),
+            rows: row_count.unwrap_or(0).max(0) as usize,
+            ms: duration_ms.unwrap_or(0).max(0) as u64,
+        }),
+    }
+}
+
 impl AppView {
     /// Fire-and-forget history record, called from `run_query_with`'s
     /// `Finished`/`Failed` arms (main.rs) after every recorded run,
@@ -133,6 +148,11 @@ impl AppView {
         error: Option<&str>,
         cx: &mut Context<Self>,
     ) {
+        // The log entry is written whether or not history is available —
+        // a failed history open is exactly when you want the log — and it
+        // carries the statement KIND, never the statement (`statement_kind`
+        // returns a `&'static str` from a closed set for that reason).
+        log_run(dbc_core::format::statement_kind(sql), duration_ms, row_count, error);
         if let Some(h) = self.history.as_mut() {
             if h.add(sql, connection, started_at, duration_ms, row_count, error).is_ok() {
                 self.refresh_history_cache(cx);
@@ -160,6 +180,9 @@ impl AppView {
         kind: &str,
         cx: &mut Context<Self>,
     ) {
+        // `kind` here is one of this codebase's own literals („admin",
+        // „backup", „restore"), so it is safe to log as-is.
+        log_run(kind, duration_ms, row_count, error);
         if let Some(h) = self.history.as_mut() {
             if h.add_with_kind(sql, connection, started_at, duration_ms, row_count, error, kind).is_ok() {
                 self.refresh_history_cache(cx);
