@@ -5894,7 +5894,23 @@ impl AppView {
         let cursor = self.sql.read(cx).cursor();
         let suppressed = self.sql.read(cx).cursor_in_suppressed_span();
         let snapshot = self.tree.read(cx).snapshot();
+        let had_snapshot = snapshot.is_some();
         let candidates = autocomplete::candidates(&text, cursor, snapshot, true, suppressed);
+        // Ctrl+Space is an EXPLICIT ask, so silence is the wrong answer:
+        // every reason the popup stays shut is invisible from the outside
+        // (cursor inside a string, no schema loaded yet), which is exactly
+        // how „autocomplete is broken" gets reported for something that is
+        // working as designed. The typing trigger stays silent — a status
+        // line rewritten on every keystroke would be noise.
+        if candidates.is_empty() {
+            self.status = if suppressed {
+                "napovídání: kurzor je v řetězci nebo komentáři".into()
+            } else if !had_snapshot {
+                "napovídání: schéma není načtené — rozbalte databázi v panelu vlevo".into()
+            } else {
+                "napovídání: nic nevyhovuje".into()
+            };
+        }
         self.autocomplete =
             (!candidates.is_empty()).then(|| AutocompleteState { candidates, selected: 0 });
         // Keep the lazy-diff cache in sync so the SAME render's
@@ -12623,7 +12639,19 @@ fn main() {
         // connection roots + context (favourites/read_only/admin/scope/CLI
         // url), then — CLI-arg back-compat path (brief contract #6) — fire
         // the CLI slot's initial schema fetch, exactly like a switch does.
-        let _ = window_handle.update(cx, |view, _window, cx| {
+        let _ = window_handle.update(cx, |view, window, cx| {
+            // Focus the editor on startup. Without this the app opens with
+            // focus nowhere, so the first keystroke is swallowed and
+            // Ctrl+A, the arrow keys and autocomplete all appear BROKEN
+            // until the user happens to click into the editor — and none of
+            // them say why, because `refresh_autocomplete`'s first act is to
+            // drop the popup when the editor is not focused. A SQL client
+            // that opens ready to type is also just the right default.
+            //
+            // Startup only: forcing this every frame would fight the grid,
+            // the tree and every dialog for focus.
+            let editor_focus = view.sql.focus_handle(cx);
+            window.focus(&editor_focus, cx);
             let grouped = view.grouped_cache.clone();
             view.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
             // The tree starts on `TreeGrouping::Schema` and learns the saved
