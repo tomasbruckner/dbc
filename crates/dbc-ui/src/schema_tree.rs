@@ -36,8 +36,9 @@ use dbc_state::{ConnectionConfig, Engine, FavouriteObject, TreeGrouping};
 
 use crate::admin_panel::AdminEntry;
 use gpui::{
-    actions, div, prelude::*, px, uniform_list, AnyElement, App, ClickEvent, Context, EventEmitter,
-    FocusHandle, Focusable, Hsla, KeyBinding, KeyDownEvent, MouseButton, Window,
+    actions, anchored, deferred, div, prelude::*, px, uniform_list, AnyElement, App, ClickEvent,
+    Context, EventEmitter, FocusHandle, Focusable, Hsla, KeyBinding, KeyDownEvent, MouseButton,
+    Window,
 };
 
 use crate::theme::ActiveTheme;
@@ -2584,9 +2585,6 @@ impl SchemaTree {
         let theme = *cx.theme();
         let mut panel = div()
             .id("tree-context-menu")
-            .absolute()
-            .left(pos.x)
-            .top(pos.y)
             .w(px(240.))
             .py_1()
             .bg(theme.bg_panel)
@@ -2627,7 +2625,29 @@ impl SchemaTree {
                 }
             };
         }
-        panel.into_any_element()
+        // `deferred` + `anchored` rather than `.absolute()` inside the tree,
+        // for two reasons the first build got wrong (user report,
+        // 2026-08-29: the menu was sliced off at the sidebar's edge):
+        //
+        //   * a deferred draw carries NO content mask, so the menu paints
+        //     over the results pane instead of being clipped to the sidebar
+        //     it lives in;
+        //   * `pos` comes from a mouse event and is therefore in WINDOW
+        //     coordinates, which is what `anchored` (default
+        //     `AnchoredPositionMode::Window`) expects; `.absolute()` read
+        //     the same numbers as parent-relative and so drifted by the
+        //     height of everything above the tree.
+        //
+        // `snap_to_window_with_margin` is what keeps a menu opened near the
+        // bottom edge from running off the window.
+        deferred(
+            anchored()
+                .position(pos)
+                .snap_to_window_with_margin(px(8.))
+                .child(panel),
+        )
+        .with_priority(1)
+        .into_any_element()
     }
 }
 

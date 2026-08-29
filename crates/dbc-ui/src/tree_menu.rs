@@ -88,6 +88,32 @@ impl MenuCtx<'_> {
             .and_then(|r| r.ddl.clone())
     }
 
+    /// The single schema an ER diagram opened from a DATABASE row would
+    /// mean, or `None` when the question has no one answer.
+    ///
+    /// `None` in three distinct cases, all of which must omit the item
+    /// rather than guess:
+    ///   * the row is not the ACTIVE database — the snapshot then describes
+    ///     a different database and the diagram would be of the wrong one;
+    ///   * the snapshot has no tables — an empty diagram is not an answer;
+    ///   * the snapshot spans several schemas — the diagram is per-schema by
+    ///     design (§3 CURATION), so the schema rows own that case.
+    ///
+    /// The `Some(None)` arm is a real schema-less engine (SQLite), matching
+    /// `AppView::resolve_er_diagram_schema`, which does this for the
+    /// palette's zero-argument entry point.
+    fn er_diagram_schema(&self, db: &str) -> Option<Option<String>> {
+        if self.database.as_deref() != Some(db) {
+            return None;
+        }
+        let snapshot = self.snapshot?;
+        let mut schemas: Vec<Option<String>> =
+            snapshot.tables.iter().map(|t| t.schema.clone()).collect();
+        schemas.sort();
+        schemas.dedup();
+        if schemas.len() == 1 { schemas.into_iter().next() } else { None }
+    }
+
     fn is_favourite(&self, kind: &str, schema: &str, name: &str) -> bool {
         self.favourites.iter().any(|f| {
             f.kind == kind
@@ -180,9 +206,18 @@ fn database_menu(conn_id: &str, db: &str, ctx: &MenuCtx) -> Vec<MenuEntry> {
             TreeEvent::SwitchToDatabase { conn_id: id.clone(), db: Some(dbn.clone()) },
         ),
         MenuEntry::Separator,
-        item("ER diagram…", TreeEvent::OpenErDiagram { schema: None }),
-        item("Záloha…", TreeEvent::BackupFor { conn_id: id.clone(), db: Some(dbn.clone()) }),
     ];
+    // Was `schema: None` hardcoded, which on any engine WITH schemas
+    // filtered the snapshot down to zero tables and opened a blank diagram
+    // (user report, 2026-08-29: „nic se neděje"). A database row can only
+    // name a schema when there is exactly one to name.
+    if let Some(schema) = ctx.er_diagram_schema(db) {
+        out.push(item("ER diagram…", TreeEvent::OpenErDiagram { schema }));
+    }
+    out.push(item(
+        "Záloha…",
+        TreeEvent::BackupFor { conn_id: id.clone(), db: Some(dbn.clone()) },
+    ));
     if !ctx.read_only {
         out.push(item(
             "Obnovit ze zálohy…",
@@ -677,6 +712,91 @@ mod tests {
             database: None,
         });
         assert!(labels(&m).contains(&"Odebrat z oblíbených".to_string()));
+    }
+
+    /// A database row whose schema snapshot is loaded and holds exactly one
+    /// schema offers the ER diagram FOR THAT SCHEMA.
+    ///
+    /// Regression: this used to emit `schema: None` unconditionally, which
+    /// `AppView::open_er_diagram` filters the snapshot by — on MSSQL every
+    /// table is `Some("dbo")`, so the filter matched nothing and the tab
+    /// opened empty. It looked to the user like the click did nothing at
+    /// all, which is why the assert is on the payload and not on the label.
+    #[test]
+    fn er_diagram_from_a_database_row_names_the_schema_it_will_draw() {
+        let s = snap();
+        let mut c = ctx(&s, false);
+        c.database = Some("prod".into());
+        let row = SidebarRow::Database { conn_id: "c1".into(), db: "prod".into() };
+        let m = menu_for(&row, &c);
+        let ev = m.iter().find_map(|e| match e {
+            MenuEntry::Item(i) if i.label.starts_with("ER diagram") => Some(i.event.clone()),
+            _ => None,
+        });
+        assert_eq!(ev, Some(TreeEvent::OpenErDiagram { schema: Some("dbo".into()) }));
+    }
+
+    /// SQLite has no schemas: `Some(None)` is a real answer, not a refusal.
+    #[test]
+    fn er_diagram_from_a_schemaless_database_row_passes_none() {
+        let mut s = SchemaSnapshot::default();
+        s.tables.push(TableInfo { schema: None, name: "t".into(), ..Default::default() });
+        let mut c = ctx(&s, false);
+        c.database = Some("main".into());
+        let row = SidebarRow::Database { conn_id: "c1".into(), db: "main".into() };
+        let m = menu_for(&row, &c);
+        assert!(m.iter().any(
+            |e| matches!(e, MenuEntry::Item(i) if i.event == TreeEvent::OpenErDiagram { schema: None })
+        ));
+    }
+
+    /// Three ways the question „which schema?" has no single answer. Each
+    /// must omit the item — an ER entry that draws the wrong database, or
+    /// nothing at all, is worse than no entry.
+    #[test]
+    fn a_database_row_offers_no_er_diagram_when_the_schema_is_ambiguous() {
+        let s = snap();
+
+        // (a) not the active database — the snapshot is another database's.
+        let mut other = ctx(&s, false);
+        other.database = Some("prod".into());
+        let row = SidebarRow::Database { conn_id: "c1".into(), db: "staging".into() };
+        assert!(!labels(&menu_for(&row, &other)).iter().any(|l| l.starts_with("ER diagram")));
+
+        // (b) no snapshot loaded yet.
+        let mut unloaded = ctx(&s, false);
+        unloaded.snapshot = None;
+        unloaded.database = Some("prod".into());
+        let row = SidebarRow::Database { conn_id: "c1".into(), db: "prod".into() };
+        assert!(!labels(&menu_for(&row, &unloaded)).iter().any(|l| l.starts_with("ER diagram")));
+
+        // (c) several schemas — the schema rows own that case.
+        let mut multi = snap();
+        multi.tables.push(TableInfo {
+            schema: Some("sales".into()),
+            name: "leads".into(),
+            ..Default::default()
+        });
+        let mut c = ctx(&multi, false);
+        c.database = Some("prod".into());
+        let row = SidebarRow::Database { conn_id: "c1".into(), db: "prod".into() };
+        assert!(!labels(&menu_for(&row, &c)).iter().any(|l| l.starts_with("ER diagram")));
+    }
+
+    /// The separator shape has to hold with the ER item present too — the
+    /// row above pushes it in conditionally.
+    #[test]
+    fn an_active_database_row_still_has_a_well_formed_menu() {
+        let s = snap();
+        let mut c = ctx(&s, false);
+        c.database = Some("prod".into());
+        let m = menu_for(&SidebarRow::Database { conn_id: "c1".into(), db: "prod".into() }, &c);
+        assert!(matches!(m.first(), Some(MenuEntry::Item(_))));
+        assert!(matches!(m.last(), Some(MenuEntry::Item(_))));
+        assert!(
+            !m.windows(2)
+                .any(|w| matches!((&w[0], &w[1]), (MenuEntry::Separator, MenuEntry::Separator)))
+        );
     }
 
     /// Dropping a database is intentionally not offered here — „Správa

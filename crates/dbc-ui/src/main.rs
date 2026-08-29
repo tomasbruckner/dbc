@@ -9631,6 +9631,16 @@ impl AppView {
         };
         let scoped: Vec<TableInfo> =
             snapshot.tables.iter().filter(|t| t.schema == schema).cloned().collect();
+        // A diagram of nothing is a blank tab, and a blank tab reads as „the
+        // click did nothing" (user report, 2026-08-29). Say so instead.
+        if scoped.is_empty() {
+            self.status = match &schema {
+                Some(s) => format!("Schéma {s} nemá žádné tabulky — není co nakreslit"),
+                None => "Snímek schématu nemá žádné tabulky — není co nakreslit".to_string(),
+            };
+            cx.notify();
+            return;
+        }
         let (scoped, hidden) = er_diagram_view::cap_tables(scoped, er_diagram_view::DIAGRAM_TABLE_CAP);
         let truncated_notice = hidden.map(|hidden| {
             format!(
