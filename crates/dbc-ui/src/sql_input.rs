@@ -535,6 +535,20 @@ impl SqlInput {
         }
     }
 
+    /// Insert `text` at the cursor (the tree's „Vložit do editoru").
+    ///
+    /// Not a clobber and so not on the `BufferReplace` rail: an insert can
+    /// only ADD to the buffer, so there is no unsaved work for it to
+    /// destroy — the same reasoning that lets `accept_completion` mutate
+    /// text without a permit.
+    pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.buffer.insert(text);
+        self.marked_range = None;
+        self.follow_cursor = true;
+        self.kick_highlight(cx);
+        cx.notify();
+    }
+
     pub fn replace_buffer(
         &mut self,
         text: &str,

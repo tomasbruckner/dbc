@@ -40,6 +40,7 @@ mod sandbox;
 mod schema_tree;
 mod scripts;
 mod sql_highlight;
+mod tree_menu;
 mod sql_input;
 mod tabs;
 mod text_model;
@@ -1265,6 +1266,10 @@ enum ApplyTarget {
     Admin {
         panel: Entity<admin_panel::AdminPanel>,
     },
+    /// A `DROP`/`TRUNCATE` staged from the sidebar's context menu. Nothing
+    /// to re-run afterwards — the object is gone, so success just refreshes
+    /// the schema so the tree stops showing it.
+    Tree,
 }
 
 /// G5 Task 4 (G10 T4: generalized for the admin Apply flow too): state for
@@ -2096,6 +2101,10 @@ struct AppView {
     /// drag STARTED, not against the previous move event, or rounding
     /// accumulates and the panel creeps away from the pointer.
     sidebar_resizing: Option<(f32, f32)>,
+    /// A context-menu action that needs a `Window` (dialog focus), parked
+    /// by the cx-only tree subscription and drained at the top of `render`.
+    /// Same shape as the queued cross-context preview open.
+    pending_menu_action: Option<TreeEvent>,
     /// Sidebar rework: bumped on every db-list/schema-slot fetch dispatch;
     /// a result only applies if the generation still matches
     /// (last-dispatched wins — the slot state machines in schema_tree.rs
@@ -6666,6 +6675,7 @@ impl AppView {
         // future switch path.
         let dialect = self.active_engine().map(sql_dialect);
         self.sql.update(cx, |input, cx| input.set_dialect(dialect, cx));
+        self.tree.update(cx, |t, cx| t.set_dialect(dialect, cx));
         self.push_active_scope_to_tree(cx);
         // Workspace T7: „is there a scripts root at all" travels with the
         // rest of the tree context. Pushing it never scans by itself —
@@ -10020,6 +10030,17 @@ impl AppView {
                                 };
                                 view.run_query_with(sql, Some(preview), true, cx);
                             }
+                            ApplyTarget::Tree => {
+                                view.status = "provedeno".into();
+                                // The dropped/emptied object must leave the
+                                // tree, or the next click acts on something
+                                // that no longer exists.
+                                if let (Some(id), Some(db)) =
+                                    (view.active_connection_id.clone(), view.effective_database())
+                                {
+                                    view.start_schema_slot_fetch(id, db, cx);
+                                }
+                            }
                             ApplyTarget::Admin { panel } => {
                                 // G10 T4: clears the panel's staged sets and
                                 // re-requests the active sub-view's catalog
@@ -10321,7 +10342,165 @@ impl AppView {
             TreeEvent::ScriptDelete { rel, is_dir } => {
                 self.open_script_delete_modal(rel.clone(), *is_dir, cx)
             }
+
+            // --- Context menu (2026-08-29) ---
+            TreeEvent::CopyText { what, text } => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                self.status = format!("{what} zkopírováno");
+                cx.notify();
+            }
+            TreeEvent::InsertAtCursor { text } => {
+                let text = text.clone();
+                self.sql.update(cx, |input, cx| input.insert_text(&text, cx));
+                self.status = "vloženo do editoru".into();
+                cx.notify();
+            }
+            TreeEvent::GenerateSql { kind, sql } => {
+                let sql = sql.clone();
+                let changed = rewrite_buffer_in_place(self, cx, move |_| sql);
+                self.status = match kind {
+                    schema_tree::GenKind::Select if changed => "SELECT vygenerován".into(),
+                    schema_tree::GenKind::Insert if changed => "INSERT vygenerován".into(),
+                    schema_tree::GenKind::Update if changed => "UPDATE vygenerován".into(),
+                    _ => "editor už obsahuje tento dotaz".into(),
+                };
+                cx.notify();
+            }
+            TreeEvent::OpenPreviewHere { schema, table } => {
+                self.open_table_preview(schema.clone(), table.clone(), cx)
+            }
+            TreeEvent::CountRows { schema, table } => self.run_count_rows(schema.clone(), table.clone(), cx),
+            TreeEvent::OpenMonitorFor { .. } => self.open_monitor_tab(cx),
+            TreeEvent::OpenCompareFor { .. } => self.open_compare_dialog(cx),
+            TreeEvent::ExportCsv { schema, table } => {
+                // Export runs off a RESULT, not off a table name, so the
+                // honest thing is to open the data first — the grid's own
+                // „Export" is then one click away and exports exactly what
+                // is on screen, rather than a second, silently different
+                // extraction path.
+                self.open_table_preview(schema.clone(), table.clone(), cx);
+                self.status = "data otevřena — export je v panelu výsledku".into();
+                cx.notify();
+            }
+            // These need a `Window` (dialog focus) and this subscription is
+            // cx-only, so they are parked and drained at the top of
+            // `render`, the same shape the queued cross-context open uses.
+            TreeEvent::BackupFor { .. }
+            | TreeEvent::RestoreFor { .. }
+            | TreeEvent::EditConnection { .. }
+            | TreeEvent::DropObject { .. }
+            | TreeEvent::TruncateTable { .. } => {
+                self.pending_menu_action = Some(event.clone());
+                cx.notify();
+            }
         }
+    }
+
+    /// „Počet řádků" — runs `SELECT COUNT(*)` through the normal guarded
+    /// pipeline WITHOUT touching the editor's text, the same posture as a
+    /// table preview. `bypass_auto_limit` because a count returns one row
+    /// and an appended `LIMIT` would be noise in the history entry.
+    fn run_count_rows(&mut self, schema: Option<String>, table: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.active_engine() else {
+            self.status = "error: není aktivní připojení".into();
+            cx.notify();
+            return;
+        };
+        let target =
+            dbc_core::quote_qualified_d(sql_dialect(engine), schema.as_deref(), &table);
+        self.run_query_with(format!("SELECT COUNT(*) FROM {target}"), None, true, cx);
+    }
+
+    /// Drains [`AppView::pending_menu_action`]. Called from `render`, which
+    /// is where a `Window` exists.
+    fn perform_pending_menu_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(event) = self.pending_menu_action.take() else {
+            return;
+        };
+        match event {
+            TreeEvent::BackupFor { conn_id, .. } => self.open_backup_dialog(conn_id, window, cx),
+            TreeEvent::RestoreFor { conn_id, .. } => self.open_restore_dialog(conn_id, window, cx),
+            TreeEvent::EditConnection { conn_id } => {
+                let cfg = self.config.connections.iter().find(|c| c.id == conn_id).cloned();
+                match cfg {
+                    Some(cfg) => self.open_connection_dialog(Some(cfg), window, cx),
+                    // The row was built from this list, so a miss means the
+                    // config changed under the open menu.
+                    None => {
+                        self.status = "error: připojení už neexistuje".into();
+                        cx.notify();
+                    }
+                }
+            }
+            TreeEvent::DropObject { kind, schema, name } => {
+                self.open_destructive_confirm(
+                    |d| tree_menu::drop_sql(kind, d, schema.as_deref(), &name),
+                    format!("Objekt {name} bude nenávratně odstraněn."),
+                    window,
+                    cx,
+                );
+            }
+            TreeEvent::TruncateTable { schema, table } => {
+                self.open_destructive_confirm(
+                    |d| tree_menu::truncate_sql(d, schema.as_deref(), &table),
+                    format!("Všechna data v tabulce {table} budou nenávratně smazána."),
+                    window,
+                    cx,
+                );
+            }
+            // Every other variant is handled synchronously in
+            // `on_tree_event` and never parked.
+            _ => {}
+        }
+    }
+
+    /// Opens the SHARED Apply confirm dialog for a destructive statement.
+    ///
+    /// This is the whole safety story for the menu's `DROP`/`TRUNCATE`
+    /// items: they do not execute, they stage exactly one statement into the
+    /// dialog that already exists for sandbox and admin writes, which shows
+    /// the SQL verbatim and runs it through `run_write_transaction` — the
+    /// path that carries the read-only guard and the transaction
+    /// discipline. There is no second execution route.
+    ///
+    /// `build` takes the dialect rather than a finished string so the SQL
+    /// cannot be built before we know there IS an active connection to
+    /// build it for.
+    fn open_destructive_confirm(
+        &mut self,
+        build: impl FnOnce(dbc_core::Dialect) -> String,
+        warning: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.active_engine() else {
+            self.status = "error: není aktivní připojení".into();
+            cx.notify();
+            return;
+        };
+        if self.active_read_only() {
+            // Belt-and-braces: `tree_menu` already omits these items on a
+            // read-only connection, so reaching here means the flag changed
+            // between the menu opening and the click.
+            self.status = "error: připojení je jen pro čtení".into();
+            cx.notify();
+            return;
+        }
+        let sql = build(sql_dialect(engine));
+        let statements = vec![admin_sql::WriteStatement::from((sql.clone(), None))];
+        let focus_handle = cx.focus_handle();
+        self.apply_dialog = Some(ApplyDialogState {
+            target: ApplyTarget::Tree,
+            statements,
+            sql_text: sql,
+            warning: Some(warning),
+            conn_identity: self.current_conn_identity(),
+            running: false,
+            error: None,
+            focus_handle: focus_handle.clone(),
+        });
+        window.focus(&focus_handle, cx);
+        cx.notify();
     }
 
     /// Tab strip between the SQL editor and result content: title +
@@ -11903,6 +12082,11 @@ impl Render for AppView {
                 window.focus(&self.modal_focus_handle, cx);
             }
         }
+        // Context-menu actions that need a `Window` were parked by the
+        // cx-only tree subscription; this is the first point in the frame
+        // where one exists.
+        self.perform_pending_menu_action(window, cx);
+
         // G6 T7: lazy-diff typing-trigger recompute, BEFORE the popup is
         // drawn below (design §2 grounding) — then sync the flag T5's
         // `SqlInput::up`/`down`/`newline` check to decide whether to
@@ -12606,6 +12790,7 @@ fn main() {
                             tree_visible: true,
                             sidebar_width,
                             sidebar_resizing: None,
+                            pending_menu_action: None,
                             sidebar_fetch_generation: 0,
                             compare_fetch_generation: 0,
                             history,

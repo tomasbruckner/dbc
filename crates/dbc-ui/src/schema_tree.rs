@@ -87,6 +87,7 @@ pub enum NodeId {
 
 /// Emitted by `SchemaTree` (`EventEmitter<TreeEvent>`) for the things it
 /// can't act on itself — `main.rs` subscribes and handles them.
+#[derive(Debug, Clone, PartialEq)]
 pub enum TreeEvent {
     /// WIDENED (sidebar rework, design §5 row 1): carries the scope of the
     /// row that emitted it, so `main.rs` can switch-then-open across
@@ -176,6 +177,58 @@ pub enum TreeEvent {
     /// T10 sweep: allow removed, owner Task 9 landed
     /// (`start_script_delete`).
     ScriptDelete { rel: String, is_dir: bool },
+
+    // --- Context menu (2026-08-29). Everything below is emitted ONLY from
+    // a right-click menu; see `tree_menu::menu_for` for what appears where.
+    /// Put `text` on the clipboard. `what` names it for the status line
+    /// („jméno zkopírováno"), so one event serves every copy item instead
+    /// of one variant per thing copied.
+    CopyText { what: String, text: String },
+    /// Insert `text` at the editor's cursor (column names).
+    InsertAtCursor { text: String },
+    /// Replace the editor buffer with generated SQL. `kind` is carried for
+    /// the status line only — `sql` is already built, by
+    /// `tree_menu::generate_sql`, because building it needs the snapshot
+    /// and the dialect, which the tree has and `main.rs` would have to
+    /// re-derive.
+    GenerateSql { kind: GenKind, sql: String },
+    /// `SELECT COUNT(*)` against one table.
+    CountRows { schema: Option<String>, table: String },
+    ExportCsv { schema: Option<String>, table: String },
+    OpenMonitorFor { conn_id: String },
+    OpenCompareFor { conn_id: String },
+    BackupFor { conn_id: String, db: Option<String> },
+    RestoreFor { conn_id: String, db: Option<String> },
+    EditConnection { conn_id: String },
+    /// A destructive statement. Emitting this NEVER executes anything: it
+    /// opens the shared Apply confirm dialog with the exact SQL, which is
+    /// this codebase's rule for every write path.
+    DropObject { kind: DropKind, schema: Option<String>, name: String },
+    TruncateTable { schema: Option<String>, table: String },
+    /// Preview one table in the ACTIVE scope (the menu already knows the
+    /// row it was opened on, so unlike `OpenPreview` it carries no
+    /// conn/db).
+    OpenPreviewHere { schema: Option<String>, table: String },
+}
+
+/// Which `DROP` to build. Kept as an enum rather than a string so adding an
+/// object type cannot silently fall through to the wrong keyword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropKind {
+    Table,
+    View,
+    Routine,
+    Trigger,
+    Index,
+    Sequence,
+}
+
+/// Which skeleton `tree_menu::generate_sql` produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenKind {
+    Select,
+    Insert,
+    Update,
 }
 
 /// One visible row: `(id, depth, label, is_expandable)`.
@@ -1584,6 +1637,14 @@ pub struct SchemaTree {
     /// startup and on every toggle, so the tree holds no second source of
     /// truth for it.
     grouping: TreeGrouping,
+    /// Active connection's dialect, pushed by `main.rs` — the context menu
+    /// needs it to quote generated SQL.
+    dialect: Option<dbc_core::Dialect>,
+    /// Open right-click menu: where it was opened, and what it holds.
+    /// Built ONCE at open time from `tree_menu::menu_for`, never recomputed
+    /// while open — the menu must act on the row it was opened on, even if
+    /// a background refresh changes the tree underneath it.
+    context_menu: Option<(gpui::Point<gpui::Pixels>, Vec<crate::tree_menu::MenuEntry>)>,
     /// Per-connection lazy sidebar state, keyed by connection id. An id
     /// missing from the map renders as `NotLoaded` (see `flatten_sidebar`),
     /// but `sync_connections` keeps an entry per saved connection so
@@ -1663,6 +1724,8 @@ impl SchemaTree {
             // `AppConfig::tree_grouping`; the original shape is the safe
             // value to hold for the frames before that lands.
             grouping: TreeGrouping::Schema,
+            dialect: None,
+            context_menu: None,
             grouped: crate::connections_ui::GroupedConnections::default(),
             conns: HashMap::new(),
             lru: Vec::new(),
@@ -2413,6 +2476,42 @@ impl SchemaTree {
     /// Pushed by `main.rs`. Changing this re-flattens on the next render;
     /// no fetch is involved, because both modes are the same snapshot drawn
     /// differently.
+    pub fn set_dialect(&mut self, dialect: Option<dbc_core::Dialect>, cx: &mut Context<Self>) {
+        if self.dialect != dialect {
+            self.dialect = dialect;
+            cx.notify();
+        }
+    }
+
+    /// Builds the menu for `row` and opens it at `pos`.
+    fn open_context_menu(
+        &mut self,
+        row: &SidebarRow,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let (conn_id, database) = match self.active_scope.as_ref() {
+            Some(s) => (s.conn_id.clone(), (!s.db.is_empty()).then(|| s.db.clone())),
+            None => (String::new(), None),
+        };
+        let entries = crate::tree_menu::menu_for(
+            row,
+            &crate::tree_menu::MenuCtx {
+                read_only: self.read_only,
+                dialect: self.dialect,
+                snapshot: self.snapshot(),
+                favourites: &self.favourites,
+                conn_id: &conn_id,
+                database,
+            },
+        );
+        // An empty menu means „this row has no actions"; opening an empty
+        // box would be worse than doing nothing.
+        self.context_menu = (!entries.is_empty()).then_some((pos, entries));
+        self.selected = Some(row.clone());
+        cx.notify();
+    }
+
     pub fn set_grouping(&mut self, grouping: TreeGrouping, cx: &mut Context<Self>) {
         if self.grouping != grouping {
             self.grouping = grouping;
@@ -2468,6 +2567,68 @@ fn script_icon(
             emit(cx);
         }))
         .into_any_element()
+}
+
+impl SchemaTree {
+    /// Draws the open context menu.
+    ///
+    /// `.occlude()` so a click inside the menu never also reaches the row
+    /// beneath it, and `on_mouse_down_out` so a click anywhere else closes
+    /// it — the two halves every overlay in this codebase pairs.
+    fn render_context_menu(
+        &mut self,
+        pos: gpui::Point<gpui::Pixels>,
+        entries: Vec<crate::tree_menu::MenuEntry>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = *cx.theme();
+        let mut panel = div()
+            .id("tree-context-menu")
+            .absolute()
+            .left(pos.x)
+            .top(pos.y)
+            .w(px(240.))
+            .py_1()
+            .bg(theme.bg_panel)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _w, cx| {
+                this.context_menu = None;
+                cx.notify();
+            }));
+
+        for (ix, entry) in entries.into_iter().enumerate() {
+            panel = match entry {
+                crate::tree_menu::MenuEntry::Separator => panel.child(
+                    div().h(px(1.)).my_1().mx_2().bg(theme.border),
+                ),
+                crate::tree_menu::MenuEntry::Item(item) => {
+                    let event = item.event.clone();
+                    panel.child(
+                        div()
+                            .id(("tree-menu-item", ix))
+                            .px_3()
+                            .py_1()
+                            .cursor_pointer()
+                            .text_color(if item.danger { theme.danger } else { theme.text_primary })
+                            .hover(|st| st.bg(theme.bg_hover))
+                            .child(item.label)
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                // Close FIRST: several of these open a
+                                // modal, and a menu left on screen behind a
+                                // dialog is both ugly and clickable.
+                                this.context_menu = None;
+                                cx.emit(event.clone());
+                                cx.notify();
+                            })),
+                    )
+                }
+            };
+        }
+        panel.into_any_element()
+    }
 }
 
 impl Render for SchemaTree {
@@ -2816,8 +2977,15 @@ impl Render for SchemaTree {
                             label
                         };
 
+                        let menu_row = row_id.clone();
                         let mut row = div()
                             .id(("tree-row", ix))
+                            .on_mouse_down(
+                                gpui::MouseButton::Right,
+                                cx.listener(move |this, e: &gpui::MouseDownEvent, _w, cx| {
+                                    this.open_context_menu(&menu_row, e.position, cx);
+                                }),
+                            )
                             .flex()
                             .flex_row()
                             .items_center()
@@ -2888,6 +3056,10 @@ impl Render for SchemaTree {
             )
             .flex_1(),
         );
+
+        if let Some((pos, entries)) = self.context_menu.clone() {
+            root = root.child(self.render_context_menu(pos, entries, cx));
+        }
 
         root
     }
