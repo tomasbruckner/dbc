@@ -75,6 +75,23 @@ actions!(
         SelectUp,
         SelectDown,
         SelectAll,
+        // Windows text-editing shortcuts the editor was missing (user
+        // request 2026-08-29). Word motion, document motion, line-extent
+        // selection and word deletion — the set every Windows text field
+        // has, and whose absence is felt the moment a query is longer than
+        // one line.
+        WordLeft,
+        WordRight,
+        SelectWordLeft,
+        SelectWordRight,
+        DocStart,
+        DocEnd,
+        SelectDocStart,
+        SelectDocEnd,
+        SelectHome,
+        SelectEnd,
+        DeleteWordLeft,
+        DeleteWordRight,
         Home,
         End,
         Newline,
@@ -110,6 +127,18 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-down", SelectDown, None),
         KeyBinding::new("cmd-a", SelectAll, None),
         KeyBinding::new("ctrl-a", SelectAll, None),
+        KeyBinding::new("ctrl-left", WordLeft, None),
+        KeyBinding::new("ctrl-right", WordRight, None),
+        KeyBinding::new("ctrl-shift-left", SelectWordLeft, None),
+        KeyBinding::new("ctrl-shift-right", SelectWordRight, None),
+        KeyBinding::new("ctrl-home", DocStart, None),
+        KeyBinding::new("ctrl-end", DocEnd, None),
+        KeyBinding::new("ctrl-shift-home", SelectDocStart, None),
+        KeyBinding::new("ctrl-shift-end", SelectDocEnd, None),
+        KeyBinding::new("shift-home", SelectHome, None),
+        KeyBinding::new("shift-end", SelectEnd, None),
+        KeyBinding::new("ctrl-backspace", DeleteWordLeft, None),
+        KeyBinding::new("ctrl-delete", DeleteWordRight, None),
         KeyBinding::new("cmd-v", Paste, None),
         KeyBinding::new("ctrl-v", Paste, None),
         KeyBinding::new("cmd-c", Copy, None),
@@ -642,6 +671,76 @@ impl SqlInput {
     fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.move_down(true);
         self.follow_cursor = true;
+        cx.notify();
+    }
+
+    fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_word_and_notify(false, false, cx);
+    }
+    fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_word_and_notify(true, false, cx);
+    }
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_word_and_notify(false, true, cx);
+    }
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_word_and_notify(true, true, cx);
+    }
+
+    /// One body for all four word motions — the four handlers above differ
+    /// only in two booleans, and writing four bodies is how three of them
+    /// end up subtly different from the fourth.
+    fn move_word_and_notify(&mut self, forward: bool, extend: bool, cx: &mut Context<Self>) {
+        self.buffer.move_word(forward, extend);
+        self.follow_cursor = true;
+        cx.notify();
+    }
+
+    fn doc_start(&mut self, _: &DocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_doc_and_notify(false, false, cx);
+    }
+    fn doc_end(&mut self, _: &DocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_doc_and_notify(true, false, cx);
+    }
+    fn select_doc_start(&mut self, _: &SelectDocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_doc_and_notify(false, true, cx);
+    }
+    fn select_doc_end(&mut self, _: &SelectDocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_doc_and_notify(true, true, cx);
+    }
+
+    fn move_doc_and_notify(&mut self, to_end: bool, extend: bool, cx: &mut Context<Self>) {
+        self.buffer.move_document(to_end, extend);
+        self.follow_cursor = true;
+        cx.notify();
+    }
+
+    fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.buffer.move_home(true);
+        self.follow_cursor = true;
+        cx.notify();
+    }
+    fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.buffer.move_end(true);
+        self.follow_cursor = true;
+        cx.notify();
+    }
+
+    fn delete_word_left(&mut self, _: &DeleteWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.delete_word_and_notify(false, cx);
+    }
+    fn delete_word_right(&mut self, _: &DeleteWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.delete_word_and_notify(true, cx);
+    }
+
+    fn delete_word_and_notify(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.buffer.delete_word(forward);
+        self.marked_range = None;
+        self.follow_cursor = true;
+        // A deletion changes the text, so highlighting must be recomputed —
+        // the motion handlers above deliberately do NOT kick it, since
+        // moving the cursor cannot change what the colours should be.
+        self.kick_highlight(cx);
         cx.notify();
     }
 
@@ -1263,6 +1362,18 @@ impl Render for SqlInput {
             .on_action(cx.listener(Self::select_up))
             .on_action(cx.listener(Self::select_down))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::doc_start))
+            .on_action(cx.listener(Self::doc_end))
+            .on_action(cx.listener(Self::select_doc_start))
+            .on_action(cx.listener(Self::select_doc_end))
+            .on_action(cx.listener(Self::select_home))
+            .on_action(cx.listener(Self::select_end))
+            .on_action(cx.listener(Self::delete_word_left))
+            .on_action(cx.listener(Self::delete_word_right))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
             .on_action(cx.listener(Self::newline))

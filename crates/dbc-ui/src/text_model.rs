@@ -61,6 +61,29 @@ pub struct MultilineBuffer {
 }
 
 #[allow(dead_code)] // full surface lands in the editor element (G1 Task 4)
+#[allow(dead_code)] // full surface lands in the editor element (G1 Task 4)
+/// Character classes for word motion: a word run, a whitespace run, or a
+/// run of anything else (operators, punctuation). Grouping "everything
+/// else" means `a.b` stops at each part rather than skipping the whole
+/// expression, which is what Windows editors do.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum CharClass {
+    Word,
+    Space,
+    Other,
+}
+
+fn classify(c: char, is_word: &dyn Fn(char) -> bool) -> CharClass {
+    if is_word(c) {
+        CharClass::Word
+    } else if c.is_whitespace() {
+        CharClass::Space
+    } else {
+        CharClass::Other
+    }
+}
+
+#[allow(dead_code)] // full surface lands in the editor element (G1 Task 4)
 impl MultilineBuffer {
     pub fn new() -> Self {
         Self {
@@ -161,6 +184,103 @@ impl MultilineBuffer {
                     break;
                 }
             }
+        }
+        self.goal_column = None;
+    }
+
+    /// Byte offset of the word boundary `dir` from `self.cursor`.
+    ///
+    /// Windows/VS Code semantics, which is what the user asked for
+    /// (2026-08-29: „klasické windows zkratky pro práci s textem"): moving
+    /// LEFT skips whitespace and then consumes the word before it; moving
+    /// RIGHT consumes the word under/after the cursor and then the
+    /// whitespace after it. That asymmetry is deliberate and is why this is
+    /// ONE function with a direction rather than two that could drift.
+    ///
+    /// A "word" is a run of alphanumerics and `_` — SQL identifiers.
+    /// Everything else (operators, punctuation) is consumed one run at a
+    /// time, so `a.b` is three stops, not one.
+    fn word_boundary(&self, forward: bool) -> usize {
+        let ch: Vec<(usize, char)> = self.text.char_indices().collect();
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        // Index into `ch` of the char at/after the cursor.
+        let mut i = ch.partition_point(|(off, _)| *off < self.cursor);
+
+        if forward {
+            if i >= ch.len() {
+                return self.text.len();
+            }
+            let kind = classify(ch[i].1, &is_word);
+            while i < ch.len() && classify(ch[i].1, &is_word) == kind && kind != CharClass::Space {
+                i += 1;
+            }
+            // Trailing whitespace joins the move, so one Ctrl+Right lands on
+            // the next word rather than on the space before it.
+            while i < ch.len() && ch[i].1.is_whitespace() && ch[i].1 != '\n' {
+                i += 1;
+            }
+            ch.get(i).map(|(off, _)| *off).unwrap_or(self.text.len())
+        } else {
+            // Leading whitespace first, then the run before it.
+            while i > 0 && ch[i - 1].1.is_whitespace() && ch[i - 1].1 != '\n' {
+                i -= 1;
+            }
+            if i == 0 {
+                return 0;
+            }
+            let kind = classify(ch[i - 1].1, &is_word);
+            while i > 0 && classify(ch[i - 1].1, &is_word) == kind {
+                i -= 1;
+            }
+            ch.get(i).map(|(off, _)| *off).unwrap_or(0)
+        }
+    }
+
+    /// Ctrl+Left / Ctrl+Right, and with `extend_selection` their Shift
+    /// variants. Shares [`Self::word_boundary`] with nothing else, so the
+    /// four shortcuts can never disagree about where a word ends.
+    pub fn move_word(&mut self, forward: bool, extend_selection: bool) {
+        let target = self.word_boundary(forward);
+        if extend_selection {
+            match &mut self.selection {
+                Some(sel) => sel.end = target,
+                None => self.selection = Some(self.cursor..target),
+            }
+        } else {
+            self.selection = None;
+        }
+        self.cursor = target;
+        self.goal_column = None;
+    }
+
+    /// Ctrl+Home / Ctrl+End.
+    pub fn move_document(&mut self, to_end: bool, extend_selection: bool) {
+        let target = if to_end { self.text.len() } else { 0 };
+        if extend_selection {
+            match &mut self.selection {
+                Some(sel) => sel.end = target,
+                None => self.selection = Some(self.cursor..target),
+            }
+        } else {
+            self.selection = None;
+        }
+        self.cursor = target;
+        self.goal_column = None;
+    }
+
+    /// Ctrl+Backspace / Ctrl+Delete: delete to the word boundary. Reuses
+    /// the same boundary the cursor motions use, so what a Ctrl+Shift+Arrow
+    /// would have SELECTED is exactly what this deletes.
+    pub fn delete_word(&mut self, forward: bool) {
+        if self.selection.is_some() {
+            self.backspace();
+            return;
+        }
+        let target = self.word_boundary(forward);
+        let (from, to) = if forward { (self.cursor, target) } else { (target, self.cursor) };
+        if from < to {
+            self.text.drain(from..to);
+            self.cursor = from;
         }
         self.goal_column = None;
     }
@@ -466,6 +586,117 @@ impl MultilineBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(text: &str, cursor: usize) -> MultilineBuffer {
+        let mut b = MultilineBuffer::from_text(text);
+        b.cursor = cursor;
+        b
+    }
+
+    /// Ctrl+Right takes the word AND the space after it; Ctrl+Left takes
+    /// the space before a word AND the word. That asymmetry is what makes
+    /// repeated presses land on word STARTS in both directions, and it is
+    /// what Windows editors do.
+    #[test]
+    fn word_motion_is_asymmetric_the_way_windows_is() {
+        let mut b = at("select from table", 0);
+        b.move_word(true, false);
+        assert_eq!(b.cursor(), 7, "Ctrl+Right lands on the next word, not on the space");
+        b.move_word(true, false);
+        assert_eq!(b.cursor(), 12);
+
+        let mut b = at("select from table", 12);
+        b.move_word(false, false);
+        assert_eq!(b.cursor(), 7, "Ctrl+Left lands on the start of the previous word");
+        b.move_word(false, false);
+        assert_eq!(b.cursor(), 0);
+    }
+
+    /// `a.b` is three stops, not one: punctuation is its own run, so
+    /// Ctrl+Left in a qualified name walks the parts.
+    #[test]
+    fn punctuation_is_its_own_run() {
+        let mut b = at("dbo.orders", 10);
+        b.move_word(false, false);
+        assert_eq!(b.cursor(), 4, "stops after the dot");
+        b.move_word(false, false);
+        assert_eq!(b.cursor(), 3, "the dot itself");
+        b.move_word(false, false);
+        assert_eq!(b.cursor(), 0);
+    }
+
+    #[test]
+    fn word_motion_stops_at_the_ends_and_does_not_panic() {
+        let mut b = at("abc", 3);
+        b.move_word(true, false);
+        assert_eq!(b.cursor(), 3);
+        let mut b = at("abc", 0);
+        b.move_word(false, false);
+        assert_eq!(b.cursor(), 0);
+        let mut b = at("", 0);
+        b.move_word(true, false);
+        b.move_word(false, false);
+        assert_eq!(b.cursor(), 0);
+    }
+
+    /// The user's report: Ctrl+Shift+Arrow must SELECT, not just move.
+    #[test]
+    fn ctrl_shift_arrow_selects_the_word() {
+        let mut b = at("select from", 0);
+        b.move_word(true, true);
+        assert_eq!(b.selection(), Some(0..7), "selection must cover the word and the space");
+        // Extending again grows the same selection rather than starting a
+        // new one.
+        b.move_word(true, true);
+        assert_eq!(b.selection(), Some(0..11));
+    }
+
+    #[test]
+    fn ctrl_home_and_end_reach_the_document_bounds() {
+        let mut b = at("a\nbb\nccc", 4);
+        b.move_document(true, false);
+        assert_eq!(b.cursor(), 8);
+        b.move_document(false, false);
+        assert_eq!(b.cursor(), 0);
+        b.move_document(true, true);
+        assert_eq!(b.selection(), Some(0..8), "Ctrl+Shift+End selects to the end");
+    }
+
+    /// Ctrl+Backspace deletes exactly what Ctrl+Shift+Left would have
+    /// selected — they share `word_boundary`, and this pins that they
+    /// agree.
+    #[test]
+    fn delete_word_matches_what_select_word_would_have_covered() {
+        let mut sel = at("select from table", 17);
+        sel.move_word(false, true);
+        let covered = sel.selection().unwrap();
+
+        let mut del = at("select from table", 17);
+        del.delete_word(false);
+        assert_eq!(del.text(), "select from ");
+        assert_eq!(del.cursor(), covered.start);
+    }
+
+    #[test]
+    fn delete_word_with_a_selection_deletes_the_selection() {
+        let mut b = at("select from", 0);
+        b.move_word(true, true);
+        b.delete_word(false);
+        assert_eq!(b.text(), "from");
+    }
+
+    /// Word motion is char-based; a multi-byte identifier must not be split
+    /// mid-character (the same class of bug `walk_ident_prefix_start` was
+    /// fixed for in `autocomplete.rs`).
+    #[test]
+    fn word_motion_handles_multi_byte_identifiers() {
+        let mut b = at("čas období", "čas období".len());
+        b.move_word(false, false);
+        assert_eq!(b.cursor(), "čas ".len());
+        b.move_word(false, false);
+        assert_eq!(b.cursor(), 0);
+        assert!(b.text().is_char_boundary(b.cursor()));
+    }
 
     #[test]
     fn insert_and_newlines() {
