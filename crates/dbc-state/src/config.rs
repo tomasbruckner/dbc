@@ -155,6 +155,11 @@ pub struct AppConfig {
     /// to write `config.toml` at all stays exact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar_width: Option<u16>,
+    /// Width of the history panel in whole pixels, `None` until the user
+    /// first drags its splitter. Same shape and same reason as
+    /// [`AppConfig::sidebar_width`] — see there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_width: Option<u16>,
     /// How the schema tree groups objects under a database. Global by user
     /// decision (2026-08-28) — one setting for the whole app rather than
     /// per connection.
@@ -389,6 +394,7 @@ mod tests {
             // loaded value against this one, so a field left at its default
             // would round-trip even if `save` dropped it entirely.
             sidebar_width: Some(317),
+            history_width: Some(300),
             tree_grouping: TreeGrouping::Kind,
         }
     }

@@ -1,6 +1,6 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SchemaSnapshot {
     pub tables: Vec<TableInfo>,
     pub routines: Vec<RoutineInfo>,
@@ -8,7 +8,7 @@ pub struct SchemaSnapshot {
     pub sequences: Vec<SequenceInfo>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TableKind {
     Table,
     View,
@@ -21,7 +21,7 @@ impl Default for TableKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TableInfo {
     pub schema: Option<String>,
     pub name: String,
@@ -35,7 +35,7 @@ pub struct TableInfo {
     pub ddl: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ColumnInfo {
     pub name: String,
     pub data_type: String,
@@ -47,21 +47,21 @@ pub struct ColumnInfo {
     pub fk: Option<FkRef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct FkRef {
     pub schema: Option<String>,
     pub table: String,
     pub column: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct IndexInfo {
     pub name: String,
     pub columns: Vec<String>,
     pub unique: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ConstraintInfo {
     pub name: String,
     // "PRIMARY KEY" | "FOREIGN KEY" | "UNIQUE" | "CHECK" | engine string
@@ -70,7 +70,7 @@ pub struct ConstraintInfo {
     pub definition: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoutineKind {
     Function,
     Procedure,
@@ -82,7 +82,7 @@ impl Default for RoutineKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RoutineInfo {
     pub schema: Option<String>,
     pub name: String,
@@ -93,7 +93,7 @@ pub struct RoutineInfo {
     pub ddl: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TriggerInfo {
     pub schema: Option<String>,
     pub name: String,
@@ -101,7 +101,7 @@ pub struct TriggerInfo {
     pub ddl: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SequenceInfo {
     pub schema: Option<String>,
     pub name: String,

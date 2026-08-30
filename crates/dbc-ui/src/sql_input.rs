@@ -822,7 +822,14 @@ impl SqlInput {
         cx.notify();
     }
 
-    fn on_mouse_down(&mut self, event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Clicking the editor has to FOCUS it (user report, 2026-08-30:
+        // „da se kliknout jenom nahoru, doprostred uz ne"). `track_focus`
+        // only registers the handle with the window — it does not focus on
+        // click — so before this, the caret moved to wherever you clicked
+        // but the keystrokes still went to whatever had focus last. It felt
+        // like the click had been ignored.
+        window.focus(&self.focus_handle, cx);
         self.is_selecting = true;
         let offset = self.offset_for_position(event.position);
         self.seek(offset, event.modifiers.shift);

@@ -106,6 +106,10 @@ pub enum PaletteAction {
     /// the current snapshot (`AppView::resolve_er_diagram_schema`), or
     /// refuses with a Czech status pointing at the schema-tree icon.
     ShowErDiagram,
+    /// Forgets every cached schema snapshot. The escape hatch for „the
+    /// tree is showing a table that no longer exists" — the per-database ⟳
+    /// already refreshes one slot, this is the whole-app version.
+    ClearSchemaCache,
     /// Opens the tail of the diagnostic log in a text tab. The log lives
     /// in the profile directory, which most users never open — an app that
     /// keeps a log the user cannot find keeps it for nobody.
@@ -239,6 +243,7 @@ pub fn fixed_actions(
         // "last two rows" assumption keeps holding.
         ("Přepnout motiv".to_string(), PaletteAction::ToggleTheme),
         ("Otevřít log".to_string(), PaletteAction::ShowLog),
+        ("Vymazat mezipaměť schémat".to_string(), PaletteAction::ClearSchemaCache),
     ];
     if monitor_available {
         actions.push(("Monitor serveru".to_string(), PaletteAction::OpenMonitor));
@@ -527,7 +532,7 @@ mod rank_items_tests {
         // (`SaveScript`) + G14 T10's "Přepnout motiv" (`ToggleTheme`) +
         // the log viewer (`ShowLog`) — all unconditional, unlike
         // `OpenMonitor` which is engine-gated (monitor_available=false).
-        assert_eq!(items.len(), 2 + 2 + 1 + 12);
+        assert_eq!(items.len(), 2 + 2 + 1 + 13);
     }
 
     #[test]

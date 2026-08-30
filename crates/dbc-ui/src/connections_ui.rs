@@ -1131,6 +1131,14 @@ pub enum ModalState {
         input: Entity<TextField>,
         error: Option<String>,
         pending: PendingAfterUnlock,
+        /// The Argon2id verification is running on a background thread.
+        ///
+        /// It exists because that verification is DELIBERATELY slow — that
+        /// is what makes a stolen vault file expensive to guess against —
+        /// and it used to run on the UI thread, so the window simply froze
+        /// for about a second with no explanation (user report,
+        /// 2026-08-30: the app looked dead after pressing Enter).
+        verifying: bool,
     },
     CreateMasterPassword {
         input1: Entity<TextField>,
@@ -1773,72 +1781,102 @@ impl AppView {
         self.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
     }
 
+    /// The top bar.
+    ///
+    /// Rebuilt on request (2026-08-30: „ten navigacni bar vypada hnusne").
+    /// Three things were wrong with it, and only one of them was looks:
+    ///
+    ///   * the WHOLE BAR was one click target for the connection dropdown,
+    ///     so clicking empty space — or just missing a button — opened it.
+    ///     The picker is now a bordered chip that is exactly as big as it
+    ///     looks, and the bar itself is inert;
+    ///   * the actions were bare text at different weights with no shared
+    ///     shape, which is what made it read as unfinished. They are now
+    ///     one `bar_button` each, in one group, separated from the picker;
+    ///   * there was no way to show a hidden panel with the mouse. Ctrl+B
+    ///     and Ctrl+H were the only handles, and an invisible control is no
+    ///     control. Both panels now have a toggle here, lit when the panel
+    ///     is open.
     pub(crate) fn render_top_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let label = self.current_connection_label();
+        let theme = *cx.theme();
+        let format_enabled = self.active_engine().is_some();
+        let (tree_on, history_on) = (self.tree_visible, self.history_visible);
+
         div()
             .id("top-bar")
-            .h(px(32.))
+            .h(px(34.))
             .px_2()
+            .gap_1()
             .flex()
             .flex_row()
             .items_center()
-            .bg(cx.theme().bg_app)
-            .text_color(cx.theme().text_primary)
-            .cursor_pointer()
-            .child(format!("Připojení: {label} ▾"))
-            .on_click(cx.listener(|view, _, _, cx| {
-                view.dropdown_open = !view.dropdown_open;
-                if view.dropdown_open {
-                    view.refresh_grouped_cache(cx);
-                }
-                cx.notify();
-            }))
-            // Version label, right-aligned (spec: Versioning — bumped per
-            // completed phase as part of the merge checklist).
+            .bg(theme.bg_app)
+            .border_b_1()
+            .border_color(theme.border)
+            .text_color(theme.text_primary)
+            // The connection picker: a chip, not the whole bar.
             .child(
                 div()
-                    .ml_auto()
-                    .text_color(cx.theme().text_faint)
-                    .child(format!("dbc v{}", env!("CARGO_PKG_VERSION"))),
+                    .id("top-bar-connection")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py(px(3.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(if self.dropdown_open { theme.bg_hover } else { theme.bg_panel })
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.bg_hover))
+                    .child(div().text_color(theme.text_muted).child("Připojení"))
+                    .child(div().child(label))
+                    .child(div().text_color(theme.text_muted).child("▾"))
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.dropdown_open = !view.dropdown_open;
+                        if view.dropdown_open {
+                            view.refresh_grouped_cache(cx);
+                        }
+                        cx.notify();
+                    })),
             )
+            .child(div().flex_1())
+            // Panel toggles. Lit = open, so the bar always says which
+            // panels exist even when they are hidden.
+            .child(bar_button("top-bar-tree", "Strom", tree_on, true, theme).on_click(
+                cx.listener(|view, _, window, cx| {
+                    view.on_toggle_tree(&crate::ToggleTree, window, cx)
+                }),
+            ))
+            .child(bar_button("top-bar-history", "Historie", history_on, true, theme).on_click(
+                cx.listener(|view, _, window, cx| {
+                    view.on_toggle_history(&crate::ToggleHistory, window, cx)
+                }),
+            ))
+            .child(bar_separator(theme))
             // „Formátovat" (user request 2026-08-28), Ctrl+Shift+F. Dimmed
             // with no active connection, because the dialect comes from the
             // engine and formatting by the wrong dialect would reflow the
-            // user's SQL against the wrong lexical rules. Same
-            // `cx.stop_propagation()` as the gear below.
-            .child({
-                let enabled = self.active_engine().is_some();
-                div()
-                    .id("top-bar-format")
-                    .px_1()
-                    .cursor_pointer()
-                    .text_color(if enabled {
-                        cx.theme().text_muted
-                    } else {
-                        cx.theme().border
-                    })
-                    .hover(|s| s.text_color(cx.theme().text_primary))
-                    .child("Formátovat")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        cx.stop_propagation();
+            // user's SQL against the wrong lexical rules.
+            .child(
+                bar_button("top-bar-format", "Formátovat", false, format_enabled, theme).on_click(
+                    cx.listener(|view, _, window, cx| {
                         view.on_format_sql(&crate::FormatSql, window, cx);
-                    }))
-            })
-            // G14 T10: settings gear — same `cx.stop_propagation()` pattern
-            // as `dropdown_item`'s ★/✎ icon buttons so this click doesn't
-            // also bubble to the row's dropdown-toggle handler above.
+                    }),
+                ),
+            )
+            .child(bar_button("top-bar-settings", "⚙", false, true, theme).on_click(cx.listener(
+                |view, _, _, cx| {
+                    view.open_settings(cx);
+                },
+            )))
+            .child(bar_separator(theme))
             .child(
                 div()
-                    .id("top-bar-settings")
-                    .px_1()
-                    .cursor_pointer()
-                    .text_color(cx.theme().text_muted)
-                    .hover(|s| s.text_color(cx.theme().text_primary))
-                    .child("⚙")
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        cx.stop_propagation();
-                        view.open_settings(cx);
-                    })),
+                    .text_color(theme.text_faint)
+                    .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
             )
     }
 
@@ -1901,7 +1939,9 @@ impl AppView {
         let modal = self.modal.clone()?;
         let panel = match modal {
             ModalState::ConnectionDialog(ui) => render_connection_dialog_panel(ui, cx),
-            ModalState::MasterPasswordPrompt { input, error, .. } => render_master_password_panel(input, error, cx),
+            ModalState::MasterPasswordPrompt { input, error, verifying, .. } => {
+                render_master_password_panel(input, error, verifying, cx)
+            }
             ModalState::CreateMasterPassword { input1, input2, error, .. } => {
                 render_create_master_password_panel(input1, input2, error, cx)
             }
@@ -2627,6 +2667,7 @@ impl AppView {
             self.modal = Some(ModalState::MasterPasswordPrompt {
                 input,
                 error: None,
+                verifying: false,
                 pending: PendingAfterUnlock::TestConnection(Box::new(ui_snapshot)),
             });
             window.focus(&focus, cx);
@@ -2707,6 +2748,7 @@ impl AppView {
             self.modal = Some(ModalState::MasterPasswordPrompt {
                 input,
                 error: None,
+                verifying: false,
                 pending: PendingAfterUnlock::SaveConnection(Box::new(data)),
             });
             window.focus(&focus, cx);
@@ -2913,6 +2955,7 @@ impl AppView {
         self.modal = Some(ModalState::MasterPasswordPrompt {
             input,
             error: None,
+            verifying: false,
             pending: PendingAfterUnlock::Nothing,
         });
         window.focus(&focus, cx);
@@ -2942,6 +2985,7 @@ impl AppView {
             self.modal = Some(ModalState::MasterPasswordPrompt {
                 input,
                 error: None,
+                verifying: false,
                 pending: PendingAfterUnlock::Connect(id),
             });
             self.dropdown_open = false;
@@ -3031,23 +3075,63 @@ impl AppView {
         cx.notify();
     }
 
-    fn on_master_password_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ModalState::MasterPasswordPrompt { input, pending, .. }) = self.modal.clone() else { return };
-        let pwd = input.read(cx).text();
-        match Vault::unlock(&self.vault_path, &pwd) {
-            Ok(vault) => {
-                self.vault = Some(vault);
-                self.modal = None;
-                self.resume_pending(pending, window, cx);
-            }
-            Err(e) => {
-                input.update(cx, |f, cx| f.set_text("", cx));
-                if let Some(ModalState::MasterPasswordPrompt { error, .. }) = &mut self.modal {
-                    *error = Some(e.message);
-                }
-                cx.notify();
-            }
+    /// Verify the master password OFF the UI thread.
+    ///
+    /// `Vault::unlock` runs Argon2id, which is slow on purpose — roughly a
+    /// second, by design, because that cost is exactly what protects a
+    /// stolen vault file from being guessed against. Running it inline
+    /// froze the window for that second with nothing on screen, so the app
+    /// looked hung. Now the modal flips to `verifying` and repaints FIRST
+    /// (that is the whole reason the work moves to the background executor
+    /// — a label cannot render while the UI thread is busy), and the
+    /// result is applied when it comes back.
+    fn on_master_password_submit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ModalState::MasterPasswordPrompt { input, pending, verifying, .. }) =
+            self.modal.clone()
+        else {
+            return;
+        };
+        // Enter twice in a row must not start a second verification.
+        if verifying {
+            return;
         }
+        let pwd = input.read(cx).text();
+        if let Some(ModalState::MasterPasswordPrompt { error, verifying, .. }) = &mut self.modal {
+            *error = None;
+            *verifying = true;
+        }
+        cx.notify();
+
+        let path = self.vault_path.clone();
+        let task = cx.background_executor().spawn(async move { Vault::unlock(&path, &pwd) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |view, window, cx| {
+                // The user may have cancelled while we were hashing; if the
+                // prompt is gone, so is the answer to its question.
+                if !matches!(view.modal, Some(ModalState::MasterPasswordPrompt { .. })) {
+                    return;
+                }
+                match result {
+                    Ok(vault) => {
+                        view.vault = Some(vault);
+                        view.modal = None;
+                        view.resume_pending(pending, window, cx);
+                    }
+                    Err(e) => {
+                        input.update(cx, |f, cx| f.set_text("", cx));
+                        if let Some(ModalState::MasterPasswordPrompt { error, verifying, .. }) =
+                            &mut view.modal
+                        {
+                            *error = Some(e.message);
+                            *verifying = false;
+                        }
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     fn set_create_master_error(&mut self, msg: &str, cx: &mut Context<Self>) {
@@ -3077,7 +3161,7 @@ impl AppView {
         if Vault::exists(&self.vault_path) {
             let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
             let focus = input.focus_handle(cx);
-            self.modal = Some(ModalState::MasterPasswordPrompt { input, error: None, pending });
+            self.modal = Some(ModalState::MasterPasswordPrompt { input, error: None, verifying: false, pending });
             window.focus(&focus, cx);
             cx.notify();
             return;
@@ -3862,7 +3946,46 @@ fn render_pw_change_panel(
     panel.into_any_element()
 }
 
-fn render_master_password_panel(input: Entity<TextField>, error: Option<String>, cx: &mut Context<AppView>) -> AnyElement {
+/// One top-bar control. `active` lights it as an on/off state (the panel
+/// toggles); `enabled` dims it and is otherwise cosmetic — every caller
+/// whose action can refuse still refuses at click time, which is this
+/// codebase's existing posture for the palette.
+fn bar_button(
+    id: &'static str,
+    label: &'static str,
+    active: bool,
+    enabled: bool,
+    theme: crate::theme::Theme,
+) -> gpui::Stateful<Div> {
+    let fg = match (enabled, active) {
+        (false, _) => theme.border,
+        (true, true) => theme.text_primary,
+        (true, false) => theme.text_muted,
+    };
+    div()
+        .id(id)
+        .px_2()
+        .py(px(3.))
+        .rounded_md()
+        .cursor_pointer()
+        .text_color(fg)
+        .bg(if active { theme.bg_hover } else { theme.bg_app })
+        .hover(|s| s.bg(theme.bg_hover).text_color(theme.text_primary))
+        .child(label)
+}
+
+/// A hairline between groups of top-bar controls. Grouping is what makes a
+/// row of buttons readable at a glance instead of a wall of words.
+fn bar_separator(theme: crate::theme::Theme) -> Div {
+    div().w(px(1.)).h(px(16.)).mx_1().bg(theme.border)
+}
+
+fn render_master_password_panel(
+    input: Entity<TextField>,
+    error: Option<String>,
+    verifying: bool,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
     let mut panel: Div = div()
         .w(px(360.))
         .bg(cx.theme().bg_panel)
@@ -3884,6 +4007,13 @@ fn render_master_password_panel(input: Entity<TextField>, error: Option<String>,
     if let Some(e) = error {
         panel = panel.child(div().text_color(cx.theme().danger).child(e));
     }
+    if verifying {
+        // Naming the reason turns a freeze into a feature: told that the
+        // wait IS the protection, nobody suspects the app hung.
+        panel = panel.child(div().text_color(cx.theme().text_muted).child(
+            "Ověřuji heslo… trvá to schválně — pomalé odvození klíče (Argon2id) je to, co chrání trezor proti hádání hesla.",
+        ));
+    }
     panel = panel.child(
         div()
             .flex()
@@ -3892,7 +4022,14 @@ fn render_master_password_panel(input: Entity<TextField>, error: Option<String>,
             .justify_end()
             .mt_2()
             .child(styled_button("mpp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.cancel_master_password_prompt(cx))))
-            .child(styled_button("mpp-submit", "Odemknout", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_master_password_submit(window, cx)))),
+            .child(
+                styled_button(
+                    "mpp-submit",
+                    if verifying { "Ověřuji…" } else { "Odemknout" },
+                    *cx.theme(),
+                )
+                .on_click(cx.listener(|v, _, window, cx| v.on_master_password_submit(window, cx))),
+            ),
     );
     panel.into_any_element()
 }

@@ -2101,6 +2101,13 @@ struct AppView {
     /// drag STARTED, not against the previous move event, or rounding
     /// accumulates and the panel creeps away from the pointer.
     sidebar_resizing: Option<(f32, f32)>,
+    /// Current history-panel width in px, and the in-progress drag of its
+    /// splitter as `(pointer x at mouse-down, width at mouse-down)`. The
+    /// history splitter is on the panel's LEFT edge, so dragging right
+    /// makes it narrower — the sign is the only thing that differs from the
+    /// sidebar.
+    history_width: f32,
+    history_resizing: Option<(f32, f32)>,
     /// A context-menu action that needs a `Window` (dialog focus), parked
     /// by the cx-only tree subscription and drained at the top of `render`.
     /// Same shape as the queued cross-context preview open.
@@ -2268,6 +2275,35 @@ const CLI_CONN_IDENTITY: &str = "cli";
 /// previous one instead of stacking copies of a file that changes
 /// underneath.
 pub(crate) const LOG_PREVIEW_KEY: &str = "applog";
+
+/// The history panel's built-in width, used until the user drags its
+/// splitter. Was the hard-coded `280.`.
+pub(crate) const HISTORY_DEFAULT_W: f32 = 280.0;
+/// Narrow enough to still show a timestamp and a truncated statement.
+pub(crate) const HISTORY_MIN_W: f32 = 180.0;
+/// A history panel wider than this is a history panel that has eaten the
+/// results grid it exists to complement.
+pub(crate) const HISTORY_MAX_W: f32 = 700.0;
+
+/// Clamp a history width into [`HISTORY_MIN_W`]..=[`HISTORY_MAX_W`], mapping
+/// NaN to the default. Mirrors `clamp_sidebar_width` exactly, including the
+/// NaN arm: `f32::NAN.clamp(..)` returns NaN, and a NaN width silently
+/// renders a zero-width panel that cannot be dragged back.
+pub(crate) fn clamp_history_width(w: f32) -> f32 {
+    if w.is_nan() {
+        return HISTORY_DEFAULT_W;
+    }
+    w.clamp(HISTORY_MIN_W, HISTORY_MAX_W)
+}
+
+/// `AppConfig::history_width` (whole px, `None` = never resized) → the
+/// width to start the session with.
+pub(crate) fn history_width_from(stored: Option<u16>) -> f32 {
+    match stored {
+        Some(w) => clamp_history_width(f32::from(w)),
+        None => HISTORY_DEFAULT_W,
+    }
+}
 
 /// The sidebar's built-in width, used until the user drags the splitter.
 /// Was the hard-coded `260.` in `render`.
@@ -5444,6 +5480,26 @@ impl AppView {
     /// The equality check is not an optimisation: a plain CLICK on the
     /// splitter — no movement at all — is a complete down/up pair, so
     /// without it every stray click would write `config.toml`.
+    /// Ends a history-panel drag and persists the result. Same contract as
+    /// [`AppView::end_sidebar_resize`] — persist on drag END only, and skip
+    /// the write when nothing changed so a stray click on the splitter does
+    /// not rewrite `config.toml`.
+    fn end_history_resize(&mut self, cx: &mut Context<Self>) {
+        self.history_resizing = None;
+        let width = clamp_history_width(self.history_width) as u16;
+        if self.config.history_width == Some(width) {
+            cx.notify();
+            return;
+        }
+        self.config.history_width = Some(width);
+        if let Some(guard) = self.guard_corrupt_config(cx) {
+            if let Err(e) = self.config.save(&self.config_path, &guard) {
+                self.status = format!("error: šířku historie se nepodařilo uložit: {e}");
+            }
+        }
+        cx.notify();
+    }
+
     fn end_sidebar_resize(&mut self, cx: &mut Context<Self>) {
         self.sidebar_resizing = None;
         let width = clamp_sidebar_width(self.sidebar_width) as u16;
@@ -5709,6 +5765,15 @@ impl AppView {
                     }
                 }
                 PaletteAction::ShowLog => self.open_log_tab(cx),
+                PaletteAction::ClearSchemaCache => {
+                    dbc_state::schema_cache::clear();
+                    // The in-memory tree is untouched on purpose: this
+                    // clears what is on DISK, and throwing away the schema
+                    // the user is currently looking at would be a
+                    // surprising second effect. The next expand refetches.
+                    self.status = "Mezipaměť schémat vymazána".to_string();
+                    cx.notify();
+                }
                 PaletteAction::OpenCompare => self.open_compare_dialog(cx),
                 PaletteAction::BackupDatabase => {
                     if let Some(id) = self.active_connection_id.clone() {
@@ -6624,6 +6689,7 @@ impl AppView {
         self.modal = Some(connections_ui::ModalState::MasterPasswordPrompt {
             input,
             error: None,
+            verifying: false,
             pending,
         });
         self.dropdown_open = false;
@@ -8567,6 +8633,29 @@ impl AppView {
             spec_for_database(&cfg, &db, secret)
         };
         self.tree.update(cx, |t, cx| t.begin_schema(&conn_id, &db, my_generation, cx));
+        // Paint the cached schema NOW, then refresh from the server behind
+        // it (user request, 2026-08-30: reopening a database you have
+        // already visited should be fast). The cache is never the final
+        // answer — the fetch below still runs and replaces it — so the cost
+        // of a stale entry is at most a moment of out-of-date names, never
+        // a wrong answer that sticks.
+        //
+        // The CLI slot is excluded: it is keyed by a sentinel id and an
+        // empty database name, so every `--url` the app was ever started
+        // with would share one cache entry.
+        let served_from_cache = if conn_id == CLI_CONN_IDENTITY {
+            false
+        } else {
+            match dbc_state::schema_cache::load::<SchemaSnapshot>(&conn_id, &db) {
+                Some(cached) => {
+                    self.tree.update(cx, |t, cx| {
+                        t.finish_schema(&conn_id, &db, my_generation, Ok(cached), cx)
+                    });
+                    true
+                }
+                None => false,
+            }
+        };
         let rx = self.runner.fetch_schema(spec);
         let started = std::time::Instant::now();
         cx.spawn(async move |this, cx| {
@@ -8594,8 +8683,27 @@ impl AppView {
                         }),
                     }
                 }
-                view.tree
-                    .update(cx, |t, cx| t.finish_schema(&conn_id, &db, my_generation, result, cx));
+                match &result {
+                    Ok(snapshot) if conn_id != CLI_CONN_IDENTITY => {
+                        dbc_state::schema_cache::store(&conn_id, &db, snapshot);
+                    }
+                    _ => {}
+                }
+                // A failed REFRESH must not wipe a good cached tree. The
+                // names on screen are still the best answer anyone has, and
+                // replacing them with an error would punish the user for
+                // the cache having worked. The failure is still reported —
+                // in the status bar, and in the log by the arm above.
+                if result.is_err() && served_from_cache {
+                    if let Err(e) = &result {
+                        view.status = format!("error: schéma se nepodařilo obnovit ({e}) — zobrazeno z mezipaměti");
+                    }
+                    cx.notify();
+                } else {
+                    view.tree.update(cx, |t, cx| {
+                        t.finish_schema(&conn_id, &db, my_generation, result, cx)
+                    });
+                }
                 // The old trigger_schema_fetch success-arm side effects,
                 // ACTIVE slot only:
                 if ok && view.scope_is_active(&conn_id, &db) {
@@ -10692,7 +10800,13 @@ impl AppView {
                             .px_1()
                             .cursor_pointer()
                             .text_color(pin_color)
-                            .child("📌")
+                            // A monochrome dot, not the 📌 emoji (user
+                            // report, 2026-08-30). Colour emoji renders in
+                            // its own palette, ignores the theme, and sits
+                            // at a different weight from every other glyph
+                            // in the strip — which is exactly why it looked
+                            // out of place.
+                            .child(if pinned { "●" } else { "○" })
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 cx.stop_propagation();
                                 view.tabs.toggle_pin(id);
@@ -12379,7 +12493,34 @@ impl Render for AppView {
         // collapsible via Ctrl+H (`ToggleHistory`) — same collapse-to-0px
         // convention as the schema tree panel above.
         if self.history_visible {
-            body = body.child(self.render_history_panel(cx));
+            body = body.child(
+                div()
+                    .relative()
+                    .w(px(self.history_width))
+                    .h_full()
+                    .flex_shrink_0()
+                    .child(self.render_history_panel(cx))
+                    .child(
+                        // Mirror of the sidebar splitter, on the other edge.
+                        div()
+                            .id("history-splitter")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(px(5.))
+                            .h_full()
+                            .occlude()
+                            .cursor_col_resize()
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|view, e: &gpui::MouseDownEvent, _w, cx| {
+                                    view.history_resizing =
+                                        Some((f32::from(e.position.x), view.history_width));
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+            );
         }
 
         let mut root = div()
@@ -12407,6 +12548,27 @@ impl Render for AppView {
         // it did. `on_mouse_up_out` is the other half — releasing outside the
         // window must also end the drag, or the panel keeps following the
         // mouse after the button is up. Both learned from `grid.rs`.
+        if self.history_resizing.is_some() {
+            root = root
+                .on_mouse_move(cx.listener(|view, e: &gpui::MouseMoveEvent, _w, cx| {
+                    if let Some((start_x, start_w)) = view.history_resizing {
+                        // Minus, not plus: this splitter is on the LEFT edge
+                        // of the panel, so moving right shrinks it.
+                        view.history_width =
+                            clamp_history_width(start_w - (f32::from(e.position.x) - start_x));
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|view, _e, _w, cx| view.end_history_resize(cx)),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|view, _e, _w, cx| view.end_history_resize(cx)),
+                );
+        }
+
         if self.sidebar_resizing.is_some() {
             root = root
                 .on_mouse_move(cx.listener(|view, e: &gpui::MouseMoveEvent, _w, cx| {
@@ -12918,6 +13080,7 @@ fn main() {
                         .detach();
                         // Read before `config` is moved into the struct below.
                         let sidebar_width = sidebar_width_from(config.sidebar_width);
+                        let history_width = history_width_from(config.history_width);
                         AppView {
                             tabs: Tabs::new(),
                             status,
@@ -12951,6 +13114,8 @@ fn main() {
                             tree_visible: true,
                             sidebar_width,
                             sidebar_resizing: None,
+                            history_width,
+                            history_resizing: None,
                             pending_menu_action: None,
                             sidebar_fetch_generation: 0,
                             compare_fetch_generation: 0,
@@ -13021,6 +13186,19 @@ fn main() {
             // startup (history panel defaults to visible) instead of
             // leaving it empty until the first recorded run/search edit.
             view.refresh_history_cache(cx);
+            // Ask for the master password ONCE, at startup, instead of
+            // ambushing the first click that happens to need a secret
+            // (user request, 2026-08-30). The vault stays unlocked for the
+            // rest of the session either way — that part was already true;
+            // what changes is WHEN the question is asked, and „now, before
+            // I have started working" is a much better moment than „in the
+            // middle of expanding a connection".
+            //
+            // Cancel is still a full answer: the app runs locked, and every
+            // path that needs a secret prompts again on its own.
+            if Vault::exists(&view.vault_path) && view.vault.is_none() && blocked.is_none() {
+                view.open_vault_prompt(connections_ui::PendingAfterUnlock::Nothing, cx);
+            }
             // Design §W4: the blocking modal goes up LAST, so it occludes a
             // fully-constructed (and deliberately empty) app.
             if let Some((root, reason)) = blocked {
@@ -14322,6 +14500,18 @@ mod autocomplete_handles_action_tests {
 mod sidebar_width_tests {
     use super::*;
 
+    /// The history panel got the same treatment as the sidebar, so it gets
+    /// the same guarantees — including the NaN arm, which is the one that
+    /// would otherwise render a panel nobody can drag back.
+    #[test]
+    fn history_width_behaves_like_the_sidebar_width() {
+        assert_eq!(history_width_from(None), HISTORY_DEFAULT_W);
+        assert_eq!(history_width_from(Some(320)), 320.0);
+        assert_eq!(history_width_from(Some(0)), HISTORY_MIN_W);
+        assert_eq!(history_width_from(Some(u16::MAX)), HISTORY_MAX_W);
+        assert_eq!(clamp_history_width(f32::NAN), HISTORY_DEFAULT_W);
+    }
+
     #[test]
     fn an_unset_width_is_the_built_in_default() {
         assert_eq!(sidebar_width_from(None), SIDEBAR_DEFAULT_W);
@@ -14443,7 +14633,14 @@ mod config_save_guard_audit {
         // a deliberate click on the header icon — there is no continuous
         // gesture behind it, so it needs no equality check of its own (the
         // value provably changed, it is a two-state flip).
-        assert_eq!(sites, 8, "config.toml writer count changed — re-audit, do not just bump");
+        //
+        // 8 → 9 on 2026-08-30: `end_history_resize` persists the history
+        // panel's width. Re-audited, not bumped: it is the exact mirror of
+        // `end_sidebar_resize` two paragraphs up — guarded arm (which this
+        // test's own loop verifies by position), drag END only, and the
+        // same equality check so a bare click on the splitter writes
+        // nothing.
+        assert_eq!(sites, 9, "config.toml writer count changed — re-audit, do not just bump");
     }
 
     /// The widening is only worth anything if it actually reaches past the
