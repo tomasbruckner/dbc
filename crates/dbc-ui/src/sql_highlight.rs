@@ -157,7 +157,47 @@ fn cached_query() -> Option<(&'static tree_sitter::Language, &'static tree_sitte
 /// on T-SQL-only syntax or an unterminated comment. If the cached query
 /// failed to compile (defensive only — see `cached_query`), this returns
 /// empty spans rather than panicking.
-pub fn highlight(text: &str, syntax: &crate::theme::EditorSyntaxTheme) -> Vec<HighlightSpan> {
+/// Per-dialect keyword colouring, layered over tree-sitter's generic SQL
+/// grammar (user request 2026-08-28: „chci tam syntax highlighting podle
+/// enginu").
+///
+/// `tree-sitter-sequel` is one grammar for all of SQL, so it cannot know
+/// that `TOP` is a keyword against MSSQL and an ordinary identifier against
+/// Postgres. `dbc_core::format` does, and it is the SAME list the formatter
+/// uppercases from — one dialect vocabulary, two consumers.
+///
+/// Word tokens come from that lexer, which means they are by CONSTRUCTION
+/// outside strings and comments: no separate "am I inside a literal?" check
+/// is needed here, and there is no second scanner to disagree with the
+/// first. Byte offsets are accumulated from the token texts, which is sound
+/// because the lexer is total (`the_lexer_is_total_every_byte_lands_in_exactly_one_token`).
+fn dialect_keyword_spans(
+    text: &str,
+    dialect: dbc_core::Dialect,
+    syntax: &crate::theme::EditorSyntaxTheme,
+) -> Vec<(Range<usize>, gpui::Hsla)> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    for t in dbc_core::format::lex(text, dialect) {
+        let len = t.text.len();
+        if t.kind == dbc_core::format::TokKind::Word
+            && dbc_core::format::is_keyword(&t.text, dialect)
+        {
+            out.push((off..off + len, syntax.keyword));
+        }
+        off += len;
+    }
+    out
+}
+
+/// `dialect` is `None` when no connection is active — there is nothing to be
+/// dialect-specific ABOUT then, so the generic grammar stands alone rather
+/// than a guessed dialect colouring words that may not be keywords here.
+pub fn highlight(
+    text: &str,
+    syntax: &crate::theme::EditorSyntaxTheme,
+    dialect: Option<dbc_core::Dialect>,
+) -> Vec<HighlightSpan> {
     let Some((language, query)) = cached_query() else {
         return Vec::new();
     };
@@ -201,14 +241,31 @@ pub fn highlight(text: &str, syntax: &crate::theme::EditorSyntaxTheme) -> Vec<Hi
         }
     }
 
-    spans
+    let mut resolved: Vec<HighlightSpan> = spans
         .into_iter()
         .map(|(range, _, name, color)| HighlightSpan {
             range,
             color,
             suppresses_completion: matches!(name, "string" | "comment"),
         })
-        .collect()
+        .collect();
+
+    if let Some(dialect) = dialect {
+        for (range, color) in dialect_keyword_spans(text, dialect, syntax) {
+            match resolved.iter_mut().find(|s| s.range == range) {
+                // Recolour, but NEVER touch `suppresses_completion`: that
+                // flag is the autocomplete suppression mask, and a keyword
+                // span must not start claiming to be a string.
+                Some(existing) => existing.color = color,
+                None => resolved.push(HighlightSpan {
+                    range,
+                    color,
+                    suppresses_completion: false,
+                }),
+            }
+        }
+    }
+    resolved
 }
 
 #[cfg(test)]
@@ -220,11 +277,69 @@ mod tests {
     }
 
     fn highlight(text: &str) -> Vec<HighlightSpan> {
-        super::highlight(text, &dark_syntax())
+        super::highlight(text, &dark_syntax(), None)
     }
 
     fn color_at(spans: &[HighlightSpan], byte: usize) -> Option<gpui::Hsla> {
         spans.iter().find(|s| s.range.contains(&byte)).map(|s| s.color)
+    }
+
+    /// The user's request: the SAME text must colour differently per
+    /// engine. `TOP` is T-SQL; against Postgres it is an ordinary
+    /// identifier and must NOT get keyword colour.
+    #[test]
+    fn a_dialect_keyword_is_coloured_only_for_its_own_dialect() {
+        let syn = dark_syntax();
+        let sql = "SELECT TOP 10 x FROM t";
+        let top = sql.find("TOP").unwrap()..sql.find("TOP").unwrap() + 3;
+
+        let ms = super::highlight(sql, &syn, Some(dbc_core::Dialect::Mssql));
+        let ms_hit = ms.iter().find(|s| s.range == top);
+        assert_eq!(
+            ms_hit.map(|s| s.color),
+            Some(syn.keyword),
+            "TOP must read as a keyword against MSSQL"
+        );
+
+        let pg = super::highlight(sql, &syn, Some(dbc_core::Dialect::Postgres));
+        assert!(
+            pg.iter().find(|s| s.range == top).map(|s| s.color) != Some(syn.keyword),
+            "TOP is not a Postgres keyword and must not be coloured as one"
+        );
+    }
+
+    /// The overlay takes its words from the dialect lexer, which never
+    /// emits a `Word` inside a literal — so a keyword spelled inside a
+    /// string stays string-coloured. If this ever fails, the overlay has
+    /// grown a second, disagreeing scanner.
+    #[test]
+    fn a_keyword_inside_a_string_is_not_recoloured() {
+        let syn = dark_syntax();
+        let sql = "SELECT 'SELECT FROM WHERE' AS s";
+        let lit = sql.find('\'').unwrap()..sql.rfind('\'').unwrap() + 1;
+        let spans = super::highlight(sql, &syn, Some(dbc_core::Dialect::Postgres));
+        for s in &spans {
+            if s.range.start > lit.start && s.range.end < lit.end {
+                assert_ne!(s.color, syn.keyword, "coloured a keyword inside a literal: {s:?}");
+            }
+        }
+    }
+
+    /// The overlay must never disturb the autocomplete suppression mask —
+    /// that flag is what stops the popup opening inside a string.
+    #[test]
+    fn the_overlay_leaves_the_suppression_mask_alone() {
+        let syn = dark_syntax();
+        let sql = "SELECT 'x' -- SELECT
+";
+        let without = super::highlight(sql, &syn, None);
+        let with = super::highlight(sql, &syn, Some(dbc_core::Dialect::Postgres));
+        let mask = |v: &[super::HighlightSpan]| -> Vec<std::ops::Range<usize>> {
+            let mut r: Vec<_> = v.iter().filter(|s| s.suppresses_completion).map(|s| s.range.clone()).collect();
+            r.sort_by_key(|x| x.start);
+            r
+        };
+        assert_eq!(mask(&without), mask(&with), "the dialect overlay changed the suppression mask");
     }
 
     /// Migration regression (G14 Task 6): `highlight()` now takes the theme
@@ -235,11 +350,11 @@ mod tests {
     #[test]
     fn colors_come_from_the_passed_syntax_theme() {
         let dark = crate::theme::Theme::dark().syntax;
-        let spans = super::highlight("SELECT 1", &dark);
+        let spans = super::highlight("SELECT 1", &dark, None);
         assert_eq!(color_at(&spans, 0), Some(dark.keyword));
 
         let light = crate::theme::Theme::light().syntax;
-        let spans_l = super::highlight("SELECT 1", &light);
+        let spans_l = super::highlight("SELECT 1", &light, None);
         assert_eq!(color_at(&spans_l, 0), Some(light.keyword));
         assert_ne!(dark.keyword, light.keyword);
     }

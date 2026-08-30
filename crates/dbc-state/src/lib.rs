@@ -13,10 +13,12 @@
 mod config;
 pub use config::{
     default_config_path, AppConfig, ConfigSaveGuard, ConfigVerdict, ConnectionConfig, Engine,
-    FavouriteObject, MssqlOptions, SshTunnelConfig, StateError, ThemeMode,
+    FavouriteObject, MssqlOptions, SshTunnelConfig, StateError, ThemeMode, TreeGrouping,
 };
 
+pub mod applog;
 pub mod fsutil;
+pub mod schema_cache;
 pub mod workspace;
 
 mod scope;

@@ -15,7 +15,7 @@
 //! `AppView` seam that wires `candidates()`/`resolve_aliases()` into the
 //! editor) — T7 (`main.rs`) is now that caller.
 
-use dbc_core::SchemaSnapshot;
+use dbc_core::{SchemaSnapshot, TableInfo};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -233,41 +233,45 @@ fn keyword_and_table_candidates(prefix: &str, snapshot: Option<&SchemaSnapshot>)
     rank_and_cap(scored)
 }
 
-/// Column candidates for a `qualifier.` (alias or bare table name) dot
-/// completion. Empty if there's no snapshot, the alias scan is ambiguous,
-/// the qualifier is shadowed by a CTE name, the qualifier doesn't resolve to
-/// a known table, or (for a schema-less/bare reference) the table name is
-/// ambiguous across more than one schema in the snapshot.
-fn column_candidates(text: &str, qualifier: &str, prefix: &str, snapshot: Option<&SchemaSnapshot>) -> Vec<Candidate> {
-    let Some(snapshot) = snapshot else {
-        return Vec::new();
-    };
-    let Some(alias_map) = resolve_aliases(text) else {
-        return Vec::new();
-    };
+/// Resolves a `qualifier.` to the table it refers to, or `None`.
+///
+/// THE single resolution rail: [`column_candidates`] renders its columns and
+/// the dispatcher asks it whether the qualifier means a table at all. Two
+/// copies of this would let the two answers disagree, which is exactly the
+/// bug the schema branch was added to fix — see below.
+///
+/// `None` covers all of: no alias binding, a CTE shadowing a real table, an
+/// ambiguous bare name, and — the case that matters here — a binding that
+/// resolves to NOTHING IN THE SNAPSHOT. While the user is mid-typing
+/// `FROM dbo.`, `resolve_aliases` reads `dbo` as a bare table name and binds
+/// it, so a mere „is it in the alias map" test answered yes for a schema
+/// that is not a table, and the schema branch was never reached.
+fn resolve_qualifier_table<'a>(
+    text: &str,
+    qualifier: &str,
+    snapshot: &'a SchemaSnapshot,
+) -> Option<&'a TableInfo> {
+    let alias_map = resolve_aliases(text)?;
     let qualifier_lower = qualifier.to_lowercase();
-    let Some(target) = alias_map
+    let target = alias_map
         .iter()
         .find(|(k, _)| k.to_lowercase() == qualifier_lower)
-        .map(|(_, v)| v.clone())
-    else {
-        return Vec::new();
-    };
+        .map(|(_, v)| v.clone())?;
 
     // CTE shadowing (review round 1, finding 3): `resolve_aliases` is a
     // schema-blind text scan — it happily self-maps `FROM x` even when `x`
     // is actually a CTE name, not a real table. A CTE's result shape isn't
     // modeled by `SchemaSnapshot` at all, so if `target`'s name is ALSO
-    // bound by a `WITH ... AS (...)` in this query, the CTE shadows
-    // whatever same-named real table might exist — offer nothing rather
-    // than that real table's (likely wrong) columns.
+    // bound by a `WITH ... AS (...)` in this query, the CTE shadows whatever
+    // same-named real table might exist — offer nothing rather than that
+    // real table's (likely wrong) columns.
     let cte_scan_masked = mask_for_cte_scan(text);
     let cte_scan_chars: Vec<char> = cte_scan_masked.chars().collect();
     if cte_names(&cte_scan_chars).contains(&target.name.to_uppercase()) {
-        return Vec::new();
+        return None;
     }
 
-    let table = match &target.schema {
+    match &target.schema {
         // Schema-qualified reference (`hr.users u`) — match schema AND name
         // exactly, and require EXACTLY ONE such row (same "ambiguous ->
         // offer nothing" invariant as the bare-name path below; review
@@ -290,14 +294,68 @@ fn column_candidates(text: &str, qualifier: &str, prefix: &str, snapshot: Option
         // schemas) is ambiguous, same "offer nothing" invariant as alias
         // ambiguity (review round 1, finding 2).
         None => {
-            let mut matching = snapshot.tables.iter().filter(|t| t.name.eq_ignore_ascii_case(&target.name));
+            let mut matching =
+                snapshot.tables.iter().filter(|t| t.name.eq_ignore_ascii_case(&target.name));
             match (matching.next(), matching.next()) {
                 (Some(t), None) => Some(t),
                 _ => None,
             }
         }
+    }
+}
+
+/// Table/view candidates for a `schema.` dot completion.
+///
+/// The inserted `text` is the BARE name: the user has already typed
+/// `schema.`, and `completion_range` replaces only the identifier prefix
+/// after the dot, so inserting a qualified name would produce
+/// `dbo.dbo.orders`. The label is bare for the same reason — repeating the
+/// schema the user just typed on every row is noise.
+fn schema_table_candidates(
+    schema: &str,
+    prefix: &str,
+    snapshot: Option<&SchemaSnapshot>,
+) -> Vec<Candidate> {
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
     };
-    let Some(table) = table else {
+    let mut scored: Vec<(u8, u8, u8, usize, Candidate)> = Vec::new();
+    for (idx, t) in snapshot.tables.iter().enumerate() {
+        // `eq_ignore_ascii_case` matches the comparison `column_candidates`
+        // already uses for schema names, so the two dot paths agree on what
+        // „the same schema" means.
+        if !t.schema.as_deref().map(|s| s.eq_ignore_ascii_case(schema)).unwrap_or(false) {
+            continue;
+        }
+        if let Some((mt, ct)) = match_score(&t.name, prefix) {
+            scored.push((
+                mt,
+                ct,
+                KIND_TIER_SCHEMA_OBJECT,
+                idx,
+                Candidate {
+                    text: t.name.clone(),
+                    label: t.name.clone(),
+                    kind: CandidateKind::Table,
+                },
+            ));
+        }
+    }
+    rank_and_cap(scored)
+}
+
+/// Column candidates for a `qualifier.` (alias or bare table name) dot
+/// completion. Empty whenever [`resolve_qualifier_table`] declines.
+fn column_candidates(
+    text: &str,
+    qualifier: &str,
+    prefix: &str,
+    snapshot: Option<&SchemaSnapshot>,
+) -> Vec<Candidate> {
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
+    };
+    let Some(table) = resolve_qualifier_table(text, qualifier, snapshot) else {
         return Vec::new();
     };
 
@@ -370,7 +428,22 @@ pub fn candidates(
     };
 
     if let Some(qualifier) = qualifier {
-        return column_candidates(text, &qualifier, &prefix, snapshot);
+        // An alias or table binding WINS over a schema of the same name: in
+        // `FROM sales.orders dbo`, `dbo.` means the alias, and columns are
+        // the only useful answer. Asked explicitly rather than by falling
+        // back when `column_candidates` comes back empty, because several of
+        // its empty results are DELIBERATE (CTE shadowing, an ambiguous bare
+        // name) and must not be quietly overridden by a schema listing.
+        if snapshot.is_some_and(|s| resolve_qualifier_table(text, &qualifier, s).is_some()) {
+            return column_candidates(text, &qualifier, &prefix, snapshot);
+        }
+        // User report 2026-08-28: „nefunguje mi autocomplete v sql, když
+        // napíšu `dbo.`". Nothing was `dbo`-specific — this branch simply
+        // did not exist, so EVERY `schema.` completion returned nothing and
+        // only the alias/table case worked. Typing a bare table name still
+        // worked (its label carries the schema), which is what made it look
+        // like other schemas were fine.
+        return schema_table_candidates(&qualifier, &prefix, snapshot);
     }
 
     keyword_and_table_candidates(&prefix, snapshot)
@@ -1056,6 +1129,105 @@ mod tests {
         let table_ix = cs.iter().position(|c| c.kind == CandidateKind::Table).unwrap();
         let keyword_ix = cs.iter().position(|c| c.kind == CandidateKind::Keyword && c.text == "ORDER").unwrap();
         assert!(table_ix < keyword_ix);
+    }
+
+    /// Two schemas, one of them MSSQL's default `dbo` — the exact shape of
+    /// the user's report (2026-08-28).
+    fn snapshot_dbo_and_sales() -> SchemaSnapshot {
+        SchemaSnapshot {
+            tables: vec![
+                TableInfo {
+                    schema: Some("dbo".into()),
+                    name: "orders".into(),
+                    columns: vec![ColumnInfo { name: "id".into(), ..Default::default() }],
+                    ..Default::default()
+                },
+                TableInfo {
+                    schema: Some("dbo".into()),
+                    name: "order_lines".into(),
+                    ..Default::default()
+                },
+                TableInfo { schema: Some("sales".into()), name: "regions".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// The reported bug. Nothing was `dbo`-specific: the `schema.` branch
+    /// did not exist at all, so this returned an empty list for every
+    /// schema.
+    #[test]
+    fn a_schema_qualifier_offers_that_schemas_tables() {
+        let snap = snapshot_dbo_and_sales();
+        let cs = candidates("SELECT * FROM dbo.", 18, Some(&snap), false, false);
+        let names: Vec<&str> = cs.iter().map(|c| c.text.as_str()).collect();
+        assert!(names.contains(&"orders"), "dbo tables missing: {names:?}");
+        assert!(names.contains(&"order_lines"), "dbo tables missing: {names:?}");
+        assert!(!names.contains(&"regions"), "a different schema leaked in: {names:?}");
+    }
+
+    /// `dbo.` is not special, and neither is any other schema — the fix is
+    /// general, so this pins a second schema through the same path.
+    #[test]
+    fn the_schema_branch_is_not_specific_to_dbo() {
+        let snap = snapshot_dbo_and_sales();
+        let cs = candidates("SELECT * FROM sales.", 20, Some(&snap), false, false);
+        let names: Vec<&str> = cs.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(names, vec!["regions"]);
+    }
+
+    /// The user has already typed `dbo.`, and `completion_range` replaces
+    /// only the identifier prefix after the dot — inserting a qualified
+    /// name here would produce `dbo.dbo.orders`.
+    #[test]
+    fn a_schema_completion_inserts_the_bare_name() {
+        let snap = snapshot_dbo_and_sales();
+        let cs = candidates("SELECT * FROM dbo.ord", 21, Some(&snap), false, false);
+        assert!(!cs.is_empty());
+        for c in &cs {
+            assert!(!c.text.contains('.'), "would double the schema: {:?}", c.text);
+            assert!(!c.label.contains('.'), "label repeats what was typed: {:?}", c.label);
+        }
+    }
+
+    #[test]
+    fn a_schema_qualifier_still_filters_by_the_typed_prefix() {
+        let snap = snapshot_dbo_and_sales();
+        let cs = candidates("SELECT * FROM dbo.order_l", 25, Some(&snap), false, false);
+        let names: Vec<&str> = cs.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(names, vec!["order_lines"]);
+    }
+
+    /// An alias must WIN over a same-named schema: here `dbo` is bound as an
+    /// alias for `sales.regions`, so `dbo.` must offer that table's COLUMNS,
+    /// not the `dbo` schema's tables.
+    #[test]
+    fn an_alias_beats_a_schema_of_the_same_name() {
+        let snap = SchemaSnapshot {
+            tables: vec![
+                TableInfo {
+                    schema: Some("sales".into()),
+                    name: "regions".into(),
+                    columns: vec![ColumnInfo { name: "region_code".into(), ..Default::default() }],
+                    ..Default::default()
+                },
+                TableInfo { schema: Some("dbo".into()), name: "orders".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let sql = "SELECT * FROM sales.regions dbo WHERE dbo.";
+        let cs = candidates(sql, sql.len(), Some(&snap), false, false);
+        let names: Vec<&str> = cs.iter().map(|c| c.text.as_str()).collect();
+        assert!(names.contains(&"region_code"), "alias must give columns: {names:?}");
+        assert!(!names.contains(&"orders"), "the schema listing overrode the alias: {names:?}");
+    }
+
+    /// A qualifier that is neither an alias nor a schema still offers
+    /// nothing — the fix must not turn every unknown dot into a table dump.
+    #[test]
+    fn an_unknown_qualifier_still_offers_nothing() {
+        let snap = snapshot_dbo_and_sales();
+        assert!(candidates("SELECT * FROM nope.", 19, Some(&snap), false, false).is_empty());
     }
 
     #[test]

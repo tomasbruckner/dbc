@@ -40,6 +40,7 @@ mod sandbox;
 mod schema_tree;
 mod scripts;
 mod sql_highlight;
+mod tree_menu;
 mod sql_input;
 mod tabs;
 mod text_model;
@@ -93,7 +94,9 @@ actions!(
         OpenAutocomplete,
         // Workspace T8 (Part S §5.2/§5.4): bound => save, unbound =>
         // save-as. Global, context `None`, same posture as `RunQuery`.
-        SaveScript
+        SaveScript,
+        /// Pretty-print the editor buffer (user request 2026-08-28).
+        FormatSql
     ]
 );
 
@@ -1263,6 +1266,10 @@ enum ApplyTarget {
     Admin {
         panel: Entity<admin_panel::AdminPanel>,
     },
+    /// A `DROP`/`TRUNCATE` staged from the sidebar's context menu. Nothing
+    /// to re-run afterwards — the object is gone, so success just refreshes
+    /// the schema so the tree stops showing it.
+    Tree,
 }
 
 /// G5 Task 4 (G10 T4: generalized for the admin Apply flow too): state for
@@ -1657,8 +1664,44 @@ mod editor_guard {
         }
         None
     }
+
+    /// The second, UNCONDITIONAL mint — for rewriting the buffer into a
+    /// transformation of ITS OWN CURRENT TEXT.
+    ///
+    /// What [`with_editor_replaceable`] protects is „content from somewhere
+    /// else must not silently replace unsaved work". A self-rewrite is
+    /// categorically not that: nothing arrives from outside, so there is no
+    /// other content for the user's work to be lost TO, and prompting
+    /// „zahodit neuložené změny?" before formatting the very text they are
+    /// editing would be nonsense.
+    ///
+    /// The API is what keeps that honest: the caller never supplies text, it
+    /// supplies `rewrite: &str -> String` and this function feeds it the
+    /// live buffer. There is no parameter through which foreign content
+    /// could enter, so this cannot be quietly repurposed into a clobber —
+    /// which is why it is safe for it to skip the dirty check that the other
+    /// mint exists to enforce.
+    ///
+    /// It leaves the buffer DIRTY on purpose: a format is an edit like any
+    /// other, so the caption keeps its „ •" and Ctrl+S still has something
+    /// to do.
+    pub(crate) fn rewrite_buffer_in_place(
+        view: &mut AppView,
+        cx: &mut Context<AppView>,
+        rewrite: impl FnOnce(&str) -> String,
+    ) -> bool {
+        let before = view.sql.read(cx).text();
+        let after = rewrite(&before);
+        if after == before {
+            return false;
+        }
+        view.sql.update(cx, |input, cx| {
+            input.replace_buffer(&after, cx, BufferReplace(PhantomData));
+        });
+        true
+    }
 }
-use editor_guard::with_editor_replaceable;
+use editor_guard::{rewrite_buffer_in_place, with_editor_replaceable};
 
 mod save_guard {
     use crate::AppView;
@@ -2042,6 +2085,33 @@ struct AppView {
     /// means the panel isn't rendered at all (0 px), not just visually
     /// hidden.
     tree_visible: bool,
+    /// Current sidebar width in logical px, seeded from
+    /// `AppConfig::sidebar_width` at startup and clamped into
+    /// `SIDEBAR_MIN_W..=SIDEBAR_MAX_W`.
+    ///
+    /// The clamp lives HERE and not in the setter, because the stored value
+    /// is whatever the user dragged: a `config.toml` hand-edited to `5`, or
+    /// written on a wide monitor and reopened on a narrow one, must not be
+    /// able to leave the panel unreachably thin — there would be no handle
+    /// left to grab to undo it.
+    sidebar_width: f32,
+    /// `(mouse x at mouse-down, sidebar width at mouse-down)` while a
+    /// splitter drag is active — the same shape as `grid.rs`'s `resizing`,
+    /// and for the same reason: the delta must be measured against where the
+    /// drag STARTED, not against the previous move event, or rounding
+    /// accumulates and the panel creeps away from the pointer.
+    sidebar_resizing: Option<(f32, f32)>,
+    /// Current history-panel width in px, and the in-progress drag of its
+    /// splitter as `(pointer x at mouse-down, width at mouse-down)`. The
+    /// history splitter is on the panel's LEFT edge, so dragging right
+    /// makes it narrower — the sign is the only thing that differs from the
+    /// sidebar.
+    history_width: f32,
+    history_resizing: Option<(f32, f32)>,
+    /// A context-menu action that needs a `Window` (dialog focus), parked
+    /// by the cx-only tree subscription and drained at the top of `render`.
+    /// Same shape as the queued cross-context preview open.
+    pending_menu_action: Option<TreeEvent>,
     /// Sidebar rework: bumped on every db-list/schema-slot fetch dispatch;
     /// a result only applies if the generation still matches
     /// (last-dispatched wins — the slot state machines in schema_tree.rs
@@ -2200,6 +2270,72 @@ struct AppView {
 /// `AppView::current_conn_identity` use for the CLI-arg back-compat path
 /// (no saved `ConnectionConfig`, hence no stable id to use instead).
 const CLI_CONN_IDENTITY: &str = "cli";
+
+/// Identifies the one log tab, so opening or refreshing it replaces the
+/// previous one instead of stacking copies of a file that changes
+/// underneath.
+pub(crate) const LOG_PREVIEW_KEY: &str = "applog";
+
+/// The history panel's built-in width, used until the user drags its
+/// splitter. Was the hard-coded `280.`.
+pub(crate) const HISTORY_DEFAULT_W: f32 = 280.0;
+/// Narrow enough to still show a timestamp and a truncated statement.
+pub(crate) const HISTORY_MIN_W: f32 = 180.0;
+/// A history panel wider than this is a history panel that has eaten the
+/// results grid it exists to complement.
+pub(crate) const HISTORY_MAX_W: f32 = 700.0;
+
+/// Clamp a history width into [`HISTORY_MIN_W`]..=[`HISTORY_MAX_W`], mapping
+/// NaN to the default. Mirrors `clamp_sidebar_width` exactly, including the
+/// NaN arm: `f32::NAN.clamp(..)` returns NaN, and a NaN width silently
+/// renders a zero-width panel that cannot be dragged back.
+pub(crate) fn clamp_history_width(w: f32) -> f32 {
+    if w.is_nan() {
+        return HISTORY_DEFAULT_W;
+    }
+    w.clamp(HISTORY_MIN_W, HISTORY_MAX_W)
+}
+
+/// `AppConfig::history_width` (whole px, `None` = never resized) → the
+/// width to start the session with.
+pub(crate) fn history_width_from(stored: Option<u16>) -> f32 {
+    match stored {
+        Some(w) => clamp_history_width(f32::from(w)),
+        None => HISTORY_DEFAULT_W,
+    }
+}
+
+/// The sidebar's built-in width, used until the user drags the splitter.
+/// Was the hard-coded `260.` in `render`.
+pub(crate) const SIDEBAR_DEFAULT_W: f32 = 260.0;
+/// Narrow enough to be useful, wide enough that the 5 px splitter is still
+/// grabbable. A panel dragged to 0 could not be dragged back — Ctrl+B hides
+/// the panel, and that is the control for „I want it gone".
+pub(crate) const SIDEBAR_MIN_W: f32 = 140.0;
+/// Keeps the editor usable on a laptop screen; a user who wants the tree
+/// huge can still hide the history panel with Ctrl+H.
+pub(crate) const SIDEBAR_MAX_W: f32 = 640.0;
+
+/// The ONE clamp. Applied on load, on every drag move, and before saving, so
+/// no path can put a width outside the range into `self` or `config.toml`.
+pub(crate) fn clamp_sidebar_width(w: f32) -> f32 {
+    // `f32::clamp` PANICS on NaN. A NaN can only come from a corrupted drag
+    // start, but a resize must not be able to take the process down.
+    if w.is_nan() {
+        return SIDEBAR_DEFAULT_W;
+    }
+    w.clamp(SIDEBAR_MIN_W, SIDEBAR_MAX_W)
+}
+
+/// `AppConfig::sidebar_width` (whole px, `None` = never resized) → the
+/// working `f32`. Clamped here too, because the stored value may have been
+/// hand-edited or written on a much wider monitor.
+pub(crate) fn sidebar_width_from(stored: Option<u16>) -> f32 {
+    match stored {
+        Some(w) => clamp_sidebar_width(f32::from(w)),
+        None => SIDEBAR_DEFAULT_W,
+    }
+}
 
 /// Design §2.3: the widened connection identity. `\u{1F}` (unit separator)
 /// joins id and database — the same convention dbc-state's
@@ -5274,6 +5410,115 @@ impl AppView {
         cx.notify();
     }
 
+    /// Ctrl+Shift+F / the „Formátovat" button.
+    ///
+    /// Dialect comes from the ACTIVE connection's engine, so the same text
+    /// formats as T-SQL against MSSQL and as Postgres against pg — `[a b]`
+    /// is one identifier in the first and a subscript in the second. With no
+    /// active connection there is nothing to be right about, so it refuses
+    /// rather than guessing a dialect and reflowing the user's SQL by the
+    /// wrong rules.
+    fn on_format_sql(&mut self, _: &FormatSql, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        let Some(engine) = self.active_engine() else {
+            self.status = "error: formátování potřebuje aktivní připojení (určuje dialekt)".into();
+            cx.notify();
+            return;
+        };
+        let dialect = sql_dialect(engine);
+        let changed = rewrite_buffer_in_place(self, cx, |sql| dbc_core::format::format_sql(sql, dialect));
+        self.status =
+            if changed { "SQL naformátováno".into() } else { "SQL už je naformátované".into() };
+        cx.notify();
+    }
+
+    /// Flips the schema tree between „by schema" and „by object kind" and
+    /// persists the choice.
+    ///
+    /// No fetch: both shapes are the SAME `SchemaSnapshot` flattened
+    /// differently, so this is a re-render, not a round trip — which is why
+    /// it can be a one-click header icon rather than something guarded
+    /// behind a confirm.
+    ///
+    /// The tree does not own this value. It is global config, so the flip,
+    /// the save and the push back into the tree all happen here; letting the
+    /// tree flip its own copy would let the two disagree whenever the save
+    /// is refused.
+    fn toggle_tree_grouping(&mut self, cx: &mut Context<Self>) {
+        let next = match self.config.tree_grouping {
+            dbc_state::TreeGrouping::Schema => dbc_state::TreeGrouping::Kind,
+            dbc_state::TreeGrouping::Kind => dbc_state::TreeGrouping::Schema,
+        };
+        self.config.tree_grouping = next;
+        self.tree.update(cx, |t, cx| t.set_grouping(next, cx));
+        self.status = match next {
+            dbc_state::TreeGrouping::Schema => "strom: podle schémat".to_string(),
+            dbc_state::TreeGrouping::Kind => "strom: podle typu objektu".to_string(),
+        };
+        // Same posture as `set_theme` and `end_sidebar_resize`: the guard
+        // gates the WRITE only, the session already switched above, and a
+        // refusal leaves its own status in place.
+        if let Some(guard) = self.guard_corrupt_config(cx) {
+            if let Err(e) = self.config.save(&self.config_path, &guard) {
+                self.status = format!("error: režim stromu se nepodařilo uložit: {e}");
+            }
+        }
+        cx.notify();
+    }
+
+    /// Ends a splitter drag and persists the result.
+    ///
+    /// Persisting happens HERE — at the drag END — and never in the move
+    /// handler. A move fires per mouse event, so saving there would rewrite
+    /// `config.toml` (tmp + `sync_all` + rename, over every connection and
+    /// favourite) dozens of times per second for a single gesture. Same
+    /// contract as `grid.rs`'s column widths, which emit `ViewChanged` only
+    /// on `on_mouse_up`.
+    ///
+    /// The equality check is not an optimisation: a plain CLICK on the
+    /// splitter — no movement at all — is a complete down/up pair, so
+    /// without it every stray click would write `config.toml`.
+    /// Ends a history-panel drag and persists the result. Same contract as
+    /// [`AppView::end_sidebar_resize`] — persist on drag END only, and skip
+    /// the write when nothing changed so a stray click on the splitter does
+    /// not rewrite `config.toml`.
+    fn end_history_resize(&mut self, cx: &mut Context<Self>) {
+        self.history_resizing = None;
+        let width = clamp_history_width(self.history_width) as u16;
+        if self.config.history_width == Some(width) {
+            cx.notify();
+            return;
+        }
+        self.config.history_width = Some(width);
+        if let Some(guard) = self.guard_corrupt_config(cx) {
+            if let Err(e) = self.config.save(&self.config_path, &guard) {
+                self.status = format!("error: šířku historie se nepodařilo uložit: {e}");
+            }
+        }
+        cx.notify();
+    }
+
+    fn end_sidebar_resize(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_resizing = None;
+        let width = clamp_sidebar_width(self.sidebar_width) as u16;
+        if self.config.sidebar_width == Some(width) {
+            cx.notify();
+            return;
+        }
+        self.config.sidebar_width = Some(width);
+        // Same posture as `set_theme`: the guard gates the WRITE only. The
+        // in-session width already changed and stays changed — a save
+        // failure degrades to session-only plus the guard's own status.
+        if let Some(guard) = self.guard_corrupt_config(cx) {
+            if let Err(e) = self.config.save(&self.config_path, &guard) {
+                self.status = format!("error: šířku panelu se nepodařilo uložit: {e}");
+            }
+        }
+        cx.notify();
+    }
+
     fn on_toggle_history(&mut self, _: &ToggleHistory, _window: &mut Window, cx: &mut Context<Self>) {
         self.history_visible = !self.history_visible;
         if self.history_visible {
@@ -5519,6 +5764,16 @@ impl AppView {
                         }
                     }
                 }
+                PaletteAction::ShowLog => self.open_log_tab(cx),
+                PaletteAction::ClearSchemaCache => {
+                    dbc_state::schema_cache::clear();
+                    // The in-memory tree is untouched on purpose: this
+                    // clears what is on DISK, and throwing away the schema
+                    // the user is currently looking at would be a
+                    // surprising second effect. The next expand refetches.
+                    self.status = "Mezipaměť schémat vymazána".to_string();
+                    cx.notify();
+                }
                 PaletteAction::OpenCompare => self.open_compare_dialog(cx),
                 PaletteAction::BackupDatabase => {
                     if let Some(id) = self.active_connection_id.clone() {
@@ -5719,7 +5974,23 @@ impl AppView {
         let cursor = self.sql.read(cx).cursor();
         let suppressed = self.sql.read(cx).cursor_in_suppressed_span();
         let snapshot = self.tree.read(cx).snapshot();
+        let had_snapshot = snapshot.is_some();
         let candidates = autocomplete::candidates(&text, cursor, snapshot, true, suppressed);
+        // Ctrl+Space is an EXPLICIT ask, so silence is the wrong answer:
+        // every reason the popup stays shut is invisible from the outside
+        // (cursor inside a string, no schema loaded yet), which is exactly
+        // how „autocomplete is broken" gets reported for something that is
+        // working as designed. The typing trigger stays silent — a status
+        // line rewritten on every keystroke would be noise.
+        if candidates.is_empty() {
+            self.status = if suppressed {
+                "napovídání: kurzor je v řetězci nebo komentáři".into()
+            } else if !had_snapshot {
+                "napovídání: schéma není načtené — rozbalte databázi v panelu vlevo".into()
+            } else {
+                "napovídání: nic nevyhovuje".into()
+            };
+        }
         self.autocomplete =
             (!candidates.is_empty()).then(|| AutocompleteState { candidates, selected: 0 });
         // Keep the lazy-diff cache in sync so the SAME render's
@@ -6418,6 +6689,7 @@ impl AppView {
         self.modal = Some(connections_ui::ModalState::MasterPasswordPrompt {
             input,
             error: None,
+            verifying: false,
             pending,
         });
         self.dropdown_open = false;
@@ -6468,6 +6740,14 @@ impl AppView {
             t.set_read_only(read_only, cx);
             t.set_admin_entry(admin_entry, cx);
         });
+        // The editor's keyword colouring is dialect-specific, so it rides
+        // the same context refresh as everything else that depends on the
+        // active connection — one place where „the context changed" is
+        // acted on, rather than a second hook that could be forgotten on a
+        // future switch path.
+        let dialect = self.active_engine().map(sql_dialect);
+        self.sql.update(cx, |input, cx| input.set_dialect(dialect, cx));
+        self.tree.update(cx, |t, cx| t.set_dialect(dialect, cx));
         self.push_active_scope_to_tree(cx);
         // Workspace T7: „is there a scripts root at all" travels with the
         // rest of the tree context. Pushing it never scans by itself —
@@ -8283,6 +8563,8 @@ impl AppView {
         let default_db = cfg.database.clone();
         self.tree.update(cx, |t, cx| t.begin_db_list(&conn_id, my_generation, cx));
         let rx = self.runner.fetch_database_list(spec_for_database(&cfg, &cfg.database, secret));
+        let started = std::time::Instant::now();
+        let engine_name = format!("{:?}", cfg.engine);
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |view, cx| {
@@ -8291,6 +8573,27 @@ impl AppView {
                     Ok(Err(e)) => Err(e.to_string()),
                     Err(_) => Err("výpis databází zrušen".to_string()),
                 };
+                // Expanding a connection is the FIRST thing that touches the
+                // server, so this is where a bad host, a refused login or an
+                // ODBC driver problem actually surfaces — and it was the one
+                // outcome the log did not record (user report, 2026-08-30:
+                // a red ODBC error on screen, nothing in the log).
+                {
+                    use dbc_state::applog::{log, Event};
+                    let engine = engine_name.clone();
+                    match &result {
+                        Ok(_) => log(Event::ConnectOk {
+                            conn: conn_id.clone(),
+                            engine,
+                            ms: started.elapsed().as_millis() as u64,
+                        }),
+                        Err(e) => log(Event::ConnectFailed {
+                            conn: conn_id.clone(),
+                            engine,
+                            error: e.clone(),
+                        }),
+                    }
+                }
                 view.tree.update(cx, |t, cx| {
                     t.finish_db_list(&conn_id, my_generation, result, &default_db, cx)
                 });
@@ -8330,7 +8633,47 @@ impl AppView {
             spec_for_database(&cfg, &db, secret)
         };
         self.tree.update(cx, |t, cx| t.begin_schema(&conn_id, &db, my_generation, cx));
+        // Paint the cached schema NOW, then refresh from the server behind
+        // it (user request, 2026-08-30: reopening a database you have
+        // already visited should be fast). The cache is never the final
+        // answer — the fetch below still runs and replaces it — so the cost
+        // of a stale entry is at most a moment of out-of-date names, never
+        // a wrong answer that sticks.
+        //
+        // The CLI slot is excluded: it is keyed by a sentinel id and an
+        // empty database name, so every `--url` the app was ever started
+        // with would share one cache entry.
+        //
+        // Reading it happens on the BACKGROUND executor, not here. One real
+        // schema in this app's own use is a 4.6 MB JSON file; parsing that
+        // inline would freeze the window exactly the way the master
+        // password's Argon2id did, and a cache that stutters is not a
+        // cache. Two tasks race politely: whichever answer lands first is
+        // shown, and the cache never overwrites a fetch that already
+        // arrived.
+        let served_from_cache = std::rc::Rc::new(std::cell::Cell::new(false));
+        let fetch_done = std::rc::Rc::new(std::cell::Cell::new(false));
+        if conn_id != CLI_CONN_IDENTITY {
+            let (c, d) = (conn_id.clone(), db.clone());
+            let load = cx.background_executor()
+                .spawn(async move { dbc_state::schema_cache::load::<SchemaSnapshot>(&c, &d) });
+            let (c, d) = (conn_id.clone(), db.clone());
+            let (served, done) = (served_from_cache.clone(), fetch_done.clone());
+            cx.spawn(async move |this, cx| {
+                let Some(cached) = load.await else { return };
+                let _ = this.update(cx, |view, cx| {
+                    if done.get() {
+                        return;
+                    }
+                    served.set(true);
+                    view.tree
+                        .update(cx, |t, cx| t.finish_schema(&c, &d, my_generation, Ok(cached), cx));
+                });
+            })
+            .detach();
+        }
         let rx = self.runner.fetch_schema(spec);
+        let started = std::time::Instant::now();
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |view, cx| {
@@ -8340,8 +8683,48 @@ impl AppView {
                     Err(_) => Err("fetch zrušen".to_string()),
                 };
                 let ok = result.is_ok();
-                view.tree
-                    .update(cx, |t, cx| t.finish_schema(&conn_id, &db, my_generation, result, cx));
+                {
+                    use dbc_state::applog::{log, Event};
+                    match &result {
+                        Ok(s) => log(Event::SchemaLoaded {
+                            conn: conn_id.clone(),
+                            db: Some(db.clone()),
+                            tables: s.tables.len(),
+                            ms: started.elapsed().as_millis() as u64,
+                        }),
+                        Err(e) => log(Event::SchemaFailed {
+                            conn: conn_id.clone(),
+                            db: Some(db.clone()),
+                            error: e.clone(),
+                        }),
+                    }
+                }
+                fetch_done.set(true);
+                if let Ok(snapshot) = &result {
+                    if conn_id != CLI_CONN_IDENTITY {
+                        // Serialising 4.6 MB belongs off the UI thread for
+                        // the same reason reading it does.
+                        let (c, d, snap) = (conn_id.clone(), db.clone(), snapshot.clone());
+                        cx.background_executor()
+                            .spawn(async move { dbc_state::schema_cache::store(&c, &d, &snap) })
+                            .detach();
+                    }
+                }
+                // A failed REFRESH must not wipe a good cached tree. The
+                // names on screen are still the best answer anyone has, and
+                // replacing them with an error would punish the user for
+                // the cache having worked. The failure is still reported —
+                // in the status bar, and in the log by the arm above.
+                if result.is_err() && served_from_cache.get() {
+                    if let Err(e) = &result {
+                        view.status = format!("error: schéma se nepodařilo obnovit ({e}) — zobrazeno z mezipaměti");
+                    }
+                    cx.notify();
+                } else {
+                    view.tree.update(cx, |t, cx| {
+                        t.finish_schema(&conn_id, &db, my_generation, result, cx)
+                    });
+                }
                 // The old trigger_schema_fetch success-arm side effects,
                 // ACTIVE slot only:
                 if ok && view.scope_is_active(&conn_id, &db) {
@@ -9415,14 +9798,74 @@ impl AppView {
     /// `schema` is `None` for an engine/snapshot with no schema concept
     /// (SQLite) — matches every other `Option<String>` schema field in this
     /// codebase (strict, no "public" guessing).
+    /// Opens the tail of the diagnostic log as a text tab.
+    ///
+    /// The tail rather than the whole file: the cap is 2 MiB and the answer
+    /// to „what just happened" is always at the end. The path is the first
+    /// line so the file can be opened outside the app too — which is the
+    /// only way to read it after a crash.
+    fn open_log_tab(&mut self, cx: &mut Context<Self>) {
+        const TAIL_BYTES: usize = 64 * 1024;
+        // `Tabs::open` does NOT dedupe by `preview_key` — the codebase's
+        // idiom is to close the previous one first (the same pair
+        // `open_table_preview` and the admin tab use). Without this, every
+        // open (and every refresh) stacked another Log tab.
+        self.tabs.close_by_preview_key(LOG_PREVIEW_KEY);
+        let where_ = dbc_state::applog::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(log není k dispozici)".to_string());
+        let tail = dbc_state::applog::tail(TAIL_BYTES);
+        let body = if tail.trim().is_empty() {
+            format!("{where_}
+
+(zatím prázdný)")
+        } else {
+            format!("{where_}
+
+{tail}")
+        };
+        self.tabs.open(ResultTab {
+            id: 0,
+            title: "Log".to_string(),
+            pinned: false,
+            preview_key: Some(LOG_PREVIEW_KEY.to_string()),
+            conn_identity: self.current_conn_identity(),
+            content: TabContent::Text { text: body, scroll_lines: 0 },
+        });
+        self.status = format!("Log: {where_}");
+        cx.notify();
+    }
+
     fn open_er_diagram(&mut self, schema: Option<String>, cx: &mut Context<Self>) {
         let Some(snapshot) = self.tree.read(cx).snapshot() else {
             self.status = "Nejprve načtěte schéma".to_string();
+            dbc_state::applog::log(dbc_state::applog::Event::Refused {
+                what: "er_diagram".into(),
+                reason: "no schema snapshot loaded".into(),
+            });
             cx.notify();
             return;
         };
         let scoped: Vec<TableInfo> =
             snapshot.tables.iter().filter(|t| t.schema == schema).cloned().collect();
+        // A diagram of nothing is a blank tab, and a blank tab reads as „the
+        // click did nothing" (user report, 2026-08-29). Say so instead.
+        if scoped.is_empty() {
+            dbc_state::applog::log(dbc_state::applog::Event::Refused {
+                what: "er_diagram".into(),
+                reason: format!(
+                    "no tables in schema {:?} ({} in snapshot)",
+                    schema,
+                    snapshot.tables.len()
+                ),
+            });
+            self.status = match &schema {
+                Some(s) => format!("Schéma {s} nemá žádné tabulky — není co nakreslit"),
+                None => "Snímek schématu nemá žádné tabulky — není co nakreslit".to_string(),
+            };
+            cx.notify();
+            return;
+        }
         let (scoped, hidden) = er_diagram_view::cap_tables(scoped, er_diagram_view::DIAGRAM_TABLE_CAP);
         let truncated_notice = hidden.map(|hidden| {
             format!(
@@ -9822,6 +10265,17 @@ impl AppView {
                                 };
                                 view.run_query_with(sql, Some(preview), true, cx);
                             }
+                            ApplyTarget::Tree => {
+                                view.status = "provedeno".into();
+                                // The dropped/emptied object must leave the
+                                // tree, or the next click acts on something
+                                // that no longer exists.
+                                if let (Some(id), Some(db)) =
+                                    (view.active_connection_id.clone(), view.effective_database())
+                                {
+                                    view.start_schema_slot_fetch(id, db, cx);
+                                }
+                            }
                             ApplyTarget::Admin { panel } => {
                                 // G10 T4: clears the panel's staged sets and
                                 // re-requests the active sub-view's catalog
@@ -10000,6 +10454,14 @@ impl AppView {
     /// tree header's "DDL" button via `SchemaTree::handle_generate_ddl`)
     /// just opens a read-only `Text` tab — no DB round-trip either way.
     fn on_tree_event(&mut self, _emitter: Entity<SchemaTree>, event: &TreeEvent, cx: &mut Context<Self>) {
+        // One line per tree/context-menu action, before it runs. This is
+        // the entry that answers „did my click even arrive?" — the question
+        // the log was added for. Only the variant NAME is recorded; the
+        // payload can carry generated SQL.
+        dbc_state::applog::log(dbc_state::applog::Event::Action {
+            action: crate::schema_tree::event_name(event),
+            target: crate::schema_tree::event_target(event),
+        });
         match event {
             // Sidebar rework (design §5 row 1): scope-checked — an
             // active-scope open runs directly (including its dirty-preview
@@ -10042,6 +10504,9 @@ impl AppView {
             // transition carries the slot's expand-set forward — resolved
             // deviation 13). Nothing active → just re-push the (empty)
             // context; there is no whole-panel state to clear any more.
+            TreeEvent::ToggleGroupingRequested => {
+                self.toggle_tree_grouping(cx);
+            }
             TreeEvent::RefreshRequested => {
                 if let Some(id) = self.active_connection_id.clone() {
                     if let Some(db) = self.effective_database() {
@@ -10120,7 +10585,165 @@ impl AppView {
             TreeEvent::ScriptDelete { rel, is_dir } => {
                 self.open_script_delete_modal(rel.clone(), *is_dir, cx)
             }
+
+            // --- Context menu (2026-08-29) ---
+            TreeEvent::CopyText { what, text } => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                self.status = format!("{what} zkopírováno");
+                cx.notify();
+            }
+            TreeEvent::InsertAtCursor { text } => {
+                let text = text.clone();
+                self.sql.update(cx, |input, cx| input.insert_text(&text, cx));
+                self.status = "vloženo do editoru".into();
+                cx.notify();
+            }
+            TreeEvent::GenerateSql { kind, sql } => {
+                let sql = sql.clone();
+                let changed = rewrite_buffer_in_place(self, cx, move |_| sql);
+                self.status = match kind {
+                    schema_tree::GenKind::Select if changed => "SELECT vygenerován".into(),
+                    schema_tree::GenKind::Insert if changed => "INSERT vygenerován".into(),
+                    schema_tree::GenKind::Update if changed => "UPDATE vygenerován".into(),
+                    _ => "editor už obsahuje tento dotaz".into(),
+                };
+                cx.notify();
+            }
+            TreeEvent::OpenPreviewHere { schema, table } => {
+                self.open_table_preview(schema.clone(), table.clone(), cx)
+            }
+            TreeEvent::CountRows { schema, table } => self.run_count_rows(schema.clone(), table.clone(), cx),
+            TreeEvent::OpenMonitorFor { .. } => self.open_monitor_tab(cx),
+            TreeEvent::OpenCompareFor { .. } => self.open_compare_dialog(cx),
+            TreeEvent::ExportCsv { schema, table } => {
+                // Export runs off a RESULT, not off a table name, so the
+                // honest thing is to open the data first — the grid's own
+                // „Export" is then one click away and exports exactly what
+                // is on screen, rather than a second, silently different
+                // extraction path.
+                self.open_table_preview(schema.clone(), table.clone(), cx);
+                self.status = "data otevřena — export je v panelu výsledku".into();
+                cx.notify();
+            }
+            // These need a `Window` (dialog focus) and this subscription is
+            // cx-only, so they are parked and drained at the top of
+            // `render`, the same shape the queued cross-context open uses.
+            TreeEvent::BackupFor { .. }
+            | TreeEvent::RestoreFor { .. }
+            | TreeEvent::EditConnection { .. }
+            | TreeEvent::DropObject { .. }
+            | TreeEvent::TruncateTable { .. } => {
+                self.pending_menu_action = Some(event.clone());
+                cx.notify();
+            }
         }
+    }
+
+    /// „Počet řádků" — runs `SELECT COUNT(*)` through the normal guarded
+    /// pipeline WITHOUT touching the editor's text, the same posture as a
+    /// table preview. `bypass_auto_limit` because a count returns one row
+    /// and an appended `LIMIT` would be noise in the history entry.
+    fn run_count_rows(&mut self, schema: Option<String>, table: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.active_engine() else {
+            self.status = "error: není aktivní připojení".into();
+            cx.notify();
+            return;
+        };
+        let target =
+            dbc_core::quote_qualified_d(sql_dialect(engine), schema.as_deref(), &table);
+        self.run_query_with(format!("SELECT COUNT(*) FROM {target}"), None, true, cx);
+    }
+
+    /// Drains [`AppView::pending_menu_action`]. Called from `render`, which
+    /// is where a `Window` exists.
+    fn perform_pending_menu_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(event) = self.pending_menu_action.take() else {
+            return;
+        };
+        match event {
+            TreeEvent::BackupFor { conn_id, .. } => self.open_backup_dialog(conn_id, window, cx),
+            TreeEvent::RestoreFor { conn_id, .. } => self.open_restore_dialog(conn_id, window, cx),
+            TreeEvent::EditConnection { conn_id } => {
+                let cfg = self.config.connections.iter().find(|c| c.id == conn_id).cloned();
+                match cfg {
+                    Some(cfg) => self.open_connection_dialog(Some(cfg), window, cx),
+                    // The row was built from this list, so a miss means the
+                    // config changed under the open menu.
+                    None => {
+                        self.status = "error: připojení už neexistuje".into();
+                        cx.notify();
+                    }
+                }
+            }
+            TreeEvent::DropObject { kind, schema, name } => {
+                self.open_destructive_confirm(
+                    |d| tree_menu::drop_sql(kind, d, schema.as_deref(), &name),
+                    format!("Objekt {name} bude nenávratně odstraněn."),
+                    window,
+                    cx,
+                );
+            }
+            TreeEvent::TruncateTable { schema, table } => {
+                self.open_destructive_confirm(
+                    |d| tree_menu::truncate_sql(d, schema.as_deref(), &table),
+                    format!("Všechna data v tabulce {table} budou nenávratně smazána."),
+                    window,
+                    cx,
+                );
+            }
+            // Every other variant is handled synchronously in
+            // `on_tree_event` and never parked.
+            _ => {}
+        }
+    }
+
+    /// Opens the SHARED Apply confirm dialog for a destructive statement.
+    ///
+    /// This is the whole safety story for the menu's `DROP`/`TRUNCATE`
+    /// items: they do not execute, they stage exactly one statement into the
+    /// dialog that already exists for sandbox and admin writes, which shows
+    /// the SQL verbatim and runs it through `run_write_transaction` — the
+    /// path that carries the read-only guard and the transaction
+    /// discipline. There is no second execution route.
+    ///
+    /// `build` takes the dialect rather than a finished string so the SQL
+    /// cannot be built before we know there IS an active connection to
+    /// build it for.
+    fn open_destructive_confirm(
+        &mut self,
+        build: impl FnOnce(dbc_core::Dialect) -> String,
+        warning: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.active_engine() else {
+            self.status = "error: není aktivní připojení".into();
+            cx.notify();
+            return;
+        };
+        if self.active_read_only() {
+            // Belt-and-braces: `tree_menu` already omits these items on a
+            // read-only connection, so reaching here means the flag changed
+            // between the menu opening and the click.
+            self.status = "error: připojení je jen pro čtení".into();
+            cx.notify();
+            return;
+        }
+        let sql = build(sql_dialect(engine));
+        let statements = vec![admin_sql::WriteStatement::from((sql.clone(), None))];
+        let focus_handle = cx.focus_handle();
+        self.apply_dialog = Some(ApplyDialogState {
+            target: ApplyTarget::Tree,
+            statements,
+            sql_text: sql,
+            warning: Some(warning),
+            conn_identity: self.current_conn_identity(),
+            running: false,
+            error: None,
+            focus_handle: focus_handle.clone(),
+        });
+        window.focus(&focus_handle, cx);
+        cx.notify();
     }
 
     /// Tab strip between the SQL editor and result content: title +
@@ -10131,28 +10754,33 @@ impl AppView {
     fn render_tab_strip(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
         let active_id = self.tabs.active().map(|t| t.id);
-        let rows: Vec<(u64, String, bool, usize)> = self
+        let rows: Vec<(u64, String, bool, Option<usize>)> = self
             .tabs
             .iter()
             .map(|t| {
+                // `None` = this kind of tab HAS no row count. It used to
+                // be `0`, which the strip rendered as „Log (0)" / „ER: dbo
+                // (0)" — a count of nothing, on tabs that never had rows
+                // (user report, 2026-08-30: „proč je tam nula?").
                 let (row_count, dirty) = match &t.content {
-                    TabContent::Grid { buffer, grid } => {
-                        (buffer.borrow().row_count(), grid.read(cx).edit_state.is_dirty())
-                    }
-                    TabContent::Text { .. } => (0, false),
-                    TabContent::Monitor { .. } => (0, false),
-                    TabContent::Plan { .. } => (0, false),
-                    TabContent::Diagram { .. } => (0, false),
-                    TabContent::Compare { .. } => (0, false),
-                    TabContent::Chart { .. } => (0, false),
-                    TabContent::ScriptRun { .. } => (0, false),
+                    TabContent::Grid { buffer, grid } => (
+                        Some(buffer.borrow().row_count()),
+                        grid.read(cx).edit_state.is_dirty(),
+                    ),
+                    TabContent::Text { .. } => (None, false),
+                    TabContent::Monitor { .. } => (None, false),
+                    TabContent::Plan { .. } => (None, false),
+                    TabContent::Diagram { .. } => (None, false),
+                    TabContent::Compare { .. } => (None, false),
+                    TabContent::Chart { .. } => (None, false),
+                    TabContent::ScriptRun { .. } => (None, false),
                     // Review finding: this used to hardcode `false`
                     // regardless of staged admin edits, so a dirty admin
                     // tab never got the " •" suffix either. Reuses
                     // `AdminPanel::change_count` — the same dirtiness
                     // definition `grid_dirty_change_count`'s `Admin` arm
                     // (the close-tab guard) already reads.
-                    TabContent::Admin { view } => (0, view.read(cx).change_count() > 0),
+                    TabContent::Admin { view } => (None, view.read(cx).change_count() > 0),
                 };
                 // G5 Task 3, brief contract #7: dirty (unapplied staged
                 // edits) tabs get a " •" title suffix — the apply bar
@@ -10183,14 +10811,23 @@ impl AppView {
                         view.tabs.activate(id);
                         cx.notify();
                     }))
-                    .child(format!("{title} ({row_count})"))
+                    .child(match row_count {
+                        Some(n) => format!("{title} ({n})"),
+                        None => title.clone(),
+                    })
                     .child(
                         div()
                             .id(("tab-pin", id as usize))
                             .px_1()
                             .cursor_pointer()
                             .text_color(pin_color)
-                            .child("📌")
+                            // A monochrome dot, not the 📌 emoji (user
+                            // report, 2026-08-30). Colour emoji renders in
+                            // its own palette, ignores the theme, and sits
+                            // at a different weight from every other glyph
+                            // in the strip — which is exactly why it looked
+                            // out of place.
+                            .child(if pinned { "●" } else { "○" })
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 cx.stop_propagation();
                                 view.tabs.toggle_pin(id);
@@ -10239,6 +10876,11 @@ impl AppView {
         let Some(active) = self.tabs.active() else {
             return div().flex_1().bg(theme.bg_panel).into_any_element();
         };
+        // The log tab is a SNAPSHOT of a file that keeps being written to,
+        // so it is the one text tab that needs a way to re-read it (user
+        // report, 2026-08-30: an error appeared on screen after the tab was
+        // opened, so the tab did not have it).
+        let is_log = active.preview_key.as_deref() == Some(LOG_PREVIEW_KEY);
 
         match &active.content {
             TabContent::Grid { grid, .. } => {
@@ -10285,13 +10927,28 @@ impl AppView {
                     body = body.child(div().child(line.to_string()));
                 }
 
+                let mut header = div().flex().flex_row().justify_end().gap_2().p_1();
+                if is_log {
+                    header = header.child(
+                        div()
+                            .id("tab-log-refresh")
+                            .cursor_pointer()
+                            .bg(theme.bg_hover)
+                            .text_color(theme.text_primary)
+                            .px_2()
+                            .rounded_md()
+                            .child("Obnovit")
+                            .on_click(cx.listener(|view, _, _, cx| view.open_log_tab(cx))),
+                    );
+                }
+
                 div()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .bg(theme.bg_panel)
                     .child(
-                        div().flex().flex_row().justify_end().p_1().child(
+                        header.child(
                             div()
                                 .id("tab-copy")
                                 .cursor_pointer()
@@ -11702,6 +12359,11 @@ impl Render for AppView {
                 window.focus(&self.modal_focus_handle, cx);
             }
         }
+        // Context-menu actions that need a `Window` were parked by the
+        // cx-only tree subscription; this is the first point in the frame
+        // where one exists.
+        self.perform_pending_menu_action(window, cx);
+
         // G6 T7: lazy-diff typing-trigger recompute, BEFORE the popup is
         // drawn below (design §2 grounding) — then sync the flag T5's
         // `SqlInput::up`/`down`/`newline` check to decide whether to
@@ -11803,19 +12465,47 @@ impl Render for AppView {
         }
         column = column.child(self.render_tab_content(cx));
 
-        // G2 Task 6: the schema tree panel sits LEFT of `column`, fixed
-        // 260 px, collapsible via Ctrl+B (`ToggleTree`) — collapsed means
-        // not rendered at all (width 0), not just visually hidden.
+        // G2 Task 6: the schema tree panel sits LEFT of `column`,
+        // collapsible via Ctrl+B (`ToggleTree`) — collapsed means not
+        // rendered at all (width 0), not just visually hidden. The width was
+        // a fixed 260 px until the user asked for a draggable splitter
+        // (2026-08-28); it is now `sidebar_width`, persisted on drag END.
         let mut body = div().flex().flex_row().flex_1().min_h_0();
         if self.tree_visible {
             body = body.child(
                 div()
-                    .w(px(260.))
+                    .relative()
+                    .w(px(self.sidebar_width))
                     .h_full()
                     .flex_shrink_0()
                     .border_r_1()
                     .border_color(theme.border)
-                    .child(self.tree.clone()),
+                    .child(self.tree.clone())
+                    .child(
+                        // The splitter. A sibling of the tree rather than
+                        // part of its border, so grabbing it can never also
+                        // hit a tree row underneath — the same
+                        // `.occlude()` reasoning as `grid.rs`'s column
+                        // resize handle, which learned it from a bug where
+                        // a drag also toggled the sort.
+                        div()
+                            .id("sidebar-splitter")
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .w(px(5.))
+                            .h_full()
+                            .occlude()
+                            .cursor_col_resize()
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|view, e: &gpui::MouseDownEvent, _w, cx| {
+                                    view.sidebar_resizing =
+                                        Some((f32::from(e.position.x), view.sidebar_width));
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
             );
         }
         body = body.child(column);
@@ -11824,7 +12514,34 @@ impl Render for AppView {
         // collapsible via Ctrl+H (`ToggleHistory`) — same collapse-to-0px
         // convention as the schema tree panel above.
         if self.history_visible {
-            body = body.child(self.render_history_panel(cx));
+            body = body.child(
+                div()
+                    .relative()
+                    .w(px(self.history_width))
+                    .h_full()
+                    .flex_shrink_0()
+                    .child(self.render_history_panel(cx))
+                    .child(
+                        // Mirror of the sidebar splitter, on the other edge.
+                        div()
+                            .id("history-splitter")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(px(5.))
+                            .h_full()
+                            .occlude()
+                            .cursor_col_resize()
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|view, e: &gpui::MouseDownEvent, _w, cx| {
+                                    view.history_resizing =
+                                        Some((f32::from(e.position.x), view.history_width));
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+            );
         }
 
         let mut root = div()
@@ -11841,8 +12558,56 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_open_palette))
             .on_action(cx.listener(Self::on_open_autocomplete))
             .on_action(cx.listener(Self::on_save_script))
+            .on_action(cx.listener(Self::on_format_sql))
+            .on_action(cx.listener(Self::on_format_sql))
             .child(self.render_top_bar(cx))
             .child(body);
+
+        // Mouse tracking lives on the ROOT, not on the splitter: once the
+        // drag starts the pointer routinely leaves the 5 px handle, and a
+        // handler bound to the handle would stop receiving moves the instant
+        // it did. `on_mouse_up_out` is the other half — releasing outside the
+        // window must also end the drag, or the panel keeps following the
+        // mouse after the button is up. Both learned from `grid.rs`.
+        if self.history_resizing.is_some() {
+            root = root
+                .on_mouse_move(cx.listener(|view, e: &gpui::MouseMoveEvent, _w, cx| {
+                    if let Some((start_x, start_w)) = view.history_resizing {
+                        // Minus, not plus: this splitter is on the LEFT edge
+                        // of the panel, so moving right shrinks it.
+                        view.history_width =
+                            clamp_history_width(start_w - (f32::from(e.position.x) - start_x));
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|view, _e, _w, cx| view.end_history_resize(cx)),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|view, _e, _w, cx| view.end_history_resize(cx)),
+                );
+        }
+
+        if self.sidebar_resizing.is_some() {
+            root = root
+                .on_mouse_move(cx.listener(|view, e: &gpui::MouseMoveEvent, _w, cx| {
+                    if let Some((start_x, start_w)) = view.sidebar_resizing {
+                        view.sidebar_width =
+                            clamp_sidebar_width(start_w + (f32::from(e.position.x) - start_x));
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|view, _e, _w, cx| view.end_sidebar_resize(cx)),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|view, _e, _w, cx| view.end_sidebar_resize(cx)),
+                );
+        }
 
         // G5 Task 4, brief contract #1: apply bar sits directly above the
         // status bar (spec mockup: "apply bar (when dirty) / status bar"),
@@ -12159,6 +12924,19 @@ mod plan_restore_tests {
 }
 
 fn main() {
+    // The log goes in the PROFILE directory, not the workspace: it
+    // describes what this machine did, and a workspace folder is meant to
+    // be shared. Same reasoning as `history.sqlite`, which also stays put.
+    //
+    // First statement in `main` on purpose — the panic hook is worth having
+    // installed before anything that can panic runs, since a GPUI app that
+    // panics leaves no window and no message behind.
+    dbc_state::applog::init(&dbc_state::workspace::profile_dir());
+    dbc_state::applog::install_panic_hook();
+    dbc_state::applog::log(dbc_state::applog::Event::Startup {
+        version: env!("CARGO_PKG_VERSION"),
+    });
+
     // CLI arg is now optional: back-compat direct-connect path (phase 0-2)
     // when present, otherwise the app starts with no active connection and
     // the user picks one from the top-bar switcher (Task 7).
@@ -12238,6 +13016,12 @@ fn main() {
             KeyBinding::new("ctrl-b", ToggleTree, None),
             KeyBinding::new("ctrl-h", ToggleHistory, None),
             KeyBinding::new("ctrl-k", OpenPalette, None),
+            // Ctrl+P and Ctrl+Shift+P are what a hand reaches for after
+            // any editor of the last decade (user report, 2026-08-30:
+            // „ctrl + p nic nedela"). Both were free repo-wide; Ctrl+K
+            // stays the documented one.
+            KeyBinding::new("ctrl-p", OpenPalette, None),
+            KeyBinding::new("ctrl-shift-p", OpenPalette, None),
             // G6 T7: force-trigger, same "global, context None" precedent
             // as `RunQuery`/`OpenPalette` above (design §2).
             KeyBinding::new("ctrl-space", OpenAutocomplete, None),
@@ -12245,6 +13029,9 @@ fn main() {
             // as `RunQuery`/`OpenPalette`. Bound => save; unbound =>
             // save-as. The chord was free repo-wide before this line.
             KeyBinding::new("ctrl-s", SaveScript, None),
+            // Ctrl+Shift+F: the shape every other editor uses for "format
+            // document". Ctrl+F is left free for a future find.
+            KeyBinding::new("ctrl-shift-f", FormatSql, None),
         ]);
         sql_input::bind_keys(cx);
         grid::bind_keys(cx);
@@ -12312,6 +13099,9 @@ fn main() {
                             async {}
                         })
                         .detach();
+                        // Read before `config` is moved into the struct below.
+                        let sidebar_width = sidebar_width_from(config.sidebar_width);
+                        let history_width = history_width_from(config.history_width);
                         AppView {
                             tabs: Tabs::new(),
                             status,
@@ -12343,6 +13133,11 @@ fn main() {
                             grouped_cache,
                             tree,
                             tree_visible: true,
+                            sidebar_width,
+                            sidebar_resizing: None,
+                            history_width,
+                            history_resizing: None,
+                            pending_menu_action: None,
                             sidebar_fetch_generation: 0,
                             compare_fetch_generation: 0,
                             history,
@@ -12376,9 +13171,28 @@ fn main() {
         // connection roots + context (favourites/read_only/admin/scope/CLI
         // url), then — CLI-arg back-compat path (brief contract #6) — fire
         // the CLI slot's initial schema fetch, exactly like a switch does.
-        let _ = window_handle.update(cx, |view, _window, cx| {
+        let _ = window_handle.update(cx, |view, window, cx| {
+            // Focus the editor on startup. Without this the app opens with
+            // focus nowhere, so the first keystroke is swallowed and
+            // Ctrl+A, the arrow keys and autocomplete all appear BROKEN
+            // until the user happens to click into the editor — and none of
+            // them say why, because `refresh_autocomplete`'s first act is to
+            // drop the popup when the editor is not focused. A SQL client
+            // that opens ready to type is also just the right default.
+            //
+            // Startup only: forcing this every frame would fight the grid,
+            // the tree and every dialog for focus.
+            let editor_focus = view.sql.focus_handle(cx);
+            window.focus(&editor_focus, cx);
             let grouped = view.grouped_cache.clone();
             view.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
+            // The tree starts on `TreeGrouping::Schema` and learns the saved
+            // choice here — this is what makes the setting survive a
+            // restart. A blocked start carries a default config, so this
+            // pushes the default, which is the right answer when there is no
+            // trustworthy config to read.
+            let grouping = view.config.tree_grouping;
+            view.tree.update(cx, |t, cx| t.set_grouping(grouping, cx));
             view.refresh_tree_context(cx);
             // Part S §1.2: scan on startup when a root is configured. It is
             // a no-op-with-reset when there is none — and a BLOCKED start
@@ -12393,6 +13207,19 @@ fn main() {
             // startup (history panel defaults to visible) instead of
             // leaving it empty until the first recorded run/search edit.
             view.refresh_history_cache(cx);
+            // Ask for the master password ONCE, at startup, instead of
+            // ambushing the first click that happens to need a secret
+            // (user request, 2026-08-30). The vault stays unlocked for the
+            // rest of the session either way — that part was already true;
+            // what changes is WHEN the question is asked, and „now, before
+            // I have started working" is a much better moment than „in the
+            // middle of expanding a connection".
+            //
+            // Cancel is still a full answer: the app runs locked, and every
+            // path that needs a secret prompts again on its own.
+            if Vault::exists(&view.vault_path) && view.vault.is_none() && blocked.is_none() {
+                view.open_vault_prompt(connections_ui::PendingAfterUnlock::Nothing, cx);
+            }
             // Design §W4: the blocking modal goes up LAST, so it occludes a
             // fully-constructed (and deliberately empty) app.
             if let Some((root, reason)) = blocked {
@@ -13691,6 +14518,64 @@ mod autocomplete_handles_action_tests {
 /// compiler half of the same rail: this test proves the call is THERE, the
 /// attribute proves its verdict is not thrown away.
 #[cfg(test)]
+mod sidebar_width_tests {
+    use super::*;
+
+    /// The history panel got the same treatment as the sidebar, so it gets
+    /// the same guarantees — including the NaN arm, which is the one that
+    /// would otherwise render a panel nobody can drag back.
+    #[test]
+    fn history_width_behaves_like_the_sidebar_width() {
+        assert_eq!(history_width_from(None), HISTORY_DEFAULT_W);
+        assert_eq!(history_width_from(Some(320)), 320.0);
+        assert_eq!(history_width_from(Some(0)), HISTORY_MIN_W);
+        assert_eq!(history_width_from(Some(u16::MAX)), HISTORY_MAX_W);
+        assert_eq!(clamp_history_width(f32::NAN), HISTORY_DEFAULT_W);
+    }
+
+    #[test]
+    fn an_unset_width_is_the_built_in_default() {
+        assert_eq!(sidebar_width_from(None), SIDEBAR_DEFAULT_W);
+    }
+
+    #[test]
+    fn a_stored_width_round_trips_when_it_is_in_range() {
+        assert_eq!(sidebar_width_from(Some(317)), 317.0);
+    }
+
+    /// The reason the clamp is on LOAD and not only on drag: a `config.toml`
+    /// hand-edited to `5`, or written on a wide monitor and reopened on a
+    /// narrow one, would otherwise leave a panel too thin to contain the
+    /// 5 px splitter — with no way to drag it back.
+    #[test]
+    fn a_stored_width_outside_the_range_is_pulled_back_in() {
+        assert_eq!(sidebar_width_from(Some(5)), SIDEBAR_MIN_W, "too thin to grab");
+        assert_eq!(sidebar_width_from(Some(u16::MAX)), SIDEBAR_MAX_W, "wider than any screen");
+        assert_eq!(sidebar_width_from(Some(0)), SIDEBAR_MIN_W, "0 could never be dragged back");
+    }
+
+    /// `f32::clamp` PANICS on NaN, and this runs inside a mouse-move
+    /// handler — a panic there takes the window down mid-gesture.
+    #[test]
+    fn a_nan_width_does_not_panic_and_falls_back_to_the_default() {
+        assert_eq!(clamp_sidebar_width(f32::NAN), SIDEBAR_DEFAULT_W);
+    }
+
+    #[test]
+    fn infinities_clamp_rather_than_escape() {
+        assert_eq!(clamp_sidebar_width(f32::INFINITY), SIDEBAR_MAX_W);
+        assert_eq!(clamp_sidebar_width(f32::NEG_INFINITY), SIDEBAR_MIN_W);
+    }
+
+    /// The drag stores `start_w + dx`, so dragging left past the minimum
+    /// produces a NEGATIVE candidate, not merely a small one.
+    #[test]
+    fn dragging_far_left_stops_at_the_minimum() {
+        assert_eq!(clamp_sidebar_width(SIDEBAR_DEFAULT_W - 9999.0), SIDEBAR_MIN_W);
+    }
+}
+
+#[cfg(test)]
 mod config_save_guard_audit {
     use super::editor_clobber_audit::{code_lines, defined_fn_name, sources};
 
@@ -13756,7 +14641,27 @@ mod config_save_guard_audit {
         }
         // Pinned so a NEW writer forces a deliberate look at this test
         // rather than silently inheriting whatever its neighbours do.
-        assert_eq!(sites, 6, "config.toml writer count changed — re-audit, do not just bump");
+        //
+        // 6 → 7 on 2026-08-28: `end_sidebar_resize` persists the splitter
+        // width. Re-audited rather than bumped — the write is inside the
+        // `if let Some(guard) = self.guard_corrupt_config(cx)` arm (this
+        // test's own loop proves that, since it reports position, not just
+        // count), it runs at drag END only, and an unchanged width returns
+        // before reaching it so a bare click on the splitter writes nothing.
+        //
+        // 7 → 8 on 2026-08-28: `toggle_tree_grouping` persists the schema
+        // tree's shape. Same re-audit: guarded arm, and it can only run from
+        // a deliberate click on the header icon — there is no continuous
+        // gesture behind it, so it needs no equality check of its own (the
+        // value provably changed, it is a two-state flip).
+        //
+        // 8 → 9 on 2026-08-30: `end_history_resize` persists the history
+        // panel's width. Re-audited, not bumped: it is the exact mirror of
+        // `end_sidebar_resize` two paragraphs up — guarded arm (which this
+        // test's own loop verifies by position), drag END only, and the
+        // same equality check so a bare click on the splitter writes
+        // nothing.
+        assert_eq!(sites, 9, "config.toml writer count changed — re-audit, do not just bump");
     }
 
     /// The widening is only worth anything if it actually reaches past the
@@ -15933,10 +16838,49 @@ more();");
     fn only_the_guarded_sites_may_replace_the_sql_editors_buffer() {
         audit(
             "replace_buffer",
-            &["bind_script", "perform_script_action"],
-            2,
+            &[
+                "bind_script",
+                "perform_script_action",
+                // 2 → 3 on 2026-08-29 for „Formátovat". Sanctioned after
+                // re-reading what this audit protects: content from
+                // ELSEWHERE must not replace unsaved work.
+                // `rewrite_buffer_in_place` takes no text — it takes
+                // `&str -> String` and feeds it the live buffer — so there
+                // is no parameter through which foreign content could
+                // arrive, and nothing for the user's work to be lost to.
+                // That is why it may skip the dirty check the other mint
+                // exists to enforce, and why sanctioning it is not a
+                // widening of this rail.
+                "rewrite_buffer_in_place",
+            ],
+            3,
             "route it through `AppView::editor_load_guarded` (Part S §5.5) or a bound \
              script's unsaved changes are destroyed silently, with no undo",
+        );
+    }
+
+    /// The sanction above is only sound while `rewrite_buffer_in_place`
+    /// cannot be handed text from outside. If someone ever gives it a
+    /// `&str` parameter, it becomes an unguarded clobber wearing a
+    /// sanctioned name — and the audit above would wave it straight
+    /// through, because the owner is on the list.
+    #[test]
+    fn the_in_place_rewrite_takes_a_transform_and_never_a_string() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("own source");
+        let lines = code_lines(&src);
+        let start = lines
+            .iter()
+            .position(|l| l.contains("fn rewrite_buffer_in_place"))
+            .expect("the function must exist for its sanction to mean anything");
+        let sig: String = lines[start..start + 6].join(" ");
+        assert!(
+            sig.contains("impl FnOnce(&str) -> String"),
+            "the transform parameter is what makes the sanction sound: {sig}"
+        );
+        assert!(
+            !sig.contains("text: &str") && !sig.contains("text: String"),
+            "a text parameter would make this an unguarded clobber: {sig}"
         );
     }
 

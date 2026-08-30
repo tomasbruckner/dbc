@@ -32,12 +32,13 @@ use dbc_core::{
     synthesize_create_table, ColumnInfo, RoutineInfo, RoutineKind, SchemaSnapshot, SequenceInfo,
     TableInfo, TableKind, TriggerInfo,
 };
-use dbc_state::{ConnectionConfig, Engine, FavouriteObject};
+use dbc_state::{ConnectionConfig, Engine, FavouriteObject, TreeGrouping};
 
 use crate::admin_panel::AdminEntry;
 use gpui::{
-    actions, div, prelude::*, px, uniform_list, AnyElement, App, ClickEvent, Context, EventEmitter,
-    FocusHandle, Focusable, Hsla, KeyBinding, KeyDownEvent, MouseButton, Window,
+    actions, anchored, deferred, div, prelude::*, px, uniform_list, AnyElement, App, ClickEvent,
+    Context, EventEmitter, FocusHandle, Focusable, Hsla, KeyBinding, KeyDownEvent, MouseButton,
+    Window,
 };
 
 use crate::theme::ActiveTheme;
@@ -87,6 +88,7 @@ pub enum NodeId {
 
 /// Emitted by `SchemaTree` (`EventEmitter<TreeEvent>`) for the things it
 /// can't act on itself — `main.rs` subscribes and handles them.
+#[derive(Debug, Clone, PartialEq)]
 pub enum TreeEvent {
     /// WIDENED (sidebar rework, design §5 row 1): carries the scope of the
     /// row that emitted it, so `main.rs` can switch-then-open across
@@ -98,6 +100,11 @@ pub enum TreeEvent {
     /// the ⟳ header button's semantics are unchanged from the single-root
     /// era: refresh what the editor is talking to).
     RefreshRequested,
+    /// The grouping icon in the header was clicked. Carries no value: the
+    /// setting is global app config that `main.rs` owns, persists and pushes
+    /// back via `set_grouping`, so the tree must not decide the new value
+    /// itself and then disagree with what got saved.
+    ToggleGroupingRequested,
     /// G3 Task 4: the row's ★/☆ toggle was clicked (either a table/view/
     /// routine/trigger/sequence row, or an item already listed under
     /// `FavouriteSection`) — `main.rs` applies `config.toggle_favourite` +
@@ -171,6 +178,58 @@ pub enum TreeEvent {
     /// T10 sweep: allow removed, owner Task 9 landed
     /// (`start_script_delete`).
     ScriptDelete { rel: String, is_dir: bool },
+
+    // --- Context menu (2026-08-29). Everything below is emitted ONLY from
+    // a right-click menu; see `tree_menu::menu_for` for what appears where.
+    /// Put `text` on the clipboard. `what` names it for the status line
+    /// („jméno zkopírováno"), so one event serves every copy item instead
+    /// of one variant per thing copied.
+    CopyText { what: String, text: String },
+    /// Insert `text` at the editor's cursor (column names).
+    InsertAtCursor { text: String },
+    /// Replace the editor buffer with generated SQL. `kind` is carried for
+    /// the status line only — `sql` is already built, by
+    /// `tree_menu::generate_sql`, because building it needs the snapshot
+    /// and the dialect, which the tree has and `main.rs` would have to
+    /// re-derive.
+    GenerateSql { kind: GenKind, sql: String },
+    /// `SELECT COUNT(*)` against one table.
+    CountRows { schema: Option<String>, table: String },
+    ExportCsv { schema: Option<String>, table: String },
+    OpenMonitorFor { conn_id: String },
+    OpenCompareFor { conn_id: String },
+    BackupFor { conn_id: String, db: Option<String> },
+    RestoreFor { conn_id: String, db: Option<String> },
+    EditConnection { conn_id: String },
+    /// A destructive statement. Emitting this NEVER executes anything: it
+    /// opens the shared Apply confirm dialog with the exact SQL, which is
+    /// this codebase's rule for every write path.
+    DropObject { kind: DropKind, schema: Option<String>, name: String },
+    TruncateTable { schema: Option<String>, table: String },
+    /// Preview one table in the ACTIVE scope (the menu already knows the
+    /// row it was opened on, so unlike `OpenPreview` it carries no
+    /// conn/db).
+    OpenPreviewHere { schema: Option<String>, table: String },
+}
+
+/// Which `DROP` to build. Kept as an enum rather than a string so adding an
+/// object type cannot silently fall through to the wrong keyword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropKind {
+    Table,
+    View,
+    Routine,
+    Trigger,
+    Index,
+    Sequence,
+}
+
+/// Which skeleton `tree_menu::generate_sql` produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenKind {
+    Select,
+    Insert,
+    Update,
 }
 
 /// One visible row: `(id, depth, label, is_expandable)`.
@@ -239,9 +298,53 @@ fn column_label(c: &ColumnInfo) -> String {
 /// per item and, if that table is itself expanded, one `Column` row per
 /// column (filtered to just the matching columns unless the table's own
 /// name matched, in which case all of its columns show).
+/// Owner component of every `NodeId::Section` in [`TreeGrouping::Kind`].
+///
+/// A U+0001 prefix so it cannot collide with a real schema name — in Kind
+/// mode one section holds every schema's objects, and using a schema name as
+/// the owner would split it straight back into one section per schema, which
+/// is the mode we are inverting. It also keeps Kind-mode section ids DISJOINT
+/// from Schema-mode ones, so expand state from one mode cannot half-apply to
+/// the other after a toggle.
+const KIND_SECTION_OWNER: &str = "\u{1}kind";
+
+/// How one run of [`emit_sections`] addresses its objects.
+struct SectionCtx<'a> {
+    /// Schemas whose objects belong in these sections: exactly one in
+    /// [`TreeGrouping::Schema`], all of them in [`TreeGrouping::Kind`].
+    keys: &'a [Option<String>],
+    /// Owner component of the emitted `NodeId::Section`s.
+    section_owner: &'a str,
+    /// Prefix item labels with `[schema].`. Kind mode only.
+    qualify: bool,
+}
+
+impl SectionCtx<'_> {
+    fn owns(&self, schema: &Option<String>) -> bool {
+        self.keys.contains(schema)
+    }
+
+    /// The visible label for one object.
+    ///
+    /// Only the LABEL is qualified. Every `NodeId` keeps the object's own
+    /// schema (see the call sites), because the id is what expand state and
+    /// `TreeEvent` SQL generation key off — collapsing two schemas'
+    /// same-named tables onto one id would let a click on `sales.orders`
+    /// generate SQL against `hr.orders`.
+    fn label(&self, schema: &Option<String>, display: String) -> String {
+        match (self.qualify, schema) {
+            // The user asked for `[schema].[table_name]` (2026-08-28).
+            (true, Some(s)) => format!("[{s}].[{display}]"),
+            // Schema-less engines (sqlite, duckdb) have nothing to qualify
+            // WITH — a bare `[name]` would be noise, not information.
+            _ => display,
+        }
+    }
+}
+
 fn emit_table_like_section(
     out: &mut Vec<FlatNode>,
-    schema_name: &str,
+    ctx: &SectionCtx,
     label: &'static str,
     items: Vec<&TableInfo>,
     depth: usize,
@@ -254,14 +357,15 @@ fn emit_table_like_section(
     if filtered.is_empty() {
         return;
     }
-    let section_id = NodeId::Section(schema_name.to_string(), label);
+    let section_id = NodeId::Section(ctx.section_owner.to_string(), label);
     out.push((section_id.clone(), depth, format!("{label} ({})", filtered.len()), true));
     if !is_expanded(expanded, filter_active, &section_id) {
         return;
     }
     for t in filtered {
-        let table_id = NodeId::Table(schema_name.to_string(), t.name.clone());
-        out.push((table_id.clone(), depth + 1, t.name.clone(), true));
+        let owner = schema_key_string(&t.schema);
+        let table_id = NodeId::Table(owner.clone(), t.name.clone());
+        out.push((table_id.clone(), depth + 1, ctx.label(&t.schema, t.name.clone()), true));
         if !is_expanded(expanded, filter_active, &table_id) {
             continue;
         }
@@ -270,7 +374,10 @@ fn emit_table_like_section(
             if filter_active && !table_self_matches && !name_matches(&c.name, filter_lc) {
                 continue;
             }
-            let col_id = NodeId::Column(schema_name.to_string(), t.name.clone(), c.name.clone());
+            // Columns are never qualified: they are already nested under
+            // their (qualified) table row, so repeating the schema on every
+            // column would be noise at the depth it hurts most.
+            let col_id = NodeId::Column(owner.clone(), t.name.clone(), c.name.clone());
             out.push((col_id, depth + 2, column_label(c), false));
         }
     }
@@ -286,7 +393,7 @@ fn routine_label(r: &RoutineInfo) -> String {
 
 fn emit_routine_section(
     out: &mut Vec<FlatNode>,
-    schema_name: &str,
+    ctx: &SectionCtx,
     label: &'static str,
     items: Vec<&RoutineInfo>,
     depth: usize,
@@ -299,20 +406,20 @@ fn emit_routine_section(
     if filtered.is_empty() {
         return;
     }
-    let section_id = NodeId::Section(schema_name.to_string(), label);
+    let section_id = NodeId::Section(ctx.section_owner.to_string(), label);
     out.push((section_id.clone(), depth, format!("{label} ({})", filtered.len()), true));
     if !is_expanded(expanded, filter_active, &section_id) {
         return;
     }
     for r in filtered {
-        let id = NodeId::Routine(schema_name.to_string(), r.name.clone());
-        out.push((id, depth + 1, routine_label(r), false));
+        let id = NodeId::Routine(schema_key_string(&r.schema), r.name.clone());
+        out.push((id, depth + 1, ctx.label(&r.schema, routine_label(r)), false));
     }
 }
 
 fn emit_trigger_section(
     out: &mut Vec<FlatNode>,
-    schema_name: &str,
+    ctx: &SectionCtx,
     triggers: Vec<&TriggerInfo>,
     depth: usize,
     expanded: &HashSet<NodeId>,
@@ -324,14 +431,15 @@ fn emit_trigger_section(
     if filtered.is_empty() {
         return;
     }
-    let section_id = NodeId::Section(schema_name.to_string(), "Triggery");
+    let section_id = NodeId::Section(ctx.section_owner.to_string(), "Triggery");
     out.push((section_id.clone(), depth, format!("Triggery ({})", filtered.len()), true));
     if !is_expanded(expanded, filter_active, &section_id) {
         return;
     }
     for t in filtered {
-        let id = NodeId::Trigger(schema_name.to_string(), t.name.clone());
-        out.push((id, depth + 1, format!("{} ({})", t.name, t.table), false));
+        let id = NodeId::Trigger(schema_key_string(&t.schema), t.name.clone());
+        let display = ctx.label(&t.schema, t.name.clone());
+        out.push((id, depth + 1, format!("{} ({})", display, t.table), false));
     }
 }
 
@@ -340,41 +448,42 @@ fn emit_trigger_section(
 /// grouping node for this section).
 fn emit_index_section(
     out: &mut Vec<FlatNode>,
-    schema_name: &str,
-    schema_key: &Option<String>,
+    ctx: &SectionCtx,
     snapshot: &SchemaSnapshot,
     depth: usize,
     expanded: &HashSet<NodeId>,
     filter_lc: &str,
     filter_active: bool,
 ) {
-    let mut items: Vec<(String, String)> = Vec::new();
-    for t in snapshot.tables.iter().filter(|t| &t.schema == schema_key) {
+    let mut items: Vec<(Option<String>, String, String)> = Vec::new();
+    for t in snapshot.tables.iter().filter(|t| ctx.owns(&t.schema)) {
         for idx in &t.indexes {
-            items.push((t.name.clone(), idx.name.clone()));
+            items.push((t.schema.clone(), t.name.clone(), idx.name.clone()));
         }
     }
-    let filtered: Vec<(String, String)> = items
+    let filtered: Vec<(Option<String>, String, String)> = items
         .into_iter()
-        .filter(|(t, i)| !filter_active || name_matches(&format!("{t}.{i}"), filter_lc))
+        .filter(|(_, t, i)| !filter_active || name_matches(&format!("{t}.{i}"), filter_lc))
         .collect();
     if filtered.is_empty() {
         return;
     }
-    let section_id = NodeId::Section(schema_name.to_string(), "Indexy");
+    let section_id = NodeId::Section(ctx.section_owner.to_string(), "Indexy");
     out.push((section_id.clone(), depth, format!("Indexy ({})", filtered.len()), true));
     if !is_expanded(expanded, filter_active, &section_id) {
         return;
     }
-    for (t, i) in filtered {
-        let id = NodeId::Index(schema_name.to_string(), t.clone(), i.clone());
-        out.push((id, depth + 1, format!("{t}.{i}"), false));
+    for (schema, t, i) in filtered {
+        let id = NodeId::Index(schema_key_string(&schema), t.clone(), i.clone());
+        // The index row is already `table.index`; qualifying puts the schema
+        // on the TABLE half, giving `[sales].[orders].idx_total`.
+        out.push((id, depth + 1, format!("{}.{i}", ctx.label(&schema, t)), false));
     }
 }
 
 fn emit_sequence_section(
     out: &mut Vec<FlatNode>,
-    schema_name: &str,
+    ctx: &SectionCtx,
     seqs: Vec<&SequenceInfo>,
     depth: usize,
     expanded: &HashSet<NodeId>,
@@ -386,14 +495,14 @@ fn emit_sequence_section(
     if filtered.is_empty() {
         return;
     }
-    let section_id = NodeId::Section(schema_name.to_string(), "Sekvence");
+    let section_id = NodeId::Section(ctx.section_owner.to_string(), "Sekvence");
     out.push((section_id.clone(), depth, format!("Sekvence ({})", filtered.len()), true));
     if !is_expanded(expanded, filter_active, &section_id) {
         return;
     }
     for s in filtered {
-        let id = NodeId::Sequence(schema_name.to_string(), s.name.clone());
-        out.push((id, depth + 1, s.name.clone(), false));
+        let id = NodeId::Sequence(schema_key_string(&s.schema), s.name.clone());
+        out.push((id, depth + 1, ctx.label(&s.schema, s.name.clone()), false));
     }
 }
 
@@ -414,46 +523,44 @@ fn emit_sequence_section(
 fn emit_sections(
     out: &mut Vec<FlatNode>,
     snapshot: &SchemaSnapshot,
-    schema_key: &Option<String>,
+    ctx: &SectionCtx,
     depth: usize,
     expanded: &HashSet<NodeId>,
     filter_lc: &str,
     filter_active: bool,
 ) {
-    let schema_name = schema_key_string(schema_key);
-
     let tables: Vec<&TableInfo> =
-        snapshot.tables.iter().filter(|t| &t.schema == schema_key && t.kind == TableKind::Table).collect();
-    emit_table_like_section(out, &schema_name, "Tabulky", tables, depth, expanded, filter_lc, filter_active);
+        snapshot.tables.iter().filter(|t| ctx.owns(&t.schema) && t.kind == TableKind::Table).collect();
+    emit_table_like_section(out, ctx, "Tabulky", tables, depth, expanded, filter_lc, filter_active);
 
     let views: Vec<&TableInfo> = snapshot
         .tables
         .iter()
-        .filter(|t| &t.schema == schema_key && matches!(t.kind, TableKind::View | TableKind::MaterializedView))
+        .filter(|t| ctx.owns(&t.schema) && matches!(t.kind, TableKind::View | TableKind::MaterializedView))
         .collect();
-    emit_table_like_section(out, &schema_name, "Pohledy", views, depth, expanded, filter_lc, filter_active);
+    emit_table_like_section(out, ctx, "Pohledy", views, depth, expanded, filter_lc, filter_active);
 
     let funcs: Vec<&RoutineInfo> = snapshot
         .routines
         .iter()
-        .filter(|r| &r.schema == schema_key && r.kind == RoutineKind::Function)
+        .filter(|r| ctx.owns(&r.schema) && r.kind == RoutineKind::Function)
         .collect();
-    emit_routine_section(out, &schema_name, "Funkce", funcs, depth, expanded, filter_lc, filter_active);
+    emit_routine_section(out, ctx, "Funkce", funcs, depth, expanded, filter_lc, filter_active);
 
     let procs: Vec<&RoutineInfo> = snapshot
         .routines
         .iter()
-        .filter(|r| &r.schema == schema_key && r.kind == RoutineKind::Procedure)
+        .filter(|r| ctx.owns(&r.schema) && r.kind == RoutineKind::Procedure)
         .collect();
-    emit_routine_section(out, &schema_name, "Procedury", procs, depth, expanded, filter_lc, filter_active);
+    emit_routine_section(out, ctx, "Procedury", procs, depth, expanded, filter_lc, filter_active);
 
-    let triggers: Vec<&TriggerInfo> = snapshot.triggers.iter().filter(|t| &t.schema == schema_key).collect();
-    emit_trigger_section(out, &schema_name, triggers, depth, expanded, filter_lc, filter_active);
+    let triggers: Vec<&TriggerInfo> = snapshot.triggers.iter().filter(|t| ctx.owns(&t.schema)).collect();
+    emit_trigger_section(out, ctx, triggers, depth, expanded, filter_lc, filter_active);
 
-    emit_index_section(out, &schema_name, schema_key, snapshot, depth, expanded, filter_lc, filter_active);
+    emit_index_section(out, ctx, snapshot, depth, expanded, filter_lc, filter_active);
 
-    let seqs: Vec<&SequenceInfo> = snapshot.sequences.iter().filter(|s| &s.schema == schema_key).collect();
-    emit_sequence_section(out, &schema_name, seqs, depth, expanded, filter_lc, filter_active);
+    let seqs: Vec<&SequenceInfo> = snapshot.sequences.iter().filter(|s| ctx.owns(&s.schema)).collect();
+    emit_sequence_section(out, ctx, seqs, depth, expanded, filter_lc, filter_active);
 }
 
 /// Sidebar rework (T4): the schema-only core of the old `flatten` (deleted
@@ -476,6 +583,7 @@ pub fn flatten_schema(
     snapshot: &SchemaSnapshot,
     expanded: &HashSet<NodeId>,
     filter: &str,
+    grouping: TreeGrouping,
 ) -> Vec<FlatNode> {
     let mut out = Vec::new();
     let filter_lc = filter.to_lowercase();
@@ -498,20 +606,54 @@ pub fn flatten_schema(
 
     let single_implicit = schema_keys.iter().all(|k| k.is_none());
 
+    // A schema-less engine (sqlite, duckdb) has ONE implicit schema, so the
+    // two groupings would draw the identical tree — but not the identical
+    // NODE IDS, since Kind mode owns its sections under
+    // KIND_SECTION_OWNER. Forcing Schema mode here keeps those engines on
+    // one set of ids no matter how the global toggle happens to be set, so
+    // toggling it cannot silently collapse a sqlite user's expanded tree.
     if single_implicit {
         let key = schema_keys.into_iter().next().unwrap_or(None);
-        emit_sections(&mut out, snapshot, &key, 0, expanded, &filter_lc, filter_active);
-    } else {
-        for key in schema_keys {
-            if filter_active && !schema_subtree_matches(snapshot, &key, &filter_lc) {
-                continue;
+        let ctx = SectionCtx {
+            keys: std::slice::from_ref(&key),
+            section_owner: &schema_key_string(&key),
+            qualify: false,
+        };
+        emit_sections(&mut out, snapshot, &ctx, 0, expanded, &filter_lc, filter_active);
+        return out;
+    }
+
+    match grouping {
+        // database → schema → kind → objects (the original shape).
+        TreeGrouping::Schema => {
+            for key in schema_keys {
+                if filter_active && !schema_subtree_matches(snapshot, &key, &filter_lc) {
+                    continue;
+                }
+                let schema_name = schema_key_string(&key);
+                let node = NodeId::Schema(schema_name.clone());
+                out.push((node.clone(), 0, schema_name.clone(), true));
+                if is_expanded(expanded, filter_active, &node) {
+                    let ctx = SectionCtx {
+                        keys: std::slice::from_ref(&key),
+                        section_owner: &schema_name,
+                        qualify: false,
+                    };
+                    emit_sections(&mut out, snapshot, &ctx, 1, expanded, &filter_lc, filter_active);
+                }
             }
-            let schema_name = schema_key_string(&key);
-            let node = NodeId::Schema(schema_name.clone());
-            out.push((node.clone(), 0, schema_name, true));
-            if is_expanded(expanded, filter_active, &node) {
-                emit_sections(&mut out, snapshot, &key, 1, expanded, &filter_lc, filter_active);
-            }
+        }
+        // database → kind → `[schema].[name]` across every schema. The
+        // schema LEVEL disappears; the schema itself does not, it moves
+        // into each label. No per-schema `schema_subtree_matches` gate is
+        // needed because each section filters its own items already.
+        TreeGrouping::Kind => {
+            let ctx = SectionCtx {
+                keys: &schema_keys,
+                section_owner: KIND_SECTION_OWNER,
+                qualify: true,
+            };
+            emit_sections(&mut out, snapshot, &ctx, 0, expanded, &filter_lc, filter_active);
         }
     }
     out
@@ -1236,6 +1378,7 @@ pub fn flatten_sidebar(
     // configured))` = live (Task 7's flip); `configured` is
     // `AppView::effective_scripts_root().is_some()`.
     scripts: Option<(&ScriptsListState, bool)>,
+    grouping: TreeGrouping,
 ) -> Vec<SidebarFlatRow> {
     let mut out: Vec<SidebarFlatRow> = Vec::new();
     let filter_lc = filter.to_lowercase();
@@ -1288,7 +1431,7 @@ pub fn flatten_sidebar(
         let row = SidebarRow::Connection { conn_id: crate::CLI_CONN_IDENTITY.to_string() };
         out.push((row, 0, label.to_string(), true));
         if outer_expanded.contains(&OuterId::Connection(crate::CLI_CONN_IDENTITY.to_string())) {
-            emit_schema_slot(&mut out, crate::CLI_CONN_IDENTITY, "", slot, 1, filter);
+            emit_schema_slot(&mut out, crate::CLI_CONN_IDENTITY, "", slot, 1, filter, grouping);
         }
     }
 
@@ -1342,7 +1485,7 @@ pub fn flatten_sidebar(
                             true,
                         ));
                         if outer_expanded.contains(&OuterId::Database(c.id.clone(), d.name.clone())) {
-                            emit_schema_slot(out, &c.id, &d.name, &d.schema, depth + 2, filter);
+                            emit_schema_slot(out, &c.id, &d.name, &d.schema, depth + 2, filter, grouping);
                         }
                         // Filter: drop a childless db row whose own label misses.
                         if filter_active
@@ -1424,6 +1567,7 @@ fn emit_schema_slot(
     slot: &DbSchemaState,
     base_depth: usize,
     filter: &str,
+    grouping: TreeGrouping,
 ) {
     match slot {
         DbSchemaState::NotLoaded => {}
@@ -1450,7 +1594,7 @@ fn emit_schema_slot(
             false,
         )),
         DbSchemaState::Loaded { snapshot, expanded } => {
-            for (node, depth, label, expandable) in flatten_schema(snapshot, expanded, filter) {
+            for (node, depth, label, expandable) in flatten_schema(snapshot, expanded, filter, grouping) {
                 out.push((
                     SidebarRow::Inner { conn_id: conn_id.to_string(), db: db.to_string(), node },
                     base_depth + depth,
@@ -1489,6 +1633,19 @@ pub struct SchemaTree {
     /// `main.rs` (`sync_connections`) on startup and after every config
     /// mutation; the tree never owns a second long-term copy of the config.
     grouped: crate::connections_ui::GroupedConnections,
+    /// How the schema levels are shaped. Global (user decision
+    /// 2026-08-28) — `main.rs` pushes `AppConfig::tree_grouping` here at
+    /// startup and on every toggle, so the tree holds no second source of
+    /// truth for it.
+    grouping: TreeGrouping,
+    /// Active connection's dialect, pushed by `main.rs` — the context menu
+    /// needs it to quote generated SQL.
+    dialect: Option<dbc_core::Dialect>,
+    /// Open right-click menu: where it was opened, and what it holds.
+    /// Built ONCE at open time from `tree_menu::menu_for`, never recomputed
+    /// while open — the menu must act on the row it was opened on, even if
+    /// a background refresh changes the tree underneath it.
+    context_menu: Option<(gpui::Point<gpui::Pixels>, Vec<crate::tree_menu::MenuEntry>)>,
     /// Per-connection lazy sidebar state, keyed by connection id. An id
     /// missing from the map renders as `NotLoaded` (see `flatten_sidebar`),
     /// but `sync_connections` keeps an entry per saved connection so
@@ -1564,6 +1721,12 @@ pub struct SchemaTree {
 impl SchemaTree {
     pub fn new(cx: &mut Context<Self>, editor_focus: FocusHandle) -> Self {
         Self {
+            // Overwritten by `main.rs`'s startup push of
+            // `AppConfig::tree_grouping`; the original shape is the safe
+            // value to hold for the frames before that lands.
+            grouping: TreeGrouping::Schema,
+            dialect: None,
+            context_menu: None,
             grouped: crate::connections_ui::GroupedConnections::default(),
             conns: HashMap::new(),
             lru: Vec::new(),
@@ -2311,6 +2474,52 @@ impl SchemaTree {
 
     /// Pushes „is there a scripts root at all" (Task 7 calls this from
     /// `refresh_tree_context`). Changing it never scans by itself.
+    /// Pushed by `main.rs`. Changing this re-flattens on the next render;
+    /// no fetch is involved, because both modes are the same snapshot drawn
+    /// differently.
+    pub fn set_dialect(&mut self, dialect: Option<dbc_core::Dialect>, cx: &mut Context<Self>) {
+        if self.dialect != dialect {
+            self.dialect = dialect;
+            cx.notify();
+        }
+    }
+
+    /// Builds the menu for `row` and opens it at `pos`.
+    fn open_context_menu(
+        &mut self,
+        row: &SidebarRow,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let (conn_id, database) = match self.active_scope.as_ref() {
+            Some(s) => (s.conn_id.clone(), (!s.db.is_empty()).then(|| s.db.clone())),
+            None => (String::new(), None),
+        };
+        let entries = crate::tree_menu::menu_for(
+            row,
+            &crate::tree_menu::MenuCtx {
+                read_only: self.read_only,
+                dialect: self.dialect,
+                snapshot: self.snapshot(),
+                favourites: &self.favourites,
+                conn_id: &conn_id,
+                database,
+            },
+        );
+        // An empty menu means „this row has no actions"; opening an empty
+        // box would be worse than doing nothing.
+        self.context_menu = (!entries.is_empty()).then_some((pos, entries));
+        self.selected = Some(row.clone());
+        cx.notify();
+    }
+
+    pub fn set_grouping(&mut self, grouping: TreeGrouping, cx: &mut Context<Self>) {
+        if self.grouping != grouping {
+            self.grouping = grouping;
+            cx.notify();
+        }
+    }
+
     pub fn set_scripts_configured(&mut self, configured: bool, cx: &mut Context<Self>) {
         if self.scripts_configured != configured {
             self.scripts_configured = configured;
@@ -2361,6 +2570,161 @@ fn script_icon(
         .into_any_element()
 }
 
+impl SchemaTree {
+    /// Draws the open context menu.
+    ///
+    /// `.occlude()` so a click inside the menu never also reaches the row
+    /// beneath it, and `on_mouse_down_out` so a click anywhere else closes
+    /// it — the two halves every overlay in this codebase pairs.
+    fn render_context_menu(
+        &mut self,
+        pos: gpui::Point<gpui::Pixels>,
+        entries: Vec<crate::tree_menu::MenuEntry>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = *cx.theme();
+        let mut panel = div()
+            .id("tree-context-menu")
+            .w(px(240.))
+            .py_1()
+            .bg(theme.bg_panel)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _w, cx| {
+                this.context_menu = None;
+                cx.notify();
+            }));
+
+        for (ix, entry) in entries.into_iter().enumerate() {
+            panel = match entry {
+                crate::tree_menu::MenuEntry::Separator => panel.child(
+                    div().h(px(1.)).my_1().mx_2().bg(theme.border),
+                ),
+                crate::tree_menu::MenuEntry::Item(item) => {
+                    let event = item.event.clone();
+                    panel.child(
+                        div()
+                            .id(("tree-menu-item", ix))
+                            .px_3()
+                            .py_1()
+                            .cursor_pointer()
+                            .text_color(if item.danger { theme.danger } else { theme.text_primary })
+                            .hover(|st| st.bg(theme.bg_hover))
+                            .child(item.label)
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                // Close FIRST: several of these open a
+                                // modal, and a menu left on screen behind a
+                                // dialog is both ugly and clickable.
+                                this.context_menu = None;
+                                cx.emit(event.clone());
+                                cx.notify();
+                            })),
+                    )
+                }
+            };
+        }
+        // `deferred` + `anchored` rather than `.absolute()` inside the tree,
+        // for two reasons the first build got wrong (user report,
+        // 2026-08-29: the menu was sliced off at the sidebar's edge):
+        //
+        //   * a deferred draw carries NO content mask, so the menu paints
+        //     over the results pane instead of being clipped to the sidebar
+        //     it lives in;
+        //   * `pos` comes from a mouse event and is therefore in WINDOW
+        //     coordinates, which is what `anchored` (default
+        //     `AnchoredPositionMode::Window`) expects; `.absolute()` read
+        //     the same numbers as parent-relative and so drifted by the
+        //     height of everything above the tree.
+        //
+        // `snap_to_window_with_margin` is what keeps a menu opened near the
+        // bottom edge from running off the window.
+        deferred(
+            anchored()
+                .position(pos)
+                .snap_to_window_with_margin(px(8.))
+                .child(panel),
+        )
+        .with_priority(1)
+        .into_any_element()
+    }
+}
+
+/// The variant name of a [`TreeEvent`], for the diagnostic log.
+///
+/// Takes only the leading run of identifier characters from the `Debug`
+/// rendering, which for an enum is always the variant name — everything
+/// after it is payload, and payload is exactly what must not be logged
+/// (`InsertAtCursor` carries generated SQL, `CopyText` carries whatever was
+/// copied). Reading the name off `Debug` rather than hand-writing a 40-arm
+/// match means a new variant cannot be forgotten here.
+pub(crate) fn event_name(ev: &TreeEvent) -> String {
+    format!("{ev:?}").chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect()
+}
+
+/// What a logged [`TreeEvent`] acted ON — object and connection names
+/// only.
+///
+/// An explicit match rather than a `Debug` dump, because the choice per
+/// variant is exactly the point: names of database objects are safe to
+/// record, but `CopyText`/`InsertAtCursor`/`GenerateSql`/`OpenDdl` carry
+/// copied text, generated SQL and whole DDL bodies, which the log must
+/// never hold (see `dbc_state::applog`'s module docs). Those answer with
+/// their kind or nothing at all.
+///
+/// Empty string = „this action has no target", rendered as `-`.
+pub(crate) fn event_target(ev: &TreeEvent) -> String {
+    fn qualified(schema: &Option<String>, name: &str) -> String {
+        match schema {
+            Some(s) if !s.is_empty() => format!("{s}.{name}"),
+            _ => name.to_string(),
+        }
+    }
+    match ev {
+        TreeEvent::OpenPreview { conn_id, db, schema, table } => {
+            format!("{conn_id}/{db}/{}", qualified(schema, table))
+        }
+        TreeEvent::OpenPreviewHere { schema, table }
+        | TreeEvent::ImportCsv { schema, table }
+        | TreeEvent::CountRows { schema, table }
+        | TreeEvent::ExportCsv { schema, table }
+        | TreeEvent::TruncateTable { schema, table } => qualified(schema, table),
+        TreeEvent::DropObject { kind, schema, name } => {
+            format!("{kind:?} {}", qualified(schema, name))
+        }
+        TreeEvent::OpenErDiagram { schema } => schema.clone().unwrap_or_default(),
+        TreeEvent::ToggleFavourite(f) => qualified(&f.schema, &f.name),
+        TreeEvent::LoadDatabases { conn_id }
+        | TreeEvent::OpenMonitorFor { conn_id }
+        | TreeEvent::OpenCompareFor { conn_id }
+        | TreeEvent::EditConnection { conn_id } => conn_id.clone(),
+        TreeEvent::LoadSchema { conn_id, db } => format!("{conn_id}/{db}"),
+        TreeEvent::SwitchToDatabase { conn_id, db }
+        | TreeEvent::BackupFor { conn_id, db }
+        | TreeEvent::RestoreFor { conn_id, db } => match db {
+            Some(db) => format!("{conn_id}/{db}"),
+            None => conn_id.clone(),
+        },
+        // Script paths are relative paths inside the user's own library —
+        // names, like every other row in this list.
+        TreeEvent::ScriptOpen { rel }
+        | TreeEvent::ScriptRunFile { rel }
+        | TreeEvent::ScriptCreate { parent_rel: rel } => rel.clone(),
+        TreeEvent::ScriptRename { rel, .. } | TreeEvent::ScriptDelete { rel, .. } => rel.clone(),
+        // Deliberately no payload: these carry text, not names.
+        TreeEvent::CopyText { what, .. } => what.clone(),
+        TreeEvent::GenerateSql { kind, .. } => format!("{kind:?}"),
+        TreeEvent::OpenDdl { .. }
+        | TreeEvent::InsertAtCursor { .. }
+        | TreeEvent::RefreshRequested
+        | TreeEvent::ToggleGroupingRequested
+        | TreeEvent::OpenAdmin
+        | TreeEvent::ScriptsRefresh
+        | TreeEvent::OpenScriptsSettings => String::new(),
+    }
+}
+
 impl Render for SchemaTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Sidebar rework: the multi-root flatten, fresh every frame (brief
@@ -2381,6 +2745,7 @@ impl Render for SchemaTree {
             // `scripts_section_adds_only_its_own_rows_and_moves_nothing_else`
             // pins that the two differ by exactly this section.
             Some((&self.scripts, self.scripts_configured)),
+            self.grouping,
         );
         let no_roots = self.grouped.favourites.is_empty()
             && self.grouped.folders.is_empty()
@@ -2418,6 +2783,31 @@ impl Render for SchemaTree {
                             .child("DDL")
                             .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                 this.handle_generate_ddl(cx);
+                            })),
+                    )
+                    .child(
+                        // Grouping toggle. The glyph shows the shape you
+                        // would GET by clicking, not the one you are in —
+                        // the tree itself already shows the current one, and
+                        // a control that pictures the present state leaves
+                        // the user guessing what the button does.
+                        div()
+                            .id("tree-grouping")
+                            .cursor_pointer()
+                            .px_1()
+                            .text_color(cx.theme().text_muted)
+                            .child(match self.grouping {
+                                TreeGrouping::Schema => "⊞",
+                                TreeGrouping::Kind => "⊟",
+                            })
+                            .on_click(cx.listener(|_this, _: &ClickEvent, _window, cx| {
+                                // The tree does not flip its own field:
+                                // `tree_grouping` is global app config, so
+                                // `main.rs` owns the change, persists it and
+                                // pushes it back through `set_grouping`.
+                                // One source of truth, same posture as
+                                // `set_scripts_configured`.
+                                cx.emit(TreeEvent::ToggleGroupingRequested);
                             })),
                     )
                     .child(
@@ -2681,8 +3071,15 @@ impl Render for SchemaTree {
                             label
                         };
 
+                        let menu_row = row_id.clone();
                         let mut row = div()
                             .id(("tree-row", ix))
+                            .on_mouse_down(
+                                gpui::MouseButton::Right,
+                                cx.listener(move |this, e: &gpui::MouseDownEvent, _w, cx| {
+                                    this.open_context_menu(&menu_row, e.position, cx);
+                                }),
+                            )
                             .flex()
                             .flex_row()
                             .items_center()
@@ -2754,14 +3151,93 @@ impl Render for SchemaTree {
             .flex_1(),
         );
 
+        if let Some((pos, entries)) = self.context_menu.clone() {
+            root = root.child(self.render_context_menu(pos, entries, cx));
+        }
+
         root
     }
+}
+
+#[cfg(test)]
+/// Every sidebar-shape test predates the grouping toggle and asserts the
+/// original Schema shape, so they forward through this rather than each
+/// growing an argument that is the same in all 21 of them.
+macro_rules! flatten_sidebar_g {
+    ($($a:expr),* $(,)?) => { flatten_sidebar($($a),*, TreeGrouping::Schema) };
 }
 
 #[cfg(test)]
 mod flatten_tests {
     use super::*;
     use dbc_core::{FkRef, IndexInfo};
+
+    /// The log records the NAME of a tree event and never its payload —
+    /// these pin that the extraction really does stop at the variant name,
+    /// including for the variants whose payload is generated SQL or copied
+    /// text.
+    #[test]
+    fn an_event_name_is_only_ever_an_identifier() {
+        let events = [
+            TreeEvent::RefreshRequested,
+            TreeEvent::InsertAtCursor { text: "SELECT * FROM [dbo].[t] -- {x}".into() },
+            TreeEvent::CopyText { what: "jméno".into(), text: "a b { c } \" d".into() },
+            TreeEvent::OpenErDiagram { schema: Some("dbo".into()) },
+        ];
+        for ev in events {
+            let name = event_name(&ev);
+            assert!(!name.is_empty(), "{ev:?} produced no name");
+            assert!(
+                name.chars().all(|c| c.is_alphanumeric() || c == '_'),
+                "{name:?} is not an identifier"
+            );
+        }
+        assert_eq!(event_name(&TreeEvent::RefreshRequested), "RefreshRequested");
+        assert_eq!(
+            event_name(&TreeEvent::InsertAtCursor { text: "SELECT 1".into() }),
+            "InsertAtCursor"
+        );
+    }
+
+    /// The log records WHAT an action acted on, and object names are fine —
+    /// but the variants that carry text must not hand that text over. This
+    /// is the property, not the exact strings.
+    #[test]
+    fn an_event_target_never_carries_a_payload_that_is_text() {
+        let secret = "SELECT * FROM users WHERE pw = 'hunter2'";
+        for ev in [
+            TreeEvent::InsertAtCursor { text: secret.into() },
+            TreeEvent::CopyText { what: "hodnota".into(), text: secret.into() },
+            TreeEvent::GenerateSql { kind: GenKind::Update, sql: secret.into() },
+            TreeEvent::OpenDdl { title: "t".into(), ddl: secret.into() },
+        ] {
+            let t = event_target(&ev);
+            assert!(!t.contains("hunter2"), "{ev:?} leaked its payload as {t:?}");
+            assert!(!t.contains("SELECT"), "{ev:?} leaked its payload as {t:?}");
+        }
+    }
+
+    /// Object and connection names ARE the point of the field.
+    #[test]
+    fn an_event_target_names_the_object_it_acted_on() {
+        assert_eq!(
+            event_target(&TreeEvent::CountRows {
+                schema: Some("dbo".into()),
+                table: "orders".into()
+            }),
+            "dbo.orders"
+        );
+        assert_eq!(
+            event_target(&TreeEvent::LoadSchema { conn_id: "c1".into(), db: "prod".into() }),
+            "c1/prod"
+        );
+        assert_eq!(
+            event_target(&TreeEvent::CountRows { schema: None, table: "t".into() }),
+            "t",
+            "a schema-less engine must not produce a leading dot"
+        );
+        assert_eq!(event_target(&TreeEvent::RefreshRequested), "");
+    }
 
     fn col(name: &str, ty: &str) -> ColumnInfo {
         ColumnInfo { name: name.into(), data_type: ty.into(), nullable: false, default: None, is_pk: false, fk: None }
@@ -2791,13 +3267,101 @@ mod flatten_tests {
         SequenceInfo { schema: schema.map(str::to_string), name: name.into() }
     }
 
+    /// The snapshot the grouping tests share: two schemas, and a table name
+    /// that exists in BOTH — the case Kind mode has to keep apart.
+    fn two_schema_snap() -> SchemaSnapshot {
+        SchemaSnapshot {
+            tables: vec![
+                table(Some("sales"), "orders", TableKind::Table, vec![col("id", "INTEGER")]),
+                table(Some("hr"), "orders", TableKind::Table, vec![col("id", "INTEGER")]),
+                table(Some("hr"), "people", TableKind::Table, vec![]),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn kind_grouping_drops_the_schema_level_and_qualifies_the_labels() {
+        let snap = two_schema_snap();
+        let mut expanded = HashSet::new();
+        expanded.insert(NodeId::Section(KIND_SECTION_OWNER.to_string(), "Tabulky"));
+        let rows = flatten_schema(&snap, &expanded, "", TreeGrouping::Kind);
+
+        assert!(
+            !rows.iter().any(|(n, ..)| matches!(n, NodeId::Schema(_))),
+            "Kind mode must not emit a schema level: {rows:?}"
+        );
+        let labels: Vec<&String> = rows.iter().map(|(_, _, l, _)| l).collect();
+        assert!(labels.iter().any(|l| l.starts_with("Tabulky (3)")), "one section, all schemas");
+        assert!(labels.iter().any(|l| *l == "[sales].[orders]"), "labels carry the schema");
+        assert!(labels.iter().any(|l| *l == "[hr].[orders]"));
+        assert!(labels.iter().any(|l| *l == "[hr].[people]"));
+    }
+
+    /// The reason only the LABEL is qualified: the id is what expand state
+    /// and SQL generation key off. If both `orders` rows shared one id, a
+    /// click on `sales.orders` could generate SQL against `hr.orders`, and
+    /// expanding one would expand the other.
+    #[test]
+    fn kind_grouping_keeps_same_named_tables_in_different_schemas_apart() {
+        let snap = two_schema_snap();
+        let mut expanded = HashSet::new();
+        expanded.insert(NodeId::Section(KIND_SECTION_OWNER.to_string(), "Tabulky"));
+        let rows = flatten_schema(&snap, &expanded, "", TreeGrouping::Kind);
+
+        let table_ids: Vec<&NodeId> =
+            rows.iter().map(|(n, ..)| n).filter(|n| matches!(n, NodeId::Table(..))).collect();
+        assert_eq!(table_ids.len(), 3);
+        assert!(table_ids.contains(&&NodeId::Table("sales".into(), "orders".into())));
+        assert!(table_ids.contains(&&NodeId::Table("hr".into(), "orders".into())));
+        let unique: HashSet<&NodeId> = table_ids.iter().copied().collect();
+        assert_eq!(unique.len(), 3, "ids collided across schemas: {table_ids:?}");
+    }
+
+    /// Schema mode must be untouched by the refactor that introduced
+    /// `SectionCtx` — this is the regression guard for every existing user.
+    #[test]
+    fn schema_grouping_still_nests_under_schema_nodes_with_bare_labels() {
+        let snap = two_schema_snap();
+        let mut expanded = HashSet::new();
+        expanded.insert(NodeId::Schema("sales".into()));
+        expanded.insert(NodeId::Section("sales".into(), "Tabulky"));
+        let rows = flatten_schema(&snap, &expanded, "", TreeGrouping::Schema);
+
+        assert!(rows.iter().any(|(n, ..)| matches!(n, NodeId::Schema(s) if s == "sales")));
+        let labels: Vec<&String> = rows.iter().map(|(_, _, l, _)| l).collect();
+        assert!(labels.iter().any(|l| *l == "orders"), "schema mode labels stay bare: {labels:?}");
+        assert!(
+            !labels.iter().any(|l| l.contains('[')),
+            "no qualification in schema mode: {labels:?}"
+        );
+        assert!(labels.iter().any(|l| l.starts_with("Tabulky (1)")), "sales has one table");
+    }
+
+    /// A schema-less engine has one implicit schema, so both modes would
+    /// draw the same tree — but Kind mode owns its section ids under
+    /// `KIND_SECTION_OWNER`. Forcing Schema mode keeps sqlite/duckdb on ONE
+    /// set of ids, so flipping the global toggle cannot silently collapse
+    /// their expanded tree.
+    #[test]
+    fn a_schema_less_snapshot_ignores_the_grouping_toggle() {
+        let snap = SchemaSnapshot {
+            tables: vec![table(None, "users", TableKind::Table, vec![])],
+            ..Default::default()
+        };
+        let by_schema = flatten_schema(&snap, &HashSet::new(), "", TreeGrouping::Schema);
+        let by_kind = flatten_schema(&snap, &HashSet::new(), "", TreeGrouping::Kind);
+        assert_eq!(by_schema, by_kind, "both modes must produce identical rows AND ids");
+        assert!(!by_schema.iter().any(|(_, _, l, _)| l.contains('[')), "nothing to qualify with");
+    }
+
     #[test]
     fn sqlite_snapshot_is_a_single_implicit_level_with_no_schema_node() {
         let snap = SchemaSnapshot {
             tables: vec![table(None, "users", TableKind::Table, vec![col("id", "INTEGER")])],
             ..Default::default()
         };
-        let rows = flatten_schema(&snap, &HashSet::new(), "");
+        let rows = flatten_schema(&snap, &HashSet::new(), "", TreeGrouping::Schema);
         // No `NodeId::Schema` row anywhere, and the section sits at depth 0.
         assert!(!rows.iter().any(|(id, ..)| matches!(id, NodeId::Schema(_))));
         assert_eq!(rows[0].0, NodeId::Section("".to_string(), "Tabulky"));
@@ -2813,7 +3377,7 @@ mod flatten_tests {
             ],
             ..Default::default()
         };
-        let rows = flatten_schema(&snap, &HashSet::new(), "");
+        let rows = flatten_schema(&snap, &HashSet::new(), "", TreeGrouping::Schema);
         // Only the two Schema headers show — nothing is expanded yet.
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], (NodeId::Schema("audit".into()), 0, "audit".into(), true));
@@ -2821,7 +3385,7 @@ mod flatten_tests {
 
         let mut expanded = HashSet::new();
         expanded.insert(NodeId::Schema("public".into()));
-        let rows = flatten_schema(&snap, &expanded, "");
+        let rows = flatten_schema(&snap, &expanded, "", TreeGrouping::Schema);
         // "public" expanded reveals its Tabulky section nested one level in;
         // "audit" stays collapsed to just its header.
         assert!(rows.iter().any(|(id, depth, ..)| {
@@ -2842,7 +3406,7 @@ mod flatten_tests {
             triggers: vec![trigger(None, "trg1", "a")],
             sequences: vec![sequence(None, "seq1")],
         };
-        let rows = flatten_schema(&snap, &HashSet::new(), "");
+        let rows = flatten_schema(&snap, &HashSet::new(), "", TreeGrouping::Schema);
         let labels: Vec<&str> = rows.iter().map(|(_, _, label, _)| label.as_str()).collect();
         // Procedury and Indexy are absent (empty); the rest appear in the
         // brief's fixed order, with correct counts.
@@ -2858,7 +3422,7 @@ mod flatten_tests {
             ],
             ..Default::default()
         };
-        let rows = flatten_schema(&snap, &HashSet::new(), "");
+        let rows = flatten_schema(&snap, &HashSet::new(), "", TreeGrouping::Schema);
         assert_eq!(rows, vec![(NodeId::Section("".into(), "Pohledy"), 0, "Pohledy (2)".into(), true)]);
     }
 
@@ -2869,19 +3433,19 @@ mod flatten_tests {
             ..Default::default()
         };
         // Nothing expanded: only the section header.
-        let rows = flatten_schema(&snap, &HashSet::new(), "");
+        let rows = flatten_schema(&snap, &HashSet::new(), "", TreeGrouping::Schema);
         assert_eq!(rows.len(), 1);
 
         // Section expanded: table row appears, columns still hidden.
         let mut expanded = HashSet::new();
         expanded.insert(NodeId::Section("".into(), "Tabulky"));
-        let rows = flatten_schema(&snap, &expanded, "");
+        let rows = flatten_schema(&snap, &expanded, "", TreeGrouping::Schema);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].0, NodeId::Table("".into(), "users".into()));
 
         // Table also expanded: column row appears too.
         expanded.insert(NodeId::Table("".into(), "users".into()));
-        let rows = flatten_schema(&snap, &expanded, "");
+        let rows = flatten_schema(&snap, &expanded, "", TreeGrouping::Schema);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[2].0, NodeId::Column("".into(), "users".into(), "id".into()));
         assert_eq!(rows[2].2, "id: INTEGER");
@@ -2914,7 +3478,7 @@ mod flatten_tests {
         // "products" (no match anywhere in it) is hidden entirely, and
         // "id" (present on both tables, doesn't match) doesn't show either
         // since "users" itself didn't match by name.
-        let rows = flatten_schema(&snap, &HashSet::new(), "EMAIL");
+        let rows = flatten_schema(&snap, &HashSet::new(), "EMAIL", TreeGrouping::Schema);
         assert_eq!(
             rows,
             vec![
@@ -2931,7 +3495,7 @@ mod flatten_tests {
             tables: vec![table(None, "users", TableKind::Table, vec![col("id", "INTEGER"), col("email", "TEXT")])],
             ..Default::default()
         };
-        let rows = flatten_schema(&snap, &HashSet::new(), "users");
+        let rows = flatten_schema(&snap, &HashSet::new(), "users", TreeGrouping::Schema);
         // The table itself matched by name, so both columns show, not just
         // ones whose own name happens to contain "users".
         let col_labels: Vec<&str> = rows
@@ -2950,7 +3514,7 @@ mod flatten_tests {
 
         let mut expanded = HashSet::new();
         expanded.insert(NodeId::Section("".into(), "Indexy"));
-        let rows = flatten_schema(&snap, &expanded, "");
+        let rows = flatten_schema(&snap, &expanded, "", TreeGrouping::Schema);
         assert!(rows.iter().any(|(id, depth, label, _)| {
             *id == NodeId::Index("".into(), "users".into(), "users_pkey".into())
                 && *depth == 1
@@ -2961,7 +3525,7 @@ mod flatten_tests {
     #[test]
     fn empty_snapshot_flattens_to_no_rows() {
         let snap = SchemaSnapshot::default();
-        assert!(flatten_schema(&snap, &HashSet::new(), "").is_empty());
+        assert!(flatten_schema(&snap, &HashSet::new(), "", TreeGrouping::Schema).is_empty());
     }
 
     // --- review Issue 3: same-connection refresh state preservation ---
@@ -3137,7 +3701,7 @@ mod sidebar_tests {
         outer.insert(OuterId::Connection("c1".into()));
         outer.insert(OuterId::Database("c1".into(), "sales".into()));
 
-        let before = flatten_sidebar(&grouped(&conns_cfg), &loaded_states("c1", "sales"), None,
+        let before = flatten_sidebar_g!(&grouped(&conns_cfg), &loaded_states("c1", "sales"), None,
             &outer, "", None, &[], AdminEntry::Hidden, None);
         assert!(
             before.iter().any(|r| matches!(&r.0, SidebarRow::Database { db, .. } if db == "sales")),
@@ -3155,7 +3719,7 @@ mod sidebar_tests {
         let mut selected = None;
         clear_fetched_context(&mut conns, &mut lru, &mut active_slot, &mut cli_slot, &mut selected);
 
-        let after = flatten_sidebar(&grouped(&conns_cfg), &conns, None,
+        let after = flatten_sidebar_g!(&grouped(&conns_cfg), &conns, None,
             &outer, "", None, &[], AdminEntry::Hidden, None);
         assert!(
             !after
@@ -3175,7 +3739,7 @@ mod sidebar_tests {
         // — see the polarity note on `OuterId`), so "work" is NOT inserted.
         outer.insert(OuterId::Connection("c1".into()));
         outer.insert(OuterId::Database("c1".into(), "sales".into()));
-        let rows = flatten_sidebar(&grouped(&conns), &loaded_states("c1", "sales"), None,
+        let rows = flatten_sidebar_g!(&grouped(&conns), &loaded_states("c1", "sales"), None,
             &outer, "", None, &[], AdminEntry::Hidden, None);
         // folder(0) -> connection(1) -> database(2) -> spliced schema rows (3+)
         assert!(matches!(&rows[0], (SidebarRow::Folder { path }, 0, _, true) if path == &vec!["work".to_string()]));
@@ -3195,7 +3759,7 @@ mod sidebar_tests {
         let mut outer = HashSet::new();
         outer.insert(OuterId::Folder(vec!["work".into()]));
         outer.insert(OuterId::Connection("c1".into()));
-        let rows = flatten_sidebar(&grouped(&conns), &loaded_states("c1", "sales"), None,
+        let rows = flatten_sidebar_g!(&grouped(&conns), &loaded_states("c1", "sales"), None,
             &outer, "", None, &[], AdminEntry::Hidden, None);
         assert_eq!(rows.len(), 1, "collapsed folder shows only its own row");
         assert!(matches!(&rows[0], (SidebarRow::Folder { .. }, 0, _, true)));
@@ -3204,7 +3768,7 @@ mod sidebar_tests {
     #[test]
     fn loose_connections_sit_at_depth_zero() {
         let conns = vec![conn_cfg("c1", "loose", &[], Engine::Postgres, "db")];
-        let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+        let rows = flatten_sidebar_g!(&grouped(&conns), &HashMap::new(), None,
             &HashSet::new(), "", None, &[], AdminEntry::Hidden, None);
         assert!(matches!(&rows[0], (SidebarRow::Connection { .. }, 0, _, true)));
     }
@@ -3215,7 +3779,7 @@ mod sidebar_tests {
         let states = loaded_states("c1", "sales");
         // NOT in outer_expanded -> only the connection row renders; the
         // Loaded cache is untouched (re-expand is instant by construction).
-        let rows = flatten_sidebar(&grouped(&conns), &states, None,
+        let rows = flatten_sidebar_g!(&grouped(&conns), &states, None,
             &HashSet::new(), "", None, &[], AdminEntry::Hidden, None);
         assert_eq!(rows.len(), 1);
     }
@@ -3231,7 +3795,7 @@ mod sidebar_tests {
         ] {
             let mut states = HashMap::new();
             states.insert("c1".into(), ConnNode { dbs: state });
-            let rows = flatten_sidebar(&grouped(&conns), &states, None,
+            let rows = flatten_sidebar_g!(&grouped(&conns), &states, None,
                 &outer, "", None, &[], AdminEntry::Hidden, None);
             assert!(matches!(&rows[1], (SidebarRow::Notice { conn_id, db: None, text, retry }, 1, _, false)
                 if conn_id == "c1" && text == expect_text && *retry == expect_retry),
@@ -3248,7 +3812,7 @@ mod sidebar_tests {
         }
         let mut outer = HashSet::new();
         outer.insert(OuterId::Connection("c1".into()));
-        let rows = flatten_sidebar(&grouped(&conns), &states, None,
+        let rows = flatten_sidebar_g!(&grouped(&conns), &states, None,
             &outer, "", None, &[], AdminEntry::Hidden, None);
         let last = rows.last().unwrap();
         assert!(matches!(&last.0, SidebarRow::Notice { retry: false, text, .. }
@@ -3266,7 +3830,7 @@ mod sidebar_tests {
         let conns = vec![conn_cfg("c1", "duck", &[], Engine::Duckdb, r"D:\data\analytics.duckdb")];
         let mut outer = HashSet::new();
         outer.insert(OuterId::Connection("c1".into()));
-        let rows = flatten_sidebar(&grouped(&conns), &loaded_states("c1", r"D:\data\analytics.duckdb"),
+        let rows = flatten_sidebar_g!(&grouped(&conns), &loaded_states("c1", r"D:\data\analytics.duckdb"),
             None, &outer, "", None, &[], AdminEntry::Hidden, None);
         assert!(matches!(&rows[1], (SidebarRow::Database { db, .. }, 1, label, true)
             if db == r"D:\data\analytics.duckdb" && label.starts_with("analytics")));
@@ -3279,7 +3843,7 @@ mod sidebar_tests {
         let slot = DbSchemaState::Loaded { snapshot: snap(), expanded: HashSet::new() };
         let mut outer = HashSet::new();
         outer.insert(OuterId::Connection(crate::CLI_CONN_IDENTITY.to_string()));
-        let rows = flatten_sidebar(&grouped(&[]), &HashMap::new(),
+        let rows = flatten_sidebar_g!(&grouped(&[]), &HashMap::new(),
             Some(("postgres://localhost/x", &slot)), &outer, "", None, &[], AdminEntry::Hidden, None);
         assert!(matches!(&rows[0], (SidebarRow::Connection { conn_id }, 0, label, true)
             if conn_id == crate::CLI_CONN_IDENTITY && label == "postgres://localhost/x"));
@@ -3298,7 +3862,7 @@ mod sidebar_tests {
         let scope = ActiveScope { conn_id: "c1".into(), db: "sales".into(), default_db: "sales".into() };
         let mut outer = HashSet::new();
         outer.insert(OuterId::Favourites);
-        let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+        let rows = flatten_sidebar_g!(&grouped(&conns), &HashMap::new(), None,
             &outer, "", Some(&scope), &favs, AdminEntry::Enabled, None);
         assert!(matches!(&rows[0], (SidebarRow::Pinned(NodeId::AdminRoot), 0, _, false)));
         // Only the default-db favourite is in scope (database: None == default):
@@ -3329,7 +3893,7 @@ mod sidebar_tests {
         let scope = ActiveScope { conn_id: "c1".into(), db: "sales".into(), default_db: "sales".into() };
         let mut outer = HashSet::new();
         outer.insert(OuterId::Favourites);
-        let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+        let rows = flatten_sidebar_g!(&grouped(&conns), &HashMap::new(), None,
             &outer, "", Some(&scope), &favs, AdminEntry::Hidden, None);
         // rows[0] = the section header; the connection root follows the
         // favourite items — take exactly the five item rows.
@@ -3361,7 +3925,7 @@ mod sidebar_tests {
         }];
         let mut outer = HashSet::new();
         outer.insert(OuterId::Favourites);
-        let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+        let rows = flatten_sidebar_g!(&grouped(&conns), &HashMap::new(), None,
             &outer, "", None, &favs, AdminEntry::Hidden, None);
         assert!(!rows
             .iter()
@@ -3381,7 +3945,7 @@ mod sidebar_tests {
             database: None,
         }];
         let scope = ActiveScope { conn_id: "c1".into(), db: "sales".into(), default_db: "sales".into() };
-        let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+        let rows = flatten_sidebar_g!(&grouped(&conns), &HashMap::new(), None,
             &HashSet::new(), "", Some(&scope), &favs, AdminEntry::Hidden, None);
         assert!(matches!(&rows[0], (SidebarRow::Pinned(NodeId::FavouriteSection), 0, label, true)
             if label == "Oblíbené (1)"));
@@ -3414,7 +3978,7 @@ mod sidebar_tests {
         let scope = ActiveScope { conn_id: "c1".into(), db: "sales".into(), default_db: "sales".into() };
         let mut outer = HashSet::new();
         outer.insert(OuterId::Favourites);
-        let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+        let rows = flatten_sidebar_g!(&grouped(&conns), &HashMap::new(), None,
             &outer, "", Some(&scope), &favs, AdminEntry::Hidden, None);
         let labels: Vec<&str> = rows
             .iter()
@@ -3478,13 +4042,13 @@ mod sidebar_tests {
         // stays visible (ancestors auto-show), c2's row (label-only miss,
         // nothing loaded) is hidden. Filtering NEVER fetches — pure fn,
         // holds by construction.
-        let rows = flatten_sidebar(&grouped(&conns), &loaded_states("c1", "sales"), None,
+        let rows = flatten_sidebar_g!(&grouped(&conns), &loaded_states("c1", "sales"), None,
             &outer, "orders", None, &[], AdminEntry::Hidden, None);
         assert!(rows.iter().any(|r| matches!(&r.0, SidebarRow::Connection { conn_id } if conn_id == "c1")));
         assert!(!rows.iter().any(|r| matches!(&r.0, SidebarRow::Connection { conn_id } if conn_id == "c2")));
         assert!(rows.iter().any(|r| matches!(&r.0, SidebarRow::Inner { node: NodeId::Table(_, t), .. } if t == "orders")));
         // A filter matching a connection's own NAME keeps its row visible:
-        let rows = flatten_sidebar(&grouped(&conns), &loaded_states("c1", "sales"), None,
+        let rows = flatten_sidebar_g!(&grouped(&conns), &loaded_states("c1", "sales"), None,
             &outer, "staging", None, &[], AdminEntry::Hidden, None);
         assert!(rows.iter().any(|r| matches!(&r.0, SidebarRow::Connection { conn_id } if conn_id == "c2")));
     }
@@ -3856,9 +4420,9 @@ mod sidebar_tests {
         ]);
         let expanded: HashSet<OuterId> =
             [OuterId::Scripts, OuterId::ScriptFolder("prod".to_string())].into_iter().collect();
-        let with_none = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+        let with_none = flatten_sidebar_g!(&grouped(&conns), &HashMap::new(), None,
             &expanded, "", None, &[], AdminEntry::Hidden, None);
-        let with_some = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+        let with_some = flatten_sidebar_g!(&grouped(&conns), &HashMap::new(), None,
             &expanded, "", None, &[], AdminEntry::Hidden, Some((&state, true)));
         assert!(!with_none.iter().any(|r| matches!(r.0, SidebarRow::ScriptsRoot)));
 
@@ -3883,7 +4447,7 @@ mod sidebar_tests {
     #[test]
     fn scripts_section_is_emitted_after_favourites_and_before_the_connection_roots() {
         let conns = vec![conn_cfg("c1", "Prod", &[], Engine::Postgres, "sales")];
-        let rows = flatten_sidebar(&grouped(&conns), &HashMap::new(), None,
+        let rows = flatten_sidebar_g!(&grouped(&conns), &HashMap::new(), None,
             &HashSet::new(), "", None, &[], AdminEntry::Hidden,
             Some((&ScriptsListState::NotLoaded, true)));
         let scripts_ix = rows.iter().position(|r| matches!(r.0, SidebarRow::ScriptsRoot)).unwrap();
