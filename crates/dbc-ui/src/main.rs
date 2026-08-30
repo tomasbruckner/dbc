@@ -41,6 +41,7 @@ mod schema_tree;
 mod scripts;
 mod sql_highlight;
 mod tree_menu;
+mod keymap;
 mod sql_input;
 mod tabs;
 mod text_model;
@@ -92,6 +93,15 @@ actions!(
         ToggleHistory,
         OpenPalette,
         OpenAutocomplete,
+        /// The cheat sheet, rendered from `keymap::SHORTCUTS`.
+        ShowShortcuts,
+        /// Move keyboard focus between the three areas you actually work
+        /// in. Without these the only way back into the editor after
+        /// clicking the tree is the mouse, which is a strange thing to ask
+        /// of someone who wanted keyboard control.
+        FocusEditor,
+        FocusTree,
+        FocusResults,
         // Workspace T8 (Part S §5.2/§5.4): bound => save, unbound =>
         // save-as. Global, context `None`, same posture as `RunQuery`.
         SaveScript,
@@ -2112,6 +2122,10 @@ struct AppView {
     /// by the cx-only tree subscription and drained at the top of `render`.
     /// Same shape as the queued cross-context preview open.
     pending_menu_action: Option<TreeEvent>,
+    /// The cheat sheet overlay is open. Not a `ModalState`: it takes no
+    /// input, decides nothing, and must be dismissable without disturbing
+    /// whatever modal flow it was opened over.
+    shortcuts_open: bool,
     /// Sidebar rework: bumped on every db-list/schema-slot fetch dispatch;
     /// a result only applies if the generation still matches
     /// (last-dispatched wins — the slot state machines in schema_tree.rs
@@ -5246,6 +5260,14 @@ impl AppView {
     }
 
     fn on_cancel_query(&mut self, _: &CancelQuery, _window: &mut Window, cx: &mut Context<Self>) {
+        // Escape closes the cheat sheet first. An overlay you cannot
+        // dismiss with the key everything else dismisses with is a trap,
+        // and cancelling a query underneath it would be a surprise.
+        if self.shortcuts_open {
+            self.shortcuts_open = false;
+            cx.notify();
+            return;
+        }
         // M6: Escape closes the dropdown / a modal first, rather than
         // falling through to query-cancel underneath it. A modal holding
         // unsaved password state (a master-password prompt/creation modal,
@@ -5418,6 +5440,169 @@ impl AppView {
     /// active connection there is nothing to be right about, so it refuses
     /// rather than guessing a dialect and reflowing the user's SQL by the
     /// wrong rules.
+    fn on_show_shortcuts(
+        &mut self,
+        _: &ShowShortcuts,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.shortcuts_open = !self.shortcuts_open;
+        cx.notify();
+    }
+
+    /// Ctrl+1/2/3. Focusing the tree or the grid also makes it VISIBLE:
+    /// moving focus into a hidden panel would put the caret somewhere the
+    /// user cannot see, which is worse than doing nothing.
+    fn on_focus_editor(&mut self, _: &FocusEditor, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.sql.focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    fn on_focus_tree(&mut self, _: &FocusTree, window: &mut Window, cx: &mut Context<Self>) {
+        self.tree_visible = true;
+        let handle = self.tree.focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    fn on_focus_results(&mut self, _: &FocusResults, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(TabContent::Grid { grid, .. }) = self.tabs.active().map(|t| &t.content) {
+            let handle = grid.focus_handle(cx);
+            window.focus(&handle, cx);
+        } else {
+            self.status = "Žádný výsledek k zaměření".to_string();
+        }
+        cx.notify();
+    }
+
+    /// Which area has the keyboard right now, for the hint strip.
+    fn focused_scope(&self, window: &Window, cx: &App) -> keymap::Scope {
+        if self.modal.is_some() {
+            return keymap::Scope::Global;
+        }
+        if self.palette.is_some() {
+            return keymap::Scope::Palette;
+        }
+        if self.tree.focus_handle(cx).contains_focused(window, cx) {
+            return keymap::Scope::Tree;
+        }
+        if let Some(TabContent::Grid { grid, .. }) = self.tabs.active().map(|t| &t.content) {
+            if grid.focus_handle(cx).contains_focused(window, cx) {
+                return keymap::Scope::Results;
+            }
+        }
+        if self.sql.focus_handle(cx).contains_focused(window, cx) {
+            return keymap::Scope::Editor;
+        }
+        keymap::Scope::Global
+    }
+
+    /// The always-visible hint strip — the one thing borrowed wholesale
+    /// from zellij. It changes with FOCUS rather than with a mode, so it
+    /// answers „what do the keys do right now" without there being a state
+    /// the user can get stuck in.
+    fn render_shortcut_strip(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        let scope = self.focused_scope(window, cx);
+        let mut strip = div()
+            .h(px(22.))
+            .px_2()
+            .gap_3()
+            .flex()
+            .flex_row()
+            .items_center()
+            .bg(theme.bg_app)
+            .border_t_1()
+            .border_color(theme.border)
+            .text_color(theme.text_faint)
+            .child(div().text_color(theme.text_muted).child(scope.title()));
+        for sc in keymap::strip_for(scope) {
+            strip = strip.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .child(div().text_color(theme.text_primary).child(keymap::pretty(sc.chord)))
+                    .child(div().child(sc.label)),
+            );
+        }
+        strip.into_any_element()
+    }
+
+    /// The cheat sheet: every documented shortcut, grouped by where it
+    /// works, rendered from the same table the audits check against the
+    /// real bindings.
+    fn render_shortcuts_overlay(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        let mut panel = div()
+            .w(px(720.))
+            .max_h(px(560.))
+            .overflow_hidden()
+            .bg(theme.bg_panel)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .text_color(theme.text_primary)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(div().text_size(px(16.)).child("Klávesové zkratky"))
+                    .child(
+                        div()
+                            .ml_auto()
+                            .text_color(theme.text_muted)
+                            .child("F1 nebo Esc zavře"),
+                    ),
+            );
+        for scope in keymap::scopes() {
+            let mut column = div().flex().flex_col().child(
+                div().mt_2().text_color(theme.text_muted).child(scope.title()),
+            );
+            for sc in keymap::SHORTCUTS.iter().filter(|s| s.scope == scope) {
+                column = column.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(px(180.))
+                                .flex_shrink_0()
+                                .text_color(theme.text_primary)
+                                .child(keymap::pretty(sc.chord)),
+                        )
+                        .child(div().text_color(theme.text_muted).child(sc.label)),
+                );
+            }
+            panel = panel.child(column);
+        }
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|view, _, _, cx| {
+                    view.shortcuts_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(panel)
+            .into_any_element()
+    }
+
     fn on_format_sql(&mut self, _: &FormatSql, _window: &mut Window, cx: &mut Context<Self>) {
         if self.modal.is_some() {
             return;
@@ -12559,7 +12744,10 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_open_autocomplete))
             .on_action(cx.listener(Self::on_save_script))
             .on_action(cx.listener(Self::on_format_sql))
-            .on_action(cx.listener(Self::on_format_sql))
+            .on_action(cx.listener(Self::on_show_shortcuts))
+            .on_action(cx.listener(Self::on_focus_editor))
+            .on_action(cx.listener(Self::on_focus_tree))
+            .on_action(cx.listener(Self::on_focus_results))
             .child(self.render_top_bar(cx))
             .child(body);
 
@@ -12705,6 +12893,8 @@ impl Render for AppView {
                 })
                 .child(div().flex_1().child(self.status.clone())),
         );
+        // Below the status bar: the always-visible hint strip.
+        root = root.child(self.render_shortcut_strip(window, cx));
 
         if self.dropdown_open && self.modal.is_none() {
             root = root.child(self.render_dropdown_overlay(cx));
@@ -12728,6 +12918,11 @@ impl Render for AppView {
         // up).
         if let Some(overlay) = self.render_autocomplete_popup(cx) {
             root = root.child(overlay);
+        }
+        // Truly last: the cheat sheet is the one overlay you might open to
+        // find out how to get rid of whatever else is on screen.
+        if self.shortcuts_open {
+            root = root.child(self.render_shortcuts_overlay(cx));
         }
         root
     }
@@ -13032,6 +13227,11 @@ fn main() {
             // Ctrl+Shift+F: the shape every other editor uses for "format
             // document". Ctrl+F is left free for a future find.
             KeyBinding::new("ctrl-shift-f", FormatSql, None),
+            // F1 is the one key every Windows app spends on help.
+            KeyBinding::new("f1", ShowShortcuts, None),
+            KeyBinding::new("ctrl-1", FocusEditor, None),
+            KeyBinding::new("ctrl-2", FocusTree, None),
+            KeyBinding::new("ctrl-3", FocusResults, None),
         ]);
         sql_input::bind_keys(cx);
         grid::bind_keys(cx);
@@ -13138,6 +13338,7 @@ fn main() {
                             history_width,
                             history_resizing: None,
                             pending_menu_action: None,
+                            shortcuts_open: false,
                             sidebar_fetch_generation: 0,
                             compare_fetch_generation: 0,
                             history,
@@ -14517,6 +14718,104 @@ mod autocomplete_handles_action_tests {
 /// `#[must_use]` on `guard_corrupt_config` (T10 carry-forward 1) is the
 /// compiler half of the same rail: this test proves the call is THERE, the
 /// attribute proves its verdict is not thrown away.
+/// Keeps `keymap::SHORTCUTS` honest against the real `KeyBinding::new`
+/// calls. See `keymap.rs` for why the help is generated rather than
+/// written: shortcut documentation maintained by hand is wrong within a
+/// month, and wrong help costs more than no help.
+///
+/// Source-text audits, like `config_save_guard_audit` and
+/// `editor_clobber_audit` next door — not compiler rails. What they buy is
+/// that drift cannot land quietly.
+#[cfg(test)]
+mod keymap_audit {
+    use super::editor_clobber_audit::sources;
+    use crate::keymap::{SHORTCUTS, UNDOCUMENTED_GLOBALS};
+
+    /// `("chord", is_global)` for every binding registered anywhere in the
+    /// workspace.
+    fn bound_chords() -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        for (_, src) in sources() {
+            // The RAW source, not `code_lines`: that helper blanks string
+            // literal CONTENTS so audits cannot match text inside a string,
+            // and here the string contents ARE the thing being audited.
+            // Comment lines are skipped by hand instead — the one case
+            // `code_lines` was protecting against.
+            for line in src.lines() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let Some(rest) = line.split("KeyBinding::new(").nth(1) else { continue };
+                let Some(chord) = rest.strip_prefix('"').and_then(|r| r.split('"').next()) else {
+                    continue;
+                };
+                // Everything after the chord on the same line; a binding is
+                // global when its context argument is `None`.
+                let tail = rest.split('"').nth(2).unwrap_or("");
+                out.push((chord.to_string(), tail.contains("None")));
+            }
+        }
+        out
+    }
+
+    /// The audit is worthless if the scan finds nothing — the same
+    /// non-vacuity check the neighbouring audits carry.
+    #[test]
+    fn the_scan_actually_finds_the_bindings() {
+        let bound = bound_chords();
+        assert!(bound.len() > 50, "only found {} bindings", bound.len());
+        assert!(bound.iter().any(|(c, g)| c == "ctrl-enter" && *g));
+        assert!(bound.iter().any(|(c, g)| c == "ctrl-f" && !*g), "ctrl-f is grid-scoped");
+    }
+
+    /// No lies: the cheat sheet may not advertise a key that does nothing.
+    #[test]
+    fn every_documented_shortcut_is_actually_bound() {
+        let bound = bound_chords();
+        for sc in SHORTCUTS {
+            assert!(
+                bound.iter().any(|(c, _)| c == sc.chord),
+                "keymap documents {:?} ({}) but nothing binds it",
+                sc.chord,
+                sc.label
+            );
+        }
+    }
+
+    /// No secrets: a shortcut that works EVERYWHERE and is written down
+    /// nowhere is a feature only its author can use. Adding one forces a
+    /// choice — document it, or name it in `UNDOCUMENTED_GLOBALS` with a
+    /// reason.
+    #[test]
+    fn every_global_chord_is_documented_or_deliberately_hidden() {
+        for (chord, global) in bound_chords() {
+            if !global {
+                continue;
+            }
+            let documented = SHORTCUTS.iter().any(|s| s.chord == chord);
+            let exempt = UNDOCUMENTED_GLOBALS.contains(&chord.as_str());
+            assert!(
+                documented || exempt,
+                "{chord:?} is bound globally but appears in neither keymap::SHORTCUTS nor \
+                 keymap::UNDOCUMENTED_GLOBALS - document it or say why not"
+            );
+        }
+    }
+
+    /// An exemption for a chord nobody binds any more is stale advice about
+    /// a key that no longer exists.
+    #[test]
+    fn no_exemption_outlives_its_binding() {
+        let bound = bound_chords();
+        for chord in UNDOCUMENTED_GLOBALS {
+            assert!(
+                bound.iter().any(|(c, _)| c == chord),
+                "{chord:?} is exempted but nothing binds it - drop the exemption"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod sidebar_width_tests {
     use super::*;
