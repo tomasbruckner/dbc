@@ -2366,7 +2366,7 @@ dependencies = [
 
 [[package]]
 name = "dbc-ui"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "async-trait",
  "csv",
