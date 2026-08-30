@@ -2663,6 +2663,68 @@ pub(crate) fn event_name(ev: &TreeEvent) -> String {
     format!("{ev:?}").chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect()
 }
 
+/// What a logged [`TreeEvent`] acted ON — object and connection names
+/// only.
+///
+/// An explicit match rather than a `Debug` dump, because the choice per
+/// variant is exactly the point: names of database objects are safe to
+/// record, but `CopyText`/`InsertAtCursor`/`GenerateSql`/`OpenDdl` carry
+/// copied text, generated SQL and whole DDL bodies, which the log must
+/// never hold (see `dbc_state::applog`'s module docs). Those answer with
+/// their kind or nothing at all.
+///
+/// Empty string = „this action has no target", rendered as `-`.
+pub(crate) fn event_target(ev: &TreeEvent) -> String {
+    fn qualified(schema: &Option<String>, name: &str) -> String {
+        match schema {
+            Some(s) if !s.is_empty() => format!("{s}.{name}"),
+            _ => name.to_string(),
+        }
+    }
+    match ev {
+        TreeEvent::OpenPreview { conn_id, db, schema, table } => {
+            format!("{conn_id}/{db}/{}", qualified(schema, table))
+        }
+        TreeEvent::OpenPreviewHere { schema, table }
+        | TreeEvent::ImportCsv { schema, table }
+        | TreeEvent::CountRows { schema, table }
+        | TreeEvent::ExportCsv { schema, table }
+        | TreeEvent::TruncateTable { schema, table } => qualified(schema, table),
+        TreeEvent::DropObject { kind, schema, name } => {
+            format!("{kind:?} {}", qualified(schema, name))
+        }
+        TreeEvent::OpenErDiagram { schema } => schema.clone().unwrap_or_default(),
+        TreeEvent::ToggleFavourite(f) => qualified(&f.schema, &f.name),
+        TreeEvent::LoadDatabases { conn_id }
+        | TreeEvent::OpenMonitorFor { conn_id }
+        | TreeEvent::OpenCompareFor { conn_id }
+        | TreeEvent::EditConnection { conn_id } => conn_id.clone(),
+        TreeEvent::LoadSchema { conn_id, db } => format!("{conn_id}/{db}"),
+        TreeEvent::SwitchToDatabase { conn_id, db }
+        | TreeEvent::BackupFor { conn_id, db }
+        | TreeEvent::RestoreFor { conn_id, db } => match db {
+            Some(db) => format!("{conn_id}/{db}"),
+            None => conn_id.clone(),
+        },
+        // Script paths are relative paths inside the user's own library —
+        // names, like every other row in this list.
+        TreeEvent::ScriptOpen { rel }
+        | TreeEvent::ScriptRunFile { rel }
+        | TreeEvent::ScriptCreate { parent_rel: rel } => rel.clone(),
+        TreeEvent::ScriptRename { rel, .. } | TreeEvent::ScriptDelete { rel, .. } => rel.clone(),
+        // Deliberately no payload: these carry text, not names.
+        TreeEvent::CopyText { what, .. } => what.clone(),
+        TreeEvent::GenerateSql { kind, .. } => format!("{kind:?}"),
+        TreeEvent::OpenDdl { .. }
+        | TreeEvent::InsertAtCursor { .. }
+        | TreeEvent::RefreshRequested
+        | TreeEvent::ToggleGroupingRequested
+        | TreeEvent::OpenAdmin
+        | TreeEvent::ScriptsRefresh
+        | TreeEvent::OpenScriptsSettings => String::new(),
+    }
+}
+
 impl Render for SchemaTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Sidebar rework: the multi-root flatten, fresh every frame (brief
@@ -3135,6 +3197,46 @@ mod flatten_tests {
             event_name(&TreeEvent::InsertAtCursor { text: "SELECT 1".into() }),
             "InsertAtCursor"
         );
+    }
+
+    /// The log records WHAT an action acted on, and object names are fine —
+    /// but the variants that carry text must not hand that text over. This
+    /// is the property, not the exact strings.
+    #[test]
+    fn an_event_target_never_carries_a_payload_that_is_text() {
+        let secret = "SELECT * FROM users WHERE pw = 'hunter2'";
+        for ev in [
+            TreeEvent::InsertAtCursor { text: secret.into() },
+            TreeEvent::CopyText { what: "hodnota".into(), text: secret.into() },
+            TreeEvent::GenerateSql { kind: GenKind::Update, sql: secret.into() },
+            TreeEvent::OpenDdl { title: "t".into(), ddl: secret.into() },
+        ] {
+            let t = event_target(&ev);
+            assert!(!t.contains("hunter2"), "{ev:?} leaked its payload as {t:?}");
+            assert!(!t.contains("SELECT"), "{ev:?} leaked its payload as {t:?}");
+        }
+    }
+
+    /// Object and connection names ARE the point of the field.
+    #[test]
+    fn an_event_target_names_the_object_it_acted_on() {
+        assert_eq!(
+            event_target(&TreeEvent::CountRows {
+                schema: Some("dbo".into()),
+                table: "orders".into()
+            }),
+            "dbo.orders"
+        );
+        assert_eq!(
+            event_target(&TreeEvent::LoadSchema { conn_id: "c1".into(), db: "prod".into() }),
+            "c1/prod"
+        );
+        assert_eq!(
+            event_target(&TreeEvent::CountRows { schema: None, table: "t".into() }),
+            "t",
+            "a schema-less engine must not produce a leading dot"
+        );
+        assert_eq!(event_target(&TreeEvent::RefreshRequested), "");
     }
 
     fn col(name: &str, ty: &str) -> ColumnInfo {

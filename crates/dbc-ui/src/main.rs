@@ -2264,6 +2264,11 @@ struct AppView {
 /// (no saved `ConnectionConfig`, hence no stable id to use instead).
 const CLI_CONN_IDENTITY: &str = "cli";
 
+/// Identifies the one log tab, so opening or refreshing it replaces the
+/// previous one instead of stacking copies of a file that changes
+/// underneath.
+pub(crate) const LOG_PREVIEW_KEY: &str = "applog";
+
 /// The sidebar's built-in width, used until the user drags the splitter.
 /// Was the hard-coded `260.` in `render`.
 pub(crate) const SIDEBAR_DEFAULT_W: f32 = 260.0;
@@ -8492,6 +8497,8 @@ impl AppView {
         let default_db = cfg.database.clone();
         self.tree.update(cx, |t, cx| t.begin_db_list(&conn_id, my_generation, cx));
         let rx = self.runner.fetch_database_list(spec_for_database(&cfg, &cfg.database, secret));
+        let started = std::time::Instant::now();
+        let engine_name = format!("{:?}", cfg.engine);
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |view, cx| {
@@ -8500,6 +8507,27 @@ impl AppView {
                     Ok(Err(e)) => Err(e.to_string()),
                     Err(_) => Err("výpis databází zrušen".to_string()),
                 };
+                // Expanding a connection is the FIRST thing that touches the
+                // server, so this is where a bad host, a refused login or an
+                // ODBC driver problem actually surfaces — and it was the one
+                // outcome the log did not record (user report, 2026-08-30:
+                // a red ODBC error on screen, nothing in the log).
+                {
+                    use dbc_state::applog::{log, Event};
+                    let engine = engine_name.clone();
+                    match &result {
+                        Ok(_) => log(Event::ConnectOk {
+                            conn: conn_id.clone(),
+                            engine,
+                            ms: started.elapsed().as_millis() as u64,
+                        }),
+                        Err(e) => log(Event::ConnectFailed {
+                            conn: conn_id.clone(),
+                            engine,
+                            error: e.clone(),
+                        }),
+                    }
+                }
                 view.tree.update(cx, |t, cx| {
                     t.finish_db_list(&conn_id, my_generation, result, &default_db, cx)
                 });
@@ -9649,6 +9677,11 @@ impl AppView {
     /// only way to read it after a crash.
     fn open_log_tab(&mut self, cx: &mut Context<Self>) {
         const TAIL_BYTES: usize = 64 * 1024;
+        // `Tabs::open` does NOT dedupe by `preview_key` — the codebase's
+        // idiom is to close the previous one first (the same pair
+        // `open_table_preview` and the admin tab use). Without this, every
+        // open (and every refresh) stacked another Log tab.
+        self.tabs.close_by_preview_key(LOG_PREVIEW_KEY);
         let where_ = dbc_state::applog::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(log není k dispozici)".to_string());
@@ -9666,9 +9699,7 @@ impl AppView {
             id: 0,
             title: "Log".to_string(),
             pinned: false,
-            // Keyed, so repeatedly opening it reuses one tab instead of
-            // stacking copies of a file that changes under you.
-            preview_key: Some("applog".to_string()),
+            preview_key: Some(LOG_PREVIEW_KEY.to_string()),
             conn_identity: self.current_conn_identity(),
             content: TabContent::Text { text: body, scroll_lines: 0 },
         });
@@ -10300,7 +10331,7 @@ impl AppView {
         // payload can carry generated SQL.
         dbc_state::applog::log(dbc_state::applog::Event::Action {
             action: crate::schema_tree::event_name(event),
-            target: String::new(),
+            target: crate::schema_tree::event_target(event),
         });
         match event {
             // Sidebar rework (design §5 row 1): scope-checked — an
@@ -10594,28 +10625,33 @@ impl AppView {
     fn render_tab_strip(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
         let active_id = self.tabs.active().map(|t| t.id);
-        let rows: Vec<(u64, String, bool, usize)> = self
+        let rows: Vec<(u64, String, bool, Option<usize>)> = self
             .tabs
             .iter()
             .map(|t| {
+                // `None` = this kind of tab HAS no row count. It used to
+                // be `0`, which the strip rendered as „Log (0)" / „ER: dbo
+                // (0)" — a count of nothing, on tabs that never had rows
+                // (user report, 2026-08-30: „proč je tam nula?").
                 let (row_count, dirty) = match &t.content {
-                    TabContent::Grid { buffer, grid } => {
-                        (buffer.borrow().row_count(), grid.read(cx).edit_state.is_dirty())
-                    }
-                    TabContent::Text { .. } => (0, false),
-                    TabContent::Monitor { .. } => (0, false),
-                    TabContent::Plan { .. } => (0, false),
-                    TabContent::Diagram { .. } => (0, false),
-                    TabContent::Compare { .. } => (0, false),
-                    TabContent::Chart { .. } => (0, false),
-                    TabContent::ScriptRun { .. } => (0, false),
+                    TabContent::Grid { buffer, grid } => (
+                        Some(buffer.borrow().row_count()),
+                        grid.read(cx).edit_state.is_dirty(),
+                    ),
+                    TabContent::Text { .. } => (None, false),
+                    TabContent::Monitor { .. } => (None, false),
+                    TabContent::Plan { .. } => (None, false),
+                    TabContent::Diagram { .. } => (None, false),
+                    TabContent::Compare { .. } => (None, false),
+                    TabContent::Chart { .. } => (None, false),
+                    TabContent::ScriptRun { .. } => (None, false),
                     // Review finding: this used to hardcode `false`
                     // regardless of staged admin edits, so a dirty admin
                     // tab never got the " •" suffix either. Reuses
                     // `AdminPanel::change_count` — the same dirtiness
                     // definition `grid_dirty_change_count`'s `Admin` arm
                     // (the close-tab guard) already reads.
-                    TabContent::Admin { view } => (0, view.read(cx).change_count() > 0),
+                    TabContent::Admin { view } => (None, view.read(cx).change_count() > 0),
                 };
                 // G5 Task 3, brief contract #7: dirty (unapplied staged
                 // edits) tabs get a " •" title suffix — the apply bar
@@ -10646,7 +10682,10 @@ impl AppView {
                         view.tabs.activate(id);
                         cx.notify();
                     }))
-                    .child(format!("{title} ({row_count})"))
+                    .child(match row_count {
+                        Some(n) => format!("{title} ({n})"),
+                        None => title.clone(),
+                    })
                     .child(
                         div()
                             .id(("tab-pin", id as usize))
@@ -10702,6 +10741,11 @@ impl AppView {
         let Some(active) = self.tabs.active() else {
             return div().flex_1().bg(theme.bg_panel).into_any_element();
         };
+        // The log tab is a SNAPSHOT of a file that keeps being written to,
+        // so it is the one text tab that needs a way to re-read it (user
+        // report, 2026-08-30: an error appeared on screen after the tab was
+        // opened, so the tab did not have it).
+        let is_log = active.preview_key.as_deref() == Some(LOG_PREVIEW_KEY);
 
         match &active.content {
             TabContent::Grid { grid, .. } => {
@@ -10748,13 +10792,28 @@ impl AppView {
                     body = body.child(div().child(line.to_string()));
                 }
 
+                let mut header = div().flex().flex_row().justify_end().gap_2().p_1();
+                if is_log {
+                    header = header.child(
+                        div()
+                            .id("tab-log-refresh")
+                            .cursor_pointer()
+                            .bg(theme.bg_hover)
+                            .text_color(theme.text_primary)
+                            .px_2()
+                            .rounded_md()
+                            .child("Obnovit")
+                            .on_click(cx.listener(|view, _, _, cx| view.open_log_tab(cx))),
+                    );
+                }
+
                 div()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .bg(theme.bg_panel)
                     .child(
-                        div().flex().flex_row().justify_end().p_1().child(
+                        header.child(
                             div()
                                 .id("tab-copy")
                                 .cursor_pointer()
@@ -12774,6 +12833,12 @@ fn main() {
             KeyBinding::new("ctrl-b", ToggleTree, None),
             KeyBinding::new("ctrl-h", ToggleHistory, None),
             KeyBinding::new("ctrl-k", OpenPalette, None),
+            // Ctrl+P and Ctrl+Shift+P are what a hand reaches for after
+            // any editor of the last decade (user report, 2026-08-30:
+            // „ctrl + p nic nedela"). Both were free repo-wide; Ctrl+K
+            // stays the documented one.
+            KeyBinding::new("ctrl-p", OpenPalette, None),
+            KeyBinding::new("ctrl-shift-p", OpenPalette, None),
             // G6 T7: force-trigger, same "global, context None" precedent
             // as `RunQuery`/`OpenPalette` above (design §2).
             KeyBinding::new("ctrl-space", OpenAutocomplete, None),

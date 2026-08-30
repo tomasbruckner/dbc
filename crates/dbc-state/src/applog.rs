@@ -155,7 +155,10 @@ impl Event {
                 );
             }
             Event::Action { action, target } => {
-                let _ = write!(s, "action {} target={}", q(action), q(target));
+                // A few actions genuinely act on nothing (refresh, toggle).
+                // `-` says that; `""` looks like a bug.
+                let t = if target.is_empty() { "-" } else { target.as_str() };
+                let _ = write!(s, "action {} target={}", q(action), q(t));
             }
             Event::Refused { what, reason } => {
                 let _ = write!(s, "refused what={} reason={}", q(what), q(reason));
@@ -369,6 +372,14 @@ mod tests {
         let line = format_line(0, &Event::Action { action: "x".into(), target: evil.into() });
         assert_eq!(line.lines().count(), 1, "{line}");
         assert!(line.contains("\\n"), "{line}");
+    }
+
+    /// An action with no object acts on nothing — say so, rather than
+    /// printing an empty pair that reads like a missing value.
+    #[test]
+    fn an_action_without_a_target_says_so() {
+        let line = format_line(0, &Event::Action { action: "Refresh".into(), target: String::new() });
+        assert!(line.ends_with("target=\"-\""), "{line}");
     }
 
     #[test]
