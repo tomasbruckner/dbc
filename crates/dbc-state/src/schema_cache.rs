@@ -39,6 +39,11 @@ use serde::{de::DeserializeOwned, Serialize};
 /// bound is a disk leak, not a cache.
 const MAX_ENTRIES: usize = 64;
 
+/// …and a count alone is not a budget. One real database in this app's own
+/// use serialises to 4.6 MB (1171 tables), so 64 entries could mean 300 MB
+/// of cache for a convenience feature. Whichever limit bites first wins.
+const MAX_BYTES: u64 = 128 * 1024 * 1024;
+
 fn dir() -> PathBuf {
     crate::workspace::profile_dir().join("schema-cache")
 }
@@ -87,23 +92,32 @@ pub fn store<T: Serialize>(conn_id: &str, db: &str, snapshot: &T) {
     prune(&dir);
 }
 
-/// Drop the oldest entries past [`MAX_ENTRIES`].
+/// Drop the oldest entries until the cache is inside BOTH budgets.
 fn prune(dir: &Path) {
+    prune_to(dir, MAX_ENTRIES, MAX_BYTES);
+}
+
+fn prune_to(dir: &Path, max_entries: usize, max_bytes: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         .filter_map(|e| {
-            let modified = e.metadata().ok()?.modified().ok()?;
-            Some((modified, e.path()))
+            let meta = e.metadata().ok()?;
+            Some((meta.modified().ok()?, meta.len(), e.path()))
         })
         .collect();
-    if files.len() <= MAX_ENTRIES {
-        return;
-    }
-    files.sort_by_key(|(t, _)| *t);
-    for (_, path) in files.iter().take(files.len() - MAX_ENTRIES) {
-        let _ = std::fs::remove_file(path);
+    files.sort_by_key(|(t, _, _)| *t);
+    let mut total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    let mut count = files.len();
+    for (_, len, path) in files.iter() {
+        if count <= max_entries && total <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            total = total.saturating_sub(*len);
+            count -= 1;
+        }
     }
 }
 
@@ -144,6 +158,25 @@ mod tests {
         assert_ne!(key("a", "bc"), key("ab", "c"));
         assert_ne!(key("a", "b"), key("b", "a"));
         assert_eq!(key("a", "b"), key("a", "b"));
+    }
+
+    /// The byte budget must bite even when the entry COUNT is fine — the
+    /// case that motivated it is a handful of very large schemas, not many
+    /// small ones.
+    #[test]
+    fn prune_enforces_the_byte_budget_not_just_the_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = "x".repeat(1024);
+        for i in 0..4 {
+            let p = tmp.path().join(format!("{i:016x}.json"));
+            std::fs::write(&p, &big).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Four entries, well under MAX_ENTRIES, but over a budget this
+        // small — so the count check alone would keep all four.
+        prune_to(tmp.path(), MAX_ENTRIES, 2048);
+        let left = std::fs::read_dir(tmp.path()).unwrap().count();
+        assert_eq!(left, 2, "byte budget did not evict");
     }
 
     #[test]

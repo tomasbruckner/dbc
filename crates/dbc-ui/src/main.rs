@@ -8643,19 +8643,35 @@ impl AppView {
         // The CLI slot is excluded: it is keyed by a sentinel id and an
         // empty database name, so every `--url` the app was ever started
         // with would share one cache entry.
-        let served_from_cache = if conn_id == CLI_CONN_IDENTITY {
-            false
-        } else {
-            match dbc_state::schema_cache::load::<SchemaSnapshot>(&conn_id, &db) {
-                Some(cached) => {
-                    self.tree.update(cx, |t, cx| {
-                        t.finish_schema(&conn_id, &db, my_generation, Ok(cached), cx)
-                    });
-                    true
-                }
-                None => false,
-            }
-        };
+        //
+        // Reading it happens on the BACKGROUND executor, not here. One real
+        // schema in this app's own use is a 4.6 MB JSON file; parsing that
+        // inline would freeze the window exactly the way the master
+        // password's Argon2id did, and a cache that stutters is not a
+        // cache. Two tasks race politely: whichever answer lands first is
+        // shown, and the cache never overwrites a fetch that already
+        // arrived.
+        let served_from_cache = std::rc::Rc::new(std::cell::Cell::new(false));
+        let fetch_done = std::rc::Rc::new(std::cell::Cell::new(false));
+        if conn_id != CLI_CONN_IDENTITY {
+            let (c, d) = (conn_id.clone(), db.clone());
+            let load = cx.background_executor()
+                .spawn(async move { dbc_state::schema_cache::load::<SchemaSnapshot>(&c, &d) });
+            let (c, d) = (conn_id.clone(), db.clone());
+            let (served, done) = (served_from_cache.clone(), fetch_done.clone());
+            cx.spawn(async move |this, cx| {
+                let Some(cached) = load.await else { return };
+                let _ = this.update(cx, |view, cx| {
+                    if done.get() {
+                        return;
+                    }
+                    served.set(true);
+                    view.tree
+                        .update(cx, |t, cx| t.finish_schema(&c, &d, my_generation, Ok(cached), cx));
+                });
+            })
+            .detach();
+        }
         let rx = self.runner.fetch_schema(spec);
         let started = std::time::Instant::now();
         cx.spawn(async move |this, cx| {
@@ -8683,18 +8699,23 @@ impl AppView {
                         }),
                     }
                 }
-                match &result {
-                    Ok(snapshot) if conn_id != CLI_CONN_IDENTITY => {
-                        dbc_state::schema_cache::store(&conn_id, &db, snapshot);
+                fetch_done.set(true);
+                if let Ok(snapshot) = &result {
+                    if conn_id != CLI_CONN_IDENTITY {
+                        // Serialising 4.6 MB belongs off the UI thread for
+                        // the same reason reading it does.
+                        let (c, d, snap) = (conn_id.clone(), db.clone(), snapshot.clone());
+                        cx.background_executor()
+                            .spawn(async move { dbc_state::schema_cache::store(&c, &d, &snap) })
+                            .detach();
                     }
-                    _ => {}
                 }
                 // A failed REFRESH must not wipe a good cached tree. The
                 // names on screen are still the best answer anyone has, and
                 // replacing them with an error would punish the user for
                 // the cache having worked. The failure is still reported —
                 // in the status bar, and in the log by the arm above.
-                if result.is_err() && served_from_cache {
+                if result.is_err() && served_from_cache.get() {
                     if let Err(e) = &result {
                         view.status = format!("error: schéma se nepodařilo obnovit ({e}) — zobrazeno z mezipaměti");
                     }
