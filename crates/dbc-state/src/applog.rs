@@ -73,6 +73,18 @@ pub enum Event {
     /// question the cache exists to answer unanswerable (2026-08-31).
     SchemaFromCache { conn: String, db: Option<String>, tables: usize, ms: u64 },
     SchemaFailed { conn: String, db: Option<String>, error: String },
+    /// A schema fetched by the IDLE PREFETCH — nobody asked for it, nothing
+    /// on screen changed, only the on-disk cache was warmed. It gets its
+    /// own entry rather than borrowing `SchemaLoaded` precisely because the
+    /// log is where „why did my server see a connection I never made?" is
+    /// answered, and an entry that cannot distinguish a click from a
+    /// background guess cannot answer it.
+    SchemaPrefetched { conn: String, db: String, tables: usize, ms: u64 },
+    /// The prefetch failed. Nothing is shown to the user (they never asked
+    /// for it), which is exactly why it must be written down: a silently
+    /// failing background job is the shape of bug this project has already
+    /// paid for once.
+    SchemaPrefetchFailed { conn: String, db: String, error: String },
     /// `kind` is the statement kind (SELECT, INSERT, …), never the text.
     QueryOk { kind: String, rows: usize, ms: u64 },
     QueryFailed { kind: String, error: String },
@@ -98,10 +110,11 @@ impl Event {
             | Event::ConnectOk { .. }
             | Event::SchemaLoaded { .. }
             | Event::SchemaFromCache { .. }
+            | Event::SchemaPrefetched { .. }
             | Event::QueryOk { .. }
             | Event::WriteApplied { .. }
             | Event::Action { .. } => Level::Info,
-            Event::Refused { .. } => Level::Warn,
+            Event::Refused { .. } | Event::SchemaPrefetchFailed { .. } => Level::Warn,
             Event::ConnectFailed { .. }
             | Event::SchemaFailed { .. }
             | Event::QueryFailed { .. }
@@ -144,6 +157,18 @@ impl Event {
                     q(conn),
                     q(db.as_deref().unwrap_or("-"))
                 );
+            }
+            Event::SchemaPrefetched { conn, db, tables, ms } => {
+                let _ = write!(
+                    s,
+                    "schema.prefetch conn={} db={} tables={tables} ms={ms}",
+                    q(conn),
+                    q(db)
+                );
+            }
+            Event::SchemaPrefetchFailed { conn, db, error } => {
+                let _ =
+                    write!(s, "schema.prefetch.fail conn={} db={} error={}", q(conn), q(db), q(error));
             }
             Event::SchemaFailed { conn, db, error } => {
                 let _ = write!(

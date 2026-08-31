@@ -49,6 +49,7 @@ mod monitor_sql;
 mod monitor_view;
 mod palette;
 mod plan;
+mod prefetch;
 mod pwchange;
 mod row_view;
 mod runner;
@@ -2137,6 +2138,15 @@ struct AppView {
     /// nothing is connected yet, so a window closed during the vault
     /// prompt does not erase the context it was about to reopen.
     attempted_restore: Option<(String, Option<String>)>,
+    /// A `prefetch::may_prefetch` gate and the loop's own „one at a time"
+    /// rule (see `prefetch`'s module doc). Set when a prefetch fetch is
+    /// dispatched, cleared when it lands — success or failure.
+    prefetch_in_flight: bool,
+    /// Is the idle-prefetch timer loop already running? Without it every
+    /// `finish_db_list` would start another loop beside the last one, and
+    /// „one prefetch at a time" would be enforced only by the flag above
+    /// while N timers spun behind it.
+    prefetch_armed: bool,
     /// Sidebar rework (design §2.2): the active database WITHIN
     /// `active_connection_id`. `None` = the saved config's `database` (the
     /// default). Always `None` when `active_connection_id` is `None` (the
@@ -9283,6 +9293,151 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 view.tree.update(cx, |t, cx| {
                     t.finish_db_list(&conn_id, my_generation, result, &default_db, cx)
                 });
+                // A fresh list is the only thing that can create work for
+                // the idle prefetch, so it is the only thing that arms it.
+                view.arm_schema_prefetch(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// How long the app must be quiet before the prefetch looks again.
+    ///
+    /// Long enough that it never competes with a person who is still
+    /// clicking — every gate in `prefetch::may_prefetch` is re-checked on
+    /// each lap, so a busy app simply keeps skipping — and short enough
+    /// that leaving the window alone for a moment is already worth
+    /// something.
+    const PREFETCH_IDLE_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Start the idle-prefetch loop, if it is not already running.
+    ///
+    /// The loop ENDS — it is not a heartbeat. It breaks the moment a lap
+    /// finds nothing left to warm (or the `AppView` is gone), and only a
+    /// new database list arms it again. That is what keeps a fully warmed
+    /// app from ticking forever for no reason.
+    fn arm_schema_prefetch(&mut self, cx: &mut Context<Self>) {
+        if self.prefetch_armed {
+            return;
+        }
+        self.prefetch_armed = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Self::PREFETCH_IDLE_DELAY).await;
+                match this.update(cx, |view, cx| view.prefetch_lap(cx)) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => break,
+                }
+            }
+            let _ = this.update(cx, |view, _| view.prefetch_armed = false);
+        })
+        .detach();
+    }
+
+    /// One lap of the idle prefetch. `true` = keep looping.
+    ///
+    /// „Busy" answers `true` without looking at anything: the app being
+    /// busy says nothing about whether work remains, so ending the loop
+    /// there would silently drop the whole feature for anyone who types
+    /// continuously. Only an IDLE lap that finds no target ends it.
+    fn prefetch_lap(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(conn_id) = self.active_connection_id.clone() else {
+            // Nothing active to warm. A later connection re-arms us
+            // through `finish_db_list`.
+            return false;
+        };
+        let Some(cfg) = self.config.connections.iter().find(|c| c.id == conn_id).cloned() else {
+            return false;
+        };
+        let needs_secret = !connections_ui::engine_is_file_based(cfg.engine);
+        let secret_available = !connections_ui::connect_needs_vault_prompt(
+            needs_secret,
+            self.vault.is_some(),
+            Vault::exists(&self.vault_path),
+        );
+        let busy = prefetch::Busy {
+            query_running: self.cancel.is_some(),
+            modal_open: self.modal.is_some(),
+            sidebar_fetching: self.tree.read(cx).any_fetch_in_flight(),
+            prefetch_in_flight: self.prefetch_in_flight,
+        };
+        if !prefetch::may_prefetch(&busy, secret_available) {
+            return true;
+        }
+        let Some((dbs, _truncated)) = self.tree.read(cx).db_list_for(&conn_id) else {
+            return false;
+        };
+        let candidates: Vec<prefetch::Candidate> = dbs
+            .iter()
+            .take(prefetch::SCAN_CAP)
+            .map(|d| prefetch::Candidate {
+                name: d.name.as_str(),
+                known: !matches!(d.schema, schema_tree::DbSchemaState::NotLoaded),
+                cached: dbc_state::schema_cache::is_cached(&conn_id, &d.name),
+            })
+            .collect();
+        let active_db = self.active_database.clone().or_else(|| Some(cfg.database.clone()));
+        let Some(db) = prefetch::next_target(&candidates, active_db.as_deref()).map(str::to_string)
+        else {
+            return false;
+        };
+        self.start_schema_prefetch(cfg, conn_id, db, cx);
+        true
+    }
+
+    /// Fetch one schema and write it to the on-disk cache. Nothing else.
+    ///
+    /// Deliberately NOT `start_schema_slot_fetch`: that one bumps
+    /// `sidebar_fetch_generation` (which would supersede a fetch the user
+    /// started), transitions the tree slot (repainting rows nobody
+    /// touched), and pushes into the bounded in-memory slot cache
+    /// (evicting, by LRU, a snapshot the user IS working with). A prefetch
+    /// that did any of those would be visible, and a visible background
+    /// guess is worse than no prefetch.
+    fn start_schema_prefetch(
+        &mut self,
+        cfg: dbc_state::ConnectionConfig,
+        conn_id: String,
+        db: String,
+        cx: &mut Context<Self>,
+    ) {
+        let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
+        let spec = spec_for_database(&cfg, &db, secret);
+        self.prefetch_in_flight = true;
+        let rx = self.runner.fetch_schema(spec);
+        let started = std::time::Instant::now();
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |view, cx| {
+                view.prefetch_in_flight = false;
+                use dbc_state::applog::{log, Event};
+                match result {
+                    Ok(Ok(snapshot)) => {
+                        log(Event::SchemaPrefetched {
+                            conn: conn_id.clone(),
+                            db: db.clone(),
+                            tables: snapshot.tables.len(),
+                            ms: started.elapsed().as_millis() as u64,
+                        });
+                        // Serialising megabytes belongs off the UI thread,
+                        // exactly as on the user-facing path.
+                        cx.background_executor()
+                            .spawn(async move {
+                                dbc_state::schema_cache::store(&conn_id, &db, &snapshot)
+                            })
+                            .detach();
+                    }
+                    Ok(Err(e)) => log(Event::SchemaPrefetchFailed {
+                        conn: conn_id,
+                        db,
+                        error: e.to_string(),
+                    }),
+                    Err(_) => log(Event::SchemaPrefetchFailed {
+                        conn: conn_id,
+                        db,
+                        error: "fetch zrušen".to_string(),
+                    }),
+                }
             });
         })
         .detach();
@@ -14296,6 +14451,8 @@ fn main() {
                             vault: None,
                             active_connection_id: None,
                             attempted_restore: None,
+                            prefetch_in_flight: false,
+                            prefetch_armed: false,
                             active_database: None,
                             switch_generation: 0,
                             dropdown_open: false,

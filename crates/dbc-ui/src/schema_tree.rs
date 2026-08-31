@@ -1114,6 +1114,22 @@ pub fn row_in_active_scope(row: &SidebarRow, scope: Option<&ActiveScope>) -> boo
 /// Transitions a schema slot into `Loading`, carrying the previous
 /// expand-set forward (from `Loaded` OR an in-flight `Loading` — a
 /// superseding dispatch must not lose it either).
+/// Is this connection waiting on a fetch the USER asked for — either its
+/// database list, or any one of its schema slots?
+///
+/// Pure so the idle prefetch's politeness gate can be tested: the method
+/// that consumes it, `SchemaTree::any_fetch_in_flight`, needs a live
+/// `Context` that this crate's suite cannot build.
+pub fn list_is_fetching(state: &DbListState) -> bool {
+    match state {
+        DbListState::Loading { .. } => true,
+        DbListState::Loaded { dbs, .. } => {
+            dbs.iter().any(|d| matches!(d.schema, DbSchemaState::Loading { .. }))
+        }
+        DbListState::NotLoaded | DbListState::Error(_) => false,
+    }
+}
+
 pub fn begin_schema_load(slot: &mut DbSchemaState, generation: u64) {
     let prev_expanded = match std::mem::replace(slot, DbSchemaState::NotLoaded) {
         DbSchemaState::Loaded { expanded, .. } => expanded,
@@ -2213,6 +2229,17 @@ impl SchemaTree {
             DbListState::Loaded { dbs, truncated } => Some((dbs.as_slice(), *truncated)),
             _ => None,
         }
+    }
+
+    /// Is ANY database list or schema slot currently loading?
+    ///
+    /// The idle prefetch's politeness gate: a fetch in flight means the
+    /// user clicked something and is waiting for it, and a second
+    /// connection to the same server would only make their wait longer.
+    /// Every connection is checked, not just the active one, because a
+    /// background expand of another connection is still someone waiting.
+    pub fn any_fetch_in_flight(&self) -> bool {
+        self.conns.values().any(|c| list_is_fetching(&c.dbs))
     }
 
     /// G12 T4: see the `read_only` field's doc comment.
@@ -3513,6 +3540,39 @@ impl Render for SchemaTree {
 /// growing an argument that is the same in all 21 of them.
 macro_rules! flatten_sidebar_g {
     ($($a:expr),* $(,)?) => { flatten_sidebar($($a),*, TreeGrouping::Schema) };
+}
+
+#[cfg(test)]
+mod fetch_in_flight_tests {
+    use super::*;
+
+    fn db(name: &str, schema: DbSchemaState) -> DbNode {
+        DbNode { name: name.to_string(), is_default: false, schema }
+    }
+
+    #[test]
+    fn a_loading_database_list_is_a_fetch() {
+        assert!(list_is_fetching(&DbListState::Loading { generation: 1 }));
+    }
+
+    #[test]
+    fn a_loading_schema_slot_inside_a_loaded_list_is_a_fetch() {
+        let dbs = vec![
+            db("a", DbSchemaState::NotLoaded),
+            db("b", DbSchemaState::Loading { generation: 3, prev_expanded: HashSet::new() }),
+        ];
+        assert!(list_is_fetching(&DbListState::Loaded { dbs, truncated: false }));
+    }
+
+    /// The half that matters: a gate that always says „busy" would turn
+    /// the prefetch off entirely and nothing else would notice.
+    #[test]
+    fn a_settled_connection_is_not_a_fetch() {
+        assert!(!list_is_fetching(&DbListState::NotLoaded));
+        assert!(!list_is_fetching(&DbListState::Error("nope".into())));
+        let dbs = vec![db("a", DbSchemaState::NotLoaded), db("b", DbSchemaState::Error("x".into()))];
+        assert!(!list_is_fetching(&DbListState::Loaded { dbs, truncated: false }));
+    }
 }
 
 #[cfg(test)]
