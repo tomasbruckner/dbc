@@ -14100,6 +14100,26 @@ fn main() {
                         // process/task BEFORE the app actually exits, since
                         // nothing else reaps an abandoned pg_dump/pg_restore
                         // child.
+                        // THE hook that actually fires when the window's
+                        // X is clicked. `on_app_quit` alone does not: GPUI
+                        // removes the window — and with it the root
+                        // entity — BEFORE the quit-on-last-window path
+                        // runs, so by the time the quit observers execute
+                        // there is no `AppView` left to ask. Found the
+                        // honest way: the first session never saved and the
+                        // log said nothing, because nothing ran.
+                        //
+                        // Both are kept. This one covers closing the
+                        // window; `on_app_quit` still covers an explicit
+                        // quit while a window is open, where the entity IS
+                        // alive and this observer has not fired yet.
+                        // Saving twice is harmless — the second write is
+                        // byte-identical.
+                        let weak = cx.weak_entity();
+                        cx.on_window_closed(move |cx, _id| {
+                            let _ = weak.update(cx, |view: &mut AppView, cx| view.save_session(cx));
+                        })
+                        .detach();
                         cx.on_app_quit(|view, cx| {
                             view.cancel_active_backup_if_running();
                             // The ONE reliable moment to write the session:
