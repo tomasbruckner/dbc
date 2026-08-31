@@ -1987,6 +1987,20 @@ enum PendingDiscard {
 #[derive(Clone)]
 pub(crate) enum PendingTreeAction {
     OpenPreview { schema: Option<String>, table: String },
+    /// Session restore: load the connection's DATABASE LIST once the
+    /// switch has succeeded.
+    ///
+    /// The second kind, added deliberately (the test below used to pin
+    /// this enum as single-variant, asking for exactly this thought).
+    /// `switch_to_database` fetches the SCHEMA of the target database but
+    /// never the list of databases, so a restored „connection row was
+    /// expanded" would render open with nothing under it. Doing it through
+    /// `follow_up` rather than as a second call reuses three properties
+    /// that are hard to get right twice: it survives the vault prompt
+    /// (carried inside `PendingAfterUnlock::SwitchDatabase`), it is owned
+    /// by its dispatch and so retired by the `switch_generation` guard,
+    /// and it runs only after the connection actually succeeded.
+    LoadDatabases,
 }
 
 /// G5 Task 4 (folded T3 review issue 2): confirm prompt for an action that
@@ -2118,11 +2132,11 @@ struct AppView {
     /// master password once (brief: prompt on first use, not at startup).
     vault: Option<Vault>,
     active_connection_id: Option<String>,
-    /// „Reconnect to what was open last time", consumed once at the top of
-    /// `render`. Not applied in the constructor because switching may need
-    /// the vault, and a master-password modal needs a `Window` that does
-    /// not exist yet.
-    restore_connection: Option<(String, Option<String>)>,
+    /// The connection this run TRIED to restore, kept until the switch
+    /// lands or the user disconnects. It is what the session records when
+    /// nothing is connected yet, so a window closed during the vault
+    /// prompt does not erase the context it was about to reopen.
+    attempted_restore: Option<(String, Option<String>)>,
     /// Sidebar rework (design §2.2): the active database WITHIN
     /// `active_connection_id`. `None` = the saved config's `database` (the
     /// default). Always `None` when `active_connection_id` is `None` (the
@@ -6807,10 +6821,6 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         }
     }
 
-    /// The single site where "the database the app talks to" is decided —
-    /// see `ActiveConn`'s doc comment for the invariant. `None` = no active
-    /// saved connection OR the connection was deleted; the CLI-arg URL path
-    /// is handled by callers as today.
     /// The window state worth reopening with.
     ///
     /// Tabs contribute only if they carry SQL, which is exactly the tabs a
@@ -6818,13 +6828,61 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// DDL view has no query behind it, and inventing one would produce a
     /// tab that lies about what re-running it would do.
     fn capture_session(&self, cx: &App) -> dbc_state::session::SessionState {
+        // The fallback is not cosmetic. Without it, opening the app and
+        // closing it again before the connection lands — cancelling the
+        // master-password prompt is enough — records „no connection" and
+        // the session eats itself. Observed exactly once, for real, when
+        // the restore was still silently failing.
+        //
+        // It cannot resurrect anything the user gave up on: a successful
+        // switch sets `active_connection_id` (so the fallback never
+        // fires), and an explicit disconnect clears the claim.
+        let (connection, database) = match &self.active_connection_id {
+            Some(id) => (Some(id.clone()), self.active_database.clone()),
+            None => match &self.attempted_restore {
+                Some((id, db)) => (Some(id.clone()), db.clone()),
+                None => (None, None),
+            },
+        };
         dbc_state::session::SessionState {
-            connection: self.active_connection_id.clone(),
-            database: self.active_database.clone(),
+            connection,
+            database,
             editor: self.sql.read(cx).text(),
             cursor: self.sql.read(cx).cursor(),
             expanded: self.tree.read(cx).expanded_keys(),
             tabs: session_tabs(&self.tabs),
+        }
+    }
+
+    /// Reconnect to whatever was open when the app was last closed, and
+    /// give the restored sidebar rows something to show.
+    ///
+    /// `LoadDatabases` as the follow-up rather than a second call: the
+    /// switch may have to wait for the vault, and the follow-up rides
+    /// along inside the pending action, so one password answers both. It
+    /// also only runs once the connection actually succeeded — a database
+    /// list fetched against a connection that failed would be a second
+    /// error about the same thing.
+    fn restore_session_context(
+        &mut self,
+        restore: Option<(String, Option<String>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((conn_id, db)) = restore else { return };
+        self.attempted_restore = Some((conn_id.clone(), db.clone()));
+        // A connection deleted since the last run is not worth a modal, but
+        // it IS worth a log line — otherwise „it did not reconnect" has no
+        // visible cause at all.
+        let known = self.config.connections.iter().any(|c| c.id == conn_id);
+        dbc_state::applog::log(dbc_state::applog::Event::Action {
+            action: if known { "SessionRestored".into() } else { "SessionConnGone".into() },
+            target: match &db {
+                Some(db) => format!("{conn_id}/{db}"),
+                None => conn_id.clone(),
+            },
+        });
+        if known {
+            self.switch_to_database(&conn_id, db, Some(PendingTreeAction::LoadDatabases), cx);
         }
     }
 
@@ -6851,6 +6909,10 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         dbc_state::session::save(&self.session_path, &state);
     }
 
+    /// The single site where "the database the app talks to" is decided —
+    /// see `ActiveConn`'s doc comment for the invariant. `None` = no active
+    /// saved connection OR the connection was deleted; the CLI-arg URL path
+    /// is handled by callers as today.
     fn resolve_active(&self) -> Option<ActiveConn> {
         let id = self.active_connection_id.as_deref()?;
         resolve_active_from(&self.config, self.vault.as_ref(), id, self.active_database.as_deref())
@@ -6905,8 +6967,14 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             // follow-up (unreachable from the cross-context arm, which
             // implies a different identity — kept defensively) targets the
             // already-active context, so it runs directly.
-            if let Some(PendingTreeAction::OpenPreview { schema, table }) = follow_up {
-                self.open_table_preview(schema, table, cx);
+            match follow_up {
+                Some(PendingTreeAction::OpenPreview { schema, table }) => {
+                    self.open_table_preview(schema, table, cx)
+                }
+                Some(PendingTreeAction::LoadDatabases) => {
+                    self.start_db_list_fetch(id.to_string(), cx)
+                }
+                None => {}
             }
             return;
         }
@@ -6989,8 +7057,14 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         // dispatch never reaches here (generation guard
                         // above), so a stale action can never replay
                         // against the wrong database.
-                        if let Some(PendingTreeAction::OpenPreview { schema, table }) = follow_up {
-                            view.open_table_preview(schema, table, cx);
+                        match follow_up {
+                            Some(PendingTreeAction::OpenPreview { schema, table }) => {
+                                view.open_table_preview(schema, table, cx)
+                            }
+                            Some(PendingTreeAction::LoadDatabases) => {
+                                view.start_db_list_fetch(target_id.clone(), cx)
+                            }
+                            None => {}
                         }
                     }
                     // Failure arms: the closure-owned follow-up simply
@@ -9121,6 +9195,10 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// never land in the NEW context. The CLI-arg root goes too: it belongs
     /// to the old context and, per the sidebar design, cannot come back.
     fn clear_active_connection(&mut self, cx: &mut Context<Self>) {
+        // Dropping the context on purpose also gives up the session's
+        // claim on it — otherwise the fallback below would resurrect a
+        // connection the user has just walked away from.
+        self.attempted_restore = None;
         self.active_connection_id = None;
         self.active_database = None;
         self.conn_url = None;
@@ -13249,29 +13327,6 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Reconnect to whatever was open when the app was last closed. Here
-        // rather than in the constructor because a locked vault turns this
-        // into a master-password modal, which needs a `Window`.
-        //
-        // `take()` before the switch, not after: `switch_to_database` can
-        // re-enter `render` through the modal it opens, and a flag still set
-        // at that point would start a second switch.
-        if let Some((conn_id, db)) = self.restore_connection.take() {
-            // A connection deleted since the last run is not an error worth
-            // a modal, but it IS worth a log line — otherwise „it did not
-            // reconnect" has no visible cause at all.
-            let known = self.config.connections.iter().any(|c| c.id == conn_id);
-            dbc_state::applog::log(dbc_state::applog::Event::Action {
-                action: if known { "SessionRestored".into() } else { "SessionConnGone".into() },
-                target: match &db {
-                    Some(db) => format!("{conn_id}/{db}"),
-                    None => conn_id.clone(),
-                },
-            });
-            if known {
-                self.switch_to_database(&conn_id, db, None, cx);
-            }
-        }
         // UX-polish §1.4: deferred focus for overlay openers without a
         // `&mut Window` (see `modal_needs_focus`). Guarded: if the overlay
         // already closed again before this frame, just clear the flag.
@@ -13916,6 +13971,9 @@ fn main() {
     // happen here (it may need the vault) and is deferred to `render`.
     let session_path = dbc_state::session::path_for(&config_path);
     let session = dbc_state::session::load(&session_path);
+    // Taken before `session` moves into the window closure: the connection
+    // is restored from the startup sequence, not from the constructor.
+    let restore_conn = session.connection.clone().map(|id| (id, session.database.clone()));
     let vault_path = startup.paths.vault.clone();
     let workspace_root = startup.workspace_root.clone();
     let blocked = startup.blocked.clone();
@@ -14159,15 +14217,8 @@ fn main() {
                             workspace_panel_focus: cx.focus_handle(),
                             vault: None,
                             active_connection_id: None,
+                            attempted_restore: None,
                             active_database: None,
-                            // Applied at the top of `render` — the first
-                            // point with a live `Window`, and the only place
-                            // a vault prompt can be raised. Same deferral
-                            // idiom as `modal_needs_focus`.
-                            restore_connection: session
-                                .connection
-                                .clone()
-                                .map(|id| (id, session.database.clone())),
                             switch_generation: 0,
                             dropdown_open: false,
                             modal: None,
@@ -14264,7 +14315,23 @@ fn main() {
             //
             // Cancel is still a full answer: the app runs locked, and every
             // path that needs a secret prompts again on its own.
-            if Vault::exists(&view.vault_path) && view.vault.is_none() && blocked.is_none() {
+            //
+            // The session restore goes FIRST, and that ordering is the
+            // whole fix: the generic prompt below is an overlay, and
+            // `switch_to_database` refuses under any overlay. Restoring
+            // afterwards logged „SessionRestored" and then silently did
+            // nothing (user report 2026-08-31: „nic se nestalo, nic se
+            // nerozbalilo"). Going first means the switch raises its OWN
+            // vault prompt, carrying itself as the pending action, so one
+            // password answers both questions.
+            if blocked.is_none() {
+                view.restore_session_context(restore_conn, cx);
+            }
+            if Vault::exists(&view.vault_path)
+                && view.vault.is_none()
+                && view.modal.is_none()
+                && blocked.is_none()
+            {
                 view.open_vault_prompt(connections_ui::PendingAfterUnlock::Nothing, cx);
             }
             // Design §W4: the blocking modal goes up LAST, so it occludes a
@@ -15111,14 +15178,22 @@ mod switch_decision_tests {
         );
     }
 
-    /// The queued action is one-shot open-preview only (design §2.2) —
-    /// this pins the enum stays single-variant (a second queued kind needs
-    /// its own design pass).
+    /// The queued action was open-preview only (design §2.2), and this
+    /// test asked that a second kind get its own design pass. It got one:
+    /// session restore needs the database LIST loaded after the switch
+    /// lands, and `follow_up` is the only path that survives the vault
+    /// prompt AND the `switch_generation` guard. The exhaustive `match` is
+    /// the point — a THIRD kind still has to come through here.
     #[test]
-    fn pending_tree_action_is_open_preview_only() {
-        let a = PendingTreeAction::OpenPreview { schema: None, table: "t".into() };
-        match a {
-            PendingTreeAction::OpenPreview { .. } => {}
+    fn pending_tree_action_has_exactly_the_two_designed_kinds() {
+        for a in [
+            PendingTreeAction::OpenPreview { schema: None, table: "t".into() },
+            PendingTreeAction::LoadDatabases,
+        ] {
+            match a {
+                PendingTreeAction::OpenPreview { .. } => {}
+                PendingTreeAction::LoadDatabases => {}
+            }
         }
     }
 
