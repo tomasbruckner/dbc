@@ -126,6 +126,13 @@ HESLO
     master heslo v terminálu; `dbc login` klíč uloží do úložiště pověření
     operačního systému, aby šlo dbc volat ze skriptu. Samotné heslo se
     neukládá nikam.
+
+PŘÍKLADY
+    dbc connections
+    dbc query prodej --sql \"select * from objednavky where stav = 'nova'\"
+    dbc query prodej --file report.sql --format csv > report.csv
+    dbc tables prodej --db sklad --schema dbo
+    dbc query prodej --file migrace.sql --write
 ";
 
 /// A parse failure. `message` is already a finished sentence for stderr.
@@ -426,6 +433,67 @@ mod tests {
     fn login_and_logout_take_no_connection() {
         assert_eq!(p(&["login"]).unwrap().command, Command::Login);
         assert_eq!(p(&["logout"]).unwrap().command, Command::Logout);
+    }
+
+    /// The example lines under PŘÍKLADY, as they appear in the usage text.
+    fn usage_examples() -> Vec<String> {
+        USAGE
+            .lines()
+            .skip_while(|l| !l.starts_with("PŘÍKLADY"))
+            .map(|l| l.trim())
+            .filter(|l| l.starts_with("dbc "))
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    /// Split an example the way a shell would, well enough for these:
+    /// double quotes group, and a `>` ends the command (what follows is a
+    /// redirection, not an argument).
+    fn shell_split(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut quoted = false;
+        for c in line.chars() {
+            match c {
+                '"' => quoted = !quoted,
+                '>' if !quoted => break,
+                c if c.is_whitespace() && !quoted => {
+                    if !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                }
+                c => cur.push(c),
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+
+    /// Every example in the help must actually run through the parser. A
+    /// help text showing a command line the binary rejects is worse than
+    /// no help at all — and examples are exactly the part that rots when a
+    /// flag is renamed.
+    #[test]
+    fn every_example_in_the_usage_text_parses() {
+        let examples = usage_examples();
+        assert!(examples.len() >= 3, "the examples section vanished: {examples:?}");
+        for ex in examples {
+            let argv = shell_split(&ex);
+            assert_eq!(argv.first().map(String::as_str), Some("dbc"), "{ex}");
+            let parsed = parse(argv[1..].to_vec());
+            assert!(parsed.is_ok(), "example does not parse: {ex}
+{:?}", parsed.unwrap_err());
+        }
+    }
+
+    /// The splitter above has to be right, or the test it feeds passes for
+    /// the wrong reason.
+    #[test]
+    fn the_example_splitter_handles_quotes_and_redirection() {
+        assert_eq!(shell_split("dbc query p --sql \"a b\""), ["dbc", "query", "p", "--sql", "a b"]);
+        assert_eq!(shell_split("dbc connections > out.csv"), ["dbc", "connections"]);
     }
 
     /// The usage text is the only documentation this binary ships with, so
