@@ -54,6 +54,17 @@ const HISTORY_ROW_HEIGHT: f32 = 44.;
 /// scopes `tabs.rs` edits to "only if you parameterize `collapse_title`").
 const SQL_COLLAPSE_MAX_CHARS: usize = 48;
 
+/// Same treatment for the SECOND line (connection · rows · ms, or the
+/// error text).
+///
+/// It used to have none, and a driver error is not a short string: an ODBC
+/// failure from a CLI run wrapped onto three lines, and since
+/// `uniform_list` fixes every row at `HISTORY_ROW_HEIGHT` the overflow
+/// painted straight over the entry below it (user screenshot,
+/// 2026-08-31). Larger than the first line's budget because this line is
+/// rendered at 11px, not 13.
+const META_COLLAPSE_MAX_CHARS: usize = 64;
+
 /// Collapses `sql` onto a single line (any run of whitespace, including
 /// newlines, becomes one space) and truncates to `max_chars` characters,
 /// appending '…' when truncation happened.
@@ -142,13 +153,18 @@ pub fn history_rows(entries: &[HistoryEntry]) -> Vec<HistoryRow> {
 }
 
 pub fn format_meta_line(entry: &HistoryEntry) -> (String, bool) {
-    if let Some(err) = &entry.error {
+    let (text, is_error) = if let Some(err) = &entry.error {
         (err.clone(), true)
     } else {
         let rows = entry.row_count.map(|r| r.to_string()).unwrap_or_else(|| "?".into());
         let dur = entry.duration_ms.map(|d| d.to_string()).unwrap_or_else(|| "?".into());
         (format!("{} · {rows} řádků · {dur} ms", entry.connection), false)
-    }
+    };
+    // ONE line, always — see `META_COLLAPSE_MAX_CHARS`. Applied to both
+    // branches, not just the error one: a long connection name would
+    // overflow exactly the same way, and „only errors are dangerous" is
+    // the assumption that produced the bug.
+    (collapse_sql(&text, META_COLLAPSE_MAX_CHARS), is_error)
 }
 
 /// Both history recorders funnel through here, so every run that reaches
@@ -331,6 +347,12 @@ impl AppView {
                             .items_start()
                             .gap_1()
                             .h(px(HISTORY_ROW_HEIGHT))
+                            // The belt behind the truncation above: rows
+                            // are a fixed height, so anything that still
+                            // manages to be too tall must be clipped
+                            // rather than allowed to paint over the next
+                            // entry.
+                            .overflow_hidden()
                             .px_2()
                             .py_1()
                             .cursor_pointer()
@@ -490,6 +512,41 @@ mod format_tests {
         let (line, is_error) = format_meta_line(&entry(Some("syntax error"), None, None));
         assert_eq!(line, "syntax error");
         assert!(is_error);
+    }
+
+    /// The bug this guards: a driver error is not a short string. An ODBC
+    /// failure wrapped onto three lines, and `uniform_list` fixes every
+    /// row at one height, so the overflow painted over the entry below
+    /// (user screenshot, 2026-08-31).
+    #[test]
+    fn a_long_error_is_cut_to_one_line() {
+        let long = "ODBC emitted an error calling 'SQLExecDirect': [Microsoft][ODBC Driver 18 for SQL Server][SQL Server] Invalid column name 'neexistujici_sloupec'.";
+        let (line, is_error) = format_meta_line(&entry(Some(long), None, None));
+        assert!(is_error);
+        assert!(line.chars().count() <= META_COLLAPSE_MAX_CHARS + 1, "{line}");
+        assert!(line.ends_with('…'), "{line}");
+        assert!(!line.contains('\n'), "{line}");
+    }
+
+    /// The other half: „only errors are dangerous" is the assumption that
+    /// produced the bug, so a long CONNECTION name must be cut too.
+    #[test]
+    fn a_long_connection_label_is_cut_as_well() {
+        let name = "produkce-eu-west-1-primary/velmi-dlouhy-nazev-databaze-2026";
+        let mut e = entry(None, Some(3), Some(12));
+        e.connection = name.to_string();
+        let (line, is_error) = format_meta_line(&e);
+        assert!(!is_error);
+        assert!(line.chars().count() <= META_COLLAPSE_MAX_CHARS + 1, "{line}");
+    }
+
+    /// And the non-vacuity rail: an ordinary line must come through
+    /// UNCHANGED. A truncation that fired on everything would pass both
+    /// tests above and quietly ruin every row in the panel.
+    #[test]
+    fn an_ordinary_meta_line_is_left_exactly_as_it_was() {
+        let (line, _) = format_meta_line(&entry(None, Some(12), Some(3)));
+        assert_eq!(line, "demo · 3 řádků · 12 ms");
     }
 
     // Sidebar rework T8 (design §5 row 8): the recorded connection label.
