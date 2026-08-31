@@ -31,7 +31,7 @@
 // query) and `refresh_history_cache` only runs when they differ.
 
 use dbc_state::HistoryEntry;
-use gpui::{div, prelude::*, px, uniform_list, AnyElement, Context, Focusable};
+use gpui::{div, prelude::*, px, uniform_list, AnyElement, Context, Focusable, Render, SharedString, Window};
 
 use crate::theme::ActiveTheme;
 use crate::AppView;
@@ -92,7 +92,10 @@ fn badge_for_kind(kind: &str) -> &'static str {
     match kind {
         "query" => "",
         "admin" => "🛡 ",
-        KIND_CLI => "❯ ",
+        // NOT a chevron. „❯" here read as a disclosure triangle and
+        // promised a row that opens (user report, 2026-08-31) — a badge
+        // may say WHERE a run came from, never that it does something.
+        KIND_CLI => "⌨ ",
         _ => "🗄 ", // "backup" | "restore" | any unrecognized kind
     }
 }
@@ -148,6 +151,63 @@ pub fn history_rows(entries: &[HistoryEntry]) -> Vec<HistoryRow> {
     out.push(HistoryRow::Section(SECTION_CLI));
     out.extend(cli.into_iter().map(HistoryRow::Entry));
     out
+}
+
+/// A plain multi-line text tooltip.
+///
+/// The FIRST tooltip in this codebase. Two earlier places wanted one and
+/// wrote „no tooltip component exists" instead (`connections_ui`'s dimmed
+/// restore, `monitor_view`); gpui gives the hook but not the view, so this
+/// is that view — deliberately minimal, and worth generalising the moment
+/// a second caller appears rather than before.
+pub struct TextTooltip {
+    text: SharedString,
+}
+
+impl TextTooltip {
+    pub fn new(text: impl Into<SharedString>) -> TextTooltip {
+        TextTooltip { text: text.into() }
+    }
+}
+
+impl Render for TextTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(520.))
+            .px_2()
+            .py_1()
+            .bg(cx.theme().bg_panel)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded_md()
+            .text_size(px(12.))
+            .text_color(cx.theme().text_primary)
+            .child(self.text.clone())
+    }
+}
+
+/// The full text behind a row, or `None` when the row already shows all
+/// of it.
+///
+/// Both lines are truncated to fit a fixed-height row, and a cut-off
+/// driver error is exactly the text somebody needs in full. The row's
+/// CLICK is already spoken for — it loads the SQL into the editor, which
+/// is this panel's oldest contract — so the whole text is revealed on
+/// hover instead of competing for the same gesture.
+///
+/// `None` for an untruncated row on purpose: a tooltip that repeats what
+/// is already on screen is a tooltip people learn to ignore.
+pub fn tooltip_text(entry: &HistoryEntry) -> Option<String> {
+    let sql_cut = collapse_sql(&entry.sql, SQL_COLLAPSE_MAX_CHARS).ends_with('…');
+    let (meta, _) = format_meta_line(entry);
+    let meta_cut = meta.ends_with('…');
+    if !sql_cut && !meta_cut {
+        return None;
+    }
+    match &entry.error {
+        Some(err) => Some(format!("{}\n\n{}", entry.sql.trim(), err.trim())),
+        None => Some(entry.sql.trim().to_string()),
+    }
 }
 
 pub fn format_meta_line(entry: &HistoryEntry) -> (String, bool) {
@@ -332,14 +392,21 @@ impl AppView {
                     let raw_line1 = collapse_sql(&entry.sql, SQL_COLLAPSE_MAX_CHARS);
                     let line1 = format!("{}{raw_line1}", badge_for_kind(&entry.kind));
                     let (line2, is_error) = format_meta_line(entry);
+                    let full = tooltip_text(entry);
                     let line2_color = if is_error { cx.theme().danger } else { cx.theme().text_muted };
                     let starred = entry.starred;
                     let star = if starred { "★" } else { "☆" };
                     let star_color = if starred { cx.theme().warn } else { cx.theme().text_disabled };
 
+                    let mut row = div()
+                            .id(("history-entry", id as usize));
+                    if let Some(full) = full {
+                        row = row.tooltip(move |_window, cx| {
+                            cx.new(|_| TextTooltip::new(full.clone())).into()
+                        });
+                    }
                     items.push(
-                        div()
-                            .id(("history-entry", id as usize))
+                        row
                             .flex()
                             .flex_row()
                             .items_start()
@@ -552,6 +619,48 @@ mod format_tests {
         assert_eq!(line, "demo · 3 řádků · 12 ms");
     }
 
+    /// A row that already shows everything must NOT get a tooltip. A
+    /// tooltip that repeats what is on screen is one people learn to
+    /// ignore — and it would then be ignored on the rows that need it.
+    #[test]
+    fn a_short_row_has_no_tooltip() {
+        assert_eq!(tooltip_text(&entry(None, Some(12), Some(3))), None);
+    }
+
+    #[test]
+    fn a_cut_off_error_is_revealed_in_full_under_its_sql() {
+        let long = "ODBC emitted an error calling 'SQLExecDirect': State: 42S22.                     Native error: 207. Invalid column name 'neexistujici_sloupec'.";
+        let e = entry(Some(long), None, None);
+        let tip = tooltip_text(&e).expect("a truncated error must be revealable");
+        assert!(tip.starts_with("select 1"), "{tip}");
+        assert!(tip.contains("Invalid column name"), "{tip}");
+        assert!(tip.contains("42S22"), "{tip}");
+    }
+
+    /// Long SQL alone is enough — the second line can be short and the
+    /// first still cut.
+    #[test]
+    fn long_sql_alone_is_reason_enough_for_a_tooltip() {
+        let mut e = entry(None, Some(1), Some(1));
+        e.sql = "select ".to_string() + &"column_with_a_long_name, ".repeat(6) + "1";
+        let tip = tooltip_text(&e).expect("truncated sql must be revealable");
+        assert!(tip.contains("column_with_a_long_name"), "{tip}");
+        assert!(!tip.ends_with('…'), "the tooltip must carry the WHOLE text: {tip}");
+    }
+
+    /// The badge may say where a run came from; it may not look like a
+    /// control. „❯" read as a disclosure triangle and promised a row that
+    /// opens.
+    #[test]
+    fn no_badge_looks_like_a_disclosure_triangle() {
+        for kind in ["query", "admin", "backup", "restore", KIND_CLI, "future-kind"] {
+            let badge = badge_for_kind(kind);
+            for glyph in ['❯', '>', '▸', '▶', '⌄', '˅'] {
+                assert!(!badge.contains(glyph), "{kind}'s badge {badge:?} promises opening");
+            }
+        }
+    }
+
     // Sidebar rework T8 (design §5 row 8): the recorded connection label.
     #[test]
     fn history_conn_label_appends_db_only_when_non_default() {
@@ -653,7 +762,7 @@ mod section_tests {
 
     #[test]
     fn a_cli_run_carries_its_own_badge() {
-        assert_eq!(badge_for_kind(KIND_CLI), "❯ ");
+        assert_eq!(badge_for_kind(KIND_CLI), "⌨ ");
         assert_ne!(badge_for_kind(KIND_CLI), badge_for_kind("query"));
         assert_ne!(badge_for_kind(KIND_CLI), badge_for_kind("backup"));
     }
