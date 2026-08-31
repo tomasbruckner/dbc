@@ -56,9 +56,46 @@ pub fn forget_key() -> Result<(), String> {
     }
 }
 
-/// Prompt for the master password on the terminal, no echo.
+/// The password as typed, minus the line ending the terminal added.
+///
+/// An EMPTY line is an error rather than an empty password: it is what
+/// arrives at EOF, and „unlocking failed" would be a much worse
+/// description of „nothing was sent" than saying so.
+fn clean_password_line(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim_end_matches(['\n', '\r']);
+    if trimmed.is_empty() {
+        return Err(concat!(
+            "master heslo nedorazilo — na rouře se dbc nemá koho zeptat; ",
+            "spusť `dbc login` jednou z terminálu a klíč si uloží"
+        )
+        .to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Ask for the master password.
+///
+/// On a terminal: a no-echo prompt. Off one (a pipe, a cron job): ONE
+/// line from stdin.
+///
+/// The fallback exists because `rpassword` reads the console device
+/// directly, so a piped password is not merely ignored — the process
+/// blocks forever waiting for a console nobody is at. A background job
+/// that hangs is worse than one that fails, and it fails in the way that
+/// is hardest to diagnose.
+///
+/// NOTE the interaction with `query <conn> -`: that consumes stdin for
+/// the SQL, so there is no line left here and this reports the empty read
+/// rather than hanging. Piping SQL in and needing an unlock at the same
+/// time is what `dbc login` is for.
 pub fn prompt_master() -> Result<String, String> {
-    rpassword::prompt_password("Master heslo k trezoru: ").map_err(|e| e.to_string())
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return rpassword::prompt_password("Master heslo k trezoru: ").map_err(|e| e.to_string());
+    }
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).map_err(|e| e.to_string())?;
+    clean_password_line(&line)
 }
 
 /// Open the vault: stored key first, prompt second.
@@ -80,6 +117,25 @@ pub fn unlock(vault_path: &Path) -> Result<Vault, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_piped_password_loses_its_line_ending_and_nothing_else() {
+        assert_eq!(clean_password_line("hunter2\n").unwrap(), "hunter2");
+        assert_eq!(clean_password_line("hunter2\r\n").unwrap(), "hunter2");
+        assert_eq!(clean_password_line("hunter2").unwrap(), "hunter2");
+        // Spaces are part of a password, not whitespace to tidy away.
+        assert_eq!(clean_password_line(" a b \n").unwrap(), " a b ");
+    }
+
+    /// EOF on a pipe reads as an empty line. Reporting „nothing arrived"
+    /// beats letting Argon2id spend a second failing to verify it.
+    #[test]
+    fn an_empty_line_names_the_way_out_instead_of_trying_to_unlock() {
+        for raw in ["", "\n", "\r\n"] {
+            let e = clean_password_line(raw).unwrap_err();
+            assert!(e.contains("dbc login"), "{e}");
+        }
+    }
 
     /// The two halves of the identity must be constants, not literals
     /// repeated per call site — `login` storing under one name and

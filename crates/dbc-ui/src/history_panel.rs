@@ -83,6 +83,7 @@ fn badge_for_kind(kind: &str) -> &'static str {
     match kind {
         "query" => "",
         "admin" => "🛡 ",
+        KIND_CLI => "❯ ",
         _ => "🗄 ", // "backup" | "restore" | any unrecognized kind
     }
 }
@@ -96,11 +97,48 @@ fn badge_for_kind(kind: &str) -> &'static str {
 /// never URLs/credentials (design §4.6); dedup (`sql + connection +
 /// window`) naturally scopes per db. The known name-collision lossiness
 /// (rename/delete → "cli") is unchanged and out of scope.
-pub(crate) fn history_conn_label(name: &str, non_default_db: Option<&str>) -> String {
-    match non_default_db {
-        Some(db) => format!("{name}/{db}"),
-        None => name.to_string(),
+pub(crate) use dbc_state::conn_label as history_conn_label;
+
+/// Written by `dbc-cli`, grouped on here — defined beside the column it
+/// fills so the two sides cannot drift.
+pub use dbc_state::KIND_CLI;
+
+/// The panel's section headings.
+pub const SECTION_APP: &str = "V aplikaci";
+pub const SECTION_CLI: &str = "Z příkazové řádky";
+
+/// One rendered row: either a heading or an index into the entry cache.
+///
+/// An INDEX rather than a borrowed entry, because `uniform_list`'s
+/// processor reads `AppView::history_cache` itself and a second borrow of
+/// the same data would be a second thing to keep in step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryRow {
+    Section(&'static str),
+    Entry(usize),
+}
+
+/// Split the cache into sections: the app's own runs, then the CLI's.
+///
+/// Headings appear ONLY when both kinds are present. Anyone who never
+/// touches `dbc` therefore sees exactly the panel they saw before — a
+/// lone „V aplikaci" heading over every row is decoration, not
+/// information — and so does anyone whose history is all CLI.
+///
+/// Within each section the incoming order is preserved, which is the
+/// order `HistoryDb::search` chose: starred first, then newest.
+pub fn history_rows(entries: &[HistoryEntry]) -> Vec<HistoryRow> {
+    let (cli, app): (Vec<usize>, Vec<usize>) =
+        (0..entries.len()).partition(|&i| entries[i].kind == KIND_CLI);
+    if cli.is_empty() || app.is_empty() {
+        return (0..entries.len()).map(HistoryRow::Entry).collect();
     }
+    let mut out = Vec::with_capacity(entries.len() + 2);
+    out.push(HistoryRow::Section(SECTION_APP));
+    out.extend(app.into_iter().map(HistoryRow::Entry));
+    out.push(HistoryRow::Section(SECTION_CLI));
+    out.extend(cli.into_iter().map(HistoryRow::Entry));
+    out
 }
 
 pub fn format_meta_line(entry: &HistoryEntry) -> (String, bool) {
@@ -198,6 +236,7 @@ impl AppView {
         let query = self.history_search.read(cx).text();
         self.history_cache =
             self.history.as_ref().and_then(|h| h.search(&query, 100).ok()).unwrap_or_default();
+        self.history_rows = history_rows(&self.history_cache);
         self.last_history_query = query;
     }
 
@@ -236,13 +275,36 @@ impl AppView {
         // screenful. Reads `this.history_cache[ix]` directly inside the
         // processor rather than capturing a separate clone, since the cache
         // already lives on `AppView`.
-        let entry_count = self.history_cache.len();
+        let row_count = self.history_rows.len();
         let list = uniform_list(
             "history-list",
-            entry_count,
+            row_count,
             cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
                 let mut items = Vec::with_capacity(range.len());
-                for ix in range {
+                for row_ix in range {
+                    // A heading takes a whole row: `uniform_list` gives
+                    // every row the same height, and buying a tighter
+                    // divider would mean giving up the virtualization that
+                    // lets all 100 entries scroll.
+                    let ix = match this.history_rows[row_ix] {
+                        HistoryRow::Section(label) => {
+                            items.push(
+                                div()
+                                    .h(px(HISTORY_ROW_HEIGHT))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .border_t_1()
+                                    .border_color(cx.theme().border_subtle)
+                                    .text_size(px(11.))
+                                    .text_color(cx.theme().text_muted)
+                                    .child(label)
+                                    .into_any_element(),
+                            );
+                            continue;
+                        }
+                        HistoryRow::Entry(ix) => ix,
+                    };
                     let entry = &this.history_cache[ix];
                     let id = entry.id;
                     let sql_for_click = entry.sql.clone();
@@ -324,7 +386,8 @@ impl AppView {
                                     .min_w_0()
                                     .child(div().text_color(cx.theme().text_primary).child(line1))
                                     .child(div().text_size(px(11.)).text_color(line2_color).child(line2)),
-                            ),
+                            )
+                            .into_any_element(),
                     );
                 }
                 items
@@ -434,5 +497,104 @@ mod format_tests {
     fn history_conn_label_appends_db_only_when_non_default() {
         assert_eq!(history_conn_label("prod", None), "prod");
         assert_eq!(history_conn_label("prod", Some("inventory")), "prod/inventory");
+    }
+}
+
+#[cfg(test)]
+mod section_tests {
+    use super::*;
+
+    fn entry(id: i64, kind: &str) -> HistoryEntry {
+        HistoryEntry {
+            id,
+            sql: "select 1".into(),
+            connection: "c".into(),
+            started_at: 0,
+            duration_ms: None,
+            row_count: None,
+            error: None,
+            starred: false,
+            kind: kind.into(),
+        }
+    }
+
+    fn labels(rows: &[HistoryRow]) -> Vec<String> {
+        rows.iter()
+            .map(|r| match r {
+                HistoryRow::Section(l) => format!("[{l}]"),
+                HistoryRow::Entry(i) => i.to_string(),
+            })
+            .collect()
+    }
+
+    /// The common case, and the one that must not regress: somebody who
+    /// never runs `dbc` sees the list exactly as before, with no headings
+    /// at all.
+    #[test]
+    fn app_only_history_gets_no_headings() {
+        let e = [entry(1, "query"), entry(2, "admin"), entry(3, "backup")];
+        assert_eq!(labels(&history_rows(&e)), ["0", "1", "2"]);
+    }
+
+    /// And the mirror: an all-CLI history is a list too. „Z příkazové
+    /// řádky" over every row would be a heading that distinguishes
+    /// nothing.
+    #[test]
+    fn cli_only_history_gets_no_headings_either() {
+        let e = [entry(1, KIND_CLI), entry(2, KIND_CLI)];
+        assert_eq!(labels(&history_rows(&e)), ["0", "1"]);
+    }
+
+    #[test]
+    fn a_mixed_history_splits_into_two_sections_app_first() {
+        let e = [entry(1, "query"), entry(2, KIND_CLI), entry(3, "admin"), entry(4, KIND_CLI)];
+        assert_eq!(
+            labels(&history_rows(&e)),
+            ["[V aplikaci]", "0", "2", "[Z příkazové řádky]", "1", "3"]
+        );
+    }
+
+    /// The order inside a section is the order `search` returned (starred
+    /// first, then newest) — sectioning must not resort anything.
+    #[test]
+    fn sectioning_preserves_the_incoming_order_within_each_group() {
+        let e = [entry(9, KIND_CLI), entry(8, "query"), entry(7, KIND_CLI), entry(6, "query")];
+        let rows = history_rows(&e);
+        let entries: Vec<usize> = rows
+            .iter()
+            .filter_map(|r| match r {
+                HistoryRow::Entry(i) => Some(*i),
+                HistoryRow::Section(_) => None,
+            })
+            .collect();
+        assert_eq!(entries, [1, 3, 0, 2]);
+    }
+
+    #[test]
+    fn an_empty_history_is_an_empty_list() {
+        assert!(history_rows(&[]).is_empty());
+    }
+
+    /// Every entry must survive sectioning — a heading that swallowed a
+    /// row would hide history rather than organise it.
+    #[test]
+    fn no_entry_is_lost_or_duplicated() {
+        let e = [entry(1, "query"), entry(2, KIND_CLI), entry(3, "query")];
+        let mut seen: Vec<usize> = history_rows(&e)
+            .iter()
+            .filter_map(|r| match r {
+                HistoryRow::Entry(i) => Some(*i),
+                HistoryRow::Section(_) => None,
+            })
+            .collect();
+        seen.sort();
+        assert_eq!(seen, [0, 1, 2]);
+    }
+
+    #[test]
+    fn a_cli_run_carries_its_own_badge() {
+        assert_eq!(badge_for_kind(KIND_CLI), "❯ ");
+        assert_ne!(badge_for_kind(KIND_CLI), badge_for_kind("query"));
+        assert_ne!(badge_for_kind(KIND_CLI), badge_for_kind("backup"));
     }
 }

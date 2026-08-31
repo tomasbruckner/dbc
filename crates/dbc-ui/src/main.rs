@@ -2249,6 +2249,10 @@ struct AppView {
     /// precedent as `grouped_cache`. Post-review fix for Task 3 review
     /// Issue 1 (unindexed full-table sort on every window repaint).
     history_cache: Vec<HistoryEntry>,
+    /// The SECTIONED view of `history_cache` — headings plus indices into
+    /// it (see `history_panel::history_rows`). Rebuilt with the cache, so
+    /// the two can never describe different data.
+    history_rows: Vec<history_panel::HistoryRow>,
     /// The search text `history_cache` was last computed from, compared
     /// against `history_search`'s live text each render to decide whether a
     /// refresh is needed (see `history_search`'s doc comment).
@@ -14477,6 +14481,7 @@ fn main() {
                             history_visible: true,
                             history_search,
                             history_cache: Vec::new(),
+                            history_rows: Vec::new(),
                             last_history_query: String::new(),
                             palette: None,
                             view_prefs,

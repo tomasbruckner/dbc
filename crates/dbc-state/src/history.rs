@@ -41,6 +41,27 @@ enum SearchMode {
     Like,
 }
 
+/// `HistoryEntry::kind` for a run that came from the `dbc` command line.
+///
+/// It lives HERE, with the column it fills, because two crates depend on
+/// it agreeing: `dbc-cli` writes it and `dbc-ui`'s history panel groups on
+/// it. A drift between two literals would be silent — CLI runs would just
+/// stop being recognised and fall back among the app's own, which looks
+/// exactly like „the CLI recorded nothing".
+pub const KIND_CLI: &str = "cli";
+
+/// How a connection is NAMED in history: its name, or „{name}/{db}" when
+/// the run used a database other than the connection's default.
+///
+/// Never a URL and never a credential — a history row identifies which
+/// saved connection was used, nothing about how to reach it.
+pub fn conn_label(name: &str, non_default_db: Option<&str>) -> String {
+    match non_default_db {
+        Some(db) => format!("{name}/{db}"),
+        None => name.to_string(),
+    }
+}
+
 pub struct HistoryDb {
     conn: Connection,
     mode: SearchMode,

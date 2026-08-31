@@ -30,7 +30,9 @@ mod vault;
 pub use vault::{default_vault_path, Vault};
 
 mod history;
-pub use history::{default_history_path, HistoryDb, HistoryEntry};
+pub use history::{
+    conn_label, default_history_path, HistoryDb, HistoryEntry, KIND_CLI,
+};
 
 mod view_prefs;
 pub use view_prefs::{default_view_prefs_path, TableViewPrefs, ViewPrefsStore};

@@ -19,6 +19,7 @@
 //! things, and it is deliberately the thin part.
 
 mod args;
+mod hist;
 mod pick;
 mod policy;
 mod render;
@@ -64,18 +65,21 @@ fn main() -> ExitCode {
 /// they are in a workspace is the one failure mode this whole mechanism
 /// exists to prevent. Explicit `--config`/`--vault` still win, so there is
 /// always a way through.
-fn resolve_paths(a: &Args) -> Result<(PathBuf, PathBuf), String> {
+fn resolve_paths(a: &Args) -> Result<(PathBuf, PathBuf, PathBuf), String> {
     use dbc_state::workspace::Resolution;
-    let (config, vault) = match dbc_state::workspace::resolve() {
-        Resolution::Profile(p) => (p.config, p.vault),
-        Resolution::Workspace { paths, .. } => (paths.config, paths.vault),
+    // History is machine-local in BOTH modes (§W5), so it comes from the
+    // same resolution as the rest and simply never points into a shared
+    // workspace folder.
+    let (config, vault, history) = match dbc_state::workspace::resolve() {
+        Resolution::Profile(p) => (p.config, p.vault, p.history),
+        Resolution::Workspace { paths, .. } => (paths.config, paths.vault, paths.history),
         Resolution::Broken { root, reason } => {
             let named = root
                 .map(|r| r.display().to_string())
                 .unwrap_or_else(|| "ukazatel na pracovní prostor je nečitelný".to_string());
             let reason = dbc_state::workspace::one_line_reason(&reason);
             match (&a.config, &a.vault) {
-                (Some(c), Some(v)) => (c.clone(), v.clone()),
+                (Some(c), Some(v)) => (c.clone(), v.clone(), dbc_state::default_history_path()),
                 _ => {
                     return Err(format!(
                         "{named} ({reason})\nspusť aplikaci a vyber pracovní prostor znovu, \
@@ -85,7 +89,7 @@ fn resolve_paths(a: &Args) -> Result<(PathBuf, PathBuf), String> {
             }
         }
     };
-    Ok((a.config.clone().unwrap_or(config), a.vault.clone().unwrap_or(vault)))
+    Ok((a.config.clone().unwrap_or(config), a.vault.clone().unwrap_or(vault), history))
 }
 
 /// A missing `config.toml` reads as „no connections saved yet" — that is
@@ -120,7 +124,7 @@ fn run(a: Args) -> Result<(), String> {
         _ => {}
     }
 
-    let (config_path, vault_path) = resolve_paths(&a)?;
+    let (config_path, vault_path, history_path) = resolve_paths(&a)?;
 
     match &a.command {
         Command::Help | Command::Version => unreachable!("handled above"),
@@ -200,7 +204,16 @@ fn run(a: Args) -> Result<(), String> {
         }
         Command::Query { .. } => {
             let plan = plan.as_deref().expect("built above for exactly this command");
-            query_table(&runtime, &mut *conn, plan, &a)?
+            // The label the app's history panel will show. `--db` is part
+            // of it: „produkce" and „produkce/sklad" are different runs
+            // and a history that called them both „produkce" would be
+            // lying about which server was touched.
+            let label = dbc_state::conn_label(
+                &cfg.name,
+                a.database.as_deref().filter(|db| *db != cfg.database),
+            );
+            let mut recorder = hist::Recorder::open(&history_path);
+            query_table(&runtime, &mut *conn, plan, &a, &mut recorder, &label)?
         }
         _ => unreachable!("handled above"),
     };
@@ -382,45 +395,72 @@ fn query_table(
     conn: &mut dyn Connection,
     plan: &[policy::Stmt],
     a: &Args,
+    recorder: &mut hist::Recorder,
+    conn_label: &str,
 ) -> Result<Option<Table>, String> {
     let row_limit = if a.row_limit == 0 { usize::MAX } else { a.row_limit };
     let timeout = std::time::Duration::from_secs(a.timeout_secs);
     let mut last: Option<Table> = None;
     for (i, stmt) in plan.iter().enumerate() {
-        if stmt.is_read {
-            let drained = runtime
+        let started_at = hist::Recorder::now_secs();
+        let clock = std::time::Instant::now();
+        let expired = || {
+            dbc_core::QueryError::msg(format!(
+                "příkaz {} překročil {} s (--timeout)",
+                i + 1,
+                a.timeout_secs
+            ))
+        };
+
+        // Each statement of a batch is its own history row. A `.sql` file
+        // is a sequence of things that happened, not one thing, and a
+        // single row holding all of it could not be clicked back into the
+        // editor as anything runnable.
+        // `(rows to print, rows to record)` — a write has no table but
+        // does have an affected-row count, and history wants that number
+        // just as much as a select's.
+        let outcome: Result<(Option<Table>, Option<i64>), String> = if stmt.is_read {
+            runtime
                 .block_on(async {
                     tokio::time::timeout(timeout, drain(conn, &stmt.sql, row_limit))
                         .await
-                        .map_err(|_| {
-                            dbc_core::QueryError::msg(format!(
-                                "příkaz {} překročil {} s (--timeout)",
-                                i + 1,
-                                a.timeout_secs
-                            ))
-                        })?
+                        .map_err(|_| expired())?
                 })
-                .map_err(|e| e.message)?;
-            let mut t = Table::new(drained.columns);
-            t.rows = drained.rows;
-            t.truncated = drained.truncated;
-            last = Some(t);
+                .map(|drained| {
+                    let mut t = Table::new(drained.columns);
+                    t.rows = drained.rows;
+                    t.truncated = drained.truncated;
+                    let counted = t.rows.len() as i64;
+                    (Some(t), Some(counted))
+                })
+                .map_err(|e| e.message)
         } else {
             let cancel = CancelToken::new();
-            let affected = runtime
+            runtime
                 .block_on(async {
-                    tokio::time::timeout(timeout, conn.execute(&stmt.sql, cancel)).await.map_err(
-                        |_| {
-                            dbc_core::QueryError::msg(format!(
-                                "příkaz {} překročil {} s (--timeout)",
-                                i + 1,
-                                a.timeout_secs
-                            ))
-                        },
-                    )?
+                    tokio::time::timeout(timeout, conn.execute(&stmt.sql, cancel))
+                        .await
+                        .map_err(|_| expired())?
                 })
-                .map_err(|e| e.message)?;
-            eprintln!("příkaz {}: {} řádků změněno", i + 1, affected);
+                .map(|affected| {
+                    eprintln!("příkaz {}: {} řádků změněno", i + 1, affected);
+                    (None, Some(affected as i64))
+                })
+                .map_err(|e| e.message)
+        };
+        let ms = Some(clock.elapsed().as_millis() as i64);
+
+        // A FAILED statement is recorded too, with its error — that is the
+        // run you most want to find again, and it is what the app's own
+        // recorder does.
+        match &outcome {
+            Ok((_, rows)) => recorder.record(&stmt.sql, conn_label, started_at, ms, *rows, None),
+            Err(e) => recorder.record(&stmt.sql, conn_label, started_at, ms, None, Some(e)),
+        }
+        // Only NOW may the error end the batch: recorded first, propagated
+        // second.
+        if let (Some(table), _) = outcome? {
+            last = Some(table);
         }
     }
     Ok(last)
