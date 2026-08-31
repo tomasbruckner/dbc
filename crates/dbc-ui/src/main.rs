@@ -2053,6 +2053,13 @@ struct AppView {
     // --- Task 7: connection manager state ---
     config: AppConfig,
     config_path: PathBuf,
+    /// The session file for THIS context, derived from `config_path` once
+    /// at startup. A separate field rather than a call per save: the hash
+    /// is computed once, and — the reason it is not simply
+    /// `session::save(&self.config_path, …)` — `config_save_guard_audit`
+    /// reads any `save(` line naming `config_path` as a `config.toml`
+    /// write. It is right to; the answer is not to look like one.
+    session_path: PathBuf,
     /// Set when `AppConfig::load` failed to parse an existing config.toml at
     /// startup (surfaced in the status bar; see `main`). Cleared by
     /// `finish_save` once the corrupt file has been safely moved aside to
@@ -2111,6 +2118,11 @@ struct AppView {
     /// master password once (brief: prompt on first use, not at startup).
     vault: Option<Vault>,
     active_connection_id: Option<String>,
+    /// „Reconnect to what was open last time", consumed once at the top of
+    /// `render`. Not applied in the constructor because switching may need
+    /// the vault, and a master-password modal needs a `Window` that does
+    /// not exist yet.
+    restore_connection: Option<(String, Option<String>)>,
     /// Sidebar rework (design §2.2): the active database WITHIN
     /// `active_connection_id`. `None` = the saved config's `database` (the
     /// default). Always `None` when `active_connection_id` is `None` (the
@@ -2558,6 +2570,52 @@ fn conn_name_for_identity_from(connections: &[ConnectionConfig], identity: &str)
 
 /// Pure core of `AppView::resolve_active` — free function so it is
 /// testable without a GPUI context (this crate has no GPUI test harness).
+/// The open tabs a restart can honestly rebuild.
+///
+/// The filter IS the rule: a tab contributes only if it carries the SQL
+/// that made it. A monitor, an ER diagram, a DDL view or a script run has
+/// no query behind it, and a session entry for one would be a tab that
+/// comes back claiming a „Spustit" it cannot honour. Pulled out of
+/// `capture_session` so the rule is testable without a window.
+fn session_tabs(tabs: &Tabs) -> Vec<dbc_state::session::SessionTab> {
+    tabs.iter()
+        .filter_map(|t| {
+            t.sql.as_ref().map(|sql| dbc_state::session::SessionTab {
+                title: t.title.clone(),
+                sql: sql.clone(),
+                pinned: t.pinned,
+            })
+        })
+        .collect()
+}
+
+/// The tab strip as the last session left it.
+///
+/// Every restored tab is a TEXT tab holding the query that made it, with
+/// `sql` set — which is what makes the „Spustit" button appear on it. No
+/// result data was written to disk and none is invented here, so the tab
+/// arrives showing its query and nothing else. Re-running is a click, on
+/// purpose: firing a dozen remembered queries at a production server the
+/// moment the window opens is not a feature.
+fn restored_tabs(session: &dbc_state::session::SessionState) -> Tabs {
+    let mut tabs = Tabs::new();
+    for t in &session.tabs {
+        tabs.open(ResultTab {
+            id: 0,
+            title: t.title.clone(),
+            pinned: t.pinned,
+            preview_key: None,
+            // The connection is restored asynchronously (it may need the
+            // vault), so there is no identity to stamp yet. A restored tab
+            // holds no editable data, so nothing consults this.
+            conn_identity: String::new(),
+            sql: Some(t.sql.clone()),
+            content: TabContent::Text { text: text_view::normalize(&t.sql), scroll_lines: 0 },
+        });
+    }
+    tabs
+}
+
 fn resolve_active_from(
     config: &AppConfig,
     vault: Option<&Vault>,
@@ -3242,6 +3300,7 @@ impl AppView {
                                     preview_key: preview.as_ref().map(|p| p.key.clone()),
                                     // G5 Task 4 review fix (BLOCKER 1).
                                     conn_identity: conn_identity.clone(),
+                                    sql: Some(sql_for_title.clone()),
                                     content: TabContent::Grid { grid, buffer: buf },
                                 });
                                 tab_id = Some(id);
@@ -3521,6 +3580,7 @@ impl AppView {
             pinned: false,
             preview_key: None,
             conn_identity: conn_identity.to_string(),
+            sql: Some(title_sql.to_string()),
             content: TabContent::Grid { grid, buffer: buf.clone() },
         });
         (id, buf)
@@ -4173,6 +4233,7 @@ impl AppView {
             pinned: false,
             preview_key: None,
             conn_identity,
+            sql: None,
             content: TabContent::ScriptRun { state: state.clone() },
         });
 
@@ -4693,6 +4754,7 @@ impl AppView {
             pinned: false,
             preview_key: None,
             conn_identity,
+            sql: None,
             content: TabContent::ScriptRun { state: state.clone() },
         });
 
@@ -5064,6 +5126,7 @@ impl AppView {
                             pinned: false,
                             preview_key: None,
                             conn_identity,
+                            sql: None,
                             content: TabContent::Plan { view: view_entity },
                         };
                         view.tabs.open(tab);
@@ -5128,6 +5191,7 @@ impl AppView {
                                     pinned: false,
                                     preview_key: None,
                                     conn_identity,
+                                    sql: None,
                                     content: TabContent::Plan { view: view_entity },
                                 });
                                 view.status = if via_confirm_modal {
@@ -5278,6 +5342,7 @@ impl AppView {
                                 pinned: false,
                                 preview_key: None,
                                 conn_identity,
+                                sql: None,
                                 content: TabContent::Plan { view: view_entity },
                             });
                             view.status = "hotovo (změny vráceny zpět)".to_string();
@@ -6746,6 +6811,30 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// see `ActiveConn`'s doc comment for the invariant. `None` = no active
     /// saved connection OR the connection was deleted; the CLI-arg URL path
     /// is handled by callers as today.
+    /// The window state worth reopening with.
+    ///
+    /// Tabs contribute only if they carry SQL, which is exactly the tabs a
+    /// restart can honestly rebuild: a query. A monitor, an ER diagram or a
+    /// DDL view has no query behind it, and inventing one would produce a
+    /// tab that lies about what re-running it would do.
+    fn capture_session(&self, cx: &App) -> dbc_state::session::SessionState {
+        dbc_state::session::SessionState {
+            connection: self.active_connection_id.clone(),
+            database: self.active_database.clone(),
+            editor: self.sql.read(cx).text(),
+            cursor: self.sql.read(cx).cursor(),
+            expanded: self.tree.read(cx).expanded_keys(),
+            tabs: session_tabs(&self.tabs),
+        }
+    }
+
+    /// Best-effort, and deliberately silent. A session that cannot be
+    /// written costs a window that opens blank next time; saying so during
+    /// shutdown would be a message nobody is there to read.
+    fn save_session(&self, cx: &App) {
+        dbc_state::session::save(&self.session_path, &self.capture_session(cx));
+    }
+
     fn resolve_active(&self) -> Option<ActiveConn> {
         let id = self.active_connection_id.as_deref()?;
         resolve_active_from(&self.config, self.vault.as_ref(), id, self.active_database.as_deref())
@@ -8938,6 +9027,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // next secret use, at most once per run.
         self.vault = None;
         self.config_path = paths.config.clone();
+        // The session follows the context: a workspace switch must not
+        // leave the new context writing over the old one's open tabs.
+        self.session_path = dbc_state::session::path_for(&paths.config);
         self.vault_path = paths.vault.clone();
         let (config, config_load_error) = match AppConfig::load(&paths.config) {
             Ok(c) => (c, None),
@@ -9807,6 +9899,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     pinned: false,
                     preview_key: None, // stacked like ad-hoc tabs, Plan precedent
                     conn_identity,
+                    sql: None,
                     content: TabContent::Chart { view },
                 });
             }
@@ -10155,6 +10248,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             pinned: false,
             preview_key: Some(admin_panel::ADMIN_PREVIEW_KEY.to_string()),
             conn_identity: identity,
+            sql: None,
             content: TabContent::Admin { view: panel.clone() },
         });
         // G10 T5: seeds the Privileges sub-view's schema selector from
@@ -10285,6 +10379,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             pinned: false,
             preview_key: Some(key),
             conn_identity,
+            sql: None,
             content: TabContent::Monitor { view: view.clone() },
         });
         cx.subscribe(&view, move |this, _emitter, event, cx| {
@@ -10519,6 +10614,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             pinned: false,
             preview_key: Some(LOG_PREVIEW_KEY.to_string()),
             conn_identity: self.current_conn_identity(),
+            sql: None,
             content: TabContent::Text { text: text_view::normalize(&body), scroll_lines: 0 },
         });
         self.status = format!("Log: {where_}");
@@ -10587,6 +10683,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             pinned: false,
             preview_key: None,
             conn_identity: self.current_conn_identity(),
+            sql: None,
             content: TabContent::Diagram { view },
         });
         self.status = "ER diagram otevřen".to_string();
@@ -10609,6 +10706,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 pinned: false,
                 preview_key: None,
                 conn_identity: self.current_conn_identity(),
+                sql: None,
                 content: TabContent::Text { text: text_view::normalize(ddl), scroll_lines: 0 },
             });
             self.status = format!("DDL otevřeno: {title}");
@@ -11193,6 +11291,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     // Never editable/Grid — the identity is inert here, but
                     // every `ResultTab` needs a value (see its doc comment).
                     conn_identity: self.current_conn_identity(),
+                    sql: None,
                     content: TabContent::Text { text: text_view::normalize(ddl), scroll_lines: 0 },
                 });
                 self.status = format!("DDL otevřeno: {title}");
@@ -11588,6 +11687,12 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // report, 2026-08-30: an error appeared on screen after the tab was
         // opened, so the tab did not have it).
         let is_log = active.preview_key.as_deref() == Some(LOG_PREVIEW_KEY);
+        // A tab restored from the last session: a text body holding the
+        // query, and nothing else, because no result ever reaches the disk.
+        // The button is how it stops being a note and becomes a result
+        // again — a click, never a startup surprise.
+        let restored_sql =
+            matches!(active.content, TabContent::Text { .. }).then(|| active.sql.clone()).flatten();
 
         match &active.content {
             TabContent::Grid { grid, .. } => {
@@ -11707,6 +11812,25 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     .child(styled);
 
                 let mut header = div().flex().flex_row().justify_end().gap_2().p_1();
+                if let Some(sql) = restored_sql {
+                    header = header.child(
+                        div()
+                            .id("tab-restored-run")
+                            .cursor_pointer()
+                            .bg(theme.bg_hover)
+                            .text_color(theme.text_primary)
+                            .px_2()
+                            .rounded_md()
+                            .child("Spustit")
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                // Straight through the ordinary run path, so
+                                // the read-only guard, the auto-limit and the
+                                // history entry are all the same as if it had
+                                // been typed.
+                                view.run_query_with(sql.clone(), None, false, cx);
+                            })),
+                    );
+                }
                 if is_log {
                     header = header.child(
                         div()
@@ -13109,6 +13233,20 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Reconnect to whatever was open when the app was last closed. Here
+        // rather than in the constructor because a locked vault turns this
+        // into a master-password modal, which needs a `Window`.
+        //
+        // `take()` before the switch, not after: `switch_to_database` can
+        // re-enter `render` through the modal it opens, and a flag still set
+        // at that point would start a second switch.
+        if let Some((conn_id, db)) = self.restore_connection.take() {
+            // A connection deleted since the last run is not an error worth
+            // a message — the session simply names something that is gone.
+            if self.config.connections.iter().any(|c| c.id == conn_id) {
+                self.switch_to_database(&conn_id, db, None, cx);
+            }
+        }
         // UX-polish §1.4: deferred focus for overlay openers without a
         // `&mut Window` (see `modal_needs_focus`). Guarded: if the overlay
         // already closed again before this frame, just clear the flag.
@@ -13746,6 +13884,13 @@ fn main() {
     // other — workspace T6). Everything downstream still takes a `&Path`.
     let startup = startup_context(dbc_state::workspace::resolve());
     let config_path = startup.paths.config.clone();
+    // „Otevři se tak, jak jsem to zavřel". Read before the window exists so
+    // the editor, the sidebar and the tabs are already right on the FIRST
+    // frame — restoring them afterwards would show a blank window that then
+    // visibly repopulates. The connection is the one part that cannot
+    // happen here (it may need the vault) and is deferred to `render`.
+    let session_path = dbc_state::session::path_for(&config_path);
+    let session = dbc_state::session::load(&session_path);
     let vault_path = startup.paths.vault.clone();
     let workspace_root = startup.workspace_root.clone();
     let blocked = startup.blocked.clone();
@@ -13876,6 +14021,17 @@ fn main() {
                 |window, cx| {
                     cx.new(|cx| {
                         let sql = cx.new(|cx| SqlInput::new(cx, "Type SQL, then Ctrl+Enter…"));
+                        if !session.editor.is_empty() {
+                            // `insert_text`, not `replace_buffer`: the buffer
+                            // is empty, so this is an insert like any other
+                            // and needs no clobber permit.
+                            let text = session.editor.clone();
+                            let at = session.cursor;
+                            sql.update(cx, |s, cx| {
+                                s.insert_text(&text, cx);
+                                s.set_cursor_offset(at, cx);
+                            });
+                        }
                         window.focus(&sql.focus_handle(cx), cx);
                         let grouped_cache = connections_ui::group_connections_with(
                             &config.connections,
@@ -13906,6 +14062,10 @@ fn main() {
                         };
                         let editor_focus = sql.focus_handle(cx);
                         let tree = cx.new(|cx| SchemaTree::new(cx, editor_focus));
+                        if !session.expanded.is_empty() {
+                            let keys = session.expanded.clone();
+                            tree.update(cx, |t, cx| t.restore_expanded_keys(&keys, cx));
+                        }
                         cx.subscribe(&tree, AppView::on_tree_event).detach();
                         let history_search = cx.new(|cx| connections_ui::TextField::new(cx, "Hledat…", false));
                         // G11 T6 binding carry-forward (BackupHandle has no
@@ -13915,8 +14075,14 @@ fn main() {
                         // process/task BEFORE the app actually exits, since
                         // nothing else reaps an abandoned pg_dump/pg_restore
                         // child.
-                        cx.on_app_quit(|view, _cx| {
+                        cx.on_app_quit(|view, cx| {
                             view.cancel_active_backup_if_running();
+                            // The ONE reliable moment to write the session:
+                            // window close comes through here. Saving on
+                            // every keystroke instead would rewrite the file
+                            // sixty times a second for a feature nobody
+                            // notices until the next launch.
+                            view.save_session(cx);
                             async {}
                         })
                         .detach();
@@ -13924,7 +14090,7 @@ fn main() {
                         let sidebar_width = sidebar_width_from(config.sidebar_width);
                         let history_width = history_width_from(config.history_width);
                         AppView {
-                            tabs: Tabs::new(),
+                            tabs: restored_tabs(&session),
                             status,
                             runner: QueryRunner::new(),
                             conn_url,
@@ -13934,6 +14100,7 @@ fn main() {
                             run_generation: 0,
                             config,
                             config_path,
+                            session_path,
                             config_load_error,
                             vault_path,
                             workspace_root,
@@ -13948,6 +14115,14 @@ fn main() {
                             vault: None,
                             active_connection_id: None,
                             active_database: None,
+                            // Applied at the top of `render` — the first
+                            // point with a live `Window`, and the only place
+                            // a vault prompt can be raised. Same deferral
+                            // idiom as `modal_needs_focus`.
+                            restore_connection: session
+                                .connection
+                                .clone()
+                                .map(|id| (id, session.database.clone())),
                             switch_generation: 0,
                             dropdown_open: false,
                             modal: None,
@@ -14991,6 +15166,7 @@ mod identity_audit_tests {
             pinned: false,
             preview_key: Some(admin_panel::ADMIN_PREVIEW_KEY.to_string()),
             conn_identity: conn_identity_for("conn-a", "sales"),
+            sql: None,
             content: TabContent::Text { text: String::new(), scroll_lines: 0 },
         });
         assert!(matches!(
@@ -15035,6 +15211,7 @@ mod admin_open_tests {
             pinned: false,
             preview_key: Some(admin_panel::ADMIN_PREVIEW_KEY.to_string()),
             conn_identity: identity.to_string(),
+            sql: None,
             content: TabContent::Text { text: String::new(), scroll_lines: 0 },
         }
     }
@@ -15439,6 +15616,89 @@ mod keymap_audit {
                 "{chord:?} is exempted but nothing binds it - drop the exemption"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod session_restore_tests {
+    use super::{restored_tabs, session_tabs, ResultTab, TabContent, Tabs};
+    use dbc_state::session::{SessionState, SessionTab};
+
+    fn text_tab(title: &str, sql: Option<&str>) -> ResultTab {
+        ResultTab {
+            id: 0,
+            title: title.into(),
+            pinned: false,
+            preview_key: None,
+            conn_identity: "conn-a".into(),
+            sql: sql.map(str::to_string),
+            content: TabContent::Text { text: String::new(), scroll_lines: 0 },
+        }
+    }
+
+    /// THE rule: only a tab that carries its query is worth reopening.
+    #[test]
+    fn only_tabs_with_a_query_are_persisted() {
+        let mut tabs = Tabs::new();
+        tabs.open(text_tab("Náhled: orders", Some("SELECT * FROM orders")));
+        tabs.open(text_tab("ER: dbo", None));
+        tabs.open(text_tab("Log", None));
+        let out = session_tabs(&tabs);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].sql, "SELECT * FROM orders");
+        assert_eq!(out[0].title, "Náhled: orders");
+    }
+
+    #[test]
+    fn pinning_survives_the_round_trip() {
+        let mut tabs = Tabs::new();
+        let mut t = text_tab("q", Some("SELECT 1"));
+        t.pinned = true;
+        tabs.open(t);
+        let captured = session_tabs(&tabs);
+        assert!(captured[0].pinned);
+        let back = restored_tabs(&SessionState { tabs: captured, ..Default::default() });
+        assert!(back.iter().next().unwrap().pinned);
+    }
+
+    /// A restored tab must arrive as its QUERY and nothing else — the
+    /// whole reason no result ever reaches the disk.
+    #[test]
+    fn a_restored_tab_shows_its_sql_and_carries_it() {
+        let session = SessionState {
+            tabs: vec![SessionTab {
+                title: "Náhled: orders".into(),
+                sql: "SELECT * FROM orders".into(),
+                pinned: false,
+            }],
+            ..Default::default()
+        };
+        let tabs = restored_tabs(&session);
+        let t = tabs.iter().next().unwrap();
+        assert_eq!(t.sql.as_deref(), Some("SELECT * FROM orders"), "the Spustit button needs this");
+        match &t.content {
+            TabContent::Text { text, .. } => assert_eq!(text, "SELECT * FROM orders"),
+            _ => panic!("a restored tab must not claim to be a grid"),
+        }
+    }
+
+    #[test]
+    fn an_empty_session_opens_no_tabs() {
+        assert_eq!(restored_tabs(&SessionState::default()).iter().count(), 0);
+    }
+
+    /// What goes out must be what comes back — a capture/restore pair that
+    /// disagreed would silently drop or duplicate tabs on every restart.
+    #[test]
+    fn capture_and_restore_are_inverses() {
+        let mut tabs = Tabs::new();
+        tabs.open(text_tab("a", Some("SELECT 1")));
+        tabs.open(text_tab("skip me", None));
+        tabs.open(text_tab("b", Some("SELECT 2")));
+        let back = restored_tabs(&SessionState { tabs: session_tabs(&tabs), ..Default::default() });
+        let titles: Vec<&str> = back.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, vec!["a", "b"]);
+        assert_eq!(session_tabs(&back).len(), 2, "a second round trip changes nothing");
     }
 }
 
@@ -18048,13 +18308,24 @@ mod script_write_audit {
                 "copy_one",
                 "init_contents",
                 "write_marker",
+                // dbc-state: the session file, one per context, written
+                // from exactly one place — `AppView::save_session`, on the
+                // app-quit hook, on the UI thread. Sanctioned by name like
+                // the four above and for the same reason: it owns ONE
+                // well-known path, derived from the context and from
+                // nothing a caller passes in, so it cannot be aimed at a
+                // script or at any other writer's file. Serialization is
+                // trivially satisfied — there is one caller and it is
+                // synchronous — which is T8's contract, not an exception
+                // to it.
+                "save",
                 // dbc-state: the rail's own tests.
                 "write_atomic_refuses_a_missing_parent_while_the_store_savers_create_one",
                 "write_atomic_leaves_no_tmp_file_and_writes_bytes",
                 "write_atomic_overwrites_in_place",
                 "write_atomic_failure_leaves_no_tmp_behind",
             ],
-            10,
+            11,
             "`crate::scripts::write_script` is the ONE funnel from dbc-ui into the shared \
              atomic writer, and dbc-state's own callers each own exactly one well-known \
              file - a new caller forks T8's single-writer-per-path contract",

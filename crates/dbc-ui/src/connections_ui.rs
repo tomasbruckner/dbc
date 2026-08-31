@@ -2669,6 +2669,7 @@ impl AppView {
             pinned: false,
             preview_key: None,
             conn_identity: self.current_conn_identity(),
+            sql: None,
             content: crate::tabs::TabContent::Compare { view: view.clone() },
         });
         let pending = crate::PendingCompare { view, generation: my_generation };

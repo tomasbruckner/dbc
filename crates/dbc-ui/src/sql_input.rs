@@ -394,6 +394,18 @@ impl SqlInput {
         self.buffer.cursor()
     }
 
+    /// Put the caret at an absolute byte offset, clearing any selection.
+    ///
+    /// A cursor MOVE, not a buffer mutation — the same thing a click does —
+    /// so it is deliberately not part of the `BufferReplace` rail, which
+    /// exists to stop foreign TEXT replacing unsaved work. `seek` clamps
+    /// and snaps for us, so a stale offset out of a session file lands on a
+    /// valid boundary rather than panicking.
+    pub fn set_cursor_offset(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.seek(offset.min(self.buffer.text().len()), false);
+        cx.notify();
+    }
+
     /// True if `cursor()` currently falls inside a string/comment highlight
     /// span (T4's `suppresses_completion`) — the autocomplete trigger's
     /// suppression check (design §2), consumed by `AppView`'s

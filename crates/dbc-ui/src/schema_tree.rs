@@ -819,6 +819,69 @@ pub enum OuterId {
     ScriptFolder(String),
 }
 
+/// The unit separator, already this codebase's field joiner
+/// (`conn_identity_for`). It cannot occur in a folder name, a database
+/// name or a generated connection id, so no escaping is needed.
+const OUTER_SEP: char = '\u{1f}';
+
+impl OuterId {
+    /// A flat string for the session file.
+    ///
+    /// The POLARITY ASYMMETRY above is preserved by storing the SET
+    /// VERBATIM rather than „which rows are open": `Folder(_)` present
+    /// still means collapsed after a round trip, exactly as it did before
+    /// one. Interpreting it here would be a second place for that rule to
+    /// live, and the second place is always the one that drifts.
+    pub fn encode(&self) -> String {
+        match self {
+            OuterId::Folder(path) => {
+                let mut s = String::from("folder");
+                for seg in path {
+                    s.push(OUTER_SEP);
+                    s.push_str(seg);
+                }
+                s
+            }
+            OuterId::Connection(id) => format!("conn{OUTER_SEP}{id}"),
+            OuterId::Database(conn, db) => format!("db{OUTER_SEP}{conn}{OUTER_SEP}{db}"),
+            OuterId::Favourites => "fav".to_string(),
+            OuterId::Scripts => "scripts".to_string(),
+            OuterId::ScriptFolder(rel) => format!("scriptdir{OUTER_SEP}{rel}"),
+        }
+    }
+
+    /// The inverse, TOTAL: anything unrecognised is `None` rather than a
+    /// guess. A session file from a future version, or one a person edited,
+    /// must cost at most a row that opens closed.
+    pub fn decode(s: &str) -> Option<Self> {
+        let mut parts = s.split(OUTER_SEP);
+        match parts.next()? {
+            "folder" => {
+                let path: Vec<String> = parts.map(str::to_string).collect();
+                (!path.is_empty()).then_some(OuterId::Folder(path))
+            }
+            "conn" => {
+                let id = parts.next()?;
+                (parts.next().is_none() && !id.is_empty()).then(|| OuterId::Connection(id.into()))
+            }
+            "db" => {
+                let (conn, db) = (parts.next()?, parts.next()?);
+                // A database name may not contain the separator, so any
+                // further field means this is not a `db` key at all.
+                parts.next().is_none().then(|| OuterId::Database(conn.into(), db.into()))
+            }
+            "fav" => parts.next().is_none().then_some(OuterId::Favourites),
+            "scripts" => parts.next().is_none().then_some(OuterId::Scripts),
+            "scriptdir" => {
+                let rel = parts.next()?;
+                (parts.next().is_none() && !rel.is_empty())
+                    .then(|| OuterId::ScriptFolder(rel.into()))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The active `(connection, database)` context as the sidebar sees it —
 /// handed in by `main.rs` (T5) from `resolve_active`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1810,6 +1873,25 @@ impl SchemaTree {
     /// the ● indicator, icon gating, favourites filtering and `snapshot()`.
     pub fn set_active_scope(&mut self, scope: Option<ActiveScope>, cx: &mut Context<Self>) {
         self.active_scope = scope;
+        cx.notify();
+    }
+
+    /// The outer expand state, for the session file. Encoded here rather
+    /// than by the caller so `OuterId`'s shape stays this module's business.
+    pub fn expanded_keys(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.outer_expanded.iter().map(OuterId::encode).collect();
+        // Sorted so an unchanged sidebar produces an unchanged file — a
+        // `HashSet`'s order is not stable between runs, and a session file
+        // that rewrites itself on every save for no reason is noise.
+        out.sort();
+        out
+    }
+
+    /// Restore it. Unrecognised keys are dropped silently: a session
+    /// written by a newer build may name rows this one has never heard of,
+    /// and the worst honest outcome is a row that opens closed.
+    pub fn restore_expanded_keys(&mut self, keys: &[String], cx: &mut Context<Self>) {
+        self.outer_expanded = keys.iter().filter_map(|k| OuterId::decode(k)).collect();
         cx.notify();
     }
 
@@ -4661,5 +4743,72 @@ mod sidebar_tests {
             assert!(seen.contains(&kind), "no notice emitted for the {kind} state");
         }
         assert_eq!(seen.iter().filter(|k| **k == "caps").count(), 2, "both cap rows");
+    }
+}
+
+/// The session file's half of the sidebar: `OuterId` <-> a flat string.
+#[cfg(test)]
+mod outer_id_codec_tests {
+    use super::OuterId;
+
+    fn all() -> Vec<OuterId> {
+        vec![
+            OuterId::Folder(vec!["dw".into()]),
+            OuterId::Folder(vec!["a".into(), "b".into(), "c".into()]),
+            OuterId::Connection("conn-18ce94b370664078".into()),
+            OuterId::Database("conn-1".into(), "sales".into()),
+            OuterId::Favourites,
+            OuterId::Scripts,
+            OuterId::ScriptFolder("reports/daily".into()),
+        ]
+    }
+
+    #[test]
+    fn every_variant_round_trips() {
+        for id in all() {
+            let enc = id.encode();
+            assert_eq!(OuterId::decode(&enc), Some(id.clone()), "{enc:?}");
+        }
+    }
+
+    /// Two different rows must never collapse onto one key — a folder
+    /// named like a connection id would otherwise restore the wrong row.
+    #[test]
+    fn distinct_ids_encode_distinctly() {
+        let encoded: Vec<String> = all().iter().map(OuterId::encode).collect();
+        let mut sorted = encoded.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), encoded.len(), "a collision: {encoded:?}");
+        assert_ne!(
+            OuterId::Folder(vec!["x".into()]).encode(),
+            OuterId::Connection("x".into()).encode()
+        );
+    }
+
+    /// A file from a newer build, or one someone edited, must cost at most
+    /// a row that opens closed.
+    #[test]
+    fn garbage_decodes_to_nothing_rather_than_a_guess() {
+        let sep = '\u{1f}';
+        let bad = vec![
+            String::new(),
+            "folder".to_string(),
+            "conn".to_string(),
+            "db".to_string(),
+            format!("db{sep}only-one"),
+            "wat".to_string(),
+            format!("fav{sep}extra"),
+            "scriptdir".to_string(),
+        ];
+        for b in bad {
+            assert_eq!(OuterId::decode(&b), None, "{b:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_multi_segment_folder_keeps_its_segments() {
+        let id = OuterId::Folder(vec!["prod".into(), "eu".into()]);
+        assert_eq!(OuterId::decode(&id.encode()), Some(id));
     }
 }
