@@ -201,6 +201,14 @@ pub enum TreeEvent {
     BackupFor { conn_id: String, db: Option<String> },
     RestoreFor { conn_id: String, db: Option<String> },
     EditConnection { conn_id: String },
+    /// Connection-folder management. Folders are labels on connections plus
+    /// `AppConfig::folders` for the ones that are empty; see the `folders`
+    /// module for what each of these does to that pair.
+    FolderCreate { parent: Vec<String> },
+    FolderRename { path: Vec<String> },
+    FolderDelete { path: Vec<String> },
+    /// Emitted by a drag from a connection row onto a folder row.
+    MoveConnectionToFolder { conn_id: String, folder: Vec<String> },
     /// A destructive statement. Emitting this NEVER executes anything: it
     /// opens the shared Apply confirm dialog with the exact SQL, which is
     /// this codebase's rule for every write path.
@@ -2700,6 +2708,11 @@ pub(crate) fn event_target(ev: &TreeEvent) -> String {
         | TreeEvent::OpenCompareFor { conn_id }
         | TreeEvent::EditConnection { conn_id } => conn_id.clone(),
         TreeEvent::LoadSchema { conn_id, db } => format!("{conn_id}/{db}"),
+        TreeEvent::FolderCreate { parent } => parent.join("/"),
+        TreeEvent::FolderRename { path } | TreeEvent::FolderDelete { path } => path.join("/"),
+        TreeEvent::MoveConnectionToFolder { conn_id, folder } => {
+            format!("{conn_id} → {}", folder.join("/"))
+        }
         TreeEvent::SwitchToDatabase { conn_id, db }
         | TreeEvent::BackupFor { conn_id, db }
         | TreeEvent::RestoreFor { conn_id, db } => match db {
@@ -2722,6 +2735,37 @@ pub(crate) fn event_target(ev: &TreeEvent) -> String {
         | TreeEvent::OpenAdmin
         | TreeEvent::ScriptsRefresh
         | TreeEvent::OpenScriptsSettings => String::new(),
+    }
+}
+
+/// What a dragged connection row carries.
+///
+/// The id is what the move needs; the name is only for the label that
+/// follows the cursor. Nothing about the CONNECTION travels — no host, no
+/// user, and certainly no secret — because a drag payload can be picked up
+/// by any drop target that names the type.
+#[derive(Clone)]
+pub(crate) struct ConnectionDrag {
+    pub conn_id: String,
+    pub name: String,
+}
+
+/// The chip that follows the cursor while dragging.
+pub(crate) struct DragChip {
+    text: String,
+}
+
+impl Render for DragChip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(cx.theme().bg_panel)
+            .border_1()
+            .border_color(cx.theme().border)
+            .text_color(cx.theme().text_primary)
+            .child(self.text.clone())
     }
 }
 
@@ -2768,12 +2812,38 @@ impl Render for SchemaTree {
             .justify_between()
             .bg(cx.theme().bg_app)
             .text_color(cx.theme().text_primary)
+            // The header doubles as the ROOT drop target. Root-level
+            // connections render with no folder row of their own, so
+            // without this there would be somewhere to drag a connection
+            // INTO a folder and nowhere to drag it back out.
+            .drag_over::<ConnectionDrag>(|st, _, _, cx| st.bg(cx.theme().bg_hover))
+            .on_drop(cx.listener(|_this, drag: &ConnectionDrag, _window, cx| {
+                cx.emit(TreeEvent::MoveConnectionToFolder {
+                    conn_id: drag.conn_id.clone(),
+                    folder: Vec::new(),
+                });
+            }))
             .child(div().overflow_hidden().child(header_label))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
+                    .child(
+                        // New ROOT folder. A folder you can only create
+                        // inside another folder is a folder you can never
+                        // create the first of.
+                        div()
+                            .id("tree-new-folder")
+                            .cursor_pointer()
+                            .px_1()
+                            .text_color(cx.theme().text_muted)
+                            .child("+")
+                            .on_click(cx.listener(|_this, _: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                cx.emit(TreeEvent::FolderCreate { parent: Vec::new() });
+                            })),
+                    )
                     .child(
                         div()
                             .id("tree-generate-ddl")
@@ -3072,6 +3142,7 @@ impl Render for SchemaTree {
                         };
 
                         let menu_row = row_id.clone();
+                        let drag_label = label.clone();
                         let mut row = div()
                             .id(("tree-row", ix))
                             .on_mouse_down(
@@ -3121,6 +3192,36 @@ impl Render for SchemaTree {
                                     .text_color(color)
                                     .child(glyph),
                             );
+                        }
+                        // Drag a connection, drop it on a folder. The
+                        // move itself is `folders::move_connection`; this
+                        // is only the gesture.
+                        match &row_id {
+                            SidebarRow::Connection { conn_id } => {
+                                let payload = ConnectionDrag {
+                                    conn_id: conn_id.clone(),
+                                    name: drag_label.clone(),
+                                };
+                                row = row.on_drag(payload, |d, _pos, _window, cx| {
+                                    cx.new(|_| DragChip { text: d.name.clone() })
+                                });
+                            }
+                            SidebarRow::Folder { path } => {
+                                let target = path.clone();
+                                row = row
+                                    .drag_over::<ConnectionDrag>(|st, _, _, cx| {
+                                        st.bg(cx.theme().bg_hover)
+                                    })
+                                    .on_drop(cx.listener(
+                                        move |_this, drag: &ConnectionDrag, _window, cx| {
+                                            cx.emit(TreeEvent::MoveConnectionToFolder {
+                                                conn_id: drag.conn_id.clone(),
+                                                folder: target.clone(),
+                                            });
+                                        },
+                                    ));
+                            }
+                            _ => {}
                         }
                         row = row
                             .child(div().flex_1().overflow_hidden().child(label))

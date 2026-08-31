@@ -160,6 +160,17 @@ pub struct AppConfig {
     /// [`AppConfig::sidebar_width`] — see there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_width: Option<u16>,
+
+    /// Folders that exist on their own, not merely because a connection
+    /// names them.
+    ///
+    /// Folders used to be entirely implied by `ConnectionConfig::folder`,
+    /// which cannot express an EMPTY folder — and „make a folder, then put
+    /// things in it" is the order people actually work in. The displayed
+    /// tree is the union of these and the implied ones; see
+    /// `dbc-ui`'s `folders` module.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<Vec<String>>,
     /// How the schema tree groups objects under a database. Global by user
     /// decision (2026-08-28) — one setting for the whole app rather than
     /// per connection.
@@ -395,6 +406,7 @@ mod tests {
             // would round-trip even if `save` dropped it entirely.
             sidebar_width: Some(317),
             history_width: Some(300),
+            folders: vec![vec!["work".into()]],
             tree_grouping: TreeGrouping::Kind,
         }
     }

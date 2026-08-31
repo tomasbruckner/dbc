@@ -74,12 +74,36 @@ pub struct GroupedConnections {
     pub folders: Vec<FolderGroup>,
 }
 
+/// Grouping with no declared folders.
+///
+/// `#[cfg(test)]` because the app itself always has a folder list to pass:
+/// every production call site went through `group_connections_with` the
+/// moment folders became explicit. This is the convenience the ~20 grouping
+/// and sidebar tests were written against, and rewriting all of them to
+/// pass `&[]` would have been churn that hid the real change.
+#[cfg(test)]
 pub fn group_connections(conns: &[ConnectionConfig]) -> GroupedConnections {
+    group_connections_with(conns, &[])
+}
+
+/// `declared` are the folders that exist on their own (see the `folders`
+/// module). They appear even when empty, which is the whole point of them,
+/// and their ancestors are materialised so a nested one is never orphaned.
+pub fn group_connections_with(
+    conns: &[ConnectionConfig],
+    declared: &[Vec<String>],
+) -> GroupedConnections {
     let mut favourites: Vec<ConnectionConfig> =
         conns.iter().filter(|c| c.favourite).cloned().collect();
     favourites.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut by_folder: BTreeMap<Vec<String>, Vec<ConnectionConfig>> = BTreeMap::new();
+    // Seed the map so an empty folder still produces a row. `visible_folders`
+    // does the union and the ancestor fill-in; this just gives each of them
+    // a (possibly empty) bucket.
+    for path in crate::folders::visible_folders(conns, declared) {
+        by_folder.entry(path).or_default();
+    }
     for c in conns.iter().filter(|c| !c.favourite) {
         by_folder.entry(c.folder.clone()).or_default().push(c.clone());
     }
@@ -1478,6 +1502,21 @@ pub enum ModalState {
     /// dirty-bound script — one modal, both facts, instead of a discard
     /// confirm stacked in front of a delete confirm. `running` is the same
     /// double-dispatch/identity freeze as `ScriptName`'s.
+    /// Naming a connection folder. `rename_of` is `None` when creating a
+    /// new folder under `parent`, `Some(path)` when renaming that one —
+    /// one modal for both, because they ask the user the same question.
+    FolderName {
+        rename_of: Option<Vec<String>>,
+        parent: Vec<String>,
+        field: Entity<TextField>,
+        error: Option<String>,
+    },
+    /// `moving` is how many connections will be re-parented. The number is
+    /// the reassurance: it says the connections still exist afterwards.
+    FolderDeleteConfirm {
+        path: Vec<String>,
+        moving: usize,
+    },
     ScriptDeleteConfirm {
         rel: String,
         is_dir: bool,
@@ -1660,6 +1699,9 @@ pub(crate) enum ModalConfirmKind {
     /// NOTHING against the database (`AppView::confirm_script_name`,
     /// self-guarding — the `running` check is in its body).
     ScriptName,
+    /// Enter = „Uložit" on the connection-folder name dialog. Writes
+    /// `config.toml`, touches no database.
+    FolderName,
     Ignore,
 }
 
@@ -1677,6 +1719,7 @@ pub(crate) fn modal_confirm_kind(modal: &ModalState) -> ModalConfirmKind {
         // nothing against the database. Routed through the free fn so the
         // table and its test share ONE source.
         ModalState::ScriptName { .. } => script_name_confirm_kind(),
+        ModalState::FolderName { .. } => ModalConfirmKind::FolderName,
         // §3-novela Ignore arms — kept as explicit variants (not a `_`
         // catch-all) so a NEW ModalState variant is a compile error here
         // and must consciously pick a side of the policy table.
@@ -1696,6 +1739,10 @@ pub(crate) fn modal_confirm_kind(modal: &ModalState) -> ModalConfirmKind {
         // §3-novela's substance is IRREVERSIBILITY, not SQL: the button is
         // the last gate before an unrecoverable disk delete (there is no
         // recycle bin here, and no recursive-delete undo we could offer).
+        // Renaming or creating a FOLDER edits config.toml and runs nothing
+        // against any database — the same side of the policy table as
+        // ScriptName, for the same reason.
+        | ModalState::FolderDeleteConfirm { .. }
         | ModalState::ScriptDeleteConfirm { .. } => ModalConfirmKind::Ignore,
     }
 }
@@ -1741,6 +1788,9 @@ pub(crate) fn modal_is_blocking(modal: &ModalState) -> bool {
         // `script_modal_esc_closable`, which `on_cancel_query` asks next.
         | ModalState::ScriptName { .. }
         | ModalState::ScriptDeleteConfirm { .. }
+        // Nothing typed here is secret and nothing is running behind them.
+        | ModalState::FolderName { .. }
+        | ModalState::FolderDeleteConfirm { .. }
         | ModalState::CsvImport { .. } => false,
     }
 }
@@ -1776,7 +1826,8 @@ impl AppView {
     /// deleted must never leave a stale root behind. One write-through
     /// point rather than a per-call-site pair.
     pub(crate) fn refresh_grouped_cache(&mut self, cx: &mut Context<Self>) {
-        self.grouped_cache = group_connections(&self.config.connections);
+        self.grouped_cache =
+            group_connections_with(&self.config.connections, &self.config.folders);
         let grouped = self.grouped_cache.clone();
         self.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
     }
@@ -1797,16 +1848,27 @@ impl AppView {
     ///     and Ctrl+H were the only handles, and an invisible control is no
     ///     control. Both panels now have a toggle here, lit when the panel
     ///     is open.
-    pub(crate) fn render_top_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_top_bar(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let label = self.current_connection_label();
         let theme = *cx.theme();
         let format_enabled = self.active_engine().is_some();
         let (tree_on, history_on) = (self.tree_visible, self.history_visible);
+        let maximized = window.is_maximized();
 
         div()
             .id("top-bar")
+            // The whole bar drags the window — this IS the title bar now,
+            // and a title bar you cannot drag the window by is a broken
+            // one. Every clickable thing on it calls `.occlude()`, which is
+            // what keeps a click on a button from being read as a click on
+            // the caption.
+            .window_control_area(gpui::WindowControlArea::Drag)
             .h(px(34.))
-            .px_2()
+            .pl_1()
             .gap_1()
             .flex()
             .flex_row()
@@ -1815,10 +1877,24 @@ impl AppView {
             .border_b_1()
             .border_color(theme.border)
             .text_color(theme.text_primary)
-            // The connection picker: a chip, not the whole bar.
+            // ☰ first, the way every app with a collapsed menu does it.
+            .child(
+                bar_button("top-bar-menu", "☰", self.app_menu_open, true, theme).on_click(
+                    cx.listener(|view, _, _, cx| {
+                        view.app_menu_open = !view.app_menu_open;
+                        view.dropdown_open = false;
+                        cx.notify();
+                    }),
+                ),
+            )
+            // The connection picker. Borderless until you point at it —
+            // a resting bar should be a line of text, not a row of boxes
+            // (2026-08-31: „zed to ma takove hezke"). It is still exactly
+            // as clickable as it looks, which was the actual bug.
             .child(
                 div()
                     .id("top-bar-connection")
+                    .occlude()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -1826,9 +1902,7 @@ impl AppView {
                     .px_2()
                     .py(px(3.))
                     .rounded_md()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(if self.dropdown_open { theme.bg_hover } else { theme.bg_panel })
+                    .bg(if self.dropdown_open { theme.bg_hover } else { theme.bg_app })
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.bg_hover))
                     .child(div().text_color(theme.text_muted).child("Připojení"))
@@ -1836,6 +1910,7 @@ impl AppView {
                     .child(div().text_color(theme.text_muted).child("▾"))
                     .on_click(cx.listener(|view, _, _, cx| {
                         view.dropdown_open = !view.dropdown_open;
+                        view.app_menu_open = false;
                         if view.dropdown_open {
                             view.refresh_grouped_cache(cx);
                         }
@@ -1867,17 +1942,19 @@ impl AppView {
                     }),
                 ),
             )
-            .child(bar_button("top-bar-settings", "⚙", false, true, theme).on_click(cx.listener(
-                |view, _, _, cx| {
-                    view.open_settings(cx);
-                },
-            )))
             .child(bar_separator(theme))
             .child(
                 div()
+                    .pr_2()
                     .text_color(theme.text_faint)
                     .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
             )
+            .child(caption_button(CaptionButton::Minimize, theme))
+            .child(caption_button(
+                if maximized { CaptionButton::Restore } else { CaptionButton::Maximize },
+                theme,
+            ))
+            .child(caption_button(CaptionButton::Close, theme))
     }
 
     pub(crate) fn render_dropdown_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -2071,6 +2148,12 @@ impl AppView {
             }
             ModalState::ScriptDeleteConfirm { rel, is_dir, dirty_bound, error, running } => {
                 render_script_delete_panel(&rel, is_dir, dirty_bound, &error, running, cx)
+            }
+            ModalState::FolderName { rename_of, parent, field, error } => {
+                render_folder_name_panel(rename_of, parent, field, error, cx)
+            }
+            ModalState::FolderDeleteConfirm { path, moving } => {
+                render_folder_delete_panel(path, moving, cx)
             }
         };
         Some(
@@ -2394,6 +2477,7 @@ impl AppView {
             ModalConfirmKind::ChartConfirm => self.confirm_chart_picker(cx),
             ModalConfirmKind::ChangeServerPw => self.confirm_pw_change(cx),
             ModalConfirmKind::ScriptName => self.confirm_script_name(cx),
+            ModalConfirmKind::FolderName => self.confirm_folder_name(cx),
             // Handled no-op: propagation already stopped, Enter dies here.
             ModalConfirmKind::Ignore => {}
         }
@@ -3946,6 +4030,75 @@ fn render_pw_change_panel(
     panel.into_any_element()
 }
 
+/// Minimise / maximise / close, drawn by us because the system title bar
+/// is switched off.
+///
+/// No `on_click`: the platform performs these. Declaring the area is the
+/// whole mechanism — Windows hit-tests the region and handles the press
+/// itself, which is also why these keep working while the app is busy.
+#[derive(Clone, Copy)]
+enum CaptionButton {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
+impl CaptionButton {
+    /// Segoe Fluent Icons code points — the same glyphs every Windows 11
+    /// window uses, so the buttons are the ones muscle memory expects
+    /// rather than a hand-drawn approximation.
+    fn glyph(self) -> &'static str {
+        match self {
+            CaptionButton::Minimize => "\u{e921}",
+            CaptionButton::Restore => "\u{e923}",
+            CaptionButton::Maximize => "\u{e922}",
+            CaptionButton::Close => "\u{e8bb}",
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            CaptionButton::Minimize => "caption-min",
+            CaptionButton::Restore | CaptionButton::Maximize => "caption-max",
+            CaptionButton::Close => "caption-close",
+        }
+    }
+
+    fn area(self) -> gpui::WindowControlArea {
+        match self {
+            CaptionButton::Minimize => gpui::WindowControlArea::Min,
+            CaptionButton::Restore | CaptionButton::Maximize => gpui::WindowControlArea::Max,
+            CaptionButton::Close => gpui::WindowControlArea::Close,
+        }
+    }
+}
+
+fn caption_button(kind: CaptionButton, theme: crate::theme::Theme) -> gpui::Stateful<Div> {
+    // The Windows close button turns red on hover and white on top. That is
+    // not decoration — it is how you know which of three identical-looking
+    // boxes ends the session.
+    let close_red: gpui::Hsla = gpui::rgb(0xe81123).into();
+    let (hover_bg, hover_fg) = match kind {
+        CaptionButton::Close => (close_red, gpui::white()),
+        _ => (theme.bg_hover, theme.text_primary),
+    };
+    div()
+        .id(kind.id())
+        .occlude()
+        .window_control_area(kind.area())
+        .w(px(46.))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family("Segoe Fluent Icons")
+        .text_size(px(10.))
+        .text_color(theme.text_muted)
+        .hover(|st| st.bg(hover_bg).text_color(hover_fg))
+        .child(kind.glyph())
+}
+
 /// One top-bar control. `active` lights it as an on/off state (the panel
 /// toggles); `enabled` dims it and is otherwise cosmetic — every caller
 /// whose action can refuse still refuses at click time, which is this
@@ -3964,6 +4117,10 @@ fn bar_button(
     };
     div()
         .id(id)
+        // Every top-bar button sits inside the window's drag area, so it
+        // has to declare itself as something other than caption or the
+        // platform swallows the click.
+        .occlude()
         .px_2()
         .py(px(3.))
         .rounded_md()
@@ -3978,6 +4135,106 @@ fn bar_button(
 /// row of buttons readable at a glance instead of a wall of words.
 fn bar_separator(theme: crate::theme::Theme) -> Div {
     div().w(px(1.)).h(px(16.)).mx_1().bg(theme.border)
+}
+
+fn folder_label(path: &[String]) -> String {
+    if path.is_empty() { "kořen".to_string() } else { path.join(" / ") }
+}
+
+fn render_folder_name_panel(
+    rename_of: Option<Vec<String>>,
+    parent: Vec<String>,
+    field: Entity<TextField>,
+    error: Option<String>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let (title, hint) = match &rename_of {
+        Some(path) => ("Přejmenovat složku".to_string(), folder_label(path)),
+        None => ("Nová složka".to_string(), format!("v {}", folder_label(&parent))),
+    };
+    let mut panel = div()
+        .w(px(420.))
+        .bg(cx.theme().bg_panel)
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(cx.theme().text_primary)
+        .child(div().text_size(px(16.)).child(title))
+        .child(div().text_color(cx.theme().text_muted).child(hint))
+        .child(field_row("Název", field, *cx.theme()));
+    if let Some(e) = error {
+        panel = panel.child(div().text_color(cx.theme().danger).child(e));
+    }
+    panel
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .justify_end()
+                .mt_2()
+                .child(styled_button("folder-name-cancel", "Zrušit", *cx.theme()).on_click(
+                    cx.listener(|v, _, _, cx| {
+                        v.modal = None;
+                        cx.notify();
+                    }),
+                ))
+                .child(styled_button("folder-name-ok", "Uložit", *cx.theme()).on_click(
+                    cx.listener(|v, _, _, cx| v.confirm_folder_name(cx)),
+                )),
+        )
+        .into_any_element()
+}
+
+fn render_folder_delete_panel(
+    path: Vec<String>,
+    moving: usize,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    // The count is the whole message. „Smazat složku" over a folder full of
+    // saved connections reads like a threat; saying where they go turns it
+    // back into a tidy-up.
+    let note = match moving {
+        0 => "Složka je prázdná.".to_string(),
+        1 => "1 připojení se přesune o úroveň výš. Nic se nesmaže.".to_string(),
+        n => format!("{n} připojení se přesune o úroveň výš. Nic se nesmaže."),
+    };
+    div()
+        .w(px(460.))
+        .bg(cx.theme().bg_panel)
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(cx.theme().text_primary)
+        .child(div().text_size(px(16.)).child("Smazat složku"))
+        .child(div().text_color(cx.theme().text_muted).child(folder_label(&path)))
+        .child(div().child(note))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .justify_end()
+                .mt_2()
+                .child(styled_button("folder-del-cancel", "Zrušit", *cx.theme()).on_click(
+                    cx.listener(|v, _, _, cx| {
+                        v.modal = None;
+                        cx.notify();
+                    }),
+                ))
+                .child(styled_button("folder-del-ok", "Smazat složku", *cx.theme()).on_click(
+                    cx.listener(|v, _, _, cx| v.confirm_folder_delete(cx)),
+                )),
+        )
+        .into_any_element()
 }
 
 fn render_master_password_panel(
@@ -4942,6 +5199,12 @@ pub(crate) fn modal_blocks_context_switch(modal: Option<&ModalState>) -> bool {
         // and both hold a rel that would then resolve against a DIFFERENT
         // root — the „never a silent context change" rail, applied to the
         // one thing these modals are about.
+        // These name and delete CONNECTION folders, which is
+        // config-level state the context switch does not touch — but the
+        // path they hold would be stale if the connection list changed
+        // underneath, so they block like every other path-holding dialog.
+        | Some(ModalState::FolderName { .. })
+        | Some(ModalState::FolderDeleteConfirm { .. })
         | Some(ModalState::ScriptName { .. })
         | Some(ModalState::ScriptDeleteConfirm { .. })
         | Some(ModalState::WorkspaceMissing { .. }) => true,

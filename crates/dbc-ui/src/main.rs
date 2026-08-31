@@ -41,6 +41,8 @@ mod schema_tree;
 mod scripts;
 mod sql_highlight;
 mod tree_menu;
+mod folders;
+mod keymap;
 mod sql_input;
 mod tabs;
 mod text_model;
@@ -92,6 +94,15 @@ actions!(
         ToggleHistory,
         OpenPalette,
         OpenAutocomplete,
+        /// The cheat sheet, rendered from `keymap::SHORTCUTS`.
+        ShowShortcuts,
+        /// Move keyboard focus between the three areas you actually work
+        /// in. Without these the only way back into the editor after
+        /// clicking the tree is the mouse, which is a strange thing to ask
+        /// of someone who wanted keyboard control.
+        FocusEditor,
+        FocusTree,
+        FocusResults,
         // Workspace T8 (Part S §5.2/§5.4): bound => save, unbound =>
         // save-as. Global, context `None`, same posture as `RunQuery`.
         SaveScript,
@@ -2112,6 +2123,15 @@ struct AppView {
     /// by the cx-only tree subscription and drained at the top of `render`.
     /// Same shape as the queued cross-context preview open.
     pending_menu_action: Option<TreeEvent>,
+    /// The cheat sheet overlay is open. Not a `ModalState`: it takes no
+    /// input, decides nothing, and must be dismissable without disturbing
+    /// whatever modal flow it was opened over.
+    shortcuts_open: bool,
+    /// The ☰ application menu is open. Plain flags rather than `ModalState`
+    /// for the same reason as `shortcuts_open`: these overlays take no
+    /// input and decide nothing.
+    app_menu_open: bool,
+    about_open: bool,
     /// Sidebar rework: bumped on every db-list/schema-slot fetch dispatch;
     /// a result only applies if the generation still matches
     /// (last-dispatched wins — the slot state machines in schema_tree.rs
@@ -5246,6 +5266,16 @@ impl AppView {
     }
 
     fn on_cancel_query(&mut self, _: &CancelQuery, _window: &mut Window, cx: &mut Context<Self>) {
+        // Escape closes the cheat sheet first. An overlay you cannot
+        // dismiss with the key everything else dismisses with is a trap,
+        // and cancelling a query underneath it would be a surprise.
+        if self.shortcuts_open || self.about_open || self.app_menu_open {
+            self.shortcuts_open = false;
+            self.about_open = false;
+            self.app_menu_open = false;
+            cx.notify();
+            return;
+        }
         // M6: Escape closes the dropdown / a modal first, rather than
         // falling through to query-cancel underneath it. A modal holding
         // unsaved password state (a master-password prompt/creation modal,
@@ -5418,6 +5448,349 @@ impl AppView {
     /// active connection there is nothing to be right about, so it refuses
     /// rather than guessing a dialect and reflowing the user's SQL by the
     /// wrong rules.
+    fn on_show_shortcuts(
+        &mut self,
+        _: &ShowShortcuts,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.shortcuts_open = !self.shortcuts_open;
+        cx.notify();
+    }
+
+    /// Ctrl+1/2/3. Focusing the tree or the grid also makes it VISIBLE:
+    /// moving focus into a hidden panel would put the caret somewhere the
+    /// user cannot see, which is worse than doing nothing.
+    fn on_focus_editor(&mut self, _: &FocusEditor, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.sql.focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    fn on_focus_tree(&mut self, _: &FocusTree, window: &mut Window, cx: &mut Context<Self>) {
+        self.tree_visible = true;
+        let handle = self.tree.focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    fn on_focus_results(&mut self, _: &FocusResults, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(TabContent::Grid { grid, .. }) = self.tabs.active().map(|t| &t.content) {
+            let handle = grid.focus_handle(cx);
+            window.focus(&handle, cx);
+        } else {
+            self.status = "Žádný výsledek k zaměření".to_string();
+        }
+        cx.notify();
+    }
+
+    /// Which area has the keyboard right now, for the hint strip.
+    fn focused_scope(&self, window: &Window, cx: &App) -> keymap::Scope {
+        if self.modal.is_some() {
+            return keymap::Scope::Global;
+        }
+        if self.palette.is_some() {
+            return keymap::Scope::Palette;
+        }
+        if self.tree.focus_handle(cx).contains_focused(window, cx) {
+            return keymap::Scope::Tree;
+        }
+        if let Some(TabContent::Grid { grid, .. }) = self.tabs.active().map(|t| &t.content) {
+            if grid.focus_handle(cx).contains_focused(window, cx) {
+                return keymap::Scope::Results;
+            }
+        }
+        if self.sql.focus_handle(cx).contains_focused(window, cx) {
+            return keymap::Scope::Editor;
+        }
+        keymap::Scope::Global
+    }
+
+    /// The always-visible hint strip — the one thing borrowed wholesale
+    /// from zellij. It changes with FOCUS rather than with a mode, so it
+    /// answers „what do the keys do right now" without there being a state
+    /// the user can get stuck in.
+    fn render_shortcut_strip(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        let scope = self.focused_scope(window, cx);
+        let mut strip = div()
+            .h(px(22.))
+            .px_2()
+            .gap_3()
+            .flex()
+            .flex_row()
+            .items_center()
+            .bg(theme.bg_app)
+            .border_t_1()
+            .border_color(theme.border)
+            .text_color(theme.text_faint)
+            .child(div().text_color(theme.text_muted).child(scope.title()));
+        for sc in keymap::strip_for(scope) {
+            strip = strip.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .child(div().text_color(theme.text_primary).child(keymap::pretty(sc.chord)))
+                    .child(div().child(sc.label)),
+            );
+        }
+        strip.into_any_element()
+    }
+
+    /// The ☰ menu: the things an app has that are not about the database
+    /// in front of you — settings, help, where its files live, how to quit.
+    ///
+    /// One menu rather than a full menu BAR. A menu bar earns its width by
+    /// holding the app's whole command surface; here the command surface is
+    /// the palette (Ctrl+K), which is searchable and already lists
+    /// everything. Six items behind one glyph says the same thing in a
+    /// fraction of the room.
+    fn render_app_menu_overlay(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        let item = |id: &'static str, label: &'static str, chord: Option<&'static str>| {
+            div()
+                .id(id)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_4()
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .hover(|st| st.bg(theme.bg_hover))
+                .child(div().flex_1().text_color(theme.text_primary).child(label))
+                .child(
+                    div()
+                        .text_color(theme.text_faint)
+                        .child(chord.map(keymap::pretty).unwrap_or_default()),
+                )
+        };
+        let panel = div()
+            .absolute()
+            .top(px(34.))
+            .left(px(4.))
+            .w(px(300.))
+            .py_1()
+            .bg(theme.bg_panel)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .occlude()
+            .on_mouse_down_out(cx.listener(|view, _, _, cx| {
+                view.app_menu_open = false;
+                cx.notify();
+            }))
+            .child(item("menu-about", "O aplikaci", None).on_click(cx.listener(
+                |view, _, _, cx| {
+                    view.app_menu_open = false;
+                    view.about_open = true;
+                    cx.notify();
+                },
+            )))
+            .child(item("menu-shortcuts", "Klávesové zkratky", Some("f1")).on_click(cx.listener(
+                |view, _, _, cx| {
+                    view.app_menu_open = false;
+                    view.shortcuts_open = true;
+                    cx.notify();
+                },
+            )))
+            .child(div().h(px(1.)).my_1().mx_2().bg(theme.border))
+            .child(item("menu-settings", "Nastavení…", None).on_click(cx.listener(
+                |view, _, _, cx| {
+                    view.app_menu_open = false;
+                    view.open_settings(cx);
+                },
+            )))
+            .child(item("menu-palette", "Paleta příkazů", Some("ctrl-k")).on_click(cx.listener(
+                |view, _, window, cx| {
+                    view.app_menu_open = false;
+                    view.on_open_palette(&OpenPalette, window, cx);
+                },
+            )))
+            .child(div().h(px(1.)).my_1().mx_2().bg(theme.border))
+            .child(item("menu-log", "Otevřít log", None).on_click(cx.listener(
+                |view, _, _, cx| {
+                    view.app_menu_open = false;
+                    view.open_log_tab(cx);
+                },
+            )))
+            .child(item("menu-clear-cache", "Vymazat mezipaměť schémat", None).on_click(
+                cx.listener(|view, _, _, cx| {
+                    view.app_menu_open = false;
+                    dbc_state::schema_cache::clear();
+                    view.status = "Mezipaměť schémat vymazána".to_string();
+                    cx.notify();
+                }),
+            ));
+        panel.into_any_element()
+    }
+
+    /// „O aplikaci": version, and WHERE THE FILES ARE. The paths are the
+    /// part that is actually useful — profile, log and workspace are the
+    /// three things anyone ever needs to find, and hunting for them is how
+    /// this session started.
+    fn render_about_overlay(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        let row = |label: &'static str, value: String| {
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(div().w(px(120.)).flex_shrink_0().text_color(theme.text_muted).child(label))
+                .child(div().text_color(theme.text_primary).child(value))
+        };
+        let profile = dbc_state::workspace::profile_dir().display().to_string();
+        let log = dbc_state::applog::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let workspace = self
+            .workspace_root
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(žádný)".to_string());
+        let panel = div()
+            .w(px(620.))
+            .bg(theme.bg_panel)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().text_size(px(16.)).text_color(theme.text_primary).child("dbc"))
+            .child(row("Verze", env!("CARGO_PKG_VERSION").to_string()))
+            .child(row("Profil", profile))
+            .child(row("Log", log))
+            .child(row("Pracovní prostor", workspace))
+            .child(div().mt_2().text_color(theme.text_faint).child("Esc zavře"));
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|view, _, _, cx| {
+                    view.about_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(panel)
+            .into_any_element()
+    }
+
+    /// The cheat sheet: every documented shortcut, grouped by where it
+    /// works, rendered from the same table the audits check against the
+    /// real bindings.
+    fn render_shortcuts_overlay(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        // TWO COLUMNS, not one tall list. The single column overflowed the
+        // window and was silently clipped at the bottom (user report,
+        // 2026-08-31: „ta f1 napoveda je useknuta dole") — with
+        // `overflow_hidden` and no scrolling, the shortcuts that did not fit
+        // simply did not exist. Splitting the scopes across two columns
+        // makes the whole sheet fit at once, which is what a cheat sheet is
+        // for: you look, you do not scroll.
+        let mut panel = div()
+            .w(px(860.))
+            .bg(theme.bg_panel)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .text_color(theme.text_primary)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(div().text_size(px(16.)).child("Klávesové zkratky"))
+                    .child(
+                        div()
+                            .ml_auto()
+                            .text_color(theme.text_muted)
+                            .child("F1 nebo Esc zavře"),
+                    ),
+            );
+        // Balance by ROW COUNT, not by scope count: „Kdekoliv" alone is
+        // bigger than the other four together, so splitting the list of
+        // scopes down the middle would leave one column nearly empty.
+        let scopes = keymap::scopes();
+        let total: usize = keymap::SHORTCUTS.len() + scopes.len();
+        let mut left: Vec<keymap::Scope> = Vec::new();
+        let mut right: Vec<keymap::Scope> = Vec::new();
+        let mut used = 0usize;
+        for scope in scopes {
+            let rows = keymap::SHORTCUTS.iter().filter(|s| s.scope == scope).count() + 1;
+            if used + rows / 2 <= total / 2 || left.is_empty() {
+                left.push(scope);
+                used += rows;
+            } else {
+                right.push(scope);
+            }
+        }
+
+        let render_column = |scopes: &[keymap::Scope]| {
+            let mut column = div().flex().flex_col().gap_1().w(px(400.));
+            for scope in scopes {
+                column = column
+                    .child(div().mt_2().text_color(theme.text_muted).child(scope.title()));
+                for sc in keymap::SHORTCUTS.iter().filter(|s| s.scope == *scope) {
+                    column = column.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(150.))
+                                    .flex_shrink_0()
+                                    .text_color(theme.text_primary)
+                                    .child(keymap::pretty(sc.chord)),
+                            )
+                            .child(div().text_color(theme.text_muted).child(sc.label)),
+                    );
+                }
+            }
+            column
+        };
+        panel = panel.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_4()
+                .child(render_column(&left))
+                .child(render_column(&right)),
+        );
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|view, _, _, cx| {
+                    view.shortcuts_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(panel)
+            .into_any_element()
+    }
+
     fn on_format_sql(&mut self, _: &FormatSql, _window: &mut Window, cx: &mut Context<Self>) {
         if self.modal.is_some() {
             return;
@@ -8659,6 +9032,7 @@ impl AppView {
                 .spawn(async move { dbc_state::schema_cache::load::<SchemaSnapshot>(&c, &d) });
             let (c, d) = (conn_id.clone(), db.clone());
             let (served, done) = (served_from_cache.clone(), fetch_done.clone());
+            let cache_started = std::time::Instant::now();
             cx.spawn(async move |this, cx| {
                 let Some(cached) = load.await else { return };
                 let _ = this.update(cx, |view, cx| {
@@ -8666,6 +9040,12 @@ impl AppView {
                         return;
                     }
                     served.set(true);
+                    dbc_state::applog::log(dbc_state::applog::Event::SchemaFromCache {
+                        conn: c.clone(),
+                        db: Some(d.clone()),
+                        tables: cached.tables.len(),
+                        ms: cache_started.elapsed().as_millis() as u64,
+                    });
                     view.tree
                         .update(cx, |t, cx| t.finish_schema(&c, &d, my_generation, Ok(cached), cx));
                 });
@@ -9804,6 +10184,131 @@ impl AppView {
     /// to „what just happened" is always at the end. The path is the first
     /// line so the file can be opened outside the app too — which is the
     /// only way to read it after a crash.
+    // -----------------------------------------------------------------
+    // Connection folders. The decisions live in `crate::folders`, which is
+    // pure and tested; everything here is dialog plumbing and one save.
+    // -----------------------------------------------------------------
+
+    /// Writes the connection list and folder list back to `config.toml`.
+    ///
+    /// Guarded like every other writer in this file: a config that failed
+    /// to PARSE must never be overwritten with what is in memory, because
+    /// what is in memory would then be a default that has quietly eaten
+    /// every saved connection.
+    fn save_folder_state(&mut self, cx: &mut Context<Self>) {
+        if let Some(guard) = self.guard_corrupt_config(cx) {
+            if let Err(e) = self.config.save(&self.config_path, &guard) {
+                self.status = format!("error: složky se nepodařilo uložit: {e}");
+                return;
+            }
+        }
+        self.refresh_grouped_cache(cx);
+        let grouped = self.grouped_cache.clone();
+        self.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
+        cx.notify();
+    }
+
+    fn open_folder_name(
+        &mut self,
+        rename_of: Option<Vec<String>>,
+        parent: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let initial = rename_of.as_ref().and_then(|p| p.last().cloned()).unwrap_or_default();
+        let field = cx.new(|cx| {
+            let f = connections_ui::TextField::form_field(cx, "Název", false);
+            f
+        });
+        field.update(cx, |f, cx| f.set_text(&initial, cx));
+        self.modal = Some(connections_ui::ModalState::FolderName {
+            rename_of,
+            parent,
+            field,
+            error: None,
+        });
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    pub(crate) fn confirm_folder_name(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::FolderName { rename_of, parent, field, .. }) =
+            self.modal.clone()
+        else {
+            return;
+        };
+        let name = field.read(cx).text();
+        let outcome = match &rename_of {
+            None => folders::create(&self.config.connections, &self.config.folders, &parent, &name)
+                .map(|folders| (self.config.connections.clone(), folders)),
+            Some(path) => {
+                folders::rename(&self.config.connections, &self.config.folders, path, &name)
+            }
+        };
+        match outcome {
+            Ok((conns, folders)) => {
+                self.config.connections = conns;
+                self.config.folders = folders;
+                self.modal = None;
+                self.status = match rename_of {
+                    Some(_) => "Složka přejmenována".to_string(),
+                    None => "Složka vytvořena".to_string(),
+                };
+                self.save_folder_state(cx);
+            }
+            Err(e) => {
+                if let Some(connections_ui::ModalState::FolderName { error, .. }) = &mut self.modal
+                {
+                    *error = Some(e.message().to_string());
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn open_folder_delete(&mut self, path: Vec<String>, cx: &mut Context<Self>) {
+        let moving = self
+            .config
+            .connections
+            .iter()
+            .filter(|c| folders::is_under(&c.folder, &path))
+            .count();
+        self.modal = Some(connections_ui::ModalState::FolderDeleteConfirm { path, moving });
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    pub(crate) fn confirm_folder_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::FolderDeleteConfirm { path, .. }) = self.modal.clone()
+        else {
+            return;
+        };
+        let (conns, folders, moved) =
+            folders::delete(&self.config.connections, &self.config.folders, &path);
+        self.config.connections = conns;
+        self.config.folders = folders;
+        self.modal = None;
+        self.status = match moved {
+            0 => "Složka smazána".to_string(),
+            n => format!("Složka smazána, {n} připojení přesunuto o úroveň výš"),
+        };
+        self.save_folder_state(cx);
+    }
+
+    fn move_connection_to_folder(
+        &mut self,
+        conn_id: String,
+        folder: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.config.connections.iter().find(|c| c.id == conn_id).map(|c| c.folder.clone());
+        if before.as_deref() == Some(folder.as_slice()) {
+            return;
+        }
+        self.config.connections = folders::move_connection(&self.config.connections, &conn_id, &folder);
+        self.status = format!("Přesunuto do {}", crate::folders::label(&folder));
+        self.save_folder_state(cx);
+    }
+
     fn open_log_tab(&mut self, cx: &mut Context<Self>) {
         const TAIL_BYTES: usize = 64 * 1024;
         // `Tabs::open` does NOT dedupe by `preview_key` — the codebase's
@@ -10544,6 +11049,15 @@ impl AppView {
             }
             TreeEvent::OpenAdmin => {
                 self.open_admin_tab(cx);
+            }
+            TreeEvent::FolderCreate { parent } => self.open_folder_name(None, parent.clone(), cx),
+            TreeEvent::FolderRename { path } => {
+                let parent = path[..path.len().saturating_sub(1)].to_vec();
+                self.open_folder_name(Some(path.clone()), parent, cx)
+            }
+            TreeEvent::FolderDelete { path } => self.open_folder_delete(path.clone(), cx),
+            TreeEvent::MoveConnectionToFolder { conn_id, folder } => {
+                self.move_connection_to_folder(conn_id.clone(), folder.clone(), cx)
             }
             TreeEvent::LoadDatabases { conn_id } => self.start_db_list_fetch(conn_id.clone(), cx),
             TreeEvent::LoadSchema { conn_id, db } => {
@@ -12559,8 +13073,11 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_open_autocomplete))
             .on_action(cx.listener(Self::on_save_script))
             .on_action(cx.listener(Self::on_format_sql))
-            .on_action(cx.listener(Self::on_format_sql))
-            .child(self.render_top_bar(cx))
+            .on_action(cx.listener(Self::on_show_shortcuts))
+            .on_action(cx.listener(Self::on_focus_editor))
+            .on_action(cx.listener(Self::on_focus_tree))
+            .on_action(cx.listener(Self::on_focus_results))
+            .child(self.render_top_bar(window, cx))
             .child(body);
 
         // Mouse tracking lives on the ROOT, not on the splitter: once the
@@ -12705,6 +13222,8 @@ impl Render for AppView {
                 })
                 .child(div().flex_1().child(self.status.clone())),
         );
+        // Below the status bar: the always-visible hint strip.
+        root = root.child(self.render_shortcut_strip(window, cx));
 
         if self.dropdown_open && self.modal.is_none() {
             root = root.child(self.render_dropdown_overlay(cx));
@@ -12728,6 +13247,17 @@ impl Render for AppView {
         // up).
         if let Some(overlay) = self.render_autocomplete_popup(cx) {
             root = root.child(overlay);
+        }
+        // Truly last: the cheat sheet is the one overlay you might open to
+        // find out how to get rid of whatever else is on screen.
+        if self.app_menu_open {
+            root = root.child(self.render_app_menu_overlay(cx));
+        }
+        if self.about_open {
+            root = root.child(self.render_about_overlay(cx));
+        }
+        if self.shortcuts_open {
+            root = root.child(self.render_shortcuts_overlay(cx));
         }
         root
     }
@@ -13032,6 +13562,11 @@ fn main() {
             // Ctrl+Shift+F: the shape every other editor uses for "format
             // document". Ctrl+F is left free for a future find.
             KeyBinding::new("ctrl-shift-f", FormatSql, None),
+            // F1 is the one key every Windows app spends on help.
+            KeyBinding::new("f1", ShowShortcuts, None),
+            KeyBinding::new("ctrl-1", FocusEditor, None),
+            KeyBinding::new("ctrl-2", FocusTree, None),
+            KeyBinding::new("ctrl-3", FocusResults, None),
         ]);
         sql_input::bind_keys(cx);
         grid::bind_keys(cx);
@@ -13051,6 +13586,12 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(gpui::TitlebarOptions {
                         title: Some(format!("dbc v{}", env!("CARGO_PKG_VERSION")).into()),
+                        // The system title bar is gone; `render_top_bar`
+                        // draws its own, controls included (user request,
+                        // 2026-08-31 — the Zed look). The title is still
+                        // set because it is what the taskbar and Alt+Tab
+                        // show, and those are still the platform's.
+                        appears_transparent: true,
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -13059,7 +13600,10 @@ fn main() {
                     cx.new(|cx| {
                         let sql = cx.new(|cx| SqlInput::new(cx, "Type SQL, then Ctrl+Enter…"));
                         window.focus(&sql.focus_handle(cx), cx);
-                        let grouped_cache = connections_ui::group_connections(&config.connections);
+                        let grouped_cache = connections_ui::group_connections_with(
+                            &config.connections,
+                            &config.folders,
+                        );
                         // config.toml corruption takes priority (it blocks
                         // saving/editing connections outright); a history
                         // open failure is a lesser, non-blocking notice; a
@@ -13138,6 +13682,9 @@ fn main() {
                             history_width,
                             history_resizing: None,
                             pending_menu_action: None,
+                            shortcuts_open: false,
+                            app_menu_open: false,
+                            about_open: false,
                             sidebar_fetch_generation: 0,
                             compare_fetch_generation: 0,
                             history,
@@ -14517,6 +15064,104 @@ mod autocomplete_handles_action_tests {
 /// `#[must_use]` on `guard_corrupt_config` (T10 carry-forward 1) is the
 /// compiler half of the same rail: this test proves the call is THERE, the
 /// attribute proves its verdict is not thrown away.
+/// Keeps `keymap::SHORTCUTS` honest against the real `KeyBinding::new`
+/// calls. See `keymap.rs` for why the help is generated rather than
+/// written: shortcut documentation maintained by hand is wrong within a
+/// month, and wrong help costs more than no help.
+///
+/// Source-text audits, like `config_save_guard_audit` and
+/// `editor_clobber_audit` next door — not compiler rails. What they buy is
+/// that drift cannot land quietly.
+#[cfg(test)]
+mod keymap_audit {
+    use super::editor_clobber_audit::sources;
+    use crate::keymap::{SHORTCUTS, UNDOCUMENTED_GLOBALS};
+
+    /// `("chord", is_global)` for every binding registered anywhere in the
+    /// workspace.
+    fn bound_chords() -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        for (_, src) in sources() {
+            // The RAW source, not `code_lines`: that helper blanks string
+            // literal CONTENTS so audits cannot match text inside a string,
+            // and here the string contents ARE the thing being audited.
+            // Comment lines are skipped by hand instead — the one case
+            // `code_lines` was protecting against.
+            for line in src.lines() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let Some(rest) = line.split("KeyBinding::new(").nth(1) else { continue };
+                let Some(chord) = rest.strip_prefix('"').and_then(|r| r.split('"').next()) else {
+                    continue;
+                };
+                // Everything after the chord on the same line; a binding is
+                // global when its context argument is `None`.
+                let tail = rest.split('"').nth(2).unwrap_or("");
+                out.push((chord.to_string(), tail.contains("None")));
+            }
+        }
+        out
+    }
+
+    /// The audit is worthless if the scan finds nothing — the same
+    /// non-vacuity check the neighbouring audits carry.
+    #[test]
+    fn the_scan_actually_finds_the_bindings() {
+        let bound = bound_chords();
+        assert!(bound.len() > 50, "only found {} bindings", bound.len());
+        assert!(bound.iter().any(|(c, g)| c == "ctrl-enter" && *g));
+        assert!(bound.iter().any(|(c, g)| c == "ctrl-f" && !*g), "ctrl-f is grid-scoped");
+    }
+
+    /// No lies: the cheat sheet may not advertise a key that does nothing.
+    #[test]
+    fn every_documented_shortcut_is_actually_bound() {
+        let bound = bound_chords();
+        for sc in SHORTCUTS {
+            assert!(
+                bound.iter().any(|(c, _)| c == sc.chord),
+                "keymap documents {:?} ({}) but nothing binds it",
+                sc.chord,
+                sc.label
+            );
+        }
+    }
+
+    /// No secrets: a shortcut that works EVERYWHERE and is written down
+    /// nowhere is a feature only its author can use. Adding one forces a
+    /// choice — document it, or name it in `UNDOCUMENTED_GLOBALS` with a
+    /// reason.
+    #[test]
+    fn every_global_chord_is_documented_or_deliberately_hidden() {
+        for (chord, global) in bound_chords() {
+            if !global {
+                continue;
+            }
+            let documented = SHORTCUTS.iter().any(|s| s.chord == chord);
+            let exempt = UNDOCUMENTED_GLOBALS.contains(&chord.as_str());
+            assert!(
+                documented || exempt,
+                "{chord:?} is bound globally but appears in neither keymap::SHORTCUTS nor \
+                 keymap::UNDOCUMENTED_GLOBALS - document it or say why not"
+            );
+        }
+    }
+
+    /// An exemption for a chord nobody binds any more is stale advice about
+    /// a key that no longer exists.
+    #[test]
+    fn no_exemption_outlives_its_binding() {
+        let bound = bound_chords();
+        for chord in UNDOCUMENTED_GLOBALS {
+            assert!(
+                bound.iter().any(|(c, _)| c == chord),
+                "{chord:?} is exempted but nothing binds it - drop the exemption"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod sidebar_width_tests {
     use super::*;
@@ -14661,7 +15306,16 @@ mod config_save_guard_audit {
         // test's own loop verifies by position), drag END only, and the
         // same equality check so a bare click on the splitter writes
         // nothing.
-        assert_eq!(sites, 9, "config.toml writer count changed — re-audit, do not just bump");
+        //
+        // 9 → 10 on 2026-08-31: `save_folder_state` persists the connection
+        // list and `AppConfig::folders` after a folder is created, renamed,
+        // deleted, or a connection is dragged between folders. Re-audited,
+        // not bumped: the write sits inside the
+        // `if let Some(guard) = self.guard_corrupt_config(cx)` arm (which
+        // this test's own loop verifies by POSITION, not by counting), and
+        // it is the single funnel every folder operation goes through — so
+        // there is one writer here, not four.
+        assert_eq!(sites, 10, "config.toml writer count changed — re-audit, do not just bump");
     }
 
     /// The widening is only worth anything if it actually reaches past the

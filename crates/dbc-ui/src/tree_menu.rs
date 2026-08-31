@@ -160,13 +160,33 @@ pub fn menu_for(row: &SidebarRow, ctx: &MenuCtx) -> Vec<MenuEntry> {
             MenuEntry::Separator,
             danger("Smazat…", TreeEvent::ScriptDelete { rel: rel.clone(), is_dir: false }),
         ],
-        // A folder is a client-side grouping of saved connections, and a
-        // notice row is a status message. Neither is a database object and
-        // neither has an action that is not already on its children.
-        SidebarRow::Folder { .. } | SidebarRow::Notice { .. } | SidebarRow::ScriptNotice { .. } => {
-            Vec::new()
-        }
+        SidebarRow::Folder { path } => folder_menu(path),
+        // A notice row is a status message, not an object.
+        SidebarRow::Notice { .. } | SidebarRow::ScriptNotice { .. } => Vec::new(),
     }
+}
+
+/// A folder holds saved connections, which live in `config.toml` — nothing
+/// here touches a database, so nothing here is gated on `read_only`, which
+/// is about the SERVER.
+///
+/// „Smazat" is marked `danger` for its weight, not its blast radius:
+/// deleting a folder moves its connections to the parent and destroys
+/// none of them (see `folders::delete`). The confirm says so, because
+/// „Smazat složku" on a folder full of connections reads like a threat.
+fn folder_menu(path: &[String]) -> Vec<MenuEntry> {
+    let p = path.to_vec();
+    vec![
+        item("Nová podsložka…", TreeEvent::FolderCreate { parent: p.clone() }),
+        MenuEntry::Separator,
+        item("Přejmenovat…", TreeEvent::FolderRename { path: p.clone() }),
+        item(
+            "Kopírovat cestu",
+            TreeEvent::CopyText { what: "cesta".into(), text: p.join("/") },
+        ),
+        MenuEntry::Separator,
+        danger("Smazat složku…", TreeEvent::FolderDelete { path: p }),
+    ]
 }
 
 fn connection_menu(conn_id: &str, ctx: &MenuCtx) -> Vec<MenuEntry> {
@@ -799,6 +819,28 @@ mod tests {
         );
     }
 
+    /// A folder row used to have no menu at all — folders were implicit and
+    /// there was nothing to do to one.
+    #[test]
+    fn a_folder_offers_the_four_things_you_can_do_to_a_folder() {
+        let sn = snap();
+        let row = SidebarRow::Folder { path: vec!["work".into()] };
+        let m = menu_for(&row, &ctx(&sn, false));
+        let l = labels(&m);
+        assert!(l.iter().any(|x| x.starts_with("Nová podsložka")), "{l:?}");
+        assert!(l.iter().any(|x| x.starts_with("Přejmenovat")), "{l:?}");
+        assert!(l.iter().any(|x| x.starts_with("Smazat složku")), "{l:?}");
+    }
+
+    /// Folders hold saved connections, not server objects — the read-only
+    /// flag is about the SERVER and must not disable tidying up locally.
+    #[test]
+    fn a_read_only_connection_can_still_organise_its_folders() {
+        let sn = snap();
+        let row = SidebarRow::Folder { path: vec!["work".into()] };
+        assert_eq!(menu_for(&row, &ctx(&sn, true)).len(), menu_for(&row, &ctx(&sn, false)).len());
+    }
+
     /// Dropping a database is intentionally not offered here — „Správa
     /// serveru" owns it, with its CASCADE warning.
     #[test]
@@ -814,7 +856,6 @@ mod tests {
     fn rows_that_are_not_objects_have_no_menu() {
         let s = snap();
         for row in [
-            SidebarRow::Folder { path: vec!["work".into()] },
             SidebarRow::Notice {
                 conn_id: "c1".into(),
                 db: None,
