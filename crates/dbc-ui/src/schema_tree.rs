@@ -735,6 +735,28 @@ fn all_node_ids(snapshot: &SchemaSnapshot) -> HashSet<NodeId> {
             out.insert(NodeId::Sequence(schema_name.clone(), s.name.clone()));
         }
     }
+
+    // The SAME sections as they are keyed in Kind grouping mode, where one
+    // section holds every schema's objects and is therefore owned by
+    // `KIND_SECTION_OWNER` rather than a schema name.
+    //
+    // Without this, every id this function is asked about in Kind mode is
+    // „not in the snapshot" — so `prune_stale_ids` dropped them, and a ⟳
+    // refresh silently collapsed every section. That is a PRE-EXISTING bug
+    // on the refresh path, not only on the session restore that surfaced
+    // it (user report 2026-08-31: „tabulky nejsou rozbalené"). Table,
+    // routine and column ids were never affected: they key off the real
+    // schema in BOTH modes — only section ownership differs.
+    let kind_sections: Vec<NodeId> = out
+        .iter()
+        .filter_map(|id| match id {
+            NodeId::Section(owner, label) if owner != KIND_SECTION_OWNER => {
+                Some(NodeId::Section(KIND_SECTION_OWNER.to_string(), label))
+            }
+            _ => None,
+        })
+        .collect();
+    out.extend(kind_sections);
     out
 }
 
@@ -3848,6 +3870,47 @@ mod flatten_tests {
     }
 
     // --- review Issue 3: same-connection refresh state preservation ---
+
+    /// PRE-EXISTING BUG, found via the session restore (user report
+    /// 2026-08-31 „tabulky nejsou rozbalené"): in Kind grouping mode the
+    /// section rows are owned by `KIND_SECTION_OWNER`, but `all_node_ids`
+    /// only ever produced schema-owned ones — so `prune_stale_ids` called
+    /// every Kind-mode section stale and a ⟳ refresh collapsed the whole
+    /// sidebar. Restoring a session hit exactly the same wall.
+    #[test]
+    fn kind_mode_section_ids_survive_a_refresh() {
+        let snap = SchemaSnapshot {
+            tables: vec![table(Some("api"), "C_Data_View", TableKind::Table, vec![col("id", "INT")])],
+            ..Default::default()
+        };
+        let mut expanded = HashSet::new();
+        expanded.insert(NodeId::Section(KIND_SECTION_OWNER.to_string(), "Tabulky"));
+        expanded.insert(NodeId::Table("api".into(), "C_Data_View".into()));
+        let (kept, _) = prune_stale_ids(&expanded, &None, &snap);
+        assert!(
+            kept.contains(&NodeId::Section(KIND_SECTION_OWNER.to_string(), "Tabulky")),
+            "the Kind-mode section was pruned away: {kept:?}"
+        );
+        assert!(kept.contains(&NodeId::Table("api".into(), "C_Data_View".into())));
+    }
+
+    /// …and the pruning still prunes. A section the snapshot cannot
+    /// produce must be dropped in EITHER mode, or the fix above would just
+    /// be „accept everything".
+    #[test]
+    fn a_section_the_snapshot_cannot_produce_is_still_dropped() {
+        let snap = SchemaSnapshot {
+            tables: vec![table(Some("api"), "t", TableKind::Table, vec![col("id", "INT")])],
+            ..Default::default()
+        };
+        let mut expanded = HashSet::new();
+        // No sequences in the snapshot, so „Sekvence" cannot render.
+        expanded.insert(NodeId::Section(KIND_SECTION_OWNER.to_string(), "Sekvence"));
+        expanded.insert(NodeId::Section("api".into(), "Sekvence"));
+        expanded.insert(NodeId::Table("api".into(), "gone".into()));
+        let (kept, _) = prune_stale_ids(&expanded, &None, &snap);
+        assert!(kept.is_empty(), "nothing here exists in the snapshot: {kept:?}");
+    }
 
     #[test]
     fn all_node_ids_covers_every_kind_including_indexes_and_multi_schema() {
