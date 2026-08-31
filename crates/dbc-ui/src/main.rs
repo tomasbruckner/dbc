@@ -12942,7 +12942,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_focus_editor))
             .on_action(cx.listener(Self::on_focus_tree))
             .on_action(cx.listener(Self::on_focus_results))
-            .child(self.render_top_bar(cx))
+            .child(self.render_top_bar(window, cx))
             .child(body);
 
         // Mouse tracking lives on the ROOT, not on the splitter: once the
@@ -13451,6 +13451,12 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(gpui::TitlebarOptions {
                         title: Some(format!("dbc v{}", env!("CARGO_PKG_VERSION")).into()),
+                        // The system title bar is gone; `render_top_bar`
+                        // draws its own, controls included (user request,
+                        // 2026-08-31 — the Zed look). The title is still
+                        // set because it is what the taskbar and Alt+Tab
+                        // show, and those are still the platform's.
+                        appears_transparent: true,
                         ..Default::default()
                     }),
                     ..Default::default()

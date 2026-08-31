@@ -1797,16 +1797,27 @@ impl AppView {
     ///     and Ctrl+H were the only handles, and an invisible control is no
     ///     control. Both panels now have a toggle here, lit when the panel
     ///     is open.
-    pub(crate) fn render_top_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_top_bar(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let label = self.current_connection_label();
         let theme = *cx.theme();
         let format_enabled = self.active_engine().is_some();
         let (tree_on, history_on) = (self.tree_visible, self.history_visible);
+        let maximized = window.is_maximized();
 
         div()
             .id("top-bar")
+            // The whole bar drags the window — this IS the title bar now,
+            // and a title bar you cannot drag the window by is a broken
+            // one. Every clickable thing on it calls `.occlude()`, which is
+            // what keeps a click on a button from being read as a click on
+            // the caption.
+            .window_control_area(gpui::WindowControlArea::Drag)
             .h(px(34.))
-            .px_1()
+            .pl_1()
             .gap_1()
             .flex()
             .flex_row()
@@ -1832,6 +1843,7 @@ impl AppView {
             .child(
                 div()
                     .id("top-bar-connection")
+                    .occlude()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -1882,10 +1894,16 @@ impl AppView {
             .child(bar_separator(theme))
             .child(
                 div()
-                    .pr_1()
+                    .pr_2()
                     .text_color(theme.text_faint)
                     .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
             )
+            .child(caption_button(CaptionButton::Minimize, theme))
+            .child(caption_button(
+                if maximized { CaptionButton::Restore } else { CaptionButton::Maximize },
+                theme,
+            ))
+            .child(caption_button(CaptionButton::Close, theme))
     }
 
     pub(crate) fn render_dropdown_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -3954,6 +3972,75 @@ fn render_pw_change_panel(
     panel.into_any_element()
 }
 
+/// Minimise / maximise / close, drawn by us because the system title bar
+/// is switched off.
+///
+/// No `on_click`: the platform performs these. Declaring the area is the
+/// whole mechanism — Windows hit-tests the region and handles the press
+/// itself, which is also why these keep working while the app is busy.
+#[derive(Clone, Copy)]
+enum CaptionButton {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
+impl CaptionButton {
+    /// Segoe Fluent Icons code points — the same glyphs every Windows 11
+    /// window uses, so the buttons are the ones muscle memory expects
+    /// rather than a hand-drawn approximation.
+    fn glyph(self) -> &'static str {
+        match self {
+            CaptionButton::Minimize => "\u{e921}",
+            CaptionButton::Restore => "\u{e923}",
+            CaptionButton::Maximize => "\u{e922}",
+            CaptionButton::Close => "\u{e8bb}",
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            CaptionButton::Minimize => "caption-min",
+            CaptionButton::Restore | CaptionButton::Maximize => "caption-max",
+            CaptionButton::Close => "caption-close",
+        }
+    }
+
+    fn area(self) -> gpui::WindowControlArea {
+        match self {
+            CaptionButton::Minimize => gpui::WindowControlArea::Min,
+            CaptionButton::Restore | CaptionButton::Maximize => gpui::WindowControlArea::Max,
+            CaptionButton::Close => gpui::WindowControlArea::Close,
+        }
+    }
+}
+
+fn caption_button(kind: CaptionButton, theme: crate::theme::Theme) -> gpui::Stateful<Div> {
+    // The Windows close button turns red on hover and white on top. That is
+    // not decoration — it is how you know which of three identical-looking
+    // boxes ends the session.
+    let close_red: gpui::Hsla = gpui::rgb(0xe81123).into();
+    let (hover_bg, hover_fg) = match kind {
+        CaptionButton::Close => (close_red, gpui::white()),
+        _ => (theme.bg_hover, theme.text_primary),
+    };
+    div()
+        .id(kind.id())
+        .occlude()
+        .window_control_area(kind.area())
+        .w(px(46.))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family("Segoe Fluent Icons")
+        .text_size(px(10.))
+        .text_color(theme.text_muted)
+        .hover(|st| st.bg(hover_bg).text_color(hover_fg))
+        .child(kind.glyph())
+}
+
 /// One top-bar control. `active` lights it as an on/off state (the panel
 /// toggles); `enabled` dims it and is otherwise cosmetic — every caller
 /// whose action can refuse still refuses at click time, which is this
@@ -3972,6 +4059,10 @@ fn bar_button(
     };
     div()
         .id(id)
+        // Every top-bar button sits inside the window's drag area, so it
+        // has to declare itself as something other than caption or the
+        // platform swallows the click.
+        .occlude()
         .px_2()
         .py(px(3.))
         .rounded_md()
