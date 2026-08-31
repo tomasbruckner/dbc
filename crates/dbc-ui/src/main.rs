@@ -62,6 +62,7 @@ mod keymap;
 mod sql_input;
 mod tabs;
 mod text_model;
+mod text_view;
 mod theme;
 mod tunnel;
 
@@ -81,9 +82,9 @@ use dbc_state::{
 };
 use gpui::{
     actions, div, prelude::*, px, size, uniform_list, AnyElement, App, Bounds, ClipboardItem,
-    Context, Entity, FocusHandle, Focusable, KeyBinding, PathPromptOptions, ScrollDelta,
-    ScrollWheelEvent,
-    Window, WindowBounds, WindowOptions,
+    Context, Entity, FocusHandle, Focusable, HighlightStyle, KeyBinding, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollDelta,
+    ScrollWheelEvent, StyledText, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use grid::{GridEvent, ResultGrid};
@@ -123,9 +124,30 @@ actions!(
         // save-as. Global, context `None`, same posture as `RunQuery`.
         SaveScript,
         /// Pretty-print the editor buffer (user request 2026-08-28).
-        FormatSql
+        FormatSql,
+        /// Read-only text tabs (Log, DDL). Scoped to the `"TextView"` key
+        /// context, never global: Ctrl+C already means something in the
+        /// editor and in the grid, and the cheat sheet deliberately does
+        /// not list chords everyone already knows.
+        TextViewCopy,
+        TextViewSelectAll
     ]
 );
+
+/// A mouse selection inside a read-only text tab.
+///
+/// `tab_id`, not „the active tab": a selection belongs to the text it was
+/// dragged over, so switching tabs and coming back must not paint someone
+/// else's offsets over this tab's content — or, worse, copy them.
+struct TextSelection {
+    tab_id: u64,
+    /// Where the drag started, and where it currently is. Kept unordered
+    /// so extending a right-to-left drag back past the anchor works.
+    anchor: usize,
+    head: usize,
+    /// The mouse button is still down; `on_mouse_move` extends `head`.
+    dragging: bool,
+}
 
 /// G3 Task 5: Ctrl+K command palette state — created on `OpenPalette`,
 /// dropped on close/execute. `items`/`selected` are recomputed from
@@ -2292,6 +2314,22 @@ struct AppView {
     /// which focuses `modal_focus_handle`. Input-owning modals never set
     /// it — they keep focusing their own first field at open time.
     modal_needs_focus: bool,
+
+    // --- Selectable read-only text tabs (Log, DDL) ---
+    /// The mouse selection inside the active `TabContent::Text`, as byte
+    /// offsets into that tab's FULL text rather than the visible slice —
+    /// so scrolling neither moves nor forgets it.
+    text_selection: Option<TextSelection>,
+    /// The layout of the `StyledText` the last text tab render produced.
+    /// Turning a mouse position into a byte offset is the one thing only
+    /// GPUI can answer (`TextLayout::index_for_position`), so the handlers
+    /// need this handle; it is replaced on every text-tab render.
+    text_layout: Option<gpui::TextLayout>,
+    /// Focus for the text tab body. Ctrl+C means three different things in
+    /// this window (editor, grid, text tab), and a key context is how they
+    /// stop fighting over it.
+    text_focus: gpui::FocusHandle,
+
     // --- G6 Task 7: schema autocomplete popup ---
     /// `None` when the popup is closed — see `AutocompleteState`'s doc
     /// comment for the lazy-diff recompute idiom.
@@ -10308,6 +10346,76 @@ impl AppView {
         self.save_folder_state(cx);
     }
 
+    // -----------------------------------------------------------------
+    // Selection in read-only text tabs. The arithmetic is in
+    // `crate::text_view`, which is pure and tested; these four are the
+    // GPUI half — a hit test, a drag latch, and two actions.
+    // -----------------------------------------------------------------
+
+    /// Byte offset into the tab's FULL text for a window position.
+    ///
+    /// `index_for_position` answers in coordinates of the visible slice
+    /// (that is all the layout knows about), so `vis_start` puts it back
+    /// into the whole document. `Err` is not a failure — it is the nearest
+    /// offset when the pointer is past the end of a line, which is exactly
+    /// what a drag wants.
+    ///
+    /// The layout panics if asked before it has been measured and
+    /// prepainted. Every caller is a mouse handler on the very element
+    /// that carries this layout, so the pointer being over it is proof it
+    /// painted.
+    fn text_offset_at(&self, position: Point<Pixels>, vis_start: usize) -> Option<usize> {
+        let layout = self.text_layout.as_ref()?;
+        let local = match layout.index_for_position(position) {
+            Ok(ix) | Err(ix) => ix,
+        };
+        Some(vis_start + local)
+    }
+
+    /// Mouse released: keep the selection, stop extending it.
+    fn end_text_drag(&mut self) {
+        if let Some(s) = self.text_selection.as_mut() {
+            s.dragging = false;
+        }
+    }
+
+    /// Ctrl+C, and the „Kopírovat" button. With nothing selected this
+    /// copies the whole text, which is what the button has always done.
+    fn on_text_copy(&mut self, _: &TextViewCopy, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active) = self.tabs.active() else { return };
+        let tab_id = active.id;
+        let TabContent::Text { text, .. } = &active.content else { return };
+        let selection = self
+            .text_selection
+            .as_ref()
+            .filter(|s| s.tab_id == tab_id)
+            .map(|s| text_view::ordered(text, s.anchor, s.head));
+        let out = text_view::copy_text(text, selection.as_ref());
+        let chars = out.chars().count();
+        let whole = selection.is_none_or(|r| r.is_empty());
+        cx.write_to_clipboard(ClipboardItem::new_string(out));
+        self.status = if whole {
+            format!("Zkopírováno celé ({chars} znaků)")
+        } else {
+            format!("Zkopírován výběr ({chars} znaků)")
+        };
+        cx.notify();
+    }
+
+    fn on_text_select_all(
+        &mut self,
+        _: &TextViewSelectAll,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.tabs.active() else { return };
+        let tab_id = active.id;
+        let TabContent::Text { text, .. } = &active.content else { return };
+        let head = text.len();
+        self.text_selection = Some(TextSelection { tab_id, anchor: 0, head, dragging: false });
+        cx.notify();
+    }
+
     /// Opens the tail of the diagnostic log as a text tab.
     ///
     /// The tail rather than the whole file: the cap is 2 MiB and the answer
@@ -10340,7 +10448,7 @@ impl AppView {
             pinned: false,
             preview_key: Some(LOG_PREVIEW_KEY.to_string()),
             conn_identity: self.current_conn_identity(),
-            content: TabContent::Text { text: body, scroll_lines: 0 },
+            content: TabContent::Text { text: text_view::normalize(&body), scroll_lines: 0 },
         });
         self.status = format!("Log: {where_}");
         cx.notify();
@@ -10430,7 +10538,7 @@ impl AppView {
                 pinned: false,
                 preview_key: None,
                 conn_identity: self.current_conn_identity(),
-                content: TabContent::Text { text: ddl.clone(), scroll_lines: 0 },
+                content: TabContent::Text { text: text_view::normalize(ddl), scroll_lines: 0 },
             });
             self.status = format!("DDL otevřeno: {title}");
             cx.notify();
@@ -11014,7 +11122,7 @@ impl AppView {
                     // Never editable/Grid — the identity is inert here, but
                     // every `ResultTab` needs a value (see its doc comment).
                     conn_identity: self.current_conn_identity(),
-                    content: TabContent::Text { text: ddl.clone(), scroll_lines: 0 },
+                    content: TabContent::Text { text: text_view::normalize(ddl), scroll_lines: 0 },
                 });
                 self.status = format!("DDL otevřeno: {title}");
                 cx.notify();
@@ -11423,19 +11531,93 @@ impl AppView {
                 grid.clone().into_any_element()
             }
             TabContent::Text { text, scroll_lines } => {
-                let lines: Vec<&str> = text.lines().collect();
-                let scroll = (*scroll_lines).min(lines.len());
-                let text_for_copy = text.clone();
+                let tab_id = active.id;
+                let full = text.clone();
+                let visible = text_view::visible_span(&full, *scroll_lines);
+                let vis_start = visible.start;
 
-                let mut body = div()
+                // One `StyledText` rather than one `div` per line: a div
+                // cannot be selected, and `TextLayout` is the only thing
+                // that can turn a mouse position into a byte offset.
+                let mut styled = StyledText::new(full[visible.clone()].to_string());
+                if let Some(range) = self
+                    .text_selection
+                    .as_ref()
+                    .filter(|s| s.tab_id == tab_id)
+                    .map(|s| text_view::ordered(&full, s.anchor, s.head))
+                    .and_then(|sel| text_view::clip_to_visible(&sel, &visible))
+                {
+                    styled = styled.with_highlights([(
+                        range,
+                        HighlightStyle {
+                            background_color: Some(theme.bg_selection),
+                            ..Default::default()
+                        },
+                    )]);
+                }
+                // Kept so the mouse handlers below can hit-test this exact
+                // layout. Replaced every time a text tab renders, which is
+                // also the only time anything reads it.
+                self.text_layout = Some(styled.layout().clone());
+
+                let body = div()
                     .id("tab-text-body")
+                    .key_context("TextView")
+                    .track_focus(&self.text_focus)
                     .font_family("Consolas")
                     .flex()
                     .flex_col()
                     .flex_1()
                     .overflow_hidden()
                     .p_2()
+                    .cursor_text()
                     .text_color(theme.text_primary)
+                    .on_action(cx.listener(Self::on_text_copy))
+                    .on_action(cx.listener(Self::on_text_select_all))
+                    // `track_focus` alone does NOT focus on click (the same
+                    // trap the SQL editor hit) — without this, Ctrl+C after
+                    // a drag would still go to whatever had focus before.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, e: &MouseDownEvent, window, cx| {
+                            window.focus(&view.text_focus, cx);
+                            if let Some(ix) = view.text_offset_at(e.position, vis_start) {
+                                view.text_selection = Some(TextSelection {
+                                    tab_id,
+                                    anchor: ix,
+                                    head: ix,
+                                    dragging: true,
+                                });
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |view, e: &MouseMoveEvent, _, cx| {
+                        let extending = view
+                            .text_selection
+                            .as_ref()
+                            .is_some_and(|s| s.dragging && s.tab_id == tab_id);
+                        if !extending {
+                            return;
+                        }
+                        if let Some(ix) = view.text_offset_at(e.position, vis_start) {
+                            if let Some(s) = view.text_selection.as_mut() {
+                                s.head = ix;
+                            }
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|view, _: &MouseUpEvent, _, _| view.end_text_drag()),
+                    )
+                    // Releasing outside the body has to end the drag too,
+                    // or the next mouse-move over the text would keep
+                    // extending a selection the user finished long ago.
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|view, _: &MouseUpEvent, _, _| view.end_text_drag()),
+                    )
                     .on_scroll_wheel(cx.listener(|view, e: &ScrollWheelEvent, _, cx| {
                         let delta_lines = match e.delta {
                             ScrollDelta::Lines(p) => p.y,
@@ -11450,10 +11632,8 @@ impl AppView {
                             *scroll_lines = new_scroll.max(0.0).min(max_scroll as f32) as usize;
                         }
                         cx.notify();
-                    }));
-                for line in &lines[scroll..] {
-                    body = body.child(div().child(line.to_string()));
-                }
+                    }))
+                    .child(styled);
 
                 let mut header = div().flex().flex_row().justify_end().gap_2().p_1();
                 if is_log {
@@ -11485,8 +11665,11 @@ impl AppView {
                                 .px_2()
                                 .rounded_md()
                                 .child("Kopírovat")
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(text_for_copy.clone()));
+                                // The same funnel as Ctrl+C, so the two can
+                                // never disagree about what „copy" means
+                                // when something is selected.
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.on_text_copy(&TextViewCopy, window, cx)
                                 })),
                         ),
                     )
@@ -13582,6 +13765,11 @@ fn main() {
             KeyBinding::new("ctrl-1", FocusEditor, None),
             KeyBinding::new("ctrl-2", FocusTree, None),
             KeyBinding::new("ctrl-3", FocusResults, None),
+            // Scoped to the text tab body, the same posture as the grid's
+            // own Ctrl+C: only reachable once that body holds focus, which
+            // happens when you click into it.
+            KeyBinding::new("ctrl-c", TextViewCopy, Some("TextView")),
+            KeyBinding::new("ctrl-a", TextViewSelectAll, Some("TextView")),
         ]);
         sql_input::bind_keys(cx);
         grid::bind_keys(cx);
@@ -13719,6 +13907,9 @@ fn main() {
                             script_save_in_flight: false,
                             modal_focus_handle: cx.focus_handle(),
                             modal_needs_focus: false,
+                            text_selection: None,
+                            text_layout: None,
+                            text_focus: cx.focus_handle(),
                             autocomplete: None,
                             last_ac_text: String::new(),
                             last_ac_cursor: 0,
