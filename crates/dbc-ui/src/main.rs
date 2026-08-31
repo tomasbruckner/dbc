@@ -6632,12 +6632,34 @@ impl AppView {
     /// of view — `cursor_screen_bounds`'s own documented degradation), or
     /// while a modal is open (belt and suspenders alongside
     /// `refresh_autocomplete`'s own guard).
+/// Popup width for the autocomplete list, from the longest label.
+///
+/// It used to be a flat 280 px, which the FK join suggestions immediately
+/// outgrew: their labels name a table and a join condition, so every row
+/// was cut off at the same place and two different joins onto the same
+/// table became indistinguishable (user report 2026-08-31).
+///
+/// 7 px per character is a deliberate over-estimate for the ~13 px UI font,
+/// so a proportional label lands inside rather than one character short.
+/// Both bounds matter: the floor keeps a list of short keywords from
+/// collapsing into a sliver, and the ceiling keeps one pathological
+/// identifier from throwing a popup across the whole window.
+fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
+    const CHAR_PX: f32 = 7.0;
+    const CHROME_PX: f32 = 34.0; // kind badge, padding, border
+    const MIN: f32 = 280.0;
+    const MAX: f32 = 720.0;
+    let longest = labels.map(|l| l.chars().count()).max().unwrap_or(0) as f32;
+    (longest * CHAR_PX + CHROME_PX).clamp(MIN, MAX)
+}
+
     fn render_autocomplete_popup(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.modal.is_some() {
             return None;
         }
         let ac = self.autocomplete.as_ref()?;
         let candidates = ac.candidates.clone();
+        let popup_w = Self::autocomplete_popup_width(candidates.iter().map(|c| c.label.as_str()));
         let selected = ac.selected;
         let bounds = self.sql.read(cx).cursor_screen_bounds()?;
         let theme = *cx.theme();
@@ -6694,7 +6716,7 @@ impl AppView {
                 .absolute()
                 .left(bounds.left())
                 .top(bounds.top() + bounds.size.height)
-                .w(px(280.))
+                .w(px(popup_w))
                 .max_h(ROW_H * 8)
                 .bg(theme.bg_panel)
                 .border_1()
@@ -15417,6 +15439,32 @@ mod keymap_audit {
                 "{chord:?} is exempted but nothing binds it - drop the exemption"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod autocomplete_popup_width_tests {
+    use super::AppView;
+
+    #[test]
+    fn a_long_join_label_widens_the_popup_past_the_old_fixed_width() {
+        let short = AppView::autocomplete_popup_width(["SELECT", "FROM"].into_iter());
+        let long = AppView::autocomplete_popup_width(
+            ["APP_Applied_Permission  —  APP_User.User_Id → permission_id"].into_iter(),
+        );
+        assert_eq!(short, 280.0, "short labels keep the floor");
+        assert!(long > 280.0, "the label that was being cut off still fits in {long}px");
+    }
+
+    #[test]
+    fn one_pathological_identifier_cannot_span_the_window() {
+        let huge = "x".repeat(500);
+        assert_eq!(AppView::autocomplete_popup_width([huge.as_str()].into_iter()), 720.0);
+    }
+
+    #[test]
+    fn an_empty_list_still_has_a_width() {
+        assert_eq!(AppView::autocomplete_popup_width(std::iter::empty()), 280.0);
     }
 }
 

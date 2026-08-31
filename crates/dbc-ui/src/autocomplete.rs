@@ -313,16 +313,21 @@ fn join_candidates(
 
     let mut out: Vec<(u8, u8, usize, Candidate)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut push = |target: &str, left: String, right: String, order: usize, out: &mut Vec<_>| {
+    // `right_col` is the column ON THE TARGET, so the target name is not
+    // repeated on both sides of the label. The popup is narrow and a
+    // label that runs off its right edge is worse than no label: two
+    // rows joining the same table through DIFFERENT columns then look
+    // identical (user report 2026-08-31, "ta napoveda je useknuta").
+    let mut push = |target: &str, left: String, right_col: &str, order: usize, out: &mut Vec<_>| {
         if bound.contains(&target.to_lowercase()) {
             return;
         }
         let Some((mt, ct)) = match_score(target, prefix) else { return };
-        let text = format!("{target} ON {left} = {right}");
+        let text = format!("{target} ON {left} = {target}.{right_col}");
         if !seen.insert(text.clone()) {
             return;
         }
-        let label = format!("{target}  —  {left} = {right}");
+        let label = format!("{target}  —  {left} → {right_col}");
         out.push((mt, ct, order, Candidate { text, label, kind: CandidateKind::Table }));
     };
 
@@ -335,13 +340,7 @@ fn join_candidates(
         // Outgoing: a column here points at another table.
         for col in &base.columns {
             let Some(fk) = &col.fk else { continue };
-            push(
-                &fk.table,
-                format!("{qual}.{}", col.name),
-                format!("{}.{}", fk.table, fk.column),
-                order,
-                &mut out,
-            );
+            push(&fk.table, format!("{qual}.{}", col.name), &fk.column, order, &mut out);
         }
 
         // Incoming: another table points here.
@@ -354,13 +353,7 @@ fn join_candidates(
                 if !fk.table.eq_ignore_ascii_case(&base.name) {
                     continue;
                 }
-                push(
-                    &other.name,
-                    format!("{qual}.{}", fk.column),
-                    format!("{}.{}", other.name, col.name),
-                    order,
-                    &mut out,
-                );
+                push(&other.name, format!("{qual}.{}", fk.column), &col.name, order, &mut out);
             }
         }
     }
@@ -1765,6 +1758,51 @@ mod tests {
     fn a_subquery_source_produces_no_join_suggestions() {
         let out = join_texts("SELECT * FROM (SELECT 1) x JOIN ");
         assert!(!out.iter().any(|t| t.contains(" ON ")), "{out:?}");
+    }
+
+    /// A label that runs off the popup's right edge is worse than no label:
+    /// two joins onto the SAME table through different columns then look
+    /// identical (user report 2026-08-31, „ta napoveda je useknuta").
+    #[test]
+    fn the_label_is_short_and_names_the_column_that_distinguishes_it() {
+        let s = snapshot_with_fks();
+        let sql = "SELECT * FROM orders o JOIN ";
+        let labels: Vec<String> = candidates(sql, sql.len(), Some(&s), false, false)
+            .into_iter()
+            .map(|c| c.label)
+            .collect();
+        // The target table is named once, not on both sides of the `=`.
+        assert!(labels.iter().any(|l| l.contains("customers") && l.contains("o.customer_id")));
+        assert!(
+            !labels.iter().any(|l| l.matches("customers").count() > 1),
+            "the target is repeated: {labels:?}"
+        );
+        assert!(
+            labels.iter().all(|l| l.chars().count() <= 60),
+            "a label too long for the popup: {labels:?}"
+        );
+    }
+
+    /// The distinguishing part must survive: two FKs from one table back to
+    /// another differ ONLY in the target column, so it has to be in the
+    /// label or the two rows are indistinguishable.
+    #[test]
+    fn two_fks_onto_the_same_table_get_different_labels() {
+        let mut s = snapshot_with_fks();
+        s.tables.push(TableInfo {
+            name: "audit".into(),
+            columns: vec![
+                ColumnInfo { name: "created_by".into(), fk: fk("orders", "id"), ..Default::default() },
+                ColumnInfo { name: "closed_by".into(), fk: fk("orders", "id"), ..Default::default() },
+            ],
+            ..Default::default()
+        });
+        let sql = "SELECT * FROM orders o JOIN au";
+        let labels: Vec<String> =
+            candidates(sql, sql.len(), Some(&s), false, false).into_iter().map(|c| c.label).collect();
+        let audit: Vec<&String> = labels.iter().filter(|l| l.starts_with("audit")).collect();
+        assert_eq!(audit.len(), 2, "{labels:?}");
+        assert_ne!(audit[0], audit[1], "both join paths render the same: {audit:?}");
     }
 
     #[test]
