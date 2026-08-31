@@ -41,6 +41,7 @@ mod schema_tree;
 mod scripts;
 mod sql_highlight;
 mod tree_menu;
+mod folders;
 mod keymap;
 mod sql_input;
 mod tabs;
@@ -10183,6 +10184,131 @@ impl AppView {
     /// to „what just happened" is always at the end. The path is the first
     /// line so the file can be opened outside the app too — which is the
     /// only way to read it after a crash.
+    // -----------------------------------------------------------------
+    // Connection folders. The decisions live in `crate::folders`, which is
+    // pure and tested; everything here is dialog plumbing and one save.
+    // -----------------------------------------------------------------
+
+    /// Writes the connection list and folder list back to `config.toml`.
+    ///
+    /// Guarded like every other writer in this file: a config that failed
+    /// to PARSE must never be overwritten with what is in memory, because
+    /// what is in memory would then be a default that has quietly eaten
+    /// every saved connection.
+    fn save_folder_state(&mut self, cx: &mut Context<Self>) {
+        if let Some(guard) = self.guard_corrupt_config(cx) {
+            if let Err(e) = self.config.save(&self.config_path, &guard) {
+                self.status = format!("error: složky se nepodařilo uložit: {e}");
+                return;
+            }
+        }
+        self.refresh_grouped_cache(cx);
+        let grouped = self.grouped_cache.clone();
+        self.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
+        cx.notify();
+    }
+
+    fn open_folder_name(
+        &mut self,
+        rename_of: Option<Vec<String>>,
+        parent: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let initial = rename_of.as_ref().and_then(|p| p.last().cloned()).unwrap_or_default();
+        let field = cx.new(|cx| {
+            let f = connections_ui::TextField::form_field(cx, "Název", false);
+            f
+        });
+        field.update(cx, |f, cx| f.set_text(&initial, cx));
+        self.modal = Some(connections_ui::ModalState::FolderName {
+            rename_of,
+            parent,
+            field,
+            error: None,
+        });
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    pub(crate) fn confirm_folder_name(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::FolderName { rename_of, parent, field, .. }) =
+            self.modal.clone()
+        else {
+            return;
+        };
+        let name = field.read(cx).text();
+        let outcome = match &rename_of {
+            None => folders::create(&self.config.connections, &self.config.folders, &parent, &name)
+                .map(|folders| (self.config.connections.clone(), folders)),
+            Some(path) => {
+                folders::rename(&self.config.connections, &self.config.folders, path, &name)
+            }
+        };
+        match outcome {
+            Ok((conns, folders)) => {
+                self.config.connections = conns;
+                self.config.folders = folders;
+                self.modal = None;
+                self.status = match rename_of {
+                    Some(_) => "Složka přejmenována".to_string(),
+                    None => "Složka vytvořena".to_string(),
+                };
+                self.save_folder_state(cx);
+            }
+            Err(e) => {
+                if let Some(connections_ui::ModalState::FolderName { error, .. }) = &mut self.modal
+                {
+                    *error = Some(e.message().to_string());
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn open_folder_delete(&mut self, path: Vec<String>, cx: &mut Context<Self>) {
+        let moving = self
+            .config
+            .connections
+            .iter()
+            .filter(|c| folders::is_under(&c.folder, &path))
+            .count();
+        self.modal = Some(connections_ui::ModalState::FolderDeleteConfirm { path, moving });
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    pub(crate) fn confirm_folder_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::FolderDeleteConfirm { path, .. }) = self.modal.clone()
+        else {
+            return;
+        };
+        let (conns, folders, moved) =
+            folders::delete(&self.config.connections, &self.config.folders, &path);
+        self.config.connections = conns;
+        self.config.folders = folders;
+        self.modal = None;
+        self.status = match moved {
+            0 => "Složka smazána".to_string(),
+            n => format!("Složka smazána, {n} připojení přesunuto o úroveň výš"),
+        };
+        self.save_folder_state(cx);
+    }
+
+    fn move_connection_to_folder(
+        &mut self,
+        conn_id: String,
+        folder: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.config.connections.iter().find(|c| c.id == conn_id).map(|c| c.folder.clone());
+        if before.as_deref() == Some(folder.as_slice()) {
+            return;
+        }
+        self.config.connections = folders::move_connection(&self.config.connections, &conn_id, &folder);
+        self.status = format!("Přesunuto do {}", crate::folders::label(&folder));
+        self.save_folder_state(cx);
+    }
+
     fn open_log_tab(&mut self, cx: &mut Context<Self>) {
         const TAIL_BYTES: usize = 64 * 1024;
         // `Tabs::open` does NOT dedupe by `preview_key` — the codebase's
@@ -10923,6 +11049,15 @@ impl AppView {
             }
             TreeEvent::OpenAdmin => {
                 self.open_admin_tab(cx);
+            }
+            TreeEvent::FolderCreate { parent } => self.open_folder_name(None, parent.clone(), cx),
+            TreeEvent::FolderRename { path } => {
+                let parent = path[..path.len().saturating_sub(1)].to_vec();
+                self.open_folder_name(Some(path.clone()), parent, cx)
+            }
+            TreeEvent::FolderDelete { path } => self.open_folder_delete(path.clone(), cx),
+            TreeEvent::MoveConnectionToFolder { conn_id, folder } => {
+                self.move_connection_to_folder(conn_id.clone(), folder.clone(), cx)
             }
             TreeEvent::LoadDatabases { conn_id } => self.start_db_list_fetch(conn_id.clone(), cx),
             TreeEvent::LoadSchema { conn_id, db } => {
@@ -13465,7 +13600,10 @@ fn main() {
                     cx.new(|cx| {
                         let sql = cx.new(|cx| SqlInput::new(cx, "Type SQL, then Ctrl+Enter…"));
                         window.focus(&sql.focus_handle(cx), cx);
-                        let grouped_cache = connections_ui::group_connections(&config.connections);
+                        let grouped_cache = connections_ui::group_connections_with(
+                            &config.connections,
+                            &config.folders,
+                        );
                         // config.toml corruption takes priority (it blocks
                         // saving/editing connections outright); a history
                         // open failure is a lesser, non-blocking notice; a
@@ -15168,7 +15306,16 @@ mod config_save_guard_audit {
         // test's own loop verifies by position), drag END only, and the
         // same equality check so a bare click on the splitter writes
         // nothing.
-        assert_eq!(sites, 9, "config.toml writer count changed — re-audit, do not just bump");
+        //
+        // 9 → 10 on 2026-08-31: `save_folder_state` persists the connection
+        // list and `AppConfig::folders` after a folder is created, renamed,
+        // deleted, or a connection is dragged between folders. Re-audited,
+        // not bumped: the write sits inside the
+        // `if let Some(guard) = self.guard_corrupt_config(cx)` arm (which
+        // this test's own loop verifies by POSITION, not by counting), and
+        // it is the single funnel every folder operation goes through — so
+        // there is one writer here, not four.
+        assert_eq!(sites, 10, "config.toml writer count changed — re-audit, do not just bump");
     }
 
     /// The widening is only worth anything if it actually reaches past the

@@ -21,6 +21,24 @@
 //! codebase's other audits do. What they buy is that the list cannot drift
 //! silently: it drifts loudly, in CI, with the chord named.
 //!
+//! # What belongs in the list
+//!
+//! Only what is SPECIFIC to this app. Ctrl+C copies, Ctrl+A selects all,
+//! Home goes to the start of the line — every Windows program has done that
+//! for thirty years, and reprinting it here does not teach anyone anything.
+//! What it does do is bury Ctrl+Shift+Enter and Ctrl+Space in a wall of
+//! things the reader already knew, which is the fastest way to make a cheat
+//! sheet not worth opening (2026-08-31).
+//!
+//! Those chords are still BOUND, of course — they are in
+//! [`UNDOCUMENTED_GLOBALS`], which is the list of „yes, we know, on
+//! purpose". The test that both lists exist for makes that a decision
+//! rather than an omission.
+//!
+//! The line is „does knowing the chord tell you something you could not
+//! have guessed?". Ctrl+F opening a search IN THE RESULT GRID is worth a
+//! line, because the capability is the news, not the chord.
+//!
 //! # Why there are no modes
 //!
 //! zellij is the model for the always-visible hint strip, and deliberately
@@ -79,8 +97,6 @@ pub const SHORTCUTS: &[Shortcut] = &[
     s("ctrl-shift-enter", "Spustit bez limitu řádků", Scope::Global, false),
     s("escape", "Zrušit běžící dotaz", Scope::Global, false),
     s("ctrl-k", "Paleta příkazů", Scope::Global, true),
-    s("ctrl-p", "Paleta příkazů", Scope::Global, false),
-    s("ctrl-shift-p", "Paleta příkazů", Scope::Global, false),
     s("ctrl-space", "Napovídání", Scope::Global, true),
     s("ctrl-shift-f", "Naformátovat SQL", Scope::Global, true),
     s("ctrl-s", "Uložit skript", Scope::Global, false),
@@ -90,38 +106,16 @@ pub const SHORTCUTS: &[Shortcut] = &[
     s("ctrl-1", "Přejít do editoru", Scope::Global, false),
     s("ctrl-2", "Přejít do stromu", Scope::Global, false),
     s("ctrl-3", "Přejít do výsledků", Scope::Global, false),
-    // --- Editor ---
-    s("ctrl-a", "Vybrat vše", Scope::Editor, false),
-    s("ctrl-left", "O slovo vlevo", Scope::Editor, false),
-    s("ctrl-right", "O slovo vpravo", Scope::Editor, false),
-    s("ctrl-shift-left", "Vybrat slovo vlevo", Scope::Editor, false),
-    s("ctrl-shift-right", "Vybrat slovo vpravo", Scope::Editor, false),
-    s("home", "Na začátek řádku", Scope::Editor, false),
-    s("end", "Na konec řádku", Scope::Editor, false),
-    s("shift-home", "Vybrat k začátku řádku", Scope::Editor, false),
-    s("shift-end", "Vybrat ke konci řádku", Scope::Editor, false),
-    s("ctrl-home", "Na začátek dotazu", Scope::Editor, false),
-    s("ctrl-end", "Na konec dotazu", Scope::Editor, false),
-    s("ctrl-shift-home", "Vybrat k začátku dotazu", Scope::Editor, false),
-    s("ctrl-shift-end", "Vybrat ke konci dotazu", Scope::Editor, false),
-    s("ctrl-backspace", "Smazat slovo vlevo", Scope::Editor, false),
-    s("ctrl-delete", "Smazat slovo vpravo", Scope::Editor, false),
-    s("ctrl-c", "Kopírovat", Scope::Editor, false),
-    s("ctrl-x", "Vyjmout", Scope::Editor, false),
-    s("ctrl-v", "Vložit", Scope::Editor, false),
     // --- Results ---
-    s("ctrl-c", "Kopírovat výběr", Scope::Results, true),
+    // Not „Ctrl+C kopíruje". THAT the grid has a search, that Enter walks
+    // the hits, and that Delete stages a row deletion rather than doing one
+    // — those are the news.
     s("ctrl-f", "Hledat ve výsledku", Scope::Results, true),
     s("enter", "Další nález", Scope::Results, false),
     s("shift-enter", "Předchozí nález", Scope::Results, false),
-    s("delete", "Smazat řádek (staged)", Scope::Results, false),
+    s("delete", "Označit řádek ke smazání", Scope::Results, false),
     // --- Tree ---
     s("escape", "Zrušit hledání ve stromu", Scope::Tree, false),
-    // --- Palette ---
-    s("up", "O položku nahoru", Scope::Palette, false),
-    s("down", "O položku dolů", Scope::Palette, false),
-    s("enter", "Potvrdit", Scope::Palette, true),
-    s("escape", "Zavřít", Scope::Palette, true),
 ];
 
 /// Chords bound with context `None` that the cheat sheet deliberately does
@@ -138,6 +132,19 @@ pub const SHORTCUTS: &[Shortcut] = &[
 pub const UNDOCUMENTED_GLOBALS: &[&str] = &[
     "left", "right", "up", "down", "backspace", "delete", "enter", "tab", "shift-left",
     "shift-right", "shift-up", "shift-down", "shift-tab",
+    // Standard Windows text editing, all of it. These ARE bound and they DO
+    // work — clipboard, select-all, word jumps, line and document ends,
+    // word delete. They are not listed because every one of them does what
+    // it does in Notepad, and a cheat sheet that reprints Notepad hides the
+    // four chords a reader actually came for.
+    "ctrl-a", "ctrl-c", "ctrl-x", "ctrl-v", "home", "end", "shift-home", "shift-end",
+    "ctrl-left", "ctrl-right", "ctrl-shift-left", "ctrl-shift-right", "ctrl-home", "ctrl-end",
+    "ctrl-shift-home", "ctrl-shift-end", "ctrl-backspace", "ctrl-delete",
+    // Aliases of Ctrl+K, bound because that is what a hand reaches for
+    // after any editor of the last decade. Listed once, under the chord
+    // this app calls its own — three rows saying „Paleta příkazů" teaches
+    // nothing the first row did not.
+    "ctrl-p", "ctrl-shift-p",
     // macOS spellings of the clipboard/select-all chords, bound beside
     // their ctrl- twins. Every one of them IS documented, under its
     // Windows spelling, which is the one this app ships on.
@@ -209,6 +216,28 @@ mod tests {
         assert_eq!(pretty("f1"), "F1");
         assert_eq!(pretty("escape"), "Esc");
         assert_eq!(pretty("ctrl-left"), "Ctrl+←");
+    }
+
+    /// A cheat sheet is only worth opening while it is short enough to take
+    /// in at once. This is a deliberately tight ceiling: hitting it means
+    /// asking „is this one really specific to this app?", which is the
+    /// question that keeps the list useful.
+    #[test]
+    fn the_sheet_stays_short_enough_to_read() {
+        assert!(SHORTCUTS.len() <= 24, "{} shortcuts is a manual, not a sheet", SHORTCUTS.len());
+    }
+
+    /// The universal chords must be bound-but-unlisted, never listed. If one
+    /// reappears in `SHORTCUTS` the sheet has started reprinting Notepad.
+    #[test]
+    fn the_sheet_does_not_reprint_standard_text_editing() {
+        for chord in ["ctrl-c", "ctrl-v", "ctrl-x", "ctrl-a", "home", "end"] {
+            assert!(
+                !SHORTCUTS.iter().any(|s| s.chord == chord),
+                "{chord} is standard everywhere; it belongs in UNDOCUMENTED_GLOBALS"
+            );
+            assert!(UNDOCUMENTED_GLOBALS.contains(&chord));
+        }
     }
 
     /// The strip is the one piece of permanent screen space this feature
