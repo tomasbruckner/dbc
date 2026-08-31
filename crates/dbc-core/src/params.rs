@@ -89,7 +89,7 @@ fn scan<'a>(sql: &'a str, mut on_event: impl FnMut(ScanEvent<'a>)) -> bool {
         if let Some(tag) = &dollar_tag {
             if c == b'$' {
                 let tag_len = tag.len();
-                if i + 1 + tag_len + 1 <= len
+                if i + 1 + tag_len < len
                     && &bytes[i + 1..i + 1 + tag_len] == tag.as_slice()
                     && bytes[i + 1 + tag_len] == b'$'
                 {

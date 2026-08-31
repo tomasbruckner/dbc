@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn csv_plain_fields_are_unquoted_with_crlf_line_ends() {
         let h = headers(&["a", "b"]);
-        let data = vec![vec!["1".to_string(), "x".to_string()]];
+        let data = [vec!["1".to_string(), "x".to_string()]];
         let out = run(ExportFormat::Csv, &h, "t", 1, &mut |r, c| Some(data[r][c].clone()));
         assert_eq!(out, "a,b\r\n1,x\r\n");
     }
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn csv_quotes_fields_containing_comma_quote_or_newline() {
         let h = headers(&["a"]);
-        let rows = vec!["has,comma", "has\"quote", "has\nnewline"];
+        let rows = ["has,comma", "has\"quote", "has\nnewline"];
         let out = run(ExportFormat::Csv, &h, "t", rows.len(), &mut |r, _c| Some(rows[r].to_string()));
         assert_eq!(out, "a\r\n\"has,comma\"\r\n\"has\"\"quote\"\r\n\"has\nnewline\"\r\n");
     }
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn json_multiple_rows_are_comma_separated() {
         let h = headers(&["a"]);
-        let rows = vec!["1", "2"];
+        let rows = ["1", "2"];
         let out = run(ExportFormat::Json, &h, "t", rows.len(), &mut |r, _c| Some(rows[r].to_string()));
         assert_eq!(out, "[\n  {\"a\":\"1\"},\n  {\"a\":\"2\"}\n]\n");
     }
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn insert_emits_one_statement_per_row_in_given_order() {
         let h = headers(&["id"]);
-        let rows = vec!["1", "2", "3"];
+        let rows = ["1", "2", "3"];
         let out = run(ExportFormat::Insert, &h, "t", rows.len(), &mut |r, _c| Some(rows[r].to_string()));
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 3);
@@ -368,7 +368,7 @@ mod tests {
         // Source schema (never referenced by name below): id, secret, name.
         // "secret" (source col 1) is hidden — headers only mention id/name.
         let h = headers(&["name", "id"]); // also reordered vs. source
-        let source_rows = vec![
+        let source_rows = [
             ("row-a", "hidden-a", "1"), // source row 0
             ("row-b", "hidden-b", "2"), // source row 1
         ];

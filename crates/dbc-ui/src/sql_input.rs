@@ -413,9 +413,10 @@ impl SqlInput {
     /// before the cursor with `text` — the range/text math is
     /// `AppView::completion_edit`'s pure, unit-tested logic; this is the
     /// live-buffer surgery that actually applies it (`buffer.select_range`
-    /// + `buffer.insert`, same shape as `newline`/`backspace`), then
+    /// plus `buffer.insert`, same shape as `newline`/`backspace`), then
     /// re-kicks highlighting so T5's debounced re-highlight picks up the
     /// inserted text.
+    ///
     /// RE-VERIFY: it DERIVES the replaced range itself, and no longer takes
     /// a `prefix_len`.
     ///
@@ -1283,7 +1284,7 @@ impl Element for TextElement {
 
         // Cursor is only drawn when there's no active (non-empty) selection,
         // on whichever visible line it falls on.
-        let selection_is_empty = selection.as_ref().map_or(true, |s| s.is_empty());
+        let selection_is_empty = selection.as_ref().is_none_or(|s| s.is_empty());
         if selection_is_empty && cursor_line >= scroll && cursor_line < end_line {
             if let Some(entry) = lines.iter_mut().find(|l| l.index == cursor_line) {
                 let local = cursor.saturating_sub(entry.start).min(entry.shaped.len());

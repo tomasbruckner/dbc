@@ -1133,9 +1133,7 @@ pub fn migrate_fallback_into_list(
     }
     let DbListState::Loaded { dbs, .. } = &mut node.dbs else { return None };
     let db = slot.as_ref().map(|((_, d), _)| d.clone()).expect("checked above");
-    let Some(dbn) = dbs.iter_mut().find(|x| x.name == db) else {
-        return None;
-    };
+    let dbn = dbs.iter_mut().find(|x| x.name == db)?;
     let (key, state) = slot.take().expect("checked above");
     let was_loaded = matches!(state, DbSchemaState::Loaded { .. });
     dbn.schema = state;
@@ -2235,10 +2233,10 @@ impl SchemaTree {
                         }
                         _ => {}
                     }
-                } else if matches!(node, NodeId::FavouriteSection) {
-                    if !self.outer_expanded.remove(&OuterId::Favourites) {
-                        self.outer_expanded.insert(OuterId::Favourites);
-                    }
+                } else if matches!(node, NodeId::FavouriteSection)
+                    && !self.outer_expanded.remove(&OuterId::Favourites)
+                {
+                    self.outer_expanded.insert(OuterId::Favourites);
                 }
             }
             SidebarRow::Notice { .. } => {}

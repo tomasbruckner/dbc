@@ -373,7 +373,7 @@ pub fn rank_items(
     // tables → history → connections → actions assembly order above, which
     // gives non-empty-query results the same category precedence as the
     // empty-query fixed order when scores happen to tie.
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
     scored.truncate(cap);
     scored.into_iter().map(|(_, item)| item).collect()
 }

@@ -371,7 +371,10 @@ mod diff_schema_tests {
         let d = diff_schema(&left, &right, CompareMode::CrossEngine);
         // "id" present both sides, different data_type text — but cross-engine
         // never flags a type-text difference as Changed.
-        assert!(matches!(&d.tables[0].columns.iter().find(|c| matches!(c, ObjectDiff::Unchanged(c) if c.name == "id")), Some(_)));
+        assert!(d.tables[0]
+            .columns
+            .iter()
+            .any(|c| matches!(c, ObjectDiff::Unchanged(c) if c.name == "id")));
         // Existence-level diff still fires fully.
         assert!(d.tables[0].columns.iter().any(|c| matches!(c, ObjectDiff::Removed(c) if c.name == "gone")));
         assert!(d.tables[0].columns.iter().any(|c| matches!(c, ObjectDiff::Added(c) if c.name == "new_col")));

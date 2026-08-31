@@ -12,6 +12,22 @@
 // `fn`-spelling probes), so this costs nothing now and makes adding any
 // later a deliberate, visible act.
 #![forbid(unsafe_code)]
+// Two clippy lints this crate answers with a decision rather than a fix,
+// stated once here instead of thirteen times inline.
+//
+// `too_many_arguments`: a GPUI render helper threads the entity, the row it
+// draws, the theme, `window`, `cx` and two or three flags through every
+// call, and eight of those are routine. The lint's suggested remedy — a
+// parameter struct — would exist only to be destructured on the first line
+// of the function, which is more code and less clarity, and the arguments
+// are not interchangeable enough for a wrong-order call to type-check.
+//
+// `type_complexity`: the offending signatures return the exact tuple their
+// one caller destructures. Naming it would put a `type` alias between the
+// reader and the shape they need to know, and there is no second use to
+// share it with.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
 
 mod admin_panel;
 mod admin_sql;
@@ -1829,6 +1845,7 @@ pub(crate) const SCRIPT_LOAD_BLOCKED: &str =
 ///   root directly is exact where a shared counter would be a blunt proxy:
 ///   it supersedes the open and nothing else, and it needs no future
 ///   root-changing site to remember to bump anything.
+///
 /// `None` means „land it". Otherwise the Czech status naming WHICH of the
 /// three moved — the `context_switch_refusal` idiom, for the same reason:
 /// one refusal that covers three different causes teaches the user
@@ -2409,8 +2426,8 @@ pub(crate) fn sidebar_width_from(stored: Option<u16>) -> f32 {
 /// holds).
 ///
 /// **Intentionally guard-free surfaces re-affirmed**: monitor (identity
-/// is only a tab key; per-operation runner), backup/restore (explicit id
-/// + existence check by design), compare (self-contained swapped
+/// is only a tab key; per-operation runner), backup/restore (explicit
+/// id plus existence check by design), compare (self-contained swapped
 /// configs), read-only artifact tabs (stamped, never checked). The
 /// sidebar's cross-context SNAPSHOT non-leak is pre-pinned by the T5 fix
 /// round's fallback key-gate tests
@@ -6365,7 +6382,7 @@ impl AppView {
             };
         }
         self.autocomplete =
-            (!candidates.is_empty()).then(|| AutocompleteState { candidates, selected: 0 });
+            (!candidates.is_empty()).then_some(AutocompleteState { candidates, selected: 0 });
         // Keep the lazy-diff cache in sync so the SAME render's
         // `refresh_autocomplete` (which runs before this popup is drawn,
         // but AFTER this handler since actions dispatch before re-render)
@@ -6411,7 +6428,7 @@ impl AppView {
         let snapshot = self.tree.read(cx).snapshot();
         let candidates = autocomplete::candidates(&text, cursor, snapshot, false, suppressed);
         self.autocomplete =
-            (!candidates.is_empty()).then(|| AutocompleteState { candidates, selected: 0 });
+            (!candidates.is_empty()).then_some(AutocompleteState { candidates, selected: 0 });
     }
 
     fn on_ac_up(&mut self, _: &sql_input::Up, _window: &mut Window, cx: &mut Context<Self>) {
@@ -7166,7 +7183,7 @@ impl AppView {
         cx.spawn(async move |_this, cx| {
             let result =
                 cx.background_spawn(async move { crate::scripts::scan_scripts(&root) }).await;
-            let _ = tree.update(cx, |t, cx| t.finish_scripts_scan(generation, result, cx));
+            tree.update(cx, |t, cx| t.finish_scripts_scan(generation, result, cx));
         })
         .detach();
     }
@@ -10104,7 +10121,7 @@ impl AppView {
         let rx = self.runner.fetch_admin_catalog(spec, queries);
         cx.spawn(async move |_this, cx| {
             let result = rx.await;
-            let _ = panel.update(cx, |p, cx| match result {
+            panel.update(cx, |p, cx| match result {
                 Ok(Ok(rows)) => p.apply_catalog(rows, cx),
                 Ok(Err(e)) => p.set_error(&e.to_string(), cx),
                 Err(_) => p.set_error("dotaz zrušen", cx),
@@ -10170,21 +10187,6 @@ impl AppView {
     }
 
     // -----------------------------------------------------------------
-    // G8 T6/T7: ER diagram tab — schema-tree icon + palette entry points,
-    // large-schema truncation (design §3).
-    // -----------------------------------------------------------------
-
-    /// design §3 CURATION: the entry action always operates on ONE schema.
-    /// `schema` is `None` for an engine/snapshot with no schema concept
-    /// (SQLite) — matches every other `Option<String>` schema field in this
-    /// codebase (strict, no "public" guessing).
-    /// Opens the tail of the diagnostic log as a text tab.
-    ///
-    /// The tail rather than the whole file: the cap is 2 MiB and the answer
-    /// to „what just happened" is always at the end. The path is the first
-    /// line so the file can be opened outside the app too — which is the
-    /// only way to read it after a crash.
-    // -----------------------------------------------------------------
     // Connection folders. The decisions live in `crate::folders`, which is
     // pure and tested; everything here is dialog plumbing and one save.
     // -----------------------------------------------------------------
@@ -10215,10 +10217,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let initial = rename_of.as_ref().and_then(|p| p.last().cloned()).unwrap_or_default();
-        let field = cx.new(|cx| {
-            let f = connections_ui::TextField::form_field(cx, "Název", false);
-            f
-        });
+        let field = cx.new(|cx| connections_ui::TextField::form_field(cx, "Název", false));
         field.update(cx, |f, cx| f.set_text(&initial, cx));
         self.modal = Some(connections_ui::ModalState::FolderName {
             rename_of,
@@ -10309,6 +10308,12 @@ impl AppView {
         self.save_folder_state(cx);
     }
 
+    /// Opens the tail of the diagnostic log as a text tab.
+    ///
+    /// The tail rather than the whole file: the cap is 2 MiB and the answer
+    /// to „what just happened" is always at the end. The path is the first
+    /// line so the file can be opened outside the app too — which is the
+    /// only way to read it after a crash.
     fn open_log_tab(&mut self, cx: &mut Context<Self>) {
         const TAIL_BYTES: usize = 64 * 1024;
         // `Tabs::open` does NOT dedupe by `preview_key` — the codebase's
@@ -10341,6 +10346,15 @@ impl AppView {
         cx.notify();
     }
 
+    // -----------------------------------------------------------------
+    // G8 T6/T7: ER diagram tab — schema-tree icon + palette entry points,
+    // large-schema truncation (design §3).
+    // -----------------------------------------------------------------
+
+    /// design §3 CURATION: the entry action always operates on ONE schema.
+    /// `schema` is `None` for an engine/snapshot with no schema concept
+    /// (SQLite) — matches every other `Option<String>` schema field in this
+    /// codebase (strict, no "public" guessing).
     fn open_er_diagram(&mut self, schema: Option<String>, cx: &mut Context<Self>) {
         let Some(snapshot) = self.tree.read(cx).snapshot() else {
             self.status = "Nejprve načtěte schéma".to_string();
@@ -12817,6 +12831,7 @@ impl AppView {
     ///   (`guards.rs`), in case a future entry point calls
     ///   `switch_to_connection` directly.
     /// - the app-quit hook (`main()`, below) — window close.
+    ///
     /// A no-op when no modal is open, the open modal isn't `BackupRestore`,
     /// its status isn't `Running`, or (review MAJOR fix) there is no REAL
     /// cancel hook installed (`session.can_cancel()` — MSSQL/SQLite have
@@ -13390,7 +13405,7 @@ mod plan_restore_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.backup");
         let mut content = b"PGDMP\x01\x0e\x00rest".to_vec();
-        content.extend(std::iter::repeat(0xABu8).take(4 * 1024 * 1024)); // 4 MiB tail
+        content.extend(std::iter::repeat_n(0xABu8, 4 * 1024 * 1024)); // 4 MiB tail
         std::fs::write(&path, &content).unwrap();
 
         let header = read_sniff_prefix(path.to_str().unwrap()).unwrap();

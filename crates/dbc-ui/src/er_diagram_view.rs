@@ -745,7 +745,7 @@ mod zoom_math_tests {
         ] {
             let (pan, z) = zoom_at((0.0, 0.0), zoom, (10.0, 10.0), factor);
             assert!(z.is_finite(), "zoom {zoom} factor {factor} produced non-finite z={z}");
-            assert!(z >= ZOOM_MIN && z <= ZOOM_MAX, "z={z} out of clamp range");
+            assert!((ZOOM_MIN..=ZOOM_MAX).contains(&z), "z={z} out of clamp range");
             assert!(pan.0.is_finite() && pan.1.is_finite(), "pan {pan:?} not finite");
         }
     }

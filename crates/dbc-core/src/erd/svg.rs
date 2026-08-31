@@ -181,7 +181,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let g = build_graph(&[evil_table.clone()]);
+        let g = build_graph(std::slice::from_ref(&evil_table));
         let l = compute_layout(&g);
         let svg = export_svg(&l, &[evil_table]);
 
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn export_contains_expected_shape_and_coordinates() {
         let t = TableInfo { schema: None, name: "t".into(), columns: vec![col("id", true, None)], ..Default::default() };
-        let g = build_graph(&[t.clone()]);
+        let g = build_graph(std::slice::from_ref(&t));
         let l = compute_layout(&g);
         let svg = export_svg(&l, &[t]);
         assert!(svg.starts_with("<svg"));
@@ -249,7 +249,7 @@ mod tests {
             columns: vec![col("id", true, None), col("manager_id", false, Some(("employees", "id")))],
             ..Default::default()
         };
-        let g = build_graph(&[t.clone()]);
+        let g = build_graph(std::slice::from_ref(&t));
         let l = compute_layout(&g);
         let svg = export_svg(&l, &[t]);
         assert!(svg.contains("<path d=\"M"));

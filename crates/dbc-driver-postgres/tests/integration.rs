@@ -160,17 +160,17 @@ async fn decode_hazards_render_as_placeholders() {
     assert!(
         !a.is_null(0) && !a.value(0).is_empty(),
         "numeric NaN must render as a non-null placeholder, got: {:?}",
-        a.is_null(0).then_some("<null>").unwrap_or(a.value(0))
+        if a.is_null(0) { "<null>" } else { a.value(0) }
     );
     assert!(
         !b.is_null(0) && !b.value(0).is_empty(),
         "infinity timestamp must render as a non-null placeholder, got: {:?}",
-        b.is_null(0).then_some("<null>").unwrap_or(b.value(0))
+        if b.is_null(0) { "<null>" } else { b.value(0) }
     );
     assert!(
         !c_col.is_null(0) && !c_col.value(0).is_empty(),
         "-infinity date must render as a non-null placeholder, got: {:?}",
-        c_col.is_null(0).then_some("<null>").unwrap_or(c_col.value(0))
+        if c_col.is_null(0) { "<null>" } else { c_col.value(0) }
     );
     eprintln!(
         "decode_hazards_render_as_placeholders actual values: a={:?} b={:?} c={:?} ok={}",

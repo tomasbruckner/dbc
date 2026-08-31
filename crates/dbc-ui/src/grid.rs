@@ -3225,8 +3225,12 @@ mod delete_targets_tests {
     fn insert_display_index_is_view_len_plus_ins_ix() {
         // §4's display-index arithmetic pinned here (design §7: folded in):
         // fresh add on view_len 4 -> display 4; second add -> display 5.
-        assert_eq!(4 + 0, 4usize);
-        assert_eq!(4 + 1, 5usize);
+        // Through a named function, not two literal sums: `4 + 0` reads to
+        // clippy as an operation with no effect, and simplifying it away
+        // leaves `assert_eq!(4, 4)`, which pins nothing.
+        let display_index = |view_len: usize, ins_ix: usize| view_len + ins_ix;
+        assert_eq!(display_index(4, 0), 4usize);
+        assert_eq!(display_index(4, 1), 5usize);
     }
 }
 

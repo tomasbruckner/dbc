@@ -69,7 +69,7 @@ const ALIAS_STOPWORDS: &[&str] = &["CROSS", "NATURAL", "USING", "LATERAL"];
 /// boundaries) and `ALIAS_STOPWORDS` (join-syntax words with no other
 /// reason to be in the completion keyword list).
 fn is_alias_stopword(word_upper: &str) -> bool {
-    KEYWORDS.iter().any(|k| *k == word_upper) || ALIAS_STOPWORDS.iter().any(|k| *k == word_upper)
+    KEYWORDS.contains(&word_upper) || ALIAS_STOPWORDS.contains(&word_upper)
 }
 
 const MAX_CANDIDATES: usize = 20;
@@ -185,7 +185,7 @@ fn distinct_schema_count(snapshot: &SchemaSnapshot) -> usize {
 /// would otherwise push common keywords out of the 20-item cap when the
 /// match prefix is empty (Ctrl+Space full-set mode).
 fn rank_and_cap(mut items: Vec<(u8, u8, u8, usize, Candidate)>) -> Vec<Candidate> {
-    items.sort_by(|a, b| (a.0, a.1, a.2, a.3).cmp(&(b.0, b.1, b.2, b.3)));
+    items.sort_by_key(|a| (a.0, a.1, a.2, a.3));
     items.into_iter().take(MAX_CANDIDATES).map(|i| i.4).collect()
 }
 
@@ -1303,14 +1303,14 @@ mod tests {
         let text = "SELECT café";
         // Byte 11 sits mid-way through the 2-byte 'é' (bytes 10-11).
         let ctx = cursor_context(text, 11);
-        assert!(ctx.prefix.chars().all(|c| c.is_ascii()));
+        assert!(ctx.prefix.is_ascii());
 
         // 4-byte emoji: 'SELECT ' (7 bytes) + \u{1F600} (bytes 7..11) + 'x'.
         let text2 = "SELECT \u{1F600}x";
         let ctx2 = cursor_context(text2, 9); // mid-emoji
-        assert!(ctx2.prefix.chars().all(|c| c.is_ascii()));
+        assert!(ctx2.prefix.is_ascii());
         let ctx3 = cursor_context(text2, 10); // also mid-emoji
-        assert!(ctx3.prefix.chars().all(|c| c.is_ascii()));
+        assert!(ctx3.prefix.is_ascii());
     }
 
     // --- Review round 2 fixes ---

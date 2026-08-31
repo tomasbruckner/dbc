@@ -461,7 +461,12 @@ fn new_relop_frame(e: &BytesStart) -> RelOpFrame {
 /// `<RelOp .../>` leaf) closure paths — the self-closing case pushes then
 /// immediately calls this, exactly like a `Start` followed instantly by an
 /// `End`.
-fn close_relop_frame(mut frame: RelOpFrame, stack: &mut Vec<RelOpFrame>, root: &mut Option<PlanNode>, is_analyze: bool) {
+fn close_relop_frame(
+    mut frame: RelOpFrame,
+    stack: &mut [RelOpFrame],
+    root: &mut Option<PlanNode>,
+    is_analyze: bool,
+) {
     if is_analyze && frame.has_runtime_counters {
         frame.node.actual_rows = finite(Some(frame.actual_rows_sum));
         frame.node.actual_time_ms = finite(Some(frame.actual_ms_max));
@@ -743,7 +748,7 @@ fn convert_pg_tree(root: PgPlanJson) -> PlanNode {
             || j.shared_written_blocks.is_some()
             || j.temp_read_blocks.is_some()
             || j.temp_written_blocks.is_some();
-        any.then(|| BufferStats {
+        any.then_some(BufferStats {
             shared_hit: j.shared_hit_blocks,
             shared_read: j.shared_read_blocks,
             shared_dirtied: j.shared_dirtied_blocks,

@@ -1148,6 +1148,12 @@ pub enum PendingAfterUnlock {
     Nothing,
 }
 
+/// The size spread between variants is deliberate and costs nothing:
+/// `AppView` holds exactly one `Option<ModalState>`, so at most one of
+/// these exists in the whole process. Boxing the biggest variant would add
+/// an allocation and a `*` to every construction and match arm in this
+/// file to save bytes that are never multiplied by anything.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum ModalState {
     ConnectionDialog(ConnectionDialogUi),
@@ -3062,7 +3068,7 @@ impl AppView {
             .connections
             .iter()
             .find(|c| c.id == id)
-            .map_or(false, |c| !engine_is_file_based(c.engine));
+            .is_some_and(|c| !engine_is_file_based(c.engine));
         if connect_needs_vault_prompt(needs_secret, self.vault.is_some(), Vault::exists(&self.vault_path)) {
             let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
             let focus = input.focus_handle(cx);
@@ -4834,7 +4840,7 @@ fn render_workspace_missing_panel(
     }
     panel
         .child(
-            button(0, "workspace-missing-find", WORKSPACE_MISSING_FIND, &focus, cx)
+            button(0, "workspace-missing-find", WORKSPACE_MISSING_FIND, focus, cx)
                 .on_click(cx.listener(|this, _, _, cx| this.pick_workspace_for_recovery(cx)))
                 .on_action(cx.listener(|this, _: &ActivateChoice, _, cx| {
                     this.pick_workspace_for_recovery(cx)
@@ -4848,7 +4854,7 @@ fn render_workspace_missing_panel(
         )
         .child(div().text_color(cx.theme().text_muted).child(WORKSPACE_MISSING_PROFILE_HINT))
         .child(
-            button(1, "workspace-missing-profile", WORKSPACE_MISSING_PROFILE, &focus, cx)
+            button(1, "workspace-missing-profile", WORKSPACE_MISSING_PROFILE, focus, cx)
                 .on_click(cx.listener(|this, _, _, cx| this.use_local_profile(cx)))
                 .on_action(
                     cx.listener(|this, _: &ActivateChoice, _, cx| this.use_local_profile(cx)),
@@ -4861,7 +4867,7 @@ fn render_workspace_missing_panel(
                 })),
         )
         .child(
-            button(2, "workspace-missing-quit", WORKSPACE_MISSING_QUIT, &focus, cx)
+            button(2, "workspace-missing-quit", WORKSPACE_MISSING_QUIT, focus, cx)
                 .on_click(cx.listener(|_this, _, _, cx| cx.quit()))
                 .on_action(cx.listener(|_this, _: &ActivateChoice, _, cx| cx.quit()))
                 .on_key_down(cx.listener(|_this, ev: &KeyDownEvent, _, cx| {
@@ -7164,25 +7170,17 @@ mod workspace_confirm_tests {
             WorkspaceConfirmMode::Adopt,
             WorkspaceConfirmMode::ToProfile,
         ] {
-            assert!(workspace_confirm_lines(mode)
-                .iter()
-                .any(|l| *l == "Aktivní připojení bude odpojeno."));
+            assert!(workspace_confirm_lines(mode).contains(&"Aktivní připojení bude odpojeno."));
         }
         // §W3.3: adopt additionally explains the foreign vault.
         assert!(workspace_confirm_lines(WorkspaceConfirmMode::Adopt)
-            .iter()
-            .any(|l| *l == "Trezor tohoto prostoru se odemyká jeho vlastním master heslem."));
+            .contains(&"Trezor tohoto prostoru se odemyká jeho vlastním master heslem."));
         // §W6.3: the git warning renders on the two folder-facing modes;
         // going back to the profile writes nothing into any folder.
-        assert!(workspace_confirm_lines(WorkspaceConfirmMode::Init)
-            .iter()
-            .any(|l| *l == WORKSPACE_GIT_WARNING));
-        assert!(workspace_confirm_lines(WorkspaceConfirmMode::Adopt)
-            .iter()
-            .any(|l| *l == WORKSPACE_GIT_WARNING));
+        assert!(workspace_confirm_lines(WorkspaceConfirmMode::Init).contains(&WORKSPACE_GIT_WARNING));
+        assert!(workspace_confirm_lines(WorkspaceConfirmMode::Adopt).contains(&WORKSPACE_GIT_WARNING));
         assert!(!workspace_confirm_lines(WorkspaceConfirmMode::ToProfile)
-            .iter()
-            .any(|l| *l == WORKSPACE_GIT_WARNING));
+            .contains(&WORKSPACE_GIT_WARNING));
     }
 
     /// FINAL-REVIEW MINOR-1. „Najít složku…" in the §W4 blocking modal is
@@ -7225,10 +7223,8 @@ mod workspace_confirm_tests {
         );
         // And that vector is the one carrying both disclosures.
         let lines = workspace_confirm_lines(WorkspaceConfirmMode::Adopt);
-        assert!(lines.iter().any(|l| *l == WORKSPACE_GIT_WARNING));
-        assert!(lines
-            .iter()
-            .any(|l| *l == "Trezor tohoto prostoru se odemyká jeho vlastním master heslem."));
+        assert!(lines.contains(&WORKSPACE_GIT_WARNING));
+        assert!(lines.contains(&"Trezor tohoto prostoru se odemyká jeho vlastním master heslem."));
 
         // The NEGATIVE half, and it is not an oversight: the three-choice
         // panel is what the user meets ON STARTUP, and §W6.3 is explicit
@@ -7246,11 +7242,11 @@ mod workspace_confirm_tests {
     /// touched" promise, each stated to the user BEFORE the write.
     #[test]
     fn init_promises_a_copy_and_to_profile_promises_no_folder_write() {
-        assert!(workspace_confirm_lines(WorkspaceConfirmMode::Init).iter().any(|l| *l
-            == "Nastavení, připojení a trezor se do složky ZKOPÍRUJÍ; původní soubory zůstanou beze změny."));
+        assert!(workspace_confirm_lines(WorkspaceConfirmMode::Init).contains(
+            &"Nastavení, připojení a trezor se do složky ZKOPÍRUJÍ; původní soubory zůstanou beze změny."
+        ));
         assert!(workspace_confirm_lines(WorkspaceConfirmMode::ToProfile)
-            .iter()
-            .any(|l| *l == "Soubory v pracovním prostoru zůstanou beze změny."));
+            .contains(&"Soubory v pracovním prostoru zůstanou beze změny."));
     }
 
     #[test]

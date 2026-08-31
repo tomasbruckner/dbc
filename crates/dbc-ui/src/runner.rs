@@ -2255,21 +2255,21 @@ async fn drive_script(
         return;
     }
 
-    if opts.tx_scope == TxScope::WholeRun {
-        if conn.execute(dbc_core::tx_begin_sql(opts.dialect), cancel.child_token()).await.is_err() {
-            // A BEGIN failure aborts the run immediately — no tx opened,
-            // nothing to roll back.
-            let _ = tx
-                .send(ScriptEvent::RunFinished {
-                    files_run,
-                    statements_run,
-                    statements_failed,
-                    elapsed: run_started.elapsed(),
-                    aborted: true,
-                })
-                .await;
-            return;
-        }
+    if opts.tx_scope == TxScope::WholeRun
+        && conn.execute(dbc_core::tx_begin_sql(opts.dialect), cancel.child_token()).await.is_err()
+    {
+        // A BEGIN failure aborts the run immediately — no tx opened,
+        // nothing to roll back.
+        let _ = tx
+            .send(ScriptEvent::RunFinished {
+                files_run,
+                statements_run,
+                statements_failed,
+                elapsed: run_started.elapsed(),
+                aborted: true,
+            })
+            .await;
+        return;
     }
 
     'files: for (index, path) in files.iter().enumerate() {
@@ -2407,11 +2407,12 @@ async fn drive_script(
         }
     }
 
-    if !aborted && opts.tx_scope == TxScope::WholeRun {
-        if conn.execute(dbc_core::tx_commit_sql(opts.dialect), cancel.child_token()).await.is_err() {
-            let _ = conn.execute(dbc_core::tx_rollback_sql(opts.dialect), cancel.child_token()).await;
-            aborted = true;
-        }
+    if !aborted
+        && opts.tx_scope == TxScope::WholeRun
+        && conn.execute(dbc_core::tx_commit_sql(opts.dialect), cancel.child_token()).await.is_err()
+    {
+        let _ = conn.execute(dbc_core::tx_rollback_sql(opts.dialect), cancel.child_token()).await;
+        aborted = true;
     }
 
     let _ = tx
@@ -2656,10 +2657,10 @@ async fn run_csv_import_drive(
             let row: crate::csv_import::CsvRow =
                 record.iter().map(crate::csv_field_to_value).collect();
             chunk.push(row);
-            if chunk.len() >= crate::csv_import::CSV_IMPORT_BATCH_SIZE {
-                if chunk_tx.blocking_send(Ok(std::mem::take(&mut chunk))).is_err() {
-                    return; // driver side hung up (already failed/rolled back)
-                }
+            if chunk.len() >= crate::csv_import::CSV_IMPORT_BATCH_SIZE
+                && chunk_tx.blocking_send(Ok(std::mem::take(&mut chunk))).is_err()
+            {
+                return; // driver side hung up (already failed/rolled back)
             }
         }
         if !chunk.is_empty() {

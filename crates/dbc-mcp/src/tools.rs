@@ -603,8 +603,12 @@ mod tests {
         let body = result.structured_content.unwrap();
         assert_eq!(body["error"], "write statement rejected");
 
-        // Restore writability so the temp file can be cleaned up.
+        // Restore writability so the temp file can be cleaned up. The
+        // `false` is the point — the test made the file read-only on
+        // purpose and has to undo it, which is exactly the case
+        // `permissions_set_readonly_false` warns about generically.
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
         perms.set_readonly(false);
         std::fs::set_permissions(&path, perms).unwrap();
     }

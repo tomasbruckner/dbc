@@ -127,7 +127,7 @@ fn assign_layers(nodes: &[TableKey], acyclic_edges: &[(TableKey, TableKey)]) -> 
         if let Some(children) = succ.get(&u) {
             for v in children {
                 let candidate = ul + 1;
-                let better = layer.get(v).map_or(true, |&cur| candidate > cur);
+                let better = layer.get(v).is_none_or(|&cur| candidate > cur);
                 if better {
                     layer.insert(v.clone(), candidate);
                 }
@@ -169,7 +169,7 @@ fn barycenter_reorder(
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => a.1.name.cmp(&b.1.name),
         });
-        for (slot, (_, k)) in layer.iter_mut().zip(scored.into_iter()) {
+        for (slot, (_, k)) in layer.iter_mut().zip(scored) {
             *slot = k;
         }
     }
@@ -352,7 +352,7 @@ mod tests {
     }
     #[allow(dead_code)]
     fn key(name: &str) -> TableKey { TableKey { schema: None, name: name.into() } }
-    fn layer_of<'a>(layout: &'a DiagramLayout, name: &str) -> f32 {
+    fn layer_of(layout: &DiagramLayout, name: &str) -> f32 {
         layout.nodes.iter().find(|n| n.key.name == name).unwrap().y
     }
 

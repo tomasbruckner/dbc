@@ -95,7 +95,10 @@ pub fn scale_to(range: (f64, f64), value: f64, pixel_height: f32) -> f32 {
         return pixel_height / 2.0;
     }
     let span = range.1 - range.0;
-    if !(span > 0.0) || !span.is_finite() {
+    // Was `!(span > 0.0)`, which read as a negated partial comparison for
+    // no gain: a NaN span is already caught by the `is_finite` half, so the
+    // plain `<=` is byte-for-byte the same decision and says what it means.
+    if span <= 0.0 || !span.is_finite() {
         return pixel_height / 2.0;
     }
     let frac = ((value - range.0) / span).clamp(0.0, 1.0) as f32;

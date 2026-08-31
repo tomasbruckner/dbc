@@ -557,24 +557,24 @@ mod tests {
 
         // Toggle on
         let state = config.toggle_favourite(fav.clone());
-        assert_eq!(state, true);
-        assert_eq!(config.is_favourite(&fav), true);
+        assert!(state);
+        assert!(config.is_favourite(&fav));
 
         // Save and load
         config.save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
         let loaded = AppConfig::load(&p).unwrap();
-        assert_eq!(loaded.is_favourite(&fav), true);
+        assert!(loaded.is_favourite(&fav));
 
         // Toggle off
         let mut config2 = loaded;
         let state = config2.toggle_favourite(fav.clone());
-        assert_eq!(state, false);
-        assert_eq!(config2.is_favourite(&fav), false);
+        assert!(!state);
+        assert!(!config2.is_favourite(&fav));
 
         // Save and load again
         config2.save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
         let loaded2 = AppConfig::load(&p).unwrap();
-        assert_eq!(loaded2.is_favourite(&fav), false);
+        assert!(!loaded2.is_favourite(&fav));
     }
 
     #[test]
@@ -742,8 +742,8 @@ user = "postgres"
 
     #[test]
     fn scripts_dir_set_roundtrips() {
-        let mut config = AppConfig::default();
-        config.scripts_dir = Some("D:\\sql\\library".to_string());
+        let config =
+            AppConfig { scripts_dir: Some("D:\\sql\\library".to_string()), ..Default::default() };
         let s = toml::to_string_pretty(&config).unwrap();
         let back: AppConfig = toml::from_str(&s).unwrap();
         assert_eq!(back.scripts_dir.as_deref(), Some("D:\\sql\\library"));
@@ -857,8 +857,8 @@ trust_server_certificate = true
 "#;
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         let opts = config.connections[0].mssql.clone().unwrap();
-        assert_eq!(opts.trust_server_certificate, true);
-        assert_eq!(opts.encrypt, true);
+        assert!(opts.trust_server_certificate);
+        assert!(opts.encrypt);
         assert_eq!(opts.driver, None);
     }
 
