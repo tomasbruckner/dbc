@@ -214,7 +214,7 @@ impl Vault {
             ciphertext: B64.encode(ct),
         };
         if let Some(dir) = self.path.parent() { std::fs::create_dir_all(dir)?; }
-        let tmp = self.path.with_extension("bin.tmp");
+        let tmp = crate::fsutil::tmp_path_for(&self.path);
         std::fs::write(&tmp, serde_json::to_string(&env).map_err(|e| err(e.to_string()))?)?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())

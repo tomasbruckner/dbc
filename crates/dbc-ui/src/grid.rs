@@ -2639,11 +2639,10 @@ fn write_export_file(
     rows: usize,
     data: &[Vec<Option<String>>],
 ) -> Result<(), String> {
-    let tmp_path = {
-        let mut s = path.as_os_str().to_owned();
-        s.push(".tmp");
-        std::path::PathBuf::from(s)
-    };
+    // The `.tmp` name comes from `fsutil::tmp_path_for`, not from a second
+    // copy of the rule here: the shipped workspace `.gitignore` matches the
+    // suffix, and a naming rule with two owners is a rule that drifts.
+    let tmp_path = dbc_state::fsutil::tmp_path_for(path);
     // On any failure past this point, remove the partial .tmp so a
     // disk-full/AV-locked run doesn't leave orphans (Task 4 re-review
     // issue 5).

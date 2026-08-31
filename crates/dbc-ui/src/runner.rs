@@ -5737,23 +5737,24 @@ mod monitor_pg_tests {
 
             // Refresh to learn the victim's pid.
             cmd_tx.send(MonitorCmd::Refresh { generation: 1 }).await.unwrap();
-            let pid = loop {
-                match tokio::time::timeout(Duration::from_secs(30), event_rx.recv())
-                    .await
-                    .expect("event")
-                    .expect("channel open")
-                {
-                    MonitorEvent::Data { snapshot, .. } => {
-                        let running = snapshot.running.expect("running section");
-                        let found = running
-                            .iter()
-                            .find(|r| r.query.as_deref().unwrap_or("").contains("pg_sleep(600)"))
-                            .map(|r| r.pid);
-                        break found.expect("victim session visible in running queries");
-                    }
-                    MonitorEvent::Error { message, .. } => panic!("refresh failed: {message}"),
-                    MonitorEvent::KillResult { .. } => unreachable!("no kill dispatched yet"),
+            // The first event after a Refresh is the answer or a failure —
+            // no retry loop, so this is a `match`, not a `loop` whose every
+            // arm leaves on the first pass.
+            let pid = match tokio::time::timeout(Duration::from_secs(30), event_rx.recv())
+                .await
+                .expect("event")
+                .expect("channel open")
+            {
+                MonitorEvent::Data { snapshot, .. } => {
+                    let running = snapshot.running.expect("running section");
+                    running
+                        .iter()
+                        .find(|r| r.query.as_deref().unwrap_or("").contains("pg_sleep(600)"))
+                        .map(|r| r.pid)
+                        .expect("victim session visible in running queries")
                 }
+                MonitorEvent::Error { message, .. } => panic!("refresh failed: {message}"),
+                MonitorEvent::KillResult { .. } => unreachable!("no kill dispatched yet"),
             };
 
             cmd_tx.send(MonitorCmd::Kill { generation: 1, pid }).await.unwrap();

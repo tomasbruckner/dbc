@@ -344,7 +344,7 @@ impl AppConfig {
             });
         }
         if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
-        let tmp = path.with_extension("toml.tmp");
+        let tmp = crate::fsutil::tmp_path_for(path);
         {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(toml::to_string_pretty(self)?.as_bytes())?;

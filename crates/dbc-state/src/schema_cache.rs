@@ -85,7 +85,7 @@ pub fn store<T: Serialize>(conn_id: &str, db: &str, snapshot: &T) {
     let path = dir.join(key(conn_id, db));
     // Same write-then-rename as every other file this app owns: a crash
     // mid-write must not leave a half-written entry that parses.
-    let tmp = path.with_extension("json.tmp");
+    let tmp = crate::fsutil::tmp_path_for(&path);
     if std::fs::write(&tmp, json).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
     }

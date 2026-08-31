@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn parse_y_strict() {
         assert_eq!(parse_y(" 42 "), Some(42.0));
-        assert_eq!(parse_y("3.14"), Some(3.14));
+        assert_eq!(parse_y("1.37"), Some(1.37)); // not exactly representable in binary
         assert_eq!(parse_y("-1.5e3"), Some(-1500.0));
         assert_eq!(parse_y(""), None);
         assert_eq!(parse_y("abc"), None);
@@ -214,6 +214,14 @@ mod tests {
         assert_eq!(scale_to((7.0, 7.0), 7.0, 100.0), 50.0);
     }
 
+    /// Only a build WITH `debug_assertions` can observe the panic — in a
+    /// `cargo test --release` run `debug_assert!` is a no-op and the
+    /// function returns the fallback instead, so an ungated `should_panic`
+    /// here is not a stricter test, it is a test that fails in release for
+    /// a reason that has nothing to do with the code being wrong. The
+    /// release half of the contract is pinned by
+    /// `scale_to_release_returns_the_midline_for_non_finite_input` below.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "scale_to: value must be finite")]
     fn scale_to_non_finite_value_trips_debug_assert() {
@@ -226,6 +234,19 @@ mod tests {
         // `scale_to_release_fallback_is_finite_for_non_finite_input` for a
         // build-independent proof of that fallback value.
         scale_to((0.0, 10.0), f64::NAN, 100.0);
+    }
+
+    /// The other half of the same contract, and the only build that can
+    /// actually execute it: with `debug_assertions` off the guard is gone,
+    /// so this calls `scale_to` with the very input the debug build
+    /// refuses and pins what ships to users — the midline, never a NaN
+    /// leaking into the lyon paint math.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn scale_to_release_returns_the_midline_for_non_finite_input() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(scale_to((0.0, 10.0), value, 100.0), 50.0);
+        }
     }
 
     #[test]
@@ -244,6 +265,10 @@ mod tests {
         assert_eq!(midline, 50.0);
     }
 
+    /// Debug-only for the same reason as the `scale_to` pair above; the
+    /// release behaviour is pinned by
+    /// `prepare_release_truncates_a_ragged_y_column` below.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "must match x_labels length")]
     fn prepare_ragged_y_column_trips_debug_assert() {
@@ -265,6 +290,24 @@ mod tests {
         );
     }
 
+    /// What a user's build actually does with a ragged column: truncate to
+    /// the short column's own length and plot fewer points, never panic on
+    /// live data. `total_rows` is still the caller's number, so the „N z M"
+    /// label does not silently shrink along with the series.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn prepare_release_truncates_a_ragged_y_column() {
+        let out = prepare(
+            vec!["a".into(), "b".into(), "c".into()],
+            &[("y".into(), vec![Some("1".into())])],
+            500,
+            3,
+        );
+        assert_eq!(out.x_labels.len(), 3);
+        assert_eq!(out.series[0].points, vec![Some(1.0)]);
+        assert_eq!(out.total_rows, 3);
+    }
+
     #[test]
     fn visible_ticks_width_derived_with_hard_cap() {
         // curation item 3: max_bars = plot_width_px / 3, hard cap 500.
@@ -278,7 +321,7 @@ mod tests {
     #[test]
     fn format_axis_trims_noise() {
         assert_eq!(format_axis(1500.0), "1500");
-        assert_eq!(format_axis(3.14), "3.14");
+        assert_eq!(format_axis(1.37), "1.37");
         assert_eq!(format_axis(0.5), "0.5");
         assert_eq!(format_axis(-2.0), "-2");
     }
