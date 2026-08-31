@@ -1806,7 +1806,7 @@ impl AppView {
         div()
             .id("top-bar")
             .h(px(34.))
-            .px_2()
+            .px_1()
             .gap_1()
             .flex()
             .flex_row()
@@ -1815,7 +1815,20 @@ impl AppView {
             .border_b_1()
             .border_color(theme.border)
             .text_color(theme.text_primary)
-            // The connection picker: a chip, not the whole bar.
+            // ☰ first, the way every app with a collapsed menu does it.
+            .child(
+                bar_button("top-bar-menu", "☰", self.app_menu_open, true, theme).on_click(
+                    cx.listener(|view, _, _, cx| {
+                        view.app_menu_open = !view.app_menu_open;
+                        view.dropdown_open = false;
+                        cx.notify();
+                    }),
+                ),
+            )
+            // The connection picker. Borderless until you point at it —
+            // a resting bar should be a line of text, not a row of boxes
+            // (2026-08-31: „zed to ma takove hezke"). It is still exactly
+            // as clickable as it looks, which was the actual bug.
             .child(
                 div()
                     .id("top-bar-connection")
@@ -1826,9 +1839,7 @@ impl AppView {
                     .px_2()
                     .py(px(3.))
                     .rounded_md()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(if self.dropdown_open { theme.bg_hover } else { theme.bg_panel })
+                    .bg(if self.dropdown_open { theme.bg_hover } else { theme.bg_app })
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.bg_hover))
                     .child(div().text_color(theme.text_muted).child("Připojení"))
@@ -1836,6 +1847,7 @@ impl AppView {
                     .child(div().text_color(theme.text_muted).child("▾"))
                     .on_click(cx.listener(|view, _, _, cx| {
                         view.dropdown_open = !view.dropdown_open;
+                        view.app_menu_open = false;
                         if view.dropdown_open {
                             view.refresh_grouped_cache(cx);
                         }
@@ -1867,14 +1879,10 @@ impl AppView {
                     }),
                 ),
             )
-            .child(bar_button("top-bar-settings", "⚙", false, true, theme).on_click(cx.listener(
-                |view, _, _, cx| {
-                    view.open_settings(cx);
-                },
-            )))
             .child(bar_separator(theme))
             .child(
                 div()
+                    .pr_1()
                     .text_color(theme.text_faint)
                     .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
             )

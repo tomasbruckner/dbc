@@ -2126,6 +2126,11 @@ struct AppView {
     /// input, decides nothing, and must be dismissable without disturbing
     /// whatever modal flow it was opened over.
     shortcuts_open: bool,
+    /// The ☰ application menu is open. Plain flags rather than `ModalState`
+    /// for the same reason as `shortcuts_open`: these overlays take no
+    /// input and decide nothing.
+    app_menu_open: bool,
+    about_open: bool,
     /// Sidebar rework: bumped on every db-list/schema-slot fetch dispatch;
     /// a result only applies if the generation still matches
     /// (last-dispatched wins — the slot state machines in schema_tree.rs
@@ -5263,8 +5268,10 @@ impl AppView {
         // Escape closes the cheat sheet first. An overlay you cannot
         // dismiss with the key everything else dismisses with is a trap,
         // and cancelling a query underneath it would be a surprise.
-        if self.shortcuts_open {
+        if self.shortcuts_open || self.about_open || self.app_menu_open {
             self.shortcuts_open = false;
+            self.about_open = false;
+            self.app_menu_open = false;
             cx.notify();
             return;
         }
@@ -5530,15 +5537,167 @@ impl AppView {
         strip.into_any_element()
     }
 
+    /// The ☰ menu: the things an app has that are not about the database
+    /// in front of you — settings, help, where its files live, how to quit.
+    ///
+    /// One menu rather than a full menu BAR. A menu bar earns its width by
+    /// holding the app's whole command surface; here the command surface is
+    /// the palette (Ctrl+K), which is searchable and already lists
+    /// everything. Six items behind one glyph says the same thing in a
+    /// fraction of the room.
+    fn render_app_menu_overlay(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        let item = |id: &'static str, label: &'static str, chord: Option<&'static str>| {
+            div()
+                .id(id)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_4()
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .hover(|st| st.bg(theme.bg_hover))
+                .child(div().flex_1().text_color(theme.text_primary).child(label))
+                .child(
+                    div()
+                        .text_color(theme.text_faint)
+                        .child(chord.map(keymap::pretty).unwrap_or_default()),
+                )
+        };
+        let panel = div()
+            .absolute()
+            .top(px(34.))
+            .left(px(4.))
+            .w(px(300.))
+            .py_1()
+            .bg(theme.bg_panel)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .occlude()
+            .on_mouse_down_out(cx.listener(|view, _, _, cx| {
+                view.app_menu_open = false;
+                cx.notify();
+            }))
+            .child(item("menu-about", "O aplikaci", None).on_click(cx.listener(
+                |view, _, _, cx| {
+                    view.app_menu_open = false;
+                    view.about_open = true;
+                    cx.notify();
+                },
+            )))
+            .child(item("menu-shortcuts", "Klávesové zkratky", Some("f1")).on_click(cx.listener(
+                |view, _, _, cx| {
+                    view.app_menu_open = false;
+                    view.shortcuts_open = true;
+                    cx.notify();
+                },
+            )))
+            .child(div().h(px(1.)).my_1().mx_2().bg(theme.border))
+            .child(item("menu-settings", "Nastavení…", None).on_click(cx.listener(
+                |view, _, _, cx| {
+                    view.app_menu_open = false;
+                    view.open_settings(cx);
+                },
+            )))
+            .child(item("menu-palette", "Paleta příkazů", Some("ctrl-k")).on_click(cx.listener(
+                |view, _, window, cx| {
+                    view.app_menu_open = false;
+                    view.on_open_palette(&OpenPalette, window, cx);
+                },
+            )))
+            .child(div().h(px(1.)).my_1().mx_2().bg(theme.border))
+            .child(item("menu-log", "Otevřít log", None).on_click(cx.listener(
+                |view, _, _, cx| {
+                    view.app_menu_open = false;
+                    view.open_log_tab(cx);
+                },
+            )))
+            .child(item("menu-clear-cache", "Vymazat mezipaměť schémat", None).on_click(
+                cx.listener(|view, _, _, cx| {
+                    view.app_menu_open = false;
+                    dbc_state::schema_cache::clear();
+                    view.status = "Mezipaměť schémat vymazána".to_string();
+                    cx.notify();
+                }),
+            ));
+        panel.into_any_element()
+    }
+
+    /// „O aplikaci": version, and WHERE THE FILES ARE. The paths are the
+    /// part that is actually useful — profile, log and workspace are the
+    /// three things anyone ever needs to find, and hunting for them is how
+    /// this session started.
+    fn render_about_overlay(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        let row = |label: &'static str, value: String| {
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(div().w(px(120.)).flex_shrink_0().text_color(theme.text_muted).child(label))
+                .child(div().text_color(theme.text_primary).child(value))
+        };
+        let profile = dbc_state::workspace::profile_dir().display().to_string();
+        let log = dbc_state::applog::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let workspace = self
+            .workspace_root
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(žádný)".to_string());
+        let panel = div()
+            .w(px(620.))
+            .bg(theme.bg_panel)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().text_size(px(16.)).text_color(theme.text_primary).child("dbc"))
+            .child(row("Verze", env!("CARGO_PKG_VERSION").to_string()))
+            .child(row("Profil", profile))
+            .child(row("Log", log))
+            .child(row("Pracovní prostor", workspace))
+            .child(div().mt_2().text_color(theme.text_faint).child("Esc zavře"));
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|view, _, _, cx| {
+                    view.about_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(panel)
+            .into_any_element()
+    }
+
     /// The cheat sheet: every documented shortcut, grouped by where it
     /// works, rendered from the same table the audits check against the
     /// real bindings.
     fn render_shortcuts_overlay(&self, cx: &Context<Self>) -> AnyElement {
         let theme = *cx.theme();
+        // TWO COLUMNS, not one tall list. The single column overflowed the
+        // window and was silently clipped at the bottom (user report,
+        // 2026-08-31: „ta f1 napoveda je useknuta dole") — with
+        // `overflow_hidden` and no scrolling, the shortcuts that did not fit
+        // simply did not exist. Splitting the scopes across two columns
+        // makes the whole sheet fit at once, which is what a cheat sheet is
+        // for: you look, you do not scroll.
         let mut panel = div()
-            .w(px(720.))
-            .max_h(px(560.))
-            .overflow_hidden()
+            .w(px(860.))
             .bg(theme.bg_panel)
             .border_1()
             .border_color(theme.border)
@@ -5561,28 +5720,56 @@ impl AppView {
                             .child("F1 nebo Esc zavře"),
                     ),
             );
-        for scope in keymap::scopes() {
-            let mut column = div().flex().flex_col().child(
-                div().mt_2().text_color(theme.text_muted).child(scope.title()),
-            );
-            for sc in keymap::SHORTCUTS.iter().filter(|s| s.scope == scope) {
-                column = column.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap_2()
-                        .child(
-                            div()
-                                .w(px(180.))
-                                .flex_shrink_0()
-                                .text_color(theme.text_primary)
-                                .child(keymap::pretty(sc.chord)),
-                        )
-                        .child(div().text_color(theme.text_muted).child(sc.label)),
-                );
+        // Balance by ROW COUNT, not by scope count: „Kdekoliv" alone is
+        // bigger than the other four together, so splitting the list of
+        // scopes down the middle would leave one column nearly empty.
+        let scopes = keymap::scopes();
+        let total: usize = keymap::SHORTCUTS.len() + scopes.len();
+        let mut left: Vec<keymap::Scope> = Vec::new();
+        let mut right: Vec<keymap::Scope> = Vec::new();
+        let mut used = 0usize;
+        for scope in scopes {
+            let rows = keymap::SHORTCUTS.iter().filter(|s| s.scope == scope).count() + 1;
+            if used + rows / 2 <= total / 2 || left.is_empty() {
+                left.push(scope);
+                used += rows;
+            } else {
+                right.push(scope);
             }
-            panel = panel.child(column);
         }
+
+        let render_column = |scopes: &[keymap::Scope]| {
+            let mut column = div().flex().flex_col().gap_1().w(px(400.));
+            for scope in scopes {
+                column = column
+                    .child(div().mt_2().text_color(theme.text_muted).child(scope.title()));
+                for sc in keymap::SHORTCUTS.iter().filter(|s| s.scope == *scope) {
+                    column = column.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(150.))
+                                    .flex_shrink_0()
+                                    .text_color(theme.text_primary)
+                                    .child(keymap::pretty(sc.chord)),
+                            )
+                            .child(div().text_color(theme.text_muted).child(sc.label)),
+                    );
+                }
+            }
+            column
+        };
+        panel = panel.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_4()
+                .child(render_column(&left))
+                .child(render_column(&right)),
+        );
         div()
             .absolute()
             .top_0()
@@ -8844,6 +9031,7 @@ impl AppView {
                 .spawn(async move { dbc_state::schema_cache::load::<SchemaSnapshot>(&c, &d) });
             let (c, d) = (conn_id.clone(), db.clone());
             let (served, done) = (served_from_cache.clone(), fetch_done.clone());
+            let cache_started = std::time::Instant::now();
             cx.spawn(async move |this, cx| {
                 let Some(cached) = load.await else { return };
                 let _ = this.update(cx, |view, cx| {
@@ -8851,6 +9039,12 @@ impl AppView {
                         return;
                     }
                     served.set(true);
+                    dbc_state::applog::log(dbc_state::applog::Event::SchemaFromCache {
+                        conn: c.clone(),
+                        db: Some(d.clone()),
+                        tables: cached.tables.len(),
+                        ms: cache_started.elapsed().as_millis() as u64,
+                    });
                     view.tree
                         .update(cx, |t, cx| t.finish_schema(&c, &d, my_generation, Ok(cached), cx));
                 });
@@ -12921,6 +13115,12 @@ impl Render for AppView {
         }
         // Truly last: the cheat sheet is the one overlay you might open to
         // find out how to get rid of whatever else is on screen.
+        if self.app_menu_open {
+            root = root.child(self.render_app_menu_overlay(cx));
+        }
+        if self.about_open {
+            root = root.child(self.render_about_overlay(cx));
+        }
         if self.shortcuts_open {
             root = root.child(self.render_shortcuts_overlay(cx));
         }
@@ -13339,6 +13539,8 @@ fn main() {
                             history_resizing: None,
                             pending_menu_action: None,
                             shortcuts_open: false,
+                            app_menu_open: false,
+                            about_open: false,
                             sidebar_fetch_generation: 0,
                             compare_fetch_generation: 0,
                             history,

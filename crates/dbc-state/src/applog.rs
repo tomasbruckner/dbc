@@ -67,6 +67,11 @@ pub enum Event {
     ConnectOk { conn: String, engine: String, ms: u64 },
     ConnectFailed { conn: String, engine: String, error: String },
     SchemaLoaded { conn: String, db: Option<String>, tables: usize, ms: u64 },
+    /// The tree was painted from the on-disk cache before the server
+    /// answered. Without this entry the log cannot tell a cache HIT from a
+    /// miss — both look like a later `schema.ok` — which made the one
+    /// question the cache exists to answer unanswerable (2026-08-31).
+    SchemaFromCache { conn: String, db: Option<String>, tables: usize, ms: u64 },
     SchemaFailed { conn: String, db: Option<String>, error: String },
     /// `kind` is the statement kind (SELECT, INSERT, …), never the text.
     QueryOk { kind: String, rows: usize, ms: u64 },
@@ -92,6 +97,7 @@ impl Event {
             Event::Startup { .. }
             | Event::ConnectOk { .. }
             | Event::SchemaLoaded { .. }
+            | Event::SchemaFromCache { .. }
             | Event::QueryOk { .. }
             | Event::WriteApplied { .. }
             | Event::Action { .. } => Level::Info,
@@ -127,6 +133,14 @@ impl Event {
                 let _ = write!(
                     s,
                     "schema.ok conn={} db={} tables={tables} ms={ms}",
+                    q(conn),
+                    q(db.as_deref().unwrap_or("-"))
+                );
+            }
+            Event::SchemaFromCache { conn, db, tables, ms } => {
+                let _ = write!(
+                    s,
+                    "schema.cache conn={} db={} tables={tables} ms={ms}",
                     q(conn),
                     q(db.as_deref().unwrap_or("-"))
                 );
