@@ -56,6 +56,7 @@ mod sandbox;
 mod schema_tree;
 mod scripts;
 mod sql_highlight;
+mod star_expand;
 mod tree_menu;
 mod folders;
 mod keymap;
@@ -125,6 +126,8 @@ actions!(
         SaveScript,
         /// Pretty-print the editor buffer (user request 2026-08-28).
         FormatSql,
+        /// `SELECT *` -> the real column list (user request 2026-08-31).
+        ExpandStar,
         /// Read-only text tabs (Log, DDL). Scoped to the `"TextView"` key
         /// context, never global: Ctrl+C already means something in the
         /// editor and in the grid, and the cheat sheet deliberately does
@@ -5844,6 +5847,52 @@ impl AppView {
             )
             .child(panel)
             .into_any_element()
+    }
+
+    /// „Rozbal hvězdičku": `SELECT *` becomes the real column list.
+    ///
+    /// A self-rewrite, so it goes through `rewrite_buffer_in_place` like
+    /// „Formátovat" — the caller supplies a transform, never text, which is
+    /// what makes it safe to skip the unsaved-changes prompt. The cursor is
+    /// read BEFORE the rewrite and only chooses WHICH star; no content
+    /// enters from outside the buffer.
+    fn on_expand_star(&mut self, _: &ExpandStar, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        let Some(engine) = self.active_engine() else {
+            self.status = "error: rozbalení hvězdičky potřebuje aktivní připojení".into();
+            cx.notify();
+            return;
+        };
+        let dialect = sql_dialect(engine);
+        let cursor = self.sql.read(cx).cursor();
+        // Cloned, not borrowed: `snapshot()` hands back a reference into
+        // the tree entity, and `rewrite_buffer_in_place` needs `cx`
+        // mutably. A schema snapshot is metadata, and this runs once per
+        // keypress, not per frame.
+        let snapshot = self.tree.read(cx).snapshot().cloned();
+        let mut outcome: Result<usize, star_expand::Refusal> = Err(star_expand::Refusal::NoStar);
+        rewrite_buffer_in_place(self, cx, |sql| {
+            match star_expand::expand_at(sql, cursor, snapshot.as_ref(), dialect) {
+                Ok(e) => {
+                    let mut out = sql.to_string();
+                    let n = e.text.split(", ").count();
+                    out.replace_range(e.range, &e.text);
+                    outcome = Ok(n);
+                    out
+                }
+                Err(r) => {
+                    outcome = Err(r);
+                    sql.to_string()
+                }
+            }
+        });
+        self.status = match outcome {
+            Ok(n) => format!("Rozbaleno na {n} sloupců"),
+            Err(r) => format!("error: {}", r.message()),
+        };
+        cx.notify();
     }
 
     fn on_format_sql(&mut self, _: &FormatSql, _window: &mut Window, cx: &mut Context<Self>) {
@@ -13271,6 +13320,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_open_autocomplete))
             .on_action(cx.listener(Self::on_save_script))
             .on_action(cx.listener(Self::on_format_sql))
+            .on_action(cx.listener(Self::on_expand_star))
             .on_action(cx.listener(Self::on_show_shortcuts))
             .on_action(cx.listener(Self::on_focus_editor))
             .on_action(cx.listener(Self::on_focus_tree))
@@ -13760,6 +13810,8 @@ fn main() {
             // Ctrl+Shift+F: the shape every other editor uses for "format
             // document". Ctrl+F is left free for a future find.
             KeyBinding::new("ctrl-shift-f", FormatSql, None),
+            // Ctrl+Shift+E for „expand". Free repo-wide before this line.
+            KeyBinding::new("ctrl-shift-e", ExpandStar, None),
             // F1 is the one key every Windows app spends on help.
             KeyBinding::new("f1", ShowShortcuts, None),
             KeyBinding::new("ctrl-1", FocusEditor, None),
