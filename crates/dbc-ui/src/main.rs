@@ -6850,6 +6850,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             editor: self.sql.read(cx).text(),
             cursor: self.sql.read(cx).cursor(),
             expanded: self.tree.read(cx).expanded_keys(),
+            expanded_nodes: self.tree.read(cx).expanded_node_keys(),
             tabs: session_tabs(&self.tabs),
         }
     }
@@ -14145,9 +14146,16 @@ fn main() {
                         };
                         let editor_focus = sql.focus_handle(cx);
                         let tree = cx.new(|cx| SchemaTree::new(cx, editor_focus));
-                        if !session.expanded.is_empty() {
+                        if !session.expanded.is_empty() || !session.expanded_nodes.is_empty() {
                             let keys = session.expanded.clone();
-                            tree.update(cx, |t, cx| t.restore_expanded_keys(&keys, cx));
+                            let nodes = session.expanded_nodes.clone();
+                            tree.update(cx, |t, cx| {
+                                t.restore_expanded_keys(&keys, cx);
+                                // Parked, not applied: the sections and
+                                // tables it names live inside snapshots
+                                // that have not loaded yet.
+                                t.restore_expanded_nodes(&nodes);
+                            });
                         }
                         cx.subscribe(&tree, AppView::on_tree_event).detach();
                         let history_search = cx.new(|cx| connections_ui::TextField::new(cx, "Hledat…", false));

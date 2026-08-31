@@ -47,6 +47,10 @@ const MAX_TABS: usize = 16;
 /// work that survived when it did not.
 const MAX_SQL_BYTES: usize = 1024 * 1024;
 
+/// Enough for a deeply browsed schema, far short of „every table in a
+/// 1171-table database is open".
+const MAX_EXPANDED_NODES: usize = 2000;
+
 /// One restored tab: what it was called and what query made it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTab {
@@ -79,6 +83,12 @@ pub struct SessionState {
     /// module only carries the strings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expanded: Vec<String>,
+    /// The expand state INSIDE each loaded database — sections, tables,
+    /// columns. A separate list because it lives somewhere else in the UI
+    /// (one set per loaded snapshot, not one flat set), and because it can
+    /// only be applied once that database's schema has arrived.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expanded_nodes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tabs: Vec<SessionTab>,
 }
@@ -98,6 +108,14 @@ impl SessionState {
         }
         self.tabs.retain(|t| t.sql.len() <= MAX_SQL_BYTES);
         self.tabs.truncate(MAX_TABS);
+        // A tree opened all the way down a 1171-table database would
+        // otherwise write a megabyte of node ids. Past the cap the inner
+        // expansion is dropped whole: losing „which tables were open" is a
+        // small, obvious loss, where a half-restored tree is a confusing
+        // one.
+        if self.expanded_nodes.len() > MAX_EXPANDED_NODES {
+            self.expanded_nodes.clear();
+        }
         self
     }
 
@@ -180,6 +198,7 @@ mod tests {
             editor: "SELECT 1".into(),
             cursor: 3,
             expanded: vec!["conn:conn-1".into()],
+            expanded_nodes: vec!["conn-1|dw|t|dbo|orders".into()],
             tabs: vec![SessionTab {
                 title: "Náhled: orders".into(),
                 sql: "SELECT * FROM orders".into(),
@@ -194,7 +213,8 @@ mod tests {
     #[test]
     fn the_file_carries_only_names_sql_and_offsets() {
         const ALLOWED: &[&str] = &[
-            "connection", "database", "editor", "cursor", "expanded", "title", "sql", "pinned",
+            "connection", "database", "editor", "cursor", "expanded", "expanded_nodes", "title",
+            "sql", "pinned",
         ];
         let text = toml::to_string_pretty(&full()).unwrap();
         let keys: Vec<&str> = text

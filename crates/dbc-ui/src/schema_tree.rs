@@ -824,6 +824,65 @@ pub enum OuterId {
 /// name or a generated connection id, so no escaping is needed.
 const OUTER_SEP: char = '\u{1f}';
 
+/// The section headers, as the closed vocabulary they already are.
+///
+/// `NodeId::Section` holds a `&'static str`, so decoding one out of a
+/// session file has to land back on one of THESE — a session cannot
+/// invent a section. Same posture as `applog`'s event names and
+/// `format::statement_kind`: the type is the rail, this list is what it
+/// admits.
+const SECTION_NAMES: &[&str] =
+    &["Tabulky", "Pohledy", "Funkce", "Procedury", "Triggery", "Indexy", "Sekvence"];
+
+impl NodeId {
+    /// A flat string for the session file. Same scheme as `OuterId` next
+    /// door: a short tag, then the fields, joined by the unit separator.
+    pub fn encode(&self) -> String {
+        let j = OUTER_SEP;
+        match self {
+            NodeId::Schema(s) => format!("s{j}{s}"),
+            NodeId::Section(s, name) => format!("sec{j}{s}{j}{name}"),
+            NodeId::Table(s, t) => format!("t{j}{s}{j}{t}"),
+            NodeId::Column(s, t, c) => format!("c{j}{s}{j}{t}{j}{c}"),
+            NodeId::Routine(s, n) => format!("r{j}{s}{j}{n}"),
+            NodeId::Trigger(s, n) => format!("g{j}{s}{j}{n}"),
+            NodeId::Sequence(s, n) => format!("q{j}{s}{j}{n}"),
+            NodeId::Index(s, t, i) => format!("i{j}{s}{j}{t}{j}{i}"),
+            NodeId::FavouriteSection => "favsec".to_string(),
+            NodeId::Favourite(k, s, n) => format!("fav{j}{k}{j}{s}{j}{n}"),
+            NodeId::AdminRoot => "admin".to_string(),
+        }
+    }
+
+    /// Total inverse: anything unrecognised is `None`. A row that fails to
+    /// decode simply opens closed, which is the cheapest way to be wrong.
+    pub fn decode(text: &str) -> Option<Self> {
+        let mut p = text.split(OUTER_SEP);
+        let tag = p.next()?;
+        let mut next = || p.next().map(str::to_string);
+        let out = match tag {
+            "s" => NodeId::Schema(next()?),
+            "sec" => {
+                let (schema, name) = (next()?, next()?);
+                let name = SECTION_NAMES.iter().find(|n| **n == name)?;
+                NodeId::Section(schema, name)
+            }
+            "t" => NodeId::Table(next()?, next()?),
+            "c" => NodeId::Column(next()?, next()?, next()?),
+            "r" => NodeId::Routine(next()?, next()?),
+            "g" => NodeId::Trigger(next()?, next()?),
+            "q" => NodeId::Sequence(next()?, next()?),
+            "i" => NodeId::Index(next()?, next()?, next()?),
+            "favsec" => NodeId::FavouriteSection,
+            "fav" => NodeId::Favourite(next()?, next()?, next()?),
+            "admin" => NodeId::AdminRoot,
+            _ => return None,
+        };
+        // Trailing fields mean this is not the shape it claimed to be.
+        p.next().is_none().then_some(out)
+    }
+}
+
 impl OuterId {
     /// A flat string for the session file.
     ///
@@ -1745,6 +1804,17 @@ pub struct SchemaTree {
     /// absent; migrated into the real `DbNode` once the list loads
     /// (`finish_db_list`). See `ActiveSlot`'s doc comment.
     active_slot: ActiveSlot,
+    /// Inner expand state restored from the session, waiting for the
+    /// schema it describes.
+    ///
+    /// It cannot be applied when it is read: `NodeId`s live inside a
+    /// `DbSchemaState::Loaded`, and at startup no schema is loaded yet.
+    /// So it is parked per `(conn, db)` and drained the moment that
+    /// database's snapshot lands — which also means a database the user
+    /// never revisits costs nothing, and one whose tables have since been
+    /// dropped is pruned against the fresh snapshot like any other
+    /// refresh.
+    pending_expanded: HashMap<(String, String), HashSet<NodeId>>,
     filter: String,
     selected: Option<SidebarRow>,
     focus_handle: FocusHandle,
@@ -1804,6 +1874,7 @@ impl SchemaTree {
             cli_url: None,
             cli_slot: DbSchemaState::NotLoaded,
             active_slot: None,
+            pending_expanded: HashMap::new(),
             filter: String::new(),
             selected: None,
             focus_handle: cx.focus_handle(),
@@ -1895,6 +1966,71 @@ impl SchemaTree {
         cx.notify();
     }
 
+    /// The INNER expand state — which sections and tables are open inside
+    /// each loaded database — as `conn<US>db<US>node` strings.
+    ///
+    /// Separate from `expanded_keys` because it lives somewhere else
+    /// entirely: outer rows are one flat set on the tree, inner ones are a
+    /// set per loaded snapshot. Restoring only the outer half is what left
+    /// „Tabulky" and the open table closed after a restart.
+    pub fn expanded_node_keys(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut push = |conn: &str, db: &str, state: &DbSchemaState| {
+            if let DbSchemaState::Loaded { expanded, .. } = state {
+                let j = OUTER_SEP;
+                out.extend(expanded.iter().map(|id| format!("{conn}{j}{db}{j}{}", id.encode())));
+            }
+        };
+        for (conn_id, node) in &self.conns {
+            if let DbListState::Loaded { dbs, .. } = &node.dbs {
+                for d in dbs {
+                    push(conn_id, &d.name, &d.schema);
+                }
+            }
+        }
+        if let Some(((conn, db), state)) = &self.active_slot {
+            push(conn, db, state);
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Park the inner expand state until each database's schema arrives.
+    pub fn restore_expanded_nodes(&mut self, keys: &[String]) {
+        for key in keys {
+            let mut parts = key.splitn(3, OUTER_SEP);
+            let (Some(conn), Some(db), Some(node)) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let Some(id) = NodeId::decode(node) else { continue };
+            self.pending_expanded
+                .entry((conn.to_string(), db.to_string()))
+                .or_default()
+                .insert(id);
+        }
+    }
+
+    /// Drain the parked ids for `(conn, db)` into a snapshot that has just
+    /// loaded. Pruned against that snapshot, so a table dropped since the
+    /// session was written is simply not re-opened.
+    fn apply_pending_expanded(&mut self, conn_id: &str, db: &str) {
+        let Some(ids) = self.pending_expanded.remove(&(conn_id.to_string(), db.to_string())) else {
+            return;
+        };
+        let slot = match self.slot_mut(conn_id, db) {
+            Some(slot) => Some(slot),
+            None => match &mut self.active_slot {
+                Some(((c, d), state)) if c == conn_id && d == db => Some(state),
+                _ => None,
+            },
+        };
+        let Some(DbSchemaState::Loaded { snapshot, expanded }) = slot else { return };
+        let (valid, _) = prune_stale_ids(&ids, &None, snapshot);
+        expanded.extend(valid);
+    }
+
     /// Sidebar rework (design §3.4): the CLI synthetic root's URL. A switch
     /// to a saved connection sets it `None` — the CLI root disappears for
     /// good (its slot is dropped too; `conn_url` is never re-set).
@@ -1983,10 +2119,12 @@ impl SchemaTree {
             // switch path's result when the db list was never loaded —
             // key-gated, so no cross-context result can land here.
             apply_fallback_schema_result(&mut self.active_slot, conn_id, db, generation, result);
+            self.apply_pending_expanded(conn_id, db);
             cx.notify();
             return;
         };
         apply_schema_result(slot, generation, result);
+        self.apply_pending_expanded(conn_id, db);
         let active = self.active_scope.as_ref().map(|s| (s.conn_id.clone(), s.db.clone()));
         touch_and_evict(
             &mut self.conns,
@@ -4810,5 +4948,86 @@ mod outer_id_codec_tests {
     fn a_multi_segment_folder_keeps_its_segments() {
         let id = OuterId::Folder(vec!["prod".into(), "eu".into()]);
         assert_eq!(OuterId::decode(&id.encode()), Some(id));
+    }
+}
+
+/// The INNER half of the sidebar — the one whose absence left „Tabulky"
+/// and the open table closed after a restart.
+#[cfg(test)]
+mod node_id_codec_tests {
+    use super::{NodeId, SECTION_NAMES};
+
+    fn all() -> Vec<NodeId> {
+        vec![
+            NodeId::Schema("dbo".into()),
+            NodeId::Section("dbo".into(), "Tabulky"),
+            NodeId::Section(String::new(), "Sekvence"),
+            NodeId::Table("dbo".into(), "C_Data_View".into()),
+            NodeId::Column("dbo".into(), "APP_User".into(), "Role_Id".into()),
+            NodeId::Routine("dbo".into(), "fn_x".into()),
+            NodeId::Trigger("dbo".into(), "trg".into()),
+            NodeId::Sequence("dbo".into(), "seq".into()),
+            NodeId::Index("dbo".into(), "orders".into(), "ix_1".into()),
+            NodeId::FavouriteSection,
+            NodeId::Favourite("table".into(), "dbo".into(), "orders".into()),
+            NodeId::AdminRoot,
+        ]
+    }
+
+    #[test]
+    fn every_variant_round_trips() {
+        for id in all() {
+            assert_eq!(NodeId::decode(&id.encode()), Some(id.clone()), "{}", id.encode());
+        }
+    }
+
+    /// SQLite has no schema level and normalizes to `""` — an empty field
+    /// must survive, or every SQLite row would decode wrong.
+    #[test]
+    fn an_empty_schema_field_survives() {
+        let id = NodeId::Table(String::new(), "t".into());
+        assert_eq!(NodeId::decode(&id.encode()), Some(id));
+    }
+
+    #[test]
+    fn distinct_ids_encode_distinctly() {
+        let mut enc: Vec<String> = all().iter().map(NodeId::encode).collect();
+        let n = enc.len();
+        enc.sort();
+        enc.dedup();
+        assert_eq!(enc.len(), n);
+        // A table and a routine of the same name are different rows.
+        assert_ne!(
+            NodeId::Table("s".into(), "x".into()).encode(),
+            NodeId::Routine("s".into(), "x".into()).encode()
+        );
+    }
+
+    /// `Section` holds a `&'static str`, so a session file cannot invent
+    /// one — that is the rail, and this is what proves it.
+    #[test]
+    fn an_unknown_section_name_is_refused() {
+        let sep = '\u{1f}';
+        assert!(NodeId::decode(&format!("sec{sep}dbo{sep}Tabulky")).is_some());
+        assert_eq!(NodeId::decode(&format!("sec{sep}dbo{sep}Vymyslene")), None);
+        for name in SECTION_NAMES {
+            assert!(NodeId::decode(&format!("sec{sep}dbo{sep}{name}")).is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn garbage_decodes_to_nothing() {
+        let sep = '\u{1f}';
+        let bad = vec![
+            String::new(),
+            "t".to_string(),
+            format!("t{sep}only-schema"),
+            format!("admin{sep}extra"),
+            "nope".to_string(),
+            format!("c{sep}a{sep}b"),
+        ];
+        for b in bad {
+            assert_eq!(NodeId::decode(&b), None, "{b:?} was accepted");
+        }
     }
 }
