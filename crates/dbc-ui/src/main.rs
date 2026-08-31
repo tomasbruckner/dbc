@@ -10592,6 +10592,73 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         self.save_folder_state(cx);
     }
 
+    /// Open the confirm for deleting a SAVED connection.
+    ///
+    /// `secret_stays` is read HERE, not at confirm time, so the sentence
+    /// the user reads is the one that will hold when they click: the vault
+    /// cannot lock itself between the two (there is no idle re-lock), and
+    /// deciding it up front is what lets the dialog warn instead of
+    /// surprising them afterwards.
+    fn open_connection_delete(&mut self, conn_id: String, cx: &mut Context<Self>) {
+        let Some(conn) = self.config.connections.iter().find(|c| c.id == conn_id) else {
+            return;
+        };
+        let name = conn.name.clone();
+        self.modal = Some(connections_ui::ModalState::ConnectionDeleteConfirm {
+            conn_id,
+            name,
+            secret_stays: self.vault.is_none(),
+        });
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    /// Delete the connection: its `config.toml` entry, its favourites, and
+    /// — when the vault is open — its stored password.
+    ///
+    /// The favourites go with it because a favourite is keyed by connection
+    /// id: left behind, they would be unreachable rows that no UI can ever
+    /// show or clear again. The vault secret is removed for the same
+    /// reason plus a stronger one — a stored password nothing refers to is
+    /// exactly the kind of residue this app's rules exist to prevent.
+    ///
+    /// The ACTIVE connection is allowed to be the target: it is dropped
+    /// first, through the same path Odpojit uses, so no later code can go
+    /// looking for a connection that is no longer in the config.
+    pub(crate) fn confirm_connection_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::ConnectionDeleteConfirm { conn_id, name, .. }) =
+            self.modal.clone()
+        else {
+            return;
+        };
+        let Some(guard) = self.guard_corrupt_config(cx) else { return };
+        self.modal = None;
+        if self.active_connection_id.as_deref() == Some(conn_id.as_str()) {
+            self.clear_active_connection(cx);
+        }
+        // A locked vault simply has no key to decrypt with; the dialog has
+        // already said so (`connection_delete_secret_line`).
+        let mut secret_error = None;
+        if let Some(vault) = self.vault.as_mut() {
+            if let Err(e) = vault.remove_secret(&conn_id) {
+                secret_error = Some(e.message);
+            }
+        }
+        self.config.connections.retain(|c| c.id != conn_id);
+        self.config.favourite_objects.retain(|f| f.connection_id != conn_id);
+        self.status = match (self.config.save(&self.config_path, &guard), secret_error) {
+            (Err(e), _) => format!("error: připojení se nepodařilo smazat: {}", e.message),
+            (Ok(()), Some(e)) => {
+                format!("Připojení {name} smazáno, ale heslo v trezoru zůstalo: {e}")
+            }
+            (Ok(()), None) => format!("Připojení {name} smazáno"),
+        };
+        self.refresh_grouped_cache(cx);
+        let grouped = self.grouped_cache.clone();
+        self.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
+        cx.notify();
+    }
+
     fn move_connection_to_folder(
         &mut self,
         conn_id: String,
@@ -11443,6 +11510,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 self.open_folder_name(Some(path.clone()), parent, cx)
             }
             TreeEvent::FolderDelete { path } => self.open_folder_delete(path.clone(), cx),
+            TreeEvent::ConnectionDelete { conn_id } => {
+                self.open_connection_delete(conn_id.clone(), cx)
+            }
             TreeEvent::MoveConnectionToFolder { conn_id, folder } => {
                 self.move_connection_to_folder(conn_id.clone(), folder.clone(), cx)
             }
@@ -16009,7 +16079,17 @@ mod config_save_guard_audit {
         // this test's own loop verifies by POSITION, not by counting), and
         // it is the single funnel every folder operation goes through — so
         // there is one writer here, not four.
-        assert_eq!(sites, 10, "config.toml writer count changed — re-audit, do not just bump");
+        //
+        // 10 → 11 on 2026-08-31: `confirm_connection_delete` removes a saved
+        // connection. Re-audited, not bumped: the write is inside the
+        // `let Some(guard) = self.guard_corrupt_config(cx) else { return }`
+        // arm (position-verified by this test's own loop), and the guard is
+        // taken BEFORE anything is mutated — a corrupt config therefore
+        // loses neither the vault secret nor the favourites, because the
+        // function returns before touching either. This is the one writer
+        // in the crate that also DELETES, which is exactly why the guard
+        // ordering matters here more than anywhere above.
+        assert_eq!(sites, 11, "config.toml writer count changed — re-audit, do not just bump");
     }
 
     /// The widening is only worth anything if it actually reaches past the

@@ -37,7 +37,7 @@ use std::ops::Range;
 use dbc_buffer::ResultBuffer;
 use dbc_state::{ConnectionConfig, Engine, MssqlOptions, SshTunnelConfig, Vault};
 use gpui::{
-    actions, div, fill, hsla, point, prelude::*, px, relative, size, App, AnyElement,
+    actions, div, fill, hsla, point, prelude::*, px, relative, rgb, size, App, AnyElement,
     Bounds, ClipboardItem, Context, CursorStyle, Div, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
     LayoutId, Modifiers,
@@ -246,6 +246,17 @@ mod clipboard_guard_tests {
     #[test]
     fn unmasked_field_allows_clipboard_write() {
         assert!(!blocks_clipboard_write(false));
+    }
+
+    /// The bug behind [`FIELD_SELECTION`] was invisibility, not absence:
+    /// Ctrl+A DID select, the highlight simply could not be seen on the
+    /// field's white background. A translucent or near-white value would
+    /// bring that back with no other symptom, so both halves are pinned.
+    #[test]
+    fn the_field_selection_stays_visible_on_a_white_field() {
+        let c: gpui::Hsla = rgb(FIELD_SELECTION).into();
+        assert_eq!(c.a, 1.0, "a translucent tint over white is what nobody could see");
+        assert!(c.l < 0.9, "lightness {} is indistinguishable from the white field", c.l);
     }
 }
 
@@ -684,6 +695,20 @@ impl EntityInputHandler for TextField {
     }
 }
 
+/// The selection highlight inside a `TextField`, deliberately NOT
+/// `Theme::bg_selection`.
+///
+/// A `TextField` paints itself `gpui::white()` with black text in BOTH
+/// themes (see `Render for TextField`), while `bg_selection` is a ~20 %
+/// alpha blue tuned for the editor's dark background. Over white that tint
+/// is almost invisible — and because a selection also REPLACES the blue
+/// caret (`prepaint` emits either a selection quad or a cursor quad, never
+/// both), Ctrl+A on a password field looked like it did nothing at all: the
+/// bullets do not change shape, the caret vanishes, and the tint reads as
+/// paper (user report, 2026-08-31: „ctrl + a nefunguje když zadávám heslo").
+/// Opaque, so it cannot be washed out by whatever the field sits on.
+const FIELD_SELECTION: u32 = 0xa8d0ff;
+
 struct FieldElement {
     input: Entity<TextField>,
 }
@@ -817,7 +842,7 @@ impl Element for FieldElement {
                 (
                     Some(fill(
                         Bounds::from_corners(point(bounds.left() + x0, bounds.top()), point(bounds.left() + x1, bounds.bottom())),
-                        cx.theme().bg_selection,
+                        rgb(FIELD_SELECTION),
                     )),
                     None,
                 )
@@ -1523,6 +1548,16 @@ pub enum ModalState {
         path: Vec<String>,
         moving: usize,
     },
+    /// Delete a SAVED connection. `name` is carried rather than looked up
+    /// so the dialog keeps naming the same connection even if the list
+    /// changes underneath it. `secret_stays` is decided when the dialog
+    /// OPENS (is the vault unlocked right now?) so the warning the user
+    /// reads is the one that will actually be true on confirm.
+    ConnectionDeleteConfirm {
+        conn_id: String,
+        name: String,
+        secret_stays: bool,
+    },
     ScriptDeleteConfirm {
         rel: String,
         is_dir: bool,
@@ -1558,6 +1593,26 @@ pub(crate) fn script_delete_text(name: &str, is_dir: bool) -> String {
 /// discard confirm in front of it — one modal, both facts.
 pub(crate) fn script_delete_dirty_line() -> &'static str {
     "Skript má neuložené změny v editoru."
+}
+
+/// The connection-delete confirm's body.
+///
+/// It says what is NOT destroyed, because that is the question: deleting a
+/// connection removes an entry from this app's own list and leaves the
+/// database, its data and the server account exactly as they were.
+pub(crate) fn connection_delete_text(name: &str) -> String {
+    format!("Smazat připojení {name}? Databáze ani její data se nijak nezmění — mizí jen tento záznam v aplikaci.")
+}
+
+/// The second line, shown ONLY when the vault is locked at confirm time.
+///
+/// Stated rather than hidden: with no master key in memory the stored
+/// password cannot be decrypted, so it cannot be removed either. What
+/// stays behind is an encrypted blob under a connection id nothing refers
+/// to any more — unreachable, but not gone, and the user is the one who
+/// gets to decide whether that is good enough.
+pub(crate) fn connection_delete_secret_line() -> &'static str {
+    "Trezor je zamčený, takže uložené heslo v něm zůstane (zašifrované, bez záznamu, který by na ně odkazoval). Odemkni trezor před smazáním, ať zmizí i ono."
 }
 
 /// The name dialog's PRIMARY BUTTON — distinct from its title (a rename's
@@ -1749,6 +1804,9 @@ pub(crate) fn modal_confirm_kind(modal: &ModalState) -> ModalConfirmKind {
         // against any database — the same side of the policy table as
         // ScriptName, for the same reason.
         | ModalState::FolderDeleteConfirm { .. }
+        // Irreversible in the same sense: config.toml has no undo and the
+        // vault secret is destroyed with it. The button is the gate.
+        | ModalState::ConnectionDeleteConfirm { .. }
         | ModalState::ScriptDeleteConfirm { .. } => ModalConfirmKind::Ignore,
     }
 }
@@ -1797,6 +1855,7 @@ pub(crate) fn modal_is_blocking(modal: &ModalState) -> bool {
         // Nothing typed here is secret and nothing is running behind them.
         | ModalState::FolderName { .. }
         | ModalState::FolderDeleteConfirm { .. }
+        | ModalState::ConnectionDeleteConfirm { .. }
         | ModalState::CsvImport { .. } => false,
     }
 }
@@ -2160,6 +2219,9 @@ impl AppView {
             }
             ModalState::FolderDeleteConfirm { path, moving } => {
                 render_folder_delete_panel(path, moving, cx)
+            }
+            ModalState::ConnectionDeleteConfirm { name, secret_stays, .. } => {
+                render_connection_delete_panel(&name, secret_stays, cx)
             }
         };
         Some(
@@ -4244,6 +4306,49 @@ fn render_folder_delete_panel(
         .into_any_element()
 }
 
+fn render_connection_delete_panel(
+    name: &str,
+    secret_stays: bool,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let mut panel: Div = div()
+        .w(px(460.))
+        .bg(cx.theme().bg_panel)
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(cx.theme().text_primary)
+        .child(div().text_size(px(16.)).child("Smazat připojení"))
+        .child(div().child(connection_delete_text(name)));
+    if secret_stays {
+        panel = panel
+            .child(div().text_color(cx.theme().warn).child(connection_delete_secret_line()));
+    }
+    panel
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .justify_end()
+                .mt_2()
+                .child(styled_button("conn-del-cancel", "Zrušit", *cx.theme()).on_click(
+                    cx.listener(|v, _, _, cx| {
+                        v.modal = None;
+                        cx.notify();
+                    }),
+                ))
+                .child(styled_button("conn-del-ok", "Smazat připojení", *cx.theme()).on_click(
+                    cx.listener(|v, _, _, cx| v.confirm_connection_delete(cx)),
+                )),
+        )
+        .into_any_element()
+}
+
 fn render_master_password_panel(
     input: Entity<TextField>,
     error: Option<String>,
@@ -5198,6 +5303,9 @@ pub(crate) fn modal_blocks_context_switch(modal: Option<&ModalState>) -> bool {
         | Some(ModalState::ChartPicker { .. })
         | Some(ModalState::ChangeServerPassword { .. })
         | Some(ModalState::KillConfirm { .. })
+        // A workspace swap replaces `config.toml` under this dialog — the
+        // entry it is about to delete may not even exist in the new one.
+        | Some(ModalState::ConnectionDeleteConfirm { .. })
         | Some(ModalState::AnalyzeWriteConfirm { .. })
         | Some(ModalState::BackupRestore(_))
         | Some(ModalState::ScriptRun { .. })

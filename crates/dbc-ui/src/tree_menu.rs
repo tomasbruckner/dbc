@@ -213,7 +213,14 @@ fn connection_menu(conn_id: &str, ctx: &MenuCtx) -> Vec<MenuEntry> {
         item("Upravit připojení…", TreeEvent::EditConnection { conn_id: id.clone() }),
         item("Kopírovat jméno", TreeEvent::CopyText { what: "jméno".into(), text: id.clone() }),
         MenuEntry::Separator,
-        item("Obnovit seznam databází", TreeEvent::LoadDatabases { conn_id: id }),
+        item("Obnovit seznam databází", TreeEvent::LoadDatabases { conn_id: id.clone() }),
+        // Last and after a separator, like every other destructive item —
+        // and NOT gated on `read_only`, which is about the SERVER. This
+        // deletes an entry from this app's own list (user report,
+        // 2026-08-31: „nejde smazat connection při pravým kliku"); the
+        // database it points at is not touched.
+        MenuEntry::Separator,
+        danger("Smazat připojení…", TreeEvent::ConnectionDelete { conn_id: id }),
     ]);
     out
 }
@@ -913,6 +920,29 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// „Smazat připojení…" is offered on a connection row in BOTH read-only
+    /// states, and NOWHERE else. Read-only is a promise about the SERVER;
+    /// suppressing it there (the reflex, since every other `danger` item is
+    /// suppressed) would leave a read-only connection impossible to remove.
+    /// The database row is the negative half: „delete" there would read as
+    /// DROP DATABASE, which this menu deliberately does not offer at all.
+    #[test]
+    fn a_connection_can_be_deleted_read_only_or_not_and_a_database_cannot() {
+        let s = snap();
+        for read_only in [false, true] {
+            let conn = labels(&menu_for(&SidebarRow::Connection { conn_id: "c1".into() }, &ctx(&s, read_only)));
+            assert!(
+                conn.iter().any(|l| l.starts_with("Smazat připojení")),
+                "ro={read_only}: {conn:?}"
+            );
+            let db = labels(&menu_for(
+                &SidebarRow::Database { conn_id: "c1".into(), db: "d".into() },
+                &ctx(&s, read_only),
+            ));
+            assert!(!db.iter().any(|l| l.starts_with("Smazat")), "ro={read_only}: {db:?}");
         }
     }
 }

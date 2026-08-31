@@ -201,6 +201,12 @@ pub enum TreeEvent {
     BackupFor { conn_id: String, db: Option<String> },
     RestoreFor { conn_id: String, db: Option<String> },
     EditConnection { conn_id: String },
+    /// Delete a SAVED connection (`config.toml` + its vault secret). Opens
+    /// `ModalState::ConnectionDeleteConfirm`; emitting this never touches
+    /// disk on its own. Nothing on the SERVER is touched — this removes an
+    /// entry from this app's own list, which is why it is not gated on
+    /// `read_only` (that flag is about the database).
+    ConnectionDelete { conn_id: String },
     /// Connection-folder management. Folders are labels on connections plus
     /// `AppConfig::folders` for the ones that are empty; see the `folders`
     /// module for what each of these does to that pair.
@@ -2946,7 +2952,8 @@ pub(crate) fn event_target(ev: &TreeEvent) -> String {
         TreeEvent::LoadDatabases { conn_id }
         | TreeEvent::OpenMonitorFor { conn_id }
         | TreeEvent::OpenCompareFor { conn_id }
-        | TreeEvent::EditConnection { conn_id } => conn_id.clone(),
+        | TreeEvent::EditConnection { conn_id }
+        | TreeEvent::ConnectionDelete { conn_id } => conn_id.clone(),
         TreeEvent::LoadSchema { conn_id, db } => format!("{conn_id}/{db}"),
         TreeEvent::FolderCreate { parent } => parent.join("/"),
         TreeEvent::FolderRename { path } | TreeEvent::FolderDelete { path } => path.join("/"),
