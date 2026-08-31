@@ -12,6 +12,7 @@
 
 mod config;
 pub use config::{
+    engine_is_file_based,
     default_config_path, AppConfig, ConfigSaveGuard, ConfigVerdict, ConnectionConfig, Engine,
     FavouriteObject, MssqlOptions, SshTunnelConfig, StateError, ThemeMode, TreeGrouping,
 };

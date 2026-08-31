@@ -1,0 +1,22 @@
+[package]
+name = "dbc-cli"
+version.workspace = true
+edition.workspace = true
+description = "Command line over the connections saved in the dbc app."
+
+[[bin]]
+name = "dbc"
+path = "src/main.rs"
+
+[dependencies]
+dbc-core = { path = "../dbc-core" }
+dbc-buffer = { path = "../dbc-buffer" }
+dbc-state = { path = "../dbc-state" }
+dbc-connect = { path = "../dbc-connect" }
+tokio.workspace = true
+serde_json.workspace = true
+keyring = "4"
+rpassword = "7"
+
+[dev-dependencies]
+tempfile.workspace = true

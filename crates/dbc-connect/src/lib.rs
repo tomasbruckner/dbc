@@ -1,3 +1,24 @@
+//! Opening a saved connection — ONE implementation, for every engine.
+//!
+//! This used to live inside `dbc-ui`, which made it unreachable from any
+//! other binary: `dbc-mcp` grew its own near-duplicate (read-only, and
+//! refusing MSSQL outright), and a CLI would have been a third copy of the
+//! same four `match cfg.engine` arms. The security notes below are the
+//! reason that mattered — they are per-engine posture statements about
+//! where a password may live and what read-only actually enforces, and
+//! three drifting copies of those is exactly the shape of bug this
+//! codebase spends its audits preventing.
+//!
+//! What is NOT here: policy. This crate opens what it is told to open. The
+//! read-only guard, the auto-limit, the confirm-before-write rule and the
+//! row caps all live with their callers, because a GUI's confirm dialog
+//! and a CLI's `--write` flag are the same rule wearing different clothes
+//! and neither belongs in a connection opener.
+
+pub mod tunnel;
+
+use tunnel::Tunnel;
+
 use std::time::Duration;
 
 use dbc_core::{Connection, QueryError};
@@ -7,7 +28,6 @@ use dbc_driver_postgres::{PgConfig, PostgresConnection};
 use dbc_driver_sqlite::SqliteConnection;
 use dbc_state::{ConnectionConfig, Engine, Vault};
 
-use crate::tunnel::Tunnel;
 
 /// Fallback bound for `PgConfig::connect_timeout` when a saved
 /// connection doesn't set `timeout_secs` (that field otherwise doubles as
@@ -46,6 +66,47 @@ pub fn open(
 /// working — currently just an optional SSH tunnel. Dropping this drops the
 /// tunnel's child `ssh` process after the connection, tearing the forward
 /// down.
+/// Design §6: the DB-list cap. The listing SQL carries a `2001`-row cap in
+/// its own dialect (`LIMIT` / `TOP`) and `drain_all_rows` is capped at
+/// `DB_LIST_CAP + 1` as a second belt — the sentinel 2001st row is how
+/// `truncate_db_list` detects "there were more" without a COUNT round-trip.
+pub const DB_LIST_CAP: usize = 2000;
+
+/// Design §3.2: excludes templates AND `datallowconn = false` —
+/// deliberately stricter than `admin_sql`'s sizes query (templates only):
+/// a database you cannot connect to must not render as an expandable row.
+pub const PG_DB_LIST_SQL: &str = "SELECT datname FROM pg_catalog.pg_database \
+     WHERE NOT datistemplate AND datallowconn ORDER BY datname LIMIT 2001";
+
+/// Design §3.2: ONLINE databases only (state = 0). System DBs
+/// (master/msdb/model/tempdb) are INCLUDED — DataGrip precedent; hiding
+/// them would surprise admins, and they are just rows until expanded.
+/// `TOP (2001)`, not `LIMIT` — resolved deviation 2.
+pub const MSSQL_DB_LIST_SQL: &str =
+    "SELECT TOP (2001) name FROM sys.databases WHERE state = 0 ORDER BY name";
+
+/// The listing SQL for `engine`, or `None` for the file engines — those
+/// have no list to fetch: the file IS the database.
+pub fn db_list_sql(engine: Engine) -> Option<&'static str> {
+    match engine {
+        Engine::Postgres => Some(PG_DB_LIST_SQL),
+        Engine::Mssql => Some(MSSQL_DB_LIST_SQL),
+        Engine::Sqlite | Engine::Duckdb => None,
+    }
+}
+
+/// Pure half of the truncation contract: keep at most `DB_LIST_CAP` names,
+/// flag whether anything was dropped (the caller renders the disclosure
+/// Notice row, design §6).
+pub fn truncate_db_list(mut names: Vec<String>) -> (Vec<String>, bool) {
+    if names.len() > DB_LIST_CAP {
+        names.truncate(DB_LIST_CAP);
+        (names, true)
+    } else {
+        (names, false)
+    }
+}
+
 pub struct OpenConnection {
     pub conn: Box<dyn Connection>,
     pub _tunnel: Option<Tunnel>,
@@ -199,7 +260,7 @@ pub fn open_config(
 ///
 /// Prefix match, not equality (T3 review finding 1): DuckDB also accepts
 /// the NAMED in-memory form `:memory:name` — same trap, same refusal.
-pub(crate) fn is_in_memory_duckdb_path(path: &str) -> bool {
+pub fn is_in_memory_duckdb_path(path: &str) -> bool {
     let trimmed = path.trim();
     trimmed.is_empty() || trimmed.starts_with(":memory:")
 }
@@ -240,7 +301,7 @@ pub fn resolve_secret_for_connect(vault: Option<&Vault>, cfg: &ConnectionConfig)
     if mssql_connect_refusal(cfg) {
         return None;
     }
-    if crate::connections_ui::engine_is_file_based(cfg.engine) {
+    if dbc_state::engine_is_file_based(cfg.engine) {
         return None;
     }
     vault.and_then(|v| v.get_secret(&cfg.id))
@@ -263,7 +324,7 @@ pub fn resolve_secret_for_connect(vault: Option<&Vault>, cfg: &ConnectionConfig)
 /// build — včetně obou refusalů a timeout defaultu — potřebuje i změna
 /// hesla při loginu ([`change_mssql_password`]), která NEotevírá
 /// `MssqlConnection`.
-pub(crate) fn mssql_config_from_config(
+pub fn mssql_config_from_config(
     cfg: &ConnectionConfig,
     secret: Option<String>,
 ) -> Result<MssqlConfig, QueryError> {
@@ -305,7 +366,7 @@ pub(crate) fn mssql_config_from_config(
     Ok(mssql_cfg)
 }
 
-pub(crate) fn mssql_connection_from_config(
+pub fn mssql_connection_from_config(
     cfg: &ConnectionConfig,
     secret: Option<String>,
 ) -> Result<MssqlConnection, QueryError> {
@@ -316,7 +377,7 @@ pub(crate) fn mssql_connection_from_config(
 /// staré jde do `SQL_COPT_SS_OLDPWD`. Volá se VÝHRADNĚ přes
 /// `QueryRunner::change_mssql_password` (sankcionovaná cesta — UI nikdy
 /// nesahá na driver přímo).
-pub(crate) fn change_mssql_password(
+pub fn change_mssql_password(
     cfg: &ConnectionConfig,
     old_password: &str,
     new_password: &str,
@@ -331,7 +392,7 @@ pub(crate) fn change_mssql_password(
 /// diagnostic is appended, and a non-IM002 error passes through
 /// untouched. Detection checks the structured code first (odbc_err puts
 /// the bare SQLSTATE there) and falls back to a substring match.
-pub(crate) fn mssql_im002_hint(e: QueryError) -> QueryError {
+pub fn mssql_im002_hint(e: QueryError) -> QueryError {
     let is_im002 = e.code.as_deref() == Some("IM002") || e.message.contains("IM002");
     if !is_im002 {
         return e;
@@ -654,5 +715,53 @@ mod mssql_connect_tests {
         let e = QueryError { code: Some("08001".into()), message: "certificate chain".into(), position: None };
         let untouched = mssql_im002_hint(e.clone());
         assert_eq!(untouched.message, e.message);
+    }
+}
+
+#[cfg(test)]
+mod db_list_tests {
+    use super::*;
+
+    /// The two catalog queries are saved-behaviour contracts (design §3.2):
+    /// pg excludes templates AND `datallowconn = false` (deliberately
+    /// stricter than admin_sql's sizes query — a db you cannot connect to
+    /// must not render as expandable); MSSQL takes ONLINE only (state = 0)
+    /// and deliberately INCLUDES system DBs (DataGrip precedent). Each cap
+    /// is dialect-native: `LIMIT` is not T-SQL, `TOP` is not Postgres —
+    /// resolved deviation 2.
+    #[test]
+    fn db_list_sql_texts_are_pinned() {
+        assert_eq!(
+            PG_DB_LIST_SQL,
+            "SELECT datname FROM pg_catalog.pg_database \
+             WHERE NOT datistemplate AND datallowconn ORDER BY datname LIMIT 2001"
+        );
+        assert_eq!(
+            MSSQL_DB_LIST_SQL,
+            "SELECT TOP (2001) name FROM sys.databases WHERE state = 0 ORDER BY name"
+        );
+    }
+
+    #[test]
+    fn truncate_db_list_caps_at_2000_and_flags() {
+        let names: Vec<String> = (0..2001).map(|i| format!("db{i:04}")).collect();
+        let (kept, truncated) = truncate_db_list(names);
+        assert_eq!(kept.len(), DB_LIST_CAP);
+        assert!(truncated);
+        let (kept, truncated) = truncate_db_list(vec!["a".into(), "b".into()]);
+        assert_eq!(kept.len(), 2);
+        assert!(!truncated);
+        // Exactly at the cap: NOT truncated (the +1 sentinel row is the signal).
+        let names: Vec<String> = (0..2000).map(|i| format!("db{i:04}")).collect();
+        assert!(!truncate_db_list(names).1);
+    }
+
+    /// The file engines have no list to ask for — one file, one database.
+    #[test]
+    fn the_file_engines_have_no_listing_sql() {
+        assert!(db_list_sql(Engine::Sqlite).is_none());
+        assert!(db_list_sql(Engine::Duckdb).is_none());
+        assert_eq!(db_list_sql(Engine::Postgres), Some(PG_DB_LIST_SQL));
+        assert_eq!(db_list_sql(Engine::Mssql), Some(MSSQL_DB_LIST_SQL));
     }
 }

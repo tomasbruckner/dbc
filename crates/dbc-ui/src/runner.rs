@@ -187,36 +187,13 @@ pub struct CsvImportJob {
     pub mapping: crate::csv_import::ColumnMapping,
 }
 
-/// Design §6: the DB-list cap. The listing SQL carries a `2001`-row cap in
-/// its own dialect (`LIMIT` / `TOP`) and `drain_all_rows` is capped at
-/// `DB_LIST_CAP + 1` as a second belt — the sentinel 2001st row is how
-/// `truncate_db_list` detects "there were more" without a COUNT round-trip.
-pub const DB_LIST_CAP: usize = 2000;
+/// The DB-list SQL, its cap and the truncation rule moved to `dbc-connect`
+/// when the CLI needed the same three (a second copy of „which databases
+/// does this engine list, and how many" is a second thing to keep true).
+/// Re-exported under their old names so every call site and the pinning
+/// test below read exactly as they did.
+pub use dbc_connect::{db_list_sql, truncate_db_list, DB_LIST_CAP};
 
-/// Design §3.2: excludes templates AND `datallowconn = false` —
-/// deliberately stricter than `admin_sql`'s sizes query (templates only):
-/// a database you cannot connect to must not render as an expandable row.
-pub const PG_DB_LIST_SQL: &str = "SELECT datname FROM pg_catalog.pg_database \
-     WHERE NOT datistemplate AND datallowconn ORDER BY datname LIMIT 2001";
-
-/// Design §3.2: ONLINE databases only (state = 0). System DBs
-/// (master/msdb/model/tempdb) are INCLUDED — DataGrip precedent; hiding
-/// them would surprise admins, and they are just rows until expanded.
-/// `TOP (2001)`, not `LIMIT` — resolved deviation 2.
-pub const MSSQL_DB_LIST_SQL: &str =
-    "SELECT TOP (2001) name FROM sys.databases WHERE state = 0 ORDER BY name";
-
-/// Pure half of the truncation contract: keep at most `DB_LIST_CAP` names,
-/// flag whether anything was dropped (the caller renders the disclosure
-/// Notice row, design §6).
-pub fn truncate_db_list(mut names: Vec<String>) -> (Vec<String>, bool) {
-    if names.len() > DB_LIST_CAP {
-        names.truncate(DB_LIST_CAP);
-        (names, true)
-    } else {
-        (names, false)
-    }
-}
 
 /// Owns the tokio runtime. All DB I/O lives here; the UI thread only ever
 /// awaits the event channel from inside `cx.spawn`.
@@ -435,14 +412,11 @@ impl QueryRunner {
             }
         };
         // Exhaustive over Engine — house rule, no `_ =>`.
-        let sql = match engine {
-            dbc_state::Engine::Sqlite | dbc_state::Engine::Duckdb => {
-                let ConnectSpec::Config { cfg, .. } = &spec else { unreachable!("matched above") };
-                let _ = tx.send(Ok((vec![cfg.database.clone()], false)));
-                return rx;
-            }
-            dbc_state::Engine::Postgres => PG_DB_LIST_SQL,
-            dbc_state::Engine::Mssql => MSSQL_DB_LIST_SQL,
+        let Some(sql) = db_list_sql(engine) else {
+            // File engines resolve immediately: one file, one database.
+            let ConnectSpec::Config { cfg, .. } = &spec else { unreachable!("matched above") };
+            let _ = tx.send(Ok((vec![cfg.database.clone()], false)));
+            return rx;
         };
         let handle = self.handle();
         self.runtime.spawn(async move {
@@ -2977,40 +2951,6 @@ async fn stream_query(
 #[cfg(test)]
 mod db_list_tests {
     use super::*;
-
-    /// The two catalog queries are saved-behaviour contracts (design §3.2):
-    /// pg excludes templates AND `datallowconn = false` (deliberately
-    /// stricter than admin_sql's sizes query — a db you cannot connect to
-    /// must not render as expandable); MSSQL takes ONLINE only (state = 0)
-    /// and deliberately INCLUDES system DBs (DataGrip precedent). Each cap
-    /// is dialect-native: `LIMIT` is not T-SQL, `TOP` is not Postgres —
-    /// resolved deviation 2.
-    #[test]
-    fn db_list_sql_texts_are_pinned() {
-        assert_eq!(
-            PG_DB_LIST_SQL,
-            "SELECT datname FROM pg_catalog.pg_database \
-             WHERE NOT datistemplate AND datallowconn ORDER BY datname LIMIT 2001"
-        );
-        assert_eq!(
-            MSSQL_DB_LIST_SQL,
-            "SELECT TOP (2001) name FROM sys.databases WHERE state = 0 ORDER BY name"
-        );
-    }
-
-    #[test]
-    fn truncate_db_list_caps_at_2000_and_flags() {
-        let names: Vec<String> = (0..2001).map(|i| format!("db{i:04}")).collect();
-        let (kept, truncated) = truncate_db_list(names);
-        assert_eq!(kept.len(), DB_LIST_CAP);
-        assert!(truncated);
-        let (kept, truncated) = truncate_db_list(vec!["a".into(), "b".into()]);
-        assert_eq!(kept.len(), 2);
-        assert!(!truncated);
-        // Exactly at the cap: NOT truncated (the +1 sentinel row is the signal).
-        let names: Vec<String> = (0..2000).map(|i| format!("db{i:04}")).collect();
-        assert!(!truncate_db_list(names).1);
-    }
 
     fn file_cfg(engine: dbc_state::Engine, path: &str) -> dbc_state::ConnectionConfig {
         dbc_state::ConnectionConfig {

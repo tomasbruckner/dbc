@@ -3443,9 +3443,11 @@ pub(crate) const ALL_ENGINES: [Engine; 4] =
 /// skipped one) for the wrong engine. Used by `on_dropdown_item_click`'s
 /// needs_secret lookup, `test_needs_vault_prompt`, and the connection
 /// dialog's file-path helper row.
-pub(crate) fn engine_is_file_based(e: Engine) -> bool {
-    matches!(e, Engine::Sqlite | Engine::Duckdb)
-}
+/// Re-export, not a definition: the predicate now lives beside `Engine`
+/// itself in `dbc-state` so `dbc-connect` can ask it too. Kept under this
+/// name because two dozen call sites in this crate read `connections_ui::
+/// engine_is_file_based(...)` and renaming them would say nothing.
+pub(crate) use dbc_state::engine_is_file_based;
 
 fn parse_u16(s: &str) -> Option<u16> {
     let s = s.trim();

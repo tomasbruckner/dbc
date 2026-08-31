@@ -10,6 +10,7 @@ dbc-core = { path = "../dbc-core" }
 dbc-buffer = { path = "../dbc-buffer" }
 dbc-diff = { path = "../dbc-diff" }
 dbc-state = { path = "../dbc-state" }
+dbc-connect = { path = "../dbc-connect" }
 dbc-driver-sqlite = { path = "../dbc-driver-sqlite" }
 dbc-driver-postgres = { path = "../dbc-driver-postgres" }
 dbc-driver-mssql = { path = "../dbc-driver-mssql" }

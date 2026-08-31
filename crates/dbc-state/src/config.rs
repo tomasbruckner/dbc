@@ -22,6 +22,17 @@ impl From<toml::ser::Error> for StateError {
 #[serde(rename_all = "lowercase")]
 pub enum Engine { Postgres, Mssql, Sqlite, Duckdb }
 
+/// Is this engine a FILE on disk rather than a server?
+///
+/// The answer drives three unrelated behaviours, which is why it belongs
+/// next to `Engine` rather than in whichever crate happened to need it
+/// first: a file engine has no password to fetch (so no vault prompt may
+/// ever be raised for one), no host/port/user to validate, and its
+/// `database` field is a path, not a name.
+pub fn engine_is_file_based(e: Engine) -> bool {
+    matches!(e, Engine::Sqlite | Engine::Duckdb)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshTunnelConfig {
     pub host: String,

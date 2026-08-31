@@ -1,0 +1,17 @@
+[package]
+name = "dbc-connect"
+version.workspace = true
+edition.workspace = true
+description = "Opening a saved connection: one implementation, shared by the GUI and the CLI."
+
+[dependencies]
+dbc-core = { path = "../dbc-core" }
+dbc-state = { path = "../dbc-state" }
+dbc-driver-sqlite = { path = "../dbc-driver-sqlite" }
+dbc-driver-postgres = { path = "../dbc-driver-postgres" }
+dbc-driver-mssql = { path = "../dbc-driver-mssql" }
+dbc-driver-duckdb = { path = "../dbc-driver-duckdb" }
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

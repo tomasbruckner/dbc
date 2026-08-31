@@ -2249,6 +2249,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbc-cli"
+version = "0.25.0"
+dependencies = [
+ "dbc-buffer",
+ "dbc-connect",
+ "dbc-core",
+ "dbc-state",
+ "keyring",
+ "rpassword",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "dbc-connect"
+version = "0.25.0"
+dependencies = [
+ "dbc-core",
+ "dbc-driver-duckdb",
+ "dbc-driver-mssql",
+ "dbc-driver-postgres",
+ "dbc-driver-sqlite",
+ "dbc-state",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "dbc-core"
 version = "0.1.0"
 dependencies = [
@@ -2371,6 +2400,7 @@ dependencies = [
  "async-trait",
  "csv",
  "dbc-buffer",
+ "dbc-connect",
  "dbc-core",
  "dbc-diff",
  "dbc-driver-duckdb",

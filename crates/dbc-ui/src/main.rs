@@ -36,7 +36,11 @@ mod backup;
 mod chart_data;
 mod chart_view;
 mod compare;
-mod connect;
+/// The connection opener moved out to its own crate so the CLI and the
+/// MCP server can use the SAME one (see `dbc-connect`'s module doc). Kept
+/// aliased rather than renamed at every call site: the paths that read
+/// `connect::open_config(...)` say exactly what they did before.
+use dbc_connect as connect;
 mod connections_ui;
 mod csv_import;
 mod er_diagram_view;
@@ -66,7 +70,6 @@ mod tabs;
 mod text_model;
 mod text_view;
 mod theme;
-mod tunnel;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
