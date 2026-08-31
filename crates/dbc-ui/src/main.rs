@@ -13744,9 +13744,11 @@ impl Render for AppView {
         }
         body = body.child(column);
 
-        // G3 Task 3: the history panel sits RIGHT of `column`, fixed 280 px,
-        // collapsible via Ctrl+H (`ToggleHistory`) — same collapse-to-0px
-        // convention as the schema tree panel above.
+        // G3 Task 3: the history panel sits RIGHT of `column`, collapsible
+        // via Ctrl+H (`ToggleHistory`) — same collapse-to-0px convention as
+        // the schema tree panel above. THIS div owns the width: the panel
+        // inside fills it (`history_panel`'s `width_audit` keeps it that
+        // way), so the splitter below actually moves something.
         if self.history_visible {
             body = body.child(
                 div()

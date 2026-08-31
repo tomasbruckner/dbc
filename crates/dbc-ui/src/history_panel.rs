@@ -38,8 +38,6 @@ use crate::AppView;
 
 /// Right-panel fixed width (brief contract #3), mirroring the schema tree
 /// panel's `w(px(260.))` in `main.rs`'s `render`.
-pub const PANEL_WIDTH: f32 = 280.;
-
 /// Fixed per-row height (brief: G3 final-review fix F4) — `uniform_list`
 /// (the same mechanism `grid.rs`/`schema_tree.rs` use for their scrollable
 /// rows) requires every row the same height; a two-line entry (SQL +
@@ -419,7 +417,12 @@ impl AppView {
 
         div()
             .id("history-panel")
-            .w(px(PANEL_WIDTH))
+            // FILLS the wrapper, which is what owns the dragged width
+            // (`AppView::history_width`). This used to pin 280 px, so the
+            // splitter resized the container around an unchanged panel and
+            // dragging appeared to do nothing at all (user report,
+            // 2026-08-31). See `width_audit` below.
+            .w_full()
             .h_full()
             .flex_shrink_0()
             .flex()
@@ -653,5 +656,37 @@ mod section_tests {
         assert_eq!(badge_for_kind(KIND_CLI), "❯ ");
         assert_ne!(badge_for_kind(KIND_CLI), badge_for_kind("query"));
         assert_ne!(badge_for_kind(KIND_CLI), badge_for_kind("backup"));
+    }
+}
+
+/// The history panel lives inside a wrapper whose width the splitter
+/// drags. Anything in HERE that pins a width overrides that silently: no
+/// test can see it, nothing errors, and the splitter simply stops having
+/// an effect. That is not a hypothetical — `PANEL_WIDTH` did exactly this
+/// from the day the resize was added until 2026-08-31, so the whole
+/// feature had never once worked.
+#[cfg(test)]
+mod width_audit {
+    /// Assembled rather than written out, so this module's own source
+    /// cannot be what the scan matches.
+    fn needle() -> String {
+        format!(".w{}px{}", '(', '(')
+    }
+
+    #[test]
+    fn nothing_in_the_history_panel_pins_a_width() {
+        let source = include_str!("history_panel.rs");
+        assert!(
+            !source.contains(&needle()),
+            "a fixed width here disables the splitter without failing anything —              use w_full and let the wrapper decide"
+        );
+    }
+
+    /// The rail is worthless if the needle cannot match the shape it is
+    /// looking for.
+    #[test]
+    fn the_audit_can_fail() {
+        let offending = format!("div(){}280.))", needle());
+        assert!(offending.contains(&needle()));
     }
 }
