@@ -7950,6 +7950,17 @@ mod mssql_docker_tests {
 
             // Bounded poll (~8s max) until the blocking DMV shows the
             // waiter — never an unbounded loop.
+            //
+            // KNOWN FLAKY, and NOT because of this bound (2026-08-31):
+            // this test passes 6/6 run on its own, and fails repeatedly
+            // when run alongside the other `mssql_docker_tests::` — the
+            // blocking chain never reaches the DMV at all in that
+            // configuration. Widening the bound to 60 s was tried and
+            // changed nothing except how long the failure takes, so it was
+            // reverted rather than left in as a fix that isn't one. It also
+            // fails WITHOUT the `run_execute` drain fix, so it is not a
+            // regression from it. Root cause still unknown.
+            let started_wait = Instant::now();
             let mut confirmed = false;
             for _ in 0..40 {
                 let refresh = run_monitor_refresh(&mut *monitor_conn.conn, engine, CancelToken::new()).await;
@@ -7975,13 +7986,21 @@ mod mssql_docker_tests {
                             .connections
                             .expect("connections tile must be Some given the raw query succeeded");
                         assert!(conns.active >= 1, "at least our own monitor session must show as active: {conns:?}");
+                        println!(
+                            "blocking chain appeared after {:?}",
+                            started_wait.elapsed()
+                        );
                         confirmed = true;
                         break;
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            assert!(confirmed, "blocking chain never appeared in the live BLOCKING DMV within the bound");
+            assert!(
+                confirmed,
+                "blocking chain never appeared in the live BLOCKING DMV within {:?}",
+                started_wait.elapsed()
+            );
 
             // KILL round-trip through the REAL monitor_loop/MonitorCmd
             // dispatch (not a raw `KILL` execute) — proves the T-SQL
