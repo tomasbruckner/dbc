@@ -581,7 +581,7 @@ mod tests {
         assert_eq!(fk.column, "id");
 
         // Check index
-        assert!(orders.indexes.len() > 0);
+        assert!(!orders.indexes.is_empty());
         let idx = orders.indexes.iter().find(|i| i.name == "idx_orders_cid").unwrap();
         assert_eq!(idx.columns, vec!["cid"]);
         assert!(!idx.unique);
@@ -594,7 +594,7 @@ mod tests {
         assert!(v_orders.ddl.as_ref().unwrap().contains("CREATE VIEW"));
 
         // Check trigger
-        assert!(snap.triggers.len() > 0);
+        assert!(!snap.triggers.is_empty());
         let trg = snap.triggers.iter().find(|t| t.name == "trg").unwrap();
         assert_eq!(trg.table, "orders");
         assert!(trg.ddl.is_some());

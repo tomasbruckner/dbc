@@ -140,6 +140,9 @@ pub fn fetch_schema_snapshot(conn: &Connection<'_>) -> Result<SchemaSnapshot, Qu
 /// rendered with length/precision/scale suffixes for the types where that
 /// matters (`varchar(n)`, `decimal(p,s)`, ...); other types render as the
 /// bare type name.
+/// The tuple is the three indexes the one caller immediately destructures
+/// — a named type would sit between the reader and a shape used once.
+#[allow(clippy::type_complexity)]
 fn fetch_tables(
     conn: &Connection<'_>,
 ) -> Result<(Vec<TableInfo>, HashMap<i64, usize>, ColLookup), QueryError> {

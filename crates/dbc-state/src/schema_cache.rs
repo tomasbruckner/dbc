@@ -74,6 +74,19 @@ pub fn load<T: DeserializeOwned>(conn_id: &str, db: &str) -> Option<T> {
     serde_json::from_str(&text).ok()
 }
 
+/// Is there an entry for `(conn_id, db)` at all?
+///
+/// Deliberately a `stat`, not a parse: the idle prefetch asks this about
+/// every database on a server to decide which one to warm next, and
+/// reading (let alone deserializing) a multi-megabyte snapshot just to
+/// answer „is it there?" would cost more than the fetch it is trying to
+/// save. A corrupt entry therefore answers `true` here and `None` from
+/// [`load`] — the right way round: the prefetch skips it, and the normal
+/// path re-fetches it when the user actually opens it.
+pub fn is_cached(conn_id: &str, db: &str) -> bool {
+    dir().join(key(conn_id, db)).exists()
+}
+
 /// Write the snapshot for `(conn_id, db)`. Every failure is swallowed: a
 /// cache that cannot be written is a slow app, never a broken one.
 pub fn store<T: Serialize>(conn_id: &str, db: &str, snapshot: &T) {
@@ -85,7 +98,7 @@ pub fn store<T: Serialize>(conn_id: &str, db: &str, snapshot: &T) {
     let path = dir.join(key(conn_id, db));
     // Same write-then-rename as every other file this app owns: a crash
     // mid-write must not leave a half-written entry that parses.
-    let tmp = path.with_extension("json.tmp");
+    let tmp = crate::fsutil::tmp_path_for(&path);
     if std::fs::write(&tmp, json).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
     }

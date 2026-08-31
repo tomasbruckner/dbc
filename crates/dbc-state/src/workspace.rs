@@ -143,7 +143,7 @@ pub enum Resolution {
 pub fn one_line_reason(reason: &str) -> String {
     let mut lines = reason.lines().map(str::trim).filter(|l| !l.is_empty());
     let Some(first) = lines.next() else { return String::new() };
-    match lines.last() {
+    match lines.next_back() {
         Some(last) => format!("{first}: {last}"),
         None => first.to_string(),
     }

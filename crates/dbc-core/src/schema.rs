@@ -8,17 +8,12 @@ pub struct SchemaSnapshot {
     pub sequences: Vec<SequenceInfo>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TableKind {
+    #[default]
     Table,
     View,
     MaterializedView,
-}
-
-impl Default for TableKind {
-    fn default() -> Self {
-        TableKind::Table
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -70,16 +65,11 @@ pub struct ConstraintInfo {
     pub definition: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoutineKind {
+    #[default]
     Function,
     Procedure,
-}
-
-impl Default for RoutineKind {
-    fn default() -> Self {
-        RoutineKind::Function
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

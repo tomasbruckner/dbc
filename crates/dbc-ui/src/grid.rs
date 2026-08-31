@@ -2639,11 +2639,10 @@ fn write_export_file(
     rows: usize,
     data: &[Vec<Option<String>>],
 ) -> Result<(), String> {
-    let tmp_path = {
-        let mut s = path.as_os_str().to_owned();
-        s.push(".tmp");
-        std::path::PathBuf::from(s)
-    };
+    // The `.tmp` name comes from `fsutil::tmp_path_for`, not from a second
+    // copy of the rule here: the shipped workspace `.gitignore` matches the
+    // suffix, and a naming rule with two owners is a rule that drifts.
+    let tmp_path = dbc_state::fsutil::tmp_path_for(path);
     // On any failure past this point, remove the partial .tmp so a
     // disk-full/AV-locked run doesn't leave orphans (Task 4 re-review
     // issue 5).
@@ -3226,8 +3225,12 @@ mod delete_targets_tests {
     fn insert_display_index_is_view_len_plus_ins_ix() {
         // §4's display-index arithmetic pinned here (design §7: folded in):
         // fresh add on view_len 4 -> display 4; second add -> display 5.
-        assert_eq!(4 + 0, 4usize);
-        assert_eq!(4 + 1, 5usize);
+        // Through a named function, not two literal sums: `4 + 0` reads to
+        // clippy as an operation with no effect, and simplifying it away
+        // leaves `assert_eq!(4, 4)`, which pins nothing.
+        let display_index = |view_len: usize, ins_ix: usize| view_len + ins_ix;
+        assert_eq!(display_index(4, 0), 4usize);
+        assert_eq!(display_index(4, 1), 5usize);
     }
 }
 

@@ -61,7 +61,6 @@ pub struct MultilineBuffer {
 }
 
 #[allow(dead_code)] // full surface lands in the editor element (G1 Task 4)
-#[allow(dead_code)] // full surface lands in the editor element (G1 Task 4)
 /// Character classes for word motion: a word run, a whitespace run, or a
 /// run of anything else (operators, punctuation). Grouping "everything
 /// else" means `a.b` stops at each part rather than skipping the whole
@@ -520,10 +519,8 @@ impl MultilineBuffer {
             return self.text.len();
         }
 
-        let mut offset = 0;
-        for i in 0..line {
-            offset += lines[i].len() + 1; // +1 for newline
-        }
+        // +1 per line for the newline that `split` consumed.
+        let offset: usize = lines[..line].iter().map(|l| l.len() + 1).sum();
 
         let line_text = lines[line];
         let clamped_col = snap_to_grapheme_boundary(line_text, byte_col);

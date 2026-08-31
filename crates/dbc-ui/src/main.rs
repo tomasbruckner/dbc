@@ -12,6 +12,22 @@
 // `fn`-spelling probes), so this costs nothing now and makes adding any
 // later a deliberate, visible act.
 #![forbid(unsafe_code)]
+// Two clippy lints this crate answers with a decision rather than a fix,
+// stated once here instead of thirteen times inline.
+//
+// `too_many_arguments`: a GPUI render helper threads the entity, the row it
+// draws, the theme, `window`, `cx` and two or three flags through every
+// call, and eight of those are routine. The lint's suggested remedy — a
+// parameter struct — would exist only to be destructured on the first line
+// of the function, which is more code and less clarity, and the arguments
+// are not interchangeable enough for a wrong-order call to type-check.
+//
+// `type_complexity`: the offending signatures return the exact tuple their
+// one caller destructures. Naming it would put a `type` alias between the
+// reader and the shape they need to know, and there is no second use to
+// share it with.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
 
 mod admin_panel;
 mod admin_sql;
@@ -33,6 +49,7 @@ mod monitor_sql;
 mod monitor_view;
 mod palette;
 mod plan;
+mod prefetch;
 mod pwchange;
 mod row_view;
 mod runner;
@@ -40,12 +57,14 @@ mod sandbox;
 mod schema_tree;
 mod scripts;
 mod sql_highlight;
+mod star_expand;
 mod tree_menu;
 mod folders;
 mod keymap;
 mod sql_input;
 mod tabs;
 mod text_model;
+mod text_view;
 mod theme;
 mod tunnel;
 
@@ -65,9 +84,9 @@ use dbc_state::{
 };
 use gpui::{
     actions, div, prelude::*, px, size, uniform_list, AnyElement, App, Bounds, ClipboardItem,
-    Context, Entity, FocusHandle, Focusable, KeyBinding, PathPromptOptions, ScrollDelta,
-    ScrollWheelEvent,
-    Window, WindowBounds, WindowOptions,
+    Context, Entity, FocusHandle, Focusable, HighlightStyle, KeyBinding, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollDelta,
+    ScrollWheelEvent, StyledText, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use grid::{GridEvent, ResultGrid};
@@ -107,9 +126,32 @@ actions!(
         // save-as. Global, context `None`, same posture as `RunQuery`.
         SaveScript,
         /// Pretty-print the editor buffer (user request 2026-08-28).
-        FormatSql
+        FormatSql,
+        /// `SELECT *` -> the real column list (user request 2026-08-31).
+        ExpandStar,
+        /// Read-only text tabs (Log, DDL). Scoped to the `"TextView"` key
+        /// context, never global: Ctrl+C already means something in the
+        /// editor and in the grid, and the cheat sheet deliberately does
+        /// not list chords everyone already knows.
+        TextViewCopy,
+        TextViewSelectAll
     ]
 );
+
+/// A mouse selection inside a read-only text tab.
+///
+/// `tab_id`, not „the active tab": a selection belongs to the text it was
+/// dragged over, so switching tabs and coming back must not paint someone
+/// else's offsets over this tab's content — or, worse, copy them.
+struct TextSelection {
+    tab_id: u64,
+    /// Where the drag started, and where it currently is. Kept unordered
+    /// so extending a right-to-left drag back past the anchor works.
+    anchor: usize,
+    head: usize,
+    /// The mouse button is still down; `on_mouse_move` extends `head`.
+    dragging: bool,
+}
 
 /// G3 Task 5: Ctrl+K command palette state — created on `OpenPalette`,
 /// dropped on close/execute. `items`/`selected` are recomputed from
@@ -1829,6 +1871,7 @@ pub(crate) const SCRIPT_LOAD_BLOCKED: &str =
 ///   root directly is exact where a shared counter would be a blunt proxy:
 ///   it supersedes the open and nothing else, and it needs no future
 ///   root-changing site to remember to bump anything.
+///
 /// `None` means „land it". Otherwise the Czech status naming WHICH of the
 /// three moved — the `context_switch_refusal` idiom, for the same reason:
 /// one refusal that covers three different causes teaches the user
@@ -1945,6 +1988,20 @@ enum PendingDiscard {
 #[derive(Clone)]
 pub(crate) enum PendingTreeAction {
     OpenPreview { schema: Option<String>, table: String },
+    /// Session restore: load the connection's DATABASE LIST once the
+    /// switch has succeeded.
+    ///
+    /// The second kind, added deliberately (the test below used to pin
+    /// this enum as single-variant, asking for exactly this thought).
+    /// `switch_to_database` fetches the SCHEMA of the target database but
+    /// never the list of databases, so a restored „connection row was
+    /// expanded" would render open with nothing under it. Doing it through
+    /// `follow_up` rather than as a second call reuses three properties
+    /// that are hard to get right twice: it survives the vault prompt
+    /// (carried inside `PendingAfterUnlock::SwitchDatabase`), it is owned
+    /// by its dispatch and so retired by the `switch_generation` guard,
+    /// and it runs only after the connection actually succeeded.
+    LoadDatabases,
 }
 
 /// G5 Task 4 (folded T3 review issue 2): confirm prompt for an action that
@@ -2011,6 +2068,13 @@ struct AppView {
     // --- Task 7: connection manager state ---
     config: AppConfig,
     config_path: PathBuf,
+    /// The session file for THIS context, derived from `config_path` once
+    /// at startup. A separate field rather than a call per save: the hash
+    /// is computed once, and — the reason it is not simply
+    /// `session::save(&self.config_path, …)` — `config_save_guard_audit`
+    /// reads any `save(` line naming `config_path` as a `config.toml`
+    /// write. It is right to; the answer is not to look like one.
+    session_path: PathBuf,
     /// Set when `AppConfig::load` failed to parse an existing config.toml at
     /// startup (surfaced in the status bar; see `main`). Cleared by
     /// `finish_save` once the corrupt file has been safely moved aside to
@@ -2069,6 +2133,20 @@ struct AppView {
     /// master password once (brief: prompt on first use, not at startup).
     vault: Option<Vault>,
     active_connection_id: Option<String>,
+    /// The connection this run TRIED to restore, kept until the switch
+    /// lands or the user disconnects. It is what the session records when
+    /// nothing is connected yet, so a window closed during the vault
+    /// prompt does not erase the context it was about to reopen.
+    attempted_restore: Option<(String, Option<String>)>,
+    /// A `prefetch::may_prefetch` gate and the loop's own „one at a time"
+    /// rule (see `prefetch`'s module doc). Set when a prefetch fetch is
+    /// dispatched, cleared when it lands — success or failure.
+    prefetch_in_flight: bool,
+    /// Is the idle-prefetch timer loop already running? Without it every
+    /// `finish_db_list` would start another loop beside the last one, and
+    /// „one prefetch at a time" would be enforced only by the flag above
+    /// while N timers spun behind it.
+    prefetch_armed: bool,
     /// Sidebar rework (design §2.2): the active database WITHIN
     /// `active_connection_id`. `None` = the saved config's `database` (the
     /// default). Always `None` when `active_connection_id` is `None` (the
@@ -2275,6 +2353,22 @@ struct AppView {
     /// which focuses `modal_focus_handle`. Input-owning modals never set
     /// it — they keep focusing their own first field at open time.
     modal_needs_focus: bool,
+
+    // --- Selectable read-only text tabs (Log, DDL) ---
+    /// The mouse selection inside the active `TabContent::Text`, as byte
+    /// offsets into that tab's FULL text rather than the visible slice —
+    /// so scrolling neither moves nor forgets it.
+    text_selection: Option<TextSelection>,
+    /// The layout of the `StyledText` the last text tab render produced.
+    /// Turning a mouse position into a byte offset is the one thing only
+    /// GPUI can answer (`TextLayout::index_for_position`), so the handlers
+    /// need this handle; it is replaced on every text-tab render.
+    text_layout: Option<gpui::TextLayout>,
+    /// Focus for the text tab body. Ctrl+C means three different things in
+    /// this window (editor, grid, text tab), and a key context is how they
+    /// stop fighting over it.
+    text_focus: gpui::FocusHandle,
+
     // --- G6 Task 7: schema autocomplete popup ---
     /// `None` when the popup is closed — see `AutocompleteState`'s doc
     /// comment for the lazy-diff recompute idiom.
@@ -2409,8 +2503,8 @@ pub(crate) fn sidebar_width_from(stored: Option<u16>) -> f32 {
 /// holds).
 ///
 /// **Intentionally guard-free surfaces re-affirmed**: monitor (identity
-/// is only a tab key; per-operation runner), backup/restore (explicit id
-/// + existence check by design), compare (self-contained swapped
+/// is only a tab key; per-operation runner), backup/restore (explicit
+/// id plus existence check by design), compare (self-contained swapped
 /// configs), read-only artifact tabs (stamped, never checked). The
 /// sidebar's cross-context SNAPSHOT non-leak is pre-pinned by the T5 fix
 /// round's fallback key-gate tests
@@ -2500,6 +2594,52 @@ fn conn_name_for_identity_from(connections: &[ConnectionConfig], identity: &str)
 
 /// Pure core of `AppView::resolve_active` — free function so it is
 /// testable without a GPUI context (this crate has no GPUI test harness).
+/// The open tabs a restart can honestly rebuild.
+///
+/// The filter IS the rule: a tab contributes only if it carries the SQL
+/// that made it. A monitor, an ER diagram, a DDL view or a script run has
+/// no query behind it, and a session entry for one would be a tab that
+/// comes back claiming a „Spustit" it cannot honour. Pulled out of
+/// `capture_session` so the rule is testable without a window.
+fn session_tabs(tabs: &Tabs) -> Vec<dbc_state::session::SessionTab> {
+    tabs.iter()
+        .filter_map(|t| {
+            t.sql.as_ref().map(|sql| dbc_state::session::SessionTab {
+                title: t.title.clone(),
+                sql: sql.clone(),
+                pinned: t.pinned,
+            })
+        })
+        .collect()
+}
+
+/// The tab strip as the last session left it.
+///
+/// Every restored tab is a TEXT tab holding the query that made it, with
+/// `sql` set — which is what makes the „Spustit" button appear on it. No
+/// result data was written to disk and none is invented here, so the tab
+/// arrives showing its query and nothing else. Re-running is a click, on
+/// purpose: firing a dozen remembered queries at a production server the
+/// moment the window opens is not a feature.
+fn restored_tabs(session: &dbc_state::session::SessionState) -> Tabs {
+    let mut tabs = Tabs::new();
+    for t in &session.tabs {
+        tabs.open(ResultTab {
+            id: 0,
+            title: t.title.clone(),
+            pinned: t.pinned,
+            preview_key: None,
+            // The connection is restored asynchronously (it may need the
+            // vault), so there is no identity to stamp yet. A restored tab
+            // holds no editable data, so nothing consults this.
+            conn_identity: String::new(),
+            sql: Some(t.sql.clone()),
+            content: TabContent::Text { text: text_view::normalize(&t.sql), scroll_lines: 0 },
+        });
+    }
+    tabs
+}
+
 fn resolve_active_from(
     config: &AppConfig,
     vault: Option<&Vault>,
@@ -3184,6 +3324,7 @@ impl AppView {
                                     preview_key: preview.as_ref().map(|p| p.key.clone()),
                                     // G5 Task 4 review fix (BLOCKER 1).
                                     conn_identity: conn_identity.clone(),
+                                    sql: Some(sql_for_title.clone()),
                                     content: TabContent::Grid { grid, buffer: buf },
                                 });
                                 tab_id = Some(id);
@@ -3463,6 +3604,7 @@ impl AppView {
             pinned: false,
             preview_key: None,
             conn_identity: conn_identity.to_string(),
+            sql: Some(title_sql.to_string()),
             content: TabContent::Grid { grid, buffer: buf.clone() },
         });
         (id, buf)
@@ -4115,6 +4257,7 @@ impl AppView {
             pinned: false,
             preview_key: None,
             conn_identity,
+            sql: None,
             content: TabContent::ScriptRun { state: state.clone() },
         });
 
@@ -4635,6 +4778,7 @@ impl AppView {
             pinned: false,
             preview_key: None,
             conn_identity,
+            sql: None,
             content: TabContent::ScriptRun { state: state.clone() },
         });
 
@@ -5006,6 +5150,7 @@ impl AppView {
                             pinned: false,
                             preview_key: None,
                             conn_identity,
+                            sql: None,
                             content: TabContent::Plan { view: view_entity },
                         };
                         view.tabs.open(tab);
@@ -5070,6 +5215,7 @@ impl AppView {
                                     pinned: false,
                                     preview_key: None,
                                     conn_identity,
+                                    sql: None,
                                     content: TabContent::Plan { view: view_entity },
                                 });
                                 view.status = if via_confirm_modal {
@@ -5220,6 +5366,7 @@ impl AppView {
                                 pinned: false,
                                 preview_key: None,
                                 conn_identity,
+                                sql: None,
                                 content: TabContent::Plan { view: view_entity },
                             });
                             view.status = "hotovo (změny vráceny zpět)".to_string();
@@ -5789,6 +5936,52 @@ impl AppView {
             )
             .child(panel)
             .into_any_element()
+    }
+
+    /// „Rozbal hvězdičku": `SELECT *` becomes the real column list.
+    ///
+    /// A self-rewrite, so it goes through `rewrite_buffer_in_place` like
+    /// „Formátovat" — the caller supplies a transform, never text, which is
+    /// what makes it safe to skip the unsaved-changes prompt. The cursor is
+    /// read BEFORE the rewrite and only chooses WHICH star; no content
+    /// enters from outside the buffer.
+    fn on_expand_star(&mut self, _: &ExpandStar, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        let Some(engine) = self.active_engine() else {
+            self.status = "error: rozbalení hvězdičky potřebuje aktivní připojení".into();
+            cx.notify();
+            return;
+        };
+        let dialect = sql_dialect(engine);
+        let cursor = self.sql.read(cx).cursor();
+        // Cloned, not borrowed: `snapshot()` hands back a reference into
+        // the tree entity, and `rewrite_buffer_in_place` needs `cx`
+        // mutably. A schema snapshot is metadata, and this runs once per
+        // keypress, not per frame.
+        let snapshot = self.tree.read(cx).snapshot().cloned();
+        let mut outcome: Result<usize, star_expand::Refusal> = Err(star_expand::Refusal::NoStar);
+        rewrite_buffer_in_place(self, cx, |sql| {
+            match star_expand::expand_at(sql, cursor, snapshot.as_ref(), dialect) {
+                Ok(e) => {
+                    let mut out = sql.to_string();
+                    let n = e.text.split(", ").count();
+                    out.replace_range(e.range, &e.text);
+                    outcome = Ok(n);
+                    out
+                }
+                Err(r) => {
+                    outcome = Err(r);
+                    sql.to_string()
+                }
+            }
+        });
+        self.status = match outcome {
+            Ok(n) => format!("Rozbaleno na {n} sloupců"),
+            Err(r) => format!("error: {}", r.message()),
+        };
+        cx.notify();
     }
 
     fn on_format_sql(&mut self, _: &FormatSql, _window: &mut Window, cx: &mut Context<Self>) {
@@ -6365,7 +6558,7 @@ impl AppView {
             };
         }
         self.autocomplete =
-            (!candidates.is_empty()).then(|| AutocompleteState { candidates, selected: 0 });
+            (!candidates.is_empty()).then_some(AutocompleteState { candidates, selected: 0 });
         // Keep the lazy-diff cache in sync so the SAME render's
         // `refresh_autocomplete` (which runs before this popup is drawn,
         // but AFTER this handler since actions dispatch before re-render)
@@ -6411,7 +6604,7 @@ impl AppView {
         let snapshot = self.tree.read(cx).snapshot();
         let candidates = autocomplete::candidates(&text, cursor, snapshot, false, suppressed);
         self.autocomplete =
-            (!candidates.is_empty()).then(|| AutocompleteState { candidates, selected: 0 });
+            (!candidates.is_empty()).then_some(AutocompleteState { candidates, selected: 0 });
     }
 
     fn on_ac_up(&mut self, _: &sql_input::Up, _window: &mut Window, cx: &mut Context<Self>) {
@@ -6528,12 +6721,34 @@ impl AppView {
     /// of view — `cursor_screen_bounds`'s own documented degradation), or
     /// while a modal is open (belt and suspenders alongside
     /// `refresh_autocomplete`'s own guard).
+/// Popup width for the autocomplete list, from the longest label.
+///
+/// It used to be a flat 280 px, which the FK join suggestions immediately
+/// outgrew: their labels name a table and a join condition, so every row
+/// was cut off at the same place and two different joins onto the same
+/// table became indistinguishable (user report 2026-08-31).
+///
+/// 7 px per character is a deliberate over-estimate for the ~13 px UI font,
+/// so a proportional label lands inside rather than one character short.
+/// Both bounds matter: the floor keeps a list of short keywords from
+/// collapsing into a sliver, and the ceiling keeps one pathological
+/// identifier from throwing a popup across the whole window.
+fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
+    const CHAR_PX: f32 = 7.0;
+    const CHROME_PX: f32 = 34.0; // kind badge, padding, border
+    const MIN: f32 = 280.0;
+    const MAX: f32 = 720.0;
+    let longest = labels.map(|l| l.chars().count()).max().unwrap_or(0) as f32;
+    (longest * CHAR_PX + CHROME_PX).clamp(MIN, MAX)
+}
+
     fn render_autocomplete_popup(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.modal.is_some() {
             return None;
         }
         let ac = self.autocomplete.as_ref()?;
         let candidates = ac.candidates.clone();
+        let popup_w = Self::autocomplete_popup_width(candidates.iter().map(|c| c.label.as_str()));
         let selected = ac.selected;
         let bounds = self.sql.read(cx).cursor_screen_bounds()?;
         let theme = *cx.theme();
@@ -6590,7 +6805,7 @@ impl AppView {
                 .absolute()
                 .left(bounds.left())
                 .top(bounds.top() + bounds.size.height)
-                .w(px(280.))
+                .w(px(popup_w))
                 .max_h(ROW_H * 8)
                 .bg(theme.bg_panel)
                 .border_1()
@@ -6614,6 +6829,95 @@ impl AppView {
         } else {
             self.conn_url.clone().map(ConnectSpec::Url)
         }
+    }
+
+    /// The window state worth reopening with.
+    ///
+    /// Tabs contribute only if they carry SQL, which is exactly the tabs a
+    /// restart can honestly rebuild: a query. A monitor, an ER diagram or a
+    /// DDL view has no query behind it, and inventing one would produce a
+    /// tab that lies about what re-running it would do.
+    fn capture_session(&self, cx: &App) -> dbc_state::session::SessionState {
+        // The fallback is not cosmetic. Without it, opening the app and
+        // closing it again before the connection lands — cancelling the
+        // master-password prompt is enough — records „no connection" and
+        // the session eats itself. Observed exactly once, for real, when
+        // the restore was still silently failing.
+        //
+        // It cannot resurrect anything the user gave up on: a successful
+        // switch sets `active_connection_id` (so the fallback never
+        // fires), and an explicit disconnect clears the claim.
+        let (connection, database) = match &self.active_connection_id {
+            Some(id) => (Some(id.clone()), self.active_database.clone()),
+            None => match &self.attempted_restore {
+                Some((id, db)) => (Some(id.clone()), db.clone()),
+                None => (None, None),
+            },
+        };
+        dbc_state::session::SessionState {
+            connection,
+            database,
+            editor: self.sql.read(cx).text(),
+            cursor: self.sql.read(cx).cursor(),
+            expanded: self.tree.read(cx).expanded_keys(),
+            expanded_nodes: self.tree.read(cx).expanded_node_keys(),
+            tabs: session_tabs(&self.tabs),
+        }
+    }
+
+    /// Reconnect to whatever was open when the app was last closed, and
+    /// give the restored sidebar rows something to show.
+    ///
+    /// `LoadDatabases` as the follow-up rather than a second call: the
+    /// switch may have to wait for the vault, and the follow-up rides
+    /// along inside the pending action, so one password answers both. It
+    /// also only runs once the connection actually succeeded — a database
+    /// list fetched against a connection that failed would be a second
+    /// error about the same thing.
+    fn restore_session_context(
+        &mut self,
+        restore: Option<(String, Option<String>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((conn_id, db)) = restore else { return };
+        self.attempted_restore = Some((conn_id.clone(), db.clone()));
+        // A connection deleted since the last run is not worth a modal, but
+        // it IS worth a log line — otherwise „it did not reconnect" has no
+        // visible cause at all.
+        let known = self.config.connections.iter().any(|c| c.id == conn_id);
+        dbc_state::applog::log(dbc_state::applog::Event::Action {
+            action: if known { "SessionRestored".into() } else { "SessionConnGone".into() },
+            target: match &db {
+                Some(db) => format!("{conn_id}/{db}"),
+                None => conn_id.clone(),
+            },
+        });
+        if known {
+            self.switch_to_database(&conn_id, db, Some(PendingTreeAction::LoadDatabases), cx);
+        }
+    }
+
+    /// Best-effort, and deliberately silent. A session that cannot be
+    /// written costs a window that opens blank next time; saying so during
+    /// shutdown would be a message nobody is there to read.
+    fn save_session(&self, cx: &App) {
+        let state = self.capture_session(cx);
+        // Logged because a restart that comes back blank is otherwise
+        // undiagnosable: „nothing was restored" and „nothing was saved"
+        // look identical from the outside, and an empty session correctly
+        // REMOVES the file, so its absence proves nothing either. Counts
+        // and the connection id only — the same vocabulary every other
+        // entry uses, never the SQL itself.
+        dbc_state::applog::log(dbc_state::applog::Event::Action {
+            action: "SessionSaved".into(),
+            target: format!(
+                "conn={} tabs={} editor={}B",
+                state.connection.as_deref().unwrap_or("-"),
+                state.tabs.len(),
+                state.editor.len()
+            ),
+        });
+        dbc_state::session::save(&self.session_path, &state);
     }
 
     /// The single site where "the database the app talks to" is decided —
@@ -6674,8 +6978,14 @@ impl AppView {
             // follow-up (unreachable from the cross-context arm, which
             // implies a different identity — kept defensively) targets the
             // already-active context, so it runs directly.
-            if let Some(PendingTreeAction::OpenPreview { schema, table }) = follow_up {
-                self.open_table_preview(schema, table, cx);
+            match follow_up {
+                Some(PendingTreeAction::OpenPreview { schema, table }) => {
+                    self.open_table_preview(schema, table, cx)
+                }
+                Some(PendingTreeAction::LoadDatabases) => {
+                    self.start_db_list_fetch(id.to_string(), cx)
+                }
+                None => {}
             }
             return;
         }
@@ -6758,8 +7068,14 @@ impl AppView {
                         // dispatch never reaches here (generation guard
                         // above), so a stale action can never replay
                         // against the wrong database.
-                        if let Some(PendingTreeAction::OpenPreview { schema, table }) = follow_up {
-                            view.open_table_preview(schema, table, cx);
+                        match follow_up {
+                            Some(PendingTreeAction::OpenPreview { schema, table }) => {
+                                view.open_table_preview(schema, table, cx)
+                            }
+                            Some(PendingTreeAction::LoadDatabases) => {
+                                view.start_db_list_fetch(target_id.clone(), cx)
+                            }
+                            None => {}
                         }
                     }
                     // Failure arms: the closure-owned follow-up simply
@@ -7166,7 +7482,7 @@ impl AppView {
         cx.spawn(async move |_this, cx| {
             let result =
                 cx.background_spawn(async move { crate::scripts::scan_scripts(&root) }).await;
-            let _ = tree.update(cx, |t, cx| t.finish_scripts_scan(generation, result, cx));
+            tree.update(cx, |t, cx| t.finish_scripts_scan(generation, result, cx));
         })
         .detach();
     }
@@ -8812,6 +9128,9 @@ impl AppView {
         // next secret use, at most once per run.
         self.vault = None;
         self.config_path = paths.config.clone();
+        // The session follows the context: a workspace switch must not
+        // leave the new context writing over the old one's open tabs.
+        self.session_path = dbc_state::session::path_for(&paths.config);
         self.vault_path = paths.vault.clone();
         let (config, config_load_error) = match AppConfig::load(&paths.config) {
             Ok(c) => (c, None),
@@ -8887,6 +9206,10 @@ impl AppView {
     /// never land in the NEW context. The CLI-arg root goes too: it belongs
     /// to the old context and, per the sidebar design, cannot come back.
     fn clear_active_connection(&mut self, cx: &mut Context<Self>) {
+        // Dropping the context on purpose also gives up the session's
+        // claim on it — otherwise the fallback below would resurrect a
+        // connection the user has just walked away from.
+        self.attempted_restore = None;
         self.active_connection_id = None;
         self.active_database = None;
         self.conn_url = None;
@@ -8970,6 +9293,151 @@ impl AppView {
                 view.tree.update(cx, |t, cx| {
                     t.finish_db_list(&conn_id, my_generation, result, &default_db, cx)
                 });
+                // A fresh list is the only thing that can create work for
+                // the idle prefetch, so it is the only thing that arms it.
+                view.arm_schema_prefetch(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// How long the app must be quiet before the prefetch looks again.
+    ///
+    /// Long enough that it never competes with a person who is still
+    /// clicking — every gate in `prefetch::may_prefetch` is re-checked on
+    /// each lap, so a busy app simply keeps skipping — and short enough
+    /// that leaving the window alone for a moment is already worth
+    /// something.
+    const PREFETCH_IDLE_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Start the idle-prefetch loop, if it is not already running.
+    ///
+    /// The loop ENDS — it is not a heartbeat. It breaks the moment a lap
+    /// finds nothing left to warm (or the `AppView` is gone), and only a
+    /// new database list arms it again. That is what keeps a fully warmed
+    /// app from ticking forever for no reason.
+    fn arm_schema_prefetch(&mut self, cx: &mut Context<Self>) {
+        if self.prefetch_armed {
+            return;
+        }
+        self.prefetch_armed = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Self::PREFETCH_IDLE_DELAY).await;
+                match this.update(cx, |view, cx| view.prefetch_lap(cx)) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => break,
+                }
+            }
+            let _ = this.update(cx, |view, _| view.prefetch_armed = false);
+        })
+        .detach();
+    }
+
+    /// One lap of the idle prefetch. `true` = keep looping.
+    ///
+    /// „Busy" answers `true` without looking at anything: the app being
+    /// busy says nothing about whether work remains, so ending the loop
+    /// there would silently drop the whole feature for anyone who types
+    /// continuously. Only an IDLE lap that finds no target ends it.
+    fn prefetch_lap(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(conn_id) = self.active_connection_id.clone() else {
+            // Nothing active to warm. A later connection re-arms us
+            // through `finish_db_list`.
+            return false;
+        };
+        let Some(cfg) = self.config.connections.iter().find(|c| c.id == conn_id).cloned() else {
+            return false;
+        };
+        let needs_secret = !connections_ui::engine_is_file_based(cfg.engine);
+        let secret_available = !connections_ui::connect_needs_vault_prompt(
+            needs_secret,
+            self.vault.is_some(),
+            Vault::exists(&self.vault_path),
+        );
+        let busy = prefetch::Busy {
+            query_running: self.cancel.is_some(),
+            modal_open: self.modal.is_some(),
+            sidebar_fetching: self.tree.read(cx).any_fetch_in_flight(),
+            prefetch_in_flight: self.prefetch_in_flight,
+        };
+        if !prefetch::may_prefetch(&busy, secret_available) {
+            return true;
+        }
+        let Some((dbs, _truncated)) = self.tree.read(cx).db_list_for(&conn_id) else {
+            return false;
+        };
+        let candidates: Vec<prefetch::Candidate> = dbs
+            .iter()
+            .take(prefetch::SCAN_CAP)
+            .map(|d| prefetch::Candidate {
+                name: d.name.as_str(),
+                known: !matches!(d.schema, schema_tree::DbSchemaState::NotLoaded),
+                cached: dbc_state::schema_cache::is_cached(&conn_id, &d.name),
+            })
+            .collect();
+        let active_db = self.active_database.clone().or_else(|| Some(cfg.database.clone()));
+        let Some(db) = prefetch::next_target(&candidates, active_db.as_deref()).map(str::to_string)
+        else {
+            return false;
+        };
+        self.start_schema_prefetch(cfg, conn_id, db, cx);
+        true
+    }
+
+    /// Fetch one schema and write it to the on-disk cache. Nothing else.
+    ///
+    /// Deliberately NOT `start_schema_slot_fetch`: that one bumps
+    /// `sidebar_fetch_generation` (which would supersede a fetch the user
+    /// started), transitions the tree slot (repainting rows nobody
+    /// touched), and pushes into the bounded in-memory slot cache
+    /// (evicting, by LRU, a snapshot the user IS working with). A prefetch
+    /// that did any of those would be visible, and a visible background
+    /// guess is worse than no prefetch.
+    fn start_schema_prefetch(
+        &mut self,
+        cfg: dbc_state::ConnectionConfig,
+        conn_id: String,
+        db: String,
+        cx: &mut Context<Self>,
+    ) {
+        let secret = connect::resolve_secret_for_connect(self.vault.as_ref(), &cfg);
+        let spec = spec_for_database(&cfg, &db, secret);
+        self.prefetch_in_flight = true;
+        let rx = self.runner.fetch_schema(spec);
+        let started = std::time::Instant::now();
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |view, cx| {
+                view.prefetch_in_flight = false;
+                use dbc_state::applog::{log, Event};
+                match result {
+                    Ok(Ok(snapshot)) => {
+                        log(Event::SchemaPrefetched {
+                            conn: conn_id.clone(),
+                            db: db.clone(),
+                            tables: snapshot.tables.len(),
+                            ms: started.elapsed().as_millis() as u64,
+                        });
+                        // Serialising megabytes belongs off the UI thread,
+                        // exactly as on the user-facing path.
+                        cx.background_executor()
+                            .spawn(async move {
+                                dbc_state::schema_cache::store(&conn_id, &db, &snapshot)
+                            })
+                            .detach();
+                    }
+                    Ok(Err(e)) => log(Event::SchemaPrefetchFailed {
+                        conn: conn_id,
+                        db,
+                        error: e.to_string(),
+                    }),
+                    Err(_) => log(Event::SchemaPrefetchFailed {
+                        conn: conn_id,
+                        db,
+                        error: "fetch zrušen".to_string(),
+                    }),
+                }
             });
         })
         .detach();
@@ -9681,6 +10149,7 @@ impl AppView {
                     pinned: false,
                     preview_key: None, // stacked like ad-hoc tabs, Plan precedent
                     conn_identity,
+                    sql: None,
                     content: TabContent::Chart { view },
                 });
             }
@@ -10029,6 +10498,7 @@ impl AppView {
             pinned: false,
             preview_key: Some(admin_panel::ADMIN_PREVIEW_KEY.to_string()),
             conn_identity: identity,
+            sql: None,
             content: TabContent::Admin { view: panel.clone() },
         });
         // G10 T5: seeds the Privileges sub-view's schema selector from
@@ -10104,7 +10574,7 @@ impl AppView {
         let rx = self.runner.fetch_admin_catalog(spec, queries);
         cx.spawn(async move |_this, cx| {
             let result = rx.await;
-            let _ = panel.update(cx, |p, cx| match result {
+            panel.update(cx, |p, cx| match result {
                 Ok(Ok(rows)) => p.apply_catalog(rows, cx),
                 Ok(Err(e)) => p.set_error(&e.to_string(), cx),
                 Err(_) => p.set_error("dotaz zrušen", cx),
@@ -10159,6 +10629,7 @@ impl AppView {
             pinned: false,
             preview_key: Some(key),
             conn_identity,
+            sql: None,
             content: TabContent::Monitor { view: view.clone() },
         });
         cx.subscribe(&view, move |this, _emitter, event, cx| {
@@ -10169,21 +10640,6 @@ impl AppView {
         cx.notify();
     }
 
-    // -----------------------------------------------------------------
-    // G8 T6/T7: ER diagram tab — schema-tree icon + palette entry points,
-    // large-schema truncation (design §3).
-    // -----------------------------------------------------------------
-
-    /// design §3 CURATION: the entry action always operates on ONE schema.
-    /// `schema` is `None` for an engine/snapshot with no schema concept
-    /// (SQLite) — matches every other `Option<String>` schema field in this
-    /// codebase (strict, no "public" guessing).
-    /// Opens the tail of the diagnostic log as a text tab.
-    ///
-    /// The tail rather than the whole file: the cap is 2 MiB and the answer
-    /// to „what just happened" is always at the end. The path is the first
-    /// line so the file can be opened outside the app too — which is the
-    /// only way to read it after a crash.
     // -----------------------------------------------------------------
     // Connection folders. The decisions live in `crate::folders`, which is
     // pure and tested; everything here is dialog plumbing and one save.
@@ -10215,10 +10671,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let initial = rename_of.as_ref().and_then(|p| p.last().cloned()).unwrap_or_default();
-        let field = cx.new(|cx| {
-            let f = connections_ui::TextField::form_field(cx, "Název", false);
-            f
-        });
+        let field = cx.new(|cx| connections_ui::TextField::form_field(cx, "Název", false));
         field.update(cx, |f, cx| f.set_text(&initial, cx));
         self.modal = Some(connections_ui::ModalState::FolderName {
             rename_of,
@@ -10294,6 +10747,73 @@ impl AppView {
         self.save_folder_state(cx);
     }
 
+    /// Open the confirm for deleting a SAVED connection.
+    ///
+    /// `secret_stays` is read HERE, not at confirm time, so the sentence
+    /// the user reads is the one that will hold when they click: the vault
+    /// cannot lock itself between the two (there is no idle re-lock), and
+    /// deciding it up front is what lets the dialog warn instead of
+    /// surprising them afterwards.
+    fn open_connection_delete(&mut self, conn_id: String, cx: &mut Context<Self>) {
+        let Some(conn) = self.config.connections.iter().find(|c| c.id == conn_id) else {
+            return;
+        };
+        let name = conn.name.clone();
+        self.modal = Some(connections_ui::ModalState::ConnectionDeleteConfirm {
+            conn_id,
+            name,
+            secret_stays: self.vault.is_none(),
+        });
+        self.modal_needs_focus = true;
+        cx.notify();
+    }
+
+    /// Delete the connection: its `config.toml` entry, its favourites, and
+    /// — when the vault is open — its stored password.
+    ///
+    /// The favourites go with it because a favourite is keyed by connection
+    /// id: left behind, they would be unreachable rows that no UI can ever
+    /// show or clear again. The vault secret is removed for the same
+    /// reason plus a stronger one — a stored password nothing refers to is
+    /// exactly the kind of residue this app's rules exist to prevent.
+    ///
+    /// The ACTIVE connection is allowed to be the target: it is dropped
+    /// first, through the same path Odpojit uses, so no later code can go
+    /// looking for a connection that is no longer in the config.
+    pub(crate) fn confirm_connection_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::ConnectionDeleteConfirm { conn_id, name, .. }) =
+            self.modal.clone()
+        else {
+            return;
+        };
+        let Some(guard) = self.guard_corrupt_config(cx) else { return };
+        self.modal = None;
+        if self.active_connection_id.as_deref() == Some(conn_id.as_str()) {
+            self.clear_active_connection(cx);
+        }
+        // A locked vault simply has no key to decrypt with; the dialog has
+        // already said so (`connection_delete_secret_line`).
+        let mut secret_error = None;
+        if let Some(vault) = self.vault.as_mut() {
+            if let Err(e) = vault.remove_secret(&conn_id) {
+                secret_error = Some(e.message);
+            }
+        }
+        self.config.connections.retain(|c| c.id != conn_id);
+        self.config.favourite_objects.retain(|f| f.connection_id != conn_id);
+        self.status = match (self.config.save(&self.config_path, &guard), secret_error) {
+            (Err(e), _) => format!("error: připojení se nepodařilo smazat: {}", e.message),
+            (Ok(()), Some(e)) => {
+                format!("Připojení {name} smazáno, ale heslo v trezoru zůstalo: {e}")
+            }
+            (Ok(()), None) => format!("Připojení {name} smazáno"),
+        };
+        self.refresh_grouped_cache(cx);
+        let grouped = self.grouped_cache.clone();
+        self.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
+        cx.notify();
+    }
+
     fn move_connection_to_folder(
         &mut self,
         conn_id: String,
@@ -10309,6 +10829,82 @@ impl AppView {
         self.save_folder_state(cx);
     }
 
+    // -----------------------------------------------------------------
+    // Selection in read-only text tabs. The arithmetic is in
+    // `crate::text_view`, which is pure and tested; these four are the
+    // GPUI half — a hit test, a drag latch, and two actions.
+    // -----------------------------------------------------------------
+
+    /// Byte offset into the tab's FULL text for a window position.
+    ///
+    /// `index_for_position` answers in coordinates of the visible slice
+    /// (that is all the layout knows about), so `vis_start` puts it back
+    /// into the whole document. `Err` is not a failure — it is the nearest
+    /// offset when the pointer is past the end of a line, which is exactly
+    /// what a drag wants.
+    ///
+    /// The layout panics if asked before it has been measured and
+    /// prepainted. Every caller is a mouse handler on the very element
+    /// that carries this layout, so the pointer being over it is proof it
+    /// painted.
+    fn text_offset_at(&self, position: Point<Pixels>, vis_start: usize) -> Option<usize> {
+        let layout = self.text_layout.as_ref()?;
+        let local = match layout.index_for_position(position) {
+            Ok(ix) | Err(ix) => ix,
+        };
+        Some(vis_start + local)
+    }
+
+    /// Mouse released: keep the selection, stop extending it.
+    fn end_text_drag(&mut self) {
+        if let Some(s) = self.text_selection.as_mut() {
+            s.dragging = false;
+        }
+    }
+
+    /// Ctrl+C, and the „Kopírovat" button. With nothing selected this
+    /// copies the whole text, which is what the button has always done.
+    fn on_text_copy(&mut self, _: &TextViewCopy, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active) = self.tabs.active() else { return };
+        let tab_id = active.id;
+        let TabContent::Text { text, .. } = &active.content else { return };
+        let selection = self
+            .text_selection
+            .as_ref()
+            .filter(|s| s.tab_id == tab_id)
+            .map(|s| text_view::ordered(text, s.anchor, s.head));
+        let out = text_view::copy_text(text, selection.as_ref());
+        let chars = out.chars().count();
+        let whole = selection.is_none_or(|r| r.is_empty());
+        cx.write_to_clipboard(ClipboardItem::new_string(out));
+        self.status = if whole {
+            format!("Zkopírováno celé ({chars} znaků)")
+        } else {
+            format!("Zkopírován výběr ({chars} znaků)")
+        };
+        cx.notify();
+    }
+
+    fn on_text_select_all(
+        &mut self,
+        _: &TextViewSelectAll,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.tabs.active() else { return };
+        let tab_id = active.id;
+        let TabContent::Text { text, .. } = &active.content else { return };
+        let head = text.len();
+        self.text_selection = Some(TextSelection { tab_id, anchor: 0, head, dragging: false });
+        cx.notify();
+    }
+
+    /// Opens the tail of the diagnostic log as a text tab.
+    ///
+    /// The tail rather than the whole file: the cap is 2 MiB and the answer
+    /// to „what just happened" is always at the end. The path is the first
+    /// line so the file can be opened outside the app too — which is the
+    /// only way to read it after a crash.
     fn open_log_tab(&mut self, cx: &mut Context<Self>) {
         const TAIL_BYTES: usize = 64 * 1024;
         // `Tabs::open` does NOT dedupe by `preview_key` — the codebase's
@@ -10335,12 +10931,22 @@ impl AppView {
             pinned: false,
             preview_key: Some(LOG_PREVIEW_KEY.to_string()),
             conn_identity: self.current_conn_identity(),
-            content: TabContent::Text { text: body, scroll_lines: 0 },
+            sql: None,
+            content: TabContent::Text { text: text_view::normalize(&body), scroll_lines: 0 },
         });
         self.status = format!("Log: {where_}");
         cx.notify();
     }
 
+    // -----------------------------------------------------------------
+    // G8 T6/T7: ER diagram tab — schema-tree icon + palette entry points,
+    // large-schema truncation (design §3).
+    // -----------------------------------------------------------------
+
+    /// design §3 CURATION: the entry action always operates on ONE schema.
+    /// `schema` is `None` for an engine/snapshot with no schema concept
+    /// (SQLite) — matches every other `Option<String>` schema field in this
+    /// codebase (strict, no "public" guessing).
     fn open_er_diagram(&mut self, schema: Option<String>, cx: &mut Context<Self>) {
         let Some(snapshot) = self.tree.read(cx).snapshot() else {
             self.status = "Nejprve načtěte schéma".to_string();
@@ -10394,6 +11000,7 @@ impl AppView {
             pinned: false,
             preview_key: None,
             conn_identity: self.current_conn_identity(),
+            sql: None,
             content: TabContent::Diagram { view },
         });
         self.status = "ER diagram otevřen".to_string();
@@ -10416,7 +11023,8 @@ impl AppView {
                 pinned: false,
                 preview_key: None,
                 conn_identity: self.current_conn_identity(),
-                content: TabContent::Text { text: ddl.clone(), scroll_lines: 0 },
+                sql: None,
+                content: TabContent::Text { text: text_view::normalize(ddl), scroll_lines: 0 },
             });
             self.status = format!("DDL otevřeno: {title}");
             cx.notify();
@@ -11000,7 +11608,8 @@ impl AppView {
                     // Never editable/Grid — the identity is inert here, but
                     // every `ResultTab` needs a value (see its doc comment).
                     conn_identity: self.current_conn_identity(),
-                    content: TabContent::Text { text: ddl.clone(), scroll_lines: 0 },
+                    sql: None,
+                    content: TabContent::Text { text: text_view::normalize(ddl), scroll_lines: 0 },
                 });
                 self.status = format!("DDL otevřeno: {title}");
                 cx.notify();
@@ -11056,6 +11665,9 @@ impl AppView {
                 self.open_folder_name(Some(path.clone()), parent, cx)
             }
             TreeEvent::FolderDelete { path } => self.open_folder_delete(path.clone(), cx),
+            TreeEvent::ConnectionDelete { conn_id } => {
+                self.open_connection_delete(conn_id.clone(), cx)
+            }
             TreeEvent::MoveConnectionToFolder { conn_id, folder } => {
                 self.move_connection_to_folder(conn_id.clone(), folder.clone(), cx)
             }
@@ -11395,6 +12007,12 @@ impl AppView {
         // report, 2026-08-30: an error appeared on screen after the tab was
         // opened, so the tab did not have it).
         let is_log = active.preview_key.as_deref() == Some(LOG_PREVIEW_KEY);
+        // A tab restored from the last session: a text body holding the
+        // query, and nothing else, because no result ever reaches the disk.
+        // The button is how it stops being a note and becomes a result
+        // again — a click, never a startup surprise.
+        let restored_sql =
+            matches!(active.content, TabContent::Text { .. }).then(|| active.sql.clone()).flatten();
 
         match &active.content {
             TabContent::Grid { grid, .. } => {
@@ -11409,19 +12027,93 @@ impl AppView {
                 grid.clone().into_any_element()
             }
             TabContent::Text { text, scroll_lines } => {
-                let lines: Vec<&str> = text.lines().collect();
-                let scroll = (*scroll_lines).min(lines.len());
-                let text_for_copy = text.clone();
+                let tab_id = active.id;
+                let full = text.clone();
+                let visible = text_view::visible_span(&full, *scroll_lines);
+                let vis_start = visible.start;
 
-                let mut body = div()
+                // One `StyledText` rather than one `div` per line: a div
+                // cannot be selected, and `TextLayout` is the only thing
+                // that can turn a mouse position into a byte offset.
+                let mut styled = StyledText::new(full[visible.clone()].to_string());
+                if let Some(range) = self
+                    .text_selection
+                    .as_ref()
+                    .filter(|s| s.tab_id == tab_id)
+                    .map(|s| text_view::ordered(&full, s.anchor, s.head))
+                    .and_then(|sel| text_view::clip_to_visible(&sel, &visible))
+                {
+                    styled = styled.with_highlights([(
+                        range,
+                        HighlightStyle {
+                            background_color: Some(theme.bg_selection),
+                            ..Default::default()
+                        },
+                    )]);
+                }
+                // Kept so the mouse handlers below can hit-test this exact
+                // layout. Replaced every time a text tab renders, which is
+                // also the only time anything reads it.
+                self.text_layout = Some(styled.layout().clone());
+
+                let body = div()
                     .id("tab-text-body")
+                    .key_context("TextView")
+                    .track_focus(&self.text_focus)
                     .font_family("Consolas")
                     .flex()
                     .flex_col()
                     .flex_1()
                     .overflow_hidden()
                     .p_2()
+                    .cursor_text()
                     .text_color(theme.text_primary)
+                    .on_action(cx.listener(Self::on_text_copy))
+                    .on_action(cx.listener(Self::on_text_select_all))
+                    // `track_focus` alone does NOT focus on click (the same
+                    // trap the SQL editor hit) — without this, Ctrl+C after
+                    // a drag would still go to whatever had focus before.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, e: &MouseDownEvent, window, cx| {
+                            window.focus(&view.text_focus, cx);
+                            if let Some(ix) = view.text_offset_at(e.position, vis_start) {
+                                view.text_selection = Some(TextSelection {
+                                    tab_id,
+                                    anchor: ix,
+                                    head: ix,
+                                    dragging: true,
+                                });
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |view, e: &MouseMoveEvent, _, cx| {
+                        let extending = view
+                            .text_selection
+                            .as_ref()
+                            .is_some_and(|s| s.dragging && s.tab_id == tab_id);
+                        if !extending {
+                            return;
+                        }
+                        if let Some(ix) = view.text_offset_at(e.position, vis_start) {
+                            if let Some(s) = view.text_selection.as_mut() {
+                                s.head = ix;
+                            }
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|view, _: &MouseUpEvent, _, _| view.end_text_drag()),
+                    )
+                    // Releasing outside the body has to end the drag too,
+                    // or the next mouse-move over the text would keep
+                    // extending a selection the user finished long ago.
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|view, _: &MouseUpEvent, _, _| view.end_text_drag()),
+                    )
                     .on_scroll_wheel(cx.listener(|view, e: &ScrollWheelEvent, _, cx| {
                         let delta_lines = match e.delta {
                             ScrollDelta::Lines(p) => p.y,
@@ -11436,12 +12128,29 @@ impl AppView {
                             *scroll_lines = new_scroll.max(0.0).min(max_scroll as f32) as usize;
                         }
                         cx.notify();
-                    }));
-                for line in &lines[scroll..] {
-                    body = body.child(div().child(line.to_string()));
-                }
+                    }))
+                    .child(styled);
 
                 let mut header = div().flex().flex_row().justify_end().gap_2().p_1();
+                if let Some(sql) = restored_sql {
+                    header = header.child(
+                        div()
+                            .id("tab-restored-run")
+                            .cursor_pointer()
+                            .bg(theme.bg_hover)
+                            .text_color(theme.text_primary)
+                            .px_2()
+                            .rounded_md()
+                            .child("Spustit")
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                // Straight through the ordinary run path, so
+                                // the read-only guard, the auto-limit and the
+                                // history entry are all the same as if it had
+                                // been typed.
+                                view.run_query_with(sql.clone(), None, false, cx);
+                            })),
+                    );
+                }
                 if is_log {
                     header = header.child(
                         div()
@@ -11471,8 +12180,11 @@ impl AppView {
                                 .px_2()
                                 .rounded_md()
                                 .child("Kopírovat")
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(text_for_copy.clone()));
+                                // The same funnel as Ctrl+C, so the two can
+                                // never disagree about what „copy" means
+                                // when something is selected.
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.on_text_copy(&TextViewCopy, window, cx)
                                 })),
                         ),
                     )
@@ -12817,6 +13529,7 @@ impl AppView {
     ///   (`guards.rs`), in case a future entry point calls
     ///   `switch_to_connection` directly.
     /// - the app-quit hook (`main()`, below) — window close.
+    ///
     /// A no-op when no modal is open, the open modal isn't `BackupRestore`,
     /// its status isn't `Running`, or (review MAJOR fix) there is no REAL
     /// cancel hook installed (`session.can_cancel()` — MSSQL/SQLite have
@@ -13073,6 +13786,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_open_autocomplete))
             .on_action(cx.listener(Self::on_save_script))
             .on_action(cx.listener(Self::on_format_sql))
+            .on_action(cx.listener(Self::on_expand_star))
             .on_action(cx.listener(Self::on_show_shortcuts))
             .on_action(cx.listener(Self::on_focus_editor))
             .on_action(cx.listener(Self::on_focus_tree))
@@ -13390,7 +14104,7 @@ mod plan_restore_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.backup");
         let mut content = b"PGDMP\x01\x0e\x00rest".to_vec();
-        content.extend(std::iter::repeat(0xABu8).take(4 * 1024 * 1024)); // 4 MiB tail
+        content.extend(std::iter::repeat_n(0xABu8, 4 * 1024 * 1024)); // 4 MiB tail
         std::fs::write(&path, &content).unwrap();
 
         let header = read_sniff_prefix(path.to_str().unwrap()).unwrap();
@@ -13476,6 +14190,16 @@ fn main() {
     // other — workspace T6). Everything downstream still takes a `&Path`.
     let startup = startup_context(dbc_state::workspace::resolve());
     let config_path = startup.paths.config.clone();
+    // „Otevři se tak, jak jsem to zavřel". Read before the window exists so
+    // the editor, the sidebar and the tabs are already right on the FIRST
+    // frame — restoring them afterwards would show a blank window that then
+    // visibly repopulates. The connection is the one part that cannot
+    // happen here (it may need the vault) and is deferred to `render`.
+    let session_path = dbc_state::session::path_for(&config_path);
+    let session = dbc_state::session::load(&session_path);
+    // Taken before `session` moves into the window closure: the connection
+    // is restored from the startup sequence, not from the constructor.
+    let restore_conn = session.connection.clone().map(|id| (id, session.database.clone()));
     let vault_path = startup.paths.vault.clone();
     let workspace_root = startup.workspace_root.clone();
     let blocked = startup.blocked.clone();
@@ -13562,11 +14286,18 @@ fn main() {
             // Ctrl+Shift+F: the shape every other editor uses for "format
             // document". Ctrl+F is left free for a future find.
             KeyBinding::new("ctrl-shift-f", FormatSql, None),
+            // Ctrl+Shift+E for „expand". Free repo-wide before this line.
+            KeyBinding::new("ctrl-shift-e", ExpandStar, None),
             // F1 is the one key every Windows app spends on help.
             KeyBinding::new("f1", ShowShortcuts, None),
             KeyBinding::new("ctrl-1", FocusEditor, None),
             KeyBinding::new("ctrl-2", FocusTree, None),
             KeyBinding::new("ctrl-3", FocusResults, None),
+            // Scoped to the text tab body, the same posture as the grid's
+            // own Ctrl+C: only reachable once that body holds focus, which
+            // happens when you click into it.
+            KeyBinding::new("ctrl-c", TextViewCopy, Some("TextView")),
+            KeyBinding::new("ctrl-a", TextViewSelectAll, Some("TextView")),
         ]);
         sql_input::bind_keys(cx);
         grid::bind_keys(cx);
@@ -13599,6 +14330,17 @@ fn main() {
                 |window, cx| {
                     cx.new(|cx| {
                         let sql = cx.new(|cx| SqlInput::new(cx, "Type SQL, then Ctrl+Enter…"));
+                        if !session.editor.is_empty() {
+                            // `insert_text`, not `replace_buffer`: the buffer
+                            // is empty, so this is an insert like any other
+                            // and needs no clobber permit.
+                            let text = session.editor.clone();
+                            let at = session.cursor;
+                            sql.update(cx, |s, cx| {
+                                s.insert_text(&text, cx);
+                                s.set_cursor_offset(at, cx);
+                            });
+                        }
                         window.focus(&sql.focus_handle(cx), cx);
                         let grouped_cache = connections_ui::group_connections_with(
                             &config.connections,
@@ -13629,6 +14371,17 @@ fn main() {
                         };
                         let editor_focus = sql.focus_handle(cx);
                         let tree = cx.new(|cx| SchemaTree::new(cx, editor_focus));
+                        if !session.expanded.is_empty() || !session.expanded_nodes.is_empty() {
+                            let keys = session.expanded.clone();
+                            let nodes = session.expanded_nodes.clone();
+                            tree.update(cx, |t, cx| {
+                                t.restore_expanded_keys(&keys, cx);
+                                // Parked, not applied: the sections and
+                                // tables it names live inside snapshots
+                                // that have not loaded yet.
+                                t.restore_expanded_nodes(&nodes);
+                            });
+                        }
                         cx.subscribe(&tree, AppView::on_tree_event).detach();
                         let history_search = cx.new(|cx| connections_ui::TextField::new(cx, "Hledat…", false));
                         // G11 T6 binding carry-forward (BackupHandle has no
@@ -13638,8 +14391,34 @@ fn main() {
                         // process/task BEFORE the app actually exits, since
                         // nothing else reaps an abandoned pg_dump/pg_restore
                         // child.
-                        cx.on_app_quit(|view, _cx| {
+                        // THE hook that actually fires when the window's
+                        // X is clicked. `on_app_quit` alone does not: GPUI
+                        // removes the window — and with it the root
+                        // entity — BEFORE the quit-on-last-window path
+                        // runs, so by the time the quit observers execute
+                        // there is no `AppView` left to ask. Found the
+                        // honest way: the first session never saved and the
+                        // log said nothing, because nothing ran.
+                        //
+                        // Both are kept. This one covers closing the
+                        // window; `on_app_quit` still covers an explicit
+                        // quit while a window is open, where the entity IS
+                        // alive and this observer has not fired yet.
+                        // Saving twice is harmless — the second write is
+                        // byte-identical.
+                        let weak = cx.weak_entity();
+                        cx.on_window_closed(move |cx, _id| {
+                            let _ = weak.update(cx, |view: &mut AppView, cx| view.save_session(cx));
+                        })
+                        .detach();
+                        cx.on_app_quit(|view, cx| {
                             view.cancel_active_backup_if_running();
+                            // The ONE reliable moment to write the session:
+                            // window close comes through here. Saving on
+                            // every keystroke instead would rewrite the file
+                            // sixty times a second for a feature nobody
+                            // notices until the next launch.
+                            view.save_session(cx);
                             async {}
                         })
                         .detach();
@@ -13647,7 +14426,7 @@ fn main() {
                         let sidebar_width = sidebar_width_from(config.sidebar_width);
                         let history_width = history_width_from(config.history_width);
                         AppView {
-                            tabs: Tabs::new(),
+                            tabs: restored_tabs(&session),
                             status,
                             runner: QueryRunner::new(),
                             conn_url,
@@ -13657,6 +14436,7 @@ fn main() {
                             run_generation: 0,
                             config,
                             config_path,
+                            session_path,
                             config_load_error,
                             vault_path,
                             workspace_root,
@@ -13670,6 +14450,9 @@ fn main() {
                             workspace_panel_focus: cx.focus_handle(),
                             vault: None,
                             active_connection_id: None,
+                            attempted_restore: None,
+                            prefetch_in_flight: false,
+                            prefetch_armed: false,
                             active_database: None,
                             switch_generation: 0,
                             dropdown_open: false,
@@ -13704,6 +14487,9 @@ fn main() {
                             script_save_in_flight: false,
                             modal_focus_handle: cx.focus_handle(),
                             modal_needs_focus: false,
+                            text_selection: None,
+                            text_layout: None,
+                            text_focus: cx.focus_handle(),
                             autocomplete: None,
                             last_ac_text: String::new(),
                             last_ac_cursor: 0,
@@ -13764,7 +14550,23 @@ fn main() {
             //
             // Cancel is still a full answer: the app runs locked, and every
             // path that needs a secret prompts again on its own.
-            if Vault::exists(&view.vault_path) && view.vault.is_none() && blocked.is_none() {
+            //
+            // The session restore goes FIRST, and that ordering is the
+            // whole fix: the generic prompt below is an overlay, and
+            // `switch_to_database` refuses under any overlay. Restoring
+            // afterwards logged „SessionRestored" and then silently did
+            // nothing (user report 2026-08-31: „nic se nestalo, nic se
+            // nerozbalilo"). Going first means the switch raises its OWN
+            // vault prompt, carrying itself as the pending action, so one
+            // password answers both questions.
+            if blocked.is_none() {
+                view.restore_session_context(restore_conn, cx);
+            }
+            if Vault::exists(&view.vault_path)
+                && view.vault.is_none()
+                && view.modal.is_none()
+                && blocked.is_none()
+            {
                 view.open_vault_prompt(connections_ui::PendingAfterUnlock::Nothing, cx);
             }
             // Design §W4: the blocking modal goes up LAST, so it occludes a
@@ -14611,14 +15413,22 @@ mod switch_decision_tests {
         );
     }
 
-    /// The queued action is one-shot open-preview only (design §2.2) —
-    /// this pins the enum stays single-variant (a second queued kind needs
-    /// its own design pass).
+    /// The queued action was open-preview only (design §2.2), and this
+    /// test asked that a second kind get its own design pass. It got one:
+    /// session restore needs the database LIST loaded after the switch
+    /// lands, and `follow_up` is the only path that survives the vault
+    /// prompt AND the `switch_generation` guard. The exhaustive `match` is
+    /// the point — a THIRD kind still has to come through here.
     #[test]
-    fn pending_tree_action_is_open_preview_only() {
-        let a = PendingTreeAction::OpenPreview { schema: None, table: "t".into() };
-        match a {
-            PendingTreeAction::OpenPreview { .. } => {}
+    fn pending_tree_action_has_exactly_the_two_designed_kinds() {
+        for a in [
+            PendingTreeAction::OpenPreview { schema: None, table: "t".into() },
+            PendingTreeAction::LoadDatabases,
+        ] {
+            match a {
+                PendingTreeAction::OpenPreview { .. } => {}
+                PendingTreeAction::LoadDatabases => {}
+            }
         }
     }
 
@@ -14711,6 +15521,7 @@ mod identity_audit_tests {
             pinned: false,
             preview_key: Some(admin_panel::ADMIN_PREVIEW_KEY.to_string()),
             conn_identity: conn_identity_for("conn-a", "sales"),
+            sql: None,
             content: TabContent::Text { text: String::new(), scroll_lines: 0 },
         });
         assert!(matches!(
@@ -14755,6 +15566,7 @@ mod admin_open_tests {
             pinned: false,
             preview_key: Some(admin_panel::ADMIN_PREVIEW_KEY.to_string()),
             conn_identity: identity.to_string(),
+            sql: None,
             content: TabContent::Text { text: String::new(), scroll_lines: 0 },
         }
     }
@@ -15163,6 +15975,115 @@ mod keymap_audit {
 }
 
 #[cfg(test)]
+mod session_restore_tests {
+    use super::{restored_tabs, session_tabs, ResultTab, TabContent, Tabs};
+    use dbc_state::session::{SessionState, SessionTab};
+
+    fn text_tab(title: &str, sql: Option<&str>) -> ResultTab {
+        ResultTab {
+            id: 0,
+            title: title.into(),
+            pinned: false,
+            preview_key: None,
+            conn_identity: "conn-a".into(),
+            sql: sql.map(str::to_string),
+            content: TabContent::Text { text: String::new(), scroll_lines: 0 },
+        }
+    }
+
+    /// THE rule: only a tab that carries its query is worth reopening.
+    #[test]
+    fn only_tabs_with_a_query_are_persisted() {
+        let mut tabs = Tabs::new();
+        tabs.open(text_tab("Náhled: orders", Some("SELECT * FROM orders")));
+        tabs.open(text_tab("ER: dbo", None));
+        tabs.open(text_tab("Log", None));
+        let out = session_tabs(&tabs);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].sql, "SELECT * FROM orders");
+        assert_eq!(out[0].title, "Náhled: orders");
+    }
+
+    #[test]
+    fn pinning_survives_the_round_trip() {
+        let mut tabs = Tabs::new();
+        let mut t = text_tab("q", Some("SELECT 1"));
+        t.pinned = true;
+        tabs.open(t);
+        let captured = session_tabs(&tabs);
+        assert!(captured[0].pinned);
+        let back = restored_tabs(&SessionState { tabs: captured, ..Default::default() });
+        assert!(back.iter().next().unwrap().pinned);
+    }
+
+    /// A restored tab must arrive as its QUERY and nothing else — the
+    /// whole reason no result ever reaches the disk.
+    #[test]
+    fn a_restored_tab_shows_its_sql_and_carries_it() {
+        let session = SessionState {
+            tabs: vec![SessionTab {
+                title: "Náhled: orders".into(),
+                sql: "SELECT * FROM orders".into(),
+                pinned: false,
+            }],
+            ..Default::default()
+        };
+        let tabs = restored_tabs(&session);
+        let t = tabs.iter().next().unwrap();
+        assert_eq!(t.sql.as_deref(), Some("SELECT * FROM orders"), "the Spustit button needs this");
+        match &t.content {
+            TabContent::Text { text, .. } => assert_eq!(text, "SELECT * FROM orders"),
+            _ => panic!("a restored tab must not claim to be a grid"),
+        }
+    }
+
+    #[test]
+    fn an_empty_session_opens_no_tabs() {
+        assert_eq!(restored_tabs(&SessionState::default()).iter().count(), 0);
+    }
+
+    /// What goes out must be what comes back — a capture/restore pair that
+    /// disagreed would silently drop or duplicate tabs on every restart.
+    #[test]
+    fn capture_and_restore_are_inverses() {
+        let mut tabs = Tabs::new();
+        tabs.open(text_tab("a", Some("SELECT 1")));
+        tabs.open(text_tab("skip me", None));
+        tabs.open(text_tab("b", Some("SELECT 2")));
+        let back = restored_tabs(&SessionState { tabs: session_tabs(&tabs), ..Default::default() });
+        let titles: Vec<&str> = back.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, vec!["a", "b"]);
+        assert_eq!(session_tabs(&back).len(), 2, "a second round trip changes nothing");
+    }
+}
+
+#[cfg(test)]
+mod autocomplete_popup_width_tests {
+    use super::AppView;
+
+    #[test]
+    fn a_long_join_label_widens_the_popup_past_the_old_fixed_width() {
+        let short = AppView::autocomplete_popup_width(["SELECT", "FROM"].into_iter());
+        let long = AppView::autocomplete_popup_width(
+            ["APP_Applied_Permission  —  APP_User.User_Id → permission_id"].into_iter(),
+        );
+        assert_eq!(short, 280.0, "short labels keep the floor");
+        assert!(long > 280.0, "the label that was being cut off still fits in {long}px");
+    }
+
+    #[test]
+    fn one_pathological_identifier_cannot_span_the_window() {
+        let huge = "x".repeat(500);
+        assert_eq!(AppView::autocomplete_popup_width([huge.as_str()].into_iter()), 720.0);
+    }
+
+    #[test]
+    fn an_empty_list_still_has_a_width() {
+        assert_eq!(AppView::autocomplete_popup_width(std::iter::empty()), 280.0);
+    }
+}
+
+#[cfg(test)]
 mod sidebar_width_tests {
     use super::*;
 
@@ -15315,7 +16236,17 @@ mod config_save_guard_audit {
         // this test's own loop verifies by POSITION, not by counting), and
         // it is the single funnel every folder operation goes through — so
         // there is one writer here, not four.
-        assert_eq!(sites, 10, "config.toml writer count changed — re-audit, do not just bump");
+        //
+        // 10 → 11 on 2026-08-31: `confirm_connection_delete` removes a saved
+        // connection. Re-audited, not bumped: the write is inside the
+        // `let Some(guard) = self.guard_corrupt_config(cx) else { return }`
+        // arm (position-verified by this test's own loop), and the guard is
+        // taken BEFORE anything is mutated — a corrupt config therefore
+        // loses neither the vault secret nor the favourites, because the
+        // function returns before touching either. This is the one writer
+        // in the crate that also DELETES, which is exactly why the guard
+        // ordering matters here more than anywhere above.
+        assert_eq!(sites, 11, "config.toml writer count changed — re-audit, do not just bump");
     }
 
     /// The widening is only worth anything if it actually reaches past the
@@ -17742,13 +18673,24 @@ mod script_write_audit {
                 "copy_one",
                 "init_contents",
                 "write_marker",
+                // dbc-state: the session file, one per context, written
+                // from exactly one place — `AppView::save_session`, on the
+                // app-quit hook, on the UI thread. Sanctioned by name like
+                // the four above and for the same reason: it owns ONE
+                // well-known path, derived from the context and from
+                // nothing a caller passes in, so it cannot be aimed at a
+                // script or at any other writer's file. Serialization is
+                // trivially satisfied — there is one caller and it is
+                // synchronous — which is T8's contract, not an exception
+                // to it.
+                "save",
                 // dbc-state: the rail's own tests.
                 "write_atomic_refuses_a_missing_parent_while_the_store_savers_create_one",
                 "write_atomic_leaves_no_tmp_file_and_writes_bytes",
                 "write_atomic_overwrites_in_place",
                 "write_atomic_failure_leaves_no_tmp_behind",
             ],
-            10,
+            11,
             "`crate::scripts::write_script` is the ONE funnel from dbc-ui into the shared \
              atomic writer, and dbc-state's own callers each own exactly one well-known \
              file - a new caller forks T8's single-writer-per-path contract",

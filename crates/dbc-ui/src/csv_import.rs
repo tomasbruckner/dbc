@@ -502,11 +502,9 @@ mod tests {
         assert_eq!(via_wrapper, via_d);
     }
 
-    #[test]
-    fn csv_import_batch_size_is_under_the_tsql_values_row_cap() {
-        // T-SQL: a VALUES clause may contain at most 1000 row
-        // constructors -- a future bump past that would silently break
-        // MSSQL imports at runtime.
-        assert!(CSV_IMPORT_BATCH_SIZE <= 1000);
-    }
+    /// T-SQL: a VALUES clause may contain at most 1000 row constructors --
+    /// a future bump past that would silently break MSSQL imports at
+    /// runtime. Both operands are constants, so this is checked at COMPILE
+    /// time rather than by a test that could only ever pass.
+    const _: () = assert!(CSV_IMPORT_BATCH_SIZE <= 1000);
 }

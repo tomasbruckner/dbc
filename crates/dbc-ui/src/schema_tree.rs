@@ -201,6 +201,12 @@ pub enum TreeEvent {
     BackupFor { conn_id: String, db: Option<String> },
     RestoreFor { conn_id: String, db: Option<String> },
     EditConnection { conn_id: String },
+    /// Delete a SAVED connection (`config.toml` + its vault secret). Opens
+    /// `ModalState::ConnectionDeleteConfirm`; emitting this never touches
+    /// disk on its own. Nothing on the SERVER is touched — this removes an
+    /// entry from this app's own list, which is why it is not gated on
+    /// `read_only` (that flag is about the database).
+    ConnectionDelete { conn_id: String },
     /// Connection-folder management. Folders are labels on connections plus
     /// `AppConfig::folders` for the ones that are empty; see the `folders`
     /// module for what each of these does to that pair.
@@ -735,6 +741,28 @@ fn all_node_ids(snapshot: &SchemaSnapshot) -> HashSet<NodeId> {
             out.insert(NodeId::Sequence(schema_name.clone(), s.name.clone()));
         }
     }
+
+    // The SAME sections as they are keyed in Kind grouping mode, where one
+    // section holds every schema's objects and is therefore owned by
+    // `KIND_SECTION_OWNER` rather than a schema name.
+    //
+    // Without this, every id this function is asked about in Kind mode is
+    // „not in the snapshot" — so `prune_stale_ids` dropped them, and a ⟳
+    // refresh silently collapsed every section. That is a PRE-EXISTING bug
+    // on the refresh path, not only on the session restore that surfaced
+    // it (user report 2026-08-31: „tabulky nejsou rozbalené"). Table,
+    // routine and column ids were never affected: they key off the real
+    // schema in BOTH modes — only section ownership differs.
+    let kind_sections: Vec<NodeId> = out
+        .iter()
+        .filter_map(|id| match id {
+            NodeId::Section(owner, label) if owner != KIND_SECTION_OWNER => {
+                Some(NodeId::Section(KIND_SECTION_OWNER.to_string(), label))
+            }
+            _ => None,
+        })
+        .collect();
+    out.extend(kind_sections);
     out
 }
 
@@ -817,6 +845,128 @@ pub enum OuterId {
     /// One scripts-library folder, keyed by its '/'-separated `rel`. Lazy
     /// polarity too — the scripts tree is browsed, not pre-opened.
     ScriptFolder(String),
+}
+
+/// The unit separator, already this codebase's field joiner
+/// (`conn_identity_for`). It cannot occur in a folder name, a database
+/// name or a generated connection id, so no escaping is needed.
+const OUTER_SEP: char = '\u{1f}';
+
+/// The section headers, as the closed vocabulary they already are.
+///
+/// `NodeId::Section` holds a `&'static str`, so decoding one out of a
+/// session file has to land back on one of THESE — a session cannot
+/// invent a section. Same posture as `applog`'s event names and
+/// `format::statement_kind`: the type is the rail, this list is what it
+/// admits.
+const SECTION_NAMES: &[&str] =
+    &["Tabulky", "Pohledy", "Funkce", "Procedury", "Triggery", "Indexy", "Sekvence"];
+
+impl NodeId {
+    /// A flat string for the session file. Same scheme as `OuterId` next
+    /// door: a short tag, then the fields, joined by the unit separator.
+    pub fn encode(&self) -> String {
+        let j = OUTER_SEP;
+        match self {
+            NodeId::Schema(s) => format!("s{j}{s}"),
+            NodeId::Section(s, name) => format!("sec{j}{s}{j}{name}"),
+            NodeId::Table(s, t) => format!("t{j}{s}{j}{t}"),
+            NodeId::Column(s, t, c) => format!("c{j}{s}{j}{t}{j}{c}"),
+            NodeId::Routine(s, n) => format!("r{j}{s}{j}{n}"),
+            NodeId::Trigger(s, n) => format!("g{j}{s}{j}{n}"),
+            NodeId::Sequence(s, n) => format!("q{j}{s}{j}{n}"),
+            NodeId::Index(s, t, i) => format!("i{j}{s}{j}{t}{j}{i}"),
+            NodeId::FavouriteSection => "favsec".to_string(),
+            NodeId::Favourite(k, s, n) => format!("fav{j}{k}{j}{s}{j}{n}"),
+            NodeId::AdminRoot => "admin".to_string(),
+        }
+    }
+
+    /// Total inverse: anything unrecognised is `None`. A row that fails to
+    /// decode simply opens closed, which is the cheapest way to be wrong.
+    pub fn decode(text: &str) -> Option<Self> {
+        let mut p = text.split(OUTER_SEP);
+        let tag = p.next()?;
+        let mut next = || p.next().map(str::to_string);
+        let out = match tag {
+            "s" => NodeId::Schema(next()?),
+            "sec" => {
+                let (schema, name) = (next()?, next()?);
+                let name = SECTION_NAMES.iter().find(|n| **n == name)?;
+                NodeId::Section(schema, name)
+            }
+            "t" => NodeId::Table(next()?, next()?),
+            "c" => NodeId::Column(next()?, next()?, next()?),
+            "r" => NodeId::Routine(next()?, next()?),
+            "g" => NodeId::Trigger(next()?, next()?),
+            "q" => NodeId::Sequence(next()?, next()?),
+            "i" => NodeId::Index(next()?, next()?, next()?),
+            "favsec" => NodeId::FavouriteSection,
+            "fav" => NodeId::Favourite(next()?, next()?, next()?),
+            "admin" => NodeId::AdminRoot,
+            _ => return None,
+        };
+        // Trailing fields mean this is not the shape it claimed to be.
+        p.next().is_none().then_some(out)
+    }
+}
+
+impl OuterId {
+    /// A flat string for the session file.
+    ///
+    /// The POLARITY ASYMMETRY above is preserved by storing the SET
+    /// VERBATIM rather than „which rows are open": `Folder(_)` present
+    /// still means collapsed after a round trip, exactly as it did before
+    /// one. Interpreting it here would be a second place for that rule to
+    /// live, and the second place is always the one that drifts.
+    pub fn encode(&self) -> String {
+        match self {
+            OuterId::Folder(path) => {
+                let mut s = String::from("folder");
+                for seg in path {
+                    s.push(OUTER_SEP);
+                    s.push_str(seg);
+                }
+                s
+            }
+            OuterId::Connection(id) => format!("conn{OUTER_SEP}{id}"),
+            OuterId::Database(conn, db) => format!("db{OUTER_SEP}{conn}{OUTER_SEP}{db}"),
+            OuterId::Favourites => "fav".to_string(),
+            OuterId::Scripts => "scripts".to_string(),
+            OuterId::ScriptFolder(rel) => format!("scriptdir{OUTER_SEP}{rel}"),
+        }
+    }
+
+    /// The inverse, TOTAL: anything unrecognised is `None` rather than a
+    /// guess. A session file from a future version, or one a person edited,
+    /// must cost at most a row that opens closed.
+    pub fn decode(s: &str) -> Option<Self> {
+        let mut parts = s.split(OUTER_SEP);
+        match parts.next()? {
+            "folder" => {
+                let path: Vec<String> = parts.map(str::to_string).collect();
+                (!path.is_empty()).then_some(OuterId::Folder(path))
+            }
+            "conn" => {
+                let id = parts.next()?;
+                (parts.next().is_none() && !id.is_empty()).then(|| OuterId::Connection(id.into()))
+            }
+            "db" => {
+                let (conn, db) = (parts.next()?, parts.next()?);
+                // A database name may not contain the separator, so any
+                // further field means this is not a `db` key at all.
+                parts.next().is_none().then(|| OuterId::Database(conn.into(), db.into()))
+            }
+            "fav" => parts.next().is_none().then_some(OuterId::Favourites),
+            "scripts" => parts.next().is_none().then_some(OuterId::Scripts),
+            "scriptdir" => {
+                let rel = parts.next()?;
+                (parts.next().is_none() && !rel.is_empty())
+                    .then(|| OuterId::ScriptFolder(rel.into()))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The active `(connection, database)` context as the sidebar sees it —
@@ -964,6 +1114,22 @@ pub fn row_in_active_scope(row: &SidebarRow, scope: Option<&ActiveScope>) -> boo
 /// Transitions a schema slot into `Loading`, carrying the previous
 /// expand-set forward (from `Loaded` OR an in-flight `Loading` — a
 /// superseding dispatch must not lose it either).
+/// Is this connection waiting on a fetch the USER asked for — either its
+/// database list, or any one of its schema slots?
+///
+/// Pure so the idle prefetch's politeness gate can be tested: the method
+/// that consumes it, `SchemaTree::any_fetch_in_flight`, needs a live
+/// `Context` that this crate's suite cannot build.
+pub fn list_is_fetching(state: &DbListState) -> bool {
+    match state {
+        DbListState::Loading { .. } => true,
+        DbListState::Loaded { dbs, .. } => {
+            dbs.iter().any(|d| matches!(d.schema, DbSchemaState::Loading { .. }))
+        }
+        DbListState::NotLoaded | DbListState::Error(_) => false,
+    }
+}
+
 pub fn begin_schema_load(slot: &mut DbSchemaState, generation: u64) {
     let prev_expanded = match std::mem::replace(slot, DbSchemaState::NotLoaded) {
         DbSchemaState::Loaded { expanded, .. } => expanded,
@@ -1133,9 +1299,7 @@ pub fn migrate_fallback_into_list(
     }
     let DbListState::Loaded { dbs, .. } = &mut node.dbs else { return None };
     let db = slot.as_ref().map(|((_, d), _)| d.clone()).expect("checked above");
-    let Some(dbn) = dbs.iter_mut().find(|x| x.name == db) else {
-        return None;
-    };
+    let dbn = dbs.iter_mut().find(|x| x.name == db)?;
     let (key, state) = slot.take().expect("checked above");
     let was_loaded = matches!(state, DbSchemaState::Loaded { .. });
     dbn.schema = state;
@@ -1684,6 +1848,17 @@ pub struct SchemaTree {
     /// absent; migrated into the real `DbNode` once the list loads
     /// (`finish_db_list`). See `ActiveSlot`'s doc comment.
     active_slot: ActiveSlot,
+    /// Inner expand state restored from the session, waiting for the
+    /// schema it describes.
+    ///
+    /// It cannot be applied when it is read: `NodeId`s live inside a
+    /// `DbSchemaState::Loaded`, and at startup no schema is loaded yet.
+    /// So it is parked per `(conn, db)` and drained the moment that
+    /// database's snapshot lands — which also means a database the user
+    /// never revisits costs nothing, and one whose tables have since been
+    /// dropped is pruned against the fresh snapshot like any other
+    /// refresh.
+    pending_expanded: HashMap<(String, String), HashSet<NodeId>>,
     filter: String,
     selected: Option<SidebarRow>,
     focus_handle: FocusHandle,
@@ -1743,6 +1918,7 @@ impl SchemaTree {
             cli_url: None,
             cli_slot: DbSchemaState::NotLoaded,
             active_slot: None,
+            pending_expanded: HashMap::new(),
             filter: String::new(),
             selected: None,
             focus_handle: cx.focus_handle(),
@@ -1813,6 +1989,90 @@ impl SchemaTree {
     pub fn set_active_scope(&mut self, scope: Option<ActiveScope>, cx: &mut Context<Self>) {
         self.active_scope = scope;
         cx.notify();
+    }
+
+    /// The outer expand state, for the session file. Encoded here rather
+    /// than by the caller so `OuterId`'s shape stays this module's business.
+    pub fn expanded_keys(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.outer_expanded.iter().map(OuterId::encode).collect();
+        // Sorted so an unchanged sidebar produces an unchanged file — a
+        // `HashSet`'s order is not stable between runs, and a session file
+        // that rewrites itself on every save for no reason is noise.
+        out.sort();
+        out
+    }
+
+    /// Restore it. Unrecognised keys are dropped silently: a session
+    /// written by a newer build may name rows this one has never heard of,
+    /// and the worst honest outcome is a row that opens closed.
+    pub fn restore_expanded_keys(&mut self, keys: &[String], cx: &mut Context<Self>) {
+        self.outer_expanded = keys.iter().filter_map(|k| OuterId::decode(k)).collect();
+        cx.notify();
+    }
+
+    /// The INNER expand state — which sections and tables are open inside
+    /// each loaded database — as `conn<US>db<US>node` strings.
+    ///
+    /// Separate from `expanded_keys` because it lives somewhere else
+    /// entirely: outer rows are one flat set on the tree, inner ones are a
+    /// set per loaded snapshot. Restoring only the outer half is what left
+    /// „Tabulky" and the open table closed after a restart.
+    pub fn expanded_node_keys(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut push = |conn: &str, db: &str, state: &DbSchemaState| {
+            if let DbSchemaState::Loaded { expanded, .. } = state {
+                let j = OUTER_SEP;
+                out.extend(expanded.iter().map(|id| format!("{conn}{j}{db}{j}{}", id.encode())));
+            }
+        };
+        for (conn_id, node) in &self.conns {
+            if let DbListState::Loaded { dbs, .. } = &node.dbs {
+                for d in dbs {
+                    push(conn_id, &d.name, &d.schema);
+                }
+            }
+        }
+        if let Some(((conn, db), state)) = &self.active_slot {
+            push(conn, db, state);
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Park the inner expand state until each database's schema arrives.
+    pub fn restore_expanded_nodes(&mut self, keys: &[String]) {
+        for key in keys {
+            let mut parts = key.splitn(3, OUTER_SEP);
+            let (Some(conn), Some(db), Some(node)) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let Some(id) = NodeId::decode(node) else { continue };
+            self.pending_expanded
+                .entry((conn.to_string(), db.to_string()))
+                .or_default()
+                .insert(id);
+        }
+    }
+
+    /// Drain the parked ids for `(conn, db)` into a snapshot that has just
+    /// loaded. Pruned against that snapshot, so a table dropped since the
+    /// session was written is simply not re-opened.
+    fn apply_pending_expanded(&mut self, conn_id: &str, db: &str) {
+        let Some(ids) = self.pending_expanded.remove(&(conn_id.to_string(), db.to_string())) else {
+            return;
+        };
+        let slot = match self.slot_mut(conn_id, db) {
+            Some(slot) => Some(slot),
+            None => match &mut self.active_slot {
+                Some(((c, d), state)) if c == conn_id && d == db => Some(state),
+                _ => None,
+            },
+        };
+        let Some(DbSchemaState::Loaded { snapshot, expanded }) = slot else { return };
+        let (valid, _) = prune_stale_ids(&ids, &None, snapshot);
+        expanded.extend(valid);
     }
 
     /// Sidebar rework (design §3.4): the CLI synthetic root's URL. A switch
@@ -1903,10 +2163,12 @@ impl SchemaTree {
             // switch path's result when the db list was never loaded —
             // key-gated, so no cross-context result can land here.
             apply_fallback_schema_result(&mut self.active_slot, conn_id, db, generation, result);
+            self.apply_pending_expanded(conn_id, db);
             cx.notify();
             return;
         };
         apply_schema_result(slot, generation, result);
+        self.apply_pending_expanded(conn_id, db);
         let active = self.active_scope.as_ref().map(|s| (s.conn_id.clone(), s.db.clone()));
         touch_and_evict(
             &mut self.conns,
@@ -1967,6 +2229,17 @@ impl SchemaTree {
             DbListState::Loaded { dbs, truncated } => Some((dbs.as_slice(), *truncated)),
             _ => None,
         }
+    }
+
+    /// Is ANY database list or schema slot currently loading?
+    ///
+    /// The idle prefetch's politeness gate: a fetch in flight means the
+    /// user clicked something and is waiting for it, and a second
+    /// connection to the same server would only make their wait longer.
+    /// Every connection is checked, not just the active one, because a
+    /// background expand of another connection is still someone waiting.
+    pub fn any_fetch_in_flight(&self) -> bool {
+        self.conns.values().any(|c| list_is_fetching(&c.dbs))
     }
 
     /// G12 T4: see the `read_only` field's doc comment.
@@ -2235,10 +2508,10 @@ impl SchemaTree {
                         }
                         _ => {}
                     }
-                } else if matches!(node, NodeId::FavouriteSection) {
-                    if !self.outer_expanded.remove(&OuterId::Favourites) {
-                        self.outer_expanded.insert(OuterId::Favourites);
-                    }
+                } else if matches!(node, NodeId::FavouriteSection)
+                    && !self.outer_expanded.remove(&OuterId::Favourites)
+                {
+                    self.outer_expanded.insert(OuterId::Favourites);
                 }
             }
             SidebarRow::Notice { .. } => {}
@@ -2706,7 +2979,8 @@ pub(crate) fn event_target(ev: &TreeEvent) -> String {
         TreeEvent::LoadDatabases { conn_id }
         | TreeEvent::OpenMonitorFor { conn_id }
         | TreeEvent::OpenCompareFor { conn_id }
-        | TreeEvent::EditConnection { conn_id } => conn_id.clone(),
+        | TreeEvent::EditConnection { conn_id }
+        | TreeEvent::ConnectionDelete { conn_id } => conn_id.clone(),
         TreeEvent::LoadSchema { conn_id, db } => format!("{conn_id}/{db}"),
         TreeEvent::FolderCreate { parent } => parent.join("/"),
         TreeEvent::FolderRename { path } | TreeEvent::FolderDelete { path } => path.join("/"),
@@ -3269,6 +3543,39 @@ macro_rules! flatten_sidebar_g {
 }
 
 #[cfg(test)]
+mod fetch_in_flight_tests {
+    use super::*;
+
+    fn db(name: &str, schema: DbSchemaState) -> DbNode {
+        DbNode { name: name.to_string(), is_default: false, schema }
+    }
+
+    #[test]
+    fn a_loading_database_list_is_a_fetch() {
+        assert!(list_is_fetching(&DbListState::Loading { generation: 1 }));
+    }
+
+    #[test]
+    fn a_loading_schema_slot_inside_a_loaded_list_is_a_fetch() {
+        let dbs = vec![
+            db("a", DbSchemaState::NotLoaded),
+            db("b", DbSchemaState::Loading { generation: 3, prev_expanded: HashSet::new() }),
+        ];
+        assert!(list_is_fetching(&DbListState::Loaded { dbs, truncated: false }));
+    }
+
+    /// The half that matters: a gate that always says „busy" would turn
+    /// the prefetch off entirely and nothing else would notice.
+    #[test]
+    fn a_settled_connection_is_not_a_fetch() {
+        assert!(!list_is_fetching(&DbListState::NotLoaded));
+        assert!(!list_is_fetching(&DbListState::Error("nope".into())));
+        let dbs = vec![db("a", DbSchemaState::NotLoaded), db("b", DbSchemaState::Error("x".into()))];
+        assert!(!list_is_fetching(&DbListState::Loaded { dbs, truncated: false }));
+    }
+}
+
+#[cfg(test)]
 mod flatten_tests {
     use super::*;
     use dbc_core::{FkRef, IndexInfo};
@@ -3630,6 +3937,47 @@ mod flatten_tests {
     }
 
     // --- review Issue 3: same-connection refresh state preservation ---
+
+    /// PRE-EXISTING BUG, found via the session restore (user report
+    /// 2026-08-31 „tabulky nejsou rozbalené"): in Kind grouping mode the
+    /// section rows are owned by `KIND_SECTION_OWNER`, but `all_node_ids`
+    /// only ever produced schema-owned ones — so `prune_stale_ids` called
+    /// every Kind-mode section stale and a ⟳ refresh collapsed the whole
+    /// sidebar. Restoring a session hit exactly the same wall.
+    #[test]
+    fn kind_mode_section_ids_survive_a_refresh() {
+        let snap = SchemaSnapshot {
+            tables: vec![table(Some("api"), "C_Data_View", TableKind::Table, vec![col("id", "INT")])],
+            ..Default::default()
+        };
+        let mut expanded = HashSet::new();
+        expanded.insert(NodeId::Section(KIND_SECTION_OWNER.to_string(), "Tabulky"));
+        expanded.insert(NodeId::Table("api".into(), "C_Data_View".into()));
+        let (kept, _) = prune_stale_ids(&expanded, &None, &snap);
+        assert!(
+            kept.contains(&NodeId::Section(KIND_SECTION_OWNER.to_string(), "Tabulky")),
+            "the Kind-mode section was pruned away: {kept:?}"
+        );
+        assert!(kept.contains(&NodeId::Table("api".into(), "C_Data_View".into())));
+    }
+
+    /// …and the pruning still prunes. A section the snapshot cannot
+    /// produce must be dropped in EITHER mode, or the fix above would just
+    /// be „accept everything".
+    #[test]
+    fn a_section_the_snapshot_cannot_produce_is_still_dropped() {
+        let snap = SchemaSnapshot {
+            tables: vec![table(Some("api"), "t", TableKind::Table, vec![col("id", "INT")])],
+            ..Default::default()
+        };
+        let mut expanded = HashSet::new();
+        // No sequences in the snapshot, so „Sekvence" cannot render.
+        expanded.insert(NodeId::Section(KIND_SECTION_OWNER.to_string(), "Sekvence"));
+        expanded.insert(NodeId::Section("api".into(), "Sekvence"));
+        expanded.insert(NodeId::Table("api".into(), "gone".into()));
+        let (kept, _) = prune_stale_ids(&expanded, &None, &snap);
+        assert!(kept.is_empty(), "nothing here exists in the snapshot: {kept:?}");
+    }
 
     #[test]
     fn all_node_ids_covers_every_kind_including_indexes_and_multi_schema() {
@@ -4663,5 +5011,153 @@ mod sidebar_tests {
             assert!(seen.contains(&kind), "no notice emitted for the {kind} state");
         }
         assert_eq!(seen.iter().filter(|k| **k == "caps").count(), 2, "both cap rows");
+    }
+}
+
+/// The session file's half of the sidebar: `OuterId` <-> a flat string.
+#[cfg(test)]
+mod outer_id_codec_tests {
+    use super::OuterId;
+
+    fn all() -> Vec<OuterId> {
+        vec![
+            OuterId::Folder(vec!["dw".into()]),
+            OuterId::Folder(vec!["a".into(), "b".into(), "c".into()]),
+            OuterId::Connection("conn-18ce94b370664078".into()),
+            OuterId::Database("conn-1".into(), "sales".into()),
+            OuterId::Favourites,
+            OuterId::Scripts,
+            OuterId::ScriptFolder("reports/daily".into()),
+        ]
+    }
+
+    #[test]
+    fn every_variant_round_trips() {
+        for id in all() {
+            let enc = id.encode();
+            assert_eq!(OuterId::decode(&enc), Some(id.clone()), "{enc:?}");
+        }
+    }
+
+    /// Two different rows must never collapse onto one key — a folder
+    /// named like a connection id would otherwise restore the wrong row.
+    #[test]
+    fn distinct_ids_encode_distinctly() {
+        let encoded: Vec<String> = all().iter().map(OuterId::encode).collect();
+        let mut sorted = encoded.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), encoded.len(), "a collision: {encoded:?}");
+        assert_ne!(
+            OuterId::Folder(vec!["x".into()]).encode(),
+            OuterId::Connection("x".into()).encode()
+        );
+    }
+
+    /// A file from a newer build, or one someone edited, must cost at most
+    /// a row that opens closed.
+    #[test]
+    fn garbage_decodes_to_nothing_rather_than_a_guess() {
+        let sep = '\u{1f}';
+        let bad = vec![
+            String::new(),
+            "folder".to_string(),
+            "conn".to_string(),
+            "db".to_string(),
+            format!("db{sep}only-one"),
+            "wat".to_string(),
+            format!("fav{sep}extra"),
+            "scriptdir".to_string(),
+        ];
+        for b in bad {
+            assert_eq!(OuterId::decode(&b), None, "{b:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_multi_segment_folder_keeps_its_segments() {
+        let id = OuterId::Folder(vec!["prod".into(), "eu".into()]);
+        assert_eq!(OuterId::decode(&id.encode()), Some(id));
+    }
+}
+
+/// The INNER half of the sidebar — the one whose absence left „Tabulky"
+/// and the open table closed after a restart.
+#[cfg(test)]
+mod node_id_codec_tests {
+    use super::{NodeId, SECTION_NAMES};
+
+    fn all() -> Vec<NodeId> {
+        vec![
+            NodeId::Schema("dbo".into()),
+            NodeId::Section("dbo".into(), "Tabulky"),
+            NodeId::Section(String::new(), "Sekvence"),
+            NodeId::Table("dbo".into(), "C_Data_View".into()),
+            NodeId::Column("dbo".into(), "APP_User".into(), "Role_Id".into()),
+            NodeId::Routine("dbo".into(), "fn_x".into()),
+            NodeId::Trigger("dbo".into(), "trg".into()),
+            NodeId::Sequence("dbo".into(), "seq".into()),
+            NodeId::Index("dbo".into(), "orders".into(), "ix_1".into()),
+            NodeId::FavouriteSection,
+            NodeId::Favourite("table".into(), "dbo".into(), "orders".into()),
+            NodeId::AdminRoot,
+        ]
+    }
+
+    #[test]
+    fn every_variant_round_trips() {
+        for id in all() {
+            assert_eq!(NodeId::decode(&id.encode()), Some(id.clone()), "{}", id.encode());
+        }
+    }
+
+    /// SQLite has no schema level and normalizes to `""` — an empty field
+    /// must survive, or every SQLite row would decode wrong.
+    #[test]
+    fn an_empty_schema_field_survives() {
+        let id = NodeId::Table(String::new(), "t".into());
+        assert_eq!(NodeId::decode(&id.encode()), Some(id));
+    }
+
+    #[test]
+    fn distinct_ids_encode_distinctly() {
+        let mut enc: Vec<String> = all().iter().map(NodeId::encode).collect();
+        let n = enc.len();
+        enc.sort();
+        enc.dedup();
+        assert_eq!(enc.len(), n);
+        // A table and a routine of the same name are different rows.
+        assert_ne!(
+            NodeId::Table("s".into(), "x".into()).encode(),
+            NodeId::Routine("s".into(), "x".into()).encode()
+        );
+    }
+
+    /// `Section` holds a `&'static str`, so a session file cannot invent
+    /// one — that is the rail, and this is what proves it.
+    #[test]
+    fn an_unknown_section_name_is_refused() {
+        let sep = '\u{1f}';
+        assert!(NodeId::decode(&format!("sec{sep}dbo{sep}Tabulky")).is_some());
+        assert_eq!(NodeId::decode(&format!("sec{sep}dbo{sep}Vymyslene")), None);
+        for name in SECTION_NAMES {
+            assert!(NodeId::decode(&format!("sec{sep}dbo{sep}{name}")).is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn garbage_decodes_to_nothing() {
+        let sep = '\u{1f}';
+        let bad = vec![
+            String::new(),
+            "t".to_string(),
+            format!("t{sep}only-schema"),
+            format!("admin{sep}extra"),
+            "nope".to_string(),
+            format!("c{sep}a{sep}b"),
+        ];
+        for b in bad {
+            assert_eq!(NodeId::decode(&b), None, "{b:?} was accepted");
+        }
     }
 }

@@ -1,10 +1,10 @@
-/// SQL execution guards: auto-LIMIT and read-only statement detection.
-///
-/// Fail-closed is the guiding principle throughout this module: whenever the
-/// scanner cannot be sure a statement is safe (unterminated comment/string,
-/// ambiguous PRAGMA form, an unrecognized leading keyword, a write keyword
-/// appearing anywhere in the text, ...), `is_read_statement` returns `false`
-/// and `apply_auto_limit` leaves the SQL untouched.
+//! SQL execution guards: auto-LIMIT and read-only statement detection.
+//!
+//! Fail-closed is the guiding principle throughout this module: whenever the
+//! scanner cannot be sure a statement is safe (unterminated comment/string,
+//! ambiguous PRAGMA form, an unrecognized leading keyword, a write keyword
+//! appearing anywhere in the text, ...), `is_read_statement` returns `false`
+//! and `apply_auto_limit` leaves the SQL untouched.
 
 use crate::split::Dialect;
 
@@ -513,8 +513,7 @@ fn apply_auto_limit_pg(sql: &str, limit: u64) -> (String, bool) {
     let trimmed = sql.trim_end();
     let limit_str = format!(" LIMIT {}", limit);
 
-    let result = if trimmed.ends_with(';') {
-        let without_semicolon = &trimmed[..trimmed.len() - 1];
+    let result = if let Some(without_semicolon) = trimmed.strip_suffix(';') {
         format!("{}{};", without_semicolon, limit_str)
     } else {
         format!("{}{}", trimmed, limit_str)

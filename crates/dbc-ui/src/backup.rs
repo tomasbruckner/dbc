@@ -645,8 +645,7 @@ mod pure_tests {
 
     #[test]
     fn pg_restore_create_db_adds_flag() {
-        let mut opts = PgRestoreOptions::default();
-        opts.create_db = true;
+        let opts = PgRestoreOptions { create_db: true, ..Default::default() };
         let args = build_pg_restore_args(&cfg(), "h", 1, &opts, "f.backup").unwrap();
         assert!(args.contains(&"--create".to_string()));
     }

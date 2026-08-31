@@ -69,7 +69,7 @@ const ALIAS_STOPWORDS: &[&str] = &["CROSS", "NATURAL", "USING", "LATERAL"];
 /// boundaries) and `ALIAS_STOPWORDS` (join-syntax words with no other
 /// reason to be in the completion keyword list).
 fn is_alias_stopword(word_upper: &str) -> bool {
-    KEYWORDS.iter().any(|k| *k == word_upper) || ALIAS_STOPWORDS.iter().any(|k| *k == word_upper)
+    KEYWORDS.contains(&word_upper) || ALIAS_STOPWORDS.contains(&word_upper)
 }
 
 const MAX_CANDIDATES: usize = 20;
@@ -185,7 +185,7 @@ fn distinct_schema_count(snapshot: &SchemaSnapshot) -> usize {
 /// would otherwise push common keywords out of the 20-item cap when the
 /// match prefix is empty (Ctrl+Space full-set mode).
 fn rank_and_cap(mut items: Vec<(u8, u8, u8, usize, Candidate)>) -> Vec<Candidate> {
-    items.sort_by(|a, b| (a.0, a.1, a.2, a.3).cmp(&(b.0, b.1, b.2, b.3)));
+    items.sort_by_key(|a| (a.0, a.1, a.2, a.3));
     items.into_iter().take(MAX_CANDIDATES).map(|i| i.4).collect()
 }
 
@@ -231,6 +231,135 @@ fn keyword_and_table_candidates(prefix: &str, snapshot: Option<&SchemaSnapshot>)
     }
 
     rank_and_cap(scored)
+}
+
+/// Byte offset of the `JOIN` keyword when the cursor sits where a JOIN
+/// TARGET goes — `... JOIN |` or `... JOIN cust|` — and `None` otherwise.
+///
+/// `prefix_len` is the identifier already typed, which the caller has
+/// measured; the word to inspect is whatever precedes it.
+///
+/// Scanned on the RAW text, not the mask, because the mask drops quote
+/// characters and so does not preserve offsets. The cost is that a `JOIN`
+/// written inside a comment on the previous line counts as one. The blast
+/// radius is a few extra suggestions in the popup — the sort of wrong this
+/// module tolerates, unlike a wrong column list.
+fn join_keyword_before(text: &str, cursor: usize, prefix_len: usize) -> Option<usize> {
+    let mut end = cursor.min(text.len()).saturating_sub(prefix_len);
+    let bytes = text.as_bytes();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    // A `JOIN` glued to the cursor with no space is not a target position:
+    // the user is still typing the keyword itself.
+    if end == cursor.min(text.len()).saturating_sub(prefix_len) && prefix_len > 0 {
+        return None;
+    }
+    let mut start = end;
+    while start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+        start -= 1;
+    }
+    (text.get(start..end)?.eq_ignore_ascii_case("JOIN")).then_some(start)
+}
+
+fn table_matches(t: &TableInfo, want: &TableRef) -> bool {
+    t.name.eq_ignore_ascii_case(&want.name)
+        && match (&want.schema, &t.schema) {
+            (Some(w), Some(have)) => w.eq_ignore_ascii_case(have),
+            (None, _) => true,
+            (Some(_), None) => false,
+        }
+}
+
+/// Tables worth joining to what the query already mentions, with the `ON`
+/// clause already written — the DataGrip behaviour (user request
+/// 2026-08-31).
+///
+/// Both directions count, because both are how people actually join:
+/// OUTGOING (this table has an FK to that one — `orders.customer_id ->
+/// customers.id`) and INCOMING (that table has an FK to this one —
+/// `order_lines.order_id -> orders.id`). Only the catalog's own FK metadata
+/// is used; nothing is inferred from column names, because a guess that
+/// `user_id` means `users` is exactly the kind of confident wrongness this
+/// module refuses everywhere else.
+///
+/// A table already bound in the query is SKIPPED rather than offered with a
+/// generated alias: the completion inserts the table name as its own
+/// correlation name, so offering an already-present table would produce an
+/// ambiguous — that is, broken — query.
+///
+/// Identifiers go in bare, exactly as every other table candidate in this
+/// module already does. That is a pre-existing limitation for names that
+/// would need quoting, not one this function introduces.
+fn join_candidates(
+    text: &str,
+    join_at: usize,
+    prefix: &str,
+    snapshot: Option<&SchemaSnapshot>,
+) -> Vec<Candidate> {
+    let Some(snapshot) = snapshot else { return Vec::new() };
+    let Some(sources) = sources_in_order(&text[..join_at]) else { return Vec::new() };
+    if sources.is_empty() {
+        return Vec::new();
+    }
+
+    let bound: HashSet<String> = sources
+        .iter()
+        .flat_map(|s| {
+            [Some(s.table.name.to_lowercase()), s.alias.as_ref().map(|a| a.to_lowercase())]
+        })
+        .flatten()
+        .collect();
+
+    let mut out: Vec<(u8, u8, usize, Candidate)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    // `right_col` is the column ON THE TARGET, so the target name is not
+    // repeated on both sides of the label. The popup is narrow and a
+    // label that runs off its right edge is worse than no label: two
+    // rows joining the same table through DIFFERENT columns then look
+    // identical (user report 2026-08-31, "ta napoveda je useknuta").
+    let mut push = |target: &str, left: String, right_col: &str, order: usize, out: &mut Vec<_>| {
+        if bound.contains(&target.to_lowercase()) {
+            return;
+        }
+        let Some((mt, ct)) = match_score(target, prefix) else { return };
+        let text = format!("{target} ON {left} = {target}.{right_col}");
+        if !seen.insert(text.clone()) {
+            return;
+        }
+        let label = format!("{target}  —  {left} → {right_col}");
+        out.push((mt, ct, order, Candidate { text, label, kind: CandidateKind::Table }));
+    };
+
+    for (order, src) in sources.iter().enumerate() {
+        let Some(base) = snapshot.tables.iter().find(|t| table_matches(t, &src.table)) else {
+            continue;
+        };
+        let qual = src.qualifier();
+
+        // Outgoing: a column here points at another table.
+        for col in &base.columns {
+            let Some(fk) = &col.fk else { continue };
+            push(&fk.table, format!("{qual}.{}", col.name), &fk.column, order, &mut out);
+        }
+
+        // Incoming: another table points here.
+        for other in &snapshot.tables {
+            if std::ptr::eq(other, base) {
+                continue;
+            }
+            for col in &other.columns {
+                let Some(fk) = &col.fk else { continue };
+                if !fk.table.eq_ignore_ascii_case(&base.name) {
+                    continue;
+                }
+                push(&other.name, format!("{qual}.{}", fk.column), &col.name, order, &mut out);
+            }
+        }
+    }
+
+    out.sort_by_key(|(mt, ct, order, _)| (*mt, *ct, *order));
+    out.into_iter().map(|(_, _, _, c)| c).collect()
 }
 
 /// Resolves a `qualifier.` to the table it refers to, or `None`.
@@ -446,6 +575,33 @@ pub fn candidates(
         return schema_table_candidates(&qualifier, &prefix, snapshot);
     }
 
+    // After `JOIN`, the useful answer is not „every table in the database"
+    // but „the ones this query can actually be joined to, and how". Those
+    // go first; the ordinary table/keyword list still follows, so nothing
+    // that used to be reachable stops being reachable.
+    //
+    // `cursor_context` is asked again for the REAL prefix length even under
+    // `force`, which blanks the prefix: the position of the `JOIN` keyword
+    // is a fact about the text, not about how completion was triggered.
+    let typed = cursor_context(text, cursor).prefix;
+    if let Some(join_at) = join_keyword_before(text, cursor, typed.len()) {
+        let mut out = join_candidates(text, join_at, &prefix, snapshot);
+        if !out.is_empty() {
+            let taken: HashSet<String> =
+                out.iter().filter_map(|c| c.text.split(' ').next().map(str::to_string)).collect();
+            for c in keyword_and_table_candidates(&prefix, snapshot) {
+                if out.len() >= MAX_CANDIDATES {
+                    break;
+                }
+                if !taken.contains(&c.text) {
+                    out.push(c);
+                }
+            }
+            out.truncate(MAX_CANDIDATES);
+            return out;
+        }
+    }
+
     keyword_and_table_candidates(&prefix, snapshot)
 }
 
@@ -545,7 +701,7 @@ fn insert_alias(map: &mut HashMap<String, TableRef>, key: String, value: TableRe
 ///
 /// NOT used for `cte_names` — see `mask_for_cte_scan` below, which needs a
 /// different tradeoff (quoted identifier content stays visible).
-fn mask_strings_and_comments(text: &str) -> String {
+pub(crate) fn mask_strings_and_comments(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(chars.len());
     let mut i = 0usize;
@@ -786,10 +942,57 @@ fn mask_for_cte_scan(text: &str) -> String {
 /// alias bound to two different tables, or an unresolvable `FROM (`/`JOIN (`
 /// subquery) — "offers nothing" rather than a guess.
 pub fn resolve_aliases(text: &str) -> Option<HashMap<String, TableRef>> {
+    let mut map: HashMap<String, TableRef> = HashMap::new();
+    for src in sources_in_order(text)? {
+        // The table name always maps to itself, so a bare `table.`
+        // qualifier resolves without a separate lookup path.
+        if !insert_alias(&mut map, src.table.name.clone(), src.table.clone()) {
+            return None;
+        }
+        if let Some(alias) = src.alias {
+            if !insert_alias(&mut map, alias, src.table) {
+                return None;
+            }
+        }
+    }
+    Some(map)
+}
+
+/// One table reference in a `FROM`/`JOIN` clause, with the alias the user
+/// gave it (if any).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Source {
+    pub table: TableRef,
+    pub alias: Option<String>,
+}
+
+impl Source {
+    /// What a generated column reference must be prefixed with: the alias
+    /// when there is one, otherwise the table's own name. Never the schema
+    /// — `FROM sales.orders` binds the correlation name `orders`, and
+    /// `sales.orders.id` is not valid in the select list.
+    pub fn qualifier(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.table.name)
+    }
+}
+
+/// Every `FROM`/`JOIN` table reference in `text`, IN THE ORDER THEY APPEAR.
+///
+/// This is the single scan behind three features that all need to know
+/// „which tables is this query talking about": column completion
+/// (`resolve_aliases`, which folds this into a lookup map), star expansion
+/// (`crate::star_expand`, which needs the order and the alias), and the FK
+/// join suggestions below (which need the set). They used to be one scan
+/// and two would-be copies of it; one scan with three readers cannot drift.
+///
+/// `None` means „do not guess": a subquery in `FROM`/`JOIN` position binds
+/// a shape this module does not model, and every caller would rather offer
+/// nothing than something wrong.
+pub fn sources_in_order(text: &str) -> Option<Vec<Source>> {
     let masked = mask_strings_and_comments(text);
     let chars: Vec<char> = masked.chars().collect();
     let len = chars.len();
-    let mut map: HashMap<String, TableRef> = HashMap::new();
+    let mut out: Vec<Source> = Vec::new();
     let mut i = 0usize;
 
     while i < len {
@@ -820,14 +1023,11 @@ pub fn resolve_aliases(text: &str) -> Option<HashMap<String, TableRef>> {
             i = after_kw;
             continue;
         };
-        let table_ref = TableRef { schema, name: table.clone() };
-
-        if !insert_alias(&mut map, table.clone(), table_ref.clone()) {
-            return None;
-        }
+        let table = TableRef { schema, name: table };
 
         let after_ws = skip_ws(&chars, after_table);
         let Some((next_word, after_next)) = read_word(&chars, after_ws) else {
+            out.push(Source { table, alias: None });
             i = after_table;
             continue;
         };
@@ -836,24 +1036,22 @@ pub fn resolve_aliases(text: &str) -> Option<HashMap<String, TableRef>> {
         if next_upper == "AS" {
             let after_as_ws = skip_ws(&chars, after_next);
             if let Some((alias, after_alias)) = read_word(&chars, after_as_ws) {
-                if !insert_alias(&mut map, alias, table_ref) {
-                    return None;
-                }
+                out.push(Source { table, alias: Some(alias) });
                 i = after_alias;
             } else {
+                out.push(Source { table, alias: None });
                 i = after_next;
             }
         } else if !is_alias_stopword(&next_upper) {
-            if !insert_alias(&mut map, next_word, table_ref) {
-                return None;
-            }
+            out.push(Source { table, alias: Some(next_word) });
             i = after_next;
         } else {
+            out.push(Source { table, alias: None });
             i = after_table;
         }
     }
 
-    Some(map)
+    Some(out)
 }
 
 /// Names bound by a `WITH <name> [(cols)] AS (...)` / `, <name> [(cols)] AS
@@ -1303,14 +1501,14 @@ mod tests {
         let text = "SELECT café";
         // Byte 11 sits mid-way through the 2-byte 'é' (bytes 10-11).
         let ctx = cursor_context(text, 11);
-        assert!(ctx.prefix.chars().all(|c| c.is_ascii()));
+        assert!(ctx.prefix.is_ascii());
 
         // 4-byte emoji: 'SELECT ' (7 bytes) + \u{1F600} (bytes 7..11) + 'x'.
         let text2 = "SELECT \u{1F600}x";
         let ctx2 = cursor_context(text2, 9); // mid-emoji
-        assert!(ctx2.prefix.chars().all(|c| c.is_ascii()));
+        assert!(ctx2.prefix.is_ascii());
         let ctx3 = cursor_context(text2, 10); // also mid-emoji
-        assert!(ctx3.prefix.chars().all(|c| c.is_ascii()));
+        assert!(ctx3.prefix.is_ascii());
     }
 
     // --- Review round 2 fixes ---
@@ -1400,5 +1598,219 @@ mod tests {
     fn cursor_context_captures_a_mixed_ascii_non_ascii_prefix() {
         let ctx = cursor_context("SELECT užc", 11);
         assert_eq!(ctx.prefix, "užc");
+    }
+
+    // --- FK-driven JOIN suggestions ---
+
+    fn fk(table: &str, column: &str) -> Option<dbc_core::FkRef> {
+        Some(dbc_core::FkRef { schema: None, table: table.into(), column: column.into() })
+    }
+
+    /// `orders.customer_id -> customers.id` and
+    /// `order_lines.order_id -> orders.id`, so both join directions have a
+    /// fixture. `regions` is deliberately unrelated to anything.
+    fn snapshot_with_fks() -> SchemaSnapshot {
+        SchemaSnapshot {
+            tables: vec![
+                TableInfo {
+                    name: "orders".into(),
+                    columns: vec![
+                        ColumnInfo { name: "id".into(), is_pk: true, ..Default::default() },
+                        ColumnInfo {
+                            name: "customer_id".into(),
+                            fk: fk("customers", "id"),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                TableInfo {
+                    name: "customers".into(),
+                    columns: vec![ColumnInfo { name: "id".into(), is_pk: true, ..Default::default() }],
+                    ..Default::default()
+                },
+                TableInfo {
+                    name: "order_lines".into(),
+                    columns: vec![ColumnInfo {
+                        name: "order_id".into(),
+                        fk: fk("orders", "id"),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                TableInfo { name: "regions".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn join_texts(sql: &str) -> Vec<String> {
+        let s = snapshot_with_fks();
+        candidates(sql, sql.len(), Some(&s), false, false).into_iter().map(|c| c.text).collect()
+    }
+
+    /// The table this query points AT, with the `ON` already written.
+    #[test]
+    fn a_join_offers_the_outgoing_fk_target_first() {
+        let out = join_texts("SELECT * FROM orders o JOIN ");
+        assert_eq!(out[0], "customers ON o.customer_id = customers.id");
+    }
+
+    /// …and the table that points BACK at it, which is just as common a
+    /// join and would be missed by looking only at this table's columns.
+    #[test]
+    fn a_join_offers_incoming_fks_too() {
+        let out = join_texts("SELECT * FROM orders o JOIN ");
+        assert!(
+            out.contains(&"order_lines ON o.id = order_lines.order_id".to_string()),
+            "missing the incoming direction: {out:?}"
+        );
+    }
+
+    #[test]
+    fn the_alias_is_used_when_there_is_one_and_the_table_name_otherwise() {
+        assert_eq!(join_texts("SELECT * FROM orders JOIN ")[0], "customers ON orders.customer_id = customers.id");
+        assert_eq!(join_texts("SELECT * FROM orders AS x JOIN ")[0], "customers ON x.customer_id = customers.id");
+    }
+
+    /// Typing narrows the FK list like any other completion.
+    #[test]
+    fn a_typed_prefix_filters_the_suggestions() {
+        let out = join_texts("SELECT * FROM orders o JOIN cust");
+        assert_eq!(out[0], "customers ON o.customer_id = customers.id");
+        assert!(!out.iter().any(|t| t.starts_with("order_lines")), "{out:?}");
+    }
+
+    /// A second JOIN sees BOTH tables already in the query — the user's
+    /// „pokud mám dvě najoinované tak některou z nich".
+    #[test]
+    fn a_second_join_suggests_from_every_table_already_present() {
+        let out = join_texts("SELECT * FROM customers c JOIN orders o ON o.customer_id = c.id JOIN ");
+        assert!(
+            out.contains(&"order_lines ON o.id = order_lines.order_id".to_string()),
+            "the second table's relations were not offered: {out:?}"
+        );
+    }
+
+    /// Offering a table that is already joined would insert its name as a
+    /// second correlation name for itself — an ambiguous, broken query.
+    #[test]
+    fn a_table_already_in_the_query_is_not_offered_again() {
+        let out = join_texts("SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id JOIN ");
+        assert!(!out.iter().any(|t| t.starts_with("customers ON")), "{out:?}");
+    }
+
+    /// Nothing is invented from column names: `regions` has no FK either
+    /// way, so it may appear as an ordinary table but never with an `ON`.
+    #[test]
+    fn unrelated_tables_are_never_given_an_on_clause() {
+        let out = join_texts("SELECT * FROM orders o JOIN ");
+        assert!(out.contains(&"regions".to_string()), "plain tables still reachable: {out:?}");
+        assert!(!out.iter().any(|t| t.starts_with("regions ON")), "{out:?}");
+    }
+
+    /// The suggestions are an addition, not a replacement — keywords and
+    /// every other table must still be offered after them.
+    #[test]
+    fn the_ordinary_list_still_follows_the_suggestions() {
+        let out = join_texts("SELECT * FROM orders o JOIN ");
+        assert!(out.len() > 2);
+        assert!(out.iter().any(|t| t == "regions" || t == "SELECT"), "{out:?}");
+    }
+
+    #[test]
+    fn nothing_special_happens_outside_a_join_target_position() {
+        let s = snapshot_with_fks();
+        for sql in ["SELECT * FROM orders o WHERE ", "SELECT * FROM ", "SELECT "] {
+            let out: Vec<String> = candidates(sql, sql.len(), Some(&s), false, false)
+                .into_iter()
+                .map(|c| c.text)
+                .collect();
+            assert!(!out.iter().any(|t| t.contains(" ON ")), "{sql:?} produced {out:?}");
+        }
+    }
+
+    /// Half-typed `JOI` is the keyword itself, not a target position.
+    #[test]
+    fn typing_the_join_keyword_is_not_a_target_position() {
+        let out = join_texts("SELECT * FROM orders o JOI");
+        assert!(!out.iter().any(|t| t.contains(" ON ")), "{out:?}");
+    }
+
+    #[test]
+    fn left_and_inner_joins_are_target_positions_too() {
+        for sql in [
+            "SELECT * FROM orders o LEFT JOIN ",
+            "SELECT * FROM orders o INNER JOIN ",
+            "SELECT * FROM orders o LEFT OUTER JOIN ",
+        ] {
+            assert_eq!(
+                join_texts(sql)[0],
+                "customers ON o.customer_id = customers.id",
+                "{sql:?}"
+            );
+        }
+    }
+
+    /// A subquery source makes the scan ambiguous, and this feature obeys
+    /// the same „offer nothing rather than guess" rule as the rest.
+    #[test]
+    fn a_subquery_source_produces_no_join_suggestions() {
+        let out = join_texts("SELECT * FROM (SELECT 1) x JOIN ");
+        assert!(!out.iter().any(|t| t.contains(" ON ")), "{out:?}");
+    }
+
+    /// A label that runs off the popup's right edge is worse than no label:
+    /// two joins onto the SAME table through different columns then look
+    /// identical (user report 2026-08-31, „ta napoveda je useknuta").
+    #[test]
+    fn the_label_is_short_and_names_the_column_that_distinguishes_it() {
+        let s = snapshot_with_fks();
+        let sql = "SELECT * FROM orders o JOIN ";
+        let labels: Vec<String> = candidates(sql, sql.len(), Some(&s), false, false)
+            .into_iter()
+            .map(|c| c.label)
+            .collect();
+        // The target table is named once, not on both sides of the `=`.
+        assert!(labels.iter().any(|l| l.contains("customers") && l.contains("o.customer_id")));
+        assert!(
+            !labels.iter().any(|l| l.matches("customers").count() > 1),
+            "the target is repeated: {labels:?}"
+        );
+        assert!(
+            labels.iter().all(|l| l.chars().count() <= 60),
+            "a label too long for the popup: {labels:?}"
+        );
+    }
+
+    /// The distinguishing part must survive: two FKs from one table back to
+    /// another differ ONLY in the target column, so it has to be in the
+    /// label or the two rows are indistinguishable.
+    #[test]
+    fn two_fks_onto_the_same_table_get_different_labels() {
+        let mut s = snapshot_with_fks();
+        s.tables.push(TableInfo {
+            name: "audit".into(),
+            columns: vec![
+                ColumnInfo { name: "created_by".into(), fk: fk("orders", "id"), ..Default::default() },
+                ColumnInfo { name: "closed_by".into(), fk: fk("orders", "id"), ..Default::default() },
+            ],
+            ..Default::default()
+        });
+        let sql = "SELECT * FROM orders o JOIN au";
+        let labels: Vec<String> =
+            candidates(sql, sql.len(), Some(&s), false, false).into_iter().map(|c| c.label).collect();
+        let audit: Vec<&String> = labels.iter().filter(|l| l.starts_with("audit")).collect();
+        assert_eq!(audit.len(), 2, "{labels:?}");
+        assert_ne!(audit[0], audit[1], "both join paths render the same: {audit:?}");
+    }
+
+    #[test]
+    fn ctrl_space_in_a_join_position_offers_the_suggestions_too() {
+        let s = snapshot_with_fks();
+        let sql = "SELECT * FROM orders o JOIN ";
+        let out: Vec<String> =
+            candidates(sql, sql.len(), Some(&s), true, false).into_iter().map(|c| c.text).collect();
+        assert_eq!(out[0], "customers ON o.customer_id = customers.id");
     }
 }

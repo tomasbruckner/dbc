@@ -131,6 +131,11 @@ impl HistoryDb {
     /// synthetic "sql" description is already unique-per-run via its
     /// embedded timestamped file path, so this never spuriously collapses
     /// two different runs); the UPDATE/INSERT additionally write `kind`.
+    ///
+    /// Eight arguments because a history row has eight columns. A struct
+    /// here would be a second spelling of `HistoryEntry` that exists only
+    /// to be unpacked into the same INSERT.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_with_kind(
         &mut self,
         sql: &str,

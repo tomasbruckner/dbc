@@ -64,7 +64,7 @@ impl ViewPrefsStore {
         if let Some(dir) = self.path.parent() {
             fs::create_dir_all(dir)?;
         }
-        let tmp = self.path.with_extension("toml.tmp");
+        let tmp = crate::fsutil::tmp_path_for(&self.path);
         {
             let mut f = fs::File::create(&tmp)?;
             f.write_all(toml::to_string_pretty(&self.prefs)?.as_bytes())?;

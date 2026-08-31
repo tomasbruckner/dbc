@@ -156,13 +156,16 @@ pub fn entry_exists_ci(parent: &Path, name: &str) -> Result<bool, StateError> {
 /// writes to one target collide. Keep the `.tmp` ending: §W6.2's shipped
 /// `.gitignore` matches on it.
 ///
-/// HONEST SCOPE (T8 re-verify): no caller outside this module uses this
-/// today, and it will not help the five stores `write_atomic`'s own module
-/// doc names as beneficiaries — `config.rs`, `params.rs`, `view_prefs.rs`,
-/// `vault.rs` and `dbc-ui`'s `grid.rs` all roll their own tmp+rename and
-/// never reach `write_atomic` at all. Its value is the determinism test
-/// beside it, which pins the property the contract rests on; do not read
-/// the export as leverage it does not currently have.
+/// SCOPE: this is now the ONLY place the `.tmp` naming rule lives.
+/// `config.rs`, `params.rs`, `view_prefs.rs`, `vault.rs`, `schema_cache.rs`
+/// and `dbc-ui`'s `grid.rs` still each own their tmp+rename sequence — they
+/// stream, sync and report errors differently enough that folding them into
+/// `write_atomic` would cost more than it buys — but they all derive the
+/// scratch name from here. `tmp_naming_has_a_single_owner` (below) fails the
+/// build if a seventh site starts spelling it out again. Each of them
+/// previously wrote `with_extension("toml.tmp")` / `push(".tmp")`, which
+/// agrees with this function for every path they actually use; the point of
+/// the move is that a future change to the rule reaches all of them.
 pub fn tmp_path_for(path: &Path) -> PathBuf {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
@@ -394,5 +397,135 @@ mod tests {
         std::fs::create_dir(&p).unwrap();
         assert!(write_atomic(&p, b"x").is_err());
         assert!(!td.path().join("busy.tmp").exists(), "tmp left behind after a failed rename");
+    }
+}
+
+/// Source-text audit: the `.tmp` naming rule has exactly one owner.
+///
+/// Belt, not braces — `tmp_path_for` being a function is the rail; this is
+/// what stops a seventh store from quietly growing its own
+/// `with_extension("toml.tmp")` again, which is how the rule ended up with
+/// six copies in the first place. Nothing here can be checked by the type
+/// system: the failure mode is a *new* line of code that never calls this
+/// module at all.
+///
+/// SCOPE, stated so nobody over-reads it: it matches the literal text
+/// `.tmp"` in non-`//` lines. A derivation spelled some other way (built
+/// from a variable, or hidden in a block comment) walks straight past it.
+/// It catches the shape that actually occurred, not every conceivable one.
+#[cfg(test)]
+mod tmp_naming_audit {
+    use std::path::{Path, PathBuf};
+
+    /// `(path suffix, occurrences, why it is allowed)`. Every entry is a
+    /// literal FILENAME in a test, not a scratch-path derivation.
+    const ALLOWED: &[(&str, usize, &str)] = &[(
+        "dbc-ui/src/scripts.rs",
+        1,
+        "asserts a save left no scratch file behind — names the file, does not derive it",
+    )];
+
+    /// `CARGO_MANIFEST_DIR` is `<root>/crates/dbc-state`.
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("<root>/crates/dbc-state")
+            .to_path_buf()
+    }
+
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rs_files(&p, &mut *out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    fn sources() -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        rs_files(&workspace_root().join("crates"), &mut out);
+        out.sort();
+        out
+    }
+
+    /// The needle, assembled rather than written out, so this module's own
+    /// source cannot match it and the audit stays honest about what it
+    /// scans.
+    fn needle() -> String {
+        format!(".{}{}", "tmp", '"')
+    }
+
+    /// Lines that derive a scratch path, ignoring `//` comments.
+    fn hits(src: &str) -> Vec<String> {
+        let n = needle();
+        src.lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//") && l.contains(&n))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn tmp_naming_has_a_single_owner() {
+        let files = sources();
+        assert!(files.len() >= 30, "source walk found only {} files — it is not walking", files.len());
+
+        let mut offenders: Vec<String> = Vec::new();
+        for path in &files {
+            let unix = path.to_string_lossy().replace('\\', "/");
+            if unix.ends_with("dbc-state/src/fsutil.rs") {
+                continue; // the rule's home
+            }
+            let src = std::fs::read_to_string(path).expect("readable source");
+            let found = hits(&src).len();
+            let budget = ALLOWED
+                .iter()
+                .find(|(suffix, _, _)| unix.ends_with(suffix))
+                .map_or(0, |(_, n, _)| *n);
+            if found > budget {
+                offenders.push(format!("{unix}: {found} (allowed {budget})"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these files derive a `.tmp` path themselves instead of calling \
+             `fsutil::tmp_path_for`:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// Non-vacuity, twice over: the needle must match a real derivation,
+    /// and the one file the audit skips must actually contain the thing it
+    /// is being skipped for — otherwise the exclusion above is silently
+    /// doing nothing and the whole test could pass on an empty scan.
+    #[test]
+    fn the_audit_can_fail() {
+        assert_eq!(hits("let tmp = p.with_extension(\"toml.tmp\");").len(), 1);
+        assert_eq!(hits("s.push(\".tmp\");").len(), 1);
+        assert!(hits("// a comment mentioning a \".tmp\" file").is_empty(), "comments are prose");
+
+        let home = std::fs::read_to_string(workspace_root().join("crates/dbc-state/src/fsutil.rs"))
+            .expect("fsutil.rs");
+        assert!(!hits(&home).is_empty(), "the skipped file has nothing to skip — needle is wrong");
+    }
+
+    #[test]
+    fn every_allowance_still_applies() {
+        for (suffix, n, why) in ALLOWED {
+            assert!(!why.trim().is_empty(), "{suffix} needs a reason");
+            let path = workspace_root().join("crates").join(suffix);
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("allowlisted {suffix} no longer exists — drop the entry"));
+            assert_eq!(
+                hits(&src).len(),
+                *n,
+                "{suffix} no longer has exactly {n} allowed occurrence(s); re-check, do not bump"
+            );
+        }
     }
 }

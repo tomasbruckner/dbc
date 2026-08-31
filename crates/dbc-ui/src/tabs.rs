@@ -167,6 +167,16 @@ pub struct ResultTab {
     /// Meaningless (but always present, for a uniform `ResultTab` shape) on
     /// a non-editable/`Text` tab.
     pub conn_identity: String,
+    /// The SQL that produced this tab, when there is one — an editor run,
+    /// a table preview, a plan. `None` for tabs no query made (a DDL text
+    /// view, the log, the monitor, an ER diagram).
+    ///
+    /// Kept so a restart can bring the tab back as the QUERY it was, which
+    /// is the only thing that may be persisted: rows never touch the disk,
+    /// so a restored tab arrives empty with its SQL and a „Spustit"
+    /// button, and re-running is the user's click, not a startup surprise
+    /// against a production server.
+    pub sql: Option<String>,
     pub content: TabContent,
 }
 
@@ -301,6 +311,7 @@ mod tests {
             pinned,
             preview_key: None,
             conn_identity: "conn-a".into(),
+            sql: None,
             content: TabContent::Text { text: String::new(), scroll_lines: 0 },
         }
     }
@@ -312,6 +323,7 @@ mod tests {
             pinned: false,
             preview_key: Some(key.to_string()),
             conn_identity: "conn-a".into(),
+            sql: None,
             content: TabContent::Text { text: String::new(), scroll_lines: 0 },
         }
     }

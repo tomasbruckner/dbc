@@ -394,6 +394,18 @@ impl SqlInput {
         self.buffer.cursor()
     }
 
+    /// Put the caret at an absolute byte offset, clearing any selection.
+    ///
+    /// A cursor MOVE, not a buffer mutation — the same thing a click does —
+    /// so it is deliberately not part of the `BufferReplace` rail, which
+    /// exists to stop foreign TEXT replacing unsaved work. `seek` clamps
+    /// and snaps for us, so a stale offset out of a session file lands on a
+    /// valid boundary rather than panicking.
+    pub fn set_cursor_offset(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.seek(offset.min(self.buffer.text().len()), false);
+        cx.notify();
+    }
+
     /// True if `cursor()` currently falls inside a string/comment highlight
     /// span (T4's `suppresses_completion`) — the autocomplete trigger's
     /// suppression check (design §2), consumed by `AppView`'s
@@ -413,9 +425,10 @@ impl SqlInput {
     /// before the cursor with `text` — the range/text math is
     /// `AppView::completion_edit`'s pure, unit-tested logic; this is the
     /// live-buffer surgery that actually applies it (`buffer.select_range`
-    /// + `buffer.insert`, same shape as `newline`/`backspace`), then
+    /// plus `buffer.insert`, same shape as `newline`/`backspace`), then
     /// re-kicks highlighting so T5's debounced re-highlight picks up the
     /// inserted text.
+    ///
     /// RE-VERIFY: it DERIVES the replaced range itself, and no longer takes
     /// a `prefix_len`.
     ///
@@ -1283,7 +1296,7 @@ impl Element for TextElement {
 
         // Cursor is only drawn when there's no active (non-empty) selection,
         // on whichever visible line it falls on.
-        let selection_is_empty = selection.as_ref().map_or(true, |s| s.is_empty());
+        let selection_is_empty = selection.as_ref().is_none_or(|s| s.is_empty());
         if selection_is_empty && cursor_line >= scroll && cursor_line < end_line {
             if let Some(entry) = lines.iter_mut().find(|l| l.index == cursor_line) {
                 let local = cursor.saturating_sub(entry.start).min(entry.shaped.len());
