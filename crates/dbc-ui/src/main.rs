@@ -6832,7 +6832,23 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// written costs a window that opens blank next time; saying so during
     /// shutdown would be a message nobody is there to read.
     fn save_session(&self, cx: &App) {
-        dbc_state::session::save(&self.session_path, &self.capture_session(cx));
+        let state = self.capture_session(cx);
+        // Logged because a restart that comes back blank is otherwise
+        // undiagnosable: „nothing was restored" and „nothing was saved"
+        // look identical from the outside, and an empty session correctly
+        // REMOVES the file, so its absence proves nothing either. Counts
+        // and the connection id only — the same vocabulary every other
+        // entry uses, never the SQL itself.
+        dbc_state::applog::log(dbc_state::applog::Event::Action {
+            action: "SessionSaved".into(),
+            target: format!(
+                "conn={} tabs={} editor={}B",
+                state.connection.as_deref().unwrap_or("-"),
+                state.tabs.len(),
+                state.editor.len()
+            ),
+        });
+        dbc_state::session::save(&self.session_path, &state);
     }
 
     fn resolve_active(&self) -> Option<ActiveConn> {
@@ -13242,8 +13258,17 @@ impl Render for AppView {
         // at that point would start a second switch.
         if let Some((conn_id, db)) = self.restore_connection.take() {
             // A connection deleted since the last run is not an error worth
-            // a message — the session simply names something that is gone.
-            if self.config.connections.iter().any(|c| c.id == conn_id) {
+            // a modal, but it IS worth a log line — otherwise „it did not
+            // reconnect" has no visible cause at all.
+            let known = self.config.connections.iter().any(|c| c.id == conn_id);
+            dbc_state::applog::log(dbc_state::applog::Event::Action {
+                action: if known { "SessionRestored".into() } else { "SessionConnGone".into() },
+                target: match &db {
+                    Some(db) => format!("{conn_id}/{db}"),
+                    None => conn_id.clone(),
+                },
+            });
+            if known {
                 self.switch_to_database(&conn_id, db, None, cx);
             }
         }
