@@ -53,3 +53,8 @@ tokio = { version = "1", features = ["test-util"] }
 # integration tests pin, so no version skew; "mssql_server" feature unions
 # with "postgres" in the same dependency line.
 testcontainers-modules = { version = "0.13", features = ["postgres", "mssql_server"] }
+# Direct dep purely to switch ON testcontainers' `reusable-containers`
+# feature, which `testcontainers-modules` does not pass through. Without
+# it every live run leaked a ~1.25 GB SQL Server container; with it there
+# is exactly ONE, reused by every run (see the test helpers' docs).
+testcontainers = { version = "0.25", features = ["reusable-containers"] }

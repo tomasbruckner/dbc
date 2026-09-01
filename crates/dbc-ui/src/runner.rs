@@ -7471,26 +7471,32 @@ mod admin_pg_tests {
 /// `connect::open`/driver types directly). Run with:
 ///   %USERPROFILE%\.cargo\bin\cargo.exe test -p dbc-ui -- --ignored mssql_docker_tests::
 ///
-/// The container is started ONCE per test-binary run (`std::sync::OnceLock`,
-/// `handle.block_on`'d from SYNC context — never from inside an outer
-/// `block_on`, which would panic) and deliberately leaked
-/// (`std::mem::forget`) — same rationale, and same CORRECTION,
-/// `dbc-driver-mssql/tests/common/mod.rs` documents (30-60s startup,
-/// ~1.5GB image; testcontainers' reaper (ryuk) does NOT reap these on this
-/// host, confirmed by the whole-branch review — every `--ignored` run that
-/// starts a fresh container leaks it; `docker rm -f` manually after a live
-/// run). `DBC_MSSQL_TEST_HOST_PORT="host:port"` is both the iteration
-/// convenience AND the cheap mitigation for the leak: point it at ONE
-/// manually-started, long-lived container instead of leaking a new one per
-/// invocation, mirroring the driver crate's `DBC_MSSQL_TEST_CONN`
-/// convention.
+/// The container is started ONCE (`std::sync::OnceLock`, `handle.block_on`'d
+/// from SYNC context — never from inside an outer `block_on`, which would
+/// panic) and then REUSED by every later run, in this crate and in
+/// `dbc-driver-mssql`, via a fixed name plus
+/// `ReuseDirective::Always`. See that crate's `tests/common/mod.rs` for
+/// the full rationale and the one-line cleanup; the short version is that
+/// this used to `mem::forget` an anonymous container and leak ~1.25 GB per
+/// live run.
+///
+/// `DBC_MSSQL_TEST_HOST_PORT="host:port"` still short-circuits the whole
+/// thing, mirroring the driver crate's `DBC_MSSQL_TEST_CONN`.
 #[cfg(test)]
 mod mssql_docker_tests {
     use super::*;
     use crate::admin_sql;
     use crate::plan;
     use crate::sandbox;
-    use testcontainers_modules::{mssql_server::MssqlServer, testcontainers::runners::AsyncRunner};
+    use testcontainers_modules::{
+        mssql_server::MssqlServer,
+        testcontainers::{runners::AsyncRunner, ImageExt, ReuseDirective},
+    };
+
+    /// MUST match `dbc-driver-mssql/tests/common`'s `SHARED_CONTAINER_NAME`
+    /// — the two crates cannot import from each other, and disagreeing
+    /// spells two containers where one would do.
+    const SHARED_CONTAINER_NAME: &str = "dbc-test-mssql";
 
     const SA_PASSWORD: &str = "yourStrong(!)Password";
 
@@ -7509,10 +7515,16 @@ mod mssql_docker_tests {
                     }
                 }
                 handle.block_on(async {
-                    let container = MssqlServer::default().with_accept_eula().start().await.ok()?;
+                    let container = MssqlServer::default()
+                        .with_accept_eula()
+                        .with_container_name(SHARED_CONTAINER_NAME)
+                        .with_reuse(ReuseDirective::Always)
+                        .start()
+                        .await
+                        .ok()?;
                     let host = container.get_host().await.ok()?.to_string();
                     let port = container.get_host_port_ipv4(1433).await.ok()?;
-                    std::mem::forget(container);
+                    // No `mem::forget`: reuse already stops Drop reaping it.
                     Some((host, port))
                 })
             })

@@ -22,3 +22,8 @@ zeroize.workspace = true
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 testcontainers-modules = { version = "0.13", features = ["mssql_server"] }
+# Direct dep purely to switch ON testcontainers' `reusable-containers`
+# feature, which `testcontainers-modules` does not pass through. Without
+# it every live run leaked a ~1.25 GB SQL Server container; with it there
+# is exactly ONE, reused by every run (see the test helpers' docs).
+testcontainers = { version = "0.25", features = ["reusable-containers"] }
