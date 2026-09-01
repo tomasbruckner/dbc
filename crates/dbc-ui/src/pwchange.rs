@@ -80,6 +80,9 @@ pub fn pg_rescue_display(user: &str) -> String {
 /// Tlačítko „Test" v dialogu připojení modal otevřít nesmí (single-modal
 /// invariant) — jen obohatí chybový text o českou nápovědu.
 pub fn enrich_test_error(engine: Engine, err: &QueryError) -> String {
+    if let Some(hint) = network_address_hint(engine, err) {
+        return format!("{err}\n{hint}");
+    }
     match detect(engine, err) {
         Some(PwChangeKind::MssqlMustChange) => format!(
             "{err}\nserver vyžaduje změnu hesla — po přepnutí na toto připojení aplikace nabídne dialog změny"
@@ -89,6 +92,31 @@ pub fn enrich_test_error(engine: Engine, err: &QueryError) -> String {
         }
         None => err.to_string(),
     }
+}
+
+/// „SQL Server Network Interfaces: Connection string is not valid [87]".
+///
+/// SNI is the layer that resolves and dials the ADDRESS, and it says this
+/// before any login is attempted — so whatever is wrong, it is not the
+/// user, the password or the database. The message says none of that, and
+/// the user who hit it read „connection string" and guessed their password
+/// was too long (2026-09-01). It is not: a rejected password is 18456.
+///
+/// `dbc_connect::normalise_mssql_host` now refuses the shapes that
+/// predictably cause this before the driver is reached, so anything still
+/// arriving here is something it did not anticipate — which is exactly when
+/// the user needs to be told where to look rather than left with the
+/// driver's word „string".
+fn network_address_hint(engine: Engine, err: &QueryError) -> Option<String> {
+    if engine != Engine::Mssql || !err.message.contains("Connection string is not valid") {
+        return None;
+    }
+    Some(
+        "adresu serveru odmítla síťová vrstva SQL Serveru — na přihlášení vůbec nedošlo, \
+         takže to není heslem ani databází. Zkontroluj Host (jen jméno serveru nebo IP) \
+         a Port."
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -147,6 +175,47 @@ mod tests {
     fn pg_rescue_display_is_redacted_and_shows_valid_until() {
         let d = pg_rescue_display("bob");
         assert_eq!(d, "Příkaz: ALTER ROLE \"bob\" PASSWORD '***' VALID UNTIL 'infinity'");
+    }
+
+    /// The 2026-09-01 report: the user read „Connection string is not
+    /// valid" and asked whether their password was too long. The answer has
+    /// to be in the message, because that is all they get to see.
+    #[test]
+    fn error_87_says_it_is_the_address_and_not_the_password() {
+        let sni = QueryError {
+            code: Some("08001".into()),
+            message: "[Microsoft][ODBC Driver 18 for SQL Server]SQL Server Network \
+                      Interfaces: Connection string is not valid [87]."
+                .into(),
+            position: None,
+        };
+        let out = enrich_test_error(Engine::Mssql, &sni);
+        assert!(out.contains("Zkontroluj Host"), "{out}");
+        assert!(out.contains("není heslem"), "{out}");
+        // The driver's own words survive — the hint is added, not a
+        // replacement, or the detail needed to search for it is lost.
+        assert!(out.contains("Connection string is not valid"), "{out}");
+    }
+
+    /// Only MSSQL, and only that message: a hint that fires on „connection
+    /// refused" would be pointing at the wrong field.
+    #[test]
+    fn the_address_hint_does_not_fire_on_anything_else() {
+        let other = QueryError {
+            code: Some("08001".into()),
+            message: "TCP Provider: No connection could be made".into(),
+            position: None,
+        };
+        assert_eq!(enrich_test_error(Engine::Mssql, &other), other.to_string());
+        let same_text_wrong_engine = QueryError {
+            code: None,
+            message: "Connection string is not valid".into(),
+            position: None,
+        };
+        assert_eq!(
+            enrich_test_error(Engine::Postgres, &same_text_wrong_engine),
+            same_text_wrong_engine.to_string()
+        );
     }
 
     #[test]

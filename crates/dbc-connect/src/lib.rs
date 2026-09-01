@@ -324,6 +324,93 @@ pub fn resolve_secret_for_connect(vault: Option<&Vault>, cfg: &ConnectionConfig)
 /// build — včetně obou refusalů a timeout defaultu — potřebuje i změna
 /// hesla při loginu ([`change_mssql_password`]), která NEotevírá
 /// `MssqlConnection`.
+/// Turns what a person typed into Host and Port into the pair the ODBC
+/// `Server=tcp:<host>,<port>` value is built from.
+///
+/// It exists because that value used to be `format!("tcp:{host},{port}")`
+/// over the raw fields, and the network layer's complaint about the result
+/// is famously unhelpful: „SQL Server Network Interfaces: Connection string
+/// is not valid [87]", from which a user reasonably concluded their
+/// password might be too long (2026-09-01). Nothing about the address is in
+/// that sentence, and the address is the only thing it is ever about.
+///
+/// So the shapes people actually type are accepted rather than concatenated
+/// into nonsense:
+///
+/// * surrounding whitespace, which a paste brings along;
+/// * a `tcp:` prefix, because that is what the connection string itself
+///   looks like and copying it back in is a natural thing to do;
+/// * `host,1433` and `host:1433` — the SQL Server and the everything-else
+///   spelling of „host and port together". Either supplies the port, and
+///   contradicting the Port field is refused rather than silently picking
+///   one.
+///
+/// And the shapes that cannot work are refused HERE, naming the field, in
+/// Czech, before a driver gets to describe them as a bad connection string.
+///
+/// IPv6 is left alone: a literal is bracketed (`[::1]`) and full of colons,
+/// so anything bracketed or with more than one colon is passed through
+/// untouched instead of being torn apart at the wrong one.
+pub fn normalise_mssql_host(
+    host: &str,
+    port: Option<u16>,
+) -> Result<(String, u16), QueryError> {
+    let trimmed = host.trim();
+    // `get`, not slicing: `host` is arbitrary user text and `[..4]` panics
+    // in the middle of a multi-byte character.
+    let stripped = match trimmed.get(..4) {
+        Some(p) if p.eq_ignore_ascii_case("tcp:") => trimmed[4..].trim(),
+        _ => trimmed,
+    };
+    if stripped.is_empty() {
+        return Err(QueryError::msg(
+            "MSSQL: vyplň Host — adresa serveru chybí (jméno nebo IP, port patří do pole Port)",
+        ));
+    }
+
+    let bracketed_or_ipv6 = stripped.contains('[') || stripped.matches(':').count() > 1;
+    let split_at = stripped
+        .rfind(',')
+        .or_else(|| if bracketed_or_ipv6 { None } else { stripped.rfind(':') });
+
+    let (addr, embedded_port) = match split_at {
+        Some(i) => {
+            let (a, rest) = stripped.split_at(i);
+            let p = rest[1..].trim();
+            let parsed = p.parse::<u16>().ok().filter(|n| *n != 0).ok_or_else(|| {
+                QueryError::msg(format!(
+                    "MSSQL: v poli Host je za oddělovačem „{p}“, což není číslo portu —                      napiš do Hostu jen jméno serveru nebo IP a port dej do pole Port"
+                ))
+            })?;
+            (a.trim(), Some(parsed))
+        }
+        None => (stripped, None),
+    };
+
+    if addr.is_empty() {
+        return Err(QueryError::msg(
+            "MSSQL: v poli Host je jen port — doplň jméno serveru nebo IP",
+        ));
+    }
+    if addr.chars().any(char::is_whitespace) {
+        return Err(QueryError::msg(format!(
+            "MSSQL: Host „{addr}“ obsahuje mezeru — adresa serveru žádnou mít nemůže"
+        )));
+    }
+
+    let resolved = match (embedded_port, port) {
+        (Some(from_host), Some(from_field)) if from_host != from_field => {
+            return Err(QueryError::msg(format!(
+                "MSSQL: port je zadaný dvakrát a pokaždé jinak — v Hostu {from_host},                  v poli Port {from_field}. Nech ho jen na jednom místě."
+            )))
+        }
+        (Some(from_host), _) => from_host,
+        (None, Some(from_field)) => from_field,
+        (None, None) => 1433,
+    };
+    Ok((addr.to_string(), resolved))
+}
+
 pub fn mssql_config_from_config(
     cfg: &ConnectionConfig,
     secret: Option<String>,
@@ -345,9 +432,10 @@ pub fn mssql_config_from_config(
         ));
     }
     let opts = cfg.mssql.clone().unwrap_or_default();
+    let (host, port) = normalise_mssql_host(&cfg.host, cfg.port)?;
     let mut mssql_cfg = MssqlConfig::new(
-        cfg.host.clone(),
-        cfg.port.unwrap_or(1433),
+        host,
+        port,
         cfg.database.clone(),
         cfg.user.clone(),
         secret.unwrap_or_default(),
@@ -556,6 +644,98 @@ mod duckdb_connect_tests {
             assert!(err.message.contains("již otevřena v jiném režimu"), "got: {}", err.message);
         });
         drop(rw);
+    }
+}
+
+#[cfg(test)]
+mod mssql_host_tests {
+    use super::*;
+
+    /// The plain case must come through byte for byte — this runs in front
+    /// of every existing MSSQL connection in the world, so „it also does
+    /// nothing when there is nothing to do" is the first thing to pin.
+    #[test]
+    fn an_ordinary_host_and_port_are_left_exactly_alone() {
+        assert_eq!(
+            normalise_mssql_host("production-sql.example.internal", Some(1113)).unwrap(),
+            ("production-sql.example.internal".to_string(), 1113)
+        );
+        assert_eq!(
+            normalise_mssql_host("20.224.189.174", Some(7333)).unwrap(),
+            ("20.224.189.174".to_string(), 7333)
+        );
+    }
+
+    #[test]
+    fn no_port_anywhere_means_the_sql_server_default() {
+        assert_eq!(normalise_mssql_host("srv", None).unwrap(), ("srv".to_string(), 1433));
+    }
+
+    /// The shapes a person types or pastes, all of which used to be glued
+    /// straight into `tcp:{host},{port}` and rejected by SNI as „Connection
+    /// string is not valid [87]".
+    #[test]
+    fn the_shapes_people_actually_type_are_accepted() {
+        for (host, port, want_host, want_port) in [
+            ("  srv  ", Some(1113u16), "srv", 1113u16),
+            ("tcp:srv", Some(1113), "srv", 1113),
+            ("TCP:srv", Some(1113), "srv", 1113),
+            ("srv,1113", None, "srv", 1113),
+            ("srv:1113", None, "srv", 1113),
+            ("tcp:srv,1113", None, "srv", 1113),
+            // Same port twice is agreement, not a conflict.
+            ("srv,1113", Some(1113), "srv", 1113),
+        ] {
+            assert_eq!(
+                normalise_mssql_host(host, port).unwrap(),
+                (want_host.to_string(), want_port),
+                "{host:?} + {port:?}"
+            );
+        }
+    }
+
+    /// Refused HERE, in Czech, naming the field — instead of by a driver
+    /// that will only say the connection string is invalid.
+    #[test]
+    fn what_cannot_work_is_refused_with_a_message_about_the_field() {
+        let cases = [
+            ("", None, "vyplň Host"),
+            ("   ", None, "vyplň Host"),
+            ("tcp:", None, "vyplň Host"),
+            ("srv,abc", None, "není číslo portu"),
+            ("srv,0", None, "není číslo portu"),
+            ("srv,99999", None, "není číslo portu"),
+            (",1113", None, "jen port"),
+            ("my server", None, "obsahuje mezeru"),
+        ];
+        for (host, port, needle) in cases {
+            let e = normalise_mssql_host(host, port).unwrap_err().to_string();
+            assert!(e.contains(needle), "{host:?} gave {e:?}, expected {needle:?}");
+        }
+    }
+
+    /// Two different ports is the one case where guessing would be worse
+    /// than refusing: either choice silently ignores something the user
+    /// typed on purpose.
+    #[test]
+    fn a_port_given_twice_and_differently_is_refused_rather_than_guessed() {
+        let e = normalise_mssql_host("srv,1113", Some(1433)).unwrap_err().to_string();
+        assert!(e.contains("1113") && e.contains("1433"), "{e}");
+    }
+
+    /// An IPv6 literal is bracketed and full of colons; tearing it apart at
+    /// the last one would turn a valid address into a bad one.
+    #[test]
+    fn an_ipv6_literal_is_not_split_at_a_colon() {
+        assert_eq!(
+            normalise_mssql_host("[2001:db8::1]", Some(1433)).unwrap(),
+            ("[2001:db8::1]".to_string(), 1433)
+        );
+        // …but a comma still means „and the port is", even for IPv6.
+        assert_eq!(
+            normalise_mssql_host("[2001:db8::1],1113", None).unwrap(),
+            ("[2001:db8::1]".to_string(), 1113)
+        );
     }
 }
 
