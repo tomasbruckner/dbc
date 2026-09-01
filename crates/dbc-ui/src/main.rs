@@ -59,6 +59,7 @@ mod row_view;
 mod runner;
 mod sandbox;
 mod schema_tree;
+mod server_version;
 mod scripts;
 mod sql_highlight;
 mod star_expand;
@@ -9456,6 +9457,36 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// Design §1.2: NOT eager — one bounded metadata fetch over one
     /// short-lived connection to the DEFAULT database; no other connection
     /// is touched, no schema is fetched yet.
+    /// Ask a connection which server version it is, and put the answer on
+    /// its sidebar row.
+    ///
+    /// Fire-and-forget by design. It reports NOTHING on failure — not to
+    /// the status bar, not to the log: the caller (`start_db_list_fetch`)
+    /// is already asking the same server for its database list over the
+    /// same credentials at the same moment, and a connection problem
+    /// surfaces there, loudly and once. A second copy of that message
+    /// would only teach the user that one connection error means two red
+    /// lines.
+    fn start_server_version_fetch(
+        &mut self,
+        cfg: &ConnectionConfig,
+        secret: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let conn_id = cfg.id.clone();
+        let engine = cfg.engine;
+        let rx = self
+            .runner
+            .fetch_server_version(spec_for_database(cfg, &cfg.database, secret), engine);
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(version)) = rx.await else { return };
+            let _ = this.update(cx, |view, cx| {
+                view.tree.update(cx, |t, cx| t.set_server_version(&conn_id, version, cx));
+            });
+        })
+        .detach();
+    }
+
     fn start_db_list_fetch(&mut self, conn_id: String, cx: &mut Context<Self>) {
         let Some(cfg) = self.config.connections.iter().find(|c| c.id == conn_id).cloned() else {
             return;
@@ -9474,7 +9505,17 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let my_generation = self.sidebar_fetch_generation;
         let default_db = cfg.database.clone();
         self.tree.update(cx, |t, cx| t.begin_db_list(&conn_id, my_generation, cx));
-        let rx = self.runner.fetch_database_list(spec_for_database(&cfg, &cfg.database, secret));
+        let rx = self.runner.fetch_database_list(spec_for_database(
+            &cfg,
+            &cfg.database,
+            secret.clone(),
+        ));
+        // The server's version, asked for at the same moment and reported
+        // separately: it decorates the row, so it must not be able to
+        // delay, fail or complicate the database list beside it. Its own
+        // connection, its own result, and no error path — see
+        // `fetch_server_version`.
+        self.start_server_version_fetch(&cfg, secret, cx);
         let started = std::time::Instant::now();
         let engine_name = format!("{:?}", cfg.engine);
         cx.spawn(async move |this, cx| {

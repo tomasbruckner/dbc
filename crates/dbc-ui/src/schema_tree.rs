@@ -991,6 +991,11 @@ pub struct ActiveScope {
 /// entry carrying its own lazily fetched schema slot.
 pub struct ConnNode {
     pub dbs: DbListState,
+    /// The server's short version („18"), once it has said. `None` until
+    /// then and forever after for a server that will not answer — the row
+    /// simply reads as it did before the feature existed, which is why
+    /// this is an `Option` and not a „neznámá" string.
+    pub version: Option<String>,
 }
 
 /// Lazy-fetch state machine for one connection's database list (design
@@ -1617,7 +1622,9 @@ pub fn flatten_sidebar(
     // favourites first, then the BTreeMap-of-paths (loose before named
     // folders, parents before children, alphabetical within siblings).
     let emit_conn = |out: &mut Vec<SidebarFlatRow>, c: &ConnectionConfig, depth: usize| {
-        let mut label = format!("{} ({})", c.name, crate::connections_ui::engine_label(c.engine));
+        let version = states.get(&c.id).and_then(|n| n.version.as_deref());
+        let mut label =
+            format!("{} ({})", c.name, crate::server_version::engine_segment(c.engine, version));
         if c.read_only {
             label.push_str(" (pouze pro čtení)");
         }
@@ -1957,7 +1964,7 @@ impl SchemaTree {
         for id in &ids {
             self.conns
                 .entry(id.clone())
-                .or_insert_with(|| ConnNode { dbs: DbListState::NotLoaded });
+                .or_insert_with(|| ConnNode { dbs: DbListState::NotLoaded, version: None });
         }
         self.lru.retain(|(c, _)| ids.contains(c));
         self.grouped = grouped;
@@ -2099,6 +2106,30 @@ impl SchemaTree {
             begin_db_list_load(node, generation);
             cx.notify();
         }
+    }
+
+    /// Records the server's short version for a connection row.
+    ///
+    /// No generation guard, deliberately, unlike its `finish_db_list`
+    /// neighbour: a version is a property of the SERVER, not of the fetch,
+    /// so a late answer from an earlier expand says exactly what a fresh
+    /// one would. There is nothing a stale result could clobber. `None`
+    /// (server would not say) leaves whatever is there rather than
+    /// erasing a version an earlier expand did get — a row that had „pg
+    /// 18" and now shows „pg" would read as a downgrade.
+    pub fn set_server_version(
+        &mut self,
+        conn_id: &str,
+        version: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(v) = version else { return };
+        let Some(node) = self.conns.get_mut(conn_id) else { return };
+        if node.version.as_deref() == Some(v.as_str()) {
+            return;
+        }
+        node.version = Some(v);
+        cx.notify();
     }
 
     /// Applies a database-list result (stale generations dropped by
@@ -4101,6 +4132,7 @@ mod sidebar_tests {
     fn loaded_states(conn_id: &str, db: &str) -> HashMap<String, ConnNode> {
         let mut m = HashMap::new();
         m.insert(conn_id.to_string(), ConnNode {
+            version: None,
             dbs: DbListState::Loaded {
                 dbs: vec![DbNode {
                     name: db.to_string(), is_default: true,
@@ -4250,13 +4282,54 @@ mod sidebar_tests {
             (DbListState::Error("kaput".into()), "error: kaput", true),
         ] {
             let mut states = HashMap::new();
-            states.insert("c1".into(), ConnNode { dbs: state });
+            states.insert("c1".into(), ConnNode { dbs: state, version: None });
             let rows = flatten_sidebar_g!(&grouped(&conns), &states, None,
                 &outer, "", None, &[], AdminEntry::Hidden, None);
             assert!(matches!(&rows[1], (SidebarRow::Notice { conn_id, db: None, text, retry }, 1, _, false)
                 if conn_id == "c1" && text == expect_text && *retry == expect_retry),
                 "state expecting {expect_text}: got {:?}", rows.get(1));
         }
+    }
+
+    /// The connection row carries the server's version once it is known,
+    /// and reads exactly as it always did until then (user request,
+    /// 2026-09-01: „u connection bych nekde chtel videt verzi toho
+    /// serveru (napr. pg 18)").
+    #[test]
+    fn a_connection_row_shows_the_server_version_once_it_is_known() {
+        let conns = vec![conn_cfg("c1", "prod", &[], Engine::Postgres, "sales")];
+
+        // Before the server has answered — byte-identical to the old row.
+        let mut states = HashMap::new();
+        states.insert("c1".into(), ConnNode { dbs: DbListState::NotLoaded, version: None });
+        let rows = flatten_sidebar_g!(&grouped(&conns), &states, None,
+            &HashSet::new(), "", None, &[], AdminEntry::Hidden, None);
+        assert_eq!(rows[0].2, "prod (pg)");
+
+        // After.
+        states.insert(
+            "c1".into(),
+            ConnNode { dbs: DbListState::NotLoaded, version: Some("18".into()) },
+        );
+        let rows = flatten_sidebar_g!(&grouped(&conns), &states, None,
+            &HashSet::new(), "", None, &[], AdminEntry::Hidden, None);
+        assert_eq!(rows[0].2, "prod (pg 18)");
+    }
+
+    /// The version must not push the read-only marker off the row or land
+    /// inside it — the two decorations are independent.
+    #[test]
+    fn the_version_and_the_read_only_marker_coexist() {
+        let mut cfg = conn_cfg("c1", "prod", &[], Engine::Postgres, "sales");
+        cfg.read_only = true;
+        let mut states = HashMap::new();
+        states.insert(
+            "c1".into(),
+            ConnNode { dbs: DbListState::NotLoaded, version: Some("18".into()) },
+        );
+        let rows = flatten_sidebar_g!(&grouped(&[cfg]), &states, None,
+            &HashSet::new(), "", None, &[], AdminEntry::Hidden, None);
+        assert_eq!(rows[0].2, "prod (pg 18) (pouze pro čtení)");
     }
 
     #[test]
@@ -4540,7 +4613,7 @@ mod sidebar_tests {
 
     #[test]
     fn db_list_result_marks_default_and_truncation() {
-        let mut node = ConnNode { dbs: DbListState::NotLoaded };
+        let mut node = ConnNode { dbs: DbListState::NotLoaded, version: None };
         begin_db_list_load(&mut node, 3);
         apply_db_list_result(&mut node, 3,
             Ok((vec!["inventory".into(), "sales".into()], true)), "sales");
@@ -4601,7 +4674,7 @@ mod sidebar_tests {
         let mut slot: ActiveSlot = None;
         begin_fallback_schema_load(&mut slot, "c1", "sales", 1);
         apply_fallback_schema_result(&mut slot, "c1", "sales", 1, Ok(snap()));
-        let mut node = ConnNode { dbs: DbListState::NotLoaded };
+        let mut node = ConnNode { dbs: DbListState::NotLoaded, version: None };
         begin_db_list_load(&mut node, 2);
         apply_db_list_result(
             &mut node,
@@ -4638,6 +4711,7 @@ mod sidebar_tests {
         // Load CAP + 2 slots on one connection.
         let db_names: Vec<String> = (0..LOADED_SNAPSHOT_CAP + 2).map(|i| format!("db{i}")).collect();
         states.insert("c1".into(), ConnNode {
+            version: None,
             dbs: DbListState::Loaded {
                 dbs: db_names.iter().map(|n| DbNode {
                     name: n.clone(), is_default: n == "db0",

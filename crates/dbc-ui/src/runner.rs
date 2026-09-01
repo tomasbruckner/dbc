@@ -463,6 +463,33 @@ impl QueryRunner {
         rx
     }
 
+    /// The server's own version, for the connection row in the sidebar.
+    ///
+    /// Rides along with the database-list fetch — the moment a connection
+    /// is first expanded and therefore the first moment there is a server
+    /// to ask. It is a read, over its own short-lived connection, exactly
+    /// like `fetch_schema` and `fetch_database_list` beside it.
+    ///
+    /// `Ok(None)`, not `Err`, when the answer is missing or unreadable: a
+    /// version is decoration on a row that works without it, so a server
+    /// that will not say (an old build, a locked-down `SERVERPROPERTY`)
+    /// must cost the user nothing. Only a failure to CONNECT is an error,
+    /// and the caller already has a louder report of that from the
+    /// database list it asked for at the same time.
+    pub fn fetch_server_version(
+        &self,
+        spec: ConnectSpec,
+        engine: dbc_state::Engine,
+    ) -> tokio::sync::oneshot::Receiver<Result<Option<String>, QueryError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = self.handle();
+        self.runtime.spawn(async move {
+            let result = fetch_server_version_inner(spec, engine, handle).await;
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
     /// G10 T3, design §5: one-shot fetch of the admin sub-views' labeled
     /// catalog SELECTs (`admin_sql::{roles_catalog, privileges_catalog,
     /// sizes_catalog}`'s output) — opens `spec` (same `open_spec` dispatch
@@ -2797,6 +2824,22 @@ async fn drain_all_rows(
         rows.push(row);
     }
     Ok((col_names, rows))
+}
+
+/// One row, one cell, through the same read path as every other one-shot
+/// here. The cell is whatever the engine's own statement returns; turning
+/// it into „18" is [`crate::server_version::short_version`]'s job, and it
+/// answers `None` for anything it cannot read rather than guessing.
+async fn fetch_server_version_inner(
+    spec: ConnectSpec,
+    engine: dbc_state::Engine,
+    handle: tokio::runtime::Handle,
+) -> Result<Option<String>, QueryError> {
+    let mut opened = open_spec(spec, handle).await?;
+    let sql = crate::server_version::version_sql(engine);
+    let (_cols, rows) = drain_all_rows(&mut *opened.conn, sql, 1).await?;
+    let raw = rows.first().and_then(|r| r.first()).and_then(|c| c.clone());
+    Ok(raw.as_deref().and_then(|r| crate::server_version::short_version(engine, r)))
 }
 
 async fn fetch_lookup_inner(
