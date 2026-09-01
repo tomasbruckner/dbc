@@ -1217,6 +1217,21 @@ pub fn apply_db_list_result(
     };
 }
 
+/// Is any folder ABOVE `path` collapsed?
+///
+/// The sidebar's folders are a flat list of full paths, and each row only
+/// knew about its own collapsed flag — so `A/B` was drawn whatever `A` was
+/// doing. Collapsing means „hide everything under this", and „everything"
+/// includes folders.
+///
+/// Strict ancestors only: a folder's own state is what decides whether its
+/// CONTENTS are drawn, not whether it is. Collapsing `A` must still leave
+/// `A` on screen — otherwise there is nothing left to click to open it
+/// again.
+pub fn ancestor_collapsed(path: &[String], outer_expanded: &HashSet<OuterId>) -> bool {
+    (1..path.len()).any(|n| outer_expanded.contains(&OuterId::Folder(path[..n].to_vec())))
+}
+
 /// Fill a connection's database list from what was cached last run.
 ///
 /// Returns whether anything changed. Only ever writes over `NotLoaded`:
@@ -1763,6 +1778,15 @@ pub fn flatten_sidebar(
             for c in &group.connections {
                 emit_conn(&mut out, c, 0);
             }
+            continue;
+        }
+        // A nested folder is a row of its own in this flat list, so
+        // collapsing its parent used to hide the parent's CONNECTIONS and
+        // leave the child folder sitting there with nothing above it
+        // („zabalim slozku A … porad jde videt slozka B", user
+        // 2026-09-01). Collapsing has to hide everything underneath, at
+        // every depth — see [`ancestor_collapsed`].
+        if ancestor_collapsed(&group.path, outer_expanded) {
             continue;
         }
         let depth = group.path.len() - 1;
@@ -4379,6 +4403,142 @@ mod sidebar_tests {
                 if conn_id == "c1" && text == expect_text && *retry == expect_retry),
                 "state expecting {expect_text}: got {:?}", rows.get(1));
         }
+    }
+
+    /// „je divne ze mam slozku A a v ni je slozka B a zabalim slozku A,
+    /// tak porad jde videt slozka B" (user, 2026-09-01). Collapsing hides
+    /// everything underneath, folders included.
+    #[test]
+    fn collapsing_a_folder_hides_the_folders_inside_it() {
+        let conns = vec![
+            conn_cfg("c1", "primo", &["A"], Engine::Postgres, "d"),
+            conn_cfg("c2", "hluboko", &["A", "B"], Engine::Postgres, "d"),
+            conn_cfg("c3", "jinde", &["Z"], Engine::Postgres, "d"),
+        ];
+        let g = grouped(&conns);
+        let states = HashMap::new();
+
+        // Everything open: both folders and both of their connections.
+        let rows = flatten_sidebar_g!(&g, &states, None,
+            &HashSet::new(), "", None, &[], AdminEntry::Hidden, None);
+        let labels: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
+        for expected in ["A", "B", "Z"] {
+            assert!(labels.iter().any(|l| l == expected), "{expected} missing from {labels:?}");
+        }
+
+        // Collapse A: A stays (there has to be something left to click),
+        // everything under it goes — including the folder B.
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Folder(vec!["A".into()]));
+        let rows = flatten_sidebar_g!(&g, &states, None,
+            &outer, "", None, &[], AdminEntry::Hidden, None);
+        let labels: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
+        assert!(labels.iter().any(|l| l == "A"), "the collapsed folder must stay: {labels:?}");
+        assert!(!labels.iter().any(|l| l == "B"), "B should be hidden: {labels:?}");
+        assert!(!labels.iter().any(|l| l.starts_with("hluboko")), "{labels:?}");
+        assert!(!labels.iter().any(|l| l.starts_with("primo")), "{labels:?}");
+        // A sibling branch is untouched.
+        assert!(labels.iter().any(|l| l == "Z"), "{labels:?}");
+        assert!(labels.iter().any(|l| l.starts_with("jinde")), "{labels:?}");
+    }
+
+    /// Collapsing the CHILD leaves the parent and its own connections
+    /// alone — the rule is „hide what is under me", not „hide my level".
+    #[test]
+    fn collapsing_the_inner_folder_leaves_the_outer_one_alone() {
+        let conns = vec![
+            conn_cfg("c1", "primo", &["A"], Engine::Postgres, "d"),
+            conn_cfg("c2", "hluboko", &["A", "B"], Engine::Postgres, "d"),
+        ];
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Folder(vec!["A".into(), "B".into()]));
+        let rows = flatten_sidebar_g!(&grouped(&conns), &HashMap::new(), None,
+            &outer, "", None, &[], AdminEntry::Hidden, None);
+        let labels: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
+        assert!(labels.iter().any(|l| l == "A"), "{labels:?}");
+        assert!(labels.iter().any(|l| l.starts_with("primo")), "{labels:?}");
+        assert!(labels.iter().any(|l| l == "B"), "the collapsed folder must stay: {labels:?}");
+        assert!(!labels.iter().any(|l| l.starts_with("hluboko")), "{labels:?}");
+    }
+
+    /// The predicate on its own: strict ancestors, at any depth.
+    #[test]
+    fn only_a_strict_ancestor_hides_a_folder() {
+        let path: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        let mut set = HashSet::new();
+        assert!(!ancestor_collapsed(&path, &set));
+
+        // A folder's own state is not an ancestor of itself.
+        set.insert(OuterId::Folder(path.clone()));
+        assert!(!ancestor_collapsed(&path, &set));
+
+        // A grandparent counts, not only the direct parent.
+        set.clear();
+        set.insert(OuterId::Folder(vec!["a".into()]));
+        assert!(ancestor_collapsed(&path, &set));
+        set.clear();
+        set.insert(OuterId::Folder(vec!["a".into(), "b".into()]));
+        assert!(ancestor_collapsed(&path, &set));
+
+        // A folder that merely shares a name prefix is not an ancestor.
+        set.clear();
+        set.insert(OuterId::Folder(vec!["ab".into()]));
+        assert!(!ancestor_collapsed(&path, &set));
+
+        // A top-level folder has no ancestors at all.
+        assert!(!ancestor_collapsed(&["a".to_string()], &set));
+    }
+
+    /// Expanding a connection shows what was there last time, immediately.
+    #[test]
+    fn a_remembered_database_list_fills_an_untouched_connection() {
+        let mut node = ConnNode { dbs: DbListState::NotLoaded, version: None };
+        assert!(seed_db_list_from_cache(
+            &mut node,
+            &["master".to_string(), "sales".to_string()],
+            "sales"
+        ));
+        let DbListState::Loaded { dbs, truncated } = &node.dbs else {
+            panic!("expected a loaded list")
+        };
+        assert_eq!(dbs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["master", "sales"]);
+        assert!(!truncated);
+        // The default database is marked exactly as the live path marks it.
+        assert_eq!(dbs.iter().filter(|d| d.is_default).count(), 1);
+        assert!(dbs.iter().find(|d| d.name == "sales").unwrap().is_default);
+        // …and every schema starts unfetched: the list is cached, the
+        // schemas behind it have their own cache one level down.
+        assert!(dbs.iter().all(|d| matches!(d.schema, DbSchemaState::NotLoaded)));
+    }
+
+    /// It may never write over anything else. `Loading` has a live answer
+    /// coming, `Loaded` is at least as fresh, and `Error` is telling the
+    /// user something a stale list would paper over.
+    #[test]
+    fn a_remembered_database_list_only_fills_an_untouched_slot() {
+        let names = ["x".to_string()];
+
+        let mut node = ConnNode { dbs: DbListState::Loading { generation: 3 }, version: None };
+        assert!(!seed_db_list_from_cache(&mut node, &names, ""));
+        assert!(matches!(node.dbs, DbListState::Loading { generation: 3 }));
+
+        let mut node = ConnNode { dbs: DbListState::Error("kaput".into()), version: None };
+        assert!(!seed_db_list_from_cache(&mut node, &names, ""));
+        assert!(matches!(&node.dbs, DbListState::Error(e) if e == "kaput"));
+
+        let mut node = ConnNode {
+            dbs: DbListState::Loaded { dbs: Vec::new(), truncated: false },
+            version: None,
+        };
+        assert!(!seed_db_list_from_cache(&mut node, &names, ""));
+        assert!(matches!(&node.dbs, DbListState::Loaded { dbs, .. } if dbs.is_empty()));
+    }
+
+    #[test]
+    fn an_empty_remembered_list_changes_nothing() {
+        let mut node = ConnNode { dbs: DbListState::NotLoaded, version: None };
+        assert!(!seed_db_list_from_cache(&mut node, &[], ""));
+        assert!(matches!(node.dbs, DbListState::NotLoaded));
     }
 
     /// The version survives a restart („kdyz vypnu a zapnu appku, tak mi
