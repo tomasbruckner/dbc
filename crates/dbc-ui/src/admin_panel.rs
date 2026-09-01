@@ -1547,11 +1547,7 @@ impl AdminPanel {
             if let Some(row) = roles.iter().find(|r| &r.name == sel) {
                 for (k, v) in &row.detail {
                     detail = detail.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_2()
-                            .child(div().w(px(160.)).text_color(theme.text_muted).child(k.clone()))
+                        ui::labelled_row(k.clone(), 160., theme)
                             .child(div().child(v.clone())),
                     );
                 }

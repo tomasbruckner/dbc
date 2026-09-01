@@ -52,6 +52,7 @@ mod monitor;
 mod monitor_sql;
 mod monitor_view;
 mod palette;
+mod collate;
 mod plan;
 mod prefetch;
 mod pwchange;
@@ -2165,6 +2166,13 @@ struct AppView {
     /// applies if the generation still matches (last-dispatched wins, not
     /// last-resolved).
     switch_generation: u64,
+    /// Same idea for the connection dialog's Test button, and needed for
+    /// the same reason once „Zrušit test" exists — see
+    /// `AppView::abandon_connection_test`.
+    test_generation: u64,
+    /// Dropping this is what makes „Zrušit test" take effect immediately
+    /// instead of at the connect timeout. `None` when no test is running.
+    test_abort: Option<tokio::task::AbortHandle>,
     dropdown_open: bool,
     modal: Option<connections_ui::ModalState>,
     /// Cached folder/favourite grouping of `config.connections`, recomputed
@@ -5786,11 +5794,7 @@ impl AppView {
     fn render_about_overlay(&self, cx: &Context<Self>) -> AnyElement {
         let theme = *cx.theme();
         let row = |label: &'static str, value: String| {
-            div()
-                .flex()
-                .flex_row()
-                .gap_2()
-                .child(div().w(px(120.)).flex_shrink_0().text_color(theme.text_muted).child(label))
+            ui::labelled_row(label, 120., theme)
                 .child(div().text_color(theme.text_primary).child(value))
         };
         let profile = dbc_state::workspace::profile_dir().display().to_string();
@@ -7031,7 +7035,10 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         self.switch_generation += 1;
         let my_generation = self.switch_generation;
         cx.notify();
-        let rx = self.runner.test_connect(spec);
+        // The abort handle is for the Test button's „Zrušit test"; a
+        // connection SWITCH has no cancel affordance and is already retired
+        // by `switch_generation`, so it is dropped here.
+        let (rx, _abort) = self.runner.test_connect(spec);
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |view, cx| {
@@ -14661,6 +14668,8 @@ fn main() {
                             prefetch_armed: false,
                             active_database: None,
                             switch_generation: 0,
+                            test_generation: 0,
+                            test_abort: None,
                             dropdown_open: false,
                             modal: None,
                             grouped_cache,
@@ -16406,6 +16415,57 @@ mod component_drift_audit {
             offenders.is_empty(),
             "the panel surface is spelled outside `crate::ui` at {offenders:?} — use \
              `ui::surface`, `ui::panel` or `ui::popover`, or the copies drift again"
+        );
+    }
+
+    /// A group of checkboxes must go through [`crate::ui::checkbox_row`].
+    ///
+    /// The rail under the 2026-09-01 overflow report. The obvious
+    /// hand-written container — `div().flex().flex_row().gap_4()` — does
+    /// not wrap, and a flex item never shrinks below its own content, so
+    /// two checkboxes whose labels together outrun the dialog paint the
+    /// second one OUTSIDE the panel, over whatever the modal covers. It
+    /// does not clip, ellipsise or complain; it just looks broken, and only
+    /// on the engine whose labels happen to be the longest.
+    ///
+    /// None of that is visible in the code, and a test cannot see it either
+    /// — a GPUI panel has no headless rendering. So the check is textual
+    /// and blunt: a `ui::checkbox` may not have a hand-written `flex_row`
+    /// above it in the chain that builds it. `checkbox_row` spells neither
+    /// word at the call site, so a correct call site cannot match.
+    ///
+    /// Preceding lines only, and a short window: a parent comes BEFORE its
+    /// children in a builder chain, and widening this to „anywhere nearby"
+    /// is how the button audit's first draft flagged 58 innocent sites.
+    #[test]
+    fn checkbox_groups_go_through_the_wrapping_row() {
+        let needle = format!("ui::check{}(", "box");
+        let flex_row = format!(".flex_{}()", "row");
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut seen = 0usize;
+        for (name, src) in sources() {
+            if !name.starts_with("crates/dbc-ui/") || name.ends_with("/ui.rs") {
+                continue;
+            }
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if line.trim_start().starts_with("//") || !line.contains(&needle) {
+                    continue;
+                }
+                seen += 1;
+                let lo = i.saturating_sub(6);
+                if lines[lo..i].iter().any(|l| l.contains(&flex_row)) {
+                    offenders.push(format!("{name}:{}", i + 1));
+                }
+            }
+        }
+        // Non-vacuity: if the checkboxes move or get renamed this must fail
+        // rather than pass by finding nothing to look at.
+        assert!(seen >= 4, "expected to find the app's checkboxes, found {seen}");
+        assert!(
+            offenders.is_empty(),
+            "a checkbox at {offenders:?} sits in a hand-written row — use              `ui::checkbox_row`, or its label runs off the panel"
         );
     }
 

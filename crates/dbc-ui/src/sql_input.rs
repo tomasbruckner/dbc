@@ -843,8 +843,28 @@ impl SqlInput {
         // but the keystrokes still went to whatever had focus last. It felt
         // like the click had been ignored.
         window.focus(&self.focus_handle, cx);
-        self.is_selecting = true;
         let offset = self.offset_for_position(event.position);
+        // Double click selects the word, triple the line — the editor
+        // convention, and deliberately NOT the connection dialog's
+        // „double click takes everything". A form field holds one value;
+        // this holds a script, and selecting all of it by accident is how
+        // the next keystroke destroys somebody's work.
+        //
+        // `is_selecting` is left false so the pointer settling after the
+        // second click cannot drag the selection away again.
+        if event.click_count >= 2 {
+            self.is_selecting = false;
+            let range = if event.click_count == 2 {
+                self.buffer.word_range_at(offset)
+            } else {
+                self.buffer.line_range_at(offset)
+            };
+            self.buffer.select_range(range);
+            self.follow_cursor = true;
+            cx.notify();
+            return;
+        }
+        self.is_selecting = true;
         self.seek(offset, event.modifiers.shift);
         cx.notify();
     }

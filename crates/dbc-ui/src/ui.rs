@@ -221,6 +221,34 @@ pub(crate) fn segmented_option(
         .child(label.into())
 }
 
+/// A row of checkboxes that WRAPS instead of running off the panel.
+///
+/// It exists because the obvious hand-written version does not work and
+/// does not fail loudly either. A flex item will not shrink below its own
+/// content, so two checkboxes whose labels together outrun the dialog are
+/// not squeezed, ellipsised or clipped — the second label is simply painted
+/// OUTSIDE the white surface, on top of whatever the modal is covering.
+/// That is what „Důvěřovat certifikátu serveru (TrustServerCertificate)"
+/// did beside „Šifrovat připojení (Encrypt)" in the MSSQL dialog, which the
+/// user photographed on 2026-09-01.
+///
+/// `flex_wrap` rather than one checkbox per line, because the pair that
+/// DOES fit („Pouze pro čtení" / „Oblíbené") should stay side by side.
+/// Wrapping settles that per row at the width the row actually has, instead
+/// of an author settling it once by eye and being right until someone
+/// lengthens a label.
+///
+/// The horizontal gap is the wider of the two on purpose: inside a line it
+/// is the only thing between one label and the next box, so it has to read
+/// as a bigger break than the space between lines.
+///
+/// It does not rescue a row whose SINGLE label is wider than the panel —
+/// nothing but a wider panel does. It does mean that no combination of
+/// labels which individually fit can spill.
+pub(crate) fn checkbox_row() -> Div {
+    div().flex().flex_row().flex_wrap().gap_x_4().gap_y_1()
+}
+
 /// A checkbox drawn as a glyph rather than as a platform control, because
 /// GPUI has no platform control and a hand-drawn box would need its own
 /// hit-testing to gain nothing.
@@ -257,26 +285,44 @@ pub(crate) fn checkbox(
 /// wrap from the other side.
 pub(crate) const FIELD_LABEL_W: f32 = 176.;
 
+/// „A label column, then whatever this row is about."
+///
+/// The width is a parameter rather than a constant because the app has
+/// four honest label columns, not one: dialog fields ([`FIELD_LABEL_W`]),
+/// query parameters, CSV header mapping, and the key/value lists in the
+/// admin panel and the about box. They hold different text and a single
+/// width would be too wide for some and too narrow for others.
+///
+/// What is NOT a parameter is the part every one of them got wrong. The
+/// five sites wrote the label cell out by hand and between them agreed on
+/// nothing: widths of 110, 120, 130 and 160 px, one `flex_shrink_0`, no
+/// `whitespace_nowrap` anywhere. So each of them could fold a label onto a
+/// second line, which is the bug the user photographed in the connection
+/// dialog on 2026-09-01 — and the connection dialog was the one site that
+/// had been fixed. `flex_none` and `whitespace_nowrap` now come with the
+/// column instead of being remembered.
+pub(crate) fn labelled_row(
+    label: impl Into<SharedString>,
+    label_w: f32,
+    theme: Theme,
+) -> Div {
+    div().flex().flex_row().items_center().gap_2().child(
+        div()
+            .w(px(label_w))
+            .flex_none()
+            .whitespace_nowrap()
+            .text_color(theme.text_muted)
+            .child(label.into()),
+    )
+}
+
 /// A form row: a label of fixed width, then the field taking the rest.
 pub(crate) fn field_row(
     label: impl Into<SharedString>,
     field: gpui::Entity<TextField>,
     theme: Theme,
 ) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .w(px(FIELD_LABEL_W))
-                .flex_none()
-                .whitespace_nowrap()
-                .text_color(theme.text_muted)
-                .child(label.into()),
-        )
-        .child(div().flex_1().child(field))
+    labelled_row(label, FIELD_LABEL_W, theme).child(div().flex_1().child(field))
 }
 
 #[cfg(test)]

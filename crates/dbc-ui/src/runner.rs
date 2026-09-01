@@ -323,17 +323,42 @@ impl QueryRunner {
     /// same limitation `connect_and_run`'s own connect step has (cancel is
     /// only checked before/after the blocking call, never during it). The
     /// `connect_timeout` bound is what actually caps how long this can run.
+    ///
+    /// What the returned [`tokio::task::AbortHandle`] therefore buys, and
+    /// what it does not — the distinction matters, because the button that
+    /// calls it says „Zrušit test" and a button may not lie:
+    ///
+    /// * It DOES end the wait. The awaiting task is dropped, the sender
+    ///   with it, and the caller's `rx.await` completes at once. The user
+    ///   gets the dialog back instead of watching „testuji…" for the rest
+    ///   of a 30-second timeout on an unreachable host. That is the whole
+    ///   of what the user asked for.
+    /// * It does NOT reach the connect itself. `open_spec` does the real
+    ///   work inside `spawn_blocking`, and a blocking thread cannot be
+    ///   interrupted — aborting the outer task drops the join handle, so
+    ///   the driver keeps dialling until its own `connect_timeout` and
+    ///   then throws the answer away. Nothing is left half-open (the
+    ///   connection is dropped the moment it is made, exactly as on the
+    ///   success path), and nothing is written: this path only ever opens
+    ///   and closes.
+    ///
+    /// Callers that already discriminate stale results by generation may
+    /// ignore the handle; it is an optimisation for the user's attention,
+    /// not part of the correctness argument.
     pub fn test_connect(
         &self,
         spec: ConnectSpec,
-    ) -> tokio::sync::oneshot::Receiver<Result<(), QueryError>> {
+    ) -> (
+        tokio::sync::oneshot::Receiver<Result<(), QueryError>>,
+        tokio::task::AbortHandle,
+    ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let handle = self.handle();
-        self.runtime.spawn(async move {
+        let task = self.runtime.spawn(async move {
             let result = open_spec(spec, handle).await.map(|_opened| ());
             let _ = tx.send(result);
         });
-        rx
+        (rx, task.abort_handle())
     }
 
     /// pwchange (spec §3): jediná sankcionovaná cesta UI k

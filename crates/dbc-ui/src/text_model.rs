@@ -252,6 +252,66 @@ impl MultilineBuffer {
         self.goal_column = None;
     }
 
+    /// The run of same-kind characters around `offset` — what a double
+    /// click selects.
+    ///
+    /// „Same kind" is [`classify`], shared with `word_boundary`, so a
+    /// double click and a Ctrl+Shift+Right agree about where a word ends:
+    /// `a.b` is three words to both. Unlike the motion, this does NOT eat
+    /// the whitespace after the word — a motion is going somewhere, a
+    /// selection is standing on something, and highlighting a trailing
+    /// space reads as a mistake.
+    ///
+    /// A click never lands between characters — it lands ON one and gets
+    /// rounded to the nearer edge, so half of every glyph produces the
+    /// offset of the glyph NEXT to it. `word_range_at` therefore has to
+    /// decide which side of a seam the click meant, and it prefers the
+    /// word: clicking the right-hand half of the „a" in `a.b` selects
+    /// „a", not „.". Clicking just past the end of a word selects that
+    /// word for the same reason. Only where neither side is a word does
+    /// the raw offset win.
+    pub fn word_range_at(&self, offset: usize) -> Range<usize> {
+        let ch: Vec<(usize, char)> = self.text.char_indices().collect();
+        if ch.is_empty() {
+            return 0..0;
+        }
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut i = ch.partition_point(|(off, _)| *off < offset);
+        if i >= ch.len() {
+            i = ch.len() - 1;
+        } else if i > 0 {
+            let left = classify(ch[i - 1].1, &is_word);
+            let right = classify(ch[i].1, &is_word);
+            if left != right && (right == CharClass::Space || left == CharClass::Word) {
+                i -= 1;
+            }
+        }
+        let kind = classify(ch[i].1, &is_word);
+        let mut start = i;
+        while start > 0 && classify(ch[start - 1].1, &is_word) == kind {
+            start -= 1;
+        }
+        let mut end = i;
+        while end < ch.len() && classify(ch[end].1, &is_word) == kind {
+            end += 1;
+        }
+        ch[start].0..ch.get(end).map(|(o, _)| *o).unwrap_or(self.text.len())
+    }
+
+    /// The line around `offset`, newline excluded — what a triple click
+    /// selects. Excluded so that copying a triple-clicked line and pasting
+    /// it somewhere does not bring a line break nobody asked for.
+    pub fn line_range_at(&self, offset: usize) -> Range<usize> {
+        let mut offset = offset.min(self.text.len());
+        while offset > 0 && !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        let start = self.text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let end =
+            self.text[offset..].find('\n').map(|i| offset + i).unwrap_or(self.text.len());
+        start..end
+    }
+
     /// Ctrl+Home / Ctrl+End.
     pub fn move_document(&mut self, to_end: bool, extend_selection: bool) {
         let target = if to_end { self.text.len() } else { 0 };
@@ -577,6 +637,97 @@ impl MultilineBuffer {
         self.cursor = clamped;
         self.selection = None;
         self.goal_column = None;
+    }
+}
+
+#[cfg(test)]
+mod click_selection_tests {
+    use super::*;
+
+    /// A double click inside a word takes the word and nothing around it —
+    /// no trailing space, whatever part of the word was clicked.
+    #[test]
+    fn a_double_click_anywhere_in_a_word_takes_that_word() {
+        let b = MultilineBuffer::from_text("select name from users");
+        for offset in 7..=11 {
+            assert_eq!(&b.text()[b.word_range_at(offset)], "name", "offset {offset}");
+        }
+    }
+
+    /// Every offset in the string must produce a word a human would agree
+    /// they clicked on — this is the property, the cases above are the
+    /// readable examples of it.
+    #[test]
+    fn every_offset_lands_on_the_word_under_it() {
+        let b = MultilineBuffer::from_text("select name from users");
+        let want = [
+            (0, "select"),
+            (3, "select"),
+            (6, "select"),
+            (7, "name"),
+            (12, "from"),
+            (16, "from"),
+            (17, "users"),
+            (22, "users"),
+        ];
+        for (offset, w) in want {
+            assert_eq!(&b.text()[b.word_range_at(offset)], w, "offset {offset}");
+        }
+    }
+
+    /// The rounding rule: a click that lands on the seam prefers the word
+    /// over the punctuation beside it, because the glyph the user aimed at
+    /// is the word.
+    #[test]
+    fn a_seam_prefers_the_word_over_the_punctuation() {
+        let b = MultilineBuffer::from_text("a.b");
+        assert_eq!(&b.text()[b.word_range_at(0)], "a");
+        assert_eq!(&b.text()[b.word_range_at(1)], "a");
+        assert_eq!(&b.text()[b.word_range_at(2)], "b");
+        assert_eq!(&b.text()[b.word_range_at(3)], "b");
+    }
+
+    /// A run of punctuation with no word to prefer is still one selection —
+    /// the same `classify` the Ctrl+Arrow motions use, so the two agree.
+    #[test]
+    fn a_run_of_punctuation_is_one_selection() {
+        let b = MultilineBuffer::from_text("a,,b");
+        assert_eq!(&b.text()[b.word_range_at(2)], ",,");
+    }
+
+    #[test]
+    fn an_empty_buffer_selects_nothing_rather_than_panicking() {
+        let b = MultilineBuffer::from_text("");
+        assert_eq!(b.word_range_at(0), 0..0);
+        assert_eq!(b.line_range_at(0), 0..0);
+    }
+
+    /// Multi-byte text must not be cut mid-character — these are byte
+    /// offsets and slicing with them is what the caller does next. Offset
+    /// 9 is deliberately INSIDE the two-byte „ř".
+    #[test]
+    fn a_word_of_multibyte_characters_slices_cleanly() {
+        let b = MultilineBuffer::from_text("select příjmení from x");
+        assert_eq!(&b.text()[b.word_range_at(9)], "příjmení");
+        assert_eq!(&b.text()[b.word_range_at(7)], "příjmení");
+    }
+
+    /// Triple click takes the line WITHOUT its newline, so pasting it back
+    /// does not bring a line break nobody asked for.
+    #[test]
+    fn a_triple_click_takes_the_line_but_not_the_line_break() {
+        let b = MultilineBuffer::from_text("first\nsecond\nthird");
+        assert_eq!(&b.text()[b.line_range_at(0)], "first");
+        assert_eq!(&b.text()[b.line_range_at(8)], "second");
+        assert_eq!(&b.text()[b.line_range_at(b.text().len())], "third");
+        // The newline's own offset ends the line before it.
+        assert_eq!(&b.text()[b.line_range_at(5)], "first");
+    }
+
+    #[test]
+    fn a_single_line_buffer_has_one_line_covering_everything() {
+        let b = MultilineBuffer::from_text("select 1");
+        assert_eq!(b.line_range_at(4), 0..8);
     }
 }
 

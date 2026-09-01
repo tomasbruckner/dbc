@@ -96,7 +96,10 @@ pub fn group_connections_with(
 ) -> GroupedConnections {
     let mut favourites: Vec<ConnectionConfig> =
         conns.iter().filter(|c| c.favourite).cloned().collect();
-    favourites.sort_by(|a, b| a.name.cmp(&b.name));
+    // `crate::collate`, not `cmp`: `str`'s own ordering is by UTF-8 byte,
+    // which reads as unsorted to anyone looking at the sidebar. See that
+    // module for what it does and does not promise.
+    favourites.sort_by(|a, b| crate::collate::cmp_names(&a.name, &b.name));
 
     let mut by_folder: BTreeMap<Vec<String>, Vec<ConnectionConfig>> = BTreeMap::new();
     // Seed the map so an empty folder still produces a row. `visible_folders`
@@ -108,19 +111,81 @@ pub fn group_connections_with(
     for c in conns.iter().filter(|c| !c.favourite) {
         by_folder.entry(c.folder.clone()).or_default().push(c.clone());
     }
-    let folders = by_folder
+    let mut folders: Vec<FolderGroup> = by_folder
         .into_iter()
         .map(|(path, mut cs)| {
-            cs.sort_by(|a, b| a.name.cmp(&b.name));
+            cs.sort_by(|a, b| crate::collate::cmp_names(&a.name, &b.name));
             FolderGroup { path, connections: cs }
         })
         .collect();
+    // The `BTreeMap` above ordered the folders themselves by byte too, so
+    // the folder ROWS needed the same treatment as the rows inside them.
+    // `cmp_paths` keeps a parent ahead of its own children, which the
+    // sidebar relies on to indent by depth.
+    folders.sort_by(|a, b| crate::collate::cmp_paths(&a.path, &b.path));
     GroupedConnections { favourites, folders }
 }
 
 #[cfg(test)]
 mod grouping_tests {
     use super::*;
+
+    /// The user's own „dw" folder — „connection ve slozce by se meli radit
+    /// abecedne" (2026-09-01). It WAS sorted, by `str::cmp`, which puts
+    /// every capital ahead of every lower-case letter and so reads as no
+    /// order at all.
+    #[test]
+    fn connections_in_a_folder_read_alphabetically() {
+        let conns = [
+            conn("1", "produkce", &["dw"], false),
+            conn("2", "PG-dev", &["dw"], false),
+            conn("3", "demo", &["dw"], false),
+            conn("4", "DI prod", &["dw"], false),
+            conn("5", "PG-prod", &["dw"], false),
+        ];
+        let g = group_connections(&conns);
+        let names: Vec<&str> =
+            g.folders[0].connections.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["demo", "DI prod", "PG-dev", "PG-prod", "produkce"]);
+    }
+
+    /// Favourites are their own list and were sorted the same wrong way.
+    #[test]
+    fn favourites_read_alphabetically_too() {
+        let conns = [
+            conn("1", "zeta", &["x"], true),
+            conn("2", "Alfa", &["x"], true),
+            conn("3", "beta", &["x"], true),
+        ];
+        let g = group_connections(&conns);
+        let names: Vec<&str> = g.favourites.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Alfa", "beta", "zeta"]);
+    }
+
+    /// And so were the folder rows themselves, which came out of a
+    /// `BTreeMap` keyed by the raw path. A parent must still precede its
+    /// own children — the sidebar indents by depth and would draw a child
+    /// above its parent otherwise.
+    #[test]
+    fn folder_rows_read_alphabetically_and_keep_parents_first() {
+        let conns = [
+            conn("1", "a", &["zeta"], false),
+            conn("2", "b", &["Alfa"], false),
+            conn("3", "c", &["zeta", "uvnitr"], false),
+            conn("4", "d", &["beta"], false),
+        ];
+        let g = group_connections(&conns);
+        let paths: Vec<Vec<String>> = g.folders.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                vec!["Alfa".to_string()],
+                vec!["beta".to_string()],
+                vec!["zeta".to_string()],
+                vec!["zeta".to_string(), "uvnitr".to_string()],
+            ]
+        );
+    }
 
     fn conn(id: &str, name: &str, folder: &[&str], favourite: bool) -> ConnectionConfig {
         ConnectionConfig {
@@ -528,6 +593,23 @@ impl TextField {
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
+        // Double click takes the WHOLE value here, where an editor would
+        // take a word (user request, 2026-09-01). It is not an
+        // inconsistency: these fields hold one value each — a host, a port,
+        // a database name — and what somebody double-clicking „Databáze"
+        // wants is to type over it. `sql_input`, which holds a document
+        // rather than a value, keeps the editor rule.
+        //
+        // `is_selecting` stays FALSE afterwards: with it set, the mouse
+        // moving a pixel before the button comes up collapses the fresh
+        // selection back to a caret, which is exactly the wobble a double
+        // click produces.
+        if event.click_count >= 2 {
+            self.is_selecting = false;
+            self.buffer.select_all();
+            cx.notify();
+            return;
+        }
         self.is_selecting = true;
         let offset = self.offset_for_position(event.position);
         self.seek(offset, event.modifiers.shift);
@@ -989,12 +1071,30 @@ pub struct ConnectionDialogUi {
     pub ssh_enabled: bool,
     pub mssql_encrypt: bool,
     pub mssql_trust_cert: bool,
-    pub test_result: Option<Result<String, String>>,
+    pub test_result: Option<TestOutcome>,
     /// `true` while a Test-button connect dispatched via
     /// `QueryRunner::test_connect` is in flight (Task 8 review issue #1) —
-    /// drives the "testuji…" status line and makes `on_test_clicked` a
-    /// no-op re-click guard until the result arrives.
+    /// drives the "testuji…" status line, dims the Test button, and reveals
+    /// „Zrušit test" beside it.
     pub testing: bool,
+}
+
+/// How a Test ended.
+///
+/// It was `Result<String, String>`, and giving up on a test had no way to
+/// spell itself in that type: a cancel is not a failure (the server never
+/// said no — nobody waited long enough to ask) and rendering it as one
+/// paints „✗" in the danger colour over something the user did on purpose.
+/// The third variant is the whole reason this is an enum.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TestOutcome {
+    /// The server answered and let us in.
+    Ok(String),
+    /// The server answered, or could not be reached.
+    Failed(String),
+    /// The user stopped waiting. Carries no text: the reason is „you
+    /// clicked the button", which the UI does not need to be told.
+    Cancelled,
 }
 
 impl ConnectionDialogUi {
@@ -2578,6 +2678,11 @@ impl AppView {
         // before it can be abandoned. See `cancel_active_backup_if_running`'s
         // doc comment (main.rs) for the full teardown-path accounting.
         self.cancel_active_backup_if_running();
+        // Same backstop, for the Test button: closing the dialog is the
+        // most emphatic way of saying you are no longer interested in the
+        // answer. Without this the abort handle would outlive the dialog
+        // that owned it and keep a dead attempt alive until its timeout.
+        self.abandon_connection_test();
         // T5 review MINOR-2: the pick refusal belongs to ONE Settings
         // session — it is rendered only inside that panel, so leaving it
         // set would resurrect a stale explanation the next time Settings
@@ -2858,6 +2963,39 @@ impl AppView {
         cx.notify();
     }
 
+    /// Stop waiting for the Test that is in flight, if any.
+    ///
+    /// Two steps, and the order is not interchangeable: bump the generation
+    /// FIRST so the in-flight task's own update is already disqualified,
+    /// then drop the task. Aborting first would leave a window in which the
+    /// abort's `RecvError` is delivered while the generation still matches,
+    /// and the dialog would flash a failure for a cancel.
+    ///
+    /// See `QueryRunner::test_connect` for what the abort does and does not
+    /// reach: the wait ends now, the driver's own attempt runs itself out
+    /// in the background and its answer is discarded. Nothing is left open
+    /// and nothing is written — this path only ever opens and closes.
+    fn abandon_connection_test(&mut self) {
+        self.test_generation = self.test_generation.wrapping_add(1);
+        if let Some(abort) = self.test_abort.take() {
+            abort.abort();
+        }
+    }
+
+    /// „Zrušit test" — the button beside a running Test.
+    ///
+    /// Separate from the dialog's own „Zrušit", which throws the whole
+    /// dialog away: a user who mistyped a host wants the 30-second wait to
+    /// end and the form to stay, with everything they typed still in it.
+    fn cancel_test(&mut self, cx: &mut Context<Self>) {
+        self.abandon_connection_test();
+        if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
+            ui.testing = false;
+            ui.test_result = Some(TestOutcome::Cancelled);
+        }
+        cx.notify();
+    }
+
     /// Dispatches the Test button's connect off the UI thread via
     /// `QueryRunner::test_connect` (Task 8 review issue #1: this used to
     /// call `pending_connect` synchronously, freezing the whole window for
@@ -2916,22 +3054,40 @@ impl AppView {
         match test_connect_spec(cfg, secret) {
             Err(msg) => {
                 if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
-                    ui.test_result = Some(Err(msg));
+                    ui.test_result = Some(TestOutcome::Failed(msg));
                 }
                 cx.notify();
             }
             Ok(spec) => {
+                // Stamp the dispatch BEFORE it starts, the same
+                // last-dispatched-wins shape as `switch_generation`. The
+                // `editing_id` guard below is not enough on its own once
+                // cancelling exists: cancel, then test again, and both
+                // dispatches carry the same `editing_id` on the same open
+                // dialog — the first one's late answer would land on the
+                // second one's line.
+                self.test_generation = self.test_generation.wrapping_add(1);
+                let my_generation = self.test_generation;
                 if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
                     ui.testing = true;
                     ui.test_result = None;
                 }
                 cx.notify();
 
-                let rx = self.runner.test_connect(spec);
+                let (rx, abort) = self.runner.test_connect(spec);
+                self.test_abort = Some(abort);
                 let engine = data.engine;
                 cx.spawn(async move |this, cx| {
                     let result = rx.await;
                     let _ = this.update(cx, |view, cx| {
+                        // Superseded or given up on — say nothing at all.
+                        // In particular this is the arm a cancelled test
+                        // lands in, and it must not overwrite the
+                        // „test zrušen" that `cancel_test` already wrote.
+                        if view.test_generation != my_generation {
+                            return;
+                        }
+                        view.test_abort = None;
                         // Guard: the dialog may have been closed/reopened
                         // (a different `editing_id`, or no dialog at all)
                         // while this was in flight — don't resurrect a
@@ -2940,15 +3096,23 @@ impl AppView {
                             if ui.editing_id == editing_id {
                                 ui.testing = false;
                                 ui.test_result = Some(match result {
-                                    Ok(Ok(())) => Ok(format!("Připojeno ({engine_lbl})")),
+                                    Ok(Ok(())) => {
+                                        TestOutcome::Ok(format!("Připojeno ({engine_lbl})"))
+                                    }
                                     // pwchange (spec §1): Test NIKDY neotvírá
                                     // druhý modal (single-modal invariant) —
                                     // detekovaná vynucená/expirovaná změna
                                     // hesla jen obohatí text o nápovědu.
-                                    Ok(Err(e)) => {
-                                        Err(crate::pwchange::enrich_test_error(engine, &e))
-                                    }
-                                    Err(_) => Err("connect zrušen".to_string()),
+                                    Ok(Err(e)) => TestOutcome::Failed(
+                                        crate::pwchange::enrich_test_error(engine, &e),
+                                    ),
+                                    // The sender vanished without a verdict
+                                    // and the generation still matches, so
+                                    // this is not our cancel — the runtime
+                                    // dropped the task.
+                                    Err(_) => TestOutcome::Failed(
+                                        "connect zrušen".to_string(),
+                                    ),
                                 });
                             }
                         }
@@ -3965,22 +4129,26 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
         Some(("testuji…".to_string(), None))
     } else {
         ui.test_result.clone().map(|r| match r {
-            Ok(msg) => (format!("✓ {msg}"), Some(true)),
-            Err(e) => (format!("✗ {e}"), Some(false)),
+            TestOutcome::Ok(msg) => (format!("✓ {msg}"), Some(true)),
+            TestOutcome::Failed(e) => (format!("✗ {e}"), Some(false)),
+            // Muted and unmarked, like „testuji…": no ✓ and above all no
+            // ✗, because nothing failed — the user simply stopped asking.
+            TestOutcome::Cancelled => ("test zrušen".to_string(), None),
         })
     };
     let testing = ui.testing;
+    // Only a FAILURE is worth a copy button. A success is six words the
+    // user is about to dismiss, and „test zrušen" is their own doing.
+    let test_error_text = match (&ui.test_result, ui.testing) {
+        (Some(TestOutcome::Failed(e)), false) => Some(e.clone()),
+        _ => None,
+    };
 
     let mut panel: Div = ui::panel(480., *cx.theme())
         .child(div().text_size(px(16.)).child(title))
         .child(ui::field_row("Název", ui.name.clone(), *cx.theme()))
         .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(130.)).text_color(cx.theme().text_muted).child("Engine"))
+            ui::labelled_row("Engine", ui::FIELD_LABEL_W, *cx.theme())
                 // Segmented row, not a dropdown: with four options a popup
                 // costs an extra click and an overlay to dismiss, and hides
                 // the very thing the user complained was hidden.
@@ -4027,10 +4195,7 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
         .child(ui::field_row("Timeout (s)", ui.timeout_secs.clone(), *cx.theme()))
         .child(ui::field_row("Auto-limit řádků", ui.auto_limit.clone(), *cx.theme()))
         .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap_4()
+            ui::checkbox_row()
                 .child(ui::checkbox("chk-read-only", "Pouze pro čtení", ui.read_only).on_click(cx.listener(|v, _, _, cx| v.toggle_read_only(cx))))
                 .child(ui::checkbox("chk-favourite", "Oblíbené", ui.favourite).on_click(cx.listener(|v, _, _, cx| v.toggle_favourite(cx)))),
         )
@@ -4050,10 +4215,7 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
     if ui.engine == Engine::Mssql {
         panel = panel
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_4()
+                ui::checkbox_row()
                     .child(
                         ui::checkbox("chk-mssql-encrypt", "Šifrovat připojení (Encrypt)", ui.mssql_encrypt)
                             .on_click(cx.listener(|v, _, _, cx| v.toggle_mssql_encrypt(cx))),
@@ -4083,17 +4245,42 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
             None => cx.theme().text_muted,
         };
         panel = panel.child(div().text_color(color).child(text));
+        // „ta error hlaska by mela jit oznacit a zkopirovat" (user,
+        // 2026-09-01). GPUI has no text selection for a plain element and
+        // giving one to a three-line error message would mean a text view
+        // inside a modal; a button hands over the same thing the selecting
+        // was FOR. What it copies is the driver's own words — without the
+        // „✗ " this dialog prepended, because that glyph is decoration and
+        // would only get in the way in a bug report or a search box.
+        if let Some(raw) = test_error_text {
+            panel = panel.child(
+                div().flex().flex_row().justify_end().child(
+                    ui::row_button("dlg-test-copy", "Kopírovat chybu", *cx.theme()).on_click(
+                        cx.listener(move |_, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(raw.clone()));
+                        }),
+                    ),
+                ),
+            );
+        }
     }
 
     let test_label = if testing { "Testuji…" } else { "Test" };
+    let mut buttons = div().flex().flex_row().gap_2().justify_end().mt_2().child(
+        // Dimmed rather than replaced by „Zrušit test": a button that turns
+        // into its own opposite under a cursor already resting on it means
+        // a double-click starts a test and immediately kills it.
+        ui::button_state("dlg-test", test_label, !testing, *cx.theme())
+            .on_click(cx.listener(|v, _, window, cx| v.on_test_clicked(window, cx))),
+    );
+    if testing {
+        buttons = buttons.child(
+            ui::button("dlg-test-cancel", "Zrušit test", *cx.theme())
+                .on_click(cx.listener(|v, _, _, cx| v.cancel_test(cx))),
+        );
+    }
     panel = panel.child(
-        div()
-            .flex()
-            .flex_row()
-            .gap_2()
-            .justify_end()
-            .mt_2()
-            .child(ui::button("dlg-test", test_label, *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_test_clicked(window, cx))))
+        buttons
             .child(ui::button("dlg-save", "Uložit", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_save_clicked(window, cx))))
             .child(ui::button("dlg-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx)))),
     );
@@ -4495,12 +4682,7 @@ fn render_query_params_panel(
         let is_null = null_flags.get(i).copied().unwrap_or(false);
         let mark = if is_null { "☑" } else { "☐" };
         panel = panel.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(110.)).text_color(cx.theme().text_muted).child(format!(":{name}")))
+            ui::labelled_row(format!(":{name}"), 110., *cx.theme())
                 .child(div().flex_1().child(input))
                 .child(
                     div()
@@ -6253,12 +6435,7 @@ fn render_csv_import_panel(
             .map(|c| c.name.clone())
             .unwrap_or_else(|| "(přeskočit)".to_string());
         mapping_rows = mapping_rows.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(160.)).text_color(cx.theme().text_muted).child(header.clone()))
+            ui::labelled_row(header.clone(), 160., *cx.theme())
                 .child(
                     div()
                         .id(("csv-target-cycle", ix))
