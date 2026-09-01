@@ -177,6 +177,11 @@ pub fn menu_for(row: &SidebarRow, ctx: &MenuCtx) -> Vec<MenuEntry> {
 fn folder_menu(path: &[String]) -> Vec<MenuEntry> {
     let p = path.to_vec();
     vec![
+        // FIRST, above the folder operations: a folder exists to hold
+        // connections, so „make one here" is what a right click on it is
+        // most often for. The folder is carried, so the dialog opens with
+        // this path already in its „Slozka" field.
+        item("Nové připojení zde…", TreeEvent::ConnectionCreate { folder: p.clone() }),
         item("Nová podsložka…", TreeEvent::FolderCreate { parent: p.clone() }),
         MenuEntry::Separator,
         item("Přejmenovat…", TreeEvent::FolderRename { path: p.clone() }),
@@ -837,6 +842,35 @@ mod tests {
         assert!(l.iter().any(|x| x.starts_with("Nová podsložka")), "{l:?}");
         assert!(l.iter().any(|x| x.starts_with("Přejmenovat")), "{l:?}");
         assert!(l.iter().any(|x| x.starts_with("Smazat složku")), "{l:?}");
+    }
+
+    /// A folder is where connections live, so making one is what a right
+    /// click there is most often for — and it must be the FIRST row, not
+    /// buried under the folder-management ones (user report, 2026-09-01).
+    /// The folder travels with the event so the dialog opens with it
+    /// already filled in.
+    #[test]
+    fn a_folder_offers_making_a_connection_in_it_first() {
+        let sn = snap();
+        let row = SidebarRow::Folder { path: vec!["work".into(), "dw".into()] };
+        let m = menu_for(&row, &ctx(&sn, false));
+        assert!(labels(&m)[0].starts_with("Nové připojení"), "{:?}", labels(&m));
+        let MenuEntry::Item(first) = &m[0] else { panic!("first entry is a separator") };
+        assert_eq!(
+            first.event,
+            TreeEvent::ConnectionCreate { folder: vec!["work".into(), "dw".into()] },
+            "the folder must travel with the event or the dialog opens at the root"
+        );
+    }
+
+    /// Same reason `a_read_only_connection_can_still_organise_its_folders`
+    /// exists: saving a connection writes `config.toml`, never the server.
+    #[test]
+    fn a_read_only_connection_can_still_make_a_connection_in_a_folder() {
+        let sn = snap();
+        let row = SidebarRow::Folder { path: vec!["work".into()] };
+        let l = labels(&menu_for(&row, &ctx(&sn, true)));
+        assert!(l.iter().any(|x| x.starts_with("Nové připojení")), "{l:?}");
     }
 
     /// Folders hold saved connections, not server objects — the read-only

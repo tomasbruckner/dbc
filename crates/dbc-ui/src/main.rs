@@ -11973,6 +11973,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             TreeEvent::BackupFor { .. }
             | TreeEvent::RestoreFor { .. }
             | TreeEvent::EditConnection { .. }
+            // Opens the same dialog `EditConnection` does, so it needs a
+            // `Window` for the same reason and parks the same way.
+            | TreeEvent::ConnectionCreate { .. }
             | TreeEvent::DropObject { .. }
             | TreeEvent::TruncateTable { .. } => {
                 self.pending_menu_action = Some(event.clone());
@@ -12005,6 +12008,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         match event {
             TreeEvent::BackupFor { conn_id, .. } => self.open_backup_dialog(conn_id, window, cx),
             TreeEvent::RestoreFor { conn_id, .. } => self.open_restore_dialog(conn_id, window, cx),
+            TreeEvent::ConnectionCreate { folder } => {
+                self.open_connection_dialog_in_folder(folder, window, cx)
+            }
             TreeEvent::EditConnection { conn_id } => {
                 let cfg = self.config.connections.iter().find(|c| c.id == conn_id).cloned();
                 match cfg {
@@ -13774,19 +13780,21 @@ impl Render for AppView {
         // already closed again before this frame, just clear the flag.
         if self.modal_needs_focus {
             self.modal_needs_focus = false;
-            if let Some(connections_ui::ModalState::MasterPasswordPrompt { input, .. }) = &self.modal
+            // ONE decision, taken by `connections_ui::modal_first_field`
+            // over an exhaustive match, instead of the hand-maintained
+            // if-else chain that used to live here.
+            //
+            // That chain named MasterPasswordPrompt and ScriptName and let
+            // everything else fall through to the container — so the
+            // connection dialog, the folder-name dialog, the param dialog
+            // and the server-password dialog all opened with NOTHING
+            // focused. Typing went nowhere and Ctrl+A had nothing to
+            // select, which is what „ctrl + a nefunguje v inputech na
+            // vytvoreni spojeni" (2026-09-01) actually was: the field was
+            // never focused, the input component was fine all along.
+            if let Some(focus) =
+                self.modal.as_ref().and_then(|m| connections_ui::modal_first_field(m, cx))
             {
-                // Sidebar rework: the tree's expand/switch vault gate opens
-                // this input-owning prompt from a cx-only subscribe callback
-                // — focus its field, same end state as the window-having
-                // openers (dropdown/test).
-                let focus = input.focus_handle(cx);
-                window.focus(&focus, cx);
-            } else if let Some(connections_ui::ModalState::ScriptName { field, .. }) = &self.modal {
-                // T9: an input-owning dialog opened from a cx-only tree
-                // subscription — focus its name field, same end state as
-                // the window-having openers.
-                let focus = field.focus_handle(cx);
                 window.focus(&focus, cx);
             } else if matches!(
                 self.modal,
@@ -16357,6 +16365,120 @@ mod sidebar_width_tests {
     #[test]
     fn dragging_far_left_stops_at_the_minimum() {
         assert_eq!(clamp_sidebar_width(SIDEBAR_DEFAULT_W - 9999.0), SIDEBAR_MIN_W);
+    }
+}
+
+#[cfg(test)]
+mod modal_focus_audit {
+    use super::editor_clobber_audit::sources;
+
+    /// A modal that owns a text field must focus it when it opens.
+    ///
+    /// This is the rail under the 2026-09-01 bug. The connection dialog,
+    /// the folder-name dialog, the parameter dialog and the server-password
+    /// dialog all opened with focus on the shared overlay CONTAINER: typing
+    /// went nowhere, Ctrl+A had nothing to select, and the input component
+    /// took the blame for a missing `window.focus`. The old code was an
+    /// if-else chain that named two modals, so every input-owning modal
+    /// added afterwards had to remember to opt in — and none of them did.
+    ///
+    /// `connections_ui::modal_first_field` replaced the chain with an
+    /// exhaustive match, which makes a NEW variant a compile error. It does
+    /// NOT make a new variant a compile error on the side it picks: adding
+    /// `SomeDialog { input: Entity<TextField> }` to the `None` arm compiles
+    /// perfectly and reproduces the bug exactly. That is the gap this test
+    /// closes, by reading the two pieces of source and comparing them.
+    ///
+    /// The needle for „owns a field" is the TYPE, not a naming convention:
+    /// a variant whose body mentions `Entity<TextField>` has one, whatever
+    /// the field is called.
+    #[test]
+    fn every_modal_that_owns_a_text_field_focuses_one() {
+        let src = sources()
+            .into_iter()
+            .find(|(name, _)| name == "crates/dbc-ui/src/connections_ui.rs")
+            .map(|(_, src)| src)
+            .expect("connections_ui.rs must be readable");
+
+        // Assembled so this test's own source can never be the thing found.
+        let field_ty = format!("Entity<{}>", "TextField");
+
+        // 1. The variants of `ModalState`, and whether each holds a field.
+        let enum_start = src.find("pub enum ModalState {").expect("ModalState must be declared");
+        let enum_body = &src[enum_start..];
+        let enum_end = enum_start + enum_body.find("\n}\n").expect("ModalState must be closed");
+        let body = &src[enum_start..enum_end];
+
+        let mut owns_field: Vec<String> = Vec::new();
+        let mut current: Option<String> = None;
+        let mut current_has = false;
+        for line in body.lines().skip(1) {
+            let is_variant_head = line.starts_with("    ")
+                && !line.starts_with("        ")
+                && !line.trim_start().starts_with("//")
+                && line.trim_start().starts_with(|c: char| c.is_ascii_uppercase());
+            if is_variant_head {
+                if let Some(name) = current.take() {
+                    if current_has {
+                        owns_field.push(name);
+                    }
+                }
+                let name: String =
+                    line.trim_start().chars().take_while(|c| c.is_alphanumeric()).collect();
+                current_has = line.contains(&field_ty);
+                current = Some(name);
+            } else if line.contains(&field_ty) {
+                current_has = true;
+            }
+        }
+        if let Some(name) = current.take() {
+            if current_has {
+                owns_field.push(name);
+            }
+        }
+
+        // `ConnectionDialog(ConnectionDialogUi)` is a tuple variant whose
+        // PAYLOAD holds the fields, so the scan above cannot see them. It is
+        // named here rather than resolved, and the assertion below would
+        // fail loudly if it were ever dropped from the enum.
+        assert!(
+            body.contains("ConnectionDialog(ConnectionDialogUi)"),
+            "ConnectionDialog changed shape — this audit's one hand-named case is stale"
+        );
+        owns_field.push("ConnectionDialog".to_string());
+        assert!(
+            owns_field.len() >= 5,
+            "found only {owns_field:?} — the variant scan stopped working, which would make \
+             this whole audit vacuous"
+        );
+
+        // 2. The variants `modal_first_field` actually returns a handle for.
+        let fn_start = src
+            .find("pub(crate) fn modal_first_field")
+            .expect("modal_first_field must exist");
+        let fn_body = &src[fn_start..];
+        let fn_end = fn_start + fn_body.find("\n}\n").expect("modal_first_field must be closed");
+        let decision = &src[fn_start..fn_end];
+        // Per-LINE, not by splitting on the `=> None` text: the `None` arm
+        // lists its variants one per line ABOVE that text, so a split put
+        // them on the focusing side and the audit passed while sabotaged.
+        // Verified by moving `FolderName` into the `None` arm and watching
+        // it stay green — which is why the check is now „the arm mentioning
+        // this variant calls `focus_handle`", the thing that is actually
+        // true of every focusing arm and of no other.
+        let focus_call = format!("focus_{}(", "handle");
+
+        for variant in &owns_field {
+            let arm = format!("ModalState::{variant}");
+            assert!(
+                decision
+                    .lines()
+                    .any(|l| l.contains(&arm) && l.contains(&focus_call)),
+                "`{variant}` owns a text field but `modal_first_field` does not focus one — \
+                 it opens with nothing focused, so typing goes nowhere and Ctrl+A has \
+                 nothing to select (the 2026-09-01 bug, exactly)"
+            );
+        }
     }
 }
 

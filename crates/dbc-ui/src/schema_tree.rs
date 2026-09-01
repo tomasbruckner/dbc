@@ -211,6 +211,12 @@ pub enum TreeEvent {
     /// `AppConfig::folders` for the ones that are empty; see the `folders`
     /// module for what each of these does to that pair.
     FolderCreate { parent: Vec<String> },
+    /// „Nove pripojeni zde…" on a folder. A folder is where connections
+    /// LIVE, so making one from its own menu is the first thing a right
+    /// click there should offer (user report, 2026-09-01: „kdyz kliknu
+    /// pravym na slozku, tak bych tam cekal, ze tam bude vytvoreni
+    /// connection").
+    ConnectionCreate { folder: Vec<String> },
     FolderRename { path: Vec<String> },
     FolderDelete { path: Vec<String> },
     /// Emitted by a drag from a connection row onto a folder row.
@@ -2983,6 +2989,7 @@ pub(crate) fn event_target(ev: &TreeEvent) -> String {
         | TreeEvent::ConnectionDelete { conn_id } => conn_id.clone(),
         TreeEvent::LoadSchema { conn_id, db } => format!("{conn_id}/{db}"),
         TreeEvent::FolderCreate { parent } => parent.join("/"),
+        TreeEvent::ConnectionCreate { folder } => folder.join("/"),
         TreeEvent::FolderRename { path } | TreeEvent::FolderDelete { path } => path.join("/"),
         TreeEvent::MoveConnectionToFolder { conn_id, folder } => {
             format!("{conn_id} → {}", folder.join("/"))

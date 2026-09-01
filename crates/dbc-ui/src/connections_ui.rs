@@ -248,6 +248,38 @@ mod clipboard_guard_tests {
         assert!(!blocks_clipboard_write(false));
     }
 
+    /// Every server engine gets a database you can actually open; the file
+    /// engines get nothing, because that field is a path there.
+    #[test]
+    fn every_server_engine_has_a_default_database_and_no_file_engine_does() {
+        assert_eq!(default_database_for(Engine::Postgres), "postgres");
+        assert_eq!(default_database_for(Engine::Mssql), "master");
+        for e in ALL_ENGINES {
+            let has = !default_database_for(e).is_empty();
+            assert_eq!(
+                has,
+                !engine_is_file_based(e),
+                "{e:?}: a default database and being file-based must stay opposites"
+            );
+        }
+    }
+
+    /// The whole point of the guard: switching engines may replace what the
+    /// APP put in the field and must never replace what the USER typed.
+    #[test]
+    fn switching_engines_overwrites_only_the_apps_own_defaults() {
+        assert!(may_replace_database(""), "an empty field is free to fill");
+        assert!(may_replace_database("   "), "so is a whitespace-only one");
+        assert!(may_replace_database("postgres"), "Postgres's own default");
+        assert!(may_replace_database("master"), "SQL Server's own default");
+        for typed in ["prodej", "postgres_prod", "Master", "master2", "C:/data/x.db"] {
+            assert!(
+                !may_replace_database(typed),
+                "{typed:?} is the user's text and must survive an engine switch"
+            );
+        }
+    }
+
     /// The bug behind [`FIELD_SELECTION`] was invisibility, not absence:
     /// Ctrl+A DID select, the highlight simply could not be seen on the
     /// field's white background. A translucent or near-white value would
@@ -2545,6 +2577,11 @@ impl AppView {
             )
         } else {
             let defaults = MssqlOptions::default();
+            // A new dialog opens on Postgres, so it opens on Postgres's
+            // default database. `set_engine` keeps this in step when the
+            // engine is switched — and stops the moment the user types
+            // something of their own (`may_replace_database`).
+            database.update(cx, |f, cx| f.set_text(default_database_for(Engine::Postgres), cx));
             (None, Engine::Postgres, false, false, false, defaults.encrypt, defaults.trust_server_certificate)
         };
 
@@ -2578,6 +2615,28 @@ impl AppView {
         self.dropdown_open = false;
         window.focus(&name_focus, cx);
         cx.notify();
+    }
+
+    /// „Nove pripojeni zde…" from a folder's context menu.
+    ///
+    /// Deliberately a thin wrapper over [`Self::open_connection_dialog`]
+    /// rather than a parameter on it: there is exactly one dialog, one set
+    /// of defaults and one focus rule, and the folder is the only thing
+    /// this entry point knows that the others do not. If the opener
+    /// refused (single-modal invariant), nothing is set — the check is on
+    /// what actually opened, not on what we asked for.
+    pub(crate) fn open_connection_dialog_in_folder(
+        &mut self,
+        folder: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_connection_dialog(None, window, cx);
+        if let Some(ModalState::ConnectionDialog(ui)) = &self.modal {
+            let field = ui.folder.clone();
+            field.update(cx, |f, cx| f.set_text(&folder.join("/"), cx));
+            cx.notify();
+        }
     }
 
     pub(crate) fn close_modal(&mut self, cx: &mut Context<Self>) {
@@ -2823,6 +2882,15 @@ impl AppView {
     fn set_engine(&mut self, engine: Engine, cx: &mut Context<Self>) {
         if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
             ui.engine = engine;
+            // Carry the new engine's default database across, but only over
+            // text the app itself put there (`may_replace_database`) — a
+            // value the user typed survives every engine click.
+            let field = ui.database.clone();
+            let current = field.read(cx).text();
+            if may_replace_database(&current) {
+                let default = default_database_for(engine).to_string();
+                field.update(cx, |f, cx| f.set_text(&default, cx));
+            }
         }
         cx.notify();
     }
@@ -3462,6 +3530,42 @@ impl AppView {
 // 5. Free helper functions.
 // ---------------------------------------------------------------------
 
+/// The database a fresh connection to this engine should start with.
+///
+/// Every server engine has one database you can open before you know
+/// anything else about the server — `postgres` on PostgreSQL, `master` on
+/// SQL Server. Typing it is the first thing every new connection needed
+/// and the first thing people forget, and „database does not exist" is a
+/// poor first impression of a server that is perfectly fine.
+///
+/// Empty for the file engines: there the field holds a PATH, and no
+/// filename we could invent would be more right than blank (the dialog
+/// says so in its own hint row — see `engine_is_file_based`).
+pub(crate) fn default_database_for(e: Engine) -> &'static str {
+    match e {
+        Engine::Postgres => "postgres",
+        Engine::Mssql => "master",
+        Engine::Sqlite | Engine::Duckdb => "",
+    }
+}
+
+/// May switching the engine overwrite what is in the database field?
+///
+/// Only when it is empty, or still holds ANOTHER engine's default — that
+/// is, only when the text there is something the app put in. Anything the
+/// user typed is theirs, and replacing it while they click along the
+/// engine buttons would be the worst kind of helpful.
+pub(crate) fn may_replace_database(current: &str) -> bool {
+    let t = current.trim();
+    if t.is_empty() {
+        return true;
+    }
+    ALL_ENGINES.iter().any(|&e| {
+        let d = default_database_for(e);
+        !d.is_empty() && d == t
+    })
+}
+
 pub(crate) fn engine_label(e: Engine) -> &'static str {
     match e {
         Engine::Postgres => "pg",
@@ -3812,13 +3916,36 @@ mod test_vault_prompt_tests {
     }
 }
 
+/// Width of the label column in every dialog `field_row` builds.
+///
+/// It was 130 px, and „Databaze (vychozi)" did not fit: the text wrapped
+/// and left the closing bracket alone on a second line, which is what the
+/// user photographed on 2026-09-01. Sized here for the LONGEST label the
+/// app passes — „ODBC driver (volitelne)", 23 characters — not for the one
+/// that happened to be reported.
+///
+/// The two modifiers beside it matter as much as the number.
+/// `whitespace_nowrap` is the actual guarantee: a label too long for the
+/// column now overflows by a few pixels instead of folding, so the failure
+/// mode of guessing this width wrong is cosmetic rather than the broken
+/// line above. `flex_none` stops a long VALUE from squeezing the column
+/// back down and reintroducing the wrap from the other side.
+pub(crate) const FIELD_LABEL_W: f32 = 176.;
+
 fn field_row(label: &str, field: Entity<TextField>, theme: Theme) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap_2()
-        .child(div().w(px(130.)).text_color(theme.text_muted).child(label.to_string()))
+        .child(
+            div()
+                .w(px(FIELD_LABEL_W))
+                .flex_none()
+                .whitespace_nowrap()
+                .text_color(theme.text_muted)
+                .child(label.to_string()),
+        )
         .child(div().flex_1().child(field))
 }
 
@@ -5465,6 +5592,64 @@ pub(crate) fn modal_blocks_context_switch(modal: Option<&ModalState>) -> bool {
         | Some(ModalState::ScriptName { .. })
         | Some(ModalState::ScriptDeleteConfirm { .. })
         | Some(ModalState::WorkspaceMissing { .. }) => true,
+    }
+}
+
+/// The field a modal should focus the moment it opens, if it has one.
+///
+/// **The bug this exists for** (user report, 2026-09-01: „ctrl + a nefunguje
+/// v inputech na vytvoreni spojeni"): opening the connection dialog left
+/// focus on the shared overlay CONTAINER, not on any field. Typing went
+/// nowhere and Ctrl+A had nothing to select — so the input component looked
+/// broken when it was fine; what was missing was focus. `AppView::render`'s
+/// deferred-focus block used to name three modals by hand and fall through
+/// to the container for everything else, which meant every input-owning
+/// modal added since had to remember to opt in, and most did not.
+///
+/// So this is a match with EVERY variant spelled out (the convention
+/// [`modal_confirm_kind`] and [`modal_is_blocking`] already use): a new
+/// `ModalState` is a compile error here and has to say which side it is on.
+/// `settings_modal_focus_audit` is the second half — it re-reads this
+/// source and fails if a variant that OWNS a `TextField` answers `None`.
+///
+/// `None` means „focus the overlay container", which is right for a
+/// confirm dialog: there is nothing to type, and the container is what
+/// holds keyboard focus away from the SQL editor underneath.
+pub(crate) fn modal_first_field(modal: &ModalState, cx: &App) -> Option<FocusHandle> {
+    match modal {
+        // The first thing you fill in, in every one of these.
+        ModalState::ConnectionDialog(ui) => Some(ui.name.focus_handle(cx)),
+        ModalState::MasterPasswordPrompt { input, .. } => Some(input.focus_handle(cx)),
+        ModalState::CreateMasterPassword { input1, .. } => Some(input1.focus_handle(cx)),
+        ModalState::ChangeServerPassword { new1, .. } => Some(new1.focus_handle(cx)),
+        ModalState::ScriptName { field, .. } => Some(field.focus_handle(cx)),
+        ModalState::FolderName { field, .. } => Some(field.focus_handle(cx)),
+        // Parallel vectors, and `names` is never empty when this opens —
+        // but a render fn that unwraps on that is one refactor from a
+        // panic, so an empty list simply focuses the container.
+        ModalState::QueryParams { inputs, .. } => inputs.first().map(|i| i.focus_handle(cx)),
+
+        // §W4 is the one exception that is NOT „no input": its panel is a
+        // tab group with three buttons, and `AppView::render` focuses
+        // `workspace_panel_focus` for it so Tab descends into them. That
+        // handle lives on `AppView`, not in the modal, so it cannot be
+        // answered from here.
+        ModalState::WorkspaceMissing { .. }
+        // No text input at all: confirms, pickers built from dropdowns and
+        // checkboxes, and progress dialogs. The container is correct.
+        | ModalState::Settings
+        | ModalState::KillConfirm { .. }
+        | ModalState::AnalyzeWriteConfirm { .. }
+        | ModalState::CompareDialog { .. }
+        | ModalState::BackupRestore(_)
+        | ModalState::ScriptRun { .. }
+        | ModalState::CsvImport { .. }
+        | ModalState::ChartPicker { .. }
+        | ModalState::WorkspaceConfirm { .. }
+        | ModalState::FolderDeleteConfirm { .. }
+        | ModalState::ConnectionDeleteConfirm { .. }
+        | ModalState::ScriptDeleteConfirm { .. }
+        | ModalState::SettingsImportConfirm { .. } => None,
     }
 }
 
