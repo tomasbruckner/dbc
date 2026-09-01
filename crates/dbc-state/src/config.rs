@@ -187,6 +187,48 @@ pub struct AppConfig {
     /// per connection.
     #[serde(default)]
     pub tree_grouping: TreeGrouping,
+    /// What the sidebar does NOT show, per connection id. See
+    /// [`HiddenNodes`] for why it stores what is hidden rather than what is
+    /// shown, and why it sits here rather than on [`ConnectionConfig`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub hidden: std::collections::BTreeMap<String, HiddenNodes>,
+}
+
+/// The databases and schemas a connection keeps OUT of the sidebar (user
+/// request, 2026-09-01: „u connection bych chtel mit moznost vybrat db, co
+/// se mi zobrazuji, stejne tak pak pro schemata u jednotlivych db").
+///
+/// # Hidden, not shown
+///
+/// The obvious shape is a list of what to show, and it is the wrong one. A
+/// server gains databases — a colleague restores a dump, a deployment adds
+/// a tenant — and a „shown" list would keep every one of them invisible
+/// forever, with nothing on screen to suggest anything is missing. Storing
+/// what is hidden makes the default „everything", so the sidebar can only
+/// ever fail towards showing too much, which is a thing you can see.
+///
+/// # Why here and not on `ConnectionConfig`
+///
+/// It is per-connection, so `ConnectionConfig` is where it reads as
+/// belonging. It is also purely cosmetic — it changes no connection, no
+/// credential and no query — and `ConnectionConfig` is the type the MCP
+/// server, the CLI and the settings bundle all pass around. Keeping a view
+/// preference out of the type that means „how to reach this server" is
+/// worth the indirection of a map keyed by id.
+///
+/// An entry whose connection has been deleted is dropped by
+/// [`AppConfig::forget_hidden`]; unlike a cache, this file is the user's
+/// own settings and is not allowed to accumulate rubbish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct HiddenNodes {
+    /// Database names hidden from this connection's row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub databases: Vec<String>,
+    /// Schema names hidden, keyed by the database they live in. Keyed by
+    /// database because the same schema name means different things in two
+    /// databases — hiding `dbo` in one must not hide it everywhere.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub schemas: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// The schema tree's two shapes.
@@ -369,6 +411,70 @@ impl AppConfig {
         self.favourite_objects.contains(f)
     }
 
+    /// Is `db` hidden on this connection?
+    pub fn db_hidden(&self, conn_id: &str, db: &str) -> bool {
+        self.hidden.get(conn_id).is_some_and(|h| h.databases.iter().any(|d| d == db))
+    }
+
+    /// Is `schema` hidden in this database? `None` is the implicit schema
+    /// that SQLite and DuckDB have instead of real ones — it has no name to
+    /// hide by, and hiding it would empty the database row for no reason
+    /// anybody could undo, so it is never hidden.
+    pub fn schema_hidden(&self, conn_id: &str, db: &str, schema: Option<&str>) -> bool {
+        let Some(schema) = schema else { return false };
+        self.hidden
+            .get(conn_id)
+            .and_then(|h| h.schemas.get(db))
+            .is_some_and(|v| v.iter().any(|s| s == schema))
+    }
+
+    /// Replace the hidden-database set for one connection.
+    ///
+    /// Empties prune themselves. „Nothing hidden" and „no entry" are the
+    /// same state, and only one of them should be able to appear in
+    /// `config.toml` — otherwise unticking the last box leaves a dead
+    /// `[hidden."conn-…"]` table behind forever.
+    pub fn set_hidden_databases(&mut self, conn_id: &str, hidden: Vec<String>) {
+        let entry = self.hidden.entry(conn_id.to_string()).or_default();
+        entry.databases = hidden;
+        entry.databases.sort();
+        entry.databases.dedup();
+        self.prune_hidden(conn_id);
+    }
+
+    /// Replace the hidden-schema set for one database of one connection.
+    pub fn set_hidden_schemas(&mut self, conn_id: &str, db: &str, hidden: Vec<String>) {
+        let entry = self.hidden.entry(conn_id.to_string()).or_default();
+        if hidden.is_empty() {
+            entry.schemas.remove(db);
+        } else {
+            let mut hidden = hidden;
+            hidden.sort();
+            hidden.dedup();
+            entry.schemas.insert(db.to_string(), hidden);
+        }
+        self.prune_hidden(conn_id);
+    }
+
+    fn prune_hidden(&mut self, conn_id: &str) {
+        if self
+            .hidden
+            .get(conn_id)
+            .is_some_and(|h| h.databases.is_empty() && h.schemas.is_empty())
+        {
+            self.hidden.remove(conn_id);
+        }
+    }
+
+    /// Drop visibility settings belonging to connections that no longer
+    /// exist. Unlike a cache this is the user's own settings file, so it is
+    /// not allowed to accumulate entries nobody can see or reach.
+    pub fn forget_hidden_for_missing_connections(&mut self) {
+        let ids: std::collections::HashSet<String> =
+            self.connections.iter().map(|c| c.id.clone()).collect();
+        self.hidden.retain(|id, _| ids.contains(id));
+    }
+
     pub fn toggle_favourite(&mut self, f: FavouriteObject) -> bool {
         if let Some(pos) = self.favourite_objects.iter().position(|x| x == &f) {
             self.favourite_objects.remove(pos);
@@ -419,7 +525,95 @@ mod tests {
             history_width: Some(300),
             folders: vec![vec!["work".into()]],
             tree_grouping: TreeGrouping::Kind,
+            hidden: std::collections::BTreeMap::from([(
+                "c1".to_string(),
+                HiddenNodes {
+                    databases: vec!["tempdb".into()],
+                    schemas: std::collections::BTreeMap::from([(
+                        "postgres".to_string(),
+                        vec!["guest".to_string()],
+                    )]),
+                },
+            )]),
         }
+    }
+
+    #[test]
+    fn nothing_is_hidden_until_something_is() {
+        let c = AppConfig::default();
+        assert!(!c.db_hidden("c1", "tempdb"));
+        assert!(!c.schema_hidden("c1", "sales", Some("guest")));
+    }
+
+    #[test]
+    fn hiding_a_database_hides_exactly_that_one() {
+        let mut c = AppConfig::default();
+        c.set_hidden_databases("c1", vec!["tempdb".into(), "model".into()]);
+        assert!(c.db_hidden("c1", "tempdb"));
+        assert!(c.db_hidden("c1", "model"));
+        assert!(!c.db_hidden("c1", "sales"));
+        // …on that connection only.
+        assert!(!c.db_hidden("c2", "tempdb"));
+    }
+
+    /// A schema name means different things in two databases, so hiding
+    /// `guest` in one must not hide it in the other.
+    #[test]
+    fn hidden_schemas_are_scoped_to_their_database() {
+        let mut c = AppConfig::default();
+        c.set_hidden_schemas("c1", "sales", vec!["guest".into()]);
+        assert!(c.schema_hidden("c1", "sales", Some("guest")));
+        assert!(!c.schema_hidden("c1", "hr", Some("guest")));
+        assert!(!c.schema_hidden("c2", "sales", Some("guest")));
+    }
+
+    /// The nameless schema SQLite and DuckDB have cannot be hidden — there
+    /// is nothing to key it by, and hiding it would empty the database row
+    /// with no way back.
+    #[test]
+    fn the_implicit_schema_is_never_hidden() {
+        let mut c = AppConfig::default();
+        c.set_hidden_schemas("c1", "file.db", vec!["".into()]);
+        assert!(!c.schema_hidden("c1", "file.db", None));
+    }
+
+    /// Unticking the last box must leave no trace in `config.toml` —
+    /// „nothing hidden" and „no entry" are one state.
+    #[test]
+    fn clearing_the_last_hidden_thing_removes_the_entry() {
+        let mut c = AppConfig::default();
+        c.set_hidden_databases("c1", vec!["tempdb".into()]);
+        c.set_hidden_schemas("c1", "sales", vec!["guest".into()]);
+        assert!(c.hidden.contains_key("c1"));
+
+        c.set_hidden_databases("c1", vec![]);
+        assert!(c.hidden.contains_key("c1"), "schemas still hidden, entry must stay");
+        c.set_hidden_schemas("c1", "sales", vec![]);
+        assert!(!c.hidden.contains_key("c1"), "nothing hidden ⇒ no entry: {:?}", c.hidden);
+    }
+
+    /// Written sorted and deduplicated, so two runs that hid the same
+    /// things produce the same file and the config's dirty check does not
+    /// fire on a reordering.
+    #[test]
+    fn the_hidden_list_is_stored_in_a_stable_order() {
+        let mut a = AppConfig::default();
+        a.set_hidden_databases("c1", vec!["b".into(), "a".into(), "b".into()]);
+        let mut b = AppConfig::default();
+        b.set_hidden_databases("c1", vec!["a".into(), "b".into()]);
+        assert_eq!(a.hidden, b.hidden);
+        assert_eq!(a.hidden["c1"].databases, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn a_deleted_connection_takes_its_visibility_settings_with_it() {
+        let mut c = sample();
+        c.set_hidden_databases("gone", vec!["x".into()]);
+        assert!(c.hidden.contains_key("gone"));
+        c.forget_hidden_for_missing_connections();
+        assert!(!c.hidden.contains_key("gone"));
+        // The surviving connection's settings are untouched.
+        assert!(c.hidden.contains_key("c1"), "{:?}", c.hidden);
     }
 
     /// Both new fields are `#[serde(default)]`, so a `config.toml` written

@@ -1370,6 +1370,25 @@ pub enum PendingAfterUnlock {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum ModalState {
+    /// „Zobrazené databáze…" / „Zobrazená schémata…" — one checkbox per
+    /// candidate (user request, 2026-09-01).
+    ///
+    /// The dialog is phrased as what is SHOWN while `AppConfig` stores what
+    /// is hidden. That is deliberate on both sides: a list of ticks reads
+    /// as „these are the ones I want", and storing the complement is what
+    /// makes a database created tomorrow appear by itself instead of
+    /// staying invisible forever. `confirm_visibility` is the one place the
+    /// two meet.
+    VisibilityPicker {
+        conn_id: String,
+        /// `None` = the connection's databases; `Some(db)` = that
+        /// database's schemas.
+        db: Option<String>,
+        /// Every candidate the server told us about, in display order.
+        all: Vec<String>,
+        /// The ticked ones.
+        shown: std::collections::BTreeSet<String>,
+    },
     ConnectionDialog(ConnectionDialogUi),
     MasterPasswordPrompt {
         input: Entity<TextField>,
@@ -1991,7 +2010,12 @@ pub(crate) fn modal_confirm_kind(modal: &ModalState) -> ModalConfirmKind {
         // §3-novela Ignore arms — kept as explicit variants (not a `_`
         // catch-all) so a NEW ModalState variant is a compile error here
         // and must consciously pick a side of the policy table.
-        ModalState::KillConfirm { .. }
+        // Nothing is typed, so there is no text Enter could submit, and
+        // the focus is on a list where Enter would have to mean „tick this
+        // one" before it could mean „save". Rather than have it mean two
+        // things, it means neither; „Uložit" is one click away.
+        ModalState::VisibilityPicker { .. }
+        | ModalState::KillConfirm { .. }
         | ModalState::AnalyzeWriteConfirm { .. }
         | ModalState::BackupRestore(_)
         | ModalState::ScriptRun { .. }
@@ -2068,6 +2092,9 @@ pub(crate) fn modal_is_blocking(modal: &ModalState) -> bool {
         | ModalState::FolderName { .. }
         | ModalState::FolderDeleteConfirm { .. }
         | ModalState::ConnectionDeleteConfirm { .. }
+        // Ticks a few boxes and writes config; nothing is running behind
+        // it and nothing typed into it is secret.
+        | ModalState::VisibilityPicker { .. }
         // Nothing has been written yet and the app behind it is intact, so
         // Esc is simply „no" — the same posture as every other confirm
         // whose work has not started.
@@ -2420,6 +2447,9 @@ impl AppView {
             }
             ModalState::ScriptDeleteConfirm { rel, is_dir, dirty_bound, error, running } => {
                 render_script_delete_panel(&rel, is_dir, dirty_bound, &error, running, cx)
+            }
+            ModalState::VisibilityPicker { db, all, shown, .. } => {
+                render_visibility_panel(db.as_deref(), &all, &shown, cx)
             }
             ModalState::FolderName { rename_of, parent, field, error } => {
                 render_folder_name_panel(rename_of, parent, field, error, cx)
@@ -4344,6 +4374,82 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
     panel.into_any_element()
 }
 
+/// „Zobrazené databáze…" / „Zobrazená schémata…".
+///
+/// Phrased as what is SHOWN, while the config stores what is hidden. Ticks
+/// read as „these are the ones I want"; storing the complement is what lets
+/// a database created tomorrow appear by itself. See
+/// [`ModalState::VisibilityPicker`].
+fn render_visibility_panel(
+    db: Option<&str>,
+    all: &[String],
+    shown: &std::collections::BTreeSet<String>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let theme = *cx.theme();
+    let title = match db {
+        None => "Zobrazené databáze".to_string(),
+        Some(db) => format!("Zobrazená schémata — {db}"),
+    };
+    let mut panel: Div = ui::panel(420., theme)
+        .child(div().text_size(px(16.)).child(title))
+        .child(div().text_color(theme.text_muted).child(
+            "Odškrtnuté se ve stromu neukazují. Nic se tím nemaže a nové položky              na serveru se objeví samy.",
+        ));
+    if all.is_empty() {
+        // The candidates come from what the tree has already fetched, so
+        // there is a state with nothing to offer — and saying so beats an
+        // empty box that looks broken.
+        panel = panel.child(
+            div()
+                .text_color(theme.text_muted)
+                .child("Zatím není co vybírat — rozbal to nejdřív ve stromu."),
+        );
+    } else {
+        let mut list = div()
+            .id("visibility-list")
+            .flex()
+            .flex_col()
+            .gap_1()
+            // A server with two dozen databases outruns any panel, so the
+            // list scrolls rather than the dialog growing past the window.
+            .max_h(px(320.))
+            .overflow_y_scroll();
+        for (i, name) in all.iter().enumerate() {
+            let checked = shown.contains(name);
+            let target = name.clone();
+            list = list.child(
+                ui::checkbox(("vis-item", i), name.clone(), checked).on_click(cx.listener(
+                    move |v, _, _, cx| v.toggle_visibility_item(target.clone(), cx),
+                )),
+            );
+        }
+        panel = panel.child(list);
+    }
+    panel
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .mt_2()
+                .child(ui::row_button("vis-all", "Vše", theme).on_click(
+                    cx.listener(|v, _, _, cx| v.set_all_visible(true, cx)),
+                ))
+                .child(ui::row_button("vis-none", "Nic", theme).on_click(
+                    cx.listener(|v, _, _, cx| v.set_all_visible(false, cx)),
+                ))
+                .child(div().flex_1())
+                .child(ui::button("vis-save", "Uložit", theme).on_click(
+                    cx.listener(|v, _, _, cx| v.confirm_visibility(cx)),
+                ))
+                .child(ui::button("vis-cancel", "Zrušit", theme).on_click(
+                    cx.listener(|v, _, _, cx| v.close_modal(cx)),
+                )),
+        )
+        .into_any_element()
+}
+
 /// pwchange (spec §2). Admin pole jen pro PG; PG navíc transparentně
 /// ukazuje redigovaný příkaz (`pwchange::pg_rescue_display` — display_sql
 /// nikdy nezávisí na hesle). Tlačítka bez on_click, dokud `running` —
@@ -5512,6 +5618,9 @@ pub(crate) fn modal_blocks_context_switch(modal: Option<&ModalState>) -> bool {
         // config-level state the context switch does not touch — but the
         // path they hold would be stale if the connection list changed
         // underneath, so they block like every other path-holding dialog.
+        // Holds a connection id and a database name, and would write both
+        // back into a config the switch is about to replace.
+        | Some(ModalState::VisibilityPicker { .. })
         | Some(ModalState::FolderName { .. })
         | Some(ModalState::FolderDeleteConfirm { .. })
         | Some(ModalState::ScriptName { .. })
@@ -5543,6 +5652,7 @@ pub(crate) fn modal_blocks_context_switch(modal: Option<&ModalState>) -> bool {
 pub(crate) fn modal_first_field(modal: &ModalState, cx: &App) -> Option<FocusHandle> {
     match modal {
         // The first thing you fill in, in every one of these.
+        ModalState::VisibilityPicker { .. } => None,
         ModalState::ConnectionDialog(ui) => Some(ui.name.focus_handle(cx)),
         ModalState::MasterPasswordPrompt { input, .. } => Some(input.focus_handle(cx)),
         ModalState::CreateMasterPassword { input1, .. } => Some(input1.focus_handle(cx)),

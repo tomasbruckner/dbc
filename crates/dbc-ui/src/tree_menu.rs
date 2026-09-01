@@ -218,6 +218,10 @@ fn connection_menu(conn_id: &str, ctx: &MenuCtx) -> Vec<MenuEntry> {
         item("Upravit připojení…", TreeEvent::EditConnection { conn_id: id.clone() }),
         item("Kopírovat jméno", TreeEvent::CopyText { what: "jméno".into(), text: id.clone() }),
         MenuEntry::Separator,
+        item(
+            "Zobrazené databáze…",
+            TreeEvent::ChooseVisibleDatabases { conn_id: id.clone() },
+        ),
         item("Obnovit seznam databází", TreeEvent::LoadDatabases { conn_id: id.clone() }),
         // Last and after a separator, like every other destructive item —
         // and NOT gated on `read_only`, which is about the SERVER. This
@@ -260,6 +264,10 @@ fn database_menu(conn_id: &str, db: &str, ctx: &MenuCtx) -> Vec<MenuEntry> {
         MenuEntry::Separator,
         item("Kopírovat jméno", TreeEvent::CopyText { what: "jméno".into(), text: dbn.clone() }),
         MenuEntry::Separator,
+        item(
+            "Zobrazená schémata…",
+            TreeEvent::ChooseVisibleSchemas { conn_id: id.clone(), db: dbn.clone() },
+        ),
         item("Obnovit schéma", TreeEvent::LoadSchema { conn_id: id, db: dbn }),
     ]);
     out
@@ -581,6 +589,33 @@ mod tests {
             conn_id: "c1",
             database: None,
         }
+    }
+
+    /// Both halves of the 2026-09-01 request are reachable from the menu,
+    /// and each sits with the other things that change what the tree SHOWS
+    /// rather than with the ones that talk to the server.
+    #[test]
+    fn visibility_is_offered_on_a_connection_and_on_a_database() {
+        let s = snap();
+        let conn = menu_for(&SidebarRow::Connection { conn_id: "c1".into() }, &ctx(&s, false));
+        let l = labels(&conn);
+        assert!(l.iter().any(|x| x == "Zobrazené databáze…"), "{l:?}");
+
+        let db = menu_for(
+            &SidebarRow::Database { conn_id: "c1".into(), db: "sales".into() },
+            &ctx(&s, false),
+        );
+        let l = labels(&db);
+        assert!(l.iter().any(|x| x == "Zobrazená schémata…"), "{l:?}");
+    }
+
+    /// It changes nothing on the server, so a read-only connection still
+    /// gets it — unlike every item that writes.
+    #[test]
+    fn visibility_survives_a_read_only_connection() {
+        let s = snap();
+        let l = labels(&menu_for(&SidebarRow::Connection { conn_id: "c1".into() }, &ctx(&s, true)));
+        assert!(l.iter().any(|x| x == "Zobrazené databáze…"), "{l:?}");
     }
 
     fn labels(entries: &[MenuEntry]) -> Vec<String> {

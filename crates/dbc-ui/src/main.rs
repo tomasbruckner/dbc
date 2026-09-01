@@ -10933,9 +10933,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         }
         self.refresh_grouped_cache(cx);
         let grouped = self.grouped_cache.clone();
+        let hidden = self.config.hidden.clone();
         self.tree.update(cx, |t, cx| {
             t.sync_connections(grouped, cx);
             t.seed_server_versions(&dbc_state::conn_cache::versions(), cx);
+            t.set_hidden(hidden, cx);
         });
         cx.notify();
     }
@@ -11086,9 +11088,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         };
         self.refresh_grouped_cache(cx);
         let grouped = self.grouped_cache.clone();
+        let hidden = self.config.hidden.clone();
         self.tree.update(cx, |t, cx| {
             t.sync_connections(grouped, cx);
             t.seed_server_versions(&dbc_state::conn_cache::versions(), cx);
+            t.set_hidden(hidden, cx);
         });
         cx.notify();
     }
@@ -11951,6 +11955,12 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 self.move_connection_to_folder(conn_id.clone(), folder.clone(), cx)
             }
             TreeEvent::LoadDatabases { conn_id } => self.start_db_list_fetch(conn_id.clone(), cx),
+            TreeEvent::ChooseVisibleDatabases { conn_id } => {
+                self.open_visibility_picker(conn_id.clone(), None, cx)
+            }
+            TreeEvent::ChooseVisibleSchemas { conn_id, db } => {
+                self.open_visibility_picker(conn_id.clone(), Some(db.clone()), cx)
+            }
             TreeEvent::LoadSchema { conn_id, db } => {
                 self.start_schema_slot_fetch(conn_id.clone(), db.clone(), cx)
             }
@@ -12060,6 +12070,84 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let target =
             dbc_core::quote_qualified_d(sql_dialect(engine), schema.as_deref(), &table);
         self.run_query_with(format!("SELECT COUNT(*) FROM {target}"), None, true, cx);
+    }
+
+    /// „Zobrazené databáze…" / „Zobrazená schémata…".
+    ///
+    /// The candidates come from what the tree has already fetched, never
+    /// from the server: this must not be able to start a connection,
+    /// because it is the dialog you reach for when a connection is slow and
+    /// you want to stop looking at half of it.
+    fn open_visibility_picker(
+        &mut self,
+        conn_id: String,
+        db: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal.is_some() {
+            return;
+        }
+        let all = match &db {
+            None => self.tree.read(cx).database_names(&conn_id),
+            Some(db) => self.tree.read(cx).schema_names(&conn_id, db),
+        };
+        // Ticked = shown, and shown is everything the config does not hide.
+        // A name the config still hides but the server no longer has is
+        // simply not offered, and drops out of the config on save — which
+        // is the right way for that entry to die.
+        let shown: std::collections::BTreeSet<String> = all
+            .iter()
+            .filter(|name| match &db {
+                None => !self.config.db_hidden(&conn_id, name),
+                Some(d) => !self.config.schema_hidden(&conn_id, d, Some(name)),
+            })
+            .cloned()
+            .collect();
+        self.modal =
+            Some(connections_ui::ModalState::VisibilityPicker { conn_id, db, all, shown });
+        cx.notify();
+    }
+
+    /// One checkbox.
+    fn toggle_visibility_item(&mut self, name: String, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::VisibilityPicker { shown, .. }) = &mut self.modal {
+            if !shown.remove(&name) {
+                shown.insert(name);
+            }
+            cx.notify();
+        }
+    }
+
+    /// „Vše" / „Nic".
+    fn set_all_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if let Some(connections_ui::ModalState::VisibilityPicker { all, shown, .. }) =
+            &mut self.modal
+        {
+            *shown = if visible { all.iter().cloned().collect() } else { Default::default() };
+            cx.notify();
+        }
+    }
+
+    /// „Uložit" — the one place shown becomes hidden.
+    fn confirm_visibility(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::VisibilityPicker { conn_id, db, all, shown }) =
+            self.modal.clone()
+        else {
+            return;
+        };
+        let Some(guard) = self.guard_corrupt_config(cx) else { return };
+        let hidden: Vec<String> = all.into_iter().filter(|name| !shown.contains(name)).collect();
+        match &db {
+            None => self.config.set_hidden_databases(&conn_id, hidden),
+            Some(d) => self.config.set_hidden_schemas(&conn_id, d, hidden),
+        }
+        self.status = match self.config.save(&self.config_path, &guard) {
+            Ok(()) => "Uloženo".to_string(),
+            Err(e) => format!("error saving config: {}", e.message),
+        };
+        let hidden_map = self.config.hidden.clone();
+        self.tree.update(cx, |t, cx| t.set_hidden(hidden_map, cx));
+        self.close_modal(cx);
     }
 
     /// Drains [`AppView::pending_menu_action`]. Called from `render`, which
@@ -14774,9 +14862,11 @@ fn main() {
             let editor_focus = view.sql.focus_handle(cx);
             window.focus(&editor_focus, cx);
             let grouped = view.grouped_cache.clone();
+            let hidden = view.config.hidden.clone();
             view.tree.update(cx, |t, cx| {
                 t.sync_connections(grouped, cx);
                 t.seed_server_versions(&dbc_state::conn_cache::versions(), cx);
+                t.set_hidden(hidden, cx);
             });
             // The tree starts on `TreeGrouping::Schema` and learns the saved
             // choice here — this is what makes the setting survive a
@@ -16848,7 +16938,19 @@ mod config_save_guard_audit {
         // function returns before touching either. This is the one writer
         // in the crate that also DELETES, which is exactly why the guard
         // ordering matters here more than anywhere above.
-        assert_eq!(sites, 11, "config.toml writer count changed — re-audit, do not just bump");
+        //
+        // 11 → 12 on 2026-09-01: `confirm_visibility` persists which
+        // databases and schemas a connection keeps out of the sidebar.
+        // Re-audited, not bumped: the write is inside the
+        // `let Some(guard) = self.guard_corrupt_config(cx) else { return }`
+        // arm (position-verified by this test's own loop), and the guard is
+        // taken BEFORE the config is mutated, so a corrupt `config.toml`
+        // costs the user nothing but the ticks they just made. It is also
+        // the mildest writer in the list — it changes what is DRAWN and
+        // nothing else, which is why it needs no equality check of its own:
+        // there is no continuous gesture behind it, only a click on
+        // „Uložit".
+        assert_eq!(sites, 12, "config.toml writer count changed — re-audit, do not just bump");
     }
 
     /// The widening is only worth anything if it actually reaches past the

@@ -129,6 +129,11 @@ pub enum TreeEvent {
     /// whose database list is `NotLoaded`/`Error` — `main.rs` dispatches
     /// `fetch_database_list` (vault-gated).
     LoadDatabases { conn_id: String },
+    /// „Zobrazené databáze…" — open the visibility picker for this
+    /// connection's database list (user request, 2026-09-01).
+    ChooseVisibleDatabases { conn_id: String },
+    /// „Zobrazená schémata…" — the same, one level down.
+    ChooseVisibleSchemas { conn_id: String, db: String },
     /// Sidebar rework: expand (or error-row retry) of a Database row whose
     /// schema slot is `NotLoaded`/`Error` — `main.rs` dispatches
     /// `fetch_schema` for that `(conn, db)` slot (vault-gated, design §4.4).
@@ -600,11 +605,41 @@ fn emit_sections(
 /// filter and lowercases
 /// internally (same convention as `flatten`, which it inherited the body
 /// from). Pure, GPUI-free; never fetches.
+///
+/// `#[cfg(test)]` because the app itself always has a visibility setting to
+/// pass, even when it is empty — every production call goes through
+/// [`flatten_schema_hiding`]. This is the shape the seventeen existing
+/// schema-shape tests were written against, and rewriting all of them to
+/// pass `&[]` would be churn that hid the real change.
+#[cfg(test)]
 pub fn flatten_schema(
     snapshot: &SchemaSnapshot,
     expanded: &HashSet<NodeId>,
     filter: &str,
     grouping: TreeGrouping,
+) -> Vec<FlatNode> {
+    flatten_schema_hiding(snapshot, expanded, filter, grouping, &[])
+}
+
+/// [`flatten_schema`], plus the schemas this database keeps out of the
+/// sidebar (user request, 2026-09-01).
+///
+/// The filter is applied to the schema KEY SET, once, before either
+/// grouping uses it — which is why it works for both. In „Schema" mode
+/// that drops the schema's row and everything under it; in „Kind" mode,
+/// where there is no schema level to drop, the same key set is what each
+/// section draws its objects from, so the objects go with it.
+///
+/// It hides; it does not filter the snapshot. A hidden schema is still
+/// there for autocomplete, for the palette, and for anything a query
+/// names explicitly — this setting is about what the tree is worth
+/// scrolling, not about pretending a schema does not exist.
+pub fn flatten_schema_hiding(
+    snapshot: &SchemaSnapshot,
+    expanded: &HashSet<NodeId>,
+    filter: &str,
+    grouping: TreeGrouping,
+    hidden_schemas: &[String],
 ) -> Vec<FlatNode> {
     let mut out = Vec::new();
     let filter_lc = filter.to_lowercase();
@@ -623,7 +658,13 @@ pub fn flatten_schema(
     for s in &snapshot.sequences {
         schema_key_set.insert(s.schema.clone());
     }
-    let schema_keys: Vec<Option<String>> = schema_key_set.into_iter().collect();
+    let schema_keys: Vec<Option<String>> = schema_key_set
+        .into_iter()
+        // The implicit (nameless) schema of SQLite/DuckDB is never hidden:
+        // it has no name to key by, and hiding it would empty the database
+        // row with nothing left to click to get it back.
+        .filter(|k| !k.as_deref().is_some_and(|n| hidden_schemas.iter().any(|h| h == n)))
+        .collect();
 
     let single_implicit = schema_keys.iter().all(|k| k.is_none());
 
@@ -1627,6 +1668,11 @@ pub fn flatten_sidebar(
     // `AppView::effective_scripts_root().is_some()`.
     scripts: Option<(&ScriptsListState, bool)>,
     grouping: TreeGrouping,
+    // What each connection keeps out of the sidebar, by connection id —
+    // `AppConfig::hidden`, pushed in by `main.rs`. Empty is the state every
+    // test that predates the feature passes, and the state a fresh config
+    // is in.
+    hidden: &std::collections::BTreeMap<String, dbc_state::HiddenNodes>,
 ) -> Vec<SidebarFlatRow> {
     let mut out: Vec<SidebarFlatRow> = Vec::new();
     let filter_lc = filter.to_lowercase();
@@ -1679,7 +1725,18 @@ pub fn flatten_sidebar(
         let row = SidebarRow::Connection { conn_id: crate::CLI_CONN_IDENTITY.to_string() };
         out.push((row, 0, label.to_string(), true));
         if outer_expanded.contains(&OuterId::Connection(crate::CLI_CONN_IDENTITY.to_string())) {
-            emit_schema_slot(&mut out, crate::CLI_CONN_IDENTITY, "", slot, 1, filter, grouping);
+            // The `--url` slot has no saved connection, so there is
+            // nothing whose visibility a user could have configured.
+            emit_schema_slot(
+                &mut out,
+                crate::CLI_CONN_IDENTITY,
+                "",
+                slot,
+                1,
+                filter,
+                grouping,
+                &[],
+            );
         }
     }
 
@@ -1722,7 +1779,15 @@ pub fn flatten_sidebar(
                     false,
                 )),
                 DbListState::Loaded { dbs, truncated } => {
+                    let hidden_here = hidden.get(&c.id);
                     for d in dbs {
+                        // Hidden by the user. Not filtered out of the model
+                        // — the database is still connectable, still in the
+                        // palette, still in the cache — only out of this
+                        // list.
+                        if hidden_here.is_some_and(|h| h.databases.iter().any(|x| x == &d.name)) {
+                            continue;
+                        }
                         let mut db_label = display_db_name(c.engine, &d.name);
                         if d.is_default {
                             db_label.push_str(" (výchozí)");
@@ -1735,7 +1800,20 @@ pub fn flatten_sidebar(
                             true,
                         ));
                         if outer_expanded.contains(&OuterId::Database(c.id.clone(), d.name.clone())) {
-                            emit_schema_slot(out, &c.id, &d.name, &d.schema, depth + 2, filter, grouping);
+                            let hidden_schemas = hidden_here
+                                .and_then(|h| h.schemas.get(&d.name))
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]);
+                            emit_schema_slot(
+                                out,
+                                &c.id,
+                                &d.name,
+                                &d.schema,
+                                depth + 2,
+                                filter,
+                                grouping,
+                                hidden_schemas,
+                            );
                         }
                         // Filter: drop a childless db row whose own label misses.
                         if filter_active
@@ -1819,6 +1897,7 @@ pub fn flatten_sidebar(
 /// `flatten` body verbatim, which did); `flatten_sidebar`'s own label
 /// matching uses its locally-lowercased copy. ONE convention per layer,
 /// pinned by `filter_narrows_loaded_content_and_matches_row_labels`.
+#[allow(clippy::too_many_arguments)]
 fn emit_schema_slot(
     out: &mut Vec<SidebarFlatRow>,
     conn_id: &str,
@@ -1827,6 +1906,7 @@ fn emit_schema_slot(
     base_depth: usize,
     filter: &str,
     grouping: TreeGrouping,
+    hidden_schemas: &[String],
 ) {
     match slot {
         DbSchemaState::NotLoaded => {}
@@ -1853,7 +1933,9 @@ fn emit_schema_slot(
             false,
         )),
         DbSchemaState::Loaded { snapshot, expanded } => {
-            for (node, depth, label, expandable) in flatten_schema(snapshot, expanded, filter, grouping) {
+            for (node, depth, label, expandable) in
+                flatten_schema_hiding(snapshot, expanded, filter, grouping, hidden_schemas)
+            {
                 out.push((
                     SidebarRow::Inner { conn_id: conn_id.to_string(), db: db.to_string(), node },
                     base_depth + depth,
@@ -1892,6 +1974,9 @@ pub struct SchemaTree {
     /// `main.rs` (`sync_connections`) on startup and after every config
     /// mutation; the tree never owns a second long-term copy of the config.
     grouped: crate::connections_ui::GroupedConnections,
+    /// `AppConfig::hidden`, pushed in by `main.rs` after every config
+    /// change. The tree renders it; it does not own it and never edits it.
+    hidden: std::collections::BTreeMap<String, dbc_state::HiddenNodes>,
     /// How the schema levels are shaped. Global (user decision
     /// 2026-08-28) — `main.rs` pushes `AppConfig::tree_grouping` here at
     /// startup and on every toggle, so the tree holds no second source of
@@ -1998,6 +2083,7 @@ impl SchemaTree {
             dialect: None,
             context_menu: None,
             grouped: crate::connections_ui::GroupedConnections::default(),
+            hidden: std::collections::BTreeMap::new(),
             conns: HashMap::new(),
             lru: Vec::new(),
             outer_expanded: HashSet::new(),
@@ -2017,6 +2103,58 @@ impl SchemaTree {
             scripts_configured: false,
             scripts_generation: 0,
         }
+    }
+
+    /// Every database in this connection's fetched list, HIDDEN ONES
+    /// INCLUDED — the visibility picker exists to tick one back on, so it
+    /// must see what the sidebar does not. Empty until the list is loaded,
+    /// which is what makes the picker say „rozbal to nejdřív".
+    pub fn database_names(&self, conn_id: &str) -> Vec<String> {
+        match self.conns.get(conn_id).map(|n| &n.dbs) {
+            Some(DbListState::Loaded { dbs, .. }) => dbs.iter().map(|d| d.name.clone()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Every NAMED schema in a fetched database, hidden ones included.
+    ///
+    /// The nameless schema SQLite and DuckDB have is deliberately not
+    /// offered: there is nothing to key it by, and hiding it would empty
+    /// the database row with no way back — the same rule
+    /// `AppConfig::schema_hidden` enforces on the other side.
+    pub fn schema_names(&self, conn_id: &str, db: &str) -> Vec<String> {
+        let Some(DbListState::Loaded { dbs, .. }) = self.conns.get(conn_id).map(|n| &n.dbs) else {
+            return Vec::new();
+        };
+        let Some(node) = dbs.iter().find(|d| d.name == db) else { return Vec::new() };
+        let DbSchemaState::Loaded { snapshot, .. } = &node.schema else { return Vec::new() };
+        let mut set: BTreeSet<String> = BTreeSet::new();
+        for s in snapshot
+            .tables
+            .iter()
+            .filter_map(|t| t.schema.clone())
+            .chain(snapshot.routines.iter().filter_map(|r| r.schema.clone()))
+            .chain(snapshot.triggers.iter().filter_map(|t| t.schema.clone()))
+            .chain(snapshot.sequences.iter().filter_map(|s| s.schema.clone()))
+        {
+            set.insert(s);
+        }
+        set.into_iter().collect()
+    }
+
+    /// What each connection keeps out of the sidebar. Pushed alongside
+    /// [`Self::sync_connections`] from the same config the rest of the tree
+    /// comes from, so the two can never describe different states.
+    pub fn set_hidden(
+        &mut self,
+        hidden: std::collections::BTreeMap<String, dbc_state::HiddenNodes>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.hidden == hidden {
+            return;
+        }
+        self.hidden = hidden;
+        cx.notify();
     }
 
     /// Sidebar rework: re-sync the saved-connection roots after a config
@@ -3132,11 +3270,13 @@ pub(crate) fn event_target(ev: &TreeEvent) -> String {
         TreeEvent::OpenErDiagram { schema } => schema.clone().unwrap_or_default(),
         TreeEvent::ToggleFavourite(f) => qualified(&f.schema, &f.name),
         TreeEvent::LoadDatabases { conn_id }
+        | TreeEvent::ChooseVisibleDatabases { conn_id }
         | TreeEvent::OpenMonitorFor { conn_id }
         | TreeEvent::OpenCompareFor { conn_id }
         | TreeEvent::EditConnection { conn_id }
         | TreeEvent::ConnectionDelete { conn_id } => conn_id.clone(),
-        TreeEvent::LoadSchema { conn_id, db } => format!("{conn_id}/{db}"),
+        TreeEvent::LoadSchema { conn_id, db }
+        | TreeEvent::ChooseVisibleSchemas { conn_id, db } => format!("{conn_id}/{db}"),
         TreeEvent::FolderCreate { parent } => parent.join("/"),
         TreeEvent::ConnectionCreate { folder } => folder.join("/"),
         TreeEvent::FolderRename { path } | TreeEvent::FolderDelete { path } => path.join("/"),
@@ -3216,6 +3356,7 @@ impl Render for SchemaTree {
             // pins that the two differ by exactly this section.
             Some((&self.scripts, self.scripts_configured)),
             self.grouping,
+            &self.hidden,
         );
         let no_roots = self.grouped.favourites.is_empty()
             && self.grouped.folders.is_empty()
@@ -3691,7 +3832,9 @@ impl Render for SchemaTree {
 /// original Schema shape, so they forward through this rather than each
 /// growing an argument that is the same in all 21 of them.
 macro_rules! flatten_sidebar_g {
-    ($($a:expr),* $(,)?) => { flatten_sidebar($($a),*, TreeGrouping::Schema) };
+    ($($a:expr),* $(,)?) => {
+        flatten_sidebar($($a),*, TreeGrouping::Schema, &Default::default())
+    };
 }
 
 #[cfg(test)]
@@ -4403,6 +4546,168 @@ mod sidebar_tests {
                 if conn_id == "c1" && text == expect_text && *retry == expect_retry),
                 "state expecting {expect_text}: got {:?}", rows.get(1));
         }
+    }
+
+    fn two_schema_snap() -> SchemaSnapshot {
+        let mut s = snap();
+        let mut t = s.tables[0].clone();
+        t.schema = Some("audit".into());
+        t.name = "log".into();
+        s.tables.push(t);
+        s
+    }
+
+    fn two_db_states(second_schema: DbSchemaState) -> HashMap<String, ConnNode> {
+        let mut m = HashMap::new();
+        m.insert(
+            "c1".to_string(),
+            ConnNode {
+                version: None,
+                dbs: DbListState::Loaded {
+                    dbs: vec![
+                        DbNode {
+                            name: "sales".into(),
+                            is_default: true,
+                            schema: second_schema,
+                        },
+                        DbNode {
+                            name: "tempdb".into(),
+                            is_default: false,
+                            schema: DbSchemaState::NotLoaded,
+                        },
+                    ],
+                    truncated: false,
+                },
+            },
+        );
+        m
+    }
+
+    fn hidden_for(
+        databases: &[&str],
+        schemas: &[(&str, &[&str])],
+    ) -> std::collections::BTreeMap<String, dbc_state::HiddenNodes> {
+        std::collections::BTreeMap::from([(
+            "c1".to_string(),
+            dbc_state::HiddenNodes {
+                databases: databases.iter().map(|s| s.to_string()).collect(),
+                schemas: schemas
+                    .iter()
+                    .map(|(db, list)| {
+                        (db.to_string(), list.iter().map(|s| s.to_string()).collect())
+                    })
+                    .collect(),
+            },
+        )])
+    }
+
+    /// „u connection bych chtel mit moznost vybrat db, co se mi zobrazuji"
+    /// (user, 2026-09-01). Unticked databases leave the tree; everything
+    /// else stays exactly where it was.
+    #[test]
+    fn a_hidden_database_leaves_the_tree_and_nothing_else_moves() {
+        let conns = vec![conn_cfg("c1", "prod", &[], Engine::Postgres, "sales")];
+        let states = two_db_states(DbSchemaState::NotLoaded);
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Connection("c1".into()));
+
+        let visible = |hidden: &std::collections::BTreeMap<String, dbc_state::HiddenNodes>| {
+            flatten_sidebar(
+                &grouped(&conns), &states, None, &outer, "", None, &[],
+                AdminEntry::Hidden, None, TreeGrouping::Schema, hidden,
+            )
+            .iter()
+            .map(|r| r.2.clone())
+            .collect::<Vec<String>>()
+        };
+
+        let before = visible(&Default::default());
+        assert!(before.iter().any(|l| l.starts_with("sales")), "{before:?}");
+        assert!(before.iter().any(|l| l.starts_with("tempdb")), "{before:?}");
+
+        let after = visible(&hidden_for(&["tempdb"], &[]));
+        assert!(after.iter().any(|l| l.starts_with("sales")), "{after:?}");
+        assert!(!after.iter().any(|l| l.starts_with("tempdb")), "{after:?}");
+        // Exactly one row fewer: hiding must not take a neighbour with it.
+        assert_eq!(after.len(), before.len() - 1, "{before:?} → {after:?}");
+    }
+
+    /// „stejne tak pak pro schemata u jednotlivych db" — and scoped to the
+    /// database it was hidden in.
+    #[test]
+    fn a_hidden_schema_leaves_only_its_own_database() {
+        let conns = vec![conn_cfg("c1", "prod", &[], Engine::Postgres, "sales")];
+        let states = two_db_states(DbSchemaState::Loaded {
+            snapshot: two_schema_snap(),
+            expanded: HashSet::new(),
+        });
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Connection("c1".into()));
+        outer.insert(OuterId::Database("c1".into(), "sales".into()));
+
+        let visible = |hidden: &std::collections::BTreeMap<String, dbc_state::HiddenNodes>| {
+            flatten_sidebar(
+                &grouped(&conns), &states, None, &outer, "", None, &[],
+                AdminEntry::Hidden, None, TreeGrouping::Schema, hidden,
+            )
+            .iter()
+            .map(|r| r.2.clone())
+            .collect::<Vec<String>>()
+        };
+
+        let before = visible(&Default::default());
+        assert!(before.iter().any(|l| l == "public"), "{before:?}");
+        assert!(before.iter().any(|l| l == "audit"), "{before:?}");
+
+        let after = visible(&hidden_for(&[], &[("sales", &["audit"])]));
+        assert!(after.iter().any(|l| l == "public"), "{after:?}");
+        assert!(!after.iter().any(|l| l == "audit"), "{after:?}");
+
+        // Hiding `audit` in a DIFFERENT database leaves this one alone —
+        // the same schema name means different things in two databases.
+        let elsewhere = visible(&hidden_for(&[], &[("tempdb", &["audit"])]));
+        assert_eq!(elsewhere, before, "hiding in another database changed this one");
+    }
+
+    /// The setting belongs to one connection, not to a name.
+    #[test]
+    fn hiding_is_scoped_to_the_connection_that_set_it() {
+        let conns = vec![conn_cfg("c1", "prod", &[], Engine::Postgres, "sales")];
+        let states = two_db_states(DbSchemaState::NotLoaded);
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Connection("c1".into()));
+        let other = std::collections::BTreeMap::from([(
+            "c2".to_string(),
+            dbc_state::HiddenNodes {
+                databases: vec!["tempdb".into()],
+                schemas: Default::default(),
+            },
+        )]);
+        let rows = flatten_sidebar(
+            &grouped(&conns), &states, None, &outer, "", None, &[],
+            AdminEntry::Hidden, None, TreeGrouping::Schema, &other,
+        );
+        let labels: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
+        assert!(labels.iter().any(|l| l.starts_with("tempdb")), "{labels:?}");
+    }
+
+    /// The picker offers what the tree HAS, hidden entries included —
+    /// otherwise unticking a database would be a one-way door.
+    #[test]
+    fn the_picker_is_offered_the_hidden_names_too() {
+        let states = two_db_states(DbSchemaState::Loaded {
+            snapshot: two_schema_snap(),
+            expanded: HashSet::new(),
+        });
+        // `database_names`/`schema_names` read the same node map the tree
+        // renders from, so this exercises them through it.
+        let node = states.get("c1").expect("seeded");
+        let DbListState::Loaded { dbs, .. } = &node.dbs else { panic!("seeded as loaded") };
+        assert_eq!(
+            dbs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["sales", "tempdb"],
+            "the model keeps every database; hiding happens at render time"
+        );
     }
 
     /// „je divne ze mam slozku A a v ni je slozka B a zabalim slozku A,
