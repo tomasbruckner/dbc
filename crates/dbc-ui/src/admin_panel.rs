@@ -46,6 +46,7 @@ use crate::admin_sql::{self, CellState, WriteStatement};
 use crate::theme::{ActiveTheme, Theme};
 use crate::connections_ui;
 use crate::runner::AdminCatalogRows;
+use crate::ui;
 
 /// Tab-strip singleton dedup key (`tabs.rs::ResultTab::preview_key`) —
 /// there is only ever one admin tab per connection at a time (design §2:
@@ -2067,13 +2068,9 @@ impl AdminPanel {
                             })),
                     );
                 }
-                div()
+                ui::surface(theme)
                     .id("admin-modal-new-role")
                     .w(px(360.))
-                    .bg(theme.bg_panel)
-                    .border_1()
-                    .border_color(theme.border)
-                    .rounded_md()
                     .flex()
                     .flex_col()
                     .p_2()
@@ -2117,13 +2114,9 @@ impl AdminPanel {
                             ),
                     )
             }
-            AdminModal::ChangePassword { role, password } => div()
+            AdminModal::ChangePassword { role, password } => ui::surface(theme)
                 .id("admin-modal-change-password")
                 .w(px(360.))
-                .bg(theme.bg_panel)
-                .border_1()
-                .border_color(theme.border)
-                .rounded_md()
                 .flex()
                 .flex_col()
                 .p_2()
@@ -2164,13 +2157,9 @@ impl AdminPanel {
                                 })),
                         ),
                 ),
-            AdminModal::NewSchema { name } => div()
+            AdminModal::NewSchema { name } => ui::surface(theme)
                 .id("admin-modal-new-schema")
                 .w(px(360.))
-                .bg(theme.bg_panel)
-                .border_1()
-                .border_color(theme.border)
-                .rounded_md()
                 .flex()
                 .flex_col()
                 .p_2()
@@ -2213,13 +2202,9 @@ impl AdminPanel {
                 ),
             AdminModal::DropSchema { schema, cascade } => {
                 let mark = if *cascade { "☑" } else { "☐" };
-                div()
+                ui::surface(theme)
                     .id("admin-modal-drop-schema")
                     .w(px(420.))
-                    .bg(theme.bg_panel)
-                    .border_1()
-                    .border_color(theme.border)
-                    .rounded_md()
                     .flex()
                     .flex_col()
                     .p_2()
@@ -2320,13 +2305,9 @@ impl AdminPanel {
                 .track_focus(&self.modal_focus_handle)
                 .occlude()
                 .child(
-                    div()
+                    ui::surface(theme)
                         .id("admin-discard-confirm-panel")
                         .w(px(360.))
-                        .bg(theme.bg_panel)
-                        .border_1()
-                        .border_color(theme.border)
-                        .rounded_md()
                         .flex()
                         .flex_col()
                         .p_2()

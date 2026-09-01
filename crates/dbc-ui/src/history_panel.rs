@@ -35,6 +35,7 @@ use gpui::{div, prelude::*, px, uniform_list, AnyElement, Context, Focusable, Re
 
 use crate::theme::ActiveTheme;
 use crate::AppView;
+use crate::ui;
 
 /// Right-panel fixed width (brief contract #3), mirroring the schema tree
 /// panel's `w(px(260.))` in `main.rs`'s `render`.
@@ -172,14 +173,10 @@ impl TextTooltip {
 
 impl Render for TextTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        ui::surface(*cx.theme())
             .max_w(px(520.))
             .px_2()
             .py_1()
-            .bg(cx.theme().bg_panel)
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded_md()
             .text_size(px(12.))
             .text_color(cx.theme().text_primary)
             .child(self.text.clone())

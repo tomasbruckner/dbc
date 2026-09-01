@@ -16,6 +16,7 @@ use crate::fk_join::{self, JoinSpec, VirtualCol};
 use crate::row_view::{self, RowView};
 use crate::sandbox::{self, EditState, Editable};
 use crate::theme::ActiveTheme;
+use crate::ui;
 
 pub const ROW_HEIGHT: f32 = 24.0;
 pub const DEFAULT_COL_WIDTH: f32 = 160.0;
@@ -1833,16 +1834,12 @@ impl ResultGrid {
     /// `.absolute()` under the (`.relative()`) root `render` builds.
     fn render_export_menu_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.theme();
-        let mut panel = div()
+        let mut panel = ui::surface(theme)
             .id("export-menu")
             .absolute()
             .top(px(ROW_HEIGHT))
             .left(px(70.))
             .w(px(140.))
-            .bg(theme.bg_panel)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
             .p_1()
             .flex()
             .flex_col()
@@ -1883,7 +1880,7 @@ impl ResultGrid {
     /// a hidden column is ever shown again, so it can be re-checked.
     fn render_columns_menu_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.theme();
-        let mut panel = div()
+        let mut panel = ui::surface(theme)
             .id("columns-menu")
             .absolute()
             .top(px(ROW_HEIGHT))
@@ -1891,10 +1888,6 @@ impl ResultGrid {
             .w(px(220.))
             .max_h(px(320.))
             .overflow_hidden()
-            .bg(theme.bg_panel)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
             .p_1()
             .flex()
             .flex_col()
@@ -1976,39 +1969,21 @@ impl ResultGrid {
             body = body.child(div().whitespace_normal().child(line.to_string()));
         }
 
-        let panel = div()
+        let panel = ui::surface(theme)
             .id("cell-detail-panel")
             .w(px(560.))
             .max_h(px(420.))
-            .bg(theme.bg_panel)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
             .flex()
             .flex_col()
             .child(body)
             .child(
                 div().flex().flex_row().justify_end().gap_2().p_2().child(
-                    div()
-                        .id("cell-detail-copy")
-                        .cursor_pointer()
-                        .bg(theme.bg_hover)
-                        .text_color(theme.text_primary)
-                        .px_2()
-                        .rounded_md()
-                        .child("Kopírovat")
+                    ui::button("cell-detail-copy", "Kopírovat", theme)
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(text_for_copy.clone()));
                         })),
                 ).child(
-                    div()
-                        .id("cell-detail-close")
-                        .cursor_pointer()
-                        .bg(theme.bg_hover)
-                        .text_color(theme.text_primary)
-                        .px_2()
-                        .rounded_md()
-                        .child("Zavřít")
+                    ui::button("cell-detail-close", "Zavřít", theme)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.cell_detail = None;
                             cx.notify();
@@ -2248,14 +2223,10 @@ impl ResultGrid {
         let currently_staged_null = ed.currently_staged_null;
         let input = ed.input.clone();
 
-        let panel = div()
+        let panel = ui::surface(theme)
             .id("cell-editor-panel")
             .w(px(480.))
             .max_h(px(360.))
-            .bg(theme.bg_panel)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
             .flex()
             .flex_col()
             .p_2()
@@ -2291,34 +2262,13 @@ impl ResultGrid {
             .child(div().w_full().child(input))
             .child(
                 div().flex().flex_row().justify_end().gap_2().child(
-                    div()
-                        .id("cell-editor-save")
-                        .cursor_pointer()
-                        .bg(theme.bg_hover)
-                        .text_color(theme.text_primary)
-                        .px_2()
-                        .rounded_md()
-                        .child("Uložit")
+                    ui::button("cell-editor-save", "Uložit", theme)
                         .on_click(cx.listener(|this, _, _, cx| this.commit_cell_editor(cx))),
                 ).child(
-                    div()
-                        .id("cell-editor-null")
-                        .cursor_pointer()
-                        .bg(theme.bg_hover)
-                        .text_color(theme.text_primary)
-                        .px_2()
-                        .rounded_md()
-                        .child("NULL")
+                    ui::button("cell-editor-null", "NULL", theme)
                         .on_click(cx.listener(|this, _, _, cx| this.commit_cell_editor_null(cx))),
                 ).child(
-                    div()
-                        .id("cell-editor-cancel")
-                        .cursor_pointer()
-                        .bg(theme.bg_hover)
-                        .text_color(theme.text_primary)
-                        .px_2()
-                        .rounded_md()
-                        .child("Zrušit")
+                    ui::button("cell-editor-cancel", "Zrušit", theme)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.cell_editor = None;
                             cx.notify();
@@ -2502,7 +2452,7 @@ impl ResultGrid {
         let checked = self.fk_checked.get(col).cloned().unwrap_or_default();
         let left = self.fk_menu_left_offset(col);
         let top = if self.filters_open { ROW_HEIGHT * 2.0 } else { ROW_HEIGHT };
-        let mut panel = div()
+        let mut panel = ui::surface(theme)
             .id("fk-menu")
             .absolute()
             .top(px(top))
@@ -2510,10 +2460,6 @@ impl ResultGrid {
             .w(px(220.))
             .max_h(px(320.))
             .overflow_hidden()
-            .bg(theme.bg_panel)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
             .p_1()
             .flex()
             .flex_col()

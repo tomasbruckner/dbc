@@ -24,6 +24,7 @@ use dbc_buffer::ResultBuffer;
 
 use crate::chart_data::{self, ChartData, ChartKind};
 use crate::theme::{ActiveTheme, Theme};
+use crate::ui;
 
 const PAD_LEFT: f32 = 48.0; // y-axis label gutter
 const PAD_RIGHT: f32 = 8.0;
@@ -165,14 +166,7 @@ impl Render for ChartView {
             .text_color(theme.text_muted)
             .child(format!("Graf: {source_title} ({kind_label})"))
             .child(
-                div()
-                    .id("chart-view-edit")
-                    .cursor_pointer()
-                    .bg(theme.bg_hover)
-                    .text_color(theme.text_primary)
-                    .px_2()
-                    .rounded_md()
-                    .child("Upravit…")
+                ui::button("chart-view-edit", "Upravit…", theme)
                     .on_click(cx.listener(|_this, _, _window, cx| {
                         cx.emit(ChartViewEvent::ReopenPicker);
                     })),

@@ -42,6 +42,7 @@ use gpui::{
 };
 
 use crate::theme::ActiveTheme;
+use crate::ui;
 
 /// Shown in place of a routine/trigger's DDL when the driver didn't provide
 /// one (`RoutineInfo::ddl`/`TriggerInfo::ddl` is `None`).
@@ -2901,14 +2902,10 @@ impl SchemaTree {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = *cx.theme();
-        let mut panel = div()
+        let mut panel = ui::surface(theme)
             .id("tree-context-menu")
             .w(px(240.))
             .py_1()
-            .bg(theme.bg_panel)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
             .occlude()
             .on_mouse_down_out(cx.listener(|this, _, _w, cx| {
                 this.context_menu = None;
@@ -3069,13 +3066,9 @@ pub(crate) struct DragChip {
 
 impl Render for DragChip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        ui::surface(*cx.theme())
             .px_2()
             .py_1()
-            .rounded_md()
-            .bg(cx.theme().bg_panel)
-            .border_1()
-            .border_color(cx.theme().border)
             .text_color(cx.theme().text_primary)
             .child(self.text.clone())
     }

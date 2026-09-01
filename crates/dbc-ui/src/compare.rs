@@ -946,7 +946,7 @@ impl CompareView {
         );
 
         section = section.child(
-            compare_button("compare-run-data-diff", "Porovnat data", &theme).on_click(cx.listener(
+            crate::ui::button("compare-run-data-diff", "Porovnat data", theme).w(px(140.)).on_click(cx.listener(
                 |_v, _, _, cx| {
                     cx.emit(CompareViewEvent::DataDiffRequested);
                 },
@@ -1095,19 +1095,6 @@ fn compare_row(id: SharedString, label: String, tint: Option<Hsla>, selected: bo
         row = row.text_color(theme.warn);
     }
     row
-}
-
-fn compare_button(id: &'static str, label: &'static str, theme: &Theme) -> Stateful<Div> {
-    div()
-        .id(id)
-        .px_2()
-        .py_1()
-        .w(px(140.))
-        .bg(theme.bg_hover)
-        .rounded_md()
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.bg_selected))
-        .child(label)
 }
 
 fn ddl_block(text: &str, theme: &Theme) -> impl IntoElement {

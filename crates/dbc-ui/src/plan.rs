@@ -1795,6 +1795,7 @@ use gpui::{
 };
 
 use crate::theme::ActiveTheme;
+use crate::ui;
 
 /// Stable pre-order index into `PlanView`'s `index` (`build_index`'s
 /// output) — NOT a path (see the perf deviation note above). Stable for
@@ -2180,14 +2181,10 @@ impl Render for PlanView {
         );
 
         if let Some(detail) = &self.node_detail {
-            let panel = div()
+            let panel = ui::surface(theme)
                 .id("plan-node-detail-panel")
                 .w(px(560.))
                 .max_h(px(420.))
-                .bg(theme.bg_panel)
-                .border_1()
-                .border_color(theme.border)
-                .rounded_md()
                 .flex()
                 .flex_col()
                 .child(
@@ -2203,14 +2200,7 @@ impl Render for PlanView {
                 )
                 .child(
                     div().flex().flex_row().justify_end().gap_2().p_2().child(
-                        div()
-                            .id("plan-node-detail-close")
-                            .cursor_pointer()
-                            .bg(theme.bg_hover)
-                            .text_color(theme.text_primary)
-                            .px_2()
-                            .rounded_md()
-                            .child("Zavřít")
+                        ui::button("plan-node-detail-close", "Zavřít", theme)
                             .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                 this.node_detail = None;
                                 cx.notify();

@@ -12,6 +12,7 @@ use crate::monitor;
 use crate::monitor_sql;
 use crate::runner;
 use crate::theme::{ActiveTheme, Theme};
+use crate::ui;
 
 // Duration colour tiers (design §5 — constants live HERE, not monitor.rs).
 pub const DURATION_WARN_SECS: f64 = 1.0;
@@ -238,17 +239,8 @@ impl MonitorView {
 /// Base card styling shared by the four tiles (design §5 — `bg_panel`/
 /// `border`, matching `connections_ui.rs`'s panels).
 fn card(theme: &Theme) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .p_2()
+    ui::popover(*theme)
         .w(px(220.))
-        .bg(theme.bg_panel)
-        .border_1()
-        .border_color(theme.border)
-        .rounded_md()
-        .text_color(theme.text_primary)
 }
 
 fn card_title(label: &str) -> Div {
@@ -645,14 +637,10 @@ impl MonitorView {
         let theme = *cx.theme();
         let text = self.detail.clone()?;
         let text_for_copy = text.clone();
-        let panel = div()
+        let panel = ui::surface(theme)
             .id("mon-detail-panel")
             .w(px(560.))
             .max_h(px(420.))
-            .bg(theme.bg_panel)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
             .flex()
             .flex_col()
             .child(
@@ -673,27 +661,13 @@ impl MonitorView {
                     .gap_2()
                     .p_2()
                     .child(
-                        div()
-                            .id("mon-detail-copy")
-                            .cursor_pointer()
-                            .bg(theme.bg_hover)
-                            .text_color(theme.text_primary)
-                            .px_2()
-                            .rounded_md()
-                            .child("Kopírovat")
+                        ui::button("mon-detail-copy", "Kopírovat", theme)
                             .on_click(cx.listener(move |_, _, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(text_for_copy.clone()));
                             })),
                     )
                     .child(
-                        div()
-                            .id("mon-detail-close")
-                            .cursor_pointer()
-                            .bg(theme.bg_hover)
-                            .text_color(theme.text_primary)
-                            .px_2()
-                            .rounded_md()
-                            .child("Zavřít")
+                        ui::button("mon-detail-close", "Zavřít", theme)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.detail = None;
                                 cx.notify();

@@ -42,7 +42,7 @@ use gpui::{
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
     LayoutId, Modifiers,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Stateful, Style, TextRun, UTF16Selection, UnderlineStyle,
+    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
     uniform_list, Window,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -51,6 +51,7 @@ use crate::backup;
 use crate::chart_data::ChartKind;
 use crate::runner::ConnectSpec;
 use crate::text_model::MultilineBuffer;
+use crate::ui;
 use crate::theme::{ActiveTheme, Theme};
 use crate::AppView;
 
@@ -2003,7 +2004,7 @@ impl AppView {
             .text_color(theme.text_primary)
             // ☰ first, the way every app with a collapsed menu does it.
             .child(
-                bar_button("top-bar-menu", "☰", self.app_menu_open, true, theme).on_click(
+                ui::toolbar_button("top-bar-menu", "☰", self.app_menu_open, true, theme).on_click(
                     cx.listener(|view, _, _, cx| {
                         view.app_menu_open = !view.app_menu_open;
                         view.dropdown_open = false;
@@ -2044,29 +2045,29 @@ impl AppView {
             .child(div().flex_1())
             // Panel toggles. Lit = open, so the bar always says which
             // panels exist even when they are hidden.
-            .child(bar_button("top-bar-tree", "Strom", tree_on, true, theme).on_click(
+            .child(ui::toolbar_button("top-bar-tree", "Strom", tree_on, true, theme).on_click(
                 cx.listener(|view, _, window, cx| {
                     view.on_toggle_tree(&crate::ToggleTree, window, cx)
                 }),
             ))
-            .child(bar_button("top-bar-history", "Historie", history_on, true, theme).on_click(
+            .child(ui::toolbar_button("top-bar-history", "Historie", history_on, true, theme).on_click(
                 cx.listener(|view, _, window, cx| {
                     view.on_toggle_history(&crate::ToggleHistory, window, cx)
                 }),
             ))
-            .child(bar_separator(theme))
+            .child(ui::toolbar_separator(theme))
             // „Formátovat" (user request 2026-08-28), Ctrl+Shift+F. Dimmed
             // with no active connection, because the dialect comes from the
             // engine and formatting by the wrong dialect would reflow the
             // user's SQL against the wrong lexical rules.
             .child(
-                bar_button("top-bar-format", "Formátovat", false, format_enabled, theme).on_click(
+                ui::toolbar_button("top-bar-format", "Formátovat", false, format_enabled, theme).on_click(
                     cx.listener(|view, _, window, cx| {
                         view.on_format_sql(&crate::FormatSql, window, cx);
                     }),
                 ),
             )
-            .child(bar_separator(theme))
+            .child(ui::toolbar_separator(theme))
             .child(
                 div()
                     .pr_2()
@@ -2083,20 +2084,11 @@ impl AppView {
 
     pub(crate) fn render_dropdown_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let grouped = self.grouped_cache.clone();
-        let mut panel = div()
+        let mut panel = ui::popover(*cx.theme())
             .absolute()
             .top(px(32.))
             .left(px(4.))
             .w(px(340.))
-            .bg(cx.theme().bg_panel)
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded_md()
-            .p_2()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .text_color(cx.theme().text_primary)
             .occlude()
             .on_mouse_down_out(cx.listener(|view, _, _, cx| {
                 view.dropdown_open = false;
@@ -2344,18 +2336,8 @@ impl AppView {
         // (two different shapes per mode), which a single `div().child(..)`
         // chain cannot express — hence the rebindable local. Split exactly
         // at the theme radios; nothing above changed.
-        let mut panel = div()
+        let mut panel = ui::panel(360., *cx.theme())
             .id("settings-panel")
-            .w(px(360.))
-            .bg(cx.theme().bg_panel)
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded_md()
-            .p_4()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .text_color(cx.theme().text_primary)
             .child(div().text_size(px(16.)).child("Nastavení"))
             .child(div().text_color(cx.theme().text_muted).child("Motiv"))
             .child(radio("settings-theme-dark", "Tmavý", dbc_state::ThemeMode::Dark, mode, cx))
@@ -2382,26 +2364,12 @@ impl AppView {
             // has (§W3.2 copies from the PROFILE); the way out is the
             // profile and back.
             Some(_) => panel.child(
-                div()
-                    .id("settings-workspace-leave")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(cx.theme().bg_hover)
-                    .cursor_pointer()
-                    .child(WORKSPACE_SETTINGS_LEAVE)
+                ui::row_button("settings-workspace-leave", WORKSPACE_SETTINGS_LEAVE, *cx.theme())
                     .on_click(cx.listener(|this, _, _, cx| this.start_leave_workspace(cx))),
             ),
             None => panel
                 .child(
-                    div()
-                        .id("settings-workspace-pick")
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .bg(cx.theme().bg_hover)
-                        .cursor_pointer()
-                        .child(WORKSPACE_SETTINGS_PICK)
+                    ui::row_button("settings-workspace-pick", WORKSPACE_SETTINGS_PICK, *cx.theme())
                         .on_click(cx.listener(|this, _, _, cx| this.start_workspace_pick(cx))),
                 )
                 // §W6.3(b): the warning renders STATICALLY wherever the
@@ -2435,25 +2403,11 @@ impl AppView {
                 panel
                     .child(div().text_color(cx.theme().text_muted).child(current))
                     .child(
-                        div()
-                            .id("settings-scripts-pick")
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(cx.theme().bg_hover)
-                            .cursor_pointer()
-                            .child(SCRIPTS_SETTINGS_PICK)
+                        ui::row_button("settings-scripts-pick", SCRIPTS_SETTINGS_PICK, *cx.theme())
                             .on_click(cx.listener(|this, _, _, cx| this.start_scripts_dir_pick(cx))),
                     )
                     .child(
-                        div()
-                            .id("settings-scripts-clear")
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(cx.theme().bg_hover)
-                            .cursor_pointer()
-                            .child(SCRIPTS_SETTINGS_CLEAR)
+                        ui::row_button("settings-scripts-clear", SCRIPTS_SETTINGS_CLEAR, *cx.theme())
                             .on_click(cx.listener(|this, _, _, cx| this.clear_scripts_dir(cx))),
                     )
             }
@@ -2478,39 +2432,18 @@ impl AppView {
                     .child(crate::transfer_ui::TRANSFER_SETTINGS_NOTE),
             )
             .child(
-                div()
-                    .id("settings-transfer-export")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(cx.theme().bg_hover)
-                    .cursor_pointer()
-                    .child(crate::transfer_ui::TRANSFER_SETTINGS_EXPORT)
+                ui::row_button("settings-transfer-export", crate::transfer_ui::TRANSFER_SETTINGS_EXPORT, *cx.theme())
                     .on_click(cx.listener(|this, _, _, cx| this.start_settings_export(cx))),
             )
             .child(
-                div()
-                    .id("settings-transfer-import")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(cx.theme().bg_hover)
-                    .cursor_pointer()
-                    .child(crate::transfer_ui::TRANSFER_SETTINGS_IMPORT)
+                ui::row_button("settings-transfer-import", crate::transfer_ui::TRANSFER_SETTINGS_IMPORT, *cx.theme())
                     .on_click(cx.listener(|this, _, _, cx| this.start_settings_import(cx))),
             );
 
         panel
             .child(
-                div()
-                    .id("settings-close")
+                ui::row_button("settings-close", "Zavřít", *cx.theme())
                     .mt_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(cx.theme().bg_hover)
-                    .cursor_pointer()
-                    .child("Zavřít")
                     .on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))),
             )
             .into_any_element()
@@ -3916,63 +3849,6 @@ mod test_vault_prompt_tests {
     }
 }
 
-/// Width of the label column in every dialog `field_row` builds.
-///
-/// It was 130 px, and „Databaze (vychozi)" did not fit: the text wrapped
-/// and left the closing bracket alone on a second line, which is what the
-/// user photographed on 2026-09-01. Sized here for the LONGEST label the
-/// app passes — „ODBC driver (volitelne)", 23 characters — not for the one
-/// that happened to be reported.
-///
-/// The two modifiers beside it matter as much as the number.
-/// `whitespace_nowrap` is the actual guarantee: a label too long for the
-/// column now overflows by a few pixels instead of folding, so the failure
-/// mode of guessing this width wrong is cosmetic rather than the broken
-/// line above. `flex_none` stops a long VALUE from squeezing the column
-/// back down and reintroducing the wrap from the other side.
-pub(crate) const FIELD_LABEL_W: f32 = 176.;
-
-fn field_row(label: &str, field: Entity<TextField>, theme: Theme) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .w(px(FIELD_LABEL_W))
-                .flex_none()
-                .whitespace_nowrap()
-                .text_color(theme.text_muted)
-                .child(label.to_string()),
-        )
-        .child(div().flex_1().child(field))
-}
-
-fn styled_button(id: &'static str, label: &'static str, theme: Theme) -> Stateful<Div> {
-    div()
-        .id(id)
-        .px_3()
-        .py_1()
-        .bg(theme.bg_hover)
-        .rounded_md()
-        .cursor_pointer()
-        .hover(move |s| s.bg(theme.bg_selected))
-        .child(label)
-}
-
-fn checkbox(id: &'static str, label: &'static str, checked: bool) -> Stateful<Div> {
-    let mark = if checked { "☑" } else { "☐" };
-    div()
-        .id(id)
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_1()
-        .cursor_pointer()
-        .child(format!("{mark} {label}"))
-}
-
 fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) -> impl IntoElement {
     let id = c.id.clone();
     let star_id = c.id.clone();
@@ -4095,19 +3971,9 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
     };
     let testing = ui.testing;
 
-    let mut panel: Div = div()
-        .w(px(480.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
+    let mut panel: Div = ui::panel(480., *cx.theme())
         .child(div().text_size(px(16.)).child(title))
-        .child(field_row("Název", ui.name.clone(), *cx.theme()))
+        .child(ui::field_row("Název", ui.name.clone(), *cx.theme()))
         .child(
             div()
                 .flex()
@@ -4121,31 +3987,24 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
                 .child(ALL_ENGINES.iter().fold(div().flex().gap_1(), |row, &e| {
                     let selected = ui.engine == e;
                     row.child(
-                        div()
-                            .id(SharedString::from(format!("engine-{}", engine_label(e))))
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(if selected { cx.theme().accent } else { cx.theme().bg_hover })
-                            .text_color(if selected {
-                                cx.theme().bg_panel
-                            } else {
-                                cx.theme().text_muted
-                            })
-                            .cursor_pointer()
-                            .child(engine_label(e))
-                            .on_click(cx.listener(move |view, _, _, cx| view.set_engine(e, cx))),
+                        ui::segmented_option(
+                            SharedString::from(format!("engine-{}", engine_label(e))),
+                            engine_label(e),
+                            selected,
+                            *cx.theme(),
+                        )
+                        .on_click(cx.listener(move |view, _, _, cx| view.set_engine(e, cx))),
                     )
                 })),
         )
-        .child(field_row("Host", ui.host.clone(), *cx.theme()))
-        .child(field_row("Port", ui.port.clone(), *cx.theme()))
+        .child(ui::field_row("Host", ui.host.clone(), *cx.theme()))
+        .child(ui::field_row("Port", ui.port.clone(), *cx.theme()))
         // Sidebar rework (design §8 — label only, config shape untouched):
         // for server engines this field names the DEFAULT database of a
         // multi-database connection; for file engines "výchozí" would be
         // meaningless (one file, one database), so the plain label stays
         // alongside G16's file-path hint row below.
-        .child(field_row(
+        .child(ui::field_row(
             if engine_is_file_based(ui.engine) { "Databáze" } else { "Databáze (výchozí)" },
             ui.database.clone(),
             *cx.theme(),
@@ -4162,30 +4021,30 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
         );
     }
     panel = panel
-        .child(field_row("Uživatel", ui.user.clone(), *cx.theme()))
-        .child(field_row("Heslo", ui.password.clone(), *cx.theme()))
-        .child(field_row("Složka", ui.folder.clone(), *cx.theme()))
-        .child(field_row("Timeout (s)", ui.timeout_secs.clone(), *cx.theme()))
-        .child(field_row("Auto-limit řádků", ui.auto_limit.clone(), *cx.theme()))
+        .child(ui::field_row("Uživatel", ui.user.clone(), *cx.theme()))
+        .child(ui::field_row("Heslo", ui.password.clone(), *cx.theme()))
+        .child(ui::field_row("Složka", ui.folder.clone(), *cx.theme()))
+        .child(ui::field_row("Timeout (s)", ui.timeout_secs.clone(), *cx.theme()))
+        .child(ui::field_row("Auto-limit řádků", ui.auto_limit.clone(), *cx.theme()))
         .child(
             div()
                 .flex()
                 .flex_row()
                 .gap_4()
-                .child(checkbox("chk-read-only", "Pouze pro čtení", ui.read_only).on_click(cx.listener(|v, _, _, cx| v.toggle_read_only(cx))))
-                .child(checkbox("chk-favourite", "Oblíbené", ui.favourite).on_click(cx.listener(|v, _, _, cx| v.toggle_favourite(cx)))),
+                .child(ui::checkbox("chk-read-only", "Pouze pro čtení", ui.read_only).on_click(cx.listener(|v, _, _, cx| v.toggle_read_only(cx))))
+                .child(ui::checkbox("chk-favourite", "Oblíbené", ui.favourite).on_click(cx.listener(|v, _, _, cx| v.toggle_favourite(cx)))),
         )
         .child(
-            checkbox("chk-ssh", "SSH tunel (jen klíč/agent)", ui.ssh_enabled)
+            ui::checkbox("chk-ssh", "SSH tunel (jen klíč/agent)", ui.ssh_enabled)
                 .on_click(cx.listener(|v, _, _, cx| v.toggle_ssh_enabled(cx))),
         );
 
     if ui.ssh_enabled {
         panel = panel
-            .child(field_row("SSH host", ui.ssh_host.clone(), *cx.theme()))
-            .child(field_row("SSH port", ui.ssh_port.clone(), *cx.theme()))
-            .child(field_row("SSH uživatel", ui.ssh_user.clone(), *cx.theme()))
-            .child(field_row("SSH klíč (cesta)", ui.ssh_key_path.clone(), *cx.theme()));
+            .child(ui::field_row("SSH host", ui.ssh_host.clone(), *cx.theme()))
+            .child(ui::field_row("SSH port", ui.ssh_port.clone(), *cx.theme()))
+            .child(ui::field_row("SSH uživatel", ui.ssh_user.clone(), *cx.theme()))
+            .child(ui::field_row("SSH klíč (cesta)", ui.ssh_key_path.clone(), *cx.theme()));
     }
 
     if ui.engine == Engine::Mssql {
@@ -4196,11 +4055,11 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
                     .flex_row()
                     .gap_4()
                     .child(
-                        checkbox("chk-mssql-encrypt", "Šifrovat připojení (Encrypt)", ui.mssql_encrypt)
+                        ui::checkbox("chk-mssql-encrypt", "Šifrovat připojení (Encrypt)", ui.mssql_encrypt)
                             .on_click(cx.listener(|v, _, _, cx| v.toggle_mssql_encrypt(cx))),
                     )
                     .child(
-                        checkbox(
+                        ui::checkbox(
                             "chk-mssql-trust",
                             "Důvěřovat certifikátu serveru (TrustServerCertificate)",
                             ui.mssql_trust_cert,
@@ -4208,7 +4067,7 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
                         .on_click(cx.listener(|v, _, _, cx| v.toggle_mssql_trust(cx))),
                     ),
             )
-            .child(field_row("ODBC driver (volitelné)", ui.mssql_driver.clone(), *cx.theme()))
+            .child(ui::field_row("ODBC driver (volitelné)", ui.mssql_driver.clone(), *cx.theme()))
             // Read-only honesty, UI half (§1a): rendered only for MSSQL.
             .child(
                 div()
@@ -4234,9 +4093,9 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("dlg-test", test_label, *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_test_clicked(window, cx))))
-            .child(styled_button("dlg-save", "Uložit", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_save_clicked(window, cx))))
-            .child(styled_button("dlg-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx)))),
+            .child(ui::button("dlg-test", test_label, *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_test_clicked(window, cx))))
+            .child(ui::button("dlg-save", "Uložit", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_save_clicked(window, cx))))
+            .child(ui::button("dlg-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx)))),
     );
 
     panel.into_any_element()
@@ -4259,25 +4118,15 @@ fn render_pw_change_panel(
     running: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let mut panel: Div = div()
-        .w(px(420.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
+    let mut panel: Div = ui::panel(420., *cx.theme())
         .child(div().text_size(px(16.)).child("Změna hesla na serveru"))
         .child(div().text_color(cx.theme().text_muted).child(crate::pwchange::dialog_body(kind, user)))
-        .child(field_row("Nové heslo", new1, *cx.theme()))
-        .child(field_row("Nové heslo znovu", new2, *cx.theme()));
+        .child(ui::field_row("Nové heslo", new1, *cx.theme()))
+        .child(ui::field_row("Nové heslo znovu", new2, *cx.theme()));
     if kind == crate::pwchange::PwChangeKind::PgMaybeExpired {
         panel = panel
-            .child(field_row("Admin uživatel", admin_user, *cx.theme()))
-            .child(field_row("Admin heslo", admin_password, *cx.theme()))
+            .child(ui::field_row("Admin uživatel", admin_user, *cx.theme()))
+            .child(ui::field_row("Admin heslo", admin_password, *cx.theme()))
             .child(
                 div().text_color(cx.theme().text_muted).child(crate::pwchange::pg_rescue_display(user)),
             );
@@ -4285,8 +4134,8 @@ fn render_pw_change_panel(
     if let Some(e) = error {
         panel = panel.child(div().text_color(cx.theme().danger).child(e));
     }
-    let mut cancel = styled_button("pwch-cancel", "Zrušit", *cx.theme());
-    let mut submit = styled_button(
+    let mut cancel = ui::button("pwch-cancel", "Zrušit", *cx.theme());
+    let mut submit = ui::button(
         "pwch-submit",
         if running { "měním heslo…" } else { "Změnit heslo" },
         *cx.theme(),
@@ -4368,44 +4217,6 @@ fn caption_button(kind: CaptionButton, theme: crate::theme::Theme) -> gpui::Stat
         .child(kind.glyph())
 }
 
-/// One top-bar control. `active` lights it as an on/off state (the panel
-/// toggles); `enabled` dims it and is otherwise cosmetic — every caller
-/// whose action can refuse still refuses at click time, which is this
-/// codebase's existing posture for the palette.
-fn bar_button(
-    id: &'static str,
-    label: &'static str,
-    active: bool,
-    enabled: bool,
-    theme: crate::theme::Theme,
-) -> gpui::Stateful<Div> {
-    let fg = match (enabled, active) {
-        (false, _) => theme.border,
-        (true, true) => theme.text_primary,
-        (true, false) => theme.text_muted,
-    };
-    div()
-        .id(id)
-        // Every top-bar button sits inside the window's drag area, so it
-        // has to declare itself as something other than caption or the
-        // platform swallows the click.
-        .occlude()
-        .px_2()
-        .py(px(3.))
-        .rounded_md()
-        .cursor_pointer()
-        .text_color(fg)
-        .bg(if active { theme.bg_hover } else { theme.bg_app })
-        .hover(|s| s.bg(theme.bg_hover).text_color(theme.text_primary))
-        .child(label)
-}
-
-/// A hairline between groups of top-bar controls. Grouping is what makes a
-/// row of buttons readable at a glance instead of a wall of words.
-fn bar_separator(theme: crate::theme::Theme) -> Div {
-    div().w(px(1.)).h(px(16.)).mx_1().bg(theme.border)
-}
-
 fn folder_label(path: &[String]) -> String {
     if path.is_empty() { "kořen".to_string() } else { path.join(" / ") }
 }
@@ -4421,20 +4232,10 @@ fn render_folder_name_panel(
         Some(path) => ("Přejmenovat složku".to_string(), folder_label(path)),
         None => ("Nová složka".to_string(), format!("v {}", folder_label(&parent))),
     };
-    let mut panel = div()
-        .w(px(420.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
+    let mut panel = ui::panel(420., *cx.theme())
         .child(div().text_size(px(16.)).child(title))
         .child(div().text_color(cx.theme().text_muted).child(hint))
-        .child(field_row("Název", field, *cx.theme()));
+        .child(ui::field_row("Název", field, *cx.theme()));
     if let Some(e) = error {
         panel = panel.child(div().text_color(cx.theme().danger).child(e));
     }
@@ -4446,13 +4247,13 @@ fn render_folder_name_panel(
                 .gap_2()
                 .justify_end()
                 .mt_2()
-                .child(styled_button("folder-name-cancel", "Zrušit", *cx.theme()).on_click(
+                .child(ui::button("folder-name-cancel", "Zrušit", *cx.theme()).on_click(
                     cx.listener(|v, _, _, cx| {
                         v.modal = None;
                         cx.notify();
                     }),
                 ))
-                .child(styled_button("folder-name-ok", "Uložit", *cx.theme()).on_click(
+                .child(ui::button("folder-name-ok", "Uložit", *cx.theme()).on_click(
                     cx.listener(|v, _, _, cx| v.confirm_folder_name(cx)),
                 )),
         )
@@ -4472,17 +4273,7 @@ fn render_folder_delete_panel(
         1 => "1 připojení se přesune o úroveň výš. Nic se nesmaže.".to_string(),
         n => format!("{n} připojení se přesune o úroveň výš. Nic se nesmaže."),
     };
-    div()
-        .w(px(460.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
+    ui::panel(460., *cx.theme())
         .child(div().text_size(px(16.)).child("Smazat složku"))
         .child(div().text_color(cx.theme().text_muted).child(folder_label(&path)))
         .child(div().child(note))
@@ -4493,13 +4284,13 @@ fn render_folder_delete_panel(
                 .gap_2()
                 .justify_end()
                 .mt_2()
-                .child(styled_button("folder-del-cancel", "Zrušit", *cx.theme()).on_click(
+                .child(ui::button("folder-del-cancel", "Zrušit", *cx.theme()).on_click(
                     cx.listener(|v, _, _, cx| {
                         v.modal = None;
                         cx.notify();
                     }),
                 ))
-                .child(styled_button("folder-del-ok", "Smazat složku", *cx.theme()).on_click(
+                .child(ui::button("folder-del-ok", "Smazat složku", *cx.theme()).on_click(
                     cx.listener(|v, _, _, cx| v.confirm_folder_delete(cx)),
                 )),
         )
@@ -4511,17 +4302,7 @@ fn render_connection_delete_panel(
     secret_stays: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let mut panel: Div = div()
-        .w(px(460.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
+    let mut panel: Div = ui::panel(460., *cx.theme())
         .child(div().text_size(px(16.)).child("Smazat připojení"))
         .child(div().child(connection_delete_text(name)));
     if secret_stays {
@@ -4536,13 +4317,13 @@ fn render_connection_delete_panel(
                 .gap_2()
                 .justify_end()
                 .mt_2()
-                .child(styled_button("conn-del-cancel", "Zrušit", *cx.theme()).on_click(
+                .child(ui::button("conn-del-cancel", "Zrušit", *cx.theme()).on_click(
                     cx.listener(|v, _, _, cx| {
                         v.modal = None;
                         cx.notify();
                     }),
                 ))
-                .child(styled_button("conn-del-ok", "Smazat připojení", *cx.theme()).on_click(
+                .child(ui::button("conn-del-ok", "Smazat připojení", *cx.theme()).on_click(
                     cx.listener(|v, _, _, cx| v.confirm_connection_delete(cx)),
                 )),
         )
@@ -4558,17 +4339,7 @@ fn render_settings_import_panel(
     error: &Option<String>,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let mut panel: Div = div()
-        .w(px(560.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
+    let mut panel: Div = ui::panel(560., *cx.theme())
         .child(div().text_size(px(16.)).child(crate::transfer_ui::IMPORT_CONFIRM_TITLE))
         .child(div().text_color(cx.theme().text_muted).child(path.display().to_string()));
     for line in lines {
@@ -4589,7 +4360,7 @@ fn render_settings_import_panel(
                 .justify_end()
                 .mt_2()
                 .child(
-                    styled_button(
+                    ui::button(
                         "settings-import-cancel",
                         crate::transfer_ui::IMPORT_CONFIRM_CANCEL,
                         *cx.theme(),
@@ -4600,7 +4371,7 @@ fn render_settings_import_panel(
                     })),
                 )
                 .child(
-                    styled_button(
+                    ui::button(
                         "settings-import-ok",
                         crate::transfer_ui::IMPORT_CONFIRM_OK,
                         *cx.theme(),
@@ -4617,24 +4388,14 @@ fn render_master_password_panel(
     verifying: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let mut panel: Div = div()
-        .w(px(360.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
+    let mut panel: Div = ui::panel(360., *cx.theme())
         .child(div().text_size(px(16.)).child("Odemknout trezor"))
         .child(
             div()
                 .text_color(cx.theme().text_muted)
                 .child("Master heslo platí pro celou aplikaci — zadáte ho nejvýše jednou za spuštění."),
         )
-        .child(field_row("Heslo", input, *cx.theme()));
+        .child(ui::field_row("Heslo", input, *cx.theme()));
     if let Some(e) = error {
         panel = panel.child(div().text_color(cx.theme().danger).child(e));
     }
@@ -4652,9 +4413,9 @@ fn render_master_password_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("mpp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.cancel_master_password_prompt(cx))))
+            .child(ui::button("mpp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.cancel_master_password_prompt(cx))))
             .child(
-                styled_button(
+                ui::button(
                     "mpp-submit",
                     if verifying { "Ověřuji…" } else { "Odemknout" },
                     *cx.theme(),
@@ -4671,25 +4432,15 @@ fn render_create_master_password_panel(
     error: Option<String>,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let mut panel: Div = div()
-        .w(px(360.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
+    let mut panel: Div = ui::panel(360., *cx.theme())
         .child(div().text_size(px(16.)).child("Vytvořit master heslo"))
         .child(
             div()
                 .text_color(cx.theme().text_muted)
                 .child("Master heslo platí pro celou aplikaci — zadáte ho nejvýše jednou za spuštění."),
         )
-        .child(field_row("Nové heslo", input1, *cx.theme()))
-        .child(field_row("Zopakujte heslo", input2, *cx.theme()));
+        .child(ui::field_row("Nové heslo", input1, *cx.theme()))
+        .child(ui::field_row("Zopakujte heslo", input2, *cx.theme()));
     if let Some(e) = error {
         panel = panel.child(div().text_color(cx.theme().danger).child(e));
     }
@@ -4700,8 +4451,8 @@ fn render_create_master_password_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("cmp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
-            .child(styled_button("cmp-submit", "Vytvořit", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_create_master_password_submit(window, cx)))),
+            .child(ui::button("cmp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+            .child(ui::button("cmp-submit", "Vytvořit", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_create_master_password_submit(window, cx)))),
     );
     panel.into_any_element()
 }
@@ -4735,18 +4486,8 @@ fn render_query_params_panel(
         .collect();
     let preview = crate::build_param_sql(&sql_template, &names, &values);
 
-    let mut panel: Div = div()
-        .w(px(480.))
+    let mut panel: Div = ui::panel(480., *cx.theme())
         .max_h(px(520.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Hodnoty parametrů"));
 
     for (i, name) in names.iter().enumerate() {
@@ -4802,8 +4543,8 @@ fn render_query_params_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("qp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.cancel_query_params(cx))))
-            .child(styled_button("qp-run", "Spustit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.confirm_query_params(cx)))),
+            .child(ui::button("qp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.cancel_query_params(cx))))
+            .child(ui::button("qp-run", "Spustit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.confirm_query_params(cx)))),
     );
     panel.into_any_element()
 }
@@ -4906,17 +4647,7 @@ fn render_kill_confirm_panel(
     dispatched: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let mut panel: Div = div()
-        .w(px(520.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
+    let mut panel: Div = ui::panel(520., *cx.theme())
         .child(div().text_size(px(16.)).child("Ukončit proces"))
         .child(format!("Opravdu ukončit proces {pid} ({label})?"))
         .child(
@@ -4935,17 +4666,10 @@ fn render_kill_confirm_panel(
     }
 
     let confirm_button = if dispatched {
-        div()
-            .id("kill-confirm")
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .bg(cx.theme().bg_hover)
-            .text_color(cx.theme().text_disabled)
-            .child("Ukončuji…")
+        ui::button_state("kill-confirm", "Ukončuji…", false, *cx.theme())
             .into_any_element()
     } else {
-        styled_button("kill-confirm", "Ukončit proces", *cx.theme())
+        ui::button("kill-confirm", "Ukončit proces", *cx.theme())
             .bg(cx.theme().diff_deleted_bg) // danger tint — DELETED_ROW_BG family
             .on_click(cx.listener(|v, _, _, cx| v.confirm_kill_confirm(cx)))
             .into_any_element()
@@ -4959,7 +4683,7 @@ fn render_kill_confirm_panel(
             .justify_end()
             .mt_2()
             .child(
-                styled_button("kill-cancel", "Zrušit", *cx.theme())
+                ui::button("kill-cancel", "Zrušit", *cx.theme())
                     .on_click(cx.listener(|v, _, _, cx| v.cancel_kill_confirm(cx))),
             )
             .child(confirm_button),
@@ -4990,18 +4714,8 @@ fn render_analyze_write_confirm_panel(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let sql = sql.to_string();
-    let mut panel = div()
+    let mut panel = ui::panel(520., *cx.theme())
         .id("analyze-write-confirm")
-        .w(px(520.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Analyzovat (EXPLAIN ANALYZE)"))
         .child(div().text_color(cx.theme().warn).child(
             "Toto SQL bude SKUTEČNĚ PROVEDENO, aby bylo možné změřit skutečný plán, a poté vráceno \
@@ -5034,20 +4748,16 @@ fn render_analyze_write_confirm_panel(
             .justify_end()
             .mt_2()
             .child(
-                div()
-                    .id("analyze-write-cancel")
+                ui::button_state("analyze-write-cancel", "Zrušit", !running, *cx.theme())
+                    // The handler is attached only while enabled, so the
+                    // dimming and the refusal are the same fact rather
+                    // than two that could disagree.
                     .when(!running, |d| {
-                        d.cursor_pointer().on_click(cx.listener(|v, _, _, cx| {
+                        d.on_click(cx.listener(|v, _, _, cx| {
                             v.modal = None;
                             cx.notify();
                         }))
-                    })
-                    .bg(cx.theme().bg_hover)
-                    .text_color(if running { cx.theme().text_disabled } else { cx.theme().text_primary })
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .child("Zrušit"),
+                    }),
             )
             .child(
                 div()
@@ -5128,21 +4838,18 @@ fn workspace_choice_button(
 ) -> gpui::Stateful<gpui::Div> {
     let ring = cx.theme().accent;
     let base = cx.theme().bg_hover;
-    div()
-        .id(id)
+    // `ui::button` plus the three things that make it a tabbable CHOICE.
+    // Composed rather than parameterised: this is the only button in the
+    // app that takes keyboard focus, and a `focusable: bool` on the shared
+    // component would be a flag for exactly one caller.
+    ui::button(id, label, *cx.theme())
         .track_focus(&focus[idx])
         .key_context(WORKSPACE_CHOICE_CONTEXT)
         .tab_index(idx as isize)
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .bg(base)
         .border_1()
         .border_color(base)
         // Keyboard users must SEE which choice Enter/Space would take.
         .focus(|s| s.border_color(ring))
-        .cursor_pointer()
-        .child(label)
 }
 
 fn render_workspace_missing_panel(
@@ -5181,7 +4888,7 @@ fn render_workspace_missing_panel(
     // otherwise consume the keystroke before any listener ran. `space`
     // has no binding anywhere, so it still arrives as a plain key event.
     let button = workspace_choice_button;
-    let mut panel = div()
+    let mut panel = ui::panel(460., *cx.theme())
         .id("workspace-missing-panel")
         // T4 review NIT-11: the panel is a TAB GROUP tracking its own
         // handle, and `AppView::render` focuses that handle when the modal
@@ -5190,16 +4897,6 @@ fn render_workspace_missing_panel(
         // Tab reaches the three choices instead of the window at large.
         .track_focus(panel_focus)
         .tab_group()
-        .w(px(460.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child(WORKSPACE_MISSING_TITLE))
         .child(div().text_color(cx.theme().text_muted).child(path_line))
         .child(div().text_color(cx.theme().danger).child(format!("error: {reason}")));
@@ -5286,20 +4983,10 @@ fn render_workspace_recovery_confirm_panel(
     // one unwrapped flex column with no text wrapping, and a picked path
     // can carry anything the filesystem allows.
     let path_line = dbc_state::workspace::one_line_reason(&picked.display().to_string());
-    let mut panel = div()
+    let mut panel = ui::panel(460., *cx.theme())
         .id("workspace-recovery-confirm-panel")
         .track_focus(panel_focus)
         .tab_group()
-        .w(px(460.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
         .child(
             div().text_size(px(16.)).child(workspace_confirm_title(WorkspaceConfirmMode::Adopt)),
         )
@@ -5744,18 +5431,8 @@ fn render_workspace_confirm_panel(
     running: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let mut panel = div()
+    let mut panel = ui::panel(460., *cx.theme())
         .id("workspace-confirm-panel")
-        .w(px(460.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child(workspace_confirm_title(mode)));
     if let Some(r) = root {
         panel = panel.child(div().text_color(cx.theme().text_muted).child(r.display().to_string()));
@@ -5772,15 +5449,15 @@ fn render_workspace_confirm_panel(
     let confirm_bg = if running { cx.theme().bg_selected } else { cx.theme().bg_hover };
     panel
         .child(
-            div()
-                .id("workspace-confirm-ok")
-                .px_2()
-                .py_1()
-                .rounded_sm()
-                .bg(confirm_bg)
-                .cursor_pointer()
-                .child(if running { "Pracuji…" } else { workspace_confirm_button(mode) })
-                .on_click(cx.listener(|this, _, _, cx| this.confirm_workspace(cx))),
+            ui::row_button(
+                "workspace-confirm-ok",
+                if running { "Pracuji…" } else { workspace_confirm_button(mode) },
+                *cx.theme(),
+            )
+            // Overridden, not parameterised: this is the only confirm whose
+            // weight is carried by its colour.
+            .bg(confirm_bg)
+            .on_click(cx.listener(|this, _, _, cx| this.confirm_workspace(cx))),
         )
         .child(
             // „Zrušit" is inert while `running`, exactly as Esc is
@@ -5793,15 +5470,8 @@ fn render_workspace_confirm_panel(
             // change" makes that a defect, not a nit. Cancelling the
             // WRITE itself is not offered because it cannot be honoured:
             // the copy is already under way and nothing is ever deleted.
-            div()
-                .id("workspace-confirm-cancel")
-                .px_2()
-                .py_1()
-                .rounded_sm()
-                .bg(cx.theme().bg_hover)
-                .when(!running, |d| d.cursor_pointer())
+            ui::row_button("workspace-confirm-cancel", "Zrušit", *cx.theme())
                 .when(running, |d| d.text_color(cx.theme().text_muted))
-                .child("Zrušit")
                 .on_click(cx.listener(|this, _, _, cx| this.cancel_workspace_confirm(cx))),
         )
         .into_any_element()
@@ -5854,18 +5524,8 @@ fn render_compare_dialog_panel(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let both_picked = conn_a.is_some() && conn_b.is_some();
-    let mut panel = div()
+    let mut panel = ui::panel(680., *cx.theme())
         .id("compare-dialog")
-        .w(px(680.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child("Porovnat databáze…"))
         .child(
             div()
@@ -5897,18 +5557,11 @@ fn render_compare_dialog_panel(
     }
 
     let confirm_button = if both_picked {
-        styled_button("compare-confirm", "Spustit porovnání", *cx.theme())
+        ui::button("compare-confirm", "Spustit porovnání", *cx.theme())
             .on_click(cx.listener(|v, _, _, cx| v.confirm_compare_dialog(cx)))
             .into_any_element()
     } else {
-        div()
-            .id("compare-confirm")
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .bg(cx.theme().bg_hover)
-            .text_color(cx.theme().text_disabled)
-            .child("Spustit porovnání")
+        ui::button_state("compare-confirm", "Spustit porovnání", false, *cx.theme())
             .into_any_element()
     };
 
@@ -5919,7 +5572,7 @@ fn render_compare_dialog_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("compare-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| {
+            .child(ui::button("compare-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| {
                 v.modal = None;
                 cx.notify();
             })))
@@ -6056,18 +5709,8 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
     };
     let status = session.status.borrow().clone();
 
-    let mut panel = div()
+    let mut panel = ui::panel(560., *cx.theme())
         .id("backup-restore-panel")
-        .w(px(560.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child(title))
         .child(format!(
             "{} — {} ({})",
@@ -6101,24 +5744,17 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
                         "Pro potvrzení napište přesný název databáze: {}",
                         session.expected_name
                     )))
-                    .child(field_row("Název databáze", input.clone(), *cx.theme()));
+                    .child(ui::field_row("Název databáze", input.clone(), *cx.theme()));
             }
             let typed = session.confirm_input.as_ref().map(|f| f.read(cx).text()).unwrap_or_default();
             let allowed = crate::backup::confirm_matches(&typed, &session.expected_name);
             let confirm_button = if allowed {
-                styled_button("backup-restore-confirm", "Obnovit", *cx.theme())
+                ui::button("backup-restore-confirm", "Obnovit", *cx.theme())
                     .bg(cx.theme().diff_deleted_bg)
                     .on_click(cx.listener(|v, _, _, cx| v.confirm_restore(cx)))
                     .into_any_element()
             } else {
-                div()
-                    .id("backup-restore-confirm")
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .bg(cx.theme().bg_hover)
-                    .text_color(cx.theme().text_disabled)
-                    .child("Obnovit")
+                ui::button_state("backup-restore-confirm", "Obnovit", false, *cx.theme())
                     .into_any_element()
             };
             panel = panel.child(
@@ -6129,7 +5765,7 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
                     .justify_end()
                     .mt_2()
                     .child(
-                        styled_button("backup-restore-cancel", "Zrušit", *cx.theme())
+                        ui::button("backup-restore-cancel", "Zrušit", *cx.theme())
                             .on_click(cx.listener(|v, _, _, cx| v.cancel_backup_restore(cx))),
                     )
                     .child(confirm_button),
@@ -6181,18 +5817,11 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
             // same "dimmed div, no `.on_click`" pattern this file already
             // uses for a disabled Confirming-state "Obnovit".
             let cancel_button = if session.can_cancel() {
-                styled_button("backup-restore-cancel-running", "Zrušit", *cx.theme())
+                ui::button("backup-restore-cancel-running", "Zrušit", *cx.theme())
                     .on_click(cx.listener(|v, _, _, cx| v.cancel_backup_restore(cx)))
                     .into_any_element()
             } else {
-                div()
-                    .id("backup-restore-cancel-running")
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .bg(cx.theme().bg_hover)
-                    .text_color(cx.theme().text_disabled)
-                    .child("nelze přerušit — čeká se na dokončení")
+                ui::button_state("backup-restore-cancel-running", "nelze přerušit — čeká se na dokončení", false, *cx.theme())
                     .into_any_element()
             };
             panel = panel.child(div().flex().flex_row().justify_end().mt_2().child(cancel_button));
@@ -6207,7 +5836,7 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
             panel = panel.child(div().text_color(color).child(line));
             panel = panel.child(
                 div().flex().flex_row().justify_end().mt_2().child(
-                    styled_button("backup-restore-close", "Zavřít", *cx.theme())
+                    ui::button("backup-restore-close", "Zavřít", *cx.theme())
                         .on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))),
                 ),
             );
@@ -6328,18 +5957,8 @@ fn render_script_name_panel(
         _ if parent_rel.is_empty() => "v kořeni knihovny".to_string(),
         _ => format!("ve složce: {parent_rel}"),
     };
-    let mut panel = div()
+    let mut panel = ui::panel(420., theme)
         .id("script-name-panel")
-        .w(px(420.))
-        .bg(theme.bg_panel)
-        .border_1()
-        .border_color(theme.border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(theme.text_primary)
         .child(div().text_size(px(16.)).child(script_name_title(mode)))
         .child(div().text_color(theme.text_muted).child(context_line));
 
@@ -6379,7 +5998,7 @@ fn render_script_name_panel(
         );
     }
 
-    panel = panel.child(field_row("Název", field, theme));
+    panel = panel.child(ui::field_row("Název", field, theme));
     if let Some(e) = error {
         panel = panel.child(div().text_color(script_modal_notice_color(e, theme)).child(e.clone()));
     }
@@ -6393,15 +6012,7 @@ fn render_script_name_panel(
                 .justify_end()
                 .mt_2()
                 .child(
-                    div()
-                        .id("script-name-cancel")
-                        .px_3()
-                        .py_1()
-                        .rounded_md()
-                        .bg(theme.bg_hover)
-                        .when(!running, |d| d.cursor_pointer())
-                        .when(running, |d| d.text_color(theme.text_muted))
-                        .child(SCRIPT_MODAL_CANCEL)
+                    ui::button_state("script-name-cancel", SCRIPT_MODAL_CANCEL, !running, theme)
                         .on_click(cx.listener(|v, _, _, cx| v.cancel_script_modal(cx))),
                 )
                 .child(
@@ -6433,18 +6044,8 @@ fn render_script_delete_panel(
 ) -> AnyElement {
     let theme = *cx.theme();
     let name = rel.rsplit('/').next().unwrap_or(rel);
-    let mut panel = div()
+    let mut panel = ui::panel(420., theme)
         .id("script-delete-panel")
-        .w(px(420.))
-        .bg(theme.bg_panel)
-        .border_1()
-        .border_color(theme.border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(theme.text_primary)
         .child(div().text_size(px(16.)).child(script_delete_text(name, is_dir)));
     if dirty_bound {
         panel = panel.child(div().text_color(theme.warn).child(script_delete_dirty_line()));
@@ -6461,15 +6062,7 @@ fn render_script_delete_panel(
                 .justify_end()
                 .mt_2()
                 .child(
-                    div()
-                        .id("script-delete-cancel")
-                        .px_3()
-                        .py_1()
-                        .rounded_md()
-                        .bg(theme.bg_hover)
-                        .when(!running, |d| d.cursor_pointer())
-                        .when(running, |d| d.text_color(theme.text_muted))
-                        .child(SCRIPT_MODAL_CANCEL)
+                    ui::button_state("script-delete-cancel", SCRIPT_MODAL_CANCEL, !running, theme)
                         .on_click(cx.listener(|v, _, _, cx| v.cancel_script_modal(cx))),
                 )
                 .child(
@@ -6566,18 +6159,8 @@ fn render_script_run_confirm_panel(
         None => "bez timeoutu".to_string(),
     };
 
-    let panel = div()
+    let panel = ui::panel(560., *cx.theme())
         .id("script-run-confirm")
-        .w(px(560.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child(format!("Spustit skript: {source_label}")))
         .child(conn_line)
         .child(file_list)
@@ -6626,9 +6209,9 @@ fn render_script_run_confirm_panel(
                 .gap_2()
                 .justify_end()
                 .mt_2()
-                .child(styled_button("script-run-cancel-modal", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+                .child(ui::button("script-run-cancel-modal", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
                 .child(
-                    styled_button("script-run-confirm-btn", "Spustit", *cx.theme())
+                    ui::button("script-run-confirm-btn", "Spustit", *cx.theme())
                         .on_click(cx.listener(|v, _, _, cx| v.confirm_script_run(cx))),
                 ),
         );
@@ -6690,18 +6273,8 @@ fn render_csv_import_panel(
         );
     }
 
-    let mut panel = div()
+    let mut panel = ui::panel(600., *cx.theme())
         .id("csv-import-modal")
-        .w(px(600.))
-        .bg(cx.theme().bg_panel)
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(cx.theme().text_primary)
         .child(div().text_size(px(16.)).child(format!("Import CSV do {table}")))
         .child(div().text_color(cx.theme().text_muted).child(format!("připojení: {conn_label}")))
         .child(div().text_color(cx.theme().text_muted).child(path.display().to_string()))
@@ -6737,18 +6310,11 @@ fn render_csv_import_panel(
 
     let can_run = error.is_none() && sample_sql.is_some();
     let confirm_btn = if can_run {
-        styled_button("csv-import-confirm-btn", "Spustit import", *cx.theme())
+        ui::button("csv-import-confirm-btn", "Spustit import", *cx.theme())
             .on_click(cx.listener(|v, _, _, cx| v.confirm_csv_import(cx)))
             .into_any_element()
     } else {
-        div()
-            .id("csv-import-confirm-btn")
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .bg(cx.theme().bg_hover)
-            .text_color(cx.theme().text_disabled)
-            .child("Spustit import")
+        ui::button_state("csv-import-confirm-btn", "Spustit import", false, *cx.theme())
             .into_any_element()
     };
 
@@ -6759,7 +6325,7 @@ fn render_csv_import_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(styled_button("csv-import-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+            .child(ui::button("csv-import-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
             .child(confirm_btn),
     );
     panel.into_any_element()
@@ -6785,30 +6351,13 @@ fn render_chart_picker_panel(
     let numeric_count = columns.iter().filter(|(_, numeric)| *numeric).count();
 
     let kind_button = |id: &'static str, label: &'static str, this_kind: ChartKind, cx: &mut Context<AppView>| {
-        div()
-            .id(id)
-            .px_2()
-            .py_1()
-            .rounded_sm()
-            .cursor_pointer()
-            .bg(if this_kind == kind { cx.theme().bg_selected } else { cx.theme().bg_hover })
-            .child(label)
+        ui::segmented_option(id, label, this_kind == kind, *cx.theme())
             .on_click(cx.listener(move |v, _, _, cx| v.set_chart_kind(this_kind, cx)))
     };
 
-    let mut panel = div()
+    let mut panel = ui::panel(460., theme)
         .id("chart-picker-panel")
-        .w(px(460.))
         .max_h(px(560.))
-        .bg(theme.bg_panel)
-        .border_1()
-        .border_color(theme.border)
-        .rounded_md()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(theme.text_primary)
         .child(div().text_size(px(16.)).child(format!("Graf: {source_title}")))
         .child(
             div()
@@ -6871,11 +6420,11 @@ fn render_chart_picker_panel(
             .gap_2()
             .mt_2()
             .child(
-                styled_button("chart-picker-cancel", "Zrušit", theme)
+                ui::button("chart-picker-cancel", "Zrušit", theme)
                     .on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))),
             )
             .child(
-                styled_button("chart-picker-confirm", if is_edit { "Použít" } else { "Vytvořit graf" }, theme)
+                ui::button("chart-picker-confirm", if is_edit { "Použít" } else { "Vytvořit graf" }, theme)
                     .on_click(cx.listener(|v, _, _, cx| v.confirm_chart_picker(cx))),
             ),
     );

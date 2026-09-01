@@ -72,6 +72,7 @@ mod text_model;
 mod text_view;
 mod theme;
 mod transfer_ui;
+mod ui;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -5722,16 +5723,12 @@ impl AppView {
                         .child(chord.map(keymap::pretty).unwrap_or_default()),
                 )
         };
-        let panel = div()
+        let panel = ui::surface(theme)
             .absolute()
             .top(px(34.))
             .left(px(4.))
             .w(px(300.))
             .py_1()
-            .bg(theme.bg_panel)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
             .occlude()
             .on_mouse_down_out(cx.listener(|view, _, _, cx| {
                 view.app_menu_open = false;
@@ -5805,12 +5802,8 @@ impl AppView {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(žádný)".to_string());
-        let panel = div()
+        let panel = ui::surface(theme)
             .w(px(620.))
-            .bg(theme.bg_panel)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
             .p_4()
             .flex()
             .flex_col()
@@ -5853,17 +5846,7 @@ impl AppView {
         // simply did not exist. Splitting the scopes across two columns
         // makes the whole sheet fit at once, which is what a cheat sheet is
         // for: you look, you do not scroll.
-        let mut panel = div()
-            .w(px(860.))
-            .bg(theme.bg_panel)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
-            .p_4()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .text_color(theme.text_primary)
+        let mut panel = ui::panel(860., theme)
             .child(
                 div()
                     .flex()
@@ -6483,15 +6466,11 @@ impl AppView {
             );
         }
 
-        let panel = div()
+        let panel = ui::surface(theme)
             .id("palette-panel")
             .key_context("Palette")
             .w(px(560.))
             .max_h(px(420.))
-            .bg(theme.bg_panel)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
             .flex()
             .flex_col()
             .on_action(cx.listener(Self::on_palette_up))
@@ -6814,16 +6793,12 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         .h(ROW_H * visible_rows);
 
         Some(
-            div()
+            ui::surface(theme)
                 .absolute()
                 .left(bounds.left())
                 .top(bounds.top() + bounds.size.height)
                 .w(px(popup_w))
                 .max_h(ROW_H * 8)
-                .bg(theme.bg_panel)
-                .border_1()
-                .border_color(theme.border)
-                .rounded_md()
                 .occlude()
                 .child(list)
                 .into_any_element(),
@@ -12397,14 +12372,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 let mut header = div().flex().flex_row().justify_end().gap_2().p_1();
                 if let Some(sql) = restored_sql {
                     header = header.child(
-                        div()
-                            .id("tab-restored-run")
-                            .cursor_pointer()
-                            .bg(theme.bg_hover)
-                            .text_color(theme.text_primary)
-                            .px_2()
-                            .rounded_md()
-                            .child("Spustit")
+                        ui::button("tab-restored-run", "Spustit", theme)
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 // Straight through the ordinary run path, so
                                 // the read-only guard, the auto-limit and the
@@ -12416,14 +12384,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 }
                 if is_log {
                     header = header.child(
-                        div()
-                            .id("tab-log-refresh")
-                            .cursor_pointer()
-                            .bg(theme.bg_hover)
-                            .text_color(theme.text_primary)
-                            .px_2()
-                            .rounded_md()
-                            .child("Obnovit")
+                        ui::button("tab-log-refresh", "Obnovit", theme)
                             .on_click(cx.listener(|view, _, _, cx| view.open_log_tab(cx))),
                     );
                 }
@@ -12435,14 +12396,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     .bg(theme.bg_panel)
                     .child(
                         header.child(
-                            div()
-                                .id("tab-copy")
-                                .cursor_pointer()
-                                .bg(theme.bg_hover)
-                                .text_color(theme.text_primary)
-                                .px_2()
-                                .rounded_md()
-                                .child("Kopírovat")
+                            ui::button("tab-copy", "Kopírovat", theme)
                                 // The same funnel as Ctrl+C, so the two can
                                 // never disagree about what „copy" means
                                 // when something is selected.
@@ -12583,13 +12537,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             discard_confirm_question(if is_script { self.binding_rel() } else { None }.as_deref(), n);
         let theme = *cx.theme();
 
-        let panel = div()
+        let panel = ui::surface(theme)
             .id("discard-confirm-panel")
             .w(px(420.))
-            .bg(theme.bg_panel)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
             .flex()
             .flex_col()
             .p_2()
@@ -12614,14 +12564,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                             .on_click(cx.listener(|view, _, _, cx| view.on_discard_confirm_yes(cx))),
                     )
                     .child(
-                        div()
-                            .id("discard-confirm-no")
-                            .cursor_pointer()
-                            .bg(theme.bg_hover)
-                            .text_color(theme.text_primary)
-                            .px_2()
-                            .rounded_md()
-                            .child("Zrušit")
+                        ui::button("discard-confirm-no", "Zrušit", theme)
                             .on_click(cx.listener(|view, _, _, cx| view.on_discard_confirm_no(cx))),
                     ),
             );
@@ -12688,7 +12631,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             body = body.child(div().whitespace_normal().child(line.clone()));
         }
 
-        let mut panel = div()
+        let mut panel = ui::surface(theme)
             .id("apply-dialog-panel")
             // G5 Task 4 review fix (MINOR 4): same handle
             // `on_open_apply_dialog` moved `window` focus onto — keeps
@@ -12697,10 +12640,6 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             .track_focus(&focus_handle)
             .w(px(640.))
             .max_h(px(480.))
-            .bg(theme.bg_panel)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
             .flex()
             .flex_col()
             .p_2()
@@ -16406,6 +16345,117 @@ mod sidebar_width_tests {
     #[test]
     fn dragging_far_left_stops_at_the_minimum() {
         assert_eq!(clamp_sidebar_width(SIDEBAR_DEFAULT_W - 9999.0), SIDEBAR_MIN_W);
+    }
+}
+
+#[cfg(test)]
+mod component_drift_audit {
+    use super::editor_clobber_audit::sources;
+
+    /// The panel surface may be spelled in exactly ONE place.
+    ///
+    /// This is the rail that makes `crate::ui` worth having. Before it,
+    /// the modal chrome — panel colour, border, radius — was written out
+    /// longhand 22 times character for character, with 19 near-variants
+    /// beside it that differed only in which line an author left out. That
+    /// is not untidiness: it is why „Databáze (výchozí)" wrapped in one
+    /// dialog and nowhere else, and it is why nobody could change how
+    /// dialogs look without opening 22 file regions and hoping.
+    ///
+    /// Extracting the component fixes today. It does not fix tomorrow: the
+    /// next person to need a floating box will reach for `div().bg(…)
+    /// .border_1()` because that is what autocomplete offers, and nothing
+    /// in the type system objects. This test objects.
+    ///
+    /// It fires on the CO-OCCURRENCE — a panel background together with a
+    /// border within a few lines — not on either alone, because both have
+    /// honest uses on their own (a bare `bg_panel` fill, a border on a
+    /// splitter). `ui.rs` is exempt: it is the one place.
+    #[test]
+    fn only_the_component_module_spells_the_panel_surface() {
+        // Assembled so this test's own source cannot be a match.
+        let bg = format!(".bg{}cx.theme().bg_{})", "(", "panel");
+        let bg_alt = format!(".bg{}theme.bg_{})", "(", "panel");
+        let border = format!(".border_{}()", "1");
+
+        let mut offenders: Vec<String> = Vec::new();
+        for (name, src) in sources() {
+            if !name.starts_with("crates/dbc-ui/") || name.ends_with("/ui.rs") {
+                continue;
+            }
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let t = line.trim();
+                if t.starts_with("//") {
+                    continue;
+                }
+                // Same reasoning as the button audit below: the fill has
+                // to be the chain's own, not one nested in a closure.
+                if !(t.starts_with(&bg) || t.starts_with(&bg_alt)) {
+                    continue;
+                }
+                // Within the same chain, give or take a comment line.
+                let lo = i.saturating_sub(4);
+                let hi = (i + 5).min(lines.len());
+                if lines[lo..hi].iter().any(|l| l.contains(&border)) {
+                    offenders.push(format!("{name}:{}", i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the panel surface is spelled outside `crate::ui` at {offenders:?} — use \
+             `ui::surface`, `ui::panel` or `ui::popover`, or the copies drift again"
+        );
+    }
+
+    /// A hand-rolled copy of [`crate::ui::button`], same argument as above.
+    ///
+    /// The needle is the button's OWN padding (`px_3` + `py_1`) together
+    /// with its hover fill — not „clickable thing with a hover tint",
+    /// which was this test's first draft and which fired on 58 sites. It
+    /// was right to fire on some of them and wrong on most: a history row,
+    /// a schema-tree row and an admin sub-nav tab all tint on hover and
+    /// none of them is a button. An audit that would have forced those
+    /// into a button component is an audit that is wrong, so it now
+    /// matches only the shape nobody writes by accident — the component
+    /// itself, re-typed.
+    #[test]
+    fn nobody_hand_rolls_the_button_component() {
+        let px3 = format!(".px_{}()", "3");
+        let py1 = format!(".py_{}()", "1");
+        let hover = format!(".bg{}cx.theme().bg_{})", "(", "hover");
+        let hover_alt = format!(".bg{}theme.bg_{})", "(", "hover");
+
+        let mut offenders: Vec<String> = Vec::new();
+        for (name, src) in sources() {
+            if !name.starts_with("crates/dbc-ui/") || name.ends_with("/ui.rs") {
+                continue;
+            }
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let t = line.trim();
+                // `starts_with`, not `contains`: `bg_hover` inside a
+                // `.hover(|s| s.bg(…))` closure is a menu item or a list
+                // row tinting on hover — the opposite of a button, which
+                // wears that fill at REST. Matching the substring anywhere
+                // put the shortcut list and the tree's context menu on the
+                // offender list, and neither should be a button.
+                if t.starts_with("//") || !(t.starts_with(&hover) || t.starts_with(&hover_alt)) {
+                    continue;
+                }
+                let lo = i.saturating_sub(4);
+                let hi = (i + 5).min(lines.len());
+                let near = &lines[lo..hi];
+                if near.iter().any(|l| l.contains(&px3)) && near.iter().any(|l| l.contains(&py1)) {
+                    offenders.push(format!("{name}:{}", i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "`ui::button` is written out by hand at {offenders:?} — call the component"
+        );
     }
 }
 

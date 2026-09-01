@@ -29,6 +29,7 @@ use dbc_core::TableInfo;
 
 use crate::schema_tree::TreeEvent;
 use crate::theme::ActiveTheme;
+use crate::ui;
 
 /// Anchored-zoom clamp bounds (T5 grounding, Constraints: "clamp zoom to a
 /// sane range — no zoom->0 or infinity producing NaN"). `0.2`/`3.0` per the
@@ -279,14 +280,7 @@ impl Render for ErDiagramView {
             .text_color(cx.theme().text_primary)
             .child(format!("ER: {schema_label}"))
             .child(
-                div()
-                    .id("er-diagram-export")
-                    .cursor_pointer()
-                    .bg(cx.theme().bg_hover)
-                    .text_color(cx.theme().text_primary)
-                    .px_2()
-                    .rounded_md()
-                    .child("Export…")
+                ui::button("er-diagram-export", "Export…", *cx.theme())
                     .on_click(cx.listener(|v, _, _window, cx| v.start_export_svg(cx))),
             );
 
