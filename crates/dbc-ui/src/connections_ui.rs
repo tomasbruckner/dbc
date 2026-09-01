@@ -468,6 +468,10 @@ pub struct TextField {
     masked: bool,
     last_bounds: Option<Bounds<Pixels>>,
     last_shaped: Option<ShapedLine>,
+    /// Last painted horizontal scroll. Mouse hit-testing and the IME's
+    /// candidate-window rectangle both speak in screen pixels, so both have
+    /// to know how far the text was slid.
+    last_scroll_x: Pixels,
     is_selecting: bool,
 }
 
@@ -481,6 +485,7 @@ impl TextField {
             masked,
             last_bounds: None,
             last_shaped: None,
+            last_scroll_x: px(0.),
             is_selecting: false,
         }
     }
@@ -540,7 +545,7 @@ impl TextField {
         }
         let Some(bounds) = self.last_bounds else { return 0 };
         let Some(shaped) = self.last_shaped.as_ref() else { return 0 };
-        let mut rel_x = position.x - bounds.left();
+        let mut rel_x = position.x - bounds.left() + self.last_scroll_x;
         if rel_x < px(0.) {
             rel_x = px(0.);
         }
@@ -794,8 +799,8 @@ impl EntityInputHandler for TextField {
             (range.start, range.end)
         };
         Some(Bounds::from_corners(
-            point(bounds.left() + shaped.x_for_index(s), bounds.top()),
-            point(bounds.left() + shaped.x_for_index(e), bounds.bottom()),
+            point(bounds.left() + shaped.x_for_index(s) - self.last_scroll_x, bounds.top()),
+            point(bounds.left() + shaped.x_for_index(e) - self.last_scroll_x, bounds.bottom()),
         ))
     }
 
@@ -824,6 +829,11 @@ impl EntityInputHandler for TextField {
 /// Opaque, so it cannot be washed out by whatever the field sits on.
 const FIELD_SELECTION: u32 = 0xa8d0ff;
 
+/// Width of the caret, in both text views. Named because the horizontal
+/// scroll rule subtracts it: a caret drawn exactly on the right edge is
+/// half painted and reads as „the text ends here".
+const CARET_W: Pixels = px(crate::text_model::CARET_WIDTH);
+
 struct FieldElement {
     input: Entity<TextField>,
 }
@@ -832,6 +842,9 @@ struct FieldPrepaint {
     shaped: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    /// How far the line is slid left so the caret stays in view — see
+    /// [`crate::text_model::horizontal_scroll`].
+    scroll_x: Pixels,
 }
 
 impl IntoElement for FieldElement {
@@ -950,13 +963,28 @@ impl Element for FieldElement {
         let shaped = window.text_system().shape_line(display_text, font_size, &runs, None);
 
         let cursor_x = shaped.x_for_index(disp_cursor.min(shaped.len()));
+        // The placeholder is short by construction and is not something the
+        // caret walks along, so it never scrolls — otherwise an empty field
+        // whose caret sits at 0 could still be shifted by a stale width.
+        let scroll_x = if is_empty {
+            px(0.)
+        } else {
+            px(crate::text_model::horizontal_scroll(
+                cursor_x.into(),
+                bounds.size.width.into(),
+                CARET_W.into(),
+            ))
+        };
         let (selection_quad, cursor_quad) = match &disp_selection {
             Some(sel) if !sel.is_empty() => {
                 let x0 = shaped.x_for_index(sel.start.min(shaped.len()));
                 let x1 = shaped.x_for_index(sel.end.min(shaped.len()));
                 (
                     Some(fill(
-                        Bounds::from_corners(point(bounds.left() + x0, bounds.top()), point(bounds.left() + x1, bounds.bottom())),
+                        Bounds::from_corners(
+                            point(bounds.left() + x0 - scroll_x, bounds.top()),
+                            point(bounds.left() + x1 - scroll_x, bounds.bottom()),
+                        ),
                         rgb(FIELD_SELECTION),
                     )),
                     None,
@@ -965,13 +993,21 @@ impl Element for FieldElement {
             _ => (
                 None,
                 Some(fill(
-                    Bounds::new(point(bounds.left() + cursor_x, bounds.top()), size(px(2.), bounds.bottom() - bounds.top())),
+                    Bounds::new(
+                        point(bounds.left() + cursor_x - scroll_x, bounds.top()),
+                        size(CARET_W, bounds.bottom() - bounds.top()),
+                    ),
                     gpui::blue(),
                 )),
             ),
         };
 
-        FieldPrepaint { shaped: Some(shaped), cursor: cursor_quad, selection: selection_quad }
+        FieldPrepaint {
+            shaped: Some(shaped),
+            cursor: cursor_quad,
+            selection: selection_quad,
+            scroll_x,
+        }
     }
 
     fn paint(
@@ -987,21 +1023,41 @@ impl Element for FieldElement {
         let focus_handle = self.input.read(cx).focus_handle.clone();
         window.handle_input(&focus_handle, ElementInputHandler::new(bounds, self.input.clone()), cx);
 
-        if let Some(sel) = prepaint.selection.take() {
-            window.paint_quad(sel);
-        }
         let shaped = prepaint.shaped.take().unwrap();
-        shaped.paint(bounds.origin, window.line_height(), gpui::TextAlign::Left, None, window, cx).unwrap();
-
-        if focus_handle.is_focused(window) {
-            if let Some(cq) = prepaint.cursor.take() {
-                window.paint_quad(cq);
+        let scroll_x = prepaint.scroll_x;
+        let selection = prepaint.selection.take();
+        let cursor = prepaint.cursor.take();
+        let focused = focus_handle.is_focused(window);
+        // The mask is the half of the fix that cannot be skipped. Sliding
+        // the line left keeps the caret in view, but the tail still has to
+        // stop at the field's edge — without this it is painted over
+        // whatever the dialog is sitting on, which is exactly what the user
+        // photographed.
+        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            if let Some(sel) = selection {
+                window.paint_quad(sel);
             }
-        }
+            shaped
+                .paint(
+                    point(bounds.left() - scroll_x, bounds.top()),
+                    window.line_height(),
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                )
+                .unwrap();
+            if focused {
+                if let Some(cq) = cursor {
+                    window.paint_quad(cq);
+                }
+            }
+        });
 
         self.input.update(cx, |input, _cx| {
             input.last_bounds = Some(bounds);
             input.last_shaped = Some(shaped);
+            input.last_scroll_x = scroll_x;
         });
     }
 }

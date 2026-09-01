@@ -5,9 +5,10 @@ use std::rc::Rc;
 use dbc_buffer::ResultBuffer;
 use dbc_core::FkRef;
 use gpui::{
-    actions, div, prelude::*, px, uniform_list, AnyElement, ClipboardItem, Context, Entity,
-    EventEmitter, FocusHandle, Focusable, KeyBinding, ScrollDelta, ScrollStrategy,
-    ScrollWheelEvent, UniformListScrollHandle, Window,
+    actions, div, point, prelude::*, px, uniform_list, AnyElement, ClipboardItem, Context, Div,
+    Entity,
+    EventEmitter, FocusHandle, Focusable, KeyBinding, ScrollDelta, ScrollHandle,
+    ScrollStrategy, ScrollWheelEvent, UniformListScrollHandle, Window,
 };
 
 use crate::connections_ui::TextField;
@@ -24,6 +25,32 @@ pub const DEFAULT_COL_WIDTH: f32 = 160.0;
 /// (toggle delete) per real row, "␡" (remove) per inserted row. Narrow by
 /// design (brief: "~24 px") since it holds a single glyph, not text.
 const GUTTER_WIDTH: f32 = 24.0;
+
+/// Height of the horizontal scrollbar strip under the grid.
+const H_BAR_HEIGHT: f32 = 10.0;
+
+/// The thumb never shrinks below this, however wide the result is. A
+/// two-pixel thumb is not a control, it is a decoration you cannot grab.
+const H_THUMB_MIN: f32 = 32.0;
+
+/// Where the horizontal scrollbar's thumb goes: `(x, width)` within a track
+/// as wide as the viewport, or `None` when everything already fits.
+///
+/// Pure, because this is the part that can be wrong in a way nobody notices
+/// until they try to drag it — and a GPUI element cannot be measured
+/// headlessly, so the arithmetic is what a test can hold on to.
+pub(crate) fn h_thumb(total_w: f32, view_w: f32, offset: f32) -> Option<(f32, f32)> {
+    // Before the first layout there is no viewport to measure. A thumb
+    // sized from zero would claim the whole track and mean nothing.
+    if view_w <= 1.0 || total_w <= view_w + 1.0 {
+        return None;
+    }
+    let max_off = total_w - view_w;
+    let offset = offset.clamp(0.0, max_off);
+    let width = (view_w / total_w * view_w).max(H_THUMB_MIN).min(view_w);
+    let travel = (view_w - width).max(0.0);
+    Some(((offset / max_off) * travel, width))
+}
 /// G4 Task 2: above this many rows, a sort click sets `status_note` to
 /// "řadím…" before `rebuild_view` runs. `rebuild` is synchronous today, so
 /// this note is a retroactive "that sort was over a big set" marker rather
@@ -286,6 +313,19 @@ pub struct ResultGrid {
     selection: Option<((usize, usize), (usize, usize))>,
     /// (col index, mouse-down start x, start width) while a resize drag is active.
     resizing: Option<(usize, f32, f32)>,
+    /// Horizontal scroll shared by the filter row, the header and every
+    /// data row, because they live inside ONE scrolling container. That is
+    /// not an optimisation — it is what makes them impossible to
+    /// misalign, which they were.
+    h_scroll: ScrollHandle,
+    /// An in-progress scrollbar-thumb drag: where the pointer went down,
+    /// and what the scroll offset was at that moment. Deltas are measured
+    /// against the start rather than the previous event so a drag can never
+    /// accumulate rounding error.
+    h_drag: Option<(f32, f32)>,
+    /// How many frames have been asked for while the viewport width was
+    /// still unknown. Bounded so a zero-width grid cannot re-render forever.
+    h_measure_ticks: u8,
     /// G4 Task 2: local sort (+ Task 3's filters) view over `buffer`.
     /// `uniform_list`'s row count is `view.len()`, and every row index used
     /// to read/select a cell is first mapped through `view.source_row`.
@@ -470,6 +510,9 @@ impl ResultGrid {
             focus_handle: cx.focus_handle(),
             selection: None,
             resizing: None,
+            h_scroll: ScrollHandle::new(),
+            h_drag: None,
+            h_measure_ticks: 0,
             view: RowView::identity(0),
             hidden_cols: Vec::new(),
             dirty: false,
@@ -651,6 +694,30 @@ impl ResultGrid {
         cx.notify();
     }
 
+    /// Width of one full row: the gutter, every visible source column, then
+    /// every virtual column.
+    ///
+    /// The filter row, the header and each data row are all given exactly
+    /// this width, so „do the columns line up" stops being a question about
+    /// two layout passes agreeing and becomes one number used three times.
+    /// It is also the content width the horizontal scrollbar measures
+    /// itself against.
+    pub(crate) fn total_row_width(&self) -> f32 {
+        let mut w = if self.editable.is_some() { GUTTER_WIDTH } else { 0.0 };
+        let Some(buf) = &self.buffer else { return w };
+        let ncols = buf.borrow().column_count();
+        for i in 0..ncols {
+            if self.hidden_cols.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            w += self.col_widths.get(i).copied().unwrap_or(DEFAULT_COL_WIDTH);
+        }
+        for vi in 0..self.virtual_cols.len() {
+            w += self.col_widths.get(ncols + vi).copied().unwrap_or(DEFAULT_COL_WIDTH);
+        }
+        w
+    }
+
     /// Sum of the visible SOURCE column widths strictly before `col` — used
     /// to roughly anchor the ☰ dropdown under its own column instead of
     /// always in one fixed spot like `export`/`columns` menus (whose
@@ -663,7 +730,11 @@ impl ResultGrid {
                 x += self.col_widths.get(i).copied().unwrap_or(DEFAULT_COL_WIDTH);
             }
         }
-        x
+        // The menu is anchored to the ROOT, which does not scroll, while
+        // its column does. Without this the dropdown stays where the column
+        // used to be — the further you scroll, the further it is from the
+        // ☰ you clicked.
+        x + f32::from(self.h_scroll.offset().x)
     }
 
     /// A ☰-menu checkbox click for `col`'s `ref_col`. Toggles membership in
@@ -1796,11 +1867,11 @@ impl ResultGrid {
     /// Hidden columns are skipped entirely (brief: "hidden columns keep no
     /// filter input") even though `filter_inputs`/`filter_cache` still hold
     /// an entry for them.
-    fn filter_row(&self, theme: &crate::theme::Theme) -> impl IntoElement {
+    fn filter_row(&self, theme: &crate::theme::Theme) -> Div {
         let mut row = div().flex().flex_row().bg(theme.bg_app);
         // G5 Task 3: same gutter-width alignment spacer as `header`.
         if self.editable.is_some() {
-            row = row.child(div().w(px(GUTTER_WIDTH)).h(px(ROW_HEIGHT)));
+            row = row.child(div().w(px(GUTTER_WIDTH)).flex_none().h(px(ROW_HEIGHT)));
         }
         if self.buffer.is_some() {
             // G4 Task 5: `filter_inputs`/`filter_cache` are kept sized to
@@ -1817,6 +1888,7 @@ impl ResultGrid {
                     row = row.child(
                         div()
                             .w(px(self.col_widths.get(i).copied().unwrap_or(DEFAULT_COL_WIDTH)))
+                            .flex_none()
                             .h(px(ROW_HEIGHT))
                             .px_1()
                             .child(input.clone()),
@@ -2300,14 +2372,14 @@ impl ResultGrid {
     /// indicator next to the name when it's the active sort column — the
     /// resize handle is a separate sibling element so a resize drag never
     /// also fires a sort toggle.
-    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn header(&self, cx: &mut Context<Self>) -> Div {
         let theme = *cx.theme();
         let mut row = div().flex().flex_row().bg(theme.bg_hover).text_color(theme.warn);
         // G5 Task 3: blank gutter-width spacer so the header stays aligned
         // with each row's own leading "✕"/"␡" gutter cell (brief contract
         // #4) — editable tabs only.
         if self.editable.is_some() {
-            row = row.child(div().w(px(GUTTER_WIDTH)).h(px(ROW_HEIGHT)));
+            row = row.child(div().w(px(GUTTER_WIDTH)).flex_none().h(px(ROW_HEIGHT)));
         }
         let Some(buf) = &self.buffer else { return row };
         let buf = buf.borrow();
@@ -2337,6 +2409,15 @@ impl ResultGrid {
             let mut cell = div()
                 .relative()
                 .w(px(self.col_widths[i]))
+                // `flex_none`, and this is the whole of the „nesedi to" bug
+                // (user, 2026-09-01). A flex item defaults to shrinking, so
+                // once the columns were wider than the window every header
+                // cell was squeezed — by a factor the row list did not
+                // apply to its own cells. Two layout passes, two answers,
+                // and a header that drifted further from its column with
+                // every column you passed. Nothing may shrink now; the
+                // overflow is scrolled instead.
+                .flex_none()
                 .h(px(ROW_HEIGHT))
                 .bg(bg)
                 .child(
@@ -2415,6 +2496,7 @@ impl ResultGrid {
             row = row.child(
                 div()
                     .w(px(self.col_widths.get(col_ix).copied().unwrap_or(DEFAULT_COL_WIDTH)))
+                    .flex_none()
                     .h(px(ROW_HEIGHT))
                     .bg(theme.bg_joined_col)
                     .child(
@@ -2647,10 +2729,6 @@ impl Render for ResultGrid {
         // row list read `view`/`find` below.
         if has_buffer {
             root = root.child(self.toolbar(cx));
-            if self.filters_open {
-                let theme = *cx.theme();
-                root = root.child(self.filter_row(&theme));
-            }
         }
 
         // Row count/order goes through `view` (G4 Task 2: local sort), not
@@ -2668,7 +2746,23 @@ impl Render for ResultGrid {
         let is_editable = self.editable.is_some();
         let insert_row_count = if is_editable { self.edit_state.inserted_rows.len() } else { 0 };
         let row_count = real_row_count + insert_row_count;
-        root = root.child(self.header(cx)).child(
+        // Filter row, header and every data row go inside ONE horizontally
+        // scrolling box, each laid out at the same explicit width. That is
+        // what makes them line up: not two layout passes that happen to
+        // agree, but one container and one number.
+        let total_w = self.total_row_width();
+        let mut scroller = div()
+            .id("grid-h-scroll")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_x_scroll()
+            .track_scroll(&self.h_scroll);
+        if has_buffer && self.filters_open {
+            let theme = *cx.theme();
+            scroller = scroller.child(self.filter_row(&theme).w(px(total_w)).flex_none());
+        }
+        scroller = scroller.child(self.header(cx).w(px(total_w)).flex_none()).child(
             uniform_list(
                 "result-rows",
                 row_count,
@@ -2704,6 +2798,7 @@ impl Render for ResultGrid {
                                     div()
                                         .id(("gutter-ins", ins_ix))
                                         .w(px(GUTTER_WIDTH))
+                                        .flex_none()
                                         .h(px(ROW_HEIGHT))
                                         .flex()
                                         .items_center()
@@ -2737,6 +2832,7 @@ impl Render for ResultGrid {
                                     let cell = div()
                                         .id(("cell-ins", ins_ix * 10_000 + col))
                                         .w(px(widths.get(col).copied().unwrap_or(DEFAULT_COL_WIDTH)))
+                                        .flex_none()
                                         .px_2()
                                         .overflow_hidden()
                                         .text_color(theme.text_primary)
@@ -2805,6 +2901,7 @@ impl Render for ResultGrid {
                                     div()
                                         .id(("gutter", row_ix))
                                         .w(px(GUTTER_WIDTH))
+                                        .flex_none()
                                         .h(px(ROW_HEIGHT))
                                         .flex()
                                         .items_center()
@@ -2871,6 +2968,7 @@ impl Render for ResultGrid {
                                 let mut cell = div()
                                     .id(("cell", row_ix * 10_000 + col))
                                     .w(px(widths.get(col).copied().unwrap_or(DEFAULT_COL_WIDTH)))
+                                    .flex_none()
                                     .px_2()
                                     .overflow_hidden()
                                     .text_color(theme.text_primary)
@@ -2995,9 +3093,85 @@ impl Render for ResultGrid {
                     items
                 }),
             )
+            .w(px(total_w))
             .track_scroll(&self.scroll_handle)
             .flex_1(),
         );
+        root = root.child(scroller);
+
+        // The viewport is only known AFTER a layout pass, so the very first
+        // frame of a fresh grid cannot size a thumb. Ask for one more frame
+        // rather than leaving a scrollbar that never appears — bounded, so
+        // a grid that genuinely has no width (a collapsed pane) cannot spin
+        // here forever.
+        let view_w = f32::from(self.h_scroll.bounds().size.width);
+        if has_buffer && view_w <= 1.0 && self.h_measure_ticks < 3 {
+            self.h_measure_ticks += 1;
+            cx.notify();
+        } else if view_w > 1.0 {
+            self.h_measure_ticks = 0;
+        }
+        if let Some((thumb_x, thumb_w)) =
+            h_thumb(total_w, view_w, -f32::from(self.h_scroll.offset().x))
+        {
+            let theme = *cx.theme();
+            root = root.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_none()
+                    .h(px(H_BAR_HEIGHT))
+                    .w_full()
+                    .bg(theme.bg_app)
+                    .child(div().w(px(thumb_x)).flex_none())
+                    .child(
+                        div()
+                            .id("grid-h-thumb")
+                            .w(px(thumb_w))
+                            .flex_none()
+                            .h(px(H_BAR_HEIGHT - 2.0))
+                            .rounded_sm()
+                            .bg(theme.border)
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |this, e: &gpui::MouseDownEvent, _w, cx| {
+                                    this.h_drag = Some((
+                                        f32::from(e.position.x),
+                                        -f32::from(this.h_scroll.offset().x),
+                                    ));
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+            );
+        }
+
+        if self.h_drag.is_some() {
+            root = root
+                .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _w, cx| {
+                    let Some((start_x, start_off)) = this.h_drag else { return };
+                    let view_w = f32::from(this.h_scroll.bounds().size.width);
+                    let total = this.total_row_width();
+                    let Some((_, thumb_w)) = h_thumb(total, view_w, start_off) else { return };
+                    // Pointer travel maps onto scroll travel, not one-to-one:
+                    // the thumb crosses `view - thumb` pixels while the
+                    // content crosses `total - view`.
+                    let travel = (view_w - thumb_w).max(1.0);
+                    let max_off = (total - view_w).max(1.0);
+                    let dx = f32::from(e.position.x) - start_x;
+                    let new_off = (start_off + dx / travel * max_off).clamp(0.0, max_off);
+                    this.h_scroll.set_offset(point(px(-new_off), this.h_scroll.offset().y));
+                    cx.notify();
+                }))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _e: &gpui::MouseUpEvent, _w, cx| {
+                        this.h_drag = None;
+                        cx.notify();
+                    }),
+                );
+        }
 
         if is_resizing {
             root = root
@@ -3063,6 +3237,90 @@ impl Render for ResultGrid {
 /// `ResultGrid::accept_lookup_result`. Doesn't need a `Context`/`App` at
 /// all, unlike the rest of `ResultGrid`'s behaviour, so it's tested
 /// directly rather than through a GPUI test harness.
+#[cfg(test)]
+mod h_scrollbar_tests {
+    use super::{h_thumb, H_THUMB_MIN};
+
+    /// Nothing to scroll, nothing to draw. This is every narrow result,
+    /// so it is the case that must not sprout a bar out of nowhere.
+    #[test]
+    fn a_result_that_fits_has_no_scrollbar() {
+        assert_eq!(h_thumb(500., 800., 0.), None);
+        assert_eq!(h_thumb(800., 800., 0.), None);
+        // …including the half-pixel margin, so a rounding difference
+        // between the layout and this arithmetic cannot flicker a bar in
+        // and out on every frame.
+        assert_eq!(h_thumb(800.4, 800., 0.), None);
+    }
+
+    /// Before the first layout the viewport is zero. A thumb computed from
+    /// that would claim the whole track and mean nothing.
+    #[test]
+    fn an_unmeasured_viewport_draws_nothing() {
+        assert_eq!(h_thumb(3000., 0., 0.), None);
+        assert_eq!(h_thumb(3000., 1., 0.), None);
+    }
+
+    /// The two ends: scrolled home the thumb is flush left, scrolled to the
+    /// end it is flush right. Anything else and the bar lies about where
+    /// you are.
+    #[test]
+    fn the_thumb_spans_the_track_from_end_to_end() {
+        let total = 3200.;
+        let view = 800.;
+        let (x0, w) = h_thumb(total, view, 0.).expect("scrollable");
+        assert_eq!(x0, 0.);
+        let (x1, w1) = h_thumb(total, view, total - view).expect("scrollable");
+        assert_eq!(w1, w);
+        assert!((x1 + w - view).abs() < 0.01, "right edge {} != {view}", x1 + w);
+    }
+
+    /// Over-scrolling in either direction pins to an end rather than
+    /// drawing the thumb outside its own track.
+    #[test]
+    fn an_offset_outside_the_range_is_clamped() {
+        let total = 3200.;
+        let view = 800.;
+        let (x_lo, _) = h_thumb(total, view, -500.).expect("scrollable");
+        let (x_hi, w) = h_thumb(total, view, 99999.).expect("scrollable");
+        assert_eq!(x_lo, 0.);
+        assert!((x_hi + w - view).abs() < 0.01);
+    }
+
+    /// A very wide result would give a hair-thin thumb; it is floored so it
+    /// stays grabbable, and still never wider than its own track.
+    #[test]
+    fn the_thumb_stays_grabbable_and_inside_the_track() {
+        let (_, w) = h_thumb(100_000., 400., 0.).expect("scrollable");
+        assert_eq!(w, H_THUMB_MIN);
+        let (x, w) = h_thumb(100_000., 400., 99_600.).expect("scrollable");
+        assert!(w <= 400.);
+        assert!(x + w <= 400.01, "thumb ends at {}", x + w);
+    }
+
+    /// A viewport narrower than the minimum thumb is degenerate, but must
+    /// still produce something inside the track rather than a negative
+    /// position.
+    #[test]
+    fn a_viewport_narrower_than_the_thumb_still_stays_put() {
+        let (x, w) = h_thumb(1000., 20., 500.).expect("scrollable");
+        assert_eq!(w, 20.);
+        assert_eq!(x, 0.);
+    }
+
+    /// Scrolling right moves the thumb right, always.
+    #[test]
+    fn the_thumb_follows_the_offset_monotonically() {
+        let xs: Vec<f32> = [0., 100., 500., 1200., 2400.]
+            .iter()
+            .map(|o| h_thumb(3200., 800., *o).expect("scrollable").0)
+            .collect();
+        for pair in xs.windows(2) {
+            assert!(pair[1] >= pair[0], "{xs:?} must be non-decreasing");
+        }
+    }
+}
+
 #[cfg(test)]
 mod lookup_generation_tests {
     use super::should_apply_lookup;

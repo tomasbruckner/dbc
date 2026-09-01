@@ -640,6 +640,85 @@ impl MultilineBuffer {
     }
 }
 
+/// How far a text view must slide left so the caret stays inside it.
+///
+/// Both text views paint a shaped line starting at their own left edge and
+/// nothing stopped the line from being longer than the view. It did not
+/// clip and it did not scroll: the text was simply drawn OUTSIDE, across
+/// whatever the field or the editor happened to sit on. The user
+/// photographed it as a password whose bullets ran out of the dialog and
+/// across the history panel behind it (2026-09-01, „preteka").
+///
+/// The rule is deliberately stateless — derived from the caret every frame
+/// rather than remembered — because a remembered offset is a second source
+/// of truth about where the view is looking, and the two drift the moment
+/// anything changes the text without moving the caret. Stateless means the
+/// answer to „what should be on screen" only ever depends on what IS on
+/// screen.
+///
+/// It anchors LEFT: nothing scrolls until the caret would leave the right
+/// edge, and then only by exactly as much as it takes. So a value that
+/// fits reads from its beginning, one that does not follows the caret, and
+/// walking the caret back to the start walks the view back with it.
+///
+/// `caret_width` is subtracted because a caret sitting exactly on the right
+/// edge is a caret that is half painted and looks like the text ended.
+/// Width of the caret in both text views, in pixels.
+///
+/// Here rather than beside either element because [`horizontal_scroll`]
+/// subtracts it and the two views must subtract the same thing — a caret
+/// that is two pixels wide in one and three in the other would scroll at
+/// two different moments for no reason anybody could see.
+pub const CARET_WIDTH: f32 = 2.0;
+
+pub fn horizontal_scroll(caret_x: f32, view_width: f32, caret_width: f32) -> f32 {
+    let visible = (view_width - caret_width).max(0.);
+    (caret_x - visible).max(0.)
+}
+
+#[cfg(test)]
+mod horizontal_scroll_tests {
+    use super::horizontal_scroll;
+
+    /// Text that fits never moves. This is the case every short field is
+    /// in, so it is the one that must not regress.
+    #[test]
+    fn a_caret_inside_the_view_does_not_scroll() {
+        assert_eq!(horizontal_scroll(0., 200., 2.), 0.);
+        assert_eq!(horizontal_scroll(50., 200., 2.), 0.);
+        assert_eq!(horizontal_scroll(198., 200., 2.), 0.);
+    }
+
+    /// Past the edge it slides by exactly the overshoot — no more, so the
+    /// text stays as far left as it can while showing the caret.
+    #[test]
+    fn a_caret_past_the_edge_scrolls_by_exactly_the_overshoot() {
+        assert_eq!(horizontal_scroll(250., 200., 2.), 52.);
+        assert_eq!(horizontal_scroll(1000., 200., 2.), 802.);
+    }
+
+    /// Walking the caret back walks the view back, all the way to zero.
+    #[test]
+    fn moving_the_caret_left_brings_the_view_back() {
+        let widths = [1000., 500., 250., 198., 0.];
+        let offsets: Vec<f32> = widths.iter().map(|c| horizontal_scroll(*c, 200., 2.)).collect();
+        for pair in offsets.windows(2) {
+            assert!(pair[1] <= pair[0], "{offsets:?} must be non-increasing");
+        }
+        assert_eq!(*offsets.last().unwrap(), 0.);
+    }
+
+    /// A view narrower than the caret is degenerate (a field squeezed to
+    /// nothing by a narrow window); it must clamp, not go negative and
+    /// push the text off to the right.
+    #[test]
+    fn a_degenerate_view_clamps_instead_of_going_negative() {
+        assert_eq!(horizontal_scroll(0., 1., 2.), 0.);
+        assert_eq!(horizontal_scroll(0., 0., 2.), 0.);
+        assert!(horizontal_scroll(10., 0., 2.) >= 0.);
+    }
+}
+
 #[cfg(test)]
 mod click_selection_tests {
     use super::*;

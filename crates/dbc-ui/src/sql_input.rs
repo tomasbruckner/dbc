@@ -344,6 +344,10 @@ pub struct SqlInput {
     /// review, issue 1).
     follow_cursor: bool,
     last_bounds: Option<Bounds<Pixels>>,
+    /// Last painted horizontal slide, needed by mouse hit-testing and the
+    /// IME rectangle — both are given screen pixels and have to undo the
+    /// slide to land on the right character.
+    last_scroll_x: Pixels,
     last_line_height: Option<Pixels>,
     last_visible_line_count: usize,
     last_lines: Vec<CachedLine>,
@@ -378,6 +382,7 @@ impl SqlInput {
             scroll_offset_lines: 0,
             follow_cursor: true,
             last_bounds: None,
+            last_scroll_x: px(0.),
             last_line_height: None,
             last_visible_line_count: 1,
             last_lines: Vec::new(),
@@ -637,7 +642,7 @@ impl SqlInput {
         let row = (rel_y.as_f32() / line_height.as_f32()).floor() as usize;
         let row = row.min(self.last_lines.len() - 1);
         let entry = &self.last_lines[row];
-        let mut rel_x = position.x - bounds.left();
+        let mut rel_x = position.x - bounds.left() + self.last_scroll_x;
         if rel_x < px(0.) {
             rel_x = px(0.);
         }
@@ -1096,9 +1101,12 @@ impl EntityInputHandler for SqlInput {
         let local_end = range.end.min(entry.start + entry.shaped.len()) - entry.start;
         let top = bounds.top() + line_height * row;
         Some(Bounds::from_corners(
-            point(bounds.left() + entry.shaped.x_for_index(local_start), top),
             point(
-                bounds.left() + entry.shaped.x_for_index(local_end),
+                bounds.left() + entry.shaped.x_for_index(local_start) - self.last_scroll_x,
+                top,
+            ),
+            point(
+                bounds.left() + entry.shaped.x_for_index(local_end) - self.last_scroll_x,
                 top + line_height,
             ),
         ))
@@ -1131,6 +1139,11 @@ struct PrepaintState {
     lines: Vec<LineRenderData>,
     line_height: Pixels,
     scroll_offset_lines: usize,
+    /// How far every line is slid left so the caret stays inside the
+    /// editor — see [`crate::text_model::horizontal_scroll`]. The editor
+    /// does not wrap, so without this a long statement was painted past
+    /// its own right edge and across the panel beside it.
+    scroll_x: Pixels,
 }
 
 impl IntoElement for TextElement {
@@ -1314,18 +1327,47 @@ impl Element for TextElement {
             running_offset += line_text.len() + 1;
         }
 
+        // Where the caret is horizontally, whether or not it is drawn.
+        // Computed even with a selection active: the view still has to
+        // follow the moving end of that selection, or dragging right along
+        // a long line selects text nobody can see.
+        let caret_x = lines
+            .iter()
+            .find(|l| l.index == cursor_line)
+            .map(|entry| {
+                let local = cursor.saturating_sub(entry.start).min(entry.shaped.len());
+                entry.shaped.x_for_index(local)
+            })
+            .unwrap_or(px(0.));
+        // Nothing to follow when the caret's line is scrolled out of sight
+        // vertically — snap back to column zero rather than holding an
+        // offset that belongs to a line nobody is looking at.
+        let scroll_x = px(crate::text_model::horizontal_scroll(
+            caret_x.into(),
+            bounds.size.width.into(),
+            crate::text_model::CARET_WIDTH,
+        ));
+        if scroll_x > px(0.) {
+            for line in lines.iter_mut() {
+                if let Some(q) = line.selection_quad.as_mut() {
+                    q.bounds.origin.x -= scroll_x;
+                }
+            }
+        }
+
         // Cursor is only drawn when there's no active (non-empty) selection,
         // on whichever visible line it falls on.
         let selection_is_empty = selection.as_ref().is_none_or(|s| s.is_empty());
         if selection_is_empty && cursor_line >= scroll && cursor_line < end_line {
             if let Some(entry) = lines.iter_mut().find(|l| l.index == cursor_line) {
-                let local = cursor.saturating_sub(entry.start).min(entry.shaped.len());
-                let x = entry.shaped.x_for_index(local);
                 let row = cursor_line - scroll;
                 entry.cursor_quad = Some(fill(
                     Bounds::new(
-                        point(bounds.left() + x, bounds.top() + line_height * row),
-                        size(px(2.), line_height),
+                        point(
+                            bounds.left() + caret_x - scroll_x,
+                            bounds.top() + line_height * row,
+                        ),
+                        size(px(crate::text_model::CARET_WIDTH), line_height),
                     ),
                     gpui::blue(),
                 ));
@@ -1336,6 +1378,7 @@ impl Element for TextElement {
             lines,
             line_height,
             scroll_offset_lines: scroll,
+            scroll_x,
         }
     }
 
@@ -1359,41 +1402,49 @@ impl Element for TextElement {
         let is_focused = focus_handle.is_focused(window);
         let line_height = prepaint.line_height;
         let scroll_offset_lines = prepaint.scroll_offset_lines;
+        let scroll_x = prepaint.scroll_x;
         let mut cached_lines = Vec::with_capacity(prepaint.lines.len());
+        let drained: Vec<LineRenderData> = std::mem::take(&mut prepaint.lines);
 
-        for mut line in prepaint.lines.drain(..) {
-            if let Some(selection_quad) = line.selection_quad.take() {
-                window.paint_quad(selection_quad);
-            }
-
-            let row = line.index - scroll_offset_lines;
-            line.shaped
-                .paint(
-                    point(bounds.left(), bounds.top() + line_height * row),
-                    line_height,
-                    gpui::TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                )
-                .unwrap();
-
-            if is_focused {
-                if let Some(cursor_quad) = line.cursor_quad.take() {
-                    window.paint_quad(cursor_quad);
+        // Same two halves as the single-line field: slide so the caret is
+        // visible, then MASK so the rest of a long statement stops at the
+        // editor's edge instead of being drawn across the panel beside it.
+        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            for mut line in drained {
+                if let Some(selection_quad) = line.selection_quad.take() {
+                    window.paint_quad(selection_quad);
                 }
-            }
 
-            cached_lines.push(CachedLine {
-                index: line.index,
-                start: line.start,
-                shaped: line.shaped,
-            });
-        }
+                let row = line.index - scroll_offset_lines;
+                line.shaped
+                    .paint(
+                        point(bounds.left() - scroll_x, bounds.top() + line_height * row),
+                        line_height,
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    )
+                    .unwrap();
+
+                if is_focused {
+                    if let Some(cursor_quad) = line.cursor_quad.take() {
+                        window.paint_quad(cursor_quad);
+                    }
+                }
+
+                cached_lines.push(CachedLine {
+                    index: line.index,
+                    start: line.start,
+                    shaped: line.shaped,
+                });
+            }
+        });
 
         self.input.update(cx, |input, _cx| {
             input.last_bounds = Some(bounds);
             input.last_lines = cached_lines;
+            input.last_scroll_x = scroll_x;
         });
     }
 }
