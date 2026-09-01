@@ -70,6 +70,7 @@ mod tabs;
 mod text_model;
 mod text_view;
 mod theme;
+mod transfer_ui;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -6347,6 +6348,10 @@ impl AppView {
                     self.status = "Mezipaměť schémat vymazána".to_string();
                     cx.notify();
                 }
+                // Same two handlers the Settings buttons call — one code
+                // path, two ways in.
+                PaletteAction::ExportSettings => self.start_settings_export(cx),
+                PaletteAction::ImportSettings => self.start_settings_import(cx),
                 PaletteAction::OpenCompare => self.open_compare_dialog(cx),
                 PaletteAction::BackupDatabase => {
                     if let Some(id) = self.active_connection_id.clone() {
@@ -8822,6 +8827,210 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             connections_ui::modal_blocks_context_switch(self.modal.as_ref()),
         )
         .map(str::to_string)
+    }
+
+    /// The four files of the CURRENTLY active context.
+    ///
+    /// The same two-armed resolution `apply_context` performs, and it must
+    /// stay that way: an export that read the profile's `views.toml` while
+    /// a workspace was active would bundle one context's connections with
+    /// another's column widths — exactly the silent context mixing §W3
+    /// exists to prevent.
+    fn context_paths(&self) -> dbc_state::workspace::Paths {
+        match &self.workspace_root {
+            Some(r) => dbc_state::workspace::workspace_paths(r),
+            None => dbc_state::workspace::profile_paths(),
+        }
+    }
+
+    /// „Vyvézt nastavení…" — save dialog, then write.
+    ///
+    /// NO gate, deliberately, and it is the only picker flow here without
+    /// one: export mutates nothing, opens nothing, and unseals nothing. The
+    /// bundle is built AFTER the dialog returns, so it reflects the config
+    /// as of the moment the user committed to a filename rather than as of
+    /// the moment they opened the dialog.
+    fn start_settings_export(&mut self, cx: &mut Context<Self>) {
+        let suggested = transfer_ui::export_suggested_name();
+        let paths = self.context_paths();
+        // Empty start dir, and the extension rides on the suggestion:
+        // `prompt_for_new_path` at the pinned rev has no extension filter
+        // (grounded in `start_script_pick`'s note).
+        let dialog = cx.prompt_for_new_path(&std::path::PathBuf::new(), Some(&suggested));
+        cx.spawn(async move |this, cx| {
+            // Same three arms and the same strings as every other picker
+            // here — a swallowed dialog failure is the silence this app
+            // keeps banning.
+            let picked = match dialog.await {
+                Ok(Ok(Some(p))) => p,
+                Ok(Ok(None)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "výběr zrušen".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = format!("error: dialog selhal: {e}");
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_canceled) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "error: dialog není dostupný".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let _ = this.update(cx, |view, cx| {
+                let built =
+                    dbc_state::bundle::build(&paths, env!("CARGO_PKG_VERSION")).and_then(|b| {
+                        let n = dbc_state::bundle::summary(&b)?.connections.len();
+                        dbc_state::bundle::write(&b, &picked)?;
+                        Ok(n)
+                    });
+                view.status = match built {
+                    Ok(n) => transfer_ui::export_done_status(&picked, n),
+                    Err(e) => format!("error: {}", e.message),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// „Načíst nastavení…" — open dialog, validate, then CONFIRM.
+    ///
+    /// Gated by `context_switch_blocked` for the reasons a workspace switch
+    /// is: this replaces the connection list and locks the vault, so it must
+    /// not happen under a running query, a pending apply, or a dirty script.
+    /// The gate is re-checked in the continuation because the window stays
+    /// live while the native dialog is up.
+    fn start_settings_import(&mut self, cx: &mut Context<Self>) {
+        if let Some(reason) = self.context_switch_blocked() {
+            self.status = format!("error: {reason}");
+            cx.notify();
+            return;
+        }
+        let dialog = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Načíst".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = match dialog.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
+                Ok(Ok(_)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "výběr zrušen".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = format!("error: dialog selhal: {e}");
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_canceled) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.status = "error: dialog není dostupný".to_string();
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let _ = this.update(cx, |view, cx| {
+                // Re-check: the window was interactive throughout the
+                // dialog, so a query could have been started behind it.
+                if let Some(reason) = view.context_switch_blocked() {
+                    view.status = format!("error: {reason}");
+                    cx.notify();
+                    return;
+                }
+                // Read and validate BEFORE opening the confirm. A dialog
+                // that offers to replace everything and only then admits
+                // the file was unreadable has spent the user's attention
+                // on nothing.
+                let bundle = match dbc_state::bundle::read(&picked) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        view.status = format!("error: {}", e.message);
+                        cx.notify();
+                        return;
+                    }
+                };
+                let summary = match dbc_state::bundle::summary(&bundle) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        view.status = format!("error: {}", e.message);
+                        cx.notify();
+                        return;
+                    }
+                };
+                let replacing = view.context_paths().config.exists();
+                view.modal = Some(connections_ui::ModalState::SettingsImportConfirm {
+                    path: picked,
+                    bundle: Box::new(bundle),
+                    lines: transfer_ui::import_confirm_lines(&summary, replacing),
+                    error: None,
+                });
+                view.status = String::new();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The confirmed act: write the files, then reload the context.
+    ///
+    /// `apply_context` is THE reload seam (§W3.4) and is reused verbatim
+    /// rather than re-implemented — it drops the vault (the new one opens
+    /// with a different master password), clears the active connection (its
+    /// id may not exist in the new config), reloads config/views/params and
+    /// resets the tree. Everything this import needs undone, a workspace
+    /// switch already needed undone.
+    ///
+    /// A failed `apply` leaves the dialog open carrying the message, and
+    /// `bundle::apply` has already rolled the disk back — so the app on
+    /// screen still matches the files and „try again" is a real option.
+    pub(crate) fn confirm_settings_import(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::SettingsImportConfirm { bundle, .. }) =
+            self.modal.as_ref()
+        else {
+            return;
+        };
+        let bundle = bundle.clone();
+        let paths = self.context_paths();
+        let applied = match dbc_state::bundle::apply(&bundle, &paths) {
+            Ok(a) => a,
+            Err(e) => {
+                if let Some(connections_ui::ModalState::SettingsImportConfirm { error, .. }) =
+                    self.modal.as_mut()
+                {
+                    *error = Some(e.message);
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let connections =
+            dbc_state::bundle::summary(&bundle).map(|s| s.connections.len()).unwrap_or(0);
+        let has_vault = bundle.vault_bin.is_some();
+        self.close_modal(cx);
+        let root = self.workspace_root.clone();
+        self.apply_context(root, cx);
+        // AFTER `apply_context`, which sets a status of its own about the
+        // context it just loaded — true, but not what happened here.
+        self.status =
+            transfer_ui::import_done_status(connections, applied.backed_up.len(), has_vault);
+        cx.notify();
     }
 
     /// §W3: „Použít složku…". Gates first, then picks, then classifies in
@@ -16148,6 +16357,73 @@ mod sidebar_width_tests {
     #[test]
     fn dragging_far_left_stops_at_the_minimum() {
         assert_eq!(clamp_sidebar_width(SIDEBAR_DEFAULT_W - 9999.0), SIDEBAR_MIN_W);
+    }
+}
+
+#[cfg(test)]
+mod settings_import_reload_audit {
+    use super::editor_clobber_audit::{code_lines, defined_fn_name, sources};
+
+    /// Replacing the settings files WITHOUT reloading the context is the
+    /// one way this feature can fail silently.
+    ///
+    /// `bundle::apply` writes a new `config.toml` and a new `vault.bin`. If
+    /// the enclosing handler then returns without `apply_context`, the app
+    /// keeps rendering the OLD connection list, keeps the OLD vault
+    /// unlocked in memory, and keeps an `active_connection_id` that may not
+    /// exist in the file on disk any more — so the next secret lookup
+    /// answers from one machine's vault about another machine's connection.
+    /// That is precisely the silent context mixing §W3 was built to
+    /// prevent, arrived at by a different road, and nothing in the type
+    /// system says a word about it.
+    ///
+    /// SCOPED TO `dbc-ui` ON PURPOSE. `dbc-cli` calls the same `apply` and
+    /// correctly does NOT reload anything: it is a process that exits, and
+    /// there is no live view to leave stale. The invariant is about a
+    /// long-running window, so the audit is too — and saying so here is
+    /// cheaper than a second rule nobody could read.
+    #[test]
+    fn a_settings_import_reloads_the_context_it_just_replaced() {
+        // Assembled, so this test's own source cannot count as a call site.
+        let call = format!("bundle::{}(", "apply");
+        let reload = format!("apply_{}(", "context");
+        let mut sites = 0usize;
+        for (name, src) in sources() {
+            if !name.starts_with("crates/dbc-ui/") {
+                continue;
+            }
+            let lines = code_lines(&src);
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains(&call) {
+                    continue;
+                }
+                sites += 1;
+                let start =
+                    lines[..i].iter().rposition(|l| defined_fn_name(l).is_some()).unwrap_or(0);
+                let end = lines[i..]
+                    .iter()
+                    .position(|l| l.starts_with("    }"))
+                    .map(|o| i + o)
+                    .unwrap_or(lines.len());
+                assert!(
+                    lines[start..end].iter().any(|l| l.contains(&reload)),
+                    "settings were replaced without reloading the context at {name}:{} (in \
+                     `{}`) — the window would keep showing the previous machine's \
+                     connections over the new files",
+                    i + 1,
+                    lines
+                        .get(start)
+                        .and_then(|l| defined_fn_name(l))
+                        .unwrap_or_else(|| "<file scope>".to_string())
+                );
+            }
+        }
+        // Non-vacuity: a rule that matched nothing would pass forever, and
+        // this one has exactly one call site to find.
+        assert_eq!(
+            sites, 1,
+            "settings-import call site count changed — re-audit, do not just bump"
+        );
     }
 }
 

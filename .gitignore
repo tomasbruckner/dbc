@@ -8,3 +8,8 @@ target-shared/
 
 # local dev: the app profile dir (DBC_DATA_DIR)
 /data/
+
+# settings bundles (dbc export). The vault inside stays encrypted, so this
+# is not a leak on its own — but a file whose whole purpose is to carry
+# every connection you have is not a thing to push by accident.
+*.dbcx

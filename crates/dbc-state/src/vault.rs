@@ -75,6 +75,28 @@ impl Vault {
 
 fn err(m: impl Into<String>) -> StateError { StateError { message: m.into() } }
 
+/// Does this text have the SHAPE of a sealed vault envelope?
+///
+/// Not a decryption and not an authentication — it cannot be either, since
+/// both need the master password. It answers exactly one narrow question,
+/// for [`crate::bundle`]: is the file sitting at the vault's path the
+/// ciphertext envelope [`Vault::persist`] writes, or is it something else
+/// that merely lives there — a leftover, a hand-edit, a restore of the
+/// wrong file?
+///
+/// The bundle asks BEFORE copying that file anywhere, because the one
+/// failure this module must never have is readable text leaving the machine
+/// under the name „vault". A wrong `true` here costs nothing (the envelope
+/// still will not decrypt); a wrong `false` refuses an export, loudly. Both
+/// errors are safe in the direction that matters.
+pub(crate) fn text_is_sealed_envelope(text: &str) -> bool {
+    let Ok(env) = serde_json::from_str::<Envelope>(text) else { return false };
+    env.kdf == "argon2id"
+        && !env.salt.is_empty()
+        && !env.nonce.is_empty()
+        && !env.ciphertext.is_empty()
+}
+
 fn derive_key(master: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<[u8; 32], StateError> {
     let params = Params::new(m, t, p, Some(32)).map_err(|e| err(e.to_string()))?;
     let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);

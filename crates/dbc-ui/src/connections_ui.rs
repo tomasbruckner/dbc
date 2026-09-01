@@ -1565,6 +1565,24 @@ pub enum ModalState {
         error: Option<String>,
         running: bool,
     },
+    /// The last gate before a settings bundle replaces the connection list
+    /// and the vault.
+    ///
+    /// Carries the PARSED bundle, not the path: the file was read and fully
+    /// validated when the picker returned, so confirming cannot be talked
+    /// into applying different bytes than the ones this dialog described —
+    /// and a file edited or deleted between the pick and the click changes
+    /// nothing. `path` is kept only to name the source on screen.
+    ///
+    /// `lines` is likewise computed at OPEN time (`transfer_ui::
+    /// import_confirm_lines`) so the sentence "your connections will be
+    /// replaced" is the one that was true when the user read it.
+    SettingsImportConfirm {
+        path: std::path::PathBuf,
+        bundle: Box<dbc_state::bundle::Bundle>,
+        lines: Vec<String>,
+        error: Option<String>,
+    },
 }
 
 /// Which flavour of the ONE name dialog is open (Part S §4).
@@ -1807,6 +1825,11 @@ pub(crate) fn modal_confirm_kind(modal: &ModalState) -> ModalConfirmKind {
         // Irreversible in the same sense: config.toml has no undo and the
         // vault secret is destroyed with it. The button is the gate.
         | ModalState::ConnectionDeleteConfirm { .. }
+        // §3-novela by substance again: this replaces config.toml AND the
+        // vault in one act. The backups make it recoverable, not
+        // reversible — nothing in the app puts them back. A deliberate
+        // click, never a stray Enter.
+        | ModalState::SettingsImportConfirm { .. }
         | ModalState::ScriptDeleteConfirm { .. } => ModalConfirmKind::Ignore,
     }
 }
@@ -1856,6 +1879,10 @@ pub(crate) fn modal_is_blocking(modal: &ModalState) -> bool {
         | ModalState::FolderName { .. }
         | ModalState::FolderDeleteConfirm { .. }
         | ModalState::ConnectionDeleteConfirm { .. }
+        // Nothing has been written yet and the app behind it is intact, so
+        // Esc is simply „no" — the same posture as every other confirm
+        // whose work has not started.
+        | ModalState::SettingsImportConfirm { .. }
         | ModalState::CsvImport { .. } => false,
     }
 }
@@ -2223,6 +2250,9 @@ impl AppView {
             ModalState::ConnectionDeleteConfirm { name, secret_stays, .. } => {
                 render_connection_delete_panel(&name, secret_stays, cx)
             }
+            ModalState::SettingsImportConfirm { path, lines, error, .. } => {
+                render_settings_import_panel(&path, &lines, &error, cx)
+            }
         };
         Some(
             div()
@@ -2396,6 +2426,47 @@ impl AppView {
                     )
             }
         };
+
+        // „Přenos na jiný počítač" (bundle). Last block, above Zavřít:
+        // rarely used, and the one whose Import button replaces everything
+        // above it — so it does not sit next to the theme radios.
+        panel = panel
+            .child(
+                div()
+                    .mt_2()
+                    .text_color(cx.theme().text_muted)
+                    .child(crate::transfer_ui::TRANSFER_SETTINGS_HEADING),
+            )
+            // On screen BEFORE either dialog opens — same posture as
+            // WORKSPACE_GIT_WARNING: the fact you need in order to decide
+            // must not live only inside the dialog you are deciding about.
+            .child(
+                div()
+                    .text_color(cx.theme().text_muted)
+                    .child(crate::transfer_ui::TRANSFER_SETTINGS_NOTE),
+            )
+            .child(
+                div()
+                    .id("settings-transfer-export")
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(cx.theme().bg_hover)
+                    .cursor_pointer()
+                    .child(crate::transfer_ui::TRANSFER_SETTINGS_EXPORT)
+                    .on_click(cx.listener(|this, _, _, cx| this.start_settings_export(cx))),
+            )
+            .child(
+                div()
+                    .id("settings-transfer-import")
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(cx.theme().bg_hover)
+                    .cursor_pointer()
+                    .child(crate::transfer_ui::TRANSFER_SETTINGS_IMPORT)
+                    .on_click(cx.listener(|this, _, _, cx| this.start_settings_import(cx))),
+            );
 
         panel
             .child(
@@ -4351,6 +4422,68 @@ fn render_connection_delete_panel(
         .into_any_element()
 }
 
+/// The import confirm. Wider than the delete confirms (560 px) because it
+/// carries a LIST plus three explanatory sentences, and a body that wraps
+/// into a column of ten short lines is a body nobody finishes reading.
+fn render_settings_import_panel(
+    path: &std::path::Path,
+    lines: &[String],
+    error: &Option<String>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let mut panel: Div = div()
+        .w(px(560.))
+        .bg(cx.theme().bg_panel)
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded_md()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(cx.theme().text_primary)
+        .child(div().text_size(px(16.)).child(crate::transfer_ui::IMPORT_CONFIRM_TITLE))
+        .child(div().text_color(cx.theme().text_muted).child(path.display().to_string()));
+    for line in lines {
+        panel = panel.child(div().child(line.clone()));
+    }
+    // An `apply` that failed leaves the dialog OPEN carrying its message —
+    // the Apply-dialog precedent. A refusal that closes the window it came
+    // from is a refusal the user reads as „nothing happened".
+    if let Some(e) = error {
+        panel = panel.child(div().text_color(cx.theme().danger).child(format!("error: {e}")));
+    }
+    panel
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .justify_end()
+                .mt_2()
+                .child(
+                    styled_button(
+                        "settings-import-cancel",
+                        crate::transfer_ui::IMPORT_CONFIRM_CANCEL,
+                        *cx.theme(),
+                    )
+                    .on_click(cx.listener(|v, _, _, cx| {
+                        v.modal = None;
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    styled_button(
+                        "settings-import-ok",
+                        crate::transfer_ui::IMPORT_CONFIRM_OK,
+                        *cx.theme(),
+                    )
+                    .on_click(cx.listener(|v, _, _, cx| v.confirm_settings_import(cx))),
+                ),
+        )
+        .into_any_element()
+}
+
 fn render_master_password_panel(
     input: Entity<TextField>,
     error: Option<String>,
@@ -5296,7 +5429,14 @@ pub(crate) fn workspace_confirm_esc_closable(running: bool) -> bool {
 /// the `modal_confirm_kind` / `modal_is_blocking` convention.
 pub(crate) fn modal_blocks_context_switch(modal: Option<&ModalState>) -> bool {
     match modal {
-        None | Some(ModalState::Settings) | Some(ModalState::WorkspaceConfirm { .. }) => false,
+        // The import flow's OWN confirm, like `WorkspaceConfirm` above it:
+        // it does not merely tolerate a context change, it IS one, and
+        // `confirm_settings_import` calls `apply_context` itself. Treating
+        // it as a blocker would make the flow refuse its own last step.
+        None
+        | Some(ModalState::Settings)
+        | Some(ModalState::WorkspaceConfirm { .. })
+        | Some(ModalState::SettingsImportConfirm { .. }) => false,
         Some(ModalState::ConnectionDialog(_))
         | Some(ModalState::MasterPasswordPrompt { .. })
         | Some(ModalState::CreateMasterPassword { .. })

@@ -25,7 +25,7 @@ mod policy;
 mod render;
 mod vault_key;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use dbc_core::{CancelToken, Connection, Dialect};
@@ -65,21 +65,31 @@ fn main() -> ExitCode {
 /// they are in a workspace is the one failure mode this whole mechanism
 /// exists to prevent. Explicit `--config`/`--vault` still win, so there is
 /// always a way through.
-fn resolve_paths(a: &Args) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+fn resolve_paths(a: &Args) -> Result<dbc_state::workspace::Paths, String> {
     use dbc_state::workspace::Resolution;
     // History is machine-local in BOTH modes (§W5), so it comes from the
     // same resolution as the rest and simply never points into a shared
     // workspace folder.
-    let (config, vault, history) = match dbc_state::workspace::resolve() {
-        Resolution::Profile(p) => (p.config, p.vault, p.history),
-        Resolution::Workspace { paths, .. } => (paths.config, paths.vault, paths.history),
+    let mut paths = match dbc_state::workspace::resolve() {
+        Resolution::Profile(p) => p,
+        Resolution::Workspace { paths, .. } => paths,
         Resolution::Broken { root, reason } => {
             let named = root
                 .map(|r| r.display().to_string())
                 .unwrap_or_else(|| "ukazatel na pracovní prostor je nečitelný".to_string());
             let reason = dbc_state::workspace::one_line_reason(&reason);
             match (&a.config, &a.vault) {
-                (Some(c), Some(v)) => (c.clone(), v.clone(), dbc_state::default_history_path()),
+                (Some(c), Some(v)) => dbc_state::workspace::Paths {
+                    config: c.clone(),
+                    vault: v.clone(),
+                    // A broken pointer says nothing about where the rest of
+                    // the context lives, and the two overrides do not cover
+                    // them. Beside the config the user named is the only
+                    // defensible guess.
+                    views: c.with_file_name("views.toml"),
+                    params: c.with_file_name("params.toml"),
+                    history: dbc_state::default_history_path(),
+                },
                 _ => {
                     return Err(format!(
                         "{named} ({reason})\nspusť aplikaci a vyber pracovní prostor znovu, \
@@ -89,7 +99,21 @@ fn resolve_paths(a: &Args) -> Result<(PathBuf, PathBuf, PathBuf), String> {
             }
         }
     };
-    Ok((a.config.clone().unwrap_or(config), a.vault.clone().unwrap_or(vault), history))
+    if let Some(c) = &a.config {
+        // `views` and `params` follow the config rather than staying at the
+        // profile's. `--config` names a CONTEXT, and the two files are keyed
+        // by the connection ids inside that config — leaving them pointed at
+        // `%APPDATA%\dbc` would have `dbc export --config <elsewhere>` bundle
+        // one machine's connections with another context's column widths.
+        // Only `export`/`import` read them, so nothing else notices.
+        paths.views = c.with_file_name("views.toml");
+        paths.params = c.with_file_name("params.toml");
+        paths.config = c.clone();
+    }
+    if let Some(v) = &a.vault {
+        paths.vault = v.clone();
+    }
+    Ok(paths)
 }
 
 /// A missing `config.toml` reads as „no connections saved yet" — that is
@@ -124,7 +148,9 @@ fn run(a: Args) -> Result<(), String> {
         _ => {}
     }
 
-    let (config_path, vault_path, history_path) = resolve_paths(&a)?;
+    let paths = resolve_paths(&a)?;
+    let (config_path, vault_path, history_path) =
+        (paths.config.clone(), paths.vault.clone(), paths.history.clone());
 
     match &a.command {
         Command::Help | Command::Version => unreachable!("handled above"),
@@ -134,6 +160,10 @@ fn run(a: Args) -> Result<(), String> {
             println!("uložený klíč trezoru smazán");
             return Ok(());
         }
+        // Both open no database and need no password: a bundle is files,
+        // and the vault inside it is never unsealed.
+        Command::Export { file } => return export(&paths, file),
+        Command::Import { file, force } => return import(&paths, file, *force),
         _ => {}
     }
 
@@ -239,6 +269,79 @@ fn login(vault_path: &Path) -> Result<(), String> {
     vault_key::store_key(&key)?;
     println!("klíč trezoru uložen — `dbc` teď půjde volat i ze skriptu (`dbc logout` ho smaže)");
     Ok(())
+}
+
+/// `dbc export <soubor>` — write the portable bundle.
+///
+/// Deliberately does NOT ask for the master password. Nothing is decrypted:
+/// the vault goes into the file as the sealed envelope it already is. Asking
+/// would imply a protection the export does not add, and would stop the
+/// command working from a script for no gain — the file on disk was already
+/// readable to whoever runs this.
+fn export(paths: &dbc_state::workspace::Paths, file: &Path) -> Result<(), String> {
+    let bundle =
+        dbc_state::bundle::build(paths, env!("CARGO_PKG_VERSION")).map_err(|e| e.message)?;
+    let summary = dbc_state::bundle::summary(&bundle).map_err(|e| e.message)?;
+    dbc_state::bundle::write(&bundle, file).map_err(|e| e.message)?;
+
+    println!("{} — {}", file.display(), plural_connections(summary.connections.len()));
+    if summary.has_vault {
+        println!("trezor je uvnitř, pořád zašifrovaný — hesla v souboru čitelná nejsou");
+        println!("na druhém počítači ho otevřeš tím samým master heslem jako tady");
+    } else {
+        println!("trezor zatím neexistuje, takže v souboru žádná hesla nejsou");
+    }
+    println!("nepřenáší se: historie, hodnoty parametrů, log, cesty k psql/sqlcmd");
+    Ok(())
+}
+
+/// `dbc import <soubor>` — replace this context's settings with a bundle's.
+///
+/// The `--force` gate is on the CONFIG's existence, not on the vault's: the
+/// config is what carries the connections, so its presence is what makes
+/// this a replacement rather than a first setup. A CLI cannot put a confirm
+/// dialog in front of a destructive act, so the flag is the dialog — and the
+/// refusal names the file that would have been overwritten, because that is
+/// the fact needed to decide.
+fn import(paths: &dbc_state::workspace::Paths, file: &Path, force: bool) -> Result<(), String> {
+    // Read and validate FIRST: a bundle that turns out to be unusable must
+    // not have caused a backup, a warning, or a single write.
+    let bundle = dbc_state::bundle::read(file).map_err(|e| e.message)?;
+    let summary = dbc_state::bundle::summary(&bundle).map_err(|e| e.message)?;
+
+    if paths.config.exists() && !force {
+        return Err(format!(
+            "{} už existuje a import ho nahradí ({} v balíčku) — přidej --force, \
+             pokud to je záměr; původní soubory se odloží stranou",
+            paths.config.display(),
+            plural_connections(summary.connections.len())
+        ));
+    }
+
+    let applied = dbc_state::bundle::apply(&bundle, paths).map_err(|e| e.message)?;
+
+    println!("nastaveno z {} — {}", file.display(), plural_connections(summary.connections.len()));
+    for name in &summary.connections {
+        println!("  {name}");
+    }
+    if summary.has_vault {
+        println!("trezor nahrazen — otevírá se master heslem z původního počítače");
+    }
+    if applied.backed_up.is_empty() {
+        println!("nic se nepřepisovalo, profil byl prázdný");
+    } else {
+        println!("původní soubory odloženy stranou:");
+        for (_, bak) in &applied.backed_up {
+            println!("  {}", bak.display());
+        }
+    }
+    Ok(())
+}
+
+/// `připojení` is a neuter `-í` noun: one form for every count, so this is
+/// only here to keep the number and the word together at each call site.
+fn plural_connections(n: usize) -> String {
+    format!("{n} připojení")
 }
 
 fn connections_table(config: &AppConfig) -> Table {
@@ -486,6 +589,7 @@ fn read_sql(source: &SqlSource) -> Result<String, String> {
 mod tests {
     use super::*;
     use args::Format;
+    use std::path::PathBuf;
 
     #[test]
     fn every_engine_maps_to_a_dialect() {

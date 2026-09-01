@@ -116,6 +116,19 @@ pub enum PaletteAction {
     ShowLog,
     /// G7 T6: opens `ModalState::CompareDialog` (design §3's entry point).
     OpenCompare,
+    /// „Přenos na jiný počítač" — writes a settings bundle (`transfer_ui`).
+    ///
+    /// Both this and [`PaletteAction::ImportSettings`] ALSO live in the
+    /// Settings dialog, which is where a person looks for them. They are
+    /// here as well because Settings has no keyboard route of its own — it
+    /// opens only from the ☰ menu — and „move my setup to the new laptop"
+    /// is a thing you do on a machine whose mouse you are still getting
+    /// used to.
+    ExportSettings,
+    /// Reads one back. Guarded exactly like a workspace switch, and it
+    /// still goes through the confirm dialog — a palette entry is a faster
+    /// way to REACH the question, never a way to skip it.
+    ImportSettings,
     /// G11 T6: opens `ModalState::BackupRestore` in `BackupKind::Backup`
     /// mode for the currently active connection.
     BackupDatabase,
@@ -244,6 +257,11 @@ pub fn fixed_actions(
         ("Přepnout motiv".to_string(), PaletteAction::ToggleTheme),
         ("Otevřít log".to_string(), PaletteAction::ShowLog),
         ("Vymazat mezipaměť schémat".to_string(), PaletteAction::ClearSchemaCache),
+        // Unconditional: export refuses on its own terms when there is
+        // nothing saved (with a sentence naming the profile), and import
+        // is exactly what an EMPTY app needs most.
+        ("Vyvézt nastavení…".to_string(), PaletteAction::ExportSettings),
+        ("Načíst nastavení…".to_string(), PaletteAction::ImportSettings),
     ];
     if monitor_available {
         actions.push(("Monitor serveru".to_string(), PaletteAction::OpenMonitor));
@@ -530,9 +548,10 @@ mod rank_items_tests {
         // "Porovnat databáze…" (`OpenCompare`) + G12 T3's "Spustit SQL
         // soubor…"/"Spustit SQL složku…" + workspace T8's "Uložit skript"
         // (`SaveScript`) + G14 T10's "Přepnout motiv" (`ToggleTheme`) +
-        // the log viewer (`ShowLog`) — all unconditional, unlike
+        // the log viewer (`ShowLog`) + the two settings-transfer rows
+        // (`ExportSettings`/`ImportSettings`) — all unconditional, unlike
         // `OpenMonitor` which is engine-gated (monitor_available=false).
-        assert_eq!(items.len(), 2 + 2 + 1 + 13);
+        assert_eq!(items.len(), 2 + 2 + 1 + 15);
     }
 
     #[test]
@@ -639,6 +658,19 @@ mod rank_items_tests {
             .iter()
             .all(|i| !matches!(i, PaletteItem::Action { action: PaletteAction::BackupDatabase, .. })
                 && !matches!(i, PaletteItem::Action { action: PaletteAction::RestoreDatabase, .. })));
+    }
+
+    /// They must be there with NO connection and no vault — a fresh
+    /// install is the state in which „load my settings" matters most, and
+    /// it is exactly the state where most other rows are hidden.
+    #[test]
+    fn the_transfer_actions_are_offered_even_in_a_completely_empty_app() {
+        let actions = fixed_actions(false, AdminEntry::Hidden, false, false, false, false);
+        assert!(actions.iter().any(|(_, a)| matches!(a, PaletteAction::ExportSettings)));
+        assert!(actions.iter().any(|(_, a)| matches!(a, PaletteAction::ImportSettings)));
+        let labels: Vec<&str> = actions.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(labels.contains(&"Vyvézt nastavení…"), "{labels:?}");
+        assert!(labels.contains(&"Načíst nastavení…"), "{labels:?}");
     }
 
     #[test]

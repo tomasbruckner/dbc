@@ -50,6 +50,13 @@ pub enum Command {
     Tables { conn: String, schema: Option<String> },
     /// Run SQL and print the result.
     Query { conn: String, sql: SqlSource, write: bool },
+    /// Write a portable settings bundle: connections + the SEALED vault.
+    /// Needs no master password — nothing is decrypted.
+    Export { file: PathBuf },
+    /// Replace this machine's settings with a bundle's. `force` is required
+    /// when there is already a `config.toml` to overwrite: the CLI cannot
+    /// show a confirm dialog, so the flag IS the dialog.
+    Import { file: PathBuf, force: bool },
     /// Store the derived vault key so scripts can run without a prompt.
     Login,
     /// Remove it again.
@@ -100,6 +107,8 @@ PŘÍKAZY
     query <conn> -           spustí SQL ze standardního vstupu
     login                    uloží odvozený klíč trezoru pro neinteraktivní běh
     logout                   uložený klíč smaže
+    export <soubor>          vyveze připojení i trezor do jednoho souboru
+    import <soubor>          nahradí nastavení tímhle souborem
 
     <conn> je jméno připojení, jak ho vidíš v aplikaci (nebo jeho id).
 
@@ -110,6 +119,7 @@ VOLBY
     --format table|json|csv  podoba výstupu (výchozí table)
     --limit <n>              strop řádků (výchozí 1000, 0 = bez stropu)
     --timeout <s>            časový limit na příkaz (výchozí 60)
+    --force                  u `import`: přepiš i existující nastavení
     --config <cesta>         jiný config.toml
     --vault <cesta>          jiný soubor trezoru
     -h, --help               tato nápověda
@@ -120,6 +130,17 @@ ZÁPIS
     nic se neprovede. --write je v příkazové řádce obdobou potvrzovacího
     dialogu v aplikaci: musíš ho napsat ty, pro tenhle jeden běh.
     Připojení označené jen pro čtení --write NEPŘEBIJE.
+
+PŘENOS NA JINÝ POČÍTAČ
+    `export` uloží připojení a trezor tak, jak je — trezor zůstane
+    zašifrovaný, takže export se na master heslo neptá a heslo v souboru
+    není. Na druhém počítači ho otevřeš tím SAMÝM master heslem jako na
+    prvním; import trezory neslučuje, nahrazuje jeden druhým.
+
+    Nepřenáší se historie, uložené hodnoty parametrů, log ani cesty k
+    lokálním nástrojům (psql, sqlcmd) — ty popisují počítač, ne práci.
+
+    Co import přepíše, nejdřív odloží stranou jako `*.pred-importem-<čas>`.
 
 HESLO
     Hesla k připojením jsou v trezoru. Bez uloženého klíče se dbc zeptá na
@@ -133,6 +154,8 @@ PŘÍKLADY
     dbc query prodej --file report.sql --format csv > report.csv
     dbc tables prodej --db sklad --schema dbo
     dbc query prodej --file migrace.sql --write
+    dbc export prenos.dbcx
+    dbc import prenos.dbcx --force
 ";
 
 /// A parse failure. `message` is already a finished sentence for stderr.
@@ -170,6 +193,7 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
     let mut config = None;
     let mut vault = None;
     let mut write = false;
+    let mut force = false;
     let mut sql: Option<SqlSource> = None;
 
     let simple = |command| Args {
@@ -202,6 +226,22 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
         };
     }
 
+    // Same shape for the bundle path: positional, taken here, missing =>
+    // reported as the missing argument it is. A leading `-` is rejected
+    // rather than accepted as a filename, because `dbc export --force`
+    // meaning „write to a file called --force" helps nobody.
+    let needs_file = matches!(first.as_str(), "export" | "import");
+    let mut file = PathBuf::new();
+    if needs_file {
+        file = match it.next() {
+            Some(f) if !f.starts_with('-') => PathBuf::from(f),
+            Some(other) => {
+                return Err(err(format!("{first} chce nejdřív cestu k souboru, ne {other}")))
+            }
+            None => return Err(err(format!("{first} chce cestu k souboru"))),
+        };
+    }
+
     let set_sql = |src: SqlSource, sql: &mut Option<SqlSource>| -> Result<(), ParseError> {
         if sql.is_some() {
             return Err(err("SQL je zadané dvakrát — vyber jeden zdroj (--sql, --file, nebo -)"));
@@ -218,6 +258,7 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
             }
             "-" => set_sql(SqlSource::Stdin, &mut sql)?,
             "--write" => write = true,
+            "--force" => force = true,
             "--db" => database = Some(value("--db", &mut it)?),
             "--schema" => schema = Some(value("--schema", &mut it)?),
             "--config" => config = Some(PathBuf::from(value("--config", &mut it)?)),
@@ -258,6 +299,8 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
             };
             Command::Query { conn, sql, write }
         }
+        "export" => Command::Export { file },
+        "import" => Command::Import { file, force },
         "login" => Command::Login,
         "logout" => Command::Logout,
         other => return Err(err(format!("neznámý příkaz {other} — zkus `dbc --help`"))),
@@ -271,6 +314,9 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
     }
     if schema.is_some() && !matches!(command, Command::Tables { .. }) {
         return Err(err("--schema dává smysl jen u tables"));
+    }
+    if force && !matches!(command, Command::Import { .. }) {
+        return Err(err("--force dává smysl jen u import"));
     }
 
     Ok(Args { command, database, format, row_limit, timeout_secs, config, vault })
@@ -361,6 +407,47 @@ mod tests {
     fn query_without_any_sql_is_refused() {
         let e = p(&["query", "prod"]).unwrap_err();
         assert!(e.message.contains("--sql"), "{}", e.message);
+    }
+
+    #[test]
+    fn export_and_import_take_a_path_and_import_alone_takes_force() {
+        assert_eq!(
+            p(&["export", "prenos.dbcx"]).unwrap().command,
+            Command::Export { file: PathBuf::from("prenos.dbcx") }
+        );
+        assert_eq!(
+            p(&["import", "prenos.dbcx"]).unwrap().command,
+            Command::Import { file: PathBuf::from("prenos.dbcx"), force: false }
+        );
+        assert_eq!(
+            p(&["import", "prenos.dbcx", "--force"]).unwrap().command,
+            Command::Import { file: PathBuf::from("prenos.dbcx"), force: true }
+        );
+    }
+
+    /// `--force` is the CLI's stand-in for a confirm dialog, so it must not
+    /// be accepted anywhere it would do nothing — an ignored `--force` on
+    /// `export` teaches that the flag is decorative.
+    #[test]
+    fn force_is_refused_outside_import() {
+        for argv in [
+            vec!["export", "a.dbcx", "--force"],
+            vec!["connections", "--force"],
+            vec!["query", "prod", "--sql", "select 1", "--force"],
+        ] {
+            let e = p(&argv).unwrap_err();
+            assert!(e.message.contains("jen u import"), "{argv:?}: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn export_and_import_say_so_when_the_path_is_missing_or_is_a_flag() {
+        for cmd in ["export", "import"] {
+            let e = p(&[cmd]).unwrap_err();
+            assert!(e.message.contains("cestu k souboru"), "{cmd}: {}", e.message);
+            let e = p(&[cmd, "--force"]).unwrap_err();
+            assert!(e.message.contains("cestu k souboru"), "{cmd}: {}", e.message);
+        }
     }
 
     #[test]

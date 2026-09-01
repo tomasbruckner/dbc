@@ -18,6 +18,7 @@ pub use config::{
 };
 
 pub mod applog;
+pub mod bundle;
 pub mod fsutil;
 pub mod schema_cache;
 pub mod session;
