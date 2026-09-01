@@ -1217,6 +1217,35 @@ pub fn apply_db_list_result(
     };
 }
 
+/// Fill a connection's database list from what was cached last run.
+///
+/// Returns whether anything changed. Only ever writes over `NotLoaded`:
+/// a slot that is `Loading` has a live fetch about to answer, one that is
+/// `Loaded` already holds something at least as fresh, and one holding an
+/// `Error` is telling the user something a cached list would paper over.
+///
+/// The nodes are built exactly as [`apply_db_list_result`] builds them, and
+/// `truncated` is false because a cached list is what we chose to keep, not
+/// what a server cut short — the live refresh sets the real flag a moment
+/// later.
+pub fn seed_db_list_from_cache(node: &mut ConnNode, names: &[String], default_db: &str) -> bool {
+    if !matches!(node.dbs, DbListState::NotLoaded) || names.is_empty() {
+        return false;
+    }
+    node.dbs = DbListState::Loaded {
+        dbs: names
+            .iter()
+            .map(|name| DbNode {
+                is_default: name == default_db,
+                schema: DbSchemaState::NotLoaded,
+                name: name.clone(),
+            })
+            .collect(),
+        truncated: false,
+    };
+    true
+}
+
 /// T5 review MAJOR 1: the ACTIVE context's schema fallback slot, keyed by
 /// its `(conn_id, db)` — exact `cli_slot` precedent. The switch path
 /// (dropdown/palette/double-click) fetches the active schema BEFORE the
@@ -2178,6 +2207,27 @@ impl SchemaTree {
             }
         }
         cx.notify();
+    }
+
+    /// Paint the database list remembered from an earlier run, so
+    /// expanding a connection shows its databases before — and without —
+    /// a round trip to the server.
+    ///
+    /// Same posture as the schema cache beside it: this is never the final
+    /// answer, the fetch behind it still runs and replaces it. See
+    /// [`seed_db_list_from_cache`] for why it refuses to write over
+    /// anything but `NotLoaded`.
+    pub fn seed_db_list(
+        &mut self,
+        conn_id: &str,
+        names: &[String],
+        default_db: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node) = self.conns.get_mut(conn_id) else { return };
+        if seed_db_list_from_cache(node, names, default_db) {
+            cx.notify();
+        }
     }
 
     /// Applies a database-list result (stale generations dropped by

@@ -9469,7 +9469,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             if let Some(v) = version.clone() {
                 let id = conn_id.clone();
                 cx.background_executor()
-                    .spawn(async move { dbc_state::server_versions::record(&id, &v) })
+                    .spawn(async move { dbc_state::conn_cache::record_version(&id, &v) })
                     .detach();
             }
             let _ = this.update(cx, |view, cx| {
@@ -9483,6 +9483,20 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let Some(cfg) = self.config.connections.iter().find(|c| c.id == conn_id).cloned() else {
             return;
         };
+        // Paint the list we already have FIRST -- before the vault gate,
+        // before the connect. Expanding a connection used to mean staring
+        // at the loading row for a whole round trip even though the same
+        // list had been fetched an hour earlier (user, 2026-09-01). It is
+        // never the final answer: the fetch below still runs and replaces
+        // it, exactly as the schema cache works one level down.
+        //
+        // Before the vault gate on purpose. A list of database names needs
+        // no secret to be readable, so a locked vault should not be able to
+        // hide what is already on disk.
+        if let Some(cached) = dbc_state::conn_cache::databases(&conn_id) {
+            let default_db = cfg.database.clone();
+            self.tree.update(cx, |t, cx| t.seed_db_list(&conn_id, &cached, &default_db, cx));
+        }
         let needs_secret = !connections_ui::engine_is_file_based(cfg.engine);
         if connections_ui::connect_needs_vault_prompt(
             needs_secret,
@@ -9538,6 +9552,16 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                             error: e.clone(),
                         }),
                     }
+                }
+                // Remember it for the next run, off the UI thread. Only a
+                // real answer is worth keeping -- an error leaves whatever
+                // the last good fetch stored, which is what the sidebar
+                // should show while a server is down.
+                if let Ok((names, _)) = &result {
+                    let (id, names) = (conn_id.clone(), names.clone());
+                    cx.background_executor()
+                        .spawn(async move { dbc_state::conn_cache::record_databases(&id, &names) })
+                        .detach();
                 }
                 view.tree.update(cx, |t, cx| {
                     t.finish_db_list(&conn_id, my_generation, result, &default_db, cx)
@@ -10911,7 +10935,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let grouped = self.grouped_cache.clone();
         self.tree.update(cx, |t, cx| {
             t.sync_connections(grouped, cx);
-            t.seed_server_versions(&dbc_state::server_versions::load(), cx);
+            t.seed_server_versions(&dbc_state::conn_cache::versions(), cx);
         });
         cx.notify();
     }
@@ -11064,7 +11088,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let grouped = self.grouped_cache.clone();
         self.tree.update(cx, |t, cx| {
             t.sync_connections(grouped, cx);
-            t.seed_server_versions(&dbc_state::server_versions::load(), cx);
+            t.seed_server_versions(&dbc_state::conn_cache::versions(), cx);
         });
         cx.notify();
     }
@@ -14752,7 +14776,7 @@ fn main() {
             let grouped = view.grouped_cache.clone();
             view.tree.update(cx, |t, cx| {
                 t.sync_connections(grouped, cx);
-                t.seed_server_versions(&dbc_state::server_versions::load(), cx);
+                t.seed_server_versions(&dbc_state::conn_cache::versions(), cx);
             });
             // The tree starts on `TreeGrouping::Schema` and learns the saved
             // choice here — this is what makes the setting survive a
