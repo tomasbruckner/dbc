@@ -1547,6 +1547,26 @@ fn script_notice_event(text: &str, open_settings: bool) -> Option<TreeEvent> {
     }
 }
 
+/// Which remembered versions [`SchemaTree::seed_server_versions`] is
+/// allowed to write.
+///
+/// Split out because the method needs a `Context` and therefore cannot be
+/// tested, while the rule it enforces is the entire point: a version that
+/// came from a server during this run outranks one read off disk, always.
+/// A connection the tree does not know is skipped rather than created —
+/// `sync_connections` decides which rows exist, and a leftover entry for a
+/// deleted connection must not resurrect one.
+pub(crate) fn versions_to_seed(
+    conns: &HashMap<String, ConnNode>,
+    remembered: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    conns
+        .iter()
+        .filter(|(_, node)| node.version.is_none())
+        .filter_map(|(id, _)| remembered.get(id).map(|v| (id.clone(), v.clone())))
+        .collect()
+}
+
 pub fn flatten_sidebar(
     grouped: &crate::connections_ui::GroupedConnections,
     states: &HashMap<String, ConnNode>,
@@ -2130,6 +2150,33 @@ impl SchemaTree {
             return;
         }
         node.version = Some(v);
+        cx.notify();
+    }
+
+    /// Fills in versions remembered from earlier runs
+    /// (`dbc_state::server_versions`), for the rows that do not have one
+    /// yet.
+    ///
+    /// „Do not have one yet" is the whole contract. A node that already
+    /// carries a version got it from a server during THIS run, and a
+    /// remembered value must never be allowed to overwrite that — the
+    /// remembered one is by definition the older of the two, and a config
+    /// change (rename, folder move, a new connection) re-runs
+    /// `sync_connections`, which keeps live nodes, right before this.
+    pub fn seed_server_versions(
+        &mut self,
+        remembered: &std::collections::BTreeMap<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let to_apply = versions_to_seed(&self.conns, remembered);
+        if to_apply.is_empty() {
+            return;
+        }
+        for (id, version) in to_apply {
+            if let Some(node) = self.conns.get_mut(&id) {
+                node.version = Some(version);
+            }
+        }
         cx.notify();
     }
 
@@ -4282,6 +4329,54 @@ mod sidebar_tests {
                 if conn_id == "c1" && text == expect_text && *retry == expect_retry),
                 "state expecting {expect_text}: got {:?}", rows.get(1));
         }
+    }
+
+    /// The version survives a restart („kdyz vypnu a zapnu appku, tak mi
+    /// zmizi info o verzi serveru", user 2026-09-01): what was written to
+    /// `dbc_state::server_versions` last time fills the row before anyone
+    /// has connected.
+    #[test]
+    fn a_remembered_version_fills_a_row_that_has_none() {
+        let mut conns = HashMap::new();
+        conns.insert("c1".to_string(), ConnNode { dbs: DbListState::NotLoaded, version: None });
+        let remembered = [("c1".to_string(), "18".to_string())].into_iter().collect();
+        assert_eq!(
+            versions_to_seed(&conns, &remembered),
+            vec![("c1".to_string(), "18".to_string())]
+        );
+    }
+
+    /// …and never over one this run already learned from the server. The
+    /// remembered value is by definition the older of the two, so letting
+    /// it win would turn „upgraded to pg 18" back into „pg 17" on the next
+    /// rename or folder move.
+    #[test]
+    fn a_remembered_version_never_overwrites_a_live_one() {
+        let mut conns = HashMap::new();
+        conns.insert(
+            "c1".to_string(),
+            ConnNode { dbs: DbListState::NotLoaded, version: Some("18".into()) },
+        );
+        let remembered = [("c1".to_string(), "17".to_string())].into_iter().collect();
+        assert!(versions_to_seed(&conns, &remembered).is_empty());
+    }
+
+    /// An entry for a connection that no longer exists is inert: the file
+    /// is allowed to outlive a deleted connection, but it may not put a
+    /// row back.
+    #[test]
+    fn a_remembered_version_for_an_unknown_connection_is_ignored() {
+        let conns = HashMap::new();
+        let remembered = [("gone".to_string(), "18".to_string())].into_iter().collect();
+        assert!(versions_to_seed(&conns, &remembered).is_empty());
+    }
+
+    /// Nothing remembered is not an error and not a change.
+    #[test]
+    fn an_empty_memory_seeds_nothing() {
+        let mut conns = HashMap::new();
+        conns.insert("c1".to_string(), ConnNode { dbs: DbListState::NotLoaded, version: None });
+        assert!(versions_to_seed(&conns, &Default::default()).is_empty());
     }
 
     /// The connection row carries the server's version once it is known,

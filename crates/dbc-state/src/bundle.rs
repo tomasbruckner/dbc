@@ -27,7 +27,8 @@
 //!   a `WHERE`. Machine-local by design (§W5), and not a setting.
 //! * `params.toml` — last-used `:param` values: same reason, arbitrary
 //!   user-typed literals.
-//! * `dbc.log`, `schema-cache/`, `sessions/` — diagnostic or derived. They
+//! * `dbc.log`, `schema-cache/`, `sessions/`, `server-versions.json` —
+//!   diagnostic or derived. They
 //!   would only arrive stale.
 //! * `tool_paths` and `scripts_dir` INSIDE `config.toml` — absolute paths to
 //!   THIS machine's `psql`/`sqlcmd` and to a local folder. They are the one

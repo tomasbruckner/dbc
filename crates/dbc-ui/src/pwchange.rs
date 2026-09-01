@@ -85,7 +85,8 @@ pub fn enrich_test_error(engine: Engine, err: &QueryError) -> String {
     }
     match detect(engine, err) {
         Some(PwChangeKind::MssqlMustChange) => format!(
-            "{err}\nserver vyžaduje změnu hesla — po přepnutí na toto připojení aplikace nabídne dialog změny"
+            "{err}\nserver vyžaduje změnu hesla — zavři tento dialog a přepni se na připojení \
+             (pravý klik na řádek → „Nastavit jako aktivní“); teprve pak aplikace nabídne změnu"
         ),
         Some(PwChangeKind::PgMaybeExpired) => {
             format!("{err}\npokud heslu vypršela platnost, aplikace při přepnutí na připojení nabídne změnu")

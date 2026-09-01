@@ -21,6 +21,7 @@ pub mod applog;
 pub mod bundle;
 pub mod fsutil;
 pub mod schema_cache;
+pub mod server_versions;
 pub mod session;
 pub mod workspace;
 

@@ -9462,6 +9462,16 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             .fetch_server_version(spec_for_database(cfg, &cfg.database, secret), engine);
         cx.spawn(async move |this, cx| {
             let Ok(Ok(version)) = rx.await else { return };
+            // Remember it before painting it, and off the UI thread. The
+            // file is a few hundred bytes, but „a few hundred bytes" is not
+            // a reason to do file I/O on the thread that draws — this app
+            // does not do that anywhere else either.
+            if let Some(v) = version.clone() {
+                let id = conn_id.clone();
+                cx.background_executor()
+                    .spawn(async move { dbc_state::server_versions::record(&id, &v) })
+                    .detach();
+            }
             let _ = this.update(cx, |view, cx| {
                 view.tree.update(cx, |t, cx| t.set_server_version(&conn_id, version, cx));
             });
@@ -10899,7 +10909,10 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         }
         self.refresh_grouped_cache(cx);
         let grouped = self.grouped_cache.clone();
-        self.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
+        self.tree.update(cx, |t, cx| {
+            t.sync_connections(grouped, cx);
+            t.seed_server_versions(&dbc_state::server_versions::load(), cx);
+        });
         cx.notify();
     }
 
@@ -11049,7 +11062,10 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         };
         self.refresh_grouped_cache(cx);
         let grouped = self.grouped_cache.clone();
-        self.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
+        self.tree.update(cx, |t, cx| {
+            t.sync_connections(grouped, cx);
+            t.seed_server_versions(&dbc_state::server_versions::load(), cx);
+        });
         cx.notify();
     }
 
@@ -14734,7 +14750,10 @@ fn main() {
             let editor_focus = view.sql.focus_handle(cx);
             window.focus(&editor_focus, cx);
             let grouped = view.grouped_cache.clone();
-            view.tree.update(cx, |t, cx| t.sync_connections(grouped, cx));
+            view.tree.update(cx, |t, cx| {
+                t.sync_connections(grouped, cx);
+                t.seed_server_versions(&dbc_state::server_versions::load(), cx);
+            });
             // The tree starts on `TreeGrouping::Schema` and learns the saved
             // choice here — this is what makes the setting survive a
             // restart. A blocked start carries a default config, so this
