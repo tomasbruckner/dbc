@@ -386,6 +386,8 @@ pub struct ResultGrid {
     /// `find_step`/`toolbar`'s auto-jump-to-first-match scroll a matched
     /// row into view (`UniformListScrollHandle::scroll_to_item`).
     scroll_handle: UniformListScrollHandle,
+    /// Overlay scrollbar over `scroll_handle` (same `Rc`) — `scrollbar.rs`.
+    v_scrollbar: crate::scrollbar::ScrollbarHandle,
     /// G4 Task 4: source table name for `INSERT` exports. `"export"` is the
     /// placeholder for an ad-hoc SQL-editor result (no single source table
     /// is known); a schema-tree/palette preview tab overrides this via
@@ -504,6 +506,7 @@ pub struct ResultGrid {
 
 impl ResultGrid {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let scroll_handle = UniformListScrollHandle::new();
         Self {
             buffer: None,
             col_widths: Vec::new(),
@@ -523,7 +526,8 @@ impl ResultGrid {
             filter_cache: Vec::new(),
             find: None,
             cell_detail: None,
-            scroll_handle: UniformListScrollHandle::new(),
+            scroll_handle: scroll_handle.clone(),
+            v_scrollbar: crate::scrollbar::ScrollbarHandle::with_list(scroll_handle.clone()),
             table_name: "export".to_string(),
             csv_import_enabled: false,
             export_open: false,
@@ -3095,6 +3099,7 @@ impl Render for ResultGrid {
             )
             .w(px(total_w))
             .track_scroll(&self.scroll_handle)
+            .with_decoration(self.v_scrollbar.decoration())
             .flex_1(),
         );
         root = root.child(scroller);

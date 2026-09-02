@@ -1515,6 +1515,8 @@ pub struct BackupSession {
     pub connection_name: String,
     pub database: String,
     pub log: BackupLog,
+    /// Overlay scrollbar for the log list — `scrollbar.rs`.
+    pub log_scrollbar: crate::scrollbar::ScrollbarHandle,
     pub status: std::rc::Rc<std::cell::RefCell<BackupStatus>>,
     pub started_at: std::time::Instant,
     pub cancel: CancelSlot,
@@ -1603,6 +1605,7 @@ mod session_tests {
 
     fn session(status: BackupStatus) -> BackupSession {
         BackupSession {
+            log_scrollbar: crate::scrollbar::ScrollbarHandle::new(),
             kind: BackupKind::Backup,
             engine: dbc_state::Engine::Postgres,
             connection_id: "c1".into(),

@@ -64,6 +64,8 @@ mod server_version;
 mod scripts;
 mod sql_highlight;
 mod star_expand;
+mod editor_tabs;
+mod scrollbar;
 mod tree_menu;
 mod folders;
 mod keymap;
@@ -141,7 +143,16 @@ actions!(
         /// editor and in the grid, and the cheat sheet deliberately does
         /// not list chords everyone already knows.
         TextViewCopy,
-        TextViewSelectAll
+        TextViewSelectAll,
+        /// Editor tabs (2026-09-02 design §4). Ctrl+N/W/Tab were all
+        /// unbound before; `keymap::SHORTCUTS` lists them.
+        NewEditorTab,
+        CloseEditorTab,
+        NextEditorTab,
+        PrevEditorTab,
+        /// Ctrl+D — pick `connection / database` for the active tab
+        /// (2026-09-02 design §5).
+        PickDatabase
     ]
 );
 
@@ -173,6 +184,8 @@ struct PaletteState {
     /// The text `items` was last computed from — compared against `input`'s
     /// live text each render to detect an edit.
     last_query: String,
+    /// Commands (Ctrl+K) or the database picker (Ctrl+D) — design §5.
+    mode: palette::PaletteMode,
 }
 
 /// G6 T7: autocomplete popup state — `None` when closed. `candidates` is
@@ -852,7 +865,7 @@ fn script_history_sql(files: &[(PathBuf, usize)], statements_run: usize, stateme
 /// G12 T3/T4: `TabContent::ScriptRun`'s render — a free function (not an
 /// `AppView` method) precisely so it can be called from inside
 /// `AppView::render_tab_content`'s `match &active.content` without
-/// conflicting with `active`'s still-live borrow of `self.tabs` (see the
+/// conflicting with `active`'s still-live borrow of `self.editor().results` (see the
 /// call site's comment). Renders the summary bar (files/statements/rows
 /// progress, elapsed, outcome, "Zrušit" while running), the per-file status
 /// list, and the log tail — reusing `TabContent::Text`'s wrapped-monospace
@@ -907,9 +920,9 @@ fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<Ap
                 .rounded_md()
                 .child("Zrušit")
                 .on_click(cx.listener(|view, _, _, cx| {
-                    if let Some(c) = view.cancel.take() {
+                    if let Some(c) = view.editor_mut().cancel.take() {
                         c.cancel();
-                        view.status = "cancelling…".to_string();
+                        view.editor_mut().status = "cancelling…".to_string();
                     }
                     cx.notify();
                 })),
@@ -1254,7 +1267,7 @@ fn decide_retrigger_action(tab_open: bool, dirty_change_count: Option<usize>) ->
 
 /// Set by `TreeEvent::OpenPreview` and threaded through `run_query_with` so
 /// a preview runs through the exact same guarded pipeline as an
-/// editor-typed query, without ever touching `self.sql`'s text: `title`
+/// editor-typed query, without ever touching `self.editor().sql`'s text: `title`
 /// overrides the tab's title (`collapse_title(sql)` is used otherwise), and
 /// `key` is the tab's `preview_key` — matched by `Tabs::close_by_preview_key`
 /// so re-previewing the same (schema, table) replaces rather than stacks
@@ -1717,9 +1730,9 @@ mod editor_guard {
         if !view.script_is_dirty(cx) {
             return Some(f(view, cx, BufferReplace(PhantomData)));
         }
-        if view.editor_discard_grant == Some(view.script_binding_generation) {
+        if view.editor().editor_discard_grant == Some(view.editor().script_binding_generation) {
             // One shot. A second replacement needs a second answer.
-            view.editor_discard_grant = None;
+            view.editor_mut().editor_discard_grant = None;
             return Some(f(view, cx, BufferReplace(PhantomData)));
         }
         None
@@ -1750,12 +1763,12 @@ mod editor_guard {
         cx: &mut Context<AppView>,
         rewrite: impl FnOnce(&str) -> String,
     ) -> bool {
-        let before = view.sql.read(cx).text();
+        let before = view.editor().sql.read(cx).text();
         let after = rewrite(&before);
         if after == before {
             return false;
         }
-        view.sql.update(cx, |input, cx| {
+        view.editor().sql.update(cx, |input, cx| {
             input.replace_buffer(&after, cx, BufferReplace(PhantomData));
         });
         true
@@ -1932,6 +1945,216 @@ pub(crate) struct ScriptBinding {
     pub saved_text: String,
 }
 
+/// One editor tab's state — everything that used to sit on `AppView` and
+/// assume there was exactly one editor (2026-09-02 design §1). Fields keep
+/// their old names (three renamed for clarity: `tabs`→`results`,
+/// `active_connection_id`→`connection`, `active_database`→`database`) so the
+/// ~260 `self.x` sites became `self.editor().x` mechanically.
+pub(crate) struct EditorTab {
+    pub results: Tabs,
+    pub status: String,
+    pub sql: Entity<SqlInput>,
+    pub cancel: Option<CancelToken>,
+    pub started_at: Option<std::time::Instant>,
+    /// Bumped at the top of every `run_query_with` dispatch; captured by
+    /// that run's spawned event loop as `my_generation`. Final review
+    /// fix #2: the loop's post-`while` tail clears `view.editor().cancel` for its
+    /// own run, but `rx.recv().await` can go `Pending` after the terminal
+    /// event has already been processed (the runner thread hasn't yet
+    /// dropped its sender) — a new run can legitimately start in that
+    /// gap and set a fresh `cancel`. The tail (and any other end-of-run
+    /// tail mutation) applies only when `run_generation` still matches,
+    /// so a newer run's state is never clobbered by an older run's
+    /// finally-arriving channel close. Supersedes the narrower
+    /// `retriggered` flag, which only covered the Task 6 saved-fk-join
+    /// retrigger — this covers every way a new run can start in that
+    /// window (Ctrl+Enter, palette, preview, a ☰ toggle).
+    pub run_generation: u64,
+    pub connection: Option<String>,
+    /// The connection this run TRIED to restore, kept until the switch
+    /// lands or the user disconnects. It is what the session records when
+    /// nothing is connected yet, so a window closed during the vault
+    /// prompt does not erase the context it was about to reopen.
+    pub attempted_restore: Option<(String, Option<String>)>,
+    /// Sidebar rework (design §2.2): the active database WITHIN
+    /// `active_connection_id`. `None` = the saved config's `database` (the
+    /// default). Always `None` when `active_connection_id` is `None` (the
+    /// CLI path has no db switching) and always NORMALIZED — explicitly
+    /// picking the default db stores `None`, so identity/store-key/label
+    /// logic has a single canonical spelling (`switch_to_database` enforces
+    /// this; until that lands in T5, nothing writes `Some` here).
+    pub database: Option<String>,
+    /// The `.sql` file the ONE global editor is currently bound to, or
+    /// `None` for ad-hoc text. Every mutation goes through
+    /// `set_script_binding` so `script_binding_generation` cannot drift.
+    pub script_binding: Option<ScriptBinding>,
+    /// `script_is_dirty`'s answer, recomputed ONCE per frame at the top of
+    /// `AppView::render` — the same lazy-poll idiom `refresh_autocomplete`
+    /// and `history_search`/`last_history_query` already use (see
+    /// history_panel.rs's module doc comment).
+    ///
+    /// It exists because `context_switch_blocked` takes no `cx` and so
+    /// cannot read the editor entity. That makes it at most ONE FRAME
+    /// stale, which is safe in the only direction that matters: every
+    /// path that changes the editor text calls `cx.notify()`, so a frame
+    /// is always drawn between an edit and the next click — the flag can
+    /// linger `true` after an async save lands (the gate then refuses a
+    /// switch it could have allowed, the conservative side) but cannot
+    /// report `false` for text the user has already typed.
+    pub script_dirty_flag: bool,
+    /// Bumped by `set_script_binding` on EVERY binding change. Async
+    /// continuations (`open_script`, `save_script`, `save_script_as`)
+    /// capture it at dispatch and refuse to touch the binding if it moved
+    /// — the phase's four-MAJOR "a stale background continuation applied
+    /// after the user had moved on" class (`start_script_pick`,
+    /// `start_csv_import`, `pick_workspace_for_recovery`,
+    /// `open_workspace_confirm` are the precedents).
+    pub script_binding_generation: u64,
+    /// „The user answered „Zahodit" for the action about to run" — the one
+    /// fact `editor_guard::with_editor_replaceable` cannot re-derive from
+    /// live state, stamped with the `script_binding_generation` it was
+    /// granted at and consumed once.
+    ///
+    /// Written by exactly two functions and read by one; pinned by
+    /// `the_discard_grant_is_written_only_where_the_user_answered`. Any
+    /// third writer is a way to fake the user's answer, which is why the
+    /// grant is a generation rather than a bool: every path that moves the
+    /// binding bumps it, so a stale grant expires on its own instead of
+    /// waiting to be spent.
+    pub editor_discard_grant: Option<u64>,
+    /// T8 review MAJOR-2: is a `save_script` write still in flight? The
+    /// shared `fsutil::write_atomic` rail derives ONE tmp path per target,
+    /// so two overlapping writes to the same file corrupt each other's tmp
+    /// and can leave the caption reading clean over contents the disk does
+    /// not hold. OS key auto-repeat on a held Ctrl+S is enough to trigger
+    /// it. One editor means one flag is enough; a second dispatch is
+    /// refused out loud (`SCRIPT_SAVE_IN_FLIGHT`), never queued silently.
+    pub script_save_in_flight: bool,
+    /// `None` when the popup is closed — see `AutocompleteState`'s doc
+    /// comment for the lazy-diff recompute idiom.
+    pub autocomplete: Option<AutocompleteState>,
+    /// The SQL text `autocomplete` was last computed from — compared
+    /// against `self.editor().sql`'s live text/cursor each render
+    /// (`refresh_autocomplete`) to decide whether a recompute is needed.
+    pub last_ac_text: String,
+    pub last_ac_cursor: usize,
+    /// Design §3: context restored from the session that this tab has not
+    /// connected with yet. Cleared by the first successful switch; while
+    /// set, activating the tab runs that switch.
+    pub unverified: bool,
+    /// Design §3: the bound script's path from the session, re-bound on
+    /// first activation (binding needs the file's text, which startup does
+    /// not read for every tab).
+    pub pending_script_path: Option<PathBuf>,
+}
+
+impl EditorTab {
+    pub fn new(sql: Entity<SqlInput>, connection: Option<String>, database: Option<String>) -> Self {
+        Self {
+            sql,
+            connection,
+            database,
+            results: Tabs::new(),
+            status: "ready".into(),
+            cancel: None,
+            started_at: None,
+            run_generation: 0,
+            attempted_restore: None,
+            script_binding: None,
+            script_dirty_flag: false,
+            script_binding_generation: 0,
+            editor_discard_grant: None,
+            script_save_in_flight: false,
+            autocomplete: None,
+            last_ac_text: String::new(),
+            last_ac_cursor: 0,
+            unverified: false,
+            pending_script_path: None,
+        }
+    }
+}
+
+/// What Ctrl+W has to do first (design §4). Pure, so every branch is
+/// pinned without a window.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CloseEditorDecision {
+    Close,
+    ConfirmDiscard,
+    CancelThenClose,
+    ReplaceWithEmpty,
+}
+
+/// Dirty first — nothing is cancelled or replaced behind a question the
+/// user has not answered yet.
+pub(crate) fn close_editor_decision(is_last: bool, dirty_script: bool, running: bool) -> CloseEditorDecision {
+    if dirty_script {
+        return CloseEditorDecision::ConfirmDiscard;
+    }
+    if is_last {
+        return CloseEditorDecision::ReplaceWithEmpty;
+    }
+    if running {
+        return CloseEditorDecision::CancelThenClose;
+    }
+    CloseEditorDecision::Close
+}
+
+/// GPUI-free view of an `EditorTab` for the session writer.
+pub(crate) struct EditorSnapshot {
+    pub sql: String,
+    pub cursor: usize,
+    pub connection: Option<String>,
+    pub database: Option<String>,
+    pub script_path: Option<PathBuf>,
+    pub tabs: Vec<dbc_state::session::SessionTab>,
+}
+
+/// The pre-editor-tabs top-level session fields, still written for the
+/// active tab (design §3) so an older build opens with it intact.
+pub(crate) struct LegacyFields {
+    pub connection: Option<String>,
+    pub database: Option<String>,
+    pub editor: String,
+    pub cursor: usize,
+    pub tabs: Vec<dbc_state::session::SessionTab>,
+}
+
+/// Pure core of `capture_session` (design §3). The legacy fields always
+/// describe the ACTIVE tab; the `editors` block is written only when there
+/// is something the legacy fields cannot carry (a second tab, or a bound
+/// script), so an untouched app still produces an EMPTY state and removes
+/// its session file exactly as before.
+pub(crate) fn session_editors(
+    editors: &[EditorSnapshot],
+    active: usize,
+) -> (Vec<dbc_state::session::SessionEditor>, LegacyFields) {
+    let a = &editors[active.min(editors.len() - 1)];
+    let legacy = LegacyFields {
+        connection: a.connection.clone(),
+        database: a.database.clone(),
+        editor: a.sql.clone(),
+        cursor: a.cursor,
+        tabs: a.tabs.clone(),
+    };
+    let needs_block = editors.len() > 1 || editors.iter().any(|e| e.script_path.is_some());
+    let list = if needs_block {
+        editors
+            .iter()
+            .map(|e| dbc_state::session::SessionEditor {
+                sql: e.sql.clone(),
+                cursor: e.cursor,
+                connection: e.connection.clone(),
+                database: e.database.clone(),
+                script_path: e.script_path.clone(),
+                tabs: e.tabs.clone(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (list, legacy)
+}
+
 /// Part S §5.5: what a dirty binding is parked on. `LoadText` covers the
 /// two pre-existing "load SQL into the editor" sites (the history panel row
 /// and the palette's history item) — which today clobber the editor with NO
@@ -1954,6 +2177,9 @@ pub(crate) enum PendingScriptAction {
 enum PendingDiscard {
     /// Close tab `id` outright (`Tabs::close`) — the tab strip's "✕".
     CloseTab { id: u64 },
+    /// Editor tabs (design §4): Ctrl+W on a tab whose bound script is
+    /// dirty. Yes drops the binding, then closes.
+    CloseEditorTab { id: u64 },
     /// Run `sql` as `preview` through the normal `run_query_with` pipeline
     /// on "Zahodit" — used both for "re-open the same preview from the
     /// tree/palette" and for a ☰ join-toggle re-run. `revert` is `Some((grid,
@@ -2048,30 +2274,19 @@ pub(crate) struct PendingCompare {
 }
 
 struct AppView {
-    tabs: Tabs,
-    status: String,
+    /// Editor tabs (2026-09-02 design §1). Everything that used to assume
+    /// one editor lives in the active tab's `EditorTab`; reach it through
+    /// `editor()`/`editor_mut()`, or by id from an async completion.
+    editors: editor_tabs::EditorTabs<EditorTab>,
+    /// Scrollbars for the two lists `AppView` renders itself (history,
+    /// autocomplete) — see `scrollbar.rs`.
+    history_scrollbar: scrollbar::ScrollbarHandle,
+    ac_scrollbar: scrollbar::ScrollbarHandle,
     runner: QueryRunner,
     /// Back-compat CLI-arg connection string (phase 0-2 path). `None` when
     /// the app was started with no argument (Task 7's new startup path) or
     /// once a saved connection has been switched to.
     conn_url: Option<String>,
-    sql: Entity<SqlInput>,
-    cancel: Option<CancelToken>,
-    started_at: Option<std::time::Instant>,
-    /// Bumped at the top of every `run_query_with` dispatch; captured by
-    /// that run's spawned event loop as `my_generation`. Final review
-    /// fix #2: the loop's post-`while` tail clears `view.cancel` for its
-    /// own run, but `rx.recv().await` can go `Pending` after the terminal
-    /// event has already been processed (the runner thread hasn't yet
-    /// dropped its sender) — a new run can legitimately start in that
-    /// gap and set a fresh `cancel`. The tail (and any other end-of-run
-    /// tail mutation) applies only when `run_generation` still matches,
-    /// so a newer run's state is never clobbered by an older run's
-    /// finally-arriving channel close. Supersedes the narrower
-    /// `retriggered` flag, which only covered the Task 6 saved-fk-join
-    /// retrigger — this covers every way a new run can start in that
-    /// window (Ctrl+Enter, palette, preview, a ☰ toggle).
-    run_generation: u64,
     // --- Task 7: connection manager state ---
     config: AppConfig,
     config_path: PathBuf,
@@ -2139,12 +2354,6 @@ struct AppView {
     /// Unlocked vault, kept for the session once the user has entered the
     /// master password once (brief: prompt on first use, not at startup).
     vault: Option<Vault>,
-    active_connection_id: Option<String>,
-    /// The connection this run TRIED to restore, kept until the switch
-    /// lands or the user disconnects. It is what the session records when
-    /// nothing is connected yet, so a window closed during the vault
-    /// prompt does not erase the context it was about to reopen.
-    attempted_restore: Option<(String, Option<String>)>,
     /// A `prefetch::may_prefetch` gate and the loop's own „one at a time"
     /// rule (see `prefetch`'s module doc). Set when a prefetch fetch is
     /// dispatched, cleared when it lands — success or failure.
@@ -2154,14 +2363,6 @@ struct AppView {
     /// „one prefetch at a time" would be enforced only by the flag above
     /// while N timers spun behind it.
     prefetch_armed: bool,
-    /// Sidebar rework (design §2.2): the active database WITHIN
-    /// `active_connection_id`. `None` = the saved config's `database` (the
-    /// default). Always `None` when `active_connection_id` is `None` (the
-    /// CLI path has no db switching) and always NORMALIZED — explicitly
-    /// picking the default db stores `None`, so identity/store-key/label
-    /// logic has a single canonical spelling (`switch_to_database` enforces
-    /// this; until that lands in T5, nothing writes `Some` here).
-    active_database: Option<String>,
     /// Bumped on every dropdown connection switch; a switch result only
     /// applies if the generation still matches (last-dispatched wins, not
     /// last-resolved).
@@ -2308,52 +2509,6 @@ struct AppView {
     /// trigger sites.
     discard_confirm: Option<DiscardConfirmState>,
     // --- Workspace T8: the script editor binding (Part S §5) ---
-    /// The `.sql` file the ONE global editor is currently bound to, or
-    /// `None` for ad-hoc text. Every mutation goes through
-    /// `set_script_binding` so `script_binding_generation` cannot drift.
-    script_binding: Option<ScriptBinding>,
-    /// `script_is_dirty`'s answer, recomputed ONCE per frame at the top of
-    /// `AppView::render` — the same lazy-poll idiom `refresh_autocomplete`
-    /// and `history_search`/`last_history_query` already use (see
-    /// history_panel.rs's module doc comment).
-    ///
-    /// It exists because `context_switch_blocked` takes no `cx` and so
-    /// cannot read the editor entity. That makes it at most ONE FRAME
-    /// stale, which is safe in the only direction that matters: every
-    /// path that changes the editor text calls `cx.notify()`, so a frame
-    /// is always drawn between an edit and the next click — the flag can
-    /// linger `true` after an async save lands (the gate then refuses a
-    /// switch it could have allowed, the conservative side) but cannot
-    /// report `false` for text the user has already typed.
-    script_dirty_flag: bool,
-    /// Bumped by `set_script_binding` on EVERY binding change. Async
-    /// continuations (`open_script`, `save_script`, `save_script_as`)
-    /// capture it at dispatch and refuse to touch the binding if it moved
-    /// — the phase's four-MAJOR "a stale background continuation applied
-    /// after the user had moved on" class (`start_script_pick`,
-    /// `start_csv_import`, `pick_workspace_for_recovery`,
-    /// `open_workspace_confirm` are the precedents).
-    script_binding_generation: u64,
-    /// „The user answered „Zahodit" for the action about to run" — the one
-    /// fact `editor_guard::with_editor_replaceable` cannot re-derive from
-    /// live state, stamped with the `script_binding_generation` it was
-    /// granted at and consumed once.
-    ///
-    /// Written by exactly two functions and read by one; pinned by
-    /// `the_discard_grant_is_written_only_where_the_user_answered`. Any
-    /// third writer is a way to fake the user's answer, which is why the
-    /// grant is a generation rather than a bool: every path that moves the
-    /// binding bumps it, so a stale grant expires on its own instead of
-    /// waiting to be spent.
-    editor_discard_grant: Option<u64>,
-    /// T8 review MAJOR-2: is a `save_script` write still in flight? The
-    /// shared `fsutil::write_atomic` rail derives ONE tmp path per target,
-    /// so two overlapping writes to the same file corrupt each other's tmp
-    /// and can leave the caption reading clean over contents the disk does
-    /// not hold. OS key auto-repeat on a held Ctrl+S is enough to trigger
-    /// it. One editor means one flag is enough; a second dispatch is
-    /// refused out loud (`SCRIPT_SAVE_IN_FLIGHT`), never queued silently.
-    script_save_in_flight: bool,
     // --- UX-polish §1.4: modal keyboard-focus plumbing ---
     /// Shared focus target for every overlay that owns no TextField of its
     /// own (KillConfirm, AnalyzeWriteConfirm, CompareDialog, ScriptRun,
@@ -2371,6 +2526,12 @@ struct AppView {
     /// which focuses `modal_focus_handle`. Input-owning modals never set
     /// it — they keep focusing their own first field at open time.
     modal_needs_focus: bool,
+    /// Editor tabs: „put the caret in the active editor on the next
+    /// frame". Set by tab activation and the Ctrl+D pick (user, 2026-09-02:
+    /// „pak by měl být focus v tom sql input okně"); drained in `render`
+    /// AFTER the active editor's element exists — a brand-new tab's input
+    /// has never been painted at the moment the action runs.
+    editor_needs_focus: bool,
 
     // --- Selectable read-only text tabs (Log, DDL) ---
     /// The mouse selection inside the active `TabContent::Text`, as byte
@@ -2388,14 +2549,6 @@ struct AppView {
     text_focus: gpui::FocusHandle,
 
     // --- G6 Task 7: schema autocomplete popup ---
-    /// `None` when the popup is closed — see `AutocompleteState`'s doc
-    /// comment for the lazy-diff recompute idiom.
-    autocomplete: Option<AutocompleteState>,
-    /// The SQL text `autocomplete` was last computed from — compared
-    /// against `self.sql`'s live text/cursor each render
-    /// (`refresh_autocomplete`) to decide whether a recompute is needed.
-    last_ac_text: String,
-    last_ac_cursor: usize,
 }
 
 /// G5 Task 4 review fix (BLOCKER 1): sentinel `ResultTab::conn_identity`/
@@ -2639,9 +2792,17 @@ fn session_tabs(tabs: &Tabs) -> Vec<dbc_state::session::SessionTab> {
 /// arrives showing its query and nothing else. Re-running is a click, on
 /// purpose: firing a dozen remembered queries at a production server the
 /// moment the window opens is not a feature.
+/// The legacy shape, kept for the session tests below: the app itself
+/// restores per editor (`restored_tabs_from`).
+#[cfg(test)]
 fn restored_tabs(session: &dbc_state::session::SessionState) -> Tabs {
+    restored_tabs_from(&session.tabs)
+}
+
+/// One editor's result strip from its session record (design §3).
+fn restored_tabs_from(list: &[dbc_state::session::SessionTab]) -> Tabs {
     let mut tabs = Tabs::new();
-    for t in &session.tabs {
+    for t in list {
         tabs.open(ResultTab {
             id: 0,
             title: t.title.clone(),
@@ -2733,6 +2894,37 @@ fn admin_open_decision(tabs: &Tabs, current_identity: &str) -> AdminOpenDecision
 }
 
 impl AppView {
+    /// The active editor tab. Async completions must NOT use these two —
+    /// they resolve their tab with `editor_by_id_mut` (design §2).
+    fn editor(&self) -> &EditorTab {
+        &self.editors.active().payload
+    }
+
+    fn editor_mut(&mut self) -> &mut EditorTab {
+        &mut self.editors.active_mut().payload
+    }
+
+    fn editor_id(&self) -> u64 {
+        self.editors.active_id()
+    }
+
+    fn editor_by_id_mut(&mut self, id: u64) -> Option<&mut EditorTab> {
+        self.editors.by_id_mut(id).map(|s| &mut s.payload)
+    }
+
+    /// A completion's OWN tab (design §2). Only for closures that checked
+    /// `editor_by_id_mut(id).is_some()` at entry — nothing inside one
+    /// synchronous `this.update` closes editor tabs, so the check holds
+    /// for the closure's whole body. Keeps each borrow as short as
+    /// `editor_mut()` did, which is what lets the closures keep calling
+    /// other `view.` methods in between.
+    fn tab(&mut self, id: u64) -> &mut EditorTab {
+        self.editor_by_id_mut(id).expect("the completion checked its tab at entry")
+    }
+
+    fn tab_ref(&self, id: u64) -> &EditorTab {
+        &self.editors.by_id(id).expect("the completion checked its tab at entry").payload
+    }
     fn on_run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
         self.run_query(false, window, cx);
     }
@@ -2758,7 +2950,7 @@ impl AppView {
     /// `run_query_with` — the editor-typed-query path, as opposed to a
     /// preview's `run_query_with` call (see `on_tree_event`'s
     /// `TreeEvent::OpenPreview` arm), which supplies its own SQL/title and
-    /// never touches `self.sql`.
+    /// never touches `self.editor().sql`.
     ///
     /// G6 Task 3: also the single interception point for parametrized
     /// `:name` queries — every editor-typed-query trigger (`on_run_query`,
@@ -2767,7 +2959,7 @@ impl AppView {
     /// reaching `run_query_with`, so intercepting here covers all three
     /// with one change rather than duplicating the check at each call site.
     fn run_query(&mut self, bypass_auto_limit: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let sql = self.sql.read(cx).text();
+        let sql = self.editor().sql.read(cx).text();
         if sql.trim().is_empty() {
             return;
         }
@@ -2836,14 +3028,14 @@ impl AppView {
     /// entry, substitutes via `build_param_sql` (which also runs the
     /// CURATION-mandated post-substitution rescan, design §5). On `Ok`:
     /// persists every value to `self.param_values`, surfacing any
-    /// `store.set` error to `self.status` (same posture
+    /// `store.set` error to `self.editor().status` (same posture
     /// `save_view_prefs_for_grid` takes, main.rs — NOT silently swallowed;
     /// T3 review round 1 (finding 2) caught this doc comment's earlier
     /// "best-effort, degrades silently" claim as wrong), closes the modal,
     /// and runs the final SQL with the caller's original
     /// `bypass_auto_limit`. A save failure on one param doesn't stop the
     /// rest from being attempted — the loop keeps going, so the LAST error
-    /// (if any) is what ends up in `self.status`. On `Err` from
+    /// (if any) is what ends up in `self.editor().status`. On `Err` from
     /// `build_param_sql`: sets the modal's `error` (shown in the dialog)
     /// and does NOT close the modal, run anything, or persist any value —
     /// persistence only ever happens on the `Ok` branch, i.e. only on an
@@ -2873,6 +3065,10 @@ impl AppView {
         match build_param_sql(&sql_template, &names, &values) {
             Ok(final_sql) => {
                 let conn_id = self.store_scope_key();
+                // Collected, not written in the loop: the store borrows
+                // `self` mutably for the whole loop and the status line is
+                // on the editor tab now.
+                let mut save_error: Option<String> = None;
                 if let Some(store) = &mut self.param_values {
                     for (name, (text, is_null)) in names.iter().zip(values.iter()) {
                         if let Err(e) = store.set(
@@ -2883,11 +3079,14 @@ impl AppView {
                             // Keep saving the remaining params even after a
                             // failure — a save failure on one param name
                             // shouldn't stop the others from persisting.
-                            // Last error wins in `self.status` (matches
+                            // Last error wins in the status line (matches
                             // `save_view_prefs_for_grid`'s posture).
-                            self.status = format!("error ukládání parametrů: {}", e.message);
+                            save_error = Some(format!("error ukládání parametrů: {}", e.message));
                         }
                     }
+                }
+                if let Some(msg) = save_error {
+                    self.editor_mut().status = msg;
                 }
                 self.modal = None;
                 self.run_query_with(final_sql, None, bypass_auto_limit, cx);
@@ -2914,8 +3113,23 @@ impl AppView {
     /// for a preview this is `preview_sql`'s output, never the editor's
     /// text. `bypass_auto_limit` is still the caller's choice (a preview
     /// always passes `true` since it already carries its own `LIMIT`).
+    /// Runs in the ACTIVE tab. The body is `run_query_in`, which takes the
+    /// tab explicitly so a completion can re-dispatch into its OWN tab
+    /// (the saved-fk-join retrigger) even if the user has switched tabs.
     fn run_query_with(
         &mut self,
+        sql: String,
+        preview: Option<PreviewTarget>,
+        bypass_auto_limit: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let editor_id = self.editor_id();
+        self.run_query_in(editor_id, sql, preview, bypass_auto_limit, cx)
+    }
+
+    fn run_query_in(
+        &mut self,
+        editor_id: u64,
         sql: String,
         preview: Option<PreviewTarget>,
         bypass_auto_limit: bool,
@@ -2929,20 +3143,20 @@ impl AppView {
         if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
             return; // don't run queries under a modal/dialog/confirm prompt
         }
-        if self.cancel.is_some() {
+        if self.tab_ref(editor_id).cancel.is_some() {
             return; // one query at a time in v1
         }
         if sql.trim().is_empty() {
             return;
         }
 
-        let spec = if self.active_connection_id.is_some() {
+        let spec = if self.tab_ref(editor_id).connection.is_some() {
             // Sidebar rework: `resolve_active` is the single spec-resolution
             // site (see `ActiveConn`'s invariant) — it keeps G15 T8 HARD
             // GATE ITEM 2 (`connect::resolve_secret_for_connect`, not a raw
             // `vault.get_secret`) inside `resolve_active_from`.
             let Some(a) = self.resolve_active() else {
-                self.status = "connection no longer exists".into();
+                self.tab(editor_id).status = "connection no longer exists".into();
                 cx.notify();
                 return;
             };
@@ -2961,7 +3175,7 @@ impl AppView {
             let conn_meta = Some((false, engine_from_url(&url)));
             (false, None, None, conn_meta, ConnectSpec::Url(url))
         } else {
-            self.status = "Bez připojení — vyberte připojení nahoře.".into();
+            self.tab(editor_id).status = "Bez připojení — vyberte připojení nahoře.".into();
             cx.notify();
             return;
         };
@@ -2980,7 +3194,7 @@ impl AppView {
             if let Some(dialect) = conn_meta.map(|(_, e)| e).and_then(dialect_for_engine) {
                 match dbc_core::split_sql(&sql, dialect) {
                     Err(e) => {
-                        self.status =
+                        self.tab(editor_id).status =
                             format!("error: SQL nelze rozdělit na příkazy: {}", split_error_message(e));
                         cx.notify();
                         return;
@@ -3019,7 +3233,7 @@ impl AppView {
         // GPUI `Context`.
         if read_only_guard_rejects(&sql, read_only, dialect) {
             let err = QueryError::msg("connection is read-only");
-            self.status = format!("error: {err}");
+            self.tab(editor_id).status = format!("error: {err}");
             cx.notify();
             return;
         }
@@ -3045,14 +3259,14 @@ impl AppView {
         }
 
         let cancel = CancelToken::new();
-        self.cancel = Some(cancel.clone());
-        self.started_at = Some(std::time::Instant::now());
+        self.tab(editor_id).cancel = Some(cancel.clone());
+        self.tab(editor_id).started_at = Some(std::time::Instant::now());
         // Final review fix #2: this run's identity, checked by its own
-        // spawned loop's tail before mutating `view.cancel` — see
+        // spawned loop's tail before mutating `cancel` — see
         // `run_generation`'s doc comment.
-        self.run_generation += 1;
-        let my_generation = self.run_generation;
-        self.status = format!("connecting…{limit_suffix}");
+        self.tab(editor_id).run_generation += 1;
+        let my_generation = self.tab_ref(editor_id).run_generation;
+        self.tab(editor_id).status = format!("connecting…{limit_suffix}");
         cx.notify();
 
         // Captured for the new tab's title (single-line-collapsed SQL, see
@@ -3099,14 +3313,14 @@ impl AppView {
             // G4 Task 6: set by `apply_view_prefs_to_grid` when a saved
             // fk-join needs re-triggering (this run's own preview target
             // didn't already carry joins, but the saved prefs do) — deferred
-            // until this run's `Finished` clears `view.cancel` (see the
+            // until this run's `Finished` clears `cancel` (see the
             // `QueryEvent::Finished` arm below), since `run_query_with`'s
             // one-query-at-a-time guard would otherwise silently drop it if
             // dispatched from inside `Started`.
             let mut pending_join_retrigger: Option<PreviewTarget> = None;
             // G4 Task 6: when `pending_join_retrigger` is actually
             // dispatched below, `view.run_query_with` synchronously bumps
-            // `view.run_generation` and sets a FRESH `view.cancel` for
+            // `run_generation` and sets a FRESH `cancel` for
             // that new run before this closure returns — so the tail
             // cleanup after the loop, guarded on `run_generation` still
             // matching `my_generation` (final review fix #2), naturally
@@ -3145,31 +3359,34 @@ impl AppView {
                     };
                     let stop = this
                         .update(cx, |view, cx| {
+                            if view.editor_by_id_mut(editor_id).is_none() {
+                                return true; // the tab that ran this is gone — design §2
+                            }
                             let mut stop = false;
                             if errored.is_some() {
                                 // Already failed and cancelled this run —
                                 // drop any further in-flight batches.
-                            } else if tab_id.is_some_and(|id| view.tabs.iter().all(|t| t.id != id)) {
+                            } else if tab_id.is_some_and(|id| view.tab_ref(editor_id).results.iter().all(|t| t.id != id)) {
                                 // This run's tab was closed mid-stream —
                                 // cancel and stop consuming; nothing left
                                 // to render the remaining batches into.
                                 stop = true;
-                                if let Some(token) = view.cancel.take() {
+                                if let Some(token) = view.tab(editor_id).cancel.take() {
                                     token.cancel();
                                 }
-                                view.status = "zrušeno (tab zavřen)".into();
+                                view.tab(editor_id).status = "zrušeno (tab zavřen)".into();
                             } else if let Some(Err(e)) = push_result {
                                 let err_text = e.to_string();
-                                view.status = format!("error: {err_text}");
+                                view.tab(editor_id).status = format!("error: {err_text}");
                                 errored = Some(err_text);
-                                if let Some(token) = view.cancel.take() {
+                                if let Some(token) = view.tab(editor_id).cancel.take() {
                                     token.cancel();
                                 }
                             } else {
                                 let rows = buffer.as_ref().map_or(0, |b| b.borrow().row_count());
                                 let secs =
-                                    view.started_at.map_or(0.0, |t| t.elapsed().as_secs_f32());
-                                view.status = format!("{rows} rows… {secs:.1}s{limit_suffix}");
+                                    view.tab_ref(editor_id).started_at.map_or(0.0, |t| t.elapsed().as_secs_f32());
+                                view.tab(editor_id).status = format!("{rows} rows… {secs:.1}s{limit_suffix}");
                                 // G4 Task 2: let this tab's grid know it
                                 // grew. When no sort/filter is active
                                 // this is a cheap identity-count refresh;
@@ -3180,7 +3397,7 @@ impl AppView {
                                 // `Finished` below.
                                 if let Some(id) = tab_id {
                                     if let Some(TabContent::Grid { grid, .. }) =
-                                        view.tabs.iter().find(|t| t.id == id).map(|t| &t.content)
+                                        view.tab_ref(editor_id).results.iter().find(|t| t.id == id).map(|t| &t.content)
                                     {
                                         grid.update(cx, |g, _| g.on_batch_grown());
                                     }
@@ -3197,6 +3414,9 @@ impl AppView {
                 }
                 let stop = this
                     .update(cx, |view, cx| {
+                        if view.editor_by_id_mut(editor_id).is_none() {
+                            return true; // the tab that ran this is gone — design §2
+                        }
                         // I2: `Batch` — the only arm that used to set this
                         // to `true` (tab-closed-mid-stream) — is now handled
                         // above, before this closure; every remaining arm
@@ -3229,7 +3449,7 @@ impl AppView {
                                 };
                                 // G5 Task 3: editability — PREVIEW tabs only
                                 // (brief contract #1); `no_pk_notice` is
-                                // surfaced as `view.status` further below,
+                                // surfaced as `status` further below,
                                 // AFTER the "running…" status this arm
                                 // already sets, so it isn't immediately
                                 // clobbered.
@@ -3321,7 +3541,7 @@ impl AppView {
                                 // entity — see `GridEvent`'s doc comment for
                                 // why the event payload carries everything
                                 // `on_grid_event` needs rather than this
-                                // callback searching `self.tabs`.
+                                // callback searching `self.tab_ref(editor_id).results`.
                                 cx.subscribe(&grid, AppView::on_grid_event).detach();
                                 let title = preview
                                     .as_ref()
@@ -3333,9 +3553,9 @@ impl AppView {
                                 // duplicate — must happen before `open` so
                                 // the closed tab never overlaps the new one.
                                 if let Some(p) = &preview {
-                                    view.tabs.close_by_preview_key(&p.key);
+                                    view.tab(editor_id).results.close_by_preview_key(&p.key);
                                 }
-                                let id = view.tabs.open(ResultTab {
+                                let id = view.tab(editor_id).results.open(ResultTab {
                                     id: 0,
                                     title,
                                     pinned: false,
@@ -3346,7 +3566,7 @@ impl AppView {
                                     content: TabContent::Grid { grid, buffer: buf },
                                 });
                                 tab_id = Some(id);
-                                view.status = format!("running…{limit_suffix}");
+                                view.tab(editor_id).status = format!("running…{limit_suffix}");
                                 // G5 Task 3, brief contract #5: a PK-less
                                 // table is flagged regardless of read-only/
                                 // engine — set AFTER the "running…" status
@@ -3356,7 +3576,7 @@ impl AppView {
                                 // this, same as every other transient
                                 // status note in this file).
                                 if no_pk_notice {
-                                    view.status =
+                                    view.tab(editor_id).status =
                                         "tabulka nemá primární klíč — jen pro čtení".to_string();
                                 }
                             }
@@ -3397,7 +3617,7 @@ impl AppView {
                             // buffer) and records history exactly like a
                             // successful read does.
                             QueryEvent::WriteFinished { affected, elapsed } => {
-                                view.status = format!("{affected} rows affected in {elapsed:.2?}");
+                                view.tab(editor_id).status = format!("{affected} rows affected in {elapsed:.2?}");
                                 view.record_history(
                                     &sql_for_title,
                                     &history_conn_name,
@@ -3407,7 +3627,7 @@ impl AppView {
                                     None,
                                     cx,
                                 );
-                                view.cancel = None;
+                                view.tab(editor_id).cancel = None;
                             }
                             QueryEvent::Finished { elapsed } => {
                                 // G4 Task 2: if a sort/filter was active on
@@ -3418,7 +3638,7 @@ impl AppView {
                                 // nothing deferred (identity view, already
                                 // current).
                                 let sort_note = tab_id.and_then(|id| {
-                                    view.tabs.iter().find(|t| t.id == id).and_then(|t| {
+                                    view.tab_ref(editor_id).results.iter().find(|t| t.id == id).and_then(|t| {
                                         match &t.content {
                                             TabContent::Grid { grid, .. } => {
                                                 grid.update(cx, |g, _| g.on_stream_finished())
@@ -3438,10 +3658,10 @@ impl AppView {
                                     None => {
                                         let rows =
                                             buffer.as_ref().map_or(0, |b| b.borrow().row_count());
-                                        view.status =
+                                        view.tab(editor_id).status =
                                             format!("{rows} rows in {elapsed:.2?}{limit_suffix}");
                                         if let Some(note) = &sort_note {
-                                            view.status.push_str(&format!(" · {note}"));
+                                            view.tab(editor_id).status.push_str(&format!(" · {note}"));
                                         }
                                         // G3 Task 3: record the run (previews
                                         // included — they run real SQL too).
@@ -3469,9 +3689,9 @@ impl AppView {
                                         );
                                     }
                                 }
-                                view.cancel = None;
+                                view.tab(editor_id).cancel = None;
                                 // G4 Task 6: fire the deferred saved-fk-join
-                                // re-run now that `view.cancel` is clear —
+                                // re-run now that `cancel` is clear —
                                 // only on a genuine success (an errored run
                                 // has no valid base result to re-join), see
                                 // `pending_join_retrigger`'s doc comment.
@@ -3489,7 +3709,7 @@ impl AppView {
                                 if errored.is_none() {
                                     if let Some(pt) = pending_join_retrigger.take() {
                                         let tab = tab_id
-                                            .and_then(|id| view.tabs.iter().find(|t| t.id == id));
+                                            .and_then(|id| view.tab_ref(editor_id).results.iter().find(|t| t.id == id));
                                         let tab_still_open = tab.is_some();
                                         // G5 Task 4 review fix (MAJOR 3): a
                                         // dirty tab must not have its grid
@@ -3511,10 +3731,10 @@ impl AppView {
                                                     &pt.table,
                                                     &pt.joins,
                                                 );
-                                                view.run_query_with(sql, Some(pt), true, cx);
+                                                view.run_query_in(editor_id, sql, Some(pt), true, cx);
                                             }
                                             RetriggerAction::SkipDirty => {
-                                                view.status =
+                                                view.tab(editor_id).status =
                                                     "FK joins neaktualizovány — máš rozpracované změny"
                                                         .to_string();
                                             }
@@ -3526,7 +3746,7 @@ impl AppView {
                             QueryEvent::Failed(e) => {
                                 match &errored {
                                     None => {
-                                        view.status = format!("error: {e}");
+                                        view.tab(editor_id).status = format!("error: {e}");
                                         let err_text = e.to_string();
                                         view.record_history(
                                             &sql_for_title,
@@ -3550,7 +3770,7 @@ impl AppView {
                                         );
                                     }
                                 }
-                                view.cancel = None;
+                                view.tab(editor_id).cancel = None;
                             }
                         }
                         cx.notify();
@@ -3562,7 +3782,10 @@ impl AppView {
                 }
             }
             let _ = this.update(cx, |view, cx| {
-                // Final review fix #2: only clear `view.cancel` if no
+                if view.editor_by_id_mut(editor_id).is_none() {
+                    return; // the tab that ran this is gone — design §2
+                }
+                // Final review fix #2: only clear `cancel` if no
                 // newer run has started since — `rx.recv()` above can go
                 // `Pending` after the terminal event was already
                 // processed (the runner thread hasn't dropped its sender
@@ -3572,8 +3795,8 @@ impl AppView {
                 // `run_generation` and set its own `cancel` — an
                 // unconditional clear here would wipe that out from under
                 // it. See `run_generation`'s doc comment.
-                if view.run_generation == my_generation {
-                    view.cancel = None;
+                if view.tab_ref(editor_id).run_generation == my_generation {
+                    view.tab(editor_id).cancel = None;
                 }
                 cx.notify();
             });
@@ -3616,7 +3839,7 @@ impl AppView {
             g.set_dialect(dialect);
         });
         cx.subscribe(&grid, AppView::on_grid_event).detach();
-        let id = self.tabs.open(ResultTab {
+        let id = self.editor_mut().results.open(ResultTab {
             id: 0,
             title: collapse_title(title_sql),
             pinned: false,
@@ -3648,11 +3871,11 @@ impl AppView {
     ) {
         let limit_suffix = if limited { " · auto-LIMIT".to_string() } else { String::new() };
         let cancel = CancelToken::new();
-        self.cancel = Some(cancel.clone());
-        self.started_at = Some(std::time::Instant::now());
-        self.run_generation += 1;
-        let my_generation = self.run_generation;
-        self.status = format!("connecting…{limit_suffix}");
+        self.editor_mut().cancel = Some(cancel.clone());
+        self.editor_mut().started_at = Some(std::time::Instant::now());
+        self.editor_mut().run_generation += 1;
+        let my_generation = self.editor().run_generation;
+        self.editor_mut().status = format!("connecting…{limit_suffix}");
         cx.notify();
 
         let history_started_at = std::time::SystemTime::now()
@@ -3697,22 +3920,22 @@ impl AppView {
                             let mut stop = false;
                             if errored.is_some() {
                                 // Already failed — drop further batches.
-                            } else if tab_id.is_some_and(|id| view.tabs.iter().all(|t| t.id != id)) {
+                            } else if tab_id.is_some_and(|id| view.editor().results.iter().all(|t| t.id != id)) {
                                 stop = true;
-                                if let Some(token) = view.cancel.take() {
+                                if let Some(token) = view.editor_mut().cancel.take() {
                                     token.cancel();
                                 }
-                                view.status = "zrušeno (tab zavřen)".into();
+                                view.editor_mut().status = "zrušeno (tab zavřen)".into();
                             } else if let Some(Err(e)) = push_result {
                                 let err_text = e.to_string();
-                                view.status = format!("error: {err_text}");
+                                view.editor_mut().status = format!("error: {err_text}");
                                 errored = Some(err_text);
-                                if let Some(token) = view.cancel.take() {
+                                if let Some(token) = view.editor_mut().cancel.take() {
                                     token.cancel();
                                 }
                             } else if let Some(id) = tab_id {
                                 if let Some(TabContent::Grid { grid, .. }) =
-                                    view.tabs.iter().find(|t| t.id == id).map(|t| &t.content)
+                                    view.editor().results.iter().find(|t| t.id == id).map(|t| &t.content)
                                 {
                                     grid.update(cx, |g, _| g.on_batch_grown());
                                 }
@@ -3746,10 +3969,10 @@ impl AppView {
                                 tab_id = Some(id);
                                 buffer = Some(buf);
                                 with_rows += 1;
-                                view.status = format!("příkaz {}/{total}…{limit_suffix}", index + 1);
+                                view.editor_mut().status = format!("příkaz {}/{total}…{limit_suffix}", index + 1);
                             }
                             MultiQueryEvent::StatementStarted { index, total, columns: None } => {
-                                view.status = format!("příkaz {}/{total}…{limit_suffix}", index + 1);
+                                view.editor_mut().status = format!("příkaz {}/{total}…{limit_suffix}", index + 1);
                             }
                             // I2: `Batch` handled above, before this
                             // `this.update` call — see the `if let
@@ -3759,7 +3982,7 @@ impl AppView {
                             MultiQueryEvent::StatementFinished { index, affected: Some(n), elapsed } => {
                                 total_affected += n;
                                 writes += 1;
-                                view.status = format!(
+                                view.editor_mut().status = format!(
                                     "příkaz {} dokončen ({n} řádků, {elapsed:.2?}){limit_suffix}",
                                     index + 1
                                 );
@@ -3775,14 +3998,14 @@ impl AppView {
                                 rows_returned += rows as u64;
                                 if let Some(id) = tab_id {
                                     if let Some(TabContent::Grid { grid, .. }) =
-                                        view.tabs.iter().find(|t| t.id == id).map(|t| &t.content)
+                                        view.editor().results.iter().find(|t| t.id == id).map(|t| &t.content)
                                     {
                                         grid.update(cx, |g, _| {
                                             g.on_stream_finished();
                                         });
                                     }
                                 }
-                                view.status = format!(
+                                view.editor_mut().status = format!(
                                     "příkaz {} dokončen ({rows} řádků, {elapsed:.2?}){limit_suffix}",
                                     index + 1
                                 );
@@ -3790,7 +4013,7 @@ impl AppView {
                             MultiQueryEvent::StatementFailed { index, error } => {
                                 match &errored {
                                     None => {
-                                        view.status = format!("selhalo na příkazu #{}: {error}", index + 1);
+                                        view.editor_mut().status = format!("selhalo na příkazu #{}: {error}", index + 1);
                                         let err_text = error.to_string();
                                         view.record_history(
                                             &sql,
@@ -3814,16 +4037,17 @@ impl AppView {
                                         );
                                     }
                                 }
-                                view.cancel = None;
+                                view.editor_mut().cancel = None;
                             }
                             MultiQueryEvent::RunFinished => {
                                 let elapsed_ms = view
+                                    .editor()
                                     .started_at
                                     .map(|t| t.elapsed().as_millis() as i64)
                                     .unwrap_or(0);
                                 match &errored {
                                     None => {
-                                        view.status = format!(
+                                        view.editor_mut().status = format!(
                                             "{total_statements} příkazů, {with_rows} s výsledky, \
                                              {writes} zápisů ({total_affected} řádků) — hotovo{limit_suffix}"
                                         );
@@ -3850,7 +4074,7 @@ impl AppView {
                                         );
                                     }
                                 }
-                                view.cancel = None;
+                                view.editor_mut().cancel = None;
                             }
                         }
                         cx.notify();
@@ -3862,8 +4086,8 @@ impl AppView {
                 }
             }
             let _ = this.update(cx, |view, cx| {
-                if view.run_generation == my_generation {
-                    view.cancel = None;
+                if view.editor().run_generation == my_generation {
+                    view.editor_mut().cancel = None;
                 }
                 cx.notify();
             });
@@ -3890,14 +4114,14 @@ impl AppView {
         if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
             return;
         }
-        if self.cancel.is_some() {
+        if self.editor().cancel.is_some() {
             return;
         }
         let Some((read_only, timeout_secs, engine, _spec)) = self.resolve_spec_for_explain(cx) else {
-            return; // resolve_spec_for_explain already set self.status
+            return; // resolve_spec_for_explain already set self.editor().status
         };
         let Some(dialect) = dialect_for_engine(engine) else {
-            self.status = "error: skripty nejsou podporovány pro tento engine".to_string();
+            self.editor_mut().status = "error: skripty nejsou podporovány pro tento engine".to_string();
             cx.notify();
             return;
         };
@@ -3910,7 +4134,7 @@ impl AppView {
         // dispatching anything.
         let conn_identity = self.current_conn_identity();
 
-        self.status = "výběr souboru…".to_string();
+        self.editor_mut().status = "výběr souboru…".to_string();
         cx.notify();
         // Grounding (design §7 spike, RESOLVED — no extension-filter API
         // exists at the pinned rev: `PathPromptOptions` has no filter field,
@@ -3927,21 +4151,21 @@ impl AppView {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
                 Ok(Ok(_)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "výběr zrušen".to_string();
+                        view.editor_mut().status = "výběr zrušen".to_string();
                         cx.notify();
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = format!("error: dialog selhal: {e}");
+                        view.editor_mut().status = format!("error: dialog selhal: {e}");
                         cx.notify();
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "error: dialog není dostupný".to_string();
+                        view.editor_mut().status = "error: dialog není dostupný".to_string();
                         cx.notify();
                     });
                     return;
@@ -3995,7 +4219,7 @@ impl AppView {
                     cx,
                 ),
                 Err(e) => {
-                    view.status = format!("error: {e}");
+                    view.editor_mut().status = format!("error: {e}");
                     cx.notify();
                 }
             });
@@ -4025,7 +4249,7 @@ impl AppView {
         // WHILE the pick/pre-scan was in flight wins — don't clobber it
         // with a stale script-run pick.
         if self.modal.is_some() {
-            self.status = "výběr skriptu zahozen — je otevřený jiný dialog".to_string();
+            self.editor_mut().status = "výběr skriptu zahozen — je otevřený jiný dialog".to_string();
             cx.notify();
             return;
         }
@@ -4036,7 +4260,7 @@ impl AppView {
         // same identity again regardless (the actual guard), so this is
         // purely the faster/friendlier refusal.
         if !conn_identity_matches(&conn_identity, &self.current_conn_identity()) {
-            self.status = "připojení se během výběru změnilo — spuštění zrušeno".to_string();
+            self.editor_mut().status = "připojení se během výběru změnilo — spuštění zrušeno".to_string();
             cx.notify();
             return;
         }
@@ -4044,12 +4268,13 @@ impl AppView {
         // both run paths disclose it: `▶` on the bound-and-dirty script,
         // and the ad-hoc picker when the user happens to pick that same
         // file. Folded comparison for the reason `path_fold` documents.
-        let dirty_bound = self.script_dirty_flag
+        let dirty_bound = self.editor().script_dirty_flag
             && self
+                .editor()
                 .script_binding
                 .as_ref()
                 .is_some_and(|b| files.iter().any(|f| same_path_ci(f, &b.path)));
-        self.status = String::new();
+        self.editor_mut().status = String::new();
         self.modal = Some(connections_ui::ModalState::ScriptRun {
             files,
             file_counts,
@@ -4086,20 +4311,20 @@ impl AppView {
         if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
             return;
         }
-        if self.cancel.is_some() {
+        if self.editor().cancel.is_some() {
             return;
         }
         let Some(root) = self.effective_scripts_root() else {
-            self.status = "error: nastavte složku skriptů v Nastavení".to_string();
+            self.editor_mut().status = "error: nastavte složku skriptů v Nastavení".to_string();
             cx.notify();
             return;
         };
         let Some((read_only, timeout_secs, engine, _spec)) = self.resolve_spec_for_explain(cx)
         else {
-            return; // resolve_spec_for_explain already set self.status
+            return; // resolve_spec_for_explain already set self.editor().status
         };
         let Some(dialect) = dialect_for_engine(engine) else {
-            self.status = "error: skripty nejsou podporovány pro tento engine".to_string();
+            self.editor_mut().status = "error: skripty nejsou podporovány pro tento engine".to_string();
             cx.notify();
             return;
         };
@@ -4139,7 +4364,7 @@ impl AppView {
                     cx,
                 ),
                 Err(e) => {
-                    view.status = format!("error: {e}");
+                    view.editor_mut().status = format!("error: {e}");
                     view.start_scripts_scan(cx);
                     cx.notify();
                 }
@@ -4207,11 +4432,11 @@ impl AppView {
         // Review fix (MINOR 3): a query started DURING the picker/pre-scan
         // window can still be streaming — confirming now would start a
         // second concurrent run and silently orphan the first token
-        // (`self.cancel` clobbered). Refuse and keep the modal open (don't
+        // (`self.editor().cancel` clobbered). Refuse and keep the modal open (don't
         // clear `self.modal`) so the user can retry once the other run
         // finishes.
-        if self.cancel.is_some() {
-            self.status = "jiný dotaz stále běží — počkejte na dokončení".to_string();
+        if self.editor().cancel.is_some() {
+            self.editor_mut().status = "jiný dotaz stále běží — počkejte na dokončení".to_string();
             cx.notify();
             return;
         }
@@ -4222,7 +4447,7 @@ impl AppView {
         // `self.runner.run_script` is never reached.
         if !script_run_dispatch_allowed(&conn_identity, &self.current_conn_identity()) {
             self.modal = None;
-            self.status = "připojení se během výběru změnilo — spuštění zrušeno".to_string();
+            self.editor_mut().status = "připojení se během výběru změnilo — spuštění zrušeno".to_string();
             cx.notify();
             return;
         }
@@ -4231,7 +4456,7 @@ impl AppView {
             return;
         };
         let Some(dialect) = dialect_for_engine(engine) else {
-            self.status = "error: skripty nejsou podporovány pro tento engine".to_string();
+            self.editor_mut().status = "error: skripty nejsou podporovány pro tento engine".to_string();
             self.modal = None;
             cx.notify();
             return;
@@ -4269,7 +4494,7 @@ impl AppView {
         }));
 
         let conn_identity = self.current_conn_identity();
-        self.tabs.open(ResultTab {
+        self.editor_mut().results.open(ResultTab {
             id: 0,
             title: format!("Skript: {source_label}"),
             pinned: false,
@@ -4280,10 +4505,10 @@ impl AppView {
         });
 
         let cancel = CancelToken::new();
-        self.cancel = Some(cancel.clone());
-        self.run_generation += 1;
-        let my_generation = self.run_generation;
-        self.status = format!("skript {source_label}…");
+        self.editor_mut().cancel = Some(cancel.clone());
+        self.editor_mut().run_generation += 1;
+        let my_generation = self.editor().run_generation;
+        self.editor_mut().status = format!("skript {source_label}…");
         cx.notify();
 
         let history_started_at = std::time::SystemTime::now()
@@ -4316,7 +4541,7 @@ impl AppView {
                             }
                             ScriptEvent::StatementStarted { stmt_index, sql_preview } => {
                                 last_preview = sql_preview;
-                                view.status = format!("skript {source_label}: příkaz {}…", stmt_index + 1);
+                                view.editor_mut().status = format!("skript {source_label}: příkaz {}…", stmt_index + 1);
                             }
                             ScriptEvent::StatementFinished { stmt_index, affected, elapsed } => {
                                 let mut s = state.borrow_mut();
@@ -4414,7 +4639,7 @@ impl AppView {
                                     err_opt.as_deref(),
                                     cx,
                                 );
-                                view.status = if aborted {
+                                view.editor_mut().status = if aborted {
                                     format!(
                                         "skript {source_label}: přerušeno ({files_run} souborů, {statements_run}/{total_statements} příkazů)"
                                     )
@@ -4423,8 +4648,8 @@ impl AppView {
                                         "skript {source_label}: hotovo ({files_run} souborů, {statements_run} příkazů, {statements_failed} chyb)"
                                     )
                                 };
-                                if view.run_generation == my_generation {
-                                    view.cancel = None;
+                                if view.editor().run_generation == my_generation {
+                                    view.editor_mut().cancel = None;
                                 }
                             }
                         }
@@ -4437,8 +4662,8 @@ impl AppView {
                 }
             }
             let _ = this.update(cx, |view, cx| {
-                if view.run_generation == my_generation {
-                    view.cancel = None;
+                if view.editor().run_generation == my_generation {
+                    view.editor_mut().cancel = None;
                 }
                 cx.notify();
             });
@@ -4464,21 +4689,21 @@ impl AppView {
         if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
             return;
         }
-        if self.cancel.is_some() {
+        if self.editor().cancel.is_some() {
             return;
         }
         if self.active_read_only() {
-            self.status = "error: připojení je jen pro čtení".to_string();
+            self.editor_mut().status = "error: připojení je jen pro čtení".to_string();
             cx.notify();
             return;
         }
         let Some(snapshot) = self.tree.read(cx).snapshot() else {
-            self.status = "error: schéma není načteno".to_string();
+            self.editor_mut().status = "error: schéma není načteno".to_string();
             cx.notify();
             return;
         };
         let Some(t) = snapshot.tables.iter().find(|t| t.schema == schema && t.name == table) else {
-            self.status = "error: tabulka nenalezena ve schématu".to_string();
+            self.editor_mut().status = "error: tabulka nenalezena ve schématu".to_string();
             cx.notify();
             return;
         };
@@ -4509,7 +4734,7 @@ impl AppView {
         // parity holds because both resolve from the same connection.
         let dialect = self.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres);
 
-        self.status = "výběr CSV souboru…".to_string();
+        self.editor_mut().status = "výběr CSV souboru…".to_string();
         cx.notify();
         let dialog = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -4522,21 +4747,21 @@ impl AppView {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
                 Ok(Ok(_)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "výběr zrušen".to_string();
+                        view.editor_mut().status = "výběr zrušen".to_string();
                         cx.notify();
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = format!("error: dialog selhal: {e}");
+                        view.editor_mut().status = format!("error: dialog selhal: {e}");
                         cx.notify();
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "error: dialog není dostupný".to_string();
+                        view.editor_mut().status = "error: dialog není dostupný".to_string();
                         cx.notify();
                     });
                     return;
@@ -4548,7 +4773,7 @@ impl AppView {
                 .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
             if !is_csv {
                 let _ = this.update(cx, |view, cx| {
-                    view.status = "error: vyberte soubor .csv".to_string();
+                    view.editor_mut().status = "error: vyberte soubor .csv".to_string();
                     cx.notify();
                 });
                 return;
@@ -4600,7 +4825,7 @@ impl AppView {
                     // this picker/peek was in flight wins — don't clobber
                     // it with a stale CSV-import pick.
                     if view.modal.is_some() {
-                        view.status =
+                        view.editor_mut().status =
                             "výběr CSV zahozen — je otevřený jiný dialog".to_string();
                         cx.notify();
                         return;
@@ -4614,12 +4839,12 @@ impl AppView {
                     // BLOCKER fix), so this is purely a faster/friendlier
                     // refusal, not the enforcement point.
                     if !conn_identity_matches(&conn_identity, &view.current_conn_identity()) {
-                        view.status =
+                        view.editor_mut().status =
                             "připojení se během importu změnilo — import zrušen".to_string();
                         cx.notify();
                         return;
                     }
-                    view.status = String::new();
+                    view.editor_mut().status = String::new();
                     view.modal = Some(connections_ui::ModalState::CsvImport {
                         path: picked,
                         schema,
@@ -4640,7 +4865,7 @@ impl AppView {
                     cx.notify();
                 }
                 Err(e) => {
-                    view.status = format!("error: {e}");
+                    view.editor_mut().status = format!("error: {e}");
                     cx.notify();
                 }
             });
@@ -4751,14 +4976,14 @@ impl AppView {
         // streaming; confirming now would start a second concurrent run
         // and silently orphan the first token. Refuse and keep the modal
         // open.
-        if self.cancel.is_some() {
-            self.status = "jiný dotaz stále běží — počkejte na dokončení".to_string();
+        if self.editor().cancel.is_some() {
+            self.editor_mut().status = "jiný dotaz stále běží — počkejte na dokončení".to_string();
             cx.notify();
             return;
         }
         if !csv_import_dispatch_allowed(&conn_identity, &self.current_conn_identity()) {
             self.modal = None;
-            self.status = "připojení se během importu změnilo — import zrušen".to_string();
+            self.editor_mut().status = "připojení se během importu změnilo — import zrušen".to_string();
             cx.notify();
             return;
         }
@@ -4790,7 +5015,7 @@ impl AppView {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.display().to_string());
         let conn_identity = self.current_conn_identity();
-        self.tabs.open(ResultTab {
+        self.editor_mut().results.open(ResultTab {
             id: 0,
             title: format!("CSV import: {file_name}"),
             pinned: false,
@@ -4801,10 +5026,10 @@ impl AppView {
         });
 
         let cancel = CancelToken::new();
-        self.cancel = Some(cancel.clone());
-        self.run_generation += 1;
-        let my_generation = self.run_generation;
-        self.status = format!("CSV import {file_name}…");
+        self.editor_mut().cancel = Some(cancel.clone());
+        self.editor_mut().run_generation += 1;
+        let my_generation = self.editor().run_generation;
+        self.editor_mut().status = format!("CSV import {file_name}…");
         cx.notify();
 
         let history_started_at = std::time::SystemTime::now()
@@ -4856,9 +5081,9 @@ impl AppView {
                                     Some(&err_text),
                                     cx,
                                 );
-                                view.status = format!("CSV import selhal: {error}");
-                                if view.run_generation == my_generation {
-                                    view.cancel = None;
+                                view.editor_mut().status = format!("CSV import selhal: {error}");
+                                if view.editor().run_generation == my_generation {
+                                    view.editor_mut().cancel = None;
                                 }
                             }
                             CsvImportEvent::Finished { rows_imported, elapsed } => {
@@ -4882,9 +5107,9 @@ impl AppView {
                                     None,
                                     cx,
                                 );
-                                view.status = format!("CSV import hotovo: {rows_imported} řádků");
-                                if view.run_generation == my_generation {
-                                    view.cancel = None;
+                                view.editor_mut().status = format!("CSV import hotovo: {rows_imported} řádků");
+                                if view.editor().run_generation == my_generation {
+                                    view.editor_mut().cancel = None;
                                 }
                             }
                         }
@@ -4897,8 +5122,8 @@ impl AppView {
                 }
             }
             let _ = this.update(cx, |view, cx| {
-                if view.run_generation == my_generation {
-                    view.cancel = None;
+                if view.editor().run_generation == my_generation {
+                    view.editor_mut().cancel = None;
                 }
                 cx.notify();
             });
@@ -4921,9 +5146,9 @@ impl AppView {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<(bool, Option<u64>, dbc_state::Engine, ConnectSpec)> {
-        if self.active_connection_id.is_some() {
+        if self.editor().connection.is_some() {
             let Some(a) = self.resolve_active() else {
-                self.status = "connection no longer exists".into();
+                self.editor_mut().status = "connection no longer exists".into();
                 cx.notify();
                 return None;
             };
@@ -4931,7 +5156,7 @@ impl AppView {
         } else if let Some(url) = self.conn_url.clone() {
             Some((false, None, engine_from_url(&url), ConnectSpec::Url(url)))
         } else {
-            self.status = "Bez připojení — vyberte připojení nahoře.".into();
+            self.editor_mut().status = "Bez připojení — vyberte připojení nahoře.".into();
             cx.notify();
             None
         }
@@ -4955,22 +5180,22 @@ impl AppView {
         if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
             return;
         }
-        if self.cancel.is_some() {
+        if self.editor().cancel.is_some() {
             return;
         }
-        let sql = self.sql.read(cx).text().to_string();
+        let sql = self.editor().sql.read(cx).text().to_string();
         if sql.trim().is_empty() {
             return;
         }
 
         let Some((read_only, timeout_secs, engine, spec)) = self.resolve_spec_for_explain(cx) else {
-            return; // resolve_spec_for_explain already set self.status on failure
+            return; // resolve_spec_for_explain already set self.editor().status on failure
         };
 
         if !is_analyze {
             if engine == dbc_state::Engine::Mssql {
                 if !plan::mssql_plan_dispatch_available() {
-                    self.status = "plán pro MSSQL zatím není k dispozici".to_string();
+                    self.editor_mut().status = "plán pro MSSQL zatím není k dispozici".to_string();
                     cx.notify();
                     return;
                 }
@@ -4986,7 +5211,7 @@ impl AppView {
             plan::AnalyzeGate::Run => {
                 if engine == dbc_state::Engine::Mssql {
                     if !plan::mssql_plan_dispatch_available() {
-                        self.status = "plán pro MSSQL zatím není k dispozici".to_string();
+                        self.editor_mut().status = "plán pro MSSQL zatím není k dispozici".to_string();
                         cx.notify();
                         return;
                     }
@@ -4997,7 +5222,7 @@ impl AppView {
                 self.dispatch_plan_query(spec, explain_sql, engine, true, timeout_secs, cx);
             }
             plan::AnalyzeGate::Blocked => {
-                self.status = "error: připojení je jen pro čtení".to_string();
+                self.editor_mut().status = "error: připojení je jen pro čtení".to_string();
                 cx.notify();
             }
             plan::AnalyzeGate::NeedsConfirm => {
@@ -5012,7 +5237,7 @@ impl AppView {
                     // transaction: the write would durably COMMIT while the
                     // UI claims "změny vráceny zpět". Refuse honestly.
                     // Pinned by runner.rs::duckdb_query_sessions_do_not_see_execute_transactions.
-                    self.status = "error: EXPLAIN ANALYZE zápisu není pro DuckDB podporováno — analyzovaný zápis nelze bezpečně vrátit".to_string();
+                    self.editor_mut().status = "error: EXPLAIN ANALYZE zápisu není pro DuckDB podporováno — analyzovaný zápis nelze bezpečně vrátit".to_string();
                     cx.notify();
                     return;
                 }
@@ -5045,10 +5270,10 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let cancel = CancelToken::new();
-        self.cancel = Some(cancel.clone());
-        self.run_generation += 1;
-        let my_generation = self.run_generation;
-        self.status = if is_analyze { "analyzuji plán…".to_string() } else { "vysvětluji plán…".to_string() };
+        self.editor_mut().cancel = Some(cancel.clone());
+        self.editor_mut().run_generation += 1;
+        let my_generation = self.editor().run_generation;
+        self.editor_mut().status = if is_analyze { "analyzuji plán…".to_string() } else { "vysvětluji plán…".to_string() };
         cx.notify();
 
         let sql_title = format!("Plán: {}", collapse_title(&wrapped_sql));
@@ -5111,17 +5336,17 @@ impl AppView {
             }
 
             let _ = this.update(cx, move |view, cx| {
-                if view.run_generation != my_generation {
+                if view.editor().run_generation != my_generation {
                     return; // a newer run superseded this one — don't clobber its state
                 }
-                view.cancel = None;
+                view.editor_mut().cancel = None;
                 if let Some(e) = failed {
-                    view.status = format!("error: {e}");
+                    view.editor_mut().status = format!("error: {e}");
                     cx.notify();
                     return;
                 }
                 let Some(mut buf) = buffer else {
-                    view.status = "prázdná odpověď EXPLAIN".to_string();
+                    view.editor_mut().status = "prázdná odpověď EXPLAIN".to_string();
                     cx.notify();
                     return;
                 };
@@ -5171,11 +5396,11 @@ impl AppView {
                             sql: None,
                             content: TabContent::Plan { view: view_entity },
                         };
-                        view.tabs.open(tab);
-                        view.status = "hotovo".to_string();
+                        view.editor_mut().results.open(tab);
+                        view.editor_mut().status = "hotovo".to_string();
                     }
                     Err(e) => {
-                        view.status = format!("error parsování plánu: {e}");
+                        view.editor_mut().status = format!("error parsování plánu: {e}");
                     }
                 }
                 cx.notify();
@@ -5206,7 +5431,7 @@ impl AppView {
         timeout_secs: Option<u64>,
         cx: &mut Context<Self>,
     ) {
-        self.status =
+        self.editor_mut().status =
             if is_analyze { "analyzuji plán…".to_string() } else { "vysvětluji plán…".to_string() };
         cx.notify();
 
@@ -5227,7 +5452,7 @@ impl AppView {
                                 }
                                 let parsed = Rc::new(parsed);
                                 let view_entity = cx.new(|cx| plan::PlanView::new(parsed, cx));
-                                view.tabs.open(ResultTab {
+                                view.editor_mut().results.open(ResultTab {
                                     id: 0,
                                     title: sql_title,
                                     pinned: false,
@@ -5236,14 +5461,14 @@ impl AppView {
                                     sql: None,
                                     content: TabContent::Plan { view: view_entity },
                                 });
-                                view.status = if via_confirm_modal {
+                                view.editor_mut().status = if via_confirm_modal {
                                     "hotovo (změny vráceny zpět)".to_string()
                                 } else {
                                     "hotovo".to_string()
                                 };
                             }
                             Err(e) => {
-                                view.status = format!("error parsování plánu: {e}");
+                                view.editor_mut().status = format!("error parsování plánu: {e}");
                                 if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
                                     running,
                                     error,
@@ -5257,7 +5482,7 @@ impl AppView {
                         }
                     }
                     Ok(Err(e)) => {
-                        view.status = format!("error: {e}");
+                        view.editor_mut().status = format!("error: {e}");
                         if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
                             running,
                             error,
@@ -5269,7 +5494,7 @@ impl AppView {
                         }
                     }
                     Err(_canceled) => {
-                        view.status = "error: plán zrušen".to_string();
+                        view.editor_mut().status = "error: plán zrušen".to_string();
                         if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
                             running,
                             error,
@@ -5293,13 +5518,13 @@ impl AppView {
     /// (connections_ui.rs).
     ///
     /// Review fix (MAJOR, adversarial review of commit 0bab655): the first
-    /// version of this method used `self.cancel = Some(CancelToken::new())`
+    /// version of this method used `self.editor_mut().cancel = Some(CancelToken::new())`
     /// as a busy-guard, but that token was never threaded into
     /// `QueryRunner::run_analyze_write` (which builds its own internal
     /// token in `run_analyze_write_inner`) — Escape while "analyzuji
-    /// plán…" showed would clear `self.cancel`, print a false
+    /// plán…" showed would clear `self.editor().cancel`, print a false
     /// "cancelling…" status, and re-enable every other busy-guard that
-    /// checks `self.cancel.is_none()`, letting a second query/Explain/
+    /// checks `self.editor().cancel.is_none()`, letting a second query/Explain/
     /// Analyze dispatch start while the original BEGIN…EXPLAIN ANALYZE…
     /// ROLLBACK was still running server-side (which would then land its
     /// result and silently clobber whatever the second dispatch had just
@@ -5313,8 +5538,8 @@ impl AppView {
     /// only allow-lists `ConnectionDialog`/`QueryParams` — every other
     /// modal, `AnalyzeWriteConfirm` included, falls into its `_ => false`
     /// arm) Escape is now a structural no-op against this dialog, exactly
-    /// like it already was against `KillConfirm`. `self.cancel`/
-    /// `self.run_generation` are never touched by this method — same as
+    /// like it already was against `KillConfirm`. `self.editor().cancel`/
+    /// `self.editor().run_generation` are never touched by this method — same as
     /// `on_confirm_apply`.
     fn on_confirm_analyze_write(
         &mut self,
@@ -5325,7 +5550,7 @@ impl AppView {
         // Pure guard (unit-tested directly, connections_ui.rs): `None` for
         // no modal, a DIFFERENT modal, or a re-click while `running` is
         // already `true` — see its doc comment for why this is the actual
-        // mechanism (not `self.cancel`) that makes a second dispatch a
+        // mechanism (not `self.editor().cancel`) that makes a second dispatch a
         // structural no-op.
         let Some(sql) = connections_ui::analyze_write_dispatch_sql(&self.modal) else { return };
 
@@ -5378,7 +5603,7 @@ impl AppView {
                             view.modal = None;
                             let parsed = Rc::new(parsed);
                             let view_entity = cx.new(|cx| plan::PlanView::new(parsed, cx));
-                            view.tabs.open(ResultTab {
+                            view.editor_mut().results.open(ResultTab {
                                 id: 0,
                                 title: sql_title,
                                 pinned: false,
@@ -5387,7 +5612,7 @@ impl AppView {
                                 sql: None,
                                 content: TabContent::Plan { view: view_entity },
                             });
-                            view.status = "hotovo (změny vráceny zpět)".to_string();
+                            view.editor_mut().status = "hotovo (změny vráceny zpět)".to_string();
                         }
                         Err(e) => {
                             if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
@@ -5570,7 +5795,7 @@ impl AppView {
         // "no scoped-binding shortcut, the check here IS the mechanism"
         // reasoning as the palette/modal cases above (a `"ResultGrid"`-
         // scoped `escape` binding would lose to this unscoped one).
-        if let Some(active) = self.tabs.active() {
+        if let Some(active) = self.editor().results.active() {
             match &active.content {
                 TabContent::Grid { grid, .. } => {
                     let closed = grid.update(cx, |g, _| g.close_overlay_if_open());
@@ -5593,9 +5818,9 @@ impl AppView {
                 _ => {}
             }
         }
-        if let Some(c) = self.cancel.take() {
+        if let Some(c) = self.editor_mut().cancel.take() {
             c.cancel();
-            self.status = "cancelling…".into();
+            self.editor_mut().status = "cancelling…".into();
             cx.notify();
         }
     }
@@ -5627,7 +5852,7 @@ impl AppView {
     /// moving focus into a hidden panel would put the caret somewhere the
     /// user cannot see, which is worse than doing nothing.
     fn on_focus_editor(&mut self, _: &FocusEditor, window: &mut Window, cx: &mut Context<Self>) {
-        let handle = self.sql.focus_handle(cx);
+        let handle = self.editor().sql.focus_handle(cx);
         window.focus(&handle, cx);
         cx.notify();
     }
@@ -5640,11 +5865,11 @@ impl AppView {
     }
 
     fn on_focus_results(&mut self, _: &FocusResults, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(TabContent::Grid { grid, .. }) = self.tabs.active().map(|t| &t.content) {
+        if let Some(TabContent::Grid { grid, .. }) = self.editor().results.active().map(|t| &t.content) {
             let handle = grid.focus_handle(cx);
             window.focus(&handle, cx);
         } else {
-            self.status = "Žádný výsledek k zaměření".to_string();
+            self.editor_mut().status = "Žádný výsledek k zaměření".to_string();
         }
         cx.notify();
     }
@@ -5660,12 +5885,12 @@ impl AppView {
         if self.tree.focus_handle(cx).contains_focused(window, cx) {
             return keymap::Scope::Tree;
         }
-        if let Some(TabContent::Grid { grid, .. }) = self.tabs.active().map(|t| &t.content) {
+        if let Some(TabContent::Grid { grid, .. }) = self.editor().results.active().map(|t| &t.content) {
             if grid.focus_handle(cx).contains_focused(window, cx) {
                 return keymap::Scope::Results;
             }
         }
-        if self.sql.focus_handle(cx).contains_focused(window, cx) {
+        if self.editor().sql.focus_handle(cx).contains_focused(window, cx) {
             return keymap::Scope::Editor;
         }
         keymap::Scope::Global
@@ -5780,7 +6005,7 @@ impl AppView {
                 cx.listener(|view, _, _, cx| {
                     view.app_menu_open = false;
                     dbc_state::schema_cache::clear();
-                    view.status = "Mezipaměť schémat vymazána".to_string();
+                    view.editor_mut().status = "Mezipaměť schémat vymazána".to_string();
                     cx.notify();
                 }),
             ));
@@ -5946,12 +6171,12 @@ impl AppView {
             return;
         }
         let Some(engine) = self.active_engine() else {
-            self.status = "error: rozbalení hvězdičky potřebuje aktivní připojení".into();
+            self.editor_mut().status = "error: rozbalení hvězdičky potřebuje aktivní připojení".into();
             cx.notify();
             return;
         };
         let dialect = sql_dialect(engine);
-        let cursor = self.sql.read(cx).cursor();
+        let cursor = self.editor().sql.read(cx).cursor();
         // Cloned, not borrowed: `snapshot()` hands back a reference into
         // the tree entity, and `rewrite_buffer_in_place` needs `cx`
         // mutably. A schema snapshot is metadata, and this runs once per
@@ -5973,7 +6198,7 @@ impl AppView {
                 }
             }
         });
-        self.status = match outcome {
+        self.editor_mut().status = match outcome {
             Ok(n) => format!("Rozbaleno na {n} sloupců"),
             Err(r) => format!("error: {}", r.message()),
         };
@@ -5985,13 +6210,13 @@ impl AppView {
             return;
         }
         let Some(engine) = self.active_engine() else {
-            self.status = "error: formátování potřebuje aktivní připojení (určuje dialekt)".into();
+            self.editor_mut().status = "error: formátování potřebuje aktivní připojení (určuje dialekt)".into();
             cx.notify();
             return;
         };
         let dialect = sql_dialect(engine);
         let changed = rewrite_buffer_in_place(self, cx, |sql| dbc_core::format::format_sql(sql, dialect));
-        self.status =
+        self.editor_mut().status =
             if changed { "SQL naformátováno".into() } else { "SQL už je naformátované".into() };
         cx.notify();
     }
@@ -6015,7 +6240,7 @@ impl AppView {
         };
         self.config.tree_grouping = next;
         self.tree.update(cx, |t, cx| t.set_grouping(next, cx));
-        self.status = match next {
+        self.editor_mut().status = match next {
             dbc_state::TreeGrouping::Schema => "strom: podle schémat".to_string(),
             dbc_state::TreeGrouping::Kind => "strom: podle typu objektu".to_string(),
         };
@@ -6024,7 +6249,7 @@ impl AppView {
         // refusal leaves its own status in place.
         if let Some(guard) = self.guard_corrupt_config(cx) {
             if let Err(e) = self.config.save(&self.config_path, &guard) {
-                self.status = format!("error: režim stromu se nepodařilo uložit: {e}");
+                self.editor_mut().status = format!("error: režim stromu se nepodařilo uložit: {e}");
             }
         }
         cx.notify();
@@ -6056,7 +6281,7 @@ impl AppView {
         self.config.history_width = Some(width);
         if let Some(guard) = self.guard_corrupt_config(cx) {
             if let Err(e) = self.config.save(&self.config_path, &guard) {
-                self.status = format!("error: šířku historie se nepodařilo uložit: {e}");
+                self.editor_mut().status = format!("error: šířku historie se nepodařilo uložit: {e}");
             }
         }
         cx.notify();
@@ -6075,7 +6300,7 @@ impl AppView {
         // failure degrades to session-only plus the guard's own status.
         if let Some(guard) = self.guard_corrupt_config(cx) {
             if let Err(e) = self.config.save(&self.config_path, &guard) {
-                self.status = format!("error: šířku panelu se nepodařilo uložit: {e}");
+                self.editor_mut().status = format!("error: šířku panelu se nepodařilo uložit: {e}");
             }
         }
         cx.notify();
@@ -6112,7 +6337,13 @@ impl AppView {
         let input = cx.new(|cx| connections_ui::TextField::new(cx, "Ctrl+K – tabulky, historie, spojení, akce…", false));
         let focus = input.focus_handle(cx);
         let items = self.build_palette_items("", cx);
-        self.palette = Some(PaletteState { input, items, selected: 0, last_query: String::new() });
+        self.palette = Some(PaletteState {
+            input,
+            items,
+            selected: 0,
+            last_query: String::new(),
+            mode: palette::PaletteMode::Commands,
+        });
         // G1 lesson (binding per the brief): focus must move to the
         // palette's own input in the SAME update the overlay appears in, or
         // a stray keystroke lands on whatever had focus before Ctrl+K.
@@ -6168,9 +6399,53 @@ impl AppView {
     /// `HistoryDb::search`, same call `history_panel` makes), every saved
     /// connection, and the 5 fixed actions — delegated to `palette::rank_items`,
     /// the pure scoring/assembly function.
+    /// Ctrl+D (design §5): the palette overlay in `Databases` mode. A
+    /// toggle — Ctrl+D on an open picker closes it.
+    fn on_pick_database(&mut self, _: &PickDatabase, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.as_ref().is_some_and(|p| p.mode == palette::PaletteMode::Databases) {
+            self.palette = None;
+            cx.notify();
+            return;
+        }
+        if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
+            return;
+        }
+        self.dropdown_open = false;
+        let input =
+            cx.new(|cx| connections_ui::TextField::new(cx, "Ctrl+D – připojení / databáze…", false));
+        let focus = input.focus_handle(cx);
+        self.palette = Some(PaletteState {
+            input,
+            items: Vec::new(),
+            selected: 0,
+            last_query: String::new(),
+            mode: palette::PaletteMode::Databases,
+        });
+        let items = self.build_palette_items("", cx);
+        if let Some(p) = &mut self.palette {
+            p.items = items;
+        }
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
     fn build_palette_items(&self, query: &str, cx: &Context<Self>) -> Vec<PaletteItem> {
+        if self.palette.as_ref().is_some_and(|p| p.mode == palette::PaletteMode::Databases) {
+            let db = self.effective_database();
+            let current = self
+                .editor()
+                .connection
+                .as_deref()
+                .and_then(|c| db.as_deref().map(|d| (c, d)));
+            let sources = palette::database_sources(
+                &self.config.connections,
+                dbc_state::conn_cache::databases,
+                current,
+            );
+            return palette::rank_databases(query, &sources, 50);
+        }
         let is_favourite_table = |schema: &Option<String>, name: &str| {
-            self.active_connection_id.as_deref().is_some_and(|conn_id| {
+            self.editor().connection.as_deref().is_some_and(|conn_id| {
                 self.config.favourite_objects.iter().any(|f| {
                     f.connection_id == conn_id
                         && &f.schema == schema
@@ -6217,7 +6492,7 @@ impl AppView {
         // — listed only while the active tab is a Grid (design §2.1's entry
         // gate: a chart needs an existing result buffer to draw from).
         let chart_available =
-            matches!(self.tabs.active(), Some(ResultTab { content: TabContent::Grid { .. }, .. }));
+            matches!(self.editor().results.active(), Some(ResultTab { content: TabContent::Grid { .. }, .. }));
         // App-wide master password UX design §2/§3: "Odemknout trezor" only
         // when there's actually a vault file to unlock and it's currently
         // locked; "Zamknout trezor" only while unlocked.
@@ -6231,7 +6506,7 @@ impl AppView {
             monitor_available,
             admin_entry,
             30,
-            self.active_connection_id.is_some(),
+            self.editor().connection.is_some(),
             chart_available,
             vault_unlockable,
             vault_lockable,
@@ -6264,9 +6539,15 @@ impl AppView {
                 // focus (`modal_needs_focus`) and stealing it back would
                 // strand the prompt un-dismissable by keyboard.
                 if self.discard_confirm.is_none() {
-                    let editor_focus = self.sql.focus_handle(cx);
+                    let editor_focus = self.editor().sql.focus_handle(cx);
                     window.focus(&editor_focus, cx);
                 }
+            }
+            PaletteItem::Database { conn_id, db, .. } => {
+                self.switch_to_database(&conn_id, Some(db), None, cx);
+                // The picker's field had the focus; the caret belongs back
+                // in the editor the pick was for.
+                self.editor_needs_focus = true;
             }
             PaletteItem::Connection { id, .. } => {
                 // G3 final-review fix (F3): route through the SAME
@@ -6282,6 +6563,7 @@ impl AppView {
             }
             PaletteItem::Action { action, .. } => match action {
                 PaletteAction::RunQuery => self.run_query(false, window, cx),
+                PaletteAction::PickDatabase => self.on_pick_database(&PickDatabase, window, cx),
                 PaletteAction::ToggleTree => {
                     self.tree_visible = !self.tree_visible;
                 }
@@ -6299,7 +6581,7 @@ impl AppView {
                 PaletteAction::RefreshSchema => {
                     // Exactly `on_tree_event`'s `TreeEvent::RefreshRequested`
                     // arm (sidebar rework: the ACTIVE slot).
-                    if let Some(id) = self.active_connection_id.clone() {
+                    if let Some(id) = self.editor().connection.clone() {
                         if let Some(db) = self.effective_database() {
                             self.start_schema_slot_fetch(id, db, cx);
                         }
@@ -6319,7 +6601,7 @@ impl AppView {
                     match target {
                         Some(schema) => self.open_er_diagram(schema, cx),
                         None => {
-                            self.status =
+                            self.editor_mut().status =
                                 "Vyberte schéma ve stromu (klikněte na ikonu vedle schématu)"
                                     .to_string();
                             cx.notify();
@@ -6333,7 +6615,7 @@ impl AppView {
                     // clears what is on DISK, and throwing away the schema
                     // the user is currently looking at would be a
                     // surprising second effect. The next expand refetches.
-                    self.status = "Mezipaměť schémat vymazána".to_string();
+                    self.editor_mut().status = "Mezipaměť schémat vymazána".to_string();
                     cx.notify();
                 }
                 // Same two handlers the Settings buttons call — one code
@@ -6342,12 +6624,12 @@ impl AppView {
                 PaletteAction::ImportSettings => self.start_settings_import(cx),
                 PaletteAction::OpenCompare => self.open_compare_dialog(cx),
                 PaletteAction::BackupDatabase => {
-                    if let Some(id) = self.active_connection_id.clone() {
+                    if let Some(id) = self.editor().connection.clone() {
                         self.open_backup_dialog(id, window, cx);
                     }
                 }
                 PaletteAction::RestoreDatabase => {
-                    if let Some(id) = self.active_connection_id.clone() {
+                    if let Some(id) = self.editor().connection.clone() {
                         self.open_restore_dialog(id, window, cx);
                     }
                 }
@@ -6396,7 +6678,7 @@ impl AppView {
             // `guard_corrupt_config` sets its own status when it refuses,
             // so nothing here overwrites it.
             if let Some(guard) = self.guard_corrupt_config(cx) {
-                self.status = match self.config.save(&self.config_path, &guard) {
+                self.editor_mut().status = match self.config.save(&self.config_path, &guard) {
                     Ok(()) => format!(
                         "motiv: {}",
                         match mode {
@@ -6413,7 +6695,7 @@ impl AppView {
         // spans were computed against the old one — a switch must re-kick
         // it, otherwise the SQL editor keeps stale colors until the next
         // keystroke), then repaint everything.
-        self.sql.update(cx, |sql, cx| sql.kick_highlight(cx));
+        self.editor().sql.update(cx, |sql, cx| sql.kick_highlight(cx));
         cx.refresh_windows(); // NOT cx.refresh() — doesn't exist at rev 907ed09
         cx.notify();
     }
@@ -6515,11 +6797,11 @@ impl AppView {
     /// `cx.notify()`) when already closed, so call sites don't need their
     /// own guard.
     pub(crate) fn close_autocomplete(&mut self, cx: &mut Context<Self>) {
-        if self.autocomplete.is_none() {
+        if self.editor().autocomplete.is_none() {
             return;
         }
-        self.autocomplete = None;
-        self.sql.update(cx, |s, _| s.set_autocomplete_active(false));
+        self.editor_mut().autocomplete = None;
+        self.editor().sql.update(cx, |s, _| s.set_autocomplete_active(false));
         cx.notify();
     }
 
@@ -6532,12 +6814,13 @@ impl AppView {
         if self.modal.is_some() {
             return;
         }
-        let text = self.sql.read(cx).text();
-        let cursor = self.sql.read(cx).cursor();
-        let suppressed = self.sql.read(cx).cursor_in_suppressed_span();
+        let text = self.editor().sql.read(cx).text();
+        let cursor = self.editor().sql.read(cx).cursor();
+        let suppressed = self.editor().sql.read(cx).cursor_in_suppressed_span();
         let snapshot = self.tree.read(cx).snapshot();
         let had_snapshot = snapshot.is_some();
-        let candidates = autocomplete::candidates(&text, cursor, snapshot, true, suppressed);
+        let candidates =
+            autocomplete::candidates_d(&text, cursor, snapshot, true, suppressed, self.ac_dialect());
         // Ctrl+Space is an EXPLICIT ask, so silence is the wrong answer:
         // every reason the popup stays shut is invisible from the outside
         // (cursor inside a string, no schema loaded yet), which is exactly
@@ -6545,7 +6828,7 @@ impl AppView {
         // working as designed. The typing trigger stays silent — a status
         // line rewritten on every keystroke would be noise.
         if candidates.is_empty() {
-            self.status = if suppressed {
+            self.editor_mut().status = if suppressed {
                 "napovídání: kurzor je v řetězci nebo komentáři".into()
             } else if !had_snapshot {
                 "napovídání: schéma není načtené — rozbalte databázi v panelu vlevo".into()
@@ -6553,7 +6836,7 @@ impl AppView {
                 "napovídání: nic nevyhovuje".into()
             };
         }
-        self.autocomplete =
+        self.editor_mut().autocomplete =
             (!candidates.is_empty()).then_some(AutocompleteState { candidates, selected: 0 });
         // Keep the lazy-diff cache in sync so the SAME render's
         // `refresh_autocomplete` (which runs before this popup is drawn,
@@ -6561,8 +6844,8 @@ impl AppView {
         // doesn't immediately reconsider — text/cursor are unchanged by a
         // force-trigger, so this is a no-op compare either way, but staying
         // explicit here avoids relying on that coincidence.
-        self.last_ac_text = text;
-        self.last_ac_cursor = cursor;
+        self.editor_mut().last_ac_text = text;
+        self.editor_mut().last_ac_cursor = cursor;
         cx.notify();
     }
 
@@ -6574,32 +6857,33 @@ impl AppView {
     /// other) modal opening, the cursor leaving a completable position
     /// (typing a space/most punctuation, arrow-key/mouse cursor movement
     /// that isn't popup navigation) — all of these change what
-    /// `self.sql`'s focus/text/cursor look like, which this function reads
+    /// `self.editor().sql`'s focus/text/cursor look like, which this function reads
     /// fresh every render.
     fn refresh_autocomplete(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if !self.sql.focus_handle(cx).is_focused(window) || self.modal.is_some() {
-            self.autocomplete = None;
+        if !self.editor().sql.focus_handle(cx).is_focused(window) || self.modal.is_some() {
+            self.editor_mut().autocomplete = None;
             return;
         }
 
-        let text = self.sql.read(cx).text();
-        let cursor = self.sql.read(cx).cursor();
-        if text == self.last_ac_text && cursor == self.last_ac_cursor {
+        let text = self.editor().sql.read(cx).text();
+        let cursor = self.editor().sql.read(cx).cursor();
+        if text == self.editor().last_ac_text && cursor == self.editor().last_ac_cursor {
             return;
         }
-        self.last_ac_text = text.clone();
-        self.last_ac_cursor = cursor;
+        self.editor_mut().last_ac_text = text.clone();
+        self.editor_mut().last_ac_cursor = cursor;
 
-        let suppressed = self.sql.read(cx).cursor_in_suppressed_span();
+        let suppressed = self.editor().sql.read(cx).cursor_in_suppressed_span();
         let ctx = autocomplete::cursor_context(&text, cursor);
         if suppressed || (ctx.prefix.is_empty() && ctx.qualifier.is_none()) {
-            self.autocomplete = None;
+            self.editor_mut().autocomplete = None;
             return;
         }
 
         let snapshot = self.tree.read(cx).snapshot();
-        let candidates = autocomplete::candidates(&text, cursor, snapshot, false, suppressed);
-        self.autocomplete =
+        let candidates =
+            autocomplete::candidates_d(&text, cursor, snapshot, false, suppressed, self.ac_dialect());
+        self.editor_mut().autocomplete =
             (!candidates.is_empty()).then_some(AutocompleteState { candidates, selected: 0 });
     }
 
@@ -6607,36 +6891,45 @@ impl AppView {
         // Review round 3, BLOCKER follow-up: every one of these
         // wrapper-div handlers only runs at all when `SqlInput`'s own
         // handler propagated (i.e. `autocomplete_active` was true at
-        // dispatch time), but the defensive `self.autocomplete` re-check
+        // dispatch time), but the defensive `self.editor().autocomplete` re-check
         // below can still fail on a same-frame race (plan T7 step 3, item
         // 5) — when it does, this handler must `cx.propagate()`, not
         // silently swallow the keystroke (see `on_ac_escape`'s doc comment
         // for why this matters most for `Escape`; applied uniformly here
         // for consistency/hygiene).
-        if !autocomplete_handles_action(self.autocomplete.is_some()) {
+        if !autocomplete_handles_action(self.editor().autocomplete.is_some()) {
             cx.propagate();
             return;
         }
-        let ac = self.autocomplete.as_mut().unwrap();
+        let ac = self.editor_mut().autocomplete.as_mut().unwrap();
         ac.selected = move_selection(ac.selected, ac.candidates.len(), -1);
         cx.notify();
     }
 
     fn on_ac_down(&mut self, _: &sql_input::Down, _window: &mut Window, cx: &mut Context<Self>) {
-        if !autocomplete_handles_action(self.autocomplete.is_some()) {
+        if !autocomplete_handles_action(self.editor().autocomplete.is_some()) {
             cx.propagate();
             return;
         }
-        let ac = self.autocomplete.as_mut().unwrap();
+        let ac = self.editor_mut().autocomplete.as_mut().unwrap();
         ac.selected = move_selection(ac.selected, ac.candidates.len(), 1);
         cx.notify();
     }
 
+    /// The dialect [`autocomplete::candidates_d`] spells
+    /// [`autocomplete::Candidate::insert`] for. No active connection means
+    /// no engine to ask, and postgres is this app's house convention for
+    /// that case (same fallback `open_table_preview` uses).
+    fn ac_dialect(&self) -> dbc_core::Dialect {
+        self.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres)
+    }
+
     /// Shared accept path for both `Newline` (Enter) and `Tab` — see
     /// `on_ac_confirm`/`on_ac_confirm_tab`. Inserts the selected candidate's
-    /// `text` via `SqlInput::accept_completion`, using `completion_edit`'s
-    /// pure range computation for the prefix length (design §2's "Enter/Tab
-    /// accept").
+    /// `insert` (the quoted spelling — `text` is the raw name the ranking
+    /// matched on) via `SqlInput::accept_completion`, using
+    /// `completion_edit`'s pure range computation for the prefix length
+    /// (design §2's "Enter/Tab accept").
     fn accept_selected_completion(&mut self, cx: &mut Context<Self>) {
         // Callers (`on_ac_confirm`/`on_ac_confirm_tab`) already guard on
         // `autocomplete_handles_action` before calling this, but `ac`'s
@@ -6644,27 +6937,27 @@ impl AppView {
         // list that shrank between the last nav and this accept) — the
         // `.get` below stays defensive rather than assuming it's always
         // in-bounds.
-        let Some(ac) = &self.autocomplete else { return };
+        let Some(ac) = &self.editor().autocomplete else { return };
         let Some(candidate) = ac.candidates.get(ac.selected) else { return };
-        let insert = candidate.text.clone();
+        let insert = candidate.insert.clone();
         // RE-VERIFY: the range is no longer computed HERE and handed over.
         // `accept_completion` derives it from its own buffer through the
         // same `autocomplete::cursor_context` rail `completion_edit` uses,
         // so the span it deletes is bounded by one identifier prefix by
         // construction and a caller cannot widen it into a buffer clobber.
-        self.sql.update(cx, |s, cx| s.accept_completion(&insert, cx));
-        self.autocomplete = None;
-        self.sql.update(cx, |s, _| s.set_autocomplete_active(false));
+        self.editor().sql.update(cx, |s, cx| s.accept_completion(&insert, cx));
+        self.editor_mut().autocomplete = None;
+        self.editor().sql.update(cx, |s, _| s.set_autocomplete_active(false));
         // Sync the lazy-diff cache to the post-accept text/cursor so the
         // very next render's `refresh_autocomplete` doesn't compare against
         // stale pre-accept values.
-        self.last_ac_text = self.sql.read(cx).text();
-        self.last_ac_cursor = self.sql.read(cx).cursor();
+        self.editor_mut().last_ac_text = self.editor().sql.read(cx).text();
+        self.editor_mut().last_ac_cursor = self.editor().sql.read(cx).cursor();
         cx.notify();
     }
 
     fn on_ac_confirm(&mut self, _: &sql_input::Newline, _window: &mut Window, cx: &mut Context<Self>) {
-        if !autocomplete_handles_action(self.autocomplete.is_some()) {
+        if !autocomplete_handles_action(self.editor().autocomplete.is_some()) {
             cx.propagate();
             return;
         }
@@ -6681,7 +6974,7 @@ impl AppView {
     /// keeps that from becoming a silent trap if a `Tab` binding is ever
     /// added elsewhere.
     fn on_ac_confirm_tab(&mut self, _: &sql_input::Tab, _window: &mut Window, cx: &mut Context<Self>) {
-        if !autocomplete_handles_action(self.autocomplete.is_some()) {
+        if !autocomplete_handles_action(self.editor().autocomplete.is_some()) {
             cx.propagate();
             return;
         }
@@ -6700,7 +6993,7 @@ impl AppView {
     /// user-visible regression: no way to cancel a running query from the
     /// keyboard).
     fn on_ac_escape(&mut self, _: &sql_input::Escape, _window: &mut Window, cx: &mut Context<Self>) {
-        if !autocomplete_handles_action(self.autocomplete.is_some()) {
+        if !autocomplete_handles_action(self.editor().autocomplete.is_some()) {
             cx.propagate();
             return;
         }
@@ -6742,11 +7035,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         if self.modal.is_some() {
             return None;
         }
-        let ac = self.autocomplete.as_ref()?;
+        let ac = self.editor().autocomplete.as_ref()?;
         let candidates = ac.candidates.clone();
         let popup_w = Self::autocomplete_popup_width(candidates.iter().map(|c| c.label.as_str()));
         let selected = ac.selected;
-        let bounds = self.sql.read(cx).cursor_screen_bounds()?;
+        let bounds = self.editor().sql.read(cx).cursor_screen_bounds()?;
         let theme = *cx.theme();
 
         const ROW_H: gpui::Pixels = px(22.);
@@ -6784,7 +7077,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                             .child(div().w(px(10.)).text_size(px(11.)).text_color(kind_color).child(kind_label))
                             .child(div().flex_1().overflow_hidden().child(label))
                             .on_click(cx.listener(move |view, _, _window, cx| {
-                                if let Some(a) = &mut view.autocomplete {
+                                if let Some(a) = &mut view.editor_mut().autocomplete {
                                     a.selected = ix;
                                 }
                                 view.accept_selected_completion(cx);
@@ -6794,6 +7087,8 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 items
             }),
         )
+        .track_scroll(&self.ac_scrollbar.list)
+        .with_decoration(self.ac_scrollbar.decoration())
         .h(ROW_H * visible_rows);
 
         Some(
@@ -6816,7 +7111,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// returns the spec. `None` means there's nothing to fetch a schema for
     /// (tree shows "Bez připojení").
     fn active_conn_spec(&self) -> Option<ConnectSpec> {
-        if self.active_connection_id.is_some() {
+        if self.editor().connection.is_some() {
             self.resolve_active().map(ActiveConn::into_spec)
         } else {
             self.conn_url.clone().map(ConnectSpec::Url)
@@ -6830,30 +7125,45 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// DDL view has no query behind it, and inventing one would produce a
     /// tab that lies about what re-running it would do.
     fn capture_session(&self, cx: &App) -> dbc_state::session::SessionState {
-        // The fallback is not cosmetic. Without it, opening the app and
-        // closing it again before the connection lands — cancelling the
-        // master-password prompt is enough — records „no connection" and
-        // the session eats itself. Observed exactly once, for real, when
-        // the restore was still silently failing.
-        //
-        // It cannot resurrect anything the user gave up on: a successful
-        // switch sets `active_connection_id` (so the fallback never
-        // fires), and an explicit disconnect clears the claim.
-        let (connection, database) = match &self.active_connection_id {
-            Some(id) => (Some(id.clone()), self.active_database.clone()),
-            None => match &self.attempted_restore {
-                Some((id, db)) => (Some(id.clone()), db.clone()),
-                None => (None, None),
-            },
-        };
+        let snapshots: Vec<EditorSnapshot> = self
+            .editors
+            .iter()
+            .map(|slot| {
+                let t = &slot.payload;
+                // A tab that never reconnected keeps the context it was
+                // restored with (`attempted_restore`), same as before tabs.
+                let (connection, database) = match &t.connection {
+                    Some(id) => (Some(id.clone()), t.database.clone()),
+                    None => match &t.attempted_restore {
+                        Some((id, db)) => (Some(id.clone()), db.clone()),
+                        None => (None, None),
+                    },
+                };
+                EditorSnapshot {
+                    sql: t.sql.read(cx).text(),
+                    cursor: t.sql.read(cx).cursor(),
+                    connection,
+                    database,
+                    script_path: t
+                        .script_binding
+                        .as_ref()
+                        .map(|b| b.path.clone())
+                        .or_else(|| t.pending_script_path.clone()),
+                    tabs: session_tabs(&t.results),
+                }
+            })
+            .collect();
+        let (editors, legacy) = session_editors(&snapshots, self.editors.active_index());
         dbc_state::session::SessionState {
-            connection,
-            database,
-            editor: self.sql.read(cx).text(),
-            cursor: self.sql.read(cx).cursor(),
+            connection: legacy.connection,
+            database: legacy.database,
+            editor: legacy.editor,
+            cursor: legacy.cursor,
             expanded: self.tree.read(cx).expanded_keys(),
             expanded_nodes: self.tree.read(cx).expanded_node_keys(),
-            tabs: session_tabs(&self.tabs),
+            tabs: legacy.tabs,
+            editors,
+            active_editor: self.editors.active_index(),
         }
     }
 
@@ -6872,7 +7182,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         cx: &mut Context<Self>,
     ) {
         let Some((conn_id, db)) = restore else { return };
-        self.attempted_restore = Some((conn_id.clone(), db.clone()));
+        self.editor_mut().attempted_restore = Some((conn_id.clone(), db.clone()));
         // A connection deleted since the last run is not worth a modal, but
         // it IS worth a log line — otherwise „it did not reconnect" has no
         // visible cause at all.
@@ -6917,8 +7227,8 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// saved connection OR the connection was deleted; the CLI-arg URL path
     /// is handled by callers as today.
     fn resolve_active(&self) -> Option<ActiveConn> {
-        let id = self.active_connection_id.as_deref()?;
-        resolve_active_from(&self.config, self.vault.as_ref(), id, self.active_database.as_deref())
+        let id = self.editor().connection.as_deref()?;
+        resolve_active_from(&self.config, self.vault.as_ref(), id, self.editor().database.as_deref())
     }
 
     // -----------------------------------------------------------------
@@ -7031,7 +7341,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let engine = cfg.engine;
         let conn_user = cfg.user.clone();
         self.dropdown_open = false;
-        self.status = "connecting…".into();
+        self.editor_mut().status = "connecting…".into();
         self.switch_generation += 1;
         let my_generation = self.switch_generation;
         cx.notify();
@@ -7039,24 +7349,38 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // connection SWITCH has no cancel affordance and is already retired
         // by `switch_generation`, so it is dropped here.
         let (rx, _abort) = self.runner.test_connect(spec);
+        // Editor tabs (design §2): the switch belongs to the tab that asked
+        // for it; the completion resolves it by id and drops the result if
+        // that tab was closed meanwhile.
+        let editor_id = self.editor_id();
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |view, cx| {
                 if view.switch_generation != my_generation {
                     return; // superseded — last-dispatched wins
                 }
+                if view.editor_by_id_mut(editor_id).is_none() {
+                    return; // the requesting tab is gone — design §2
+                }
                 match result {
                     Ok(Ok(())) => {
-                        view.status = format!("Připojeno ({engine_lbl})");
-                        view.active_connection_id = Some(target_id.clone());
-                        view.active_database = db.clone();
+                        view.tab(editor_id).status = format!("Připojeno ({engine_lbl})");
+                        view.tab(editor_id).connection = Some(target_id.clone());
+                        view.tab(editor_id).database = db.clone();
+                        view.tab(editor_id).unverified = false;
                         view.conn_url = None;
                         // G6 T7 review round 3, MAJOR 1 (carried forward):
                         // close any open autocomplete at the moment the
                         // identity changes — don't wait for the schema
                         // fetch below to land.
-                        view.close_autocomplete(cx);
-                        view.refresh_tree_context(cx);
+                        // The tree, ●, dropdown and autocomplete follow the
+                        // ACTIVE tab — a switch requested by a background tab
+                        // must not repaint them for a context the user is not
+                        // looking at.
+                        if view.editor_id() == editor_id {
+                            view.close_autocomplete(cx);
+                            view.refresh_tree_context(cx);
+                        }
                         view.start_schema_slot_fetch(target_id.clone(), effective.clone(), cx);
                         // T5 review MAJOR 2: the follow-up is THIS
                         // dispatch's own (closure-captured) — a superseded
@@ -7072,11 +7396,21 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                             }
                             None => {}
                         }
+                        // „Nastavit jako aktivní" on a server now REVEALS
+                        // it (user, 2026-09-02: they expect the row to
+                        // open), and the line below is what puts the
+                        // databases in it. Order matters: this runs AFTER
+                        // the follow-up, so the session-restore path —
+                        // which already dispatched its own list fetch —
+                        // has moved the state off `NotLoaded` and is
+                        // skipped rather than fetched twice.
+                        view.tree.update(cx, |t, cx| t.expand_connection(&target_id, cx));
+                        view.load_missing_db_lists(cx);
                     }
                     // Failure arms: the closure-owned follow-up simply
                     // drops with them — nothing shared to clear.
                     Ok(Err(e)) => {
-                        view.status = format!("error: {e}");
+                        view.tab(editor_id).status = format!("error: {e}");
                         // pwchange (spec §1): nabídka změny hesla — nikdy
                         // auto-změna, dialog má Zrušit/Esc; při jiném
                         // otevřeném modalu zůstane jen status výše
@@ -7092,7 +7426,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         }
                     }
                     Err(_) => {
-                        view.status = "error: connect zrušen".into();
+                        view.tab(editor_id).status = "error: connect zrušen".into();
                     }
                 }
                 cx.notify();
@@ -7103,9 +7437,144 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
 
     /// Some(change_count) when an open admin tab is stamped with the
     /// CURRENT identity and has staged edits (roles/memberships/matrix).
+    // -----------------------------------------------------------------
+    // Editor tabs (2026-09-02 design §4): open / close / cycle / activate.
+    // -----------------------------------------------------------------
+
+    fn on_new_editor_tab(&mut self, _: &NewEditorTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        self.new_editor_tab(window, cx);
+    }
+
+    /// Ctrl+N: a fresh buffer that inherits the current tab's context —
+    /// the common case is „same server, another query".
+    fn new_editor_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editors.len() >= editor_tabs::MAX_EDITOR_TABS {
+            self.editor_mut().status =
+                format!("error: maximum je {} tabů", editor_tabs::MAX_EDITOR_TABS);
+            cx.notify();
+            return;
+        }
+        let (conn, db) = (self.editor().connection.clone(), self.editor().database.clone());
+        let sql = cx.new(|cx| SqlInput::new(cx, "Type SQL, then Ctrl+Enter…"));
+        let id = self.editors.open(EditorTab::new(sql, conn, db));
+        self.activate_editor(id, window, cx);
+    }
+
+    fn on_close_editor_tab(&mut self, _: &CloseEditorTab, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        let id = self.editor_id();
+        self.close_editor_tab(id, cx);
+    }
+
+    fn close_editor_tab(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(slot) = self.editors.by_id(id) else { return };
+        let dirty = slot.payload.script_binding.as_ref().is_some_and(|b| {
+            script_text_is_dirty(&slot.payload.sql.read(cx).text(), &b.saved_text)
+        });
+        let running = slot.payload.cancel.is_some();
+        match close_editor_decision(self.editors.len() == 1, dirty, running) {
+            CloseEditorDecision::ConfirmDiscard => {
+                self.discard_confirm = Some(DiscardConfirmState {
+                    change_count: 1,
+                    action: PendingDiscard::CloseEditorTab { id },
+                });
+                self.modal_needs_focus = true;
+            }
+            CloseEditorDecision::CancelThenClose => {
+                if let Some(tab) = self.editor_by_id_mut(id) {
+                    if let Some(c) = tab.cancel.take() {
+                        c.cancel();
+                    }
+                }
+                self.editors.close(id);
+                self.refresh_tree_context(cx);
+            }
+            CloseEditorDecision::Close => {
+                self.editors.close(id);
+                self.refresh_tree_context(cx);
+            }
+            CloseEditorDecision::ReplaceWithEmpty => {
+                // Design §1: never zero tabs. Same context, empty buffer.
+                let (conn, db) = (self.editor().connection.clone(), self.editor().database.clone());
+                let sql = cx.new(|cx| SqlInput::new(cx, "Type SQL, then Ctrl+Enter…"));
+                let fresh = self.editors.open(EditorTab::new(sql, conn, db));
+                self.editors.close(id);
+                self.editors.activate(fresh);
+                self.refresh_tree_context(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_next_editor_tab(&mut self, _: &NextEditorTab, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.editors.next();
+        self.activate_editor(id, window, cx);
+    }
+
+    fn on_prev_editor_tab(&mut self, _: &PrevEditorTab, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.editors.prev();
+        self.activate_editor(id, window, cx);
+    }
+
+    /// Design §4: the tree, ●, dropdown and status all follow the active
+    /// tab. A tab restored with a context it never connected with
+    /// (design §3) connects now; a bound script it carried is re-bound.
+    fn activate_editor(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editors.activate(id) {
+            return;
+        }
+        self.close_autocomplete(cx);
+        let focus = self.editor().sql.focus_handle(cx);
+        window.focus(&focus, cx);
+        // …and again after the frame that paints the new tab's input — the
+        // call above is a no-op for an input that does not exist yet.
+        self.editor_needs_focus = true;
+        self.refresh_tree_context(cx);
+        self.rebind_pending_script(cx);
+        if self.editor().unverified {
+            if let Some(conn) = self.editor().connection.clone() {
+                let db = self.editor().database.clone();
+                self.switch_to_database(&conn, db, None, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Design §3: a restored tab's bound script, re-bound on first use.
+    /// The FILE text becomes `saved_text` and the buffer keeps what the
+    /// session restored, so the dirty dot reads honestly — this is a
+    /// binding, not a load, which is why it does not go through
+    /// `bind_script`'s buffer replace.
+    fn rebind_pending_script(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.editor_mut().pending_script_path.take() else { return };
+        match std::fs::read_to_string(&path) {
+            Ok(saved_text) => self.set_script_binding(Some(ScriptBinding { path, saved_text })),
+            Err(_) => {
+                self.editor_mut().status =
+                    format!("error: vázaný skript nenalezen: {}", path.display());
+            }
+        }
+        cx.notify();
+    }
+
+    fn editor_tab_title(&self, slot: &editor_tabs::Slot<EditorTab>, cx: &App) -> String {
+        let bound = slot
+            .payload
+            .script_binding
+            .as_ref()
+            .and_then(|b| b.path.file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        editor_tabs::derive_title(bound.as_deref(), &slot.payload.sql.read(cx).text(), slot.ordinal)
+    }
+
     fn dirty_admin_change_count(&self, cx: &Context<Self>) -> Option<usize> {
         let current = self.current_conn_identity();
-        self.tabs.iter().find_map(|t| match &t.content {
+        self.editor().results.iter().find_map(|t| match &t.content {
             TabContent::Admin { view } => {
                 let p = view.read(cx);
                 let n = p.change_count();
@@ -7340,7 +7809,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         match saved {
             Ok(()) => {
                 self.modal = None;
-                self.status = "heslo změněno a uloženo do trezoru".to_string();
+                self.editor_mut().status = "heslo změněno a uloženo do trezoru".to_string();
                 self.switch_to_database(conn_id, retry_db, None, cx);
             }
             Err(m) => self.pw_change_set_error(
@@ -7363,7 +7832,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             *error = Some(msg);
             *running = false;
         } else {
-            self.status = format!("error: {msg}");
+            self.editor_mut().status = format!("error: {msg}");
         }
         cx.notify();
     }
@@ -7385,9 +7854,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// pair (`CLI_CONN_IDENTITY`, any db) answers for the CLI-arg session.
     fn scope_is_active(&self, conn_id: &str, db: &str) -> bool {
         if conn_id == CLI_CONN_IDENTITY {
-            return self.active_connection_id.is_none() && self.conn_url.is_some();
+            return self.editor().connection.is_none() && self.conn_url.is_some();
         }
-        self.active_connection_id.as_deref() == Some(conn_id)
+        self.editor().connection.as_deref() == Some(conn_id)
             && self.effective_database().as_deref() == Some(db)
     }
 
@@ -7395,11 +7864,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// tree — the sidebar's ● indicator, icon gating and favourites
     /// filtering all derive from this one push.
     fn push_active_scope_to_tree(&mut self, cx: &mut Context<Self>) {
-        let scope = self.active_connection_id.as_ref().and_then(|id| {
+        let scope = self.editor().connection.as_ref().and_then(|id| {
             let cfg = self.config.connections.iter().find(|c| &c.id == id)?;
             Some(schema_tree::ActiveScope {
                 conn_id: id.clone(),
-                db: self.active_database.clone().unwrap_or_else(|| cfg.database.clone()),
+                db: self.editor().database.clone().unwrap_or_else(|| cfg.database.clone()),
                 default_db: cfg.database.clone(),
             })
         });
@@ -7430,7 +7899,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // acted on, rather than a second hook that could be forgotten on a
         // future switch path.
         let dialect = self.active_engine().map(sql_dialect);
-        self.sql.update(cx, |input, cx| input.set_dialect(dialect, cx));
+        self.editor().sql.update(cx, |input, cx| input.set_dialect(dialect, cx));
         self.tree.update(cx, |t, cx| t.set_dialect(dialect, cx));
         self.push_active_scope_to_tree(cx);
         // Workspace T7: „is there a scripts root at all" travels with the
@@ -7500,21 +7969,21 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
                 Ok(Ok(_)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "výběr zrušen".to_string();
+                        view.editor_mut().status = "výběr zrušen".to_string();
                         cx.notify();
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = format!("error: dialog selhal: {e}");
+                        view.editor_mut().status = format!("error: dialog selhal: {e}");
                         cx.notify();
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "error: dialog není dostupný".to_string();
+                        view.editor_mut().status = "error: dialog není dostupný".to_string();
                         cx.notify();
                     });
                     return;
@@ -7546,7 +8015,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // check below tests. A generation would be a weaker proxy
                 // for an invariant we can read directly.
                 if view.workspace_root.is_some() {
-                    view.status =
+                    view.editor_mut().status =
                         connections_ui::SCRIPTS_PICK_DISCARDED_WORKSPACE.to_string();
                     cx.notify();
                     return;
@@ -7559,7 +8028,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // U+FFFD and reporting SUCCESS would put a path that does
                 // not exist in `config.toml` and then blame the scan for it.
                 let Some(picked_str) = picked.to_str() else {
-                    view.status = format!(
+                    view.editor_mut().status = format!(
                         "error: cesta ke složce skriptů obsahuje znaky, které nelze uložit: {}",
                         picked.display()
                     );
@@ -7573,7 +8042,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // NO connections over the user's real one.
                 let Some(guard) = view.guard_corrupt_config(cx) else { return };
                 view.config.scripts_dir = Some(picked_str.to_string());
-                view.status = match view.config.save(&view.config_path, &guard) {
+                view.editor_mut().status = match view.config.save(&view.config_path, &guard) {
                     Ok(()) => format!("složka skriptů: {picked_str}"),
                     Err(e) => format!("error: nastavení se nepodařilo uložit ({e})"),
                 };
@@ -7609,7 +8078,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // See `start_scripts_dir_pick` — same corrupt-config gate.
         let Some(guard) = self.guard_corrupt_config(cx) else { return };
         self.config.scripts_dir = None;
-        self.status = match self.config.save(&self.config_path, &guard) {
+        self.editor_mut().status = match self.config.save(&self.config_path, &guard) {
             Ok(()) => "složka skriptů odebrána".to_string(),
             Err(e) => format!("error: nastavení se nepodařilo uložit ({e})"),
         };
@@ -7641,7 +8110,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// caching this answer across an await caused.
     fn binding_targets(&self, rel: &str, is_dir: bool) -> bool {
         binding_targets_entry(
-            self.script_binding.as_ref().map(|b| b.path.as_path()),
+            self.editor().script_binding.as_ref().map(|b| b.path.as_path()),
             self.effective_scripts_root().as_deref(),
             rel,
             is_dir,
@@ -7662,7 +8131,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             return;
         }
         if self.effective_scripts_root().is_none() {
-            self.status = "error: nastavte složku skriptů v Nastavení".to_string();
+            self.editor_mut().status = "error: nastavte složku skriptů v Nastavení".to_string();
             cx.notify();
             return;
         }
@@ -7708,11 +8177,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             return;
         }
         if self.effective_scripts_root().is_none() {
-            self.status = "error: nastavte složku skriptů v Nastavení".to_string();
+            self.editor_mut().status = "error: nastavte složku skriptů v Nastavení".to_string();
             cx.notify();
             return;
         }
-        let dirty_bound = self.binding_targets(&rel, is_dir) && self.script_dirty_flag;
+        let dirty_bound = self.binding_targets(&rel, is_dir) && self.editor().script_dirty_flag;
         self.modal = Some(connections_ui::ModalState::ScriptDeleteConfirm {
             rel,
             is_dir,
@@ -7808,7 +8277,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         if self.owns_script_name_modal(mode, target_rel) {
             self.set_script_name_error(message, cx);
         } else {
-            self.status = format!("error: {message}");
+            self.editor_mut().status = format!("error: {message}");
             cx.notify();
         }
     }
@@ -7818,7 +8287,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         if self.owns_script_delete_modal(rel) {
             self.set_script_delete_error(message, cx);
         } else {
-            self.status = format!("error: {message}");
+            self.editor_mut().status = format!("error: {message}");
             cx.notify();
         }
     }
@@ -7838,7 +8307,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             *running = false;
             *error = Some(message);
         } else {
-            self.status = format!("error: {message}");
+            self.editor_mut().status = format!("error: {message}");
         }
         cx.notify();
     }
@@ -7853,7 +8322,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             *running = false;
             *error = Some(message);
         } else {
-            self.status = format!("error: {message}");
+            self.editor_mut().status = format!("error: {message}");
         }
         cx.notify();
     }
@@ -7888,7 +8357,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // in-flight save. Serialize against the editor's save exactly the
         // way `save_script` serializes against itself — this is a refusal
         // the user can retry, not an error, so it reuses that wording.
-        if self.script_save_in_flight {
+        if self.editor().script_save_in_flight {
             self.set_script_name_error(SCRIPT_SAVE_IN_FLIGHT.to_string(), cx);
             return;
         }
@@ -7949,7 +8418,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // „skript vytvořen: {name}" for BOTH create modes, which says
         // „script" over a folder. A false noun in the one line confirming
         // a filesystem mutation is not a nit.
-        self.status = match mode {
+        self.editor_mut().status = match mode {
             connections_ui::ScriptNameMode::Rename => format!("přejmenováno: {name}"),
             connections_ui::ScriptNameMode::NewFolder => format!("složka vytvořena: {name}"),
             connections_ui::ScriptNameMode::NewScript => format!("skript vytvořen: {name}"),
@@ -7974,7 +8443,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// rename without sprouting a „ •".
     fn retarget_binding_after_rename(&mut self, old_rel: &str, new_rel: &str, is_dir: bool) {
         let Some(root) = self.effective_scripts_root() else { return };
-        let Some(b) = self.script_binding.as_ref() else { return };
+        let Some(b) = self.editor().script_binding.as_ref() else { return };
         let (Ok(old), Ok(new)) = (
             crate::scripts::resolve_entry_rel(&root, old_rel),
             crate::scripts::resolve_entry_rel(&root, new_rel),
@@ -8005,7 +8474,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // Same single-writer serialization as the name dialog: removing a
         // file whose atomic save is still fsyncing would race the rename
         // half of that write and could resurrect it a moment later.
-        if self.script_save_in_flight {
+        if self.editor().script_save_in_flight {
             self.set_script_delete_error(SCRIPT_SAVE_IN_FLIGHT.to_string(), cx);
             return;
         }
@@ -8075,7 +8544,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             self.set_script_binding(None);
         }
         let name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
-        self.status = format!("smazáno: {name}");
+        self.editor_mut().status = format!("smazáno: {name}");
         if mine {
             self.close_modal(cx);
         }
@@ -8087,14 +8556,14 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// whenever nothing is bound — the guard NEVER protects unbound ad-hoc
     /// text (§5.5, deliberate: identical exposure to today).
     pub(crate) fn script_is_dirty(&self, cx: &App) -> bool {
-        self.script_binding
+        self.editor().script_binding
             .as_ref()
-            .is_some_and(|b| script_text_is_dirty(&self.sql.read(cx).text(), &b.saved_text))
+            .is_some_and(|b| script_text_is_dirty(&self.editor().sql.read(cx).text(), &b.saved_text))
     }
 
     /// The bound script's label, relative to the CURRENT scripts root.
     pub(crate) fn binding_rel(&self) -> Option<String> {
-        let b = self.script_binding.as_ref()?;
+        let b = self.editor().script_binding.as_ref()?;
         Some(script_caption_rel(&b.path, self.effective_scripts_root().as_deref()))
     }
 
@@ -8115,10 +8584,10 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// `supersede_script_continuations` for the case where it is wrong.
     fn set_script_binding(&mut self, binding: Option<ScriptBinding>) {
         let changed = script_binding_target_changed(
-            self.script_binding.as_ref().map(|b| b.path.as_path()),
+            self.editor().script_binding.as_ref().map(|b| b.path.as_path()),
             binding.as_ref().map(|b| b.path.as_path()),
         );
-        self.script_binding = binding;
+        self.editor_mut().script_binding = binding;
         if changed {
             self.supersede_script_continuations();
         }
@@ -8146,7 +8615,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// heuristic. Still the ONE counter and the ONE meaning; only the
     /// trigger is broader.
     fn supersede_script_continuations(&mut self) {
-        self.script_binding_generation = self.script_binding_generation.wrapping_add(1);
+        self.editor_mut().script_binding_generation = self.editor().script_binding_generation.wrapping_add(1);
     }
 
     /// Sets the editor text AND the binding in one place, so the two can
@@ -8159,14 +8628,14 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // binding and buffer all stood still — so the permission asked for
         // here is the same one, asked again, at the instant it is spent.
         let permitted = with_editor_replaceable(self, cx, |view, cx, permit| {
-            view.sql.update(cx, |s, cx| s.replace_buffer(&text, cx, permit));
+            view.editor().sql.update(cx, |s, cx| s.replace_buffer(&text, cx, permit));
             view.set_script_binding(Some(ScriptBinding { path, saved_text: text }));
-            view.status = String::new();
+            view.editor_mut().status = String::new();
         });
         if permitted.is_none() {
             // Unreachable through the guard, and a silent no-op is the
             // shape this phase keeps banning, so it says so.
-            self.status = SCRIPT_LOAD_BLOCKED.to_string();
+            self.editor_mut().status = SCRIPT_LOAD_BLOCKED.to_string();
         }
         cx.notify();
     }
@@ -8189,7 +8658,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // „do it anyway". Refusing out loud, because a silent no-op is the
         // other thing this phase keeps banning.
         if self.discard_confirm.is_some() {
-            self.status = "nejprve dokončete rozpracované úpravy".to_string();
+            self.editor_mut().status = "nejprve dokončete rozpracované úpravy".to_string();
             cx.notify();
             return;
         }
@@ -8219,16 +8688,16 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             PendingScriptAction::Unbind => {
                 // §5.3: the text STAYS — it is simply no longer bound.
                 self.set_script_binding(None);
-                self.status = String::new();
+                self.editor_mut().status = String::new();
                 cx.notify();
             }
             PendingScriptAction::LoadText { sql } => {
                 let permitted = with_editor_replaceable(self, cx, |view, cx, permit| {
-                    view.sql.update(cx, |s, cx| s.replace_buffer(&sql, cx, permit));
+                    view.editor().sql.update(cx, |s, cx| s.replace_buffer(&sql, cx, permit));
                     view.set_script_binding(None);
                 });
                 if permitted.is_none() {
-                    self.status = SCRIPT_LOAD_BLOCKED.to_string();
+                    self.editor_mut().status = SCRIPT_LOAD_BLOCKED.to_string();
                 }
                 cx.notify();
             }
@@ -8241,19 +8710,19 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// second size probe here.
     fn open_script(&mut self, rel: String, cx: &mut Context<Self>) {
         let Some(root) = self.effective_scripts_root() else {
-            self.status = "error: nastavte složku skriptů v Nastavení".to_string();
+            self.editor_mut().status = "error: nastavte složku skriptů v Nastavení".to_string();
             cx.notify();
             return;
         };
         let path = match crate::scripts::resolve_rel(&root, &rel) {
             Ok(p) => p,
             Err(e) => {
-                self.status = format!("error: {e}");
+                self.editor_mut().status = format!("error: {e}");
                 cx.notify();
                 return;
             }
         };
-        let dispatched = self.script_binding_generation;
+        let dispatched = self.editor().script_binding_generation;
         // T8 review BLOCKER-1. `editor_load_guarded` ran at DISPATCH; the
         // read below then yields the UI thread, and the buffer is not
         // replaced until it comes back. The generation rail alone is
@@ -8264,7 +8733,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // root answers, and the read landed on top of them — permanently
         // (`SqlInput` has no undo) and silently (`bind_script` even clears
         // the status). The buffer gets the same treatment as the binding.
-        let dispatched_text = self.sql.read(cx).text();
+        let dispatched_text = self.editor().sql.read(cx).text();
         cx.spawn(async move |this, cx| {
             let job = path.clone();
             let result =
@@ -8277,19 +8746,19 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 if let Some(reason) = script_open_abort_reason(
                     view.effective_scripts_root().as_deref(),
                     &root,
-                    view.script_binding_generation,
+                    view.editor().script_binding_generation,
                     dispatched,
-                    &view.sql.read(cx).text(),
+                    &view.editor().sql.read(cx).text(),
                     &dispatched_text,
                 ) {
-                    view.status = reason.to_string();
+                    view.editor_mut().status = reason.to_string();
                     cx.notify();
                     return;
                 }
                 match result {
                     Ok(text) => view.bind_script(path.clone(), text, cx),
                     Err(e) => {
-                        view.status = format!("error: {e}");
+                        view.editor_mut().status = format!("error: {e}");
                         cx.notify();
                     }
                 }
@@ -8346,20 +8815,24 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         _allowed: SaveAllowed<'_>,
         cx: &mut Context<Self>,
     ) {
-        if self.script_save_in_flight {
-            self.status = SCRIPT_SAVE_IN_FLIGHT.to_string();
+        if self.editor().script_save_in_flight {
+            self.editor_mut().status = SCRIPT_SAVE_IN_FLIGHT.to_string();
             cx.notify();
             return;
         }
-        self.script_save_in_flight = true;
-        let dispatched = self.script_binding_generation;
+        self.editor_mut().script_save_in_flight = true;
+        let dispatched = self.editor().script_binding_generation;
+        let editor_id = self.editor_id();
         cx.spawn(async move |this, cx| {
             let (job_path, job_text) = (path.clone(), text.clone());
             let result = cx
                 .background_spawn(async move { crate::scripts::write_script(&job_path, &job_text) })
                 .await;
             let _ = this.update(cx, |view, cx| {
-                view.script_save_in_flight = false;
+                if view.editor_by_id_mut(editor_id).is_none() {
+                    return; // the tab that saved is gone — design §2
+                }
+                view.tab(editor_id).script_save_in_flight = false;
                 let name =
                     path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                 match result {
@@ -8370,14 +8843,14 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         // it after the user moved on: that would strand a
                         // different buffer under this file's caption and
                         // make the next Ctrl+S overwrite the wrong script.
-                        if view.script_binding_generation == dispatched {
+                        if view.tab_ref(editor_id).script_binding_generation == dispatched {
                             view.set_script_binding(Some(ScriptBinding {
                                 path: path.clone(),
                                 saved_text: text.clone(),
                             }));
-                            view.status = format!("skript uložen: {name}");
+                            view.tab(editor_id).status = format!("skript uložen: {name}");
                         } else {
-                            view.status =
+                            view.tab(editor_id).status =
                                 format!("skript uložen: {name} — editor se mezitím změnil");
                         }
                         // T8 review MINOR-2: the rescan is INDEPENDENT of
@@ -8394,7 +8867,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                             view.start_scripts_scan(cx);
                         }
                     }
-                    Err(e) => view.status = format!("error: {e}"),
+                    Err(e) => view.tab(editor_id).status = format!("error: {e}"),
                 }
                 cx.notify();
             });
@@ -8404,18 +8877,18 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
 
     /// Part S §5.4 — Ctrl+S with no binding.
     fn save_script_as(&mut self, cx: &mut Context<Self>) {
-        let text = self.sql.read(cx).text();
+        let text = self.editor().sql.read(cx).text();
         if text.trim().is_empty() {
-            self.status = "editor je prázdný".to_string();
+            self.editor_mut().status = "editor je prázdný".to_string();
             cx.notify();
             return;
         }
         let Some(root) = self.effective_scripts_root() else {
-            self.status = "error: nastavte složku skriptů v Nastavení".to_string();
+            self.editor_mut().status = "error: nastavte složku skriptů v Nastavení".to_string();
             cx.notify();
             return;
         };
-        let dispatched = self.script_binding_generation;
+        let dispatched = self.editor().script_binding_generation;
         // Verified in the pinned GPUI rev (907ed09,
         // `gpui_windows/src/platform.rs::file_save_dialog`): a non-empty
         // `directory` is canonicalized and pushed through
@@ -8433,6 +8906,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // fixable from here without duplicating the canonicalize (and then
         // racing it); recorded so it is not mistaken for our own silence.
         let dialog = cx.prompt_for_new_path(&root, Some("dotaz.sql"));
+        let editor_id = self.editor_id();
         cx.spawn(async move |this, cx| {
             // Same three arms as the backup save picker: a swallowed dialog
             // failure is exactly the silence this phase keeps banning.
@@ -8440,21 +8914,30 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 Ok(Ok(Some(p))) => p,
                 Ok(Ok(None)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "uložení zrušeno".to_string();
+                        if view.editor_by_id_mut(editor_id).is_none() {
+                            return; // the tab that saved is gone — design §2
+                        }
+                        view.tab(editor_id).status = "uložení zrušeno".to_string();
                         cx.notify();
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = format!("error: dialog pro uložení selhal ({e})");
+                        if view.editor_by_id_mut(editor_id).is_none() {
+                            return; // the tab that saved is gone — design §2
+                        }
+                        view.tab(editor_id).status = format!("error: dialog pro uložení selhal ({e})");
                         cx.notify();
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "error: dialog pro uložení není dostupný".to_string();
+                        if view.editor_by_id_mut(editor_id).is_none() {
+                            return; // the tab that saved is gone — design §2
+                        }
+                        view.tab(editor_id).status = "error: dialog pro uložení není dostupný".to_string();
                         cx.notify();
                     });
                     return;
@@ -8462,14 +8945,17 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             };
             let path = with_sql_extension(&picked);
             let _ = this.update(cx, |view, cx| {
+                if view.editor_by_id_mut(editor_id).is_none() {
+                    return; // the tab that saved is gone — design §2
+                }
                 // The picker is not modal to the whole app on every
                 // platform, and the buffer this save-as was started for is
                 // the one the user saw. If the editor has since been bound
                 // to a script (or reloaded from history), writing the OLD
                 // captured text to a NEW path — and then binding to it —
                 // would be a silent context change on both ends.
-                if view.script_binding_generation != dispatched {
-                    view.status = "uložení zrušeno — editor se mezitím změnil".to_string();
+                if view.tab_ref(editor_id).script_binding_generation != dispatched {
+                    view.tab(editor_id).status = "uložení zrušeno — editor se mezitím změnil".to_string();
                     cx.notify();
                     return;
                 }
@@ -8490,8 +8976,8 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // teach the user two different stories about the same
                 // event. Nothing is lost: the editor is untouched, no file
                 // is created, and Ctrl+S re-opens the picker.
-                if view.sql.read(cx).text() != text {
-                    view.status = "uložení zrušeno — mezitím jste psali do editoru".to_string();
+                if view.tab_ref(editor_id).sql.read(cx).text() != text {
+                    view.tab(editor_id).status = "uložení zrušeno — mezitím jste psali do editoru".to_string();
                     cx.notify();
                     return;
                 }
@@ -8539,7 +9025,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 })
                 .is_none()
                 {
-                    view.status = SCRIPT_SAVE_BLOCKED.to_string();
+                    view.tab(editor_id).status = SCRIPT_SAVE_BLOCKED.to_string();
                     cx.notify();
                 }
             });
@@ -8565,10 +9051,10 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // Refused OUT LOUD (a silent `return` is the other thing this phase
         // bans) and not as an „error:" — nothing failed; the keystroke
         // simply arrived while another decision was still on screen.
-        let bound = self.script_binding.as_ref().map(|b| b.path.clone());
+        let bound = self.editor().script_binding.as_ref().map(|b| b.path.clone());
         let permitted = with_save_permission(self, cx, |view, cx, allowed| match bound {
             Some(path) => {
-                let text = view.sql.read(cx).text();
+                let text = view.editor().sql.read(cx).text();
                 view.save_script(path, text, false, allowed, cx);
             }
             // The permission ENDS with this scope, deliberately.
@@ -8581,7 +9067,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             None => view.save_script_as(cx),
         });
         if permitted.is_none() {
-            self.status = SCRIPT_SAVE_BLOCKED.to_string();
+            self.editor_mut().status = SCRIPT_SAVE_BLOCKED.to_string();
             cx.notify();
         }
     }
@@ -8800,8 +9286,8 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// matters.
     pub(crate) fn context_switch_blocked(&self) -> Option<String> {
         connections_ui::context_switch_refusal(
-            self.cancel.is_some(),
-            self.script_binding.is_some() && self.script_dirty_flag,
+            self.editor().cancel.is_some(),
+            self.editor().script_binding.is_some() && self.editor().script_dirty_flag,
             self.apply_dialog.is_some() || self.discard_confirm.is_some(),
             // The switch flow's OWN modals (Settings, and the confirm
             // itself) do not count as "some other dialog" — see
@@ -8848,21 +9334,21 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 Ok(Ok(Some(p))) => p,
                 Ok(Ok(None)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "výběr zrušen".to_string();
+                        view.editor_mut().status = "výběr zrušen".to_string();
                         cx.notify();
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = format!("error: dialog selhal: {e}");
+                        view.editor_mut().status = format!("error: dialog selhal: {e}");
                         cx.notify();
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "error: dialog není dostupný".to_string();
+                        view.editor_mut().status = "error: dialog není dostupný".to_string();
                         cx.notify();
                     });
                     return;
@@ -8875,7 +9361,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         dbc_state::bundle::write(&b, &picked)?;
                         Ok(n)
                     });
-                view.status = match built {
+                view.editor_mut().status = match built {
                     Ok(n) => transfer_ui::export_done_status(&picked, n),
                     Err(e) => format!("error: {}", e.message),
                 };
@@ -8894,7 +9380,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// live while the native dialog is up.
     fn start_settings_import(&mut self, cx: &mut Context<Self>) {
         if let Some(reason) = self.context_switch_blocked() {
-            self.status = format!("error: {reason}");
+            self.editor_mut().status = format!("error: {reason}");
             cx.notify();
             return;
         }
@@ -8909,21 +9395,21 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
                 Ok(Ok(_)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "výběr zrušen".to_string();
+                        view.editor_mut().status = "výběr zrušen".to_string();
                         cx.notify();
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = format!("error: dialog selhal: {e}");
+                        view.editor_mut().status = format!("error: dialog selhal: {e}");
                         cx.notify();
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "error: dialog není dostupný".to_string();
+                        view.editor_mut().status = "error: dialog není dostupný".to_string();
                         cx.notify();
                     });
                     return;
@@ -8933,7 +9419,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // Re-check: the window was interactive throughout the
                 // dialog, so a query could have been started behind it.
                 if let Some(reason) = view.context_switch_blocked() {
-                    view.status = format!("error: {reason}");
+                    view.editor_mut().status = format!("error: {reason}");
                     cx.notify();
                     return;
                 }
@@ -8944,7 +9430,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 let bundle = match dbc_state::bundle::read(&picked) {
                     Ok(b) => b,
                     Err(e) => {
-                        view.status = format!("error: {}", e.message);
+                        view.editor_mut().status = format!("error: {}", e.message);
                         cx.notify();
                         return;
                     }
@@ -8952,7 +9438,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 let summary = match dbc_state::bundle::summary(&bundle) {
                     Ok(s) => s,
                     Err(e) => {
-                        view.status = format!("error: {}", e.message);
+                        view.editor_mut().status = format!("error: {}", e.message);
                         cx.notify();
                         return;
                     }
@@ -8964,7 +9450,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     lines: transfer_ui::import_confirm_lines(&summary, replacing),
                     error: None,
                 });
-                view.status = String::new();
+                view.editor_mut().status = String::new();
                 cx.notify();
             });
         })
@@ -9011,7 +9497,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         self.apply_context(root, cx);
         // AFTER `apply_context`, which sets a status of its own about the
         // context it just loaded — true, but not what happened here.
-        self.status =
+        self.editor_mut().status =
             transfer_ui::import_done_status(connections, applied.backed_up.len(), has_vault);
         cx.notify();
     }
@@ -9022,7 +9508,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// read-only `read_dir` (§W6.4: nothing under `.git/` is ever opened).
     fn start_workspace_pick(&mut self, cx: &mut Context<Self>) {
         if let Some(reason) = self.context_switch_blocked() {
-            self.status = format!("error: {reason}");
+            self.editor_mut().status = format!("error: {reason}");
             cx.notify();
             return;
         }
@@ -9085,7 +9571,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         return; // superseded — silent, like the Ok arm
                     }
                     view.workspace_pick_error = Some(e);
-                    view.status = connections_ui::WORKSPACE_PICK_FAILED_STATUS.to_string();
+                    view.editor_mut().status = connections_ui::WORKSPACE_PICK_FAILED_STATUS.to_string();
                     cx.notify();
                 }
             });
@@ -9107,7 +9593,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         if self.workspace_pick_generation != dispatched_generation {
             return;
         }
-        self.status = message;
+        self.editor_mut().status = message;
         cx.notify();
     }
 
@@ -9115,7 +9601,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// the workspace folder is read or written: only the pointer goes.
     fn start_leave_workspace(&mut self, cx: &mut Context<Self>) {
         if let Some(reason) = self.context_switch_blocked() {
-            self.status = format!("error: {reason}");
+            self.editor_mut().status = format!("error: {reason}");
             cx.notify();
             return;
         }
@@ -9154,7 +9640,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             // The user has already reached a newer, explicit decision.
             WorkspacePickVerdict::Superseded => return,
             WorkspacePickVerdict::OtherDialog => {
-                self.status = connections_ui::WORKSPACE_PICK_DISCARDED.to_string();
+                self.editor_mut().status = connections_ui::WORKSPACE_PICK_DISCARDED.to_string();
                 cx.notify();
                 return;
             }
@@ -9387,12 +9873,12 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // unconditional; see `supersede_script_continuations`.
         self.set_script_binding(None);
         self.supersede_script_continuations();
-        self.status = match &root {
+        self.editor_mut().status = match &root {
             Some(r) => format!("pracovní prostor: {}", r.display()),
             None => "lokální profil obnoven".to_string(),
         };
         if let Some(detail) = self.config_load_error.clone() {
-            self.status =
+            self.editor_mut().status =
                 format!("error: config.toml je poškozený – oprav nebo smaž soubor ({detail})");
         }
         cx.notify();
@@ -9408,9 +9894,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // Dropping the context on purpose also gives up the session's
         // claim on it — otherwise the fallback below would resurrect a
         // connection the user has just walked away from.
-        self.attempted_restore = None;
-        self.active_connection_id = None;
-        self.active_database = None;
+        self.editor_mut().attempted_restore = None;
+        self.editor_mut().connection = None;
+        self.editor_mut().database = None;
         self.conn_url = None;
         self.switch_generation = self.switch_generation.wrapping_add(1);
         self.dropdown_open = false;
@@ -9424,7 +9910,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     fn push_admin_schemas_if_matching(&mut self, cx: &mut Context<Self>) {
         let Some(snapshot) = self.tree.read(cx).snapshot() else { return };
         let schemas = admin_panel::distinct_schemas(snapshot);
-        if let Some(panel) = self.tabs.iter().find_map(|t| match &t.content {
+        if let Some(panel) = self.editor().results.iter().find_map(|t| match &t.content {
             TabContent::Admin { view } => Some(view.clone()),
             _ => None,
         }) {
@@ -9477,6 +9963,39 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             });
         })
         .detach();
+    }
+
+    /// Restores the invariant the chevron establishes and nothing else did:
+    /// a connection row that renders EXPANDED has had its database list
+    /// asked for. `switch_to_database` and session restore both leave rows
+    /// open without going through the chevron, and such a row draws „▾"
+    /// over nothing until the user collapses and re-expands it — see
+    /// `schema_tree::expanded_connections_without_db_list` for the full
+    /// account.
+    ///
+    /// A connection whose secret is still locked is SKIPPED, not
+    /// dispatched: `start_db_list_fetch` answers a locked vault with a
+    /// master-password modal, and a modal nobody asked for is worse than a
+    /// row that fills in on the next click. Once the vault IS open (the
+    /// switch success arm's case — it just connected), every such row is
+    /// repaired in one pass.
+    fn load_missing_db_lists(&mut self, cx: &mut Context<Self>) {
+        for conn_id in self.tree.read(cx).connections_needing_db_list() {
+            let Some(engine) =
+                self.config.connections.iter().find(|c| c.id == conn_id).map(|c| c.engine)
+            else {
+                continue; // a row for a connection that no longer exists
+            };
+            let needs_secret = !connections_ui::engine_is_file_based(engine);
+            if connections_ui::connect_needs_vault_prompt(
+                needs_secret,
+                self.vault.is_some(),
+                Vault::exists(&self.vault_path),
+            ) {
+                continue;
+            }
+            self.start_db_list_fetch(conn_id, cx);
+        }
     }
 
     fn start_db_list_fetch(&mut self, conn_id: String, cx: &mut Context<Self>) {
@@ -9614,7 +10133,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// there would silently drop the whole feature for anyone who types
     /// continuously. Only an IDLE lap that finds no target ends it.
     fn prefetch_lap(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(conn_id) = self.active_connection_id.clone() else {
+        let Some(conn_id) = self.editor().connection.clone() else {
             // Nothing active to warm. A later connection re-arms us
             // through `finish_db_list`.
             return false;
@@ -9629,7 +10148,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             Vault::exists(&self.vault_path),
         );
         let busy = prefetch::Busy {
-            query_running: self.cancel.is_some(),
+            query_running: self.editor().cancel.is_some(),
             modal_open: self.modal.is_some(),
             sidebar_fetching: self.tree.read(cx).any_fetch_in_flight(),
             prefetch_in_flight: self.prefetch_in_flight,
@@ -9649,7 +10168,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 cached: dbc_state::schema_cache::is_cached(&conn_id, &d.name),
             })
             .collect();
-        let active_db = self.active_database.clone().or_else(|| Some(cfg.database.clone()));
+        let active_db = self.editor().database.clone().or_else(|| Some(cfg.database.clone()));
         let Some(db) = prefetch::next_target(&candidates, active_db.as_deref()).map(str::to_string)
         else {
             return false;
@@ -9838,7 +10357,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // in the status bar, and in the log by the arm above.
                 if result.is_err() && served_from_cache.get() {
                     if let Err(e) = &result {
-                        view.status = format!("error: schéma se nepodařilo obnovit ({e}) — zobrazeno z mezipaměti");
+                        view.editor_mut().status = format!("error: schéma se nepodařilo obnovit ({e}) — zobrazeno z mezipaměti");
                     }
                     cx.notify();
                 } else {
@@ -9975,8 +10494,8 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         cx: &mut Context<Self>,
     ) -> Option<PreviewTarget> {
         let store = self.view_prefs.as_ref()?;
-        let conn_id = self.active_connection_id.clone()?;
-        let conn_id = dbc_state::connection_scope_key(&conn_id, self.active_database.as_deref());
+        let conn_id = self.editor().connection.clone()?;
+        let conn_id = dbc_state::connection_scope_key(&conn_id, self.editor().database.as_deref());
         // No saved entry is NOT an early return: a `from_join_change` run on
         // a table with no prior prefs must still reach the Save branch below
         // (re-review issue 3 — otherwise the very first join on a virgin
@@ -10075,8 +10594,8 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// triggered it — same "best-effort persistence" precedent
     /// `record_history` already follows.
     fn save_view_prefs_for_grid(&mut self, grid: &Entity<ResultGrid>, cx: &mut Context<Self>) {
-        let Some(conn_id) = self.active_connection_id.clone() else { return };
-        let conn_id = dbc_state::connection_scope_key(&conn_id, self.active_database.as_deref());
+        let Some(conn_id) = self.editor().connection.clone() else { return };
+        let conn_id = dbc_state::connection_scope_key(&conn_id, self.editor().database.as_deref());
         let (schema, table, headers, sort, hidden, widths, fk_joins) = {
             let g = grid.read(cx);
             let Some((schema, table)) = g.preview_identity() else { return };
@@ -10089,7 +10608,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let Some(store) = self.view_prefs.as_mut() else { return };
         let prefs = prefs_from_grid_state(&headers, sort, &hidden, &widths, fk_joins);
         if let Err(e) = store.set(&conn_id, schema.as_deref(), &table, prefs) {
-            self.status = format!("error ukládání view prefs: {}", e.message);
+            self.editor_mut().status = format!("error ukládání view prefs: {}", e.message);
         }
     }
 
@@ -10103,10 +10622,10 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// `src_col` via `set_virtual_cols_for_src`. `grid` is the SAME entity
     /// that emitted the event (ad-hoc tabs are never replaced, unlike a
     /// preview re-run) — captured from `on_grid_event`'s `emitter` rather
-    /// than looked up from `self.tabs`.
+    /// than looked up from `self.editor().results`.
     ///
     /// Review fix (Task 5 round 1, Issue 5, informational): this dispatches
-    /// `runner.fetch_lookup` regardless of `self.cancel` — no
+    /// `runner.fetch_lookup` regardless of `self.editor().cancel` — no
     /// one-query-at-a-time check here, unlike `run_query_with`. Deliberate,
     /// and safe: `fetch_lookup` opens its own independent connection (same
     /// `open_spec` dispatch every one-shot in `runner.rs` uses —
@@ -10123,7 +10642,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     ///   (`Entity::update` on a strong handle never fails even if every tab
     ///   referencing it was closed — `grid` here is a strong handle kept
     ///   alive by this very closure — so a missing-entity `Result` can't be
-    ///   relied on to detect "tab closed"; `self.tabs` has to be searched
+    ///   relied on to detect "tab closed"; `self.editor().results` has to be searched
     ///   for a matching `entity_id()` instead), and
     /// - `grid.accept_lookup_result(..)` — generation still current AND
     ///   every `wanted_cols` entry still checked (see that method's doc
@@ -10136,17 +10655,17 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     fn start_lookup(&mut self, grid: Entity<ResultGrid>, req: LookupRequest, cx: &mut Context<Self>) {
         let LookupRequest { sql, ref_table, wanted_cols, src_col, generation } = req;
         let Some(spec) = self.active_conn_spec() else {
-            self.status = "Bez připojení — vyberte připojení nahoře.".into();
+            self.editor_mut().status = "Bez připojení — vyberte připojení nahoře.".into();
             cx.notify();
             return;
         };
-        self.status = "hledám hodnoty pro join…".into();
+        self.editor_mut().status = "hledám hodnoty pro join…".into();
         cx.notify();
         let rx = self.runner.fetch_lookup(spec, sql);
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |view, cx| {
-                let tab_alive = view.tabs.iter().any(|t| {
+                let tab_alive = view.editor().results.iter().any(|t| {
                     matches!(&t.content, TabContent::Grid { grid: g, .. } if g.entity_id() == grid.entity_id())
                 });
                 if !tab_alive {
@@ -10183,13 +10702,13 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         grid.update(cx, |g, cx| {
                             g.set_virtual_cols_for_src(src_col, virtual_cols, cx);
                         });
-                        view.status = "join přidán".into();
+                        view.editor_mut().status = "join přidán".into();
                     }
                     Ok(Err(e)) => {
-                        view.status = format!("error: {e}");
+                        view.editor_mut().status = format!("error: {e}");
                     }
                     Err(_) => {
-                        view.status = "lookup zrušen".into();
+                        view.editor_mut().status = "lookup zrušen".into();
                     }
                 }
                 cx.notify();
@@ -10217,9 +10736,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // toggle that caused this event and surface why, instead of
                 // routing through `run_query_with` and letting it drop the
                 // request with no trace.
-                if self.modal.is_some() || self.cancel.is_some() {
+                if self.modal.is_some() || self.editor().cancel.is_some() {
                     emitter.update(cx, |g, cx| g.revert_fk_toggle(*col, ref_col, cx));
-                    self.status = "počkejte — běží dotaz".into();
+                    self.editor_mut().status = "počkejte — běží dotaz".into();
                     cx.notify();
                     return;
                 }
@@ -10284,7 +10803,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // non-read-only preview) AND the runner's own up-front
                 // guard in `run_csv_import`.
                 if self.active_read_only() {
-                    self.status = "error: připojení je jen pro čtení".to_string();
+                    self.editor_mut().status = "error: připojení je jen pro čtení".to_string();
                     cx.notify();
                     return;
                 }
@@ -10305,18 +10824,19 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// same guard every other opener in `connections_ui.rs` applies.
     fn open_chart_picker(&mut self, from_grid: Option<Entity<ResultGrid>>, cx: &mut Context<Self>) {
         if self.modal.is_some() {
-            self.status = "zavřete nejprve otevřený dialog".into();
+            self.editor_mut().status = "zavřete nejprve otevřený dialog".into();
             cx.notify();
             return;
         }
         // Resolve the source tab: the one owning the emitting grid Entity, or
         // the active tab (palette path). Entity<T> is comparable by identity.
         let source = self
-            .tabs
+            .editor()
+            .results
             .iter()
             .find(|t| match (&t.content, &from_grid) {
                 (TabContent::Grid { grid, .. }, Some(g)) => grid == g,
-                (TabContent::Grid { .. }, None) => Some(t.id) == self.tabs.active().map(|a| a.id),
+                (TabContent::Grid { .. }, None) => Some(t.id) == self.editor().results.active().map(|a| a.id),
                 _ => false,
             })
             .map(|t| {
@@ -10329,7 +10849,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 )
             });
         let Some((source_title, buffer)) = source else {
-            self.status = "graf lze vytvořit jen z výsledkové mřížky".into();
+            self.editor_mut().status = "graf lze vytvořit jen z výsledkové mřížky".into();
             cx.notify();
             return;
         };
@@ -10343,7 +10863,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             .map(|f| (f.name().clone(), f.data_type().is_numeric()))
             .collect();
         if !columns.iter().any(|(_, numeric)| *numeric) {
-            self.status = "výsledek nemá žádný číselný sloupec — graf nelze vytvořit".into();
+            self.editor_mut().status = "výsledek nemá žádný číselný sloupec — graf nelze vytvořit".into();
             cx.notify();
             return;
         }
@@ -10379,7 +10899,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 if y_selected.iter().any(|on| *on)
         );
         if !valid {
-            self.status = "vyberte alespoň jeden číselný sloupec pro osu Y".into();
+            self.editor_mut().status = "vyberte alespoň jeden číselný sloupec pro osu Y".into();
             cx.notify();
             return;
         }
@@ -10400,7 +10920,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         match edit_tab {
             Some(id) => {
                 // re-pick: reconfigure the existing tab's view in place (§2.4)
-                let view = self.tabs.iter().find_map(|t| {
+                let view = self.editor().results.iter().find_map(|t| {
                     (t.id == id).then_some(()).and_then(|()| match &t.content {
                         TabContent::Chart { view } => Some(view.clone()),
                         _ => None,
@@ -10416,7 +10936,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 });
                 cx.subscribe(&view, Self::on_chart_view_event).detach();
                 let conn_identity = self.current_conn_identity();
-                self.tabs.open(ResultTab {
+                self.editor_mut().results.open(ResultTab {
                     id: 0, // Tabs::open assigns
                     title: tabs::collapse_title(&format!("Graf: {source_title}")),
                     pinned: false,
@@ -10440,12 +10960,13 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         cx: &mut Context<Self>,
     ) {
         if self.modal.is_some() {
-            self.status = "zavřete nejprve otevřený dialog".into();
+            self.editor_mut().status = "zavřete nejprve otevřený dialog".into();
             cx.notify();
             return;
         }
         let Some(tab_id) = self
-            .tabs
+            .editor()
+            .results
             .iter()
             .find(|t| matches!(&t.content, TabContent::Chart { view } if view == &emitter))
             .map(|t| t.id)
@@ -10511,7 +11032,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// Tab-strip "✕" guard: `Some(n)` when closing tab `id` would drop `n`
     /// staged changes.
     fn dirty_change_count_for_tab_id(&self, id: u64, cx: &Context<Self>) -> Option<usize> {
-        self.tabs.iter().find(|t| t.id == id).and_then(|t| Self::grid_dirty_change_count(t, cx))
+        self.editor().results.iter().find(|t| t.id == id).and_then(|t| Self::grid_dirty_change_count(t, cx))
     }
 
     /// Re-open-same-preview guard (`TreeEvent::OpenPreview`/
@@ -10519,7 +11040,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// ALREADY open and dirty — `run_query_with` would otherwise close it
     /// via `Tabs::close_by_preview_key` right before opening the fresh one.
     fn dirty_change_count_for_preview_key(&self, key: &str, cx: &Context<Self>) -> Option<usize> {
-        self.tabs
+        self.editor().results
             .iter()
             .find(|t| t.preview_key.as_deref() == Some(key))
             .and_then(|t| Self::grid_dirty_change_count(t, cx))
@@ -10567,7 +11088,17 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let Some(dc) = self.discard_confirm.take() else { return };
         match dc.action {
             PendingDiscard::CloseTab { id } => {
-                self.tabs.close(id);
+                self.editor_mut().results.close(id);
+            }
+            PendingDiscard::CloseEditorTab { id } => {
+                // The user answered: the unsaved script text goes. Dropping
+                // the binding is what makes the second `close_editor_tab`
+                // see a clean tab and actually close it.
+                if let Some(tab) = self.editor_by_id_mut(id) {
+                    tab.script_binding = None;
+                    tab.script_dirty_flag = false;
+                }
+                self.close_editor_tab(id, cx);
             }
             PendingDiscard::RunPreview { sql, preview, .. } => {
                 self.run_query_with(sql, Some(*preview), true, cx);
@@ -10579,11 +11110,12 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             // own `dirty_admin_change_count` check without looping.
             PendingDiscard::SwitchDatabase { conn_id, db, follow_up } => {
                 let admin_tab_id = self
-                    .tabs
+                    .editor()
+                    .results
                     .iter()
                     .find_map(|t| matches!(&t.content, TabContent::Admin { .. }).then_some(t.id));
                 if let Some(id) = admin_tab_id {
-                    self.tabs.close(id);
+                    self.editor_mut().results.close(id);
                 }
                 self.switch_to_database(&conn_id, db, follow_up, cx);
             }
@@ -10595,7 +11127,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             // state, so it is recorded here — stamped with the generation
             // it was given at, so it expires the moment the binding moves.
             PendingDiscard::Script(action) => {
-                self.editor_discard_grant = Some(self.script_binding_generation);
+                self.editor_mut().editor_discard_grant = Some(self.editor().script_binding_generation);
                 self.perform_script_action(action, cx);
             }
         }
@@ -10642,7 +11174,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// on the SAME connection now changes the identity, which is the
     /// audit's headline fix (design §7).
     fn current_conn_identity(&self) -> String {
-        match &self.active_connection_id {
+        match &self.editor().connection {
             None => CLI_CONN_IDENTITY.to_string(),
             Some(id) => {
                 // A deleted-while-active connection (rare, transient) falls
@@ -10658,8 +11190,8 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// The database the active context points at: `active_database`, or
     /// the saved config's default. `None` = no active saved connection.
     fn effective_database(&self) -> Option<String> {
-        let id = self.active_connection_id.as_ref()?;
-        if let Some(db) = &self.active_database {
+        let id = self.editor().connection.as_ref()?;
+        if let Some(db) = &self.editor().database {
             return Some(db.clone());
         }
         self.config.connections.iter().find(|c| &c.id == id).map(|c| c.database.clone())
@@ -10672,8 +11204,8 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// path. Deliberately NOT `current_conn_identity()`: embedding the
     /// composite identity would orphan every pre-phase stored value.
     fn store_scope_key(&self) -> String {
-        match &self.active_connection_id {
-            Some(id) => dbc_state::connection_scope_key(id, self.active_database.as_deref()),
+        match &self.editor().connection {
+            Some(id) => dbc_state::connection_scope_key(id, self.editor().database.as_deref()),
             None => CLI_CONN_IDENTITY.to_string(),
         }
     }
@@ -10699,7 +11231,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// `engine_from_url` for the CLI-arg back-compat path, `None` with no
     /// active connection at all (design §7's three-way gating input).
     fn active_engine(&self) -> Option<dbc_state::Engine> {
-        if let Some(id) = &self.active_connection_id {
+        if let Some(id) = &self.editor().connection {
             return self.config.connections.iter().find(|c| &c.id == id).map(|c| c.engine);
         }
         self.conn_url.as_deref().map(engine_from_url)
@@ -10712,7 +11244,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// yet). Feeds `SchemaTree::set_read_only` (the tree's ⇪ affordance)
     /// and `grid.rs`'s `csv_import_enabled` flag.
     fn active_read_only(&self) -> bool {
-        if let Some(id) = &self.active_connection_id {
+        if let Some(id) = &self.editor().connection {
             return self.config.connections.iter().find(|c| &c.id == id).is_some_and(|c| c.read_only);
         }
         false
@@ -10737,19 +11269,19 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let engine = self.active_engine();
         let read_only = self.active_read_only();
         if admin_panel::admin_entry_state(engine, read_only) != admin_panel::AdminEntry::Enabled {
-            self.status = "správa serveru není pro toto připojení dostupná".to_string();
+            self.editor_mut().status = "správa serveru není pro toto připojení dostupná".to_string();
             cx.notify();
             return;
         }
         let engine = engine.expect("Enabled implies an engine");
         let identity = self.current_conn_identity();
-        match admin_open_decision(&self.tabs, &identity) {
+        match admin_open_decision(&self.editor().results, &identity) {
             AdminOpenDecision::Activate(id) => {
-                self.tabs.activate(id);
+                self.editor_mut().results.activate(id);
                 cx.notify();
             }
             AdminOpenDecision::Replace(id) => {
-                self.tabs.close(id);
+                self.editor_mut().results.close(id);
                 self.open_fresh_admin_tab(engine, identity, cx);
             }
             AdminOpenDecision::OpenFresh => {
@@ -10765,7 +11297,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     fn open_fresh_admin_tab(&mut self, engine: dbc_state::Engine, identity: String, cx: &mut Context<Self>) {
         let panel = cx.new(|cx| admin_panel::AdminPanel::new(engine, identity.clone(), cx));
         cx.subscribe(&panel, Self::on_admin_event).detach();
-        self.tabs.open(ResultTab {
+        self.editor_mut().results.open(ResultTab {
             id: 0,
             title: "Správa serveru".to_string(),
             pinned: false,
@@ -10862,27 +11394,27 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// reopening just ACTIVATES the existing tab (design §5).
     fn open_monitor_tab(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.active_engine() else {
-            self.status = "Bez připojení — vyberte připojení nahoře.".into();
+            self.editor_mut().status = "Bez připojení — vyberte připojení nahoře.".into();
             cx.notify();
             return;
         };
         if !monitor::monitor_available(engine) {
             // The palette already hides the entry (build_palette_items);
             // this is the belt for any other entry point.
-            self.status = "monitor serveru není pro tento engine k dispozici".into();
+            self.editor_mut().status = "monitor serveru není pro tento engine k dispozici".into();
             cx.notify();
             return;
         }
         let key = format!("monitor:{}", self.current_conn_identity());
         let existing_id =
-            self.tabs.iter().find(|t| t.preview_key.as_deref() == Some(key.as_str())).map(|t| t.id);
+            self.editor().results.iter().find(|t| t.preview_key.as_deref() == Some(key.as_str())).map(|t| t.id);
         if let Some(id) = existing_id {
-            self.tabs.activate(id);
+            self.editor_mut().results.activate(id);
             cx.notify();
             return;
         }
         let Some(spec) = self.active_conn_spec() else {
-            self.status = "Bez připojení — vyberte připojení nahoře.".into();
+            self.editor_mut().status = "Bez připojení — vyberte připojení nahoře.".into();
             cx.notify();
             return;
         };
@@ -10896,7 +11428,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let view = cx.new(|cx| monitor_view::MonitorView::new(cx, cmd_tx, event_rx, read_only, engine));
         let title = collapse_title(&format!("Monitor: {}", self.current_connection_label()));
         let conn_identity = self.current_conn_identity();
-        let tab_id = self.tabs.open(ResultTab {
+        let tab_id = self.editor_mut().results.open(ResultTab {
             id: 0,
             title,
             pinned: false,
@@ -10927,7 +11459,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     fn save_folder_state(&mut self, cx: &mut Context<Self>) {
         if let Some(guard) = self.guard_corrupt_config(cx) {
             if let Err(e) = self.config.save(&self.config_path, &guard) {
-                self.status = format!("error: složky se nepodařilo uložit: {e}");
+                self.editor_mut().status = format!("error: složky se nepodařilo uložit: {e}");
                 return;
             }
         }
@@ -10980,7 +11512,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 self.config.connections = conns;
                 self.config.folders = folders;
                 self.modal = None;
-                self.status = match rename_of {
+                self.editor_mut().status = match rename_of {
                     Some(_) => "Složka přejmenována".to_string(),
                     None => "Složka vytvořena".to_string(),
                 };
@@ -11018,7 +11550,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         self.config.connections = conns;
         self.config.folders = folders;
         self.modal = None;
-        self.status = match moved {
+        self.editor_mut().status = match moved {
             0 => "Složka smazána".to_string(),
             n => format!("Složka smazána, {n} připojení přesunuto o úroveň výš"),
         };
@@ -11066,7 +11598,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         };
         let Some(guard) = self.guard_corrupt_config(cx) else { return };
         self.modal = None;
-        if self.active_connection_id.as_deref() == Some(conn_id.as_str()) {
+        if self.editor().connection.as_deref() == Some(conn_id.as_str()) {
             self.clear_active_connection(cx);
         }
         // A locked vault simply has no key to decrypt with; the dialog has
@@ -11079,7 +11611,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         }
         self.config.connections.retain(|c| c.id != conn_id);
         self.config.favourite_objects.retain(|f| f.connection_id != conn_id);
-        self.status = match (self.config.save(&self.config_path, &guard), secret_error) {
+        self.editor_mut().status = match (self.config.save(&self.config_path, &guard), secret_error) {
             (Err(e), _) => format!("error: připojení se nepodařilo smazat: {}", e.message),
             (Ok(()), Some(e)) => {
                 format!("Připojení {name} smazáno, ale heslo v trezoru zůstalo: {e}")
@@ -11108,7 +11640,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             return;
         }
         self.config.connections = folders::move_connection(&self.config.connections, &conn_id, &folder);
-        self.status = format!("Přesunuto do {}", crate::folders::label(&folder));
+        self.editor_mut().status = format!("Přesunuto do {}", crate::folders::label(&folder));
         self.save_folder_state(cx);
     }
 
@@ -11148,7 +11680,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// Ctrl+C, and the „Kopírovat" button. With nothing selected this
     /// copies the whole text, which is what the button has always done.
     fn on_text_copy(&mut self, _: &TextViewCopy, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(active) = self.tabs.active() else { return };
+        let Some(active) = self.editor().results.active() else { return };
         let tab_id = active.id;
         let TabContent::Text { text, .. } = &active.content else { return };
         let selection = self
@@ -11160,7 +11692,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let chars = out.chars().count();
         let whole = selection.is_none_or(|r| r.is_empty());
         cx.write_to_clipboard(ClipboardItem::new_string(out));
-        self.status = if whole {
+        self.editor_mut().status = if whole {
             format!("Zkopírováno celé ({chars} znaků)")
         } else {
             format!("Zkopírován výběr ({chars} znaků)")
@@ -11174,7 +11706,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(active) = self.tabs.active() else { return };
+        let Some(active) = self.editor().results.active() else { return };
         let tab_id = active.id;
         let TabContent::Text { text, .. } = &active.content else { return };
         let head = text.len();
@@ -11194,7 +11726,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // idiom is to close the previous one first (the same pair
         // `open_table_preview` and the admin tab use). Without this, every
         // open (and every refresh) stacked another Log tab.
-        self.tabs.close_by_preview_key(LOG_PREVIEW_KEY);
+        self.editor_mut().results.close_by_preview_key(LOG_PREVIEW_KEY);
         let where_ = dbc_state::applog::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(log není k dispozici)".to_string());
@@ -11208,16 +11740,17 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
 
 {tail}")
         };
-        self.tabs.open(ResultTab {
+        let identity = self.current_conn_identity();
+        self.editor_mut().results.open(ResultTab {
             id: 0,
             title: "Log".to_string(),
             pinned: false,
             preview_key: Some(LOG_PREVIEW_KEY.to_string()),
-            conn_identity: self.current_conn_identity(),
+            conn_identity: identity,
             sql: None,
             content: TabContent::Text { text: text_view::normalize(&body), scroll_lines: 0 },
         });
-        self.status = format!("Log: {where_}");
+        self.editor_mut().status = format!("Log: {where_}");
         cx.notify();
     }
 
@@ -11232,7 +11765,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// codebase (strict, no "public" guessing).
     fn open_er_diagram(&mut self, schema: Option<String>, cx: &mut Context<Self>) {
         let Some(snapshot) = self.tree.read(cx).snapshot() else {
-            self.status = "Nejprve načtěte schéma".to_string();
+            self.editor_mut().status = "Nejprve načtěte schéma".to_string();
             dbc_state::applog::log(dbc_state::applog::Event::Refused {
                 what: "er_diagram".into(),
                 reason: "no schema snapshot loaded".into(),
@@ -11253,7 +11786,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     snapshot.tables.len()
                 ),
             });
-            self.status = match &schema {
+            self.editor_mut().status = match &schema {
                 Some(s) => format!("Schéma {s} nemá žádné tabulky — není co nakreslit"),
                 None => "Snímek schématu nemá žádné tabulky — není co nakreslit".to_string(),
             };
@@ -11277,16 +11810,17 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             v
         });
         cx.subscribe(&view, Self::on_er_diagram_event).detach();
-        self.tabs.open(ResultTab {
+        let identity = self.current_conn_identity();
+        self.editor_mut().results.open(ResultTab {
             id: 0,
             title: format!("ER: {label}"),
             pinned: false,
             preview_key: None,
-            conn_identity: self.current_conn_identity(),
+            conn_identity: identity,
             sql: None,
             content: TabContent::Diagram { view },
         });
-        self.status = "ER diagram otevřen".to_string();
+        self.editor_mut().status = "ER diagram otevřen".to_string();
         cx.notify();
     }
 
@@ -11300,16 +11834,17 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         cx: &mut Context<Self>,
     ) {
         if let TreeEvent::OpenDdl { title, ddl } = event {
-            self.tabs.open(ResultTab {
+            let identity = self.current_conn_identity();
+            self.editor_mut().results.open(ResultTab {
                 id: 0,
                 title: format!("DDL: {title}"),
                 pinned: false,
                 preview_key: None,
-                conn_identity: self.current_conn_identity(),
+                conn_identity: identity,
                 sql: None,
                 content: TabContent::Text { text: text_view::normalize(ddl), scroll_lines: 0 },
             });
-            self.status = format!("DDL otevřeno: {title}");
+            self.editor_mut().status = format!("DDL otevřeno: {title}");
             cx.notify();
         }
     }
@@ -11348,7 +11883,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 };
                 cx.background_executor().timer(std::time::Duration::from_secs(interval)).await;
                 let tick = this.update(cx, |view, cx| {
-                    let visible = view.tabs.active().is_some_and(|t| t.id == tab_id);
+                    let visible = view.editor().results.active().is_some_and(|t| t.id == tab_id);
                     if visible {
                         if let Some(m) = view.monitor_view_for_tab(tab_id) {
                             m.update(cx, |m, cx| m.tick_if_idle(cx));
@@ -11413,7 +11948,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         // out-of-cycle refresh MonitorView already
                         // dispatched shows the truth momentarily (design
                         // §6).
-                        self.status = format!("proces {pid} ukončen");
+                        self.editor_mut().status = format!("proces {pid} ukončen");
                     }
                     Err(msg) => {
                         if matches_open_dialog {
@@ -11423,7 +11958,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                             // `apply_kill_error_to_modal`'s doc comment).
                             connections_ui::apply_kill_error_to_modal(&mut self.modal, tab_id, *pid, msg);
                         } else {
-                            self.status = format!("error: {msg}");
+                            self.editor_mut().status = format!("error: {msg}");
                         }
                     }
                 }
@@ -11433,7 +11968,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     }
 
     fn apply_conn_spec(&self) -> Option<(ConnectSpec, Option<u64>)> {
-        if self.active_connection_id.is_some() {
+        if self.editor().connection.is_some() {
             self.resolve_active().map(|a| {
                 let timeout_secs = a.timeout_secs;
                 (a.into_spec(), timeout_secs)
@@ -11465,7 +12000,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         if self.modal.is_some() || self.discard_confirm.is_some() || self.apply_dialog.is_some() {
             return;
         }
-        let Some(active) = self.tabs.active() else { return };
+        let Some(active) = self.editor().results.active() else { return };
         let (tab_id, tab_conn_identity, grid) = match &active.content {
             TabContent::Grid { grid, .. } => (active.id, active.conn_identity.clone(), grid.clone()),
             TabContent::Text { .. } => return,
@@ -11483,7 +12018,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let current_identity = self.current_conn_identity();
         if !conn_identity_matches(&tab_conn_identity, &current_identity) {
             let from = self.conn_name_for_identity(&tab_conn_identity);
-            self.status = format!("změny pocházejí z jiného připojení ({from}) — přepni se zpět");
+            self.editor_mut().status = format!("změny pocházejí z jiného připojení ({from}) — přepni se zpět");
             cx.notify();
             return;
         }
@@ -11623,12 +12158,12 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         let is_admin = matches!(target, ApplyTarget::Admin { .. });
                         match target {
                             ApplyTarget::SandboxTab { tab_id, preview_identity } => {
-                                if let Some(tab) = view.tabs.iter().find(|t| t.id == tab_id) {
+                                if let Some(tab) = view.editor().results.iter().find(|t| t.id == tab_id) {
                                     if let TabContent::Grid { grid, .. } = &tab.content {
                                         grid.clone().update(cx, |g, cx| g.clear_edits(cx));
                                     }
                                 }
-                                view.status = format!("aplikováno ({n_statements} příkazů)");
+                                view.editor_mut().status = format!("aplikováno ({n_statements} příkazů)");
                                 // Re-run the preview via the EXISTING
                                 // pipeline (brief: "preserves joins via
                                 // from_join_change=false machinery" —
@@ -11638,7 +12173,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                                 // once this run's own `Started` lands,
                                 // exactly like a plain preview re-open
                                 // does). This immediately overwrites
-                                // `view.status` above with its own
+                                // `view.editor().status` above with its own
                                 // "connecting…" / progress text — expected:
                                 // the "aplikováno (…)" status is a transient
                                 // confirmation, the refreshed preview's own
@@ -11662,12 +12197,12 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                                 view.run_query_with(sql, Some(preview), true, cx);
                             }
                             ApplyTarget::Tree => {
-                                view.status = "provedeno".into();
+                                view.editor_mut().status = "provedeno".into();
                                 // The dropped/emptied object must leave the
                                 // tree, or the next click acts on something
                                 // that no longer exists.
                                 if let (Some(id), Some(db)) =
-                                    (view.active_connection_id.clone(), view.effective_database())
+                                    (view.editor().connection.clone(), view.effective_database())
                                 {
                                     view.start_schema_slot_fetch(id, db, cx);
                                 }
@@ -11678,7 +12213,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                                 // — the admin equivalent of "re-run the
                                 // preview".
                                 panel.clone().update(cx, |p, cx| p.on_apply_success(cx));
-                                view.status = format!("aplikováno ({n_statements} příkazů)");
+                                view.editor_mut().status = format!("aplikováno ({n_statements} příkazů)");
                             }
                         }
                         // Record ONE history entry for the write itself
@@ -11756,7 +12291,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let current_identity = self.current_conn_identity();
         if !conn_identity_matches(&panel_conn_identity, &current_identity) {
             let from = self.conn_name_for_identity(&panel_conn_identity);
-            self.status = format!("změny pocházejí z jiného připojení ({from}) — přepni se zpět");
+            self.editor_mut().status = format!("změny pocházejí z jiného připojení ({from}) — přepni se zpět");
             cx.notify();
             return;
         }
@@ -11812,7 +12347,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             v.state = state;
             cx.notify();
         });
-        self.status = "Porovnání schématu dokončeno".to_string();
+        self.editor_mut().status = "Porovnání schématu dokončeno".to_string();
         cx.notify();
     }
 
@@ -11883,18 +12418,19 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 }
             }
             TreeEvent::OpenDdl { title, ddl } => {
-                self.tabs.open(ResultTab {
+                let identity = self.current_conn_identity();
+                self.editor_mut().results.open(ResultTab {
                     id: 0,
                     title: format!("DDL: {title}"),
                     pinned: false,
                     preview_key: None,
                     // Never editable/Grid — the identity is inert here, but
                     // every `ResultTab` needs a value (see its doc comment).
-                    conn_identity: self.current_conn_identity(),
+                    conn_identity: identity,
                     sql: None,
                     content: TabContent::Text { text: text_view::normalize(ddl), scroll_lines: 0 },
                 });
-                self.status = format!("DDL otevřeno: {title}");
+                self.editor_mut().status = format!("DDL otevřeno: {title}");
                 cx.notify();
             }
             // Sidebar rework: ⟳ refreshes the ACTIVE slot (a `Loading`
@@ -11905,7 +12441,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 self.toggle_tree_grouping(cx);
             }
             TreeEvent::RefreshRequested => {
-                if let Some(id) = self.active_connection_id.clone() {
+                if let Some(id) = self.editor().connection.clone() {
                     if let Some(db) = self.effective_database() {
                         self.start_schema_slot_fetch(id, db, cx);
                     }
@@ -11926,7 +12462,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // table in two databases is two distinct favourites (T1's
                 // `toggle_favourite_distinguishes_databases` pin).
                 self.config.toggle_favourite(fav.clone());
-                self.status = match self.config.save(&self.config_path, &guard) {
+                self.editor_mut().status = match self.config.save(&self.config_path, &guard) {
                     Ok(()) => "Uloženo".to_string(),
                     Err(e) => format!("error saving config: {}", e.message),
                 };
@@ -12004,19 +12540,19 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             // --- Context menu (2026-08-29) ---
             TreeEvent::CopyText { what, text } => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                self.status = format!("{what} zkopírováno");
+                self.editor_mut().status = format!("{what} zkopírováno");
                 cx.notify();
             }
             TreeEvent::InsertAtCursor { text } => {
                 let text = text.clone();
-                self.sql.update(cx, |input, cx| input.insert_text(&text, cx));
-                self.status = "vloženo do editoru".into();
+                self.editor().sql.update(cx, |input, cx| input.insert_text(&text, cx));
+                self.editor_mut().status = "vloženo do editoru".into();
                 cx.notify();
             }
             TreeEvent::GenerateSql { kind, sql } => {
                 let sql = sql.clone();
                 let changed = rewrite_buffer_in_place(self, cx, move |_| sql);
-                self.status = match kind {
+                self.editor_mut().status = match kind {
                     schema_tree::GenKind::Select if changed => "SELECT vygenerován".into(),
                     schema_tree::GenKind::Insert if changed => "INSERT vygenerován".into(),
                     schema_tree::GenKind::Update if changed => "UPDATE vygenerován".into(),
@@ -12037,7 +12573,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // is on screen, rather than a second, silently different
                 // extraction path.
                 self.open_table_preview(schema.clone(), table.clone(), cx);
-                self.status = "data otevřena — export je v panelu výsledku".into();
+                self.editor_mut().status = "data otevřena — export je v panelu výsledku".into();
                 cx.notify();
             }
             // These need a `Window` (dialog focus) and this subscription is
@@ -12063,7 +12599,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// and an appended `LIMIT` would be noise in the history entry.
     fn run_count_rows(&mut self, schema: Option<String>, table: String, cx: &mut Context<Self>) {
         let Some(engine) = self.active_engine() else {
-            self.status = "error: není aktivní připojení".into();
+            self.editor_mut().status = "error: není aktivní připojení".into();
             cx.notify();
             return;
         };
@@ -12141,7 +12677,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             None => self.config.set_hidden_databases(&conn_id, hidden),
             Some(d) => self.config.set_hidden_schemas(&conn_id, d, hidden),
         }
-        self.status = match self.config.save(&self.config_path, &guard) {
+        self.editor_mut().status = match self.config.save(&self.config_path, &guard) {
             Ok(()) => "Uloženo".to_string(),
             Err(e) => format!("error saving config: {}", e.message),
         };
@@ -12169,7 +12705,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     // The row was built from this list, so a miss means the
                     // config changed under the open menu.
                     None => {
-                        self.status = "error: připojení už neexistuje".into();
+                        self.editor_mut().status = "error: připojení už neexistuje".into();
                         cx.notify();
                     }
                 }
@@ -12216,7 +12752,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         cx: &mut Context<Self>,
     ) {
         let Some(engine) = self.active_engine() else {
-            self.status = "error: není aktivní připojení".into();
+            self.editor_mut().status = "error: není aktivní připojení".into();
             cx.notify();
             return;
         };
@@ -12224,7 +12760,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             // Belt-and-braces: `tree_menu` already omits these items on a
             // read-only connection, so reaching here means the flag changed
             // between the menu opening and the click.
-            self.status = "error: připojení je jen pro čtení".into();
+            self.editor_mut().status = "error: připojení je jen pro čtení".into();
             cx.notify();
             return;
         }
@@ -12252,9 +12788,10 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// called when there's at least one open tab (see `Render::render`).
     fn render_tab_strip(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
-        let active_id = self.tabs.active().map(|t| t.id);
+        let active_id = self.editor().results.active().map(|t| t.id);
         let rows: Vec<(u64, String, bool, Option<usize>)> = self
-            .tabs
+            .editor()
+            .results
             .iter()
             .map(|t| {
                 // `None` = this kind of tab HAS no row count. It used to
@@ -12307,7 +12844,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     .text_color(theme.text_primary)
                     .cursor_pointer()
                     .on_click(cx.listener(move |view, _, _, cx| {
-                        view.tabs.activate(id);
+                        view.editor_mut().results.activate(id);
                         cx.notify();
                     }))
                     .child(match row_count {
@@ -12329,7 +12866,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                             .child(if pinned { "●" } else { "○" })
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 cx.stop_propagation();
-                                view.tabs.toggle_pin(id);
+                                view.editor_mut().results.toggle_pin(id);
                                 cx.notify();
                             })),
                     )
@@ -12356,7 +12893,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                                     cx.notify();
                                     return;
                                 }
-                                view.tabs.close(id);
+                                view.editor_mut().results.close(id);
                                 cx.notify();
                             })),
                     ),
@@ -12372,7 +12909,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// no tabs open at all, renders a neutral placeholder.
     fn render_tab_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.theme();
-        let Some(active) = self.tabs.active() else {
+        let Some(active) = self.editor().results.active() else {
             return div().flex_1().bg(theme.bg_panel).into_any_element();
         };
         // The log tab is a SNAPSHOT of a file that keeps being written to,
@@ -12387,7 +12924,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let restored_sql =
             matches!(active.content, TabContent::Text { .. }).then(|| active.sql.clone()).flatten();
 
-        match &active.content {
+        // Grid/chart notices are collected here and written to the status
+        // line AFTER the match: `active` borrows the editor's results for
+        // the whole match, and the status line lives on the same tab.
+        let mut pending_status: Option<String> = None;
+        let element = match &active.content {
             TabContent::Grid { grid, .. } => {
                 // G4 Task 2: `ResultGrid` doesn't own a status bar itself —
                 // `status_note` (currently just the large-sort "řadím…"
@@ -12395,7 +12936,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // surfacing grid-originated notices in `AppView::status`.
                 // `take()`'d so it's shown exactly once, not stuck forever.
                 if let Some(note) = grid.update(cx, |g, _| g.status_note.take()) {
-                    self.status = note;
+                    pending_status = Some(note);
                 }
                 grid.clone().into_any_element()
             }
@@ -12493,7 +13034,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                             ScrollDelta::Pixels(p) => p.y.as_f32() / 20.0,
                         };
                         if let Some(TabContent::Text { text, scroll_lines }) =
-                            view.tabs.active_mut().map(|t| &mut t.content)
+                            view.editor_mut().results.active_mut().map(|t| &mut t.content)
                         {
                             let max_scroll = text.lines().count().saturating_sub(1);
                             let current = *scroll_lines as f32;
@@ -12550,7 +13091,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // taken once so the export flow's status text surfaces in
                 // `AppView::status` exactly once, not stuck forever.
                 if let Some(note) = view.update(cx, |v, _| v.status_note.take()) {
-                    self.status = note;
+                    pending_status = Some(note);
                 }
                 view.clone().into_any_element()
             }
@@ -12560,19 +13101,23 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             // `self` directly, only `state` (cloned out of `active`) and
             // `cx` (for the "Zrušit" listener) — calling a `&mut self`
             // method here instead would conflict with `active`'s still-live
-            // borrow of `self.tabs` (the same reason every other arm above
+            // borrow of `self.editor().results` (the same reason every other arm above
             // either avoids `self` or touches only a named field like
-            // `self.status`, never an opaque method call).
+            // `self.editor().status`, never an opaque method call).
             TabContent::ScriptRun { state } => render_script_run_tab(state.clone(), cx),
             TabContent::Admin { view } => view.clone().into_any_element(),
+        };
+        if let Some(note) = pending_status {
+            self.editor_mut().status = note;
         }
+        element
     }
 
     /// The `MonitorView` entity behind an open Monitor tab, by tab id —
     /// used by the kill-confirm dialog (T5) and the per-tab timer loop
     /// (T6).
     fn monitor_view_for_tab(&self, tab_id: u64) -> Option<Entity<monitor_view::MonitorView>> {
-        self.tabs.iter().find(|t| t.id == tab_id).and_then(|t| match &t.content {
+        self.editor().results.iter().find(|t| t.id == tab_id).and_then(|t| match &t.content {
             TabContent::Monitor { view } => Some(view.clone()),
             _ => None,
         })
@@ -12590,7 +13135,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// accurate (brief: "bar can stay visible with the hint") since
     /// "Zahodit" is still a legitimate, safe action in this state.
     fn render_apply_bar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let active = self.tabs.active()?;
+        let active = self.editor().results.active()?;
         let TabContent::Grid { grid, .. } = &active.content else { return None };
         let n = grid.read(cx).edit_state.change_count();
         if n == 0 {
@@ -12918,6 +13463,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // `begin_restore_confirm` instead (unchanged).
         let needs_focus = confirm_input.is_none();
         let session = backup::BackupSession {
+            log_scrollbar: scrollbar::ScrollbarHandle::new(),
             kind,
             engine: cfg.engine,
             connection_id: cfg.id.clone(),
@@ -13039,7 +13585,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             return;
         }
         let Some((cfg, _secret)) = self.resolve_conn_for_backup(&connection_id) else {
-            self.status = "error: připojení nenalezeno".to_string();
+            self.editor_mut().status = "error: připojení nenalezeno".to_string();
             cx.notify();
             return;
         };
@@ -13050,13 +13596,13 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // source of truth both paths must respect. See
         // `backup::backup_restore_available`'s doc comment for why.
         if !backup::backup_restore_available(cfg.engine) {
-            self.status = "zálohování pro MSSQL zatím není k dispozici".to_string();
+            self.editor_mut().status = "zálohování pro MSSQL zatím není k dispozici".to_string();
             cx.notify();
             return;
         }
         let ext = backup_file_ext(cfg.engine);
         let suggested_name = format!("{}-{}.{ext}", cfg.database, backup_timestamp());
-        self.status = "volím cíl zálohy…".to_string();
+        self.editor_mut().status = "volím cíl zálohy…".to_string();
         cx.notify();
         let dialog = cx.prompt_for_new_path(&std::path::PathBuf::new(), Some(&suggested_name));
         cx.spawn(async move |this, cx| {
@@ -13064,21 +13610,21 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 Ok(Ok(Some(p))) => p,
                 Ok(Ok(None)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "záloha zrušena".to_string();
+                        view.editor_mut().status = "záloha zrušena".to_string();
                         cx.notify();
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = format!("error: dialog pro uložení selhal ({e})");
+                        view.editor_mut().status = format!("error: dialog pro uložení selhal ({e})");
                         cx.notify();
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "error: dialog pro uložení není dostupný".to_string();
+                        view.editor_mut().status = "error: dialog pro uložení není dostupný".to_string();
                         cx.notify();
                     });
                     return;
@@ -13092,7 +13638,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // arm) — don't let `run_backup_now`/`start_backup_session`
                 // clobber it by unconditionally overwriting `self.modal`.
                 if view.modal.is_some() {
-                    view.status = "záloha zahozena — je otevřený jiný dialog".to_string();
+                    view.editor_mut().status = "záloha zahozena — je otevřený jiný dialog".to_string();
                     cx.notify();
                     return;
                 }
@@ -13102,12 +13648,12 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // arbitrarily long.
                 let current_ids: Vec<String> = view.config.connections.iter().map(|c| c.id.clone()).collect();
                 if !backup::backup_dispatch_allowed(&connection_id, &current_ids) {
-                    view.status = "připojení se během výběru změnilo — akce zrušena".to_string();
+                    view.editor_mut().status = "připojení se během výběru změnilo — akce zrušena".to_string();
                     cx.notify();
                     return;
                 }
                 let Some((cfg, secret)) = view.resolve_conn_for_backup(&connection_id) else {
-                    view.status = "error: připojení nenalezeno".to_string();
+                    view.editor_mut().status = "error: připojení nenalezeno".to_string();
                     cx.notify();
                     return;
                 };
@@ -13143,7 +13689,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // tunnel inline or silently dialing the untunneled host
                 // with the real password in the child's env.
                 if cfg.ssh.is_some() {
-                    self.status =
+                    self.editor_mut().status =
                         "error: zálohování přes SSH tunel zatím není podporováno pro tento engine — použij přímé připojení"
                             .to_string();
                     cx.notify();
@@ -13154,7 +13700,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     match backup::build_pg_dump_args(&cfg, &cfg.host, cfg.port.unwrap_or(5432), &opts, &dest_path) {
                         Ok(a) => a,
                         Err(e) => {
-                            self.status = format!("error: {e}");
+                            self.editor_mut().status = format!("error: {e}");
                             cx.notify();
                             return;
                         }
@@ -13162,7 +13708,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 let program = match runner::resolve_tool_path(self.config.tool_paths.pg_dump.as_deref(), "pg_dump") {
                     Ok(p) => p,
                     Err(e) => {
-                        self.status = format!("error: {e}");
+                        self.editor_mut().status = format!("error: {e}");
                         cx.notify();
                         return;
                     }
@@ -13377,12 +13923,12 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             return;
         }
         let Some((cfg, _secret)) = self.resolve_conn_for_backup(&connection_id) else {
-            self.status = "error: připojení nenalezeno".to_string();
+            self.editor_mut().status = "error: připojení nenalezeno".to_string();
             cx.notify();
             return;
         };
         if cfg.read_only {
-            self.status = "error: připojení je pouze pro čtení — obnovu nelze spustit".to_string();
+            self.editor_mut().status = "error: připojení je pouze pro čtení — obnovu nelze spustit".to_string();
             cx.notify();
             return;
         }
@@ -13390,7 +13936,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // `open_backup_dialog` checks — see `backup::backup_restore_available`'s
         // doc comment.
         if !backup::backup_restore_available(cfg.engine) {
-            self.status = "obnova pro MSSQL zatím není k dispozici".to_string();
+            self.editor_mut().status = "obnova pro MSSQL zatím není k dispozici".to_string();
             cx.notify();
             return;
         }
@@ -13399,13 +13945,13 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // Postgres/SSH combination that's guaranteed to be refused once
         // they actually confirm.
         if cfg.engine == dbc_state::Engine::Postgres && cfg.ssh.is_some() {
-            self.status =
+            self.editor_mut().status =
                 "error: obnova přes SSH tunel zatím není podporována pro tento engine — použij přímé připojení"
                     .to_string();
             cx.notify();
             return;
         }
-        self.status = "volím zdroj obnovy…".to_string();
+        self.editor_mut().status = "volím zdroj obnovy…".to_string();
         cx.notify();
         let dialog = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -13418,21 +13964,21 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
                 Ok(Ok(_)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "obnova zrušena".to_string();
+                        view.editor_mut().status = "obnova zrušena".to_string();
                         cx.notify();
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = format!("error: dialog pro výběr souboru selhal ({e})");
+                        view.editor_mut().status = format!("error: dialog pro výběr souboru selhal ({e})");
                         cx.notify();
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.status = "error: dialog pro výběr souboru není dostupný".to_string();
+                        view.editor_mut().status = "error: dialog pro výběr souboru není dostupný".to_string();
                         cx.notify();
                     });
                     return;
@@ -13466,23 +14012,23 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // `start_backup_session` clobber it by unconditionally overwriting
         // `self.modal`.
         if self.modal.is_some() {
-            self.status = "obnova zahozena — je otevřený jiný dialog".to_string();
+            self.editor_mut().status = "obnova zahozena — je otevřený jiný dialog".to_string();
             cx.notify();
             return;
         }
         let current_ids: Vec<String> = self.config.connections.iter().map(|c| c.id.clone()).collect();
         if !backup::backup_dispatch_allowed(&connection_id, &current_ids) {
-            self.status = "připojení se během výběru změnilo — akce zrušena".to_string();
+            self.editor_mut().status = "připojení se během výběru změnilo — akce zrušena".to_string();
             cx.notify();
             return;
         }
         let Some((cfg, secret)) = self.resolve_conn_for_backup(&connection_id) else {
-            self.status = "error: připojení nenalezeno".to_string();
+            self.editor_mut().status = "error: připojení nenalezeno".to_string();
             cx.notify();
             return;
         };
         if cfg.read_only {
-            self.status = "error: připojení je pouze pro čtení — obnovu nelze spustit".to_string();
+            self.editor_mut().status = "error: připojení je pouze pro čtení — obnovu nelze spustit".to_string();
             cx.notify();
             return;
         }
@@ -13492,7 +14038,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // showing a full `pg_restore`/`psql` command preview for a run that
         // is guaranteed to be refused later is misleading.
         if cfg.engine == dbc_state::Engine::Postgres && cfg.ssh.is_some() {
-            self.status =
+            self.editor_mut().status =
                 "error: obnova přes SSH tunel zatím není podporována pro tento engine — použij přímé připojení"
                     .to_string();
             cx.notify();
@@ -13515,7 +14061,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             // magic check is runner-level, identical division of labor.
             Ok(RestorePlan::Duckdb) => format!("copy {source_path} -> {}", cfg.database),
             Err(e) => {
-                self.status = format!("error: {e}");
+                self.editor_mut().status = format!("error: {e}");
                 cx.notify();
                 return;
             }
@@ -13564,19 +14110,19 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
 
         let current_ids: Vec<String> = self.config.connections.iter().map(|c| c.id.clone()).collect();
         if !backup::backup_dispatch_allowed(&session.connection_id, &current_ids) {
-            self.status = "připojení se během výběru změnilo — akce zrušena".to_string();
+            self.editor_mut().status = "připojení se během výběru změnilo — akce zrušena".to_string();
             self.close_modal(cx);
             cx.notify();
             return;
         }
         let Some((cfg, secret)) = self.resolve_conn_for_backup(&session.connection_id) else {
-            self.status = "error: připojení nenalezeno".to_string();
+            self.editor_mut().status = "error: připojení nenalezeno".to_string();
             self.close_modal(cx);
             cx.notify();
             return;
         };
         if let Err(msg) = backup::guard_backup_restore_read_only(backup::BackupOp::Restore, cfg.read_only) {
-            self.status = format!("error: {msg}");
+            self.editor_mut().status = format!("error: {msg}");
             self.close_modal(cx);
             cx.notify();
             return;
@@ -13604,7 +14150,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let plan = match plan_restore(&cfg, &source_path) {
             Ok(p) => p,
             Err(e) => {
-                self.status = format!("error: {e}");
+                self.editor_mut().status = format!("error: {e}");
                 cx.notify();
                 return;
             }
@@ -13613,7 +14159,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         match plan {
             RestorePlan::PgTool { tool_name, args } => {
                 if cfg.ssh.is_some() {
-                    self.status =
+                    self.editor_mut().status =
                         "error: obnova přes SSH tunel zatím není podporována pro tento engine — použij přímé připojení"
                             .to_string();
                     cx.notify();
@@ -13626,7 +14172,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 let program = match runner::resolve_tool_path(configured, &tool_name) {
                     Ok(p) => p,
                     Err(e) => {
-                        self.status = format!("error: {e}");
+                        self.editor_mut().status = format!("error: {e}");
                         cx.notify();
                         return;
                     }
@@ -13893,6 +14439,11 @@ impl Render for AppView {
         // UX-polish §1.4: deferred focus for overlay openers without a
         // `&mut Window` (see `modal_needs_focus`). Guarded: if the overlay
         // already closed again before this frame, just clear the flag.
+        if self.editor_needs_focus && self.modal.is_none() && self.palette.is_none() {
+            self.editor_needs_focus = false;
+            let handle = self.editor().sql.focus_handle(cx);
+            window.focus(&handle, cx);
+        }
         if self.modal_needs_focus {
             self.modal_needs_focus = false;
             // ONE decision, taken by `connections_ui::modal_first_field`
@@ -13935,13 +14486,13 @@ impl Render for AppView {
         // `SqlInput::up`/`down`/`newline` check to decide whether to
         // consume or propagate (keyboard precedence, plan T7 step 3).
         self.refresh_autocomplete(window, cx);
-        let ac_active = self.autocomplete.is_some();
-        self.sql.update(cx, |s, _| s.set_autocomplete_active(ac_active));
+        let ac_active = self.editor().autocomplete.is_some();
+        self.editor().sql.update(cx, |s, _| s.set_autocomplete_active(ac_active));
         // Workspace T8: the ONE per-frame dirtiness recompute (same lazy-
         // poll idiom as the line above). It feeds BOTH the caption strip
         // below and `context_switch_blocked`, which has no `cx` — see
         // `script_dirty_flag`'s doc comment.
-        self.script_dirty_flag = self.script_is_dirty(cx);
+        self.editor_mut().script_dirty_flag = self.script_is_dirty(cx);
         let theme = *cx.theme();
 
         // The SQL editor + tab strip + tab content column, unchanged from
@@ -13949,11 +14500,73 @@ impl Render for AppView {
         // rather than filling the whole window body.
         let mut column = div().flex().flex_col().flex_1().min_w_0();
 
+        // Editor tabs (design §4): the strip sits above the editor; the
+        // results strip further down is the ACTIVE editor's.
+        {
+            let active_id = self.editors.active_id();
+            let rows: Vec<(u64, String, bool)> = self
+                .editors
+                .iter()
+                .map(|slot| {
+                    let dirty = slot.payload.script_binding.as_ref().is_some_and(|b| {
+                        script_text_is_dirty(&slot.payload.sql.read(cx).text(), &b.saved_text)
+                    });
+                    (slot.id, self.editor_tab_title(slot, cx), dirty)
+                })
+                .collect();
+            let mut strip = div().id("editor-tab-strip").flex().flex_row().h(px(28.)).bg(theme.bg_app);
+            for (id, title, dirty) in rows {
+                let is_active = id == active_id;
+                strip = strip.child(
+                    div()
+                        .id(("editor-tab", id as usize))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .h_full()
+                        .bg(if is_active { theme.bg_hover } else { theme.bg_app })
+                        .text_color(if is_active { theme.text_primary } else { theme.text_muted })
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            view.activate_editor(id, window, cx)
+                        }))
+                        .child(if dirty { format!("{title} •") } else { title })
+                        .child(
+                            div()
+                                .id(("editor-tab-close", id as usize))
+                                .px_1()
+                                .cursor_pointer()
+                                .text_color(theme.text_muted)
+                                .child("✕")
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    cx.stop_propagation();
+                                    view.close_editor_tab(id, cx);
+                                })),
+                        ),
+                );
+            }
+            strip = strip.child(
+                div()
+                    .id("editor-tab-new")
+                    .px_2()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .text_color(theme.text_muted)
+                    .child("+")
+                    .on_click(cx.listener(|view, _, window, cx| view.new_editor_tab(window, cx))),
+            );
+            column = column.child(strip);
+        }
+
         // Workspace T8 (Part S §5): the caption strip — rendered ONLY while
         // a script is bound, immediately above the editor, so an unbound
         // (today's) app is pixel-identical to before.
         if let Some(rel) = self.binding_rel() {
-            let dirty = self.script_dirty_flag;
+            let dirty = self.editor().script_dirty_flag;
             column = column.child(
                 div()
                     .h(px(22.))
@@ -14020,13 +14633,13 @@ impl Render for AppView {
                     .on_action(cx.listener(Self::on_ac_confirm))
                     .on_action(cx.listener(Self::on_ac_confirm_tab))
                     .on_action(cx.listener(Self::on_ac_escape))
-                    .child(self.sql.clone()),
+                    .child(self.editor().sql.clone()),
             );
 
         // Tab strip only renders when there's at least one open tab (brief
         // contract #2); with none, `render_tab_content` fills the area with
         // a neutral placeholder instead.
-        if self.tabs.iter().next().is_some() {
+        if self.editor().results.iter().next().is_some() {
             column = column.child(self.render_tab_strip(cx));
         }
         column = column.child(self.render_tab_content(cx));
@@ -14132,6 +14745,11 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_focus_editor))
             .on_action(cx.listener(Self::on_focus_tree))
             .on_action(cx.listener(Self::on_focus_results))
+            .on_action(cx.listener(Self::on_new_editor_tab))
+            .on_action(cx.listener(Self::on_close_editor_tab))
+            .on_action(cx.listener(Self::on_next_editor_tab))
+            .on_action(cx.listener(Self::on_prev_editor_tab))
+            .on_action(cx.listener(Self::on_pick_database))
             .child(self.render_top_bar(window, cx))
             .child(body);
 
@@ -14202,7 +14820,7 @@ impl Render for AppView {
                     // on any engine/connection (design §5), so the only
                     // gating here is "one run at a time" + "there's SQL to
                     // run", same as the RunQuery keybinding's own guard.
-                    let enabled = self.cancel.is_none() && !self.sql.read(cx).text().trim().is_empty();
+                    let enabled = self.editor().cancel.is_none() && !self.editor().sql.read(cx).text().trim().is_empty();
                     let color = if enabled { theme.text_primary } else { theme.border };
                     div()
                         .id("btn-explain")
@@ -14221,7 +14839,7 @@ impl Render for AppView {
                     // all, not merely disabled) via `plan::analyze_button_visible`.
                     let engine = self.active_engine();
                     let visible = engine.map(plan::analyze_button_visible).unwrap_or(true);
-                    let enabled = visible && self.cancel.is_none() && !self.sql.read(cx).text().trim().is_empty();
+                    let enabled = visible && self.editor().cancel.is_none() && !self.editor().sql.read(cx).text().trim().is_empty();
                     if !visible {
                         div().into_any_element()
                     } else {
@@ -14248,7 +14866,7 @@ impl Render for AppView {
                     // row IS the app's existing "run-adjacent action
                     // buttons" toolbar — reusing it avoids growing a new
                     // toolbar row for two buttons).
-                    let enabled = self.cancel.is_none() && self.modal.is_none();
+                    let enabled = self.editor().cancel.is_none() && self.modal.is_none();
                     let color = if enabled { theme.text_primary } else { theme.border };
                     div()
                         .id("btn-run-sql-file")
@@ -14262,7 +14880,7 @@ impl Render for AppView {
                         }))
                 })
                 .child({
-                    let enabled = self.cancel.is_none() && self.modal.is_none();
+                    let enabled = self.editor().cancel.is_none() && self.modal.is_none();
                     let color = if enabled { theme.text_primary } else { theme.border };
                     div()
                         .id("btn-run-sql-folder")
@@ -14275,7 +14893,7 @@ impl Render for AppView {
                             }
                         }))
                 })
-                .child(div().flex_1().child(self.status.clone())),
+                .child(div().flex_1().child(self.editor().status.clone())),
         );
         // Below the status bar: the always-visible hint strip.
         root = root.child(self.render_shortcut_strip(window, cx));
@@ -14540,7 +15158,12 @@ fn main() {
     let session = dbc_state::session::load(&session_path);
     // Taken before `session` moves into the window closure: the connection
     // is restored from the startup sequence, not from the constructor.
-    let restore_conn = session.connection.clone().map(|id| (id, session.database.clone()));
+    // Editor tabs (design §3): only the ACTIVE editor reconnects at startup.
+    let (session_editors, session_active_ix) = session.editors_or_legacy();
+    let restore_conn = session_editors[session_active_ix]
+        .connection
+        .clone()
+        .map(|id| (id, session_editors[session_active_ix].database.clone()));
     let vault_path = startup.paths.vault.clone();
     let workspace_root = startup.workspace_root.clone();
     let blocked = startup.blocked.clone();
@@ -14634,6 +15257,11 @@ fn main() {
             KeyBinding::new("ctrl-1", FocusEditor, None),
             KeyBinding::new("ctrl-2", FocusTree, None),
             KeyBinding::new("ctrl-3", FocusResults, None),
+            KeyBinding::new("ctrl-n", NewEditorTab, None),
+            KeyBinding::new("ctrl-w", CloseEditorTab, None),
+            KeyBinding::new("ctrl-tab", NextEditorTab, None),
+            KeyBinding::new("ctrl-shift-tab", PrevEditorTab, None),
+            KeyBinding::new("ctrl-d", PickDatabase, None),
             // Scoped to the text tab body, the same posture as the grid's
             // own Ctrl+C: only reachable once that body holds focus, which
             // happens when you click into it.
@@ -14670,19 +15298,36 @@ fn main() {
                 },
                 |window, cx| {
                     cx.new(|cx| {
-                        let sql = cx.new(|cx| SqlInput::new(cx, "Type SQL, then Ctrl+Enter…"));
-                        if !session.editor.is_empty() {
-                            // `insert_text`, not `replace_buffer`: the buffer
-                            // is empty, so this is an insert like any other
-                            // and needs no clobber permit.
-                            let text = session.editor.clone();
-                            let at = session.cursor;
-                            sql.update(cx, |s, cx| {
-                                s.insert_text(&text, cx);
-                                s.set_cursor_offset(at, cx);
-                            });
+                        // Editor tabs (design §3): one `EditorTab` per session
+                        // editor, text restored the way the one editor's was
+                        // (`insert_text`, never `replace_buffer`).
+                        let mut editors: Option<editor_tabs::EditorTabs<EditorTab>> = None;
+                        for e in &session_editors {
+                            let sql = cx.new(|cx| SqlInput::new(cx, "Type SQL, then Ctrl+Enter…"));
+                            if !e.sql.is_empty() {
+                                let (text, at) = (e.sql.clone(), e.cursor);
+                                sql.update(cx, |s, cx| {
+                                    s.insert_text(&text, cx);
+                                    s.set_cursor_offset(at, cx);
+                                });
+                            }
+                            let mut tab = EditorTab::new(sql, e.connection.clone(), e.database.clone());
+                            tab.unverified = e.connection.is_some();
+                            tab.results = restored_tabs_from(&e.tabs);
+                            tab.pending_script_path = e.script_path.clone();
+                            match &mut editors {
+                                None => editors = Some(editor_tabs::EditorTabs::new(tab)),
+                                Some(ed) => {
+                                    ed.open(tab);
+                                }
+                            }
                         }
-                        window.focus(&sql.focus_handle(cx), cx);
+                        let mut editors =
+                            editors.expect("editors_or_legacy never returns zero editors");
+                        let active_id =
+                            editors.iter().nth(session_active_ix).map(|s| s.id).unwrap_or(1);
+                        editors.activate(active_id);
+                        window.focus(&editors.active().payload.sql.focus_handle(cx), cx);
                         let grouped_cache = connections_ui::group_connections_with(
                             &config.connections,
                             &config.folders,
@@ -14710,7 +15355,7 @@ fn main() {
                         } else {
                             "ready".into()
                         };
-                        let editor_focus = sql.focus_handle(cx);
+                        let editor_focus = editors.active().payload.sql.focus_handle(cx);
                         let tree = cx.new(|cx| SchemaTree::new(cx, editor_focus));
                         if !session.expanded.is_empty() || !session.expanded_nodes.is_empty() {
                             let keys = session.expanded.clone();
@@ -14766,15 +15411,13 @@ fn main() {
                         // Read before `config` is moved into the struct below.
                         let sidebar_width = sidebar_width_from(config.sidebar_width);
                         let history_width = history_width_from(config.history_width);
+                        editors.active_mut().payload.status = status.clone();
                         AppView {
-                            tabs: restored_tabs(&session),
-                            status,
+                            editors,
+                            history_scrollbar: scrollbar::ScrollbarHandle::new(),
+                            ac_scrollbar: scrollbar::ScrollbarHandle::new(),
                             runner: QueryRunner::new(),
                             conn_url,
-                            sql,
-                            cancel: None,
-                            started_at: None,
-                            run_generation: 0,
                             config,
                             config_path,
                             session_path,
@@ -14790,11 +15433,8 @@ fn main() {
                             ],
                             workspace_panel_focus: cx.focus_handle(),
                             vault: None,
-                            active_connection_id: None,
-                            attempted_restore: None,
                             prefetch_in_flight: false,
                             prefetch_armed: false,
-                            active_database: None,
                             switch_generation: 0,
                             test_generation: 0,
                             test_abort: None,
@@ -14824,19 +15464,12 @@ fn main() {
                             param_values,
                             apply_dialog: None,
                             discard_confirm: None,
-                            script_binding: None,
-                            script_dirty_flag: false,
-                            script_binding_generation: 0,
-                            editor_discard_grant: None,
-                            script_save_in_flight: false,
                             modal_focus_handle: cx.focus_handle(),
                             modal_needs_focus: false,
+                            editor_needs_focus: false,
                             text_selection: None,
                             text_layout: None,
                             text_focus: cx.focus_handle(),
-                            autocomplete: None,
-                            last_ac_text: String::new(),
-                            last_ac_cursor: 0,
                         }
                     })
                 },
@@ -14859,7 +15492,7 @@ fn main() {
             //
             // Startup only: forcing this every frame would fight the grid,
             // the tree and every dialog for focus.
-            let editor_focus = view.sql.focus_handle(cx);
+            let editor_focus = view.editor().sql.focus_handle(cx);
             window.focus(&editor_focus, cx);
             let grouped = view.grouped_cache.clone();
             let hidden = view.config.hidden.clone();
@@ -14910,6 +15543,7 @@ fn main() {
             // password answers both questions.
             if blocked.is_none() {
                 view.restore_session_context(restore_conn, cx);
+                view.rebind_pending_script(cx);
             }
             if Vault::exists(&view.vault_path)
                 && view.vault.is_none()
@@ -16325,7 +16959,52 @@ mod keymap_audit {
 
 #[cfg(test)]
 mod session_restore_tests {
-    use super::{restored_tabs, session_tabs, ResultTab, TabContent, Tabs};
+    use super::{
+        restored_tabs, session_editors, session_tabs, EditorSnapshot, ResultTab, TabContent, Tabs,
+    };
+
+    fn snapshot(sql: &str, connection: Option<&str>, database: Option<&str>) -> EditorSnapshot {
+        EditorSnapshot {
+            sql: sql.into(),
+            cursor: sql.len().min(1),
+            connection: connection.map(str::to_string),
+            database: database.map(str::to_string),
+            script_path: None,
+            tabs: Vec::new(),
+        }
+    }
+
+    /// A single, empty tab writes NO `editors` — so an untouched app still
+    /// removes its session file (`save` deletes an empty state) exactly as
+    /// before editor tabs.
+    #[test]
+    fn a_lone_empty_editor_writes_no_editors_block() {
+        let (list, _) = session_editors(&[snapshot("", None, None)], 0);
+        assert!(list.is_empty());
+    }
+
+    /// Two tabs write the block — and the legacy fields mirror the ACTIVE
+    /// tab, so a build from before editor tabs opens with that one.
+    #[test]
+    fn the_legacy_fields_mirror_the_active_editor() {
+        let editors = [snapshot("a", Some("c1"), None), snapshot("b", Some("c2"), Some("d"))];
+        let (list, legacy) = session_editors(&editors, 1);
+        assert_eq!(list.len(), 2);
+        assert_eq!(legacy.editor, "b");
+        assert_eq!(legacy.connection.as_deref(), Some("c2"));
+        assert_eq!(legacy.database.as_deref(), Some("d"));
+    }
+
+    /// One tab with a BOUND script still needs the block: the legacy
+    /// fields have nowhere to put the path.
+    #[test]
+    fn a_bound_script_forces_the_editors_block_even_for_one_tab() {
+        let mut one = snapshot("select 1", Some("c1"), None);
+        one.script_path = Some(std::path::PathBuf::from("D:/s/report.sql"));
+        let (list, _) = session_editors(&[one], 0);
+        assert_eq!(list.len(), 1);
+        assert!(list[0].script_path.is_some());
+    }
     use dbc_state::session::{SessionState, SessionTab};
 
     fn text_tab(title: &str, sql: Option<&str>) -> ResultTab {
@@ -18536,7 +19215,10 @@ mod editor_clobber_audit {
                 // start of its line — a shape no assignment has.
                 if !require_call
                     && owner.is_none()
-                    && line.trim_start().starts_with(&format!("{needle}:"))
+                    && (line.trim_start().starts_with(&format!("{needle}:"))
+                        // `EditorTab`'s fields are `pub` (2026-09-02): the
+                        // same declaration shape, one keyword earlier.
+                        || line.trim_start().starts_with(&format!("pub {needle}:")))
                 {
                     continue;
                 }
@@ -19148,6 +19830,32 @@ more();");
         );
     }
 
+    /// Editor tabs, design §2: every async completion that writes into an
+    /// editor finds its tab BY ID, never through `editor_mut()` (which is
+    /// whatever tab is active when the future lands). Source scan over the
+    /// three functions that spawn such work.
+    #[test]
+    fn async_completions_resolve_their_editor_by_id() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("own source");
+        for f in ["fn run_query_in(", "fn save_script(", "fn save_script_as(", "fn switch_to_database("] {
+            let start = src.find(f).unwrap_or_else(|| panic!("{f} must exist"));
+            let body = &src[start..];
+            let end = body.find("\n    }\n").map(|e| e + 7).unwrap_or(body.len());
+            let body = &body[..end];
+            let spawn_at = body.find("cx.spawn(").unwrap_or_else(|| panic!("{f} spawns"));
+            let after = &body[spawn_at..];
+            assert!(
+                !after.contains("view.editor_mut()") && !after.contains("view.editor()"),
+                "{f}: a completion reads or writes the ACTIVE tab instead of its own"
+            );
+            assert!(
+                after.contains("view.editor_by_id_mut("),
+                "{f}: completion does not resolve its tab by id"
+            );
+        }
+    }
+
     /// The sanction above is only sound while `rewrite_buffer_in_place`
     /// cannot be handed text from outside. If someone ever gives it a
     /// `&str` parameter, it becomes an unguarded clobber wearing a
@@ -19202,7 +19910,10 @@ more();");
                 // grant minted before the window exists would be spent by
                 // the first load — so this one is sanctioned by NAME and
                 // pinned by the count, not waved through by shape.
-                "main",
+                // Editor tabs (2026-09-02): the `None` initialiser moved
+                // from the `AppView` literal in `main` into
+                // `EditorTab::new` — the only `fn new` that names it.
+                "new",
             ],
             4,
             "setting this fakes the user's answer to the discard prompt, which is the one              thing standing between a background load and a bound script's unsaved changes",
@@ -19529,5 +20240,39 @@ mod script_write_audit {
              clicks, not keys - and a path that awaits between the mint and the write must \
              mint a fresh one",
         );
+    }
+}
+
+#[cfg(test)]
+mod editor_tab_tests {
+    use super::*;
+
+    /// Design §4, Ctrl+W: what closing a tab has to do first.
+    #[test]
+    fn close_editor_decision_covers_every_branch() {
+        use CloseEditorDecision::*;
+        assert_eq!(close_editor_decision(false, false, false), Close);
+        assert_eq!(close_editor_decision(false, true, false), ConfirmDiscard);
+        assert_eq!(close_editor_decision(false, false, true), CancelThenClose);
+        assert_eq!(close_editor_decision(false, true, true), ConfirmDiscard, "dirty wins: ask before touching anything");
+        assert_eq!(close_editor_decision(true, false, false), ReplaceWithEmpty);
+        assert_eq!(close_editor_decision(true, true, false), ConfirmDiscard);
+    }
+
+    /// The four chords exist in all three registries: bound, handled, and
+    /// (via the keymap audit) documented.
+    #[test]
+    fn editor_tab_actions_are_bound_and_handled() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("own source");
+        for (chord, action, handler) in [
+            ("ctrl-n", "NewEditorTab", "on_new_editor_tab"),
+            ("ctrl-w", "CloseEditorTab", "on_close_editor_tab"),
+            ("ctrl-tab", "NextEditorTab", "on_next_editor_tab"),
+            ("ctrl-shift-tab", "PrevEditorTab", "on_prev_editor_tab"),
+        ] {
+            assert!(src.contains(&format!("KeyBinding::new(\"{chord}\", {action}, None)")), "{chord} not bound");
+            assert!(src.contains(&format!("Self::{handler}))")), "{action} handler not registered");
+        }
     }
 }

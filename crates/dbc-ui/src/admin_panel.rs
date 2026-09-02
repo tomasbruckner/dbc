@@ -824,6 +824,8 @@ pub enum AdminEvent {
 }
 
 pub struct AdminPanel {
+    /// Overlay scrollbar for the list below — `scrollbar.rs`.
+    scrollbar: crate::scrollbar::ScrollbarHandle,
     engine: Engine,
     /// Stamped once at open time — `main.rs`'s `open_admin_apply_dialog`
     /// re-checks this against the CURRENTLY active connection before
@@ -900,6 +902,7 @@ pub struct AdminPanel {
 impl AdminPanel {
     pub fn new(engine: Engine, conn_identity: String, cx: &mut Context<Self>) -> Self {
         Self {
+            scrollbar: crate::scrollbar::ScrollbarHandle::new(),
             engine,
             conn_identity,
             sub_view: AdminSubView::Roles,
@@ -1842,6 +1845,8 @@ impl AdminPanel {
                     items
                 }),
             )
+            .track_scroll(&self.scrollbar.list)
+            .with_decoration(self.scrollbar.decoration())
             .flex_1(),
         );
 

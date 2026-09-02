@@ -58,6 +58,21 @@ pub struct Theme {
     pub bg_warn_banner: Hsla,
     pub bg_backdrop: Hsla,
     pub bg_selection: Hsla,
+    /// What a text input paints itself — the SQL editor and every
+    /// `TextField`. Was `gpui::white()` in BOTH themes (user, 2026-09-02:
+    /// „ten input pro sql v dark modu je nějaký moc světlý … obecně každý
+    /// input"). Darker than `bg_panel` in the dark theme so a field still
+    /// reads as a field.
+    pub bg_input: Hsla,
+    /// Selection inside an input. OPAQUE on purpose — `bg_selection` is a
+    /// translucent tint that vanishes over a light field (that was the
+    /// „Ctrl+A nefunguje" report of 2026-08-31), so inputs carry their own.
+    pub bg_input_selection: Hsla,
+    /// Overlay scrollbars (2026-09-02, `scrollbar.rs`): the faint track and
+    /// the thumb. Translucent track so it reads on any surface it floats
+    /// over; opaque thumb so it is always grabbable by eye.
+    pub scrollbar_track: Hsla,
+    pub scrollbar_thumb: Hsla,
     // text
     pub text_primary: Hsla,
     pub text_muted: Hsla,
@@ -95,6 +110,10 @@ impl Theme {
             bg_warn_banner: rgb(0x3a3a1e).into(),
             bg_backdrop: rgba(0x00000099).into(),
             bg_selection: rgba(0x3311ff30).into(),
+            bg_input: rgb(0x11111b).into(),
+            bg_input_selection: rgb(0x3b5a9a).into(),
+            scrollbar_track: rgba(0xffffff10).into(),
+            scrollbar_thumb: rgb(0x585b70).into(),
             text_primary: rgb(0xcdd6f4).into(),
             text_muted: rgb(0xa6adc8).into(),
             text_faint: rgb(0x7f849c).into(),
@@ -140,6 +159,10 @@ impl Theme {
             bg_warn_banner: rgb(0xf7edc8).into(),
             bg_backdrop: rgba(0x00000066).into(),
             bg_selection: rgba(0x3355ff33).into(),
+            bg_input: rgb(0xffffff).into(),
+            bg_input_selection: rgb(0xa8d0ff).into(),
+            scrollbar_track: rgba(0x00000012).into(),
+            scrollbar_thumb: rgb(0xb4b8c8).into(),
             text_primary: rgb(0x1e2030).into(),
             text_muted: rgb(0x4c5273).into(),
             text_faint: rgb(0x6b7094).into(),
@@ -199,7 +222,8 @@ mod tests {
         vec![
             t.bg_app, t.bg_panel, t.bg_panel_alt, t.bg_hover, t.bg_selected,
             t.border, t.border_subtle, t.bg_find_match, t.bg_joined_col, t.bg_deep,
-            t.bg_warn_banner, t.bg_backdrop, t.bg_selection, t.text_primary,
+            t.bg_warn_banner, t.bg_backdrop, t.bg_selection, t.bg_input,
+            t.bg_input_selection, t.scrollbar_track, t.scrollbar_thumb, t.text_primary,
             t.text_muted, t.text_faint, t.text_disabled, t.accent,
             t.accent_alt, t.warn, t.danger, t.success, t.diff_staged_bg,
             t.diff_deleted_bg, t.diff_inserted_bg, t.syntax.keyword,
@@ -263,7 +287,7 @@ mod tests {
     #[test]
     fn light_palette_clears_wcag_aa() {
         let t = Theme::light();
-        for bg in [t.bg_panel, t.bg_app] {
+        for bg in [t.bg_panel, t.bg_app, t.bg_input] {
             assert!(contrast(t.text_primary, bg) >= 4.5);
         }
         for fg in [t.accent, t.warn, t.danger, t.success] {
@@ -279,6 +303,29 @@ mod tests {
     fn dark_text_on_dark_panel_clears_wcag_aa() {
         let t = Theme::dark();
         assert!(contrast(t.text_primary, t.bg_panel) >= 4.5);
+        assert!(contrast(t.text_primary, t.bg_input) >= 4.5);
+        let s = t.syntax;
+        for fg in [s.keyword, s.string, s.number, s.function, s.type_, s.identifier] {
+            assert!(contrast(fg, t.bg_input) >= 4.5, "syntax color under AA on dark bg_input");
+        }
+        // Comments are the shipped „overlay gray" (G6 verbatim, muted on
+        // purpose): 3.84:1 on `bg_input` — clears AA for large text /
+        // UI components (3:1), not for body text. Pinned at what it IS so
+        // a darker input cannot quietly push it below legible.
+        assert!(contrast(s.comment, t.bg_input) >= 3.0, "comment gray unreadable on dark bg_input");
+    }
+
+    /// An input's selection has to be SEEN on that input, in both themes:
+    /// opaque (a tint washes out over a light field) and clearly lighter
+    /// or darker than the field it sits on. Both halves of the 2026-08-31
+    /// „Ctrl+A nefunguje" fix, now per theme.
+    #[test]
+    fn input_selection_is_opaque_and_distinct_from_the_input_in_both_themes() {
+        for t in [Theme::dark(), Theme::light()] {
+            assert_eq!(t.bg_input_selection.a, 1.0);
+            assert!((t.bg_input_selection.l - t.bg_input.l).abs() > 0.1);
+            assert!(contrast(t.text_primary, t.bg_input_selection) >= 3.0, "selected text still legible");
+        }
     }
 
     #[test]

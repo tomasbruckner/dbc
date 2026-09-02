@@ -1369,7 +1369,7 @@ impl Element for TextElement {
                         ),
                         size(px(crate::text_model::CARET_WIDTH), line_height),
                     ),
-                    gpui::blue(),
+                    cx.theme().accent,
                 ));
             }
         }
@@ -1493,7 +1493,9 @@ impl Render for SqlInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
-            .bg(gpui::white())
+            // From the theme: this was hard-coded white, which left the
+            // editor a white slab in the dark theme (user, 2026-09-02).
+            .bg(cx.theme().bg_input)
             .line_height(px(20.))
             .text_size(px(14.))
             .size_full()
@@ -1520,6 +1522,24 @@ impl Focusable for SqlInput {
 /// where the "off-by-one at the `\n` boundary" family of bugs is actually
 /// pinned down, rather than only exercised indirectly through GPUI paint
 /// wiring (which isn't unit-testable at all).
+#[cfg(test)]
+mod theme_audit {
+    /// Same rule `ui.rs` pins for its components: the editor paints from
+    /// the theme, never from a literal — or the light/dark switch silently
+    /// stops covering it (which is exactly how it shipped white in the
+    /// dark theme). Source scan, because a GPUI element cannot be
+    /// rendered headlessly.
+    #[test]
+    fn the_editor_hardcodes_no_colour() {
+        let src = include_str!("sql_input.rs");
+        let body = src.split("mod theme_audit").next().unwrap_or("");
+        let rgb_needle = format!("{}(0x", "rgb");
+        for needle in ["gpui::white()", "gpui::black()", "gpui::blue()", rgb_needle.as_str()] {
+            assert!(!body.contains(needle), "{needle} bypasses the theme");
+        }
+    }
+}
+
 #[cfg(test)]
 mod clip_to_line_tests {
     use super::*;

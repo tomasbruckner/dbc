@@ -15,7 +15,7 @@
 //! `AppView` seam that wires `candidates()`/`resolve_aliases()` into the
 //! editor) — T7 (`main.rs`) is now that caller.
 
-use dbc_core::{SchemaSnapshot, TableInfo};
+use dbc_core::{Dialect, SchemaSnapshot, TableInfo};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -27,8 +27,18 @@ pub enum CandidateKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
-    /// Inserted at the cursor.
+    /// The candidate as this module MATCHED and ranked it: a bare keyword,
+    /// a bare identifier, or — after `JOIN` — the raw join snippet. Never
+    /// quoted, because the user types unquoted and every comparison in here
+    /// (match scoring, the join/table dedup) has to see the same spelling
+    /// they do.
     pub text: String,
+    /// What actually goes into the buffer: [`Self::text`] with every
+    /// identifier THIS module produced quoted for the dialect (user,
+    /// 2026-09-02: „když píšu SQL a je to postgres, tak bych čekal, že se
+    /// mi to hodí do uvozovek"). Keywords are never quoted, and neither is
+    /// an alias the user typed — see `join_candidates`.
+    pub insert: String,
     /// Shown in the popup (may carry a schema qualifier, e.g. `public.users`).
     pub label: String,
     pub kind: CandidateKind,
@@ -192,7 +202,11 @@ fn rank_and_cap(mut items: Vec<(u8, u8, u8, usize, Candidate)>) -> Vec<Candidate
 const KIND_TIER_SCHEMA_OBJECT: u8 = 0;
 const KIND_TIER_KEYWORD: u8 = 1;
 
-fn keyword_and_table_candidates(prefix: &str, snapshot: Option<&SchemaSnapshot>) -> Vec<Candidate> {
+fn keyword_and_table_candidates(
+    prefix: &str,
+    snapshot: Option<&SchemaSnapshot>,
+    dialect: Dialect,
+) -> Vec<Candidate> {
     let mut scored: Vec<(u8, u8, u8, usize, Candidate)> = Vec::new();
 
     for (idx, kw) in KEYWORDS.iter().enumerate() {
@@ -202,7 +216,14 @@ fn keyword_and_table_candidates(prefix: &str, snapshot: Option<&SchemaSnapshot>)
                 ct,
                 KIND_TIER_KEYWORD,
                 idx,
-                Candidate { text: (*kw).to_string(), label: (*kw).to_string(), kind: CandidateKind::Keyword },
+                // A keyword is not an identifier: `"SELECT"` would be a
+                // column called SELECT, not the statement.
+                Candidate {
+                    text: (*kw).to_string(),
+                    insert: (*kw).to_string(),
+                    label: (*kw).to_string(),
+                    kind: CandidateKind::Keyword,
+                },
             ));
         }
     }
@@ -224,7 +245,12 @@ fn keyword_and_table_candidates(prefix: &str, snapshot: Option<&SchemaSnapshot>)
                     ct,
                     KIND_TIER_SCHEMA_OBJECT,
                     idx,
-                    Candidate { text: t.name.clone(), label, kind: CandidateKind::Table },
+                    Candidate {
+                        text: t.name.clone(),
+                        insert: dbc_core::quote_ident_d(dialect, &t.name),
+                        label,
+                        kind: CandidateKind::Table,
+                    },
                 ));
             }
         }
@@ -296,6 +322,7 @@ fn join_candidates(
     join_at: usize,
     prefix: &str,
     snapshot: Option<&SchemaSnapshot>,
+    dialect: Dialect,
 ) -> Vec<Candidate> {
     let Some(snapshot) = snapshot else { return Vec::new() };
     let Some(sources) = sources_in_order(&text[..join_at]) else { return Vec::new() };
@@ -318,17 +345,35 @@ fn join_candidates(
     // label that runs off its right edge is worse than no label: two
     // rows joining the same table through DIFFERENT columns then look
     // identical (user report 2026-08-31, "ta napoveda je useknuta").
-    let mut push = |target: &str, left: String, right_col: &str, order: usize, out: &mut Vec<_>| {
+    // The left side arrives in two pieces on purpose: `left_qual` is the
+    // alias (or table name) AS THE USER WROTE IT in the query, and quoting
+    // that would change what it means — unquoted `U` is the alias `u` in
+    // postgres, `"U"` is not. Only the identifiers this module reads out of
+    // the SNAPSHOT get quoted.
+    let mut push = |target: &str,
+                    left_qual: &str,
+                    left_col: &str,
+                    right_col: &str,
+                    order: usize,
+                    out: &mut Vec<_>| {
         if bound.contains(&target.to_lowercase()) {
             return;
         }
         let Some((mt, ct)) = match_score(target, prefix) else { return };
+        let left = format!("{left_qual}.{left_col}");
         let text = format!("{target} ON {left} = {target}.{right_col}");
         if !seen.insert(text.clone()) {
             return;
         }
+        let q = |name: &str| dbc_core::quote_ident_d(dialect, name);
+        let insert = format!(
+            "{t} ON {left_qual}.{lc} = {t}.{rc}",
+            t = q(target),
+            lc = q(left_col),
+            rc = q(right_col),
+        );
         let label = format!("{target}  —  {left} → {right_col}");
-        out.push((mt, ct, order, Candidate { text, label, kind: CandidateKind::Table }));
+        out.push((mt, ct, order, Candidate { text, insert, label, kind: CandidateKind::Table }));
     };
 
     for (order, src) in sources.iter().enumerate() {
@@ -340,7 +385,7 @@ fn join_candidates(
         // Outgoing: a column here points at another table.
         for col in &base.columns {
             let Some(fk) = &col.fk else { continue };
-            push(&fk.table, format!("{qual}.{}", col.name), &fk.column, order, &mut out);
+            push(&fk.table, qual, &col.name, &fk.column, order, &mut out);
         }
 
         // Incoming: another table points here.
@@ -353,7 +398,7 @@ fn join_candidates(
                 if !fk.table.eq_ignore_ascii_case(&base.name) {
                     continue;
                 }
-                push(&other.name, format!("{qual}.{}", fk.column), &col.name, order, &mut out);
+                push(&other.name, qual, &fk.column, &col.name, order, &mut out);
             }
         }
     }
@@ -444,6 +489,7 @@ fn schema_table_candidates(
     schema: &str,
     prefix: &str,
     snapshot: Option<&SchemaSnapshot>,
+    dialect: Dialect,
 ) -> Vec<Candidate> {
     let Some(snapshot) = snapshot else {
         return Vec::new();
@@ -464,6 +510,9 @@ fn schema_table_candidates(
                 idx,
                 Candidate {
                     text: t.name.clone(),
+                    // Only the table: the schema the user just typed sits
+                    // before the dot and is theirs, not ours to re-spell.
+                    insert: dbc_core::quote_ident_d(dialect, &t.name),
                     label: t.name.clone(),
                     kind: CandidateKind::Table,
                 },
@@ -480,6 +529,7 @@ fn column_candidates(
     qualifier: &str,
     prefix: &str,
     snapshot: Option<&SchemaSnapshot>,
+    dialect: Dialect,
 ) -> Vec<Candidate> {
     let Some(snapshot) = snapshot else {
         return Vec::new();
@@ -496,7 +546,12 @@ fn column_candidates(
                 ct,
                 KIND_TIER_SCHEMA_OBJECT,
                 idx,
-                Candidate { text: col.name.clone(), label: col.name.clone(), kind: CandidateKind::Column },
+                Candidate {
+                    text: col.name.clone(),
+                    insert: dbc_core::quote_ident_d(dialect, &col.name),
+                    label: col.name.clone(),
+                    kind: CandidateKind::Column,
+                },
             ));
         }
     }
@@ -526,12 +581,32 @@ fn prefix_preceded_by_open_quote(text: &str, cursor: usize) -> bool {
 /// `in_suppressed_span` is caller-supplied (T7 wires it from
 /// `SqlInput.highlights`' `suppresses_completion` flags, T4/T5) — this
 /// module never needs its own string/comment scan.
+/// Thin pg-convention wrapper over [`candidates_d`], on the same precedent
+/// as `dbc_core::quote_ident` over `quote_ident_d` (G15 §2a). TEST-ONLY:
+/// the app always knows its dialect and calls `candidates_d`; this exists
+/// so the tests below — which are about ranking and resolution, not
+/// quoting — keep reading as one argument shorter.
+#[cfg(test)]
 pub fn candidates(
+    text: &str,
+    cursor: usize,
+    snapshot: Option<&SchemaSnapshot>,
+    force: bool,
+    in_suppressed_span: bool,
+) -> Vec<Candidate> {
+    candidates_d(text, cursor, snapshot, force, in_suppressed_span, Dialect::Postgres)
+}
+
+/// `dialect` decides how [`Candidate::insert`] is spelled, and nothing
+/// else: matching, ranking and resolution all run on the raw names the user
+/// types.
+pub fn candidates_d(
     text: &str,
     cursor: usize,
     snapshot: Option<&SchemaSnapshot>,
     force: bool, // true = Ctrl+Space, empty-prefix, full set
     in_suppressed_span: bool,
+    dialect: Dialect,
 ) -> Vec<Candidate> {
     if in_suppressed_span {
         return Vec::new();
@@ -564,7 +639,7 @@ pub fn candidates(
         // its empty results are DELIBERATE (CTE shadowing, an ambiguous bare
         // name) and must not be quietly overridden by a schema listing.
         if snapshot.is_some_and(|s| resolve_qualifier_table(text, &qualifier, s).is_some()) {
-            return column_candidates(text, &qualifier, &prefix, snapshot);
+            return column_candidates(text, &qualifier, &prefix, snapshot, dialect);
         }
         // User report 2026-08-28: „nefunguje mi autocomplete v sql, když
         // napíšu `dbo.`". Nothing was `dbo`-specific — this branch simply
@@ -572,7 +647,7 @@ pub fn candidates(
         // only the alias/table case worked. Typing a bare table name still
         // worked (its label carries the schema), which is what made it look
         // like other schemas were fine.
-        return schema_table_candidates(&qualifier, &prefix, snapshot);
+        return schema_table_candidates(&qualifier, &prefix, snapshot, dialect);
     }
 
     // After `JOIN`, the useful answer is not „every table in the database"
@@ -585,11 +660,11 @@ pub fn candidates(
     // is a fact about the text, not about how completion was triggered.
     let typed = cursor_context(text, cursor).prefix;
     if let Some(join_at) = join_keyword_before(text, cursor, typed.len()) {
-        let mut out = join_candidates(text, join_at, &prefix, snapshot);
+        let mut out = join_candidates(text, join_at, &prefix, snapshot, dialect);
         if !out.is_empty() {
             let taken: HashSet<String> =
                 out.iter().filter_map(|c| c.text.split(' ').next().map(str::to_string)).collect();
-            for c in keyword_and_table_candidates(&prefix, snapshot) {
+            for c in keyword_and_table_candidates(&prefix, snapshot, dialect) {
                 if out.len() >= MAX_CANDIDATES {
                     break;
                 }
@@ -602,7 +677,7 @@ pub fn candidates(
         }
     }
 
-    keyword_and_table_candidates(&prefix, snapshot)
+    keyword_and_table_candidates(&prefix, snapshot, dialect)
 }
 
 // --- Alias resolution ---
@@ -643,9 +718,22 @@ fn skip_ws(chars: &[char], mut j: usize) -> usize {
     j
 }
 
-/// Reads a single (non-dotted) identifier starting at `j`. Returns `None`
-/// if `j` isn't at an identifier start.
+/// Reads a single (non-dotted) identifier starting at `j`, either bare
+/// or in T-SQL brackets (`[dbo]` reads as `dbo`). Returns `None` if `j`
+/// isn't at an identifier start.
+///
+/// Brackets, not double quotes: `"quoted"` identifiers are blanked by
+/// `mask_strings_and_comments` before any of this runs, so they never
+/// reach here — a bracketed name survives the mask (user report
+/// 2026-09-02: `FROM [dbo].[C_Data_View]` resolved to nothing).
 fn read_word(chars: &[char], j: usize) -> Option<(String, usize)> {
+    if j < chars.len() && chars[j] == '[' {
+        let close = chars[j + 1..].iter().position(|c| *c == ']')? + j + 1;
+        if close == j + 1 {
+            return None; // `[]` names nothing
+        }
+        return Some((chars[j + 1..close].iter().collect(), close + 1));
+    }
     if j >= chars.len() || !is_ident_start(chars[j]) {
         return None;
     }
@@ -654,6 +742,11 @@ fn read_word(chars: &[char], j: usize) -> Option<(String, usize)> {
         k += 1;
     }
     Some((chars[j..k].iter().collect(), k))
+}
+
+/// Where `read_word` would accept a word: an identifier start or a `[`.
+fn is_word_start(c: char) -> bool {
+    is_ident_start(c) || c == '['
 }
 
 /// Reads a possibly dot-chained identifier (`schema.table`) starting at
@@ -667,7 +760,7 @@ fn read_qualified_word(chars: &[char], j: usize) -> Option<(Option<String>, Stri
     let (mut segment, mut k) = read_word(chars, j)?;
     let mut prev_segment: Option<String> = None;
     loop {
-        if k < chars.len() && chars[k] == '.' && k + 1 < chars.len() && is_ident_start(chars[k + 1]) {
+        if k < chars.len() && chars[k] == '.' && k + 1 < chars.len() && is_word_start(chars[k + 1]) {
             let (next_seg, next_k) = read_word(chars, k + 1)?;
             prev_segment = Some(segment);
             segment = next_seg;
@@ -1600,6 +1693,60 @@ mod tests {
         assert_eq!(ctx.prefix, "užc");
     }
 
+    // --- Quoted insertion (user, 2026-09-02) ---
+
+    /// What the popup MATCHES on stays the bare name; what it WRITES is
+    /// quoted for the dialect. Two fields precisely so the ranking never
+    /// has to compare a quoted spelling against what the user typed.
+    #[test]
+    fn a_table_is_matched_bare_and_inserted_quoted() {
+        let s = snapshot_one_schema();
+        let cs = candidates_d("SELECT * FROM ord", 17, Some(&s), false, false, Dialect::Postgres);
+        let t = cs.iter().find(|c| c.kind == CandidateKind::Table).unwrap();
+        assert_eq!(t.text, "orders");
+        assert_eq!(t.insert, "\"orders\"");
+    }
+
+    /// A keyword is not an identifier — `"SELECT"` would be a column called
+    /// SELECT, not the statement.
+    #[test]
+    fn keywords_are_never_quoted() {
+        let s = snapshot_one_schema();
+        let cs = candidates_d("SEL", 3, Some(&s), false, false, Dialect::Postgres);
+        let kw = cs.iter().find(|c| c.kind == CandidateKind::Keyword && c.text == "SELECT").unwrap();
+        assert_eq!(kw.insert, "SELECT");
+    }
+
+    #[test]
+    fn a_column_after_a_dot_is_inserted_quoted() {
+        let s = snapshot_one_schema();
+        let sql = "SELECT o.tot FROM orders o";
+        let cs = candidates_d(sql, 12, Some(&s), false, false, Dialect::Postgres);
+        let c = cs.iter().find(|c| c.text == "total").unwrap();
+        assert_eq!(c.insert, "\"total\"");
+    }
+
+    /// The schema before the dot is the user's own typing and is left
+    /// exactly as written — only the table we looked up gets quoted.
+    #[test]
+    fn a_schema_qualified_table_quotes_only_the_half_we_supply() {
+        let s = snapshot_two_schemas();
+        let sql = "SELECT * FROM audit.lo";
+        let cs = candidates_d(sql, sql.len(), Some(&s), false, false, Dialect::Postgres);
+        let c = cs.iter().find(|c| c.text == "log").unwrap();
+        assert_eq!(c.insert, "\"log\"");
+    }
+
+    /// Mssql gets brackets, from the SAME `quote_ident_d` the DDL and the
+    /// preview SQL already use — one quoting implementation, not a second.
+    #[test]
+    fn mssql_gets_brackets_not_double_quotes() {
+        let s = snapshot_one_schema();
+        let cs = candidates_d("SELECT * FROM ord", 17, Some(&s), false, false, Dialect::Mssql);
+        let t = cs.iter().find(|c| c.kind == CandidateKind::Table).unwrap();
+        assert_eq!(t.insert, "[orders]");
+    }
+
     // --- FK-driven JOIN suggestions ---
 
     fn fk(table: &str, column: &str) -> Option<dbc_core::FkRef> {
@@ -1654,6 +1801,22 @@ mod tests {
     fn a_join_offers_the_outgoing_fk_target_first() {
         let out = join_texts("SELECT * FROM orders o JOIN ");
         assert_eq!(out[0], "customers ON o.customer_id = customers.id");
+    }
+
+    /// The join snippet is quoted PIECE BY PIECE: the target table and both
+    /// column names come out of the snapshot and get quoted; `o` is the
+    /// alias the user wrote and is copied through untouched — quoting it
+    /// would change which table it names.
+    #[test]
+    fn a_join_snippet_quotes_our_identifiers_and_leaves_the_users_alias_alone() {
+        let s = snapshot_with_fks();
+        let sql = "SELECT * FROM orders o JOIN ";
+        let cs = candidates_d(sql, sql.len(), Some(&s), false, false, Dialect::Postgres);
+        assert_eq!(cs[0].text, "customers ON o.customer_id = customers.id");
+        assert_eq!(
+            cs[0].insert,
+            "\"customers\" ON o.\"customer_id\" = \"customers\".\"id\""
+        );
     }
 
     /// …and the table that points BACK at it, which is just as common a

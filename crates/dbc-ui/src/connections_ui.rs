@@ -37,7 +37,7 @@ use std::ops::Range;
 use dbc_buffer::ResultBuffer;
 use dbc_state::{ConnectionConfig, Engine, MssqlOptions, SshTunnelConfig, Vault};
 use gpui::{
-    actions, div, fill, hsla, point, prelude::*, px, relative, rgb, size, App, AnyElement,
+    actions, div, fill, hsla, point, prelude::*, px, relative, size, App, AnyElement,
     Bounds, ClipboardItem, Context, CursorStyle, Div, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
     LayoutId, Modifiers,
@@ -346,15 +346,18 @@ mod clipboard_guard_tests {
         }
     }
 
-    /// The bug behind [`FIELD_SELECTION`] was invisibility, not absence:
-    /// Ctrl+A DID select, the highlight simply could not be seen on the
-    /// field's white background. A translucent or near-white value would
-    /// bring that back with no other symptom, so both halves are pinned.
+    /// The field's selection colour moved into the theme
+    /// (`bg_input_selection`); its visibility contract — opaque, distinct
+    /// from the field — is pinned there, per theme, in
+    /// `theme::tests::input_selection_is_opaque_and_distinct_from_the_input_in_both_themes`.
+    /// What stays pinned HERE is that this file no longer carries a colour
+    /// of its own for it.
     #[test]
-    fn the_field_selection_stays_visible_on_a_white_field() {
-        let c: gpui::Hsla = rgb(FIELD_SELECTION).into();
-        assert_eq!(c.a, 1.0, "a translucent tint over white is what nobody could see");
-        assert!(c.l < 0.9, "lightness {} is indistinguishable from the white field", c.l);
+    fn the_field_selection_comes_from_the_theme() {
+        let src = include_str!("connections_ui.rs");
+        let body = src.split("mod tests").next().unwrap_or("");
+        assert!(!body.contains("FIELD_SELECTION"), "a local selection colour bypasses the theme");
+        assert!(body.contains("bg_input_selection"));
     }
 }
 
@@ -815,20 +818,6 @@ impl EntityInputHandler for TextField {
     }
 }
 
-/// The selection highlight inside a `TextField`, deliberately NOT
-/// `Theme::bg_selection`.
-///
-/// A `TextField` paints itself `gpui::white()` with black text in BOTH
-/// themes (see `Render for TextField`), while `bg_selection` is a ~20 %
-/// alpha blue tuned for the editor's dark background. Over white that tint
-/// is almost invisible — and because a selection also REPLACES the blue
-/// caret (`prepaint` emits either a selection quad or a cursor quad, never
-/// both), Ctrl+A on a password field looked like it did nothing at all: the
-/// bullets do not change shape, the caret vanishes, and the tint reads as
-/// paper (user report, 2026-08-31: „ctrl + a nefunguje když zadávám heslo").
-/// Opaque, so it cannot be washed out by whatever the field sits on.
-const FIELD_SELECTION: u32 = 0xa8d0ff;
-
 /// Width of the caret, in both text views. Named because the horizontal
 /// scroll rule subtracts it: a caret drawn exactly on the right edge is
 /// half painted and reads as „the text ends here".
@@ -985,7 +974,11 @@ impl Element for FieldElement {
                             point(bounds.left() + x0 - scroll_x, bounds.top()),
                             point(bounds.left() + x1 - scroll_x, bounds.bottom()),
                         ),
-                        rgb(FIELD_SELECTION),
+                        // NOT `bg_selection`: that is a translucent tint
+                        // that vanished over the field (2026-08-31: „ctrl
+                        // + a nefunguje když zadávám heslo"). The theme
+                        // pins the input one opaque and distinct.
+                        cx.theme().bg_input_selection,
                     )),
                     None,
                 )
@@ -997,7 +990,7 @@ impl Element for FieldElement {
                         point(bounds.left() + cursor_x - scroll_x, bounds.top()),
                         size(CARET_W, bounds.bottom() - bounds.top()),
                     ),
-                    gpui::blue(),
+                    cx.theme().accent,
                 )),
             ),
         };
@@ -1085,8 +1078,10 @@ impl Render for TextField {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .bg(gpui::white())
-            .text_color(gpui::black())
+            // From the theme, not `white()`/`black()` — a field that stays
+            // white in the dark theme is what the 2026-09-02 report was.
+            .bg(cx.theme().bg_input)
+            .text_color(cx.theme().text_primary)
             .line_height(px(18.))
             .text_size(px(13.))
             .w_full()
@@ -2113,9 +2108,9 @@ impl AppView {
     /// (`active_database` is always `None` for the default, T3's
     /// normalization invariant).
     pub(crate) fn current_connection_label(&self) -> String {
-        if let Some(id) = &self.active_connection_id {
+        if let Some(id) = &self.editor().connection {
             if let Some(c) = self.config.connections.iter().find(|c| &c.id == id) {
-                return connection_label(&c.name, c.engine, self.active_database.as_deref());
+                return connection_label(&c.name, c.engine, self.editor().database.as_deref());
             }
         }
         if let Some(url) = &self.conn_url {
@@ -2979,12 +2974,13 @@ impl AppView {
             data_diff_generation: 0,
         });
         cx.subscribe(&view, AppView::on_compare_view_event).detach();
-        self.tabs.open(crate::tabs::ResultTab {
+        let identity = self.current_conn_identity();
+        self.editor_mut().results.open(crate::tabs::ResultTab {
             id: 0,
             title: crate::tabs::collapse_title(&format!("Porovnání: {label_a} ↔ {label_b}")),
             pinned: false,
             preview_key: None,
-            conn_identity: self.current_conn_identity(),
+            conn_identity: identity,
             sql: None,
             content: crate::tabs::TabContent::Compare { view: view.clone() },
         });
@@ -3314,7 +3310,7 @@ impl AppView {
             // moved aside on the strength of it. Refuse and let the user
             // retry once whatever holds the file lets go.
             dbc_state::ConfigVerdict::Unreadable(e) => {
-                self.status = format!(
+                self.editor_mut().status = format!(
                     "error: config.toml se nepodařilo přečíst ({}) – uložení zrušeno",
                     e.message
                 );
@@ -3334,7 +3330,7 @@ impl AppView {
         // hand.
         let backup = self.config_path.with_extension("toml.corrupt-bak");
         if let Err(e) = std::fs::rename(&self.config_path, &backup) {
-            self.status = format!(
+            self.editor_mut().status = format!(
                 "error: nelze zálohovat poškozený config.toml ({e}) – uložení zrušeno                  (důvod: {defect})"
             );
             cx.notify();
@@ -3346,7 +3342,7 @@ impl AppView {
         match dbc_state::AppConfig::verify_savable(&self.config_path) {
             Ok(guard) => Some(guard),
             Err(e) => {
-                self.status =
+                self.editor_mut().status =
                     format!("error: config.toml nelze zapsat ({}) – uložení zrušeno", e.message);
                 cx.notify();
                 None
@@ -3362,12 +3358,12 @@ impl AppView {
                 // the vault is unlocked/created (see on_save_clicked /
                 // resume_pending); this branch is a defensive no-op guard,
                 // not a normal path.
-                self.status = "error: vault not unlocked".into();
+                self.editor_mut().status = "error: vault not unlocked".into();
                 cx.notify();
                 return;
             };
             if let Err(e) = vault.set_secret(&data.id, &data.password) {
-                self.status = format!("error: {}", e.message);
+                self.editor_mut().status = format!("error: {}", e.message);
                 cx.notify();
                 return;
             }
@@ -3378,7 +3374,7 @@ impl AppView {
         } else {
             self.config.connections.push(cfg);
         }
-        self.status = match self.config.save(&self.config_path, &guard) {
+        self.editor_mut().status = match self.config.save(&self.config_path, &guard) {
             Ok(()) => "Uloženo".to_string(),
             Err(e) => format!("error saving config: {}", e.message),
         };
@@ -3400,7 +3396,7 @@ impl AppView {
             return; // connection vanished meanwhile — nothing to toggle/save
         };
         c.favourite = !c.favourite;
-        self.status = match self.config.save(&self.config_path, &guard) {
+        self.editor_mut().status = match self.config.save(&self.config_path, &guard) {
             Ok(()) => "Uloženo".to_string(),
             Err(e) => format!("error saving config: {}", e.message),
         };
@@ -3443,7 +3439,7 @@ impl AppView {
     /// impl zeroizes the derived key and every decrypted secret
     /// (`vault.rs:56-74`) the moment `self.vault` is reassigned here.
     pub(crate) fn lock_vault(&mut self, cx: &mut Context<Self>) {
-        self.status = apply_lock(&mut self.vault).to_string();
+        self.editor_mut().status = apply_lock(&mut self.vault).to_string();
         cx.notify();
     }
 
@@ -3502,7 +3498,7 @@ impl AppView {
             // Design §4: the proactive unlock has nothing to resume — just
             // report the unlock itself.
             PendingAfterUnlock::Nothing => {
-                self.status = "Trezor odemčen".into();
+                self.editor_mut().status = "Trezor odemčen".into();
                 cx.notify();
             }
         }
@@ -3691,7 +3687,7 @@ impl AppView {
         let Some(view) = self.monitor_view_for_tab(tab_id) else {
             // Tab closed under the dialog — nothing to kill against.
             self.modal = None;
-            self.status = "monitor tab už není otevřený — ukončení zrušeno".into();
+            self.editor_mut().status = "monitor tab už není otevřený — ukončení zrušeno".into();
             cx.notify();
             return;
         };
@@ -6149,6 +6145,8 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
                         range.map(|ix| div().text_size(px(11.)).child(lines[ix].clone())).collect::<Vec<_>>()
                     },
                 )
+                .track_scroll(&session.log_scrollbar.list)
+                .with_decoration(session.log_scrollbar.decoration())
                 .h(px(160.));
                 panel = panel.child(list);
             }
@@ -6929,6 +6927,7 @@ mod modal_confirm_kind_tests {
 
     pub(super) fn backup_restore(status: backup::BackupStatus) -> ModalState {
         ModalState::BackupRestore(backup::BackupSession {
+            log_scrollbar: crate::scrollbar::ScrollbarHandle::new(),
             kind: backup::BackupKind::Backup,
             engine: Engine::Postgres,
             connection_id: "c".into(),

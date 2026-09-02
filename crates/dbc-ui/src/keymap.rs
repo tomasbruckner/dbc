@@ -107,6 +107,12 @@ pub const SHORTCUTS: &[Shortcut] = &[
     s("ctrl-1", "Přejít do editoru", Scope::Global, false),
     s("ctrl-2", "Přejít do stromu", Scope::Global, false),
     s("ctrl-3", "Přejít do výsledků", Scope::Global, false),
+    // Editor tabs (2026-09-02): every chord was unbound before.
+    s("ctrl-n", "Nový tab s dotazem", Scope::Global, false),
+    s("ctrl-w", "Zavřít tab s dotazem", Scope::Global, false),
+    s("ctrl-tab", "Další tab", Scope::Global, false),
+    s("ctrl-shift-tab", "Předchozí tab", Scope::Global, false),
+    s("ctrl-d", "Vybrat databázi", Scope::Global, false),
     // --- Results ---
     // Not „Ctrl+C kopíruje". THAT the grid has a search, that Enter walks
     // the hits, and that Delete stages a row deletion rather than doing one

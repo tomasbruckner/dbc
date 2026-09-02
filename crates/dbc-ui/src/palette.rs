@@ -20,6 +20,7 @@
 // `open_connection_dialog`/history paths) — this file is intentionally
 // GPUI-App-free except for the `actions!`/`bind_keys` plumbing in section 5.
 
+use dbc_state::ConnectionConfig;
 use gpui::{actions, App, KeyBinding};
 
 /// Case-insensitive subsequence match: every character of `query` must
@@ -92,6 +93,19 @@ pub enum PaletteItem {
     Connection { id: String, name: String },
     /// → dispatch the respective existing `AppView` method.
     Action { label: String, action: PaletteAction },
+    /// → `switch_to_database(conn_id, Some(db))` for the ACTIVE editor
+    /// (2026-09-02 design §5). `label` is prebuilt: the picker's rows carry
+    /// the folder and the ● marker, which `display_label` has no source
+    /// for.
+    Database { conn_id: String, db: String, label: String },
+}
+
+/// Which list the one palette overlay is showing (design §5): Ctrl+K's
+/// commands, or Ctrl+D's `connection / database` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteMode {
+    Commands,
+    Databases,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +191,9 @@ pub enum PaletteAction {
     /// only while the vault is currently unlocked (`fixed_actions`'s
     /// `vault_lockable`).
     LockVault,
+    /// Ctrl+D from inside the commands list — so the picker is
+    /// discoverable without knowing its chord.
+    PickDatabase,
 }
 
 /// One table/view from the current schema snapshot, plus whether it's
@@ -205,6 +222,79 @@ pub struct ConnectionSource {
 /// never in place of it — a poor match with the bonus still loses to a
 /// strong match without it.
 const FAVOURITE_BONUS: i64 = 1000;
+
+/// One row of the Ctrl+D picker (design §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseSource {
+    pub conn_id: String,
+    pub conn_name: String,
+    pub folder: Vec<String>,
+    pub db: String,
+    pub is_current: bool,
+}
+
+/// Every database of every saved connection. `cached` is
+/// `dbc_state::conn_cache::databases` in the app and a closure in tests;
+/// the cache is on disk, so servers the user has expanded before list
+/// fully even while collapsed. A connection with nothing cached
+/// contributes its default database, so nothing saved is ever
+/// unreachable from the picker. Order: config order, then cache order.
+pub fn database_sources(
+    connections: &[ConnectionConfig],
+    cached: impl Fn(&str) -> Option<Vec<String>>,
+    current: Option<(&str, &str)>,
+) -> Vec<DatabaseSource> {
+    let mut out = Vec::new();
+    for c in connections {
+        let dbs = cached(&c.id).unwrap_or_else(|| vec![c.database.clone()]);
+        for db in dbs {
+            out.push(DatabaseSource {
+                conn_id: c.id.clone(),
+                conn_name: c.name.clone(),
+                folder: c.folder.clone(),
+                is_current: current == Some((c.id.as_str(), db.as_str())),
+                db,
+            });
+        }
+    }
+    out
+}
+
+fn database_label(s: &DatabaseSource) -> String {
+    let mark = if s.is_current { "● " } else { "" };
+    if s.folder.is_empty() {
+        format!("{mark}{} · {}", s.conn_name, s.db)
+    } else {
+        format!("{mark}{} · {}  ({})", s.conn_name, s.db, s.folder.join("/"))
+    }
+}
+
+/// Empty query: everything, the current context first. Otherwise fuzzy
+/// over `"<connection> <database>"`, so „dev sal" finds dev/sales.
+pub fn rank_databases(query: &str, sources: &[DatabaseSource], cap: usize) -> Vec<PaletteItem> {
+    let mut scored: Vec<(i64, usize, &DatabaseSource)> = sources
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, s)| {
+            let score = if query.trim().is_empty() {
+                0
+            } else {
+                fuzzy_score(query, &format!("{} {}", s.conn_name, s.db))?
+            };
+            Some((score + if s.is_current { FAVOURITE_BONUS } else { 0 }, ix, s))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .take(cap)
+        .map(|(_, _, s)| PaletteItem::Database {
+            conn_id: s.conn_id.clone(),
+            db: s.db.clone(),
+            label: database_label(s),
+        })
+        .collect()
+}
 
 /// The fixed action rows, in display order, with their Czech labels (brief
 /// contract #3). `monitor_available` gates the monitor entry per the ACTIVE
@@ -238,6 +328,7 @@ pub fn fixed_actions(
 ) -> Vec<(String, PaletteAction)> {
     let mut actions = vec![
         ("Spustit dotaz".to_string(), PaletteAction::RunQuery),
+        ("Vybrat databázi… (Ctrl+D)".to_string(), PaletteAction::PickDatabase),
         ("Přepnout strom".to_string(), PaletteAction::ToggleTree),
         ("Přepnout historii".to_string(), PaletteAction::ToggleHistory),
         ("Nové spojení…".to_string(), PaletteAction::NewConnection),
@@ -411,6 +502,7 @@ pub fn display_label(item: &PaletteItem) -> String {
             format!("H {}", crate::history_panel::collapse_sql(sql, 48))
         }
         PaletteItem::Connection { name, .. } => format!("C {name}"),
+        PaletteItem::Database { label, .. } => label.clone(),
         PaletteItem::Action { label, .. } => format!("A {label}"),
     }
 }
@@ -551,7 +643,8 @@ mod rank_items_tests {
         // the log viewer (`ShowLog`) + the two settings-transfer rows
         // (`ExportSettings`/`ImportSettings`) — all unconditional, unlike
         // `OpenMonitor` which is engine-gated (monitor_available=false).
-        assert_eq!(items.len(), 2 + 2 + 1 + 15);
+        // + „Vybrat databázi… (Ctrl+D)" (`PickDatabase`, 2026-09-02).
+        assert_eq!(items.len(), 2 + 2 + 1 + 16);
     }
 
     #[test]
@@ -805,5 +898,73 @@ mod rank_items_tests {
         assert_eq!(actions.last().unwrap().1, PaletteAction::RestoreDatabase);
         assert_eq!(actions[actions.len() - 2].1, PaletteAction::BackupDatabase);
         assert!(actions.iter().any(|(_, a)| matches!(a, PaletteAction::LockVault)));
+    }
+}
+
+#[cfg(test)]
+mod database_picker_tests {
+    use super::*;
+    use dbc_state::Engine;
+
+    fn conn(id: &str, name: &str, folder: &[&str], default_db: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            id: id.into(),
+            name: name.into(),
+            folder: folder.iter().map(|s| s.to_string()).collect(),
+            engine: Engine::Postgres,
+            host: "h".into(),
+            port: None,
+            database: default_db.into(),
+            user: "u".into(),
+            read_only: false,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: None,
+        }
+    }
+
+    /// Design §5: every cached database of every connection; a connection
+    /// with nothing cached contributes its default database, so nothing
+    /// saved is ever unreachable from the picker.
+    #[test]
+    fn database_sources_use_the_cache_and_fall_back_to_the_default() {
+        let conns = vec![conn("c1", "prod", &["dw"], "sales"), conn("c2", "dev", &[], "app")];
+        let cached = |id: &str| (id == "c1").then(|| vec!["sales".to_string(), "hr".to_string()]);
+        let out = database_sources(&conns, cached, Some(("c1", "hr")));
+        let names: Vec<(String, String)> =
+            out.iter().map(|s| (s.conn_id.clone(), s.db.clone())).collect();
+        assert_eq!(
+            names,
+            vec![("c1".into(), "sales".into()), ("c1".into(), "hr".into()), ("c2".into(), "app".into())]
+        );
+        assert!(out[1].is_current && !out[0].is_current && !out[2].is_current);
+    }
+
+    #[test]
+    fn an_empty_query_lists_the_current_context_first() {
+        let conns = vec![conn("c1", "prod", &[], "sales"), conn("c2", "dev", &[], "app")];
+        let src = database_sources(&conns, |_| None, Some(("c2", "app")));
+        let items = rank_databases("", &src, 50);
+        assert!(matches!(&items[0], PaletteItem::Database { conn_id, db, .. } if conn_id == "c2" && db == "app"));
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn the_query_matches_connection_and_database_together() {
+        let conns = vec![conn("c1", "prod", &["dw"], "sales"), conn("c2", "dev", &[], "sales")];
+        let src = database_sources(&conns, |_| None, None);
+        let items = rank_databases("dev sal", &src, 50);
+        assert_eq!(items.len(), 1);
+        assert!(matches!(&items[0], PaletteItem::Database { conn_id, .. } if conn_id == "c2"));
+    }
+
+    #[test]
+    fn database_labels_read_connection_dot_database_with_the_folder_muted() {
+        let conns = vec![conn("c1", "prod", &["dw", "eu"], "sales")];
+        let src = database_sources(&conns, |_| None, Some(("c1", "sales")));
+        let items = rank_databases("", &src, 50);
+        assert_eq!(display_label(&items[0]), "● prod · sales  (dw/eu)");
     }
 }

@@ -1947,6 +1947,8 @@ struct PlanNodeDetail {
 pub enum PlanViewEvent {}
 
 pub struct PlanView {
+    /// Overlay scrollbar for the list below — `scrollbar.rs`.
+    scrollbar: crate::scrollbar::ScrollbarHandle,
     result: Rc<PlanResult>,
     index: Vec<PlanIndexEntry>,
     expanded: HashSet<PlanNodeId>,
@@ -1967,6 +1969,7 @@ impl PlanView {
         let rows_cache = flatten_plan(&index, &expanded);
         Self {
             result,
+            scrollbar: crate::scrollbar::ScrollbarHandle::new(),
             index,
             expanded,
             rows_cache,
@@ -2177,6 +2180,8 @@ impl Render for PlanView {
                     items
                 }),
             )
+            .track_scroll(&self.scrollbar.list)
+            .with_decoration(self.scrollbar.decoration())
             .flex_1(),
         );
 

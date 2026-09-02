@@ -427,8 +427,20 @@ fn column_menu(schema: &str, table: &str, col: &str, ctx: &MenuCtx) -> Vec<MenuE
     out.extend([
         MenuEntry::Separator,
         item(
+            // Quoted like every other identifier this app writes into the
+            // editor (user, 2026-09-02) — „Kopírovat jméno" above stays
+            // raw on purpose: that one answers „what is this column
+            // called", not „paste this into SQL".
             "Vložit do editoru",
-            TreeEvent::InsertAtCursor { text: col.to_string() },
+            TreeEvent::InsertAtCursor {
+                // No active connection means no dialect to quote FOR, and
+                // this menu's rule for that case is „never guess" — the
+                // bare name is what it always inserted.
+                text: match ctx.dialect {
+                    Some(d) => dbc_core::quote_ident_d(d, col),
+                    None => col.to_string(),
+                },
+            },
         ),
     ]);
     out

@@ -318,9 +318,9 @@ impl AppView {
     /// already resolved a `ConnectSpec` successfully (a query can't run
     /// with neither set).
     pub(crate) fn active_connection_name_for_history(&self) -> String {
-        if let Some(id) = &self.active_connection_id {
+        if let Some(id) = &self.editor().connection {
             if let Some(c) = self.config.connections.iter().find(|c| &c.id == id) {
-                return history_conn_label(&c.name, self.active_database.as_deref());
+                return history_conn_label(&c.name, self.editor().database.as_deref());
             }
         }
         "cli".to_string()
@@ -437,7 +437,7 @@ impl AppView {
                                     cx,
                                 );
                                 if view.discard_confirm.is_none() {
-                                    let editor_focus = view.sql.focus_handle(cx);
+                                    let editor_focus = view.editor().sql.focus_handle(cx);
                                     window.focus(&editor_focus, cx);
                                 }
                                 cx.notify();
@@ -477,6 +477,8 @@ impl AppView {
                 items
             }),
         )
+        .track_scroll(&self.history_scrollbar.list)
+        .with_decoration(self.history_scrollbar.decoration())
         .flex_1();
 
         div()

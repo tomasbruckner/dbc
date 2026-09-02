@@ -59,6 +59,8 @@ pub enum MonitorViewEvent {
 impl EventEmitter<MonitorViewEvent> for MonitorView {}
 
 pub struct MonitorView {
+    /// Overlay scrollbar for the list below — `scrollbar.rs`.
+    scrollbar: crate::scrollbar::ScrollbarHandle,
     cmd_tx: tokio::sync::mpsc::Sender<runner::MonitorCmd>,
     pub read_only: bool,
     engine: dbc_state::Engine,
@@ -100,6 +102,7 @@ impl MonitorView {
         })
         .detach();
         let mut view = Self {
+            scrollbar: crate::scrollbar::ScrollbarHandle::new(),
             cmd_tx,
             read_only,
             engine,
@@ -514,7 +517,9 @@ impl MonitorView {
                 }
                 items
             }),
-        );
+        )
+        .track_scroll(&self.scrollbar.list)
+        .with_decoration(self.scrollbar.decoration());
 
         div()
             .flex()
@@ -802,6 +807,7 @@ mod tests {
             let is_err = result.is_err();
             let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
             let mut view = MonitorView {
+                scrollbar: crate::scrollbar::ScrollbarHandle::new(),
                 cmd_tx,
                 read_only: false,
                 engine: dbc_state::Engine::Postgres,

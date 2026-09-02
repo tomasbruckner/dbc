@@ -1449,6 +1449,52 @@ pub fn touch_and_evict(
     }
 }
 
+/// Every connection that RENDERS EXPANDED while its database list is still
+/// `NotLoaded` — i.e. a row showing „▾" with nothing whatsoever under it.
+///
+/// Design §1.2 keeps the list lazy, and the chevron's collapsed→expanded
+/// edge (`handle_chevron`) is the ONLY thing that dispatches it. That leaves
+/// a gap the user reached from two directions (report 2026-09-02:
+/// „nastavím server jako aktivní, tak se jako rozbalí, ale nerozbalí se
+/// reálně — musím ho zabalit a znova rozbalit"): `switch_to_database`
+/// fetches the target database's SCHEMA but never the connection's LIST,
+/// and `restore_expanded_keys` brings every previously-expanded connection
+/// back with no fetch behind it (only the restored ACTIVE one carries a
+/// `PendingTreeAction::LoadDatabases` follow-up). Neither path goes through
+/// the chevron, so neither row ever fills itself in.
+///
+/// ONLY `NotLoaded` qualifies, which is also what keeps a caller from
+/// looping: `Loading`, `Error` and `Loaded` each render something honest (a
+/// „Načítám databáze…" row, a red retry row, the databases), and a
+/// dispatch moves the state off `NotLoaded` before it could be asked for a
+/// second time. A connection id missing from the map counts as `NotLoaded`
+/// — the same reading `flatten_sidebar` gives it.
+///
+/// The CLI root is excluded: its children are a SCHEMA slot, not a database
+/// list (design §3.4), so it is `LoadSchema`'s business, not this one's.
+/// Sorted, so a caller's dispatch order does not ride on `HashSet`
+/// iteration order.
+pub fn expanded_connections_without_db_list(
+    outer_expanded: &HashSet<OuterId>,
+    conns: &HashMap<String, ConnNode>,
+) -> Vec<String> {
+    let mut out: Vec<String> = outer_expanded
+        .iter()
+        .filter_map(|id| match id {
+            OuterId::Connection(c) if c != crate::CLI_CONN_IDENTITY => Some(c.clone()),
+            _ => None,
+        })
+        .filter(|c| {
+            matches!(
+                conns.get(c.as_str()).map(|n| &n.dbs),
+                None | Some(DbListState::NotLoaded)
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// The multi-root analogue of `flatten` (design §1.1/§6): pure, GPUI-free,
 /// called fresh every render by T5. A plain outer loop — NO recursion
 /// anywhere (folder-path length is only an indent multiplier, never a
@@ -1970,6 +2016,8 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 pub struct SchemaTree {
+    /// Overlay scrollbar for the list below — `scrollbar.rs`.
+    scrollbar: crate::scrollbar::ScrollbarHandle,
     /// Folder/favourite grouping of the saved connections — pushed by
     /// `main.rs` (`sync_connections`) on startup and after every config
     /// mutation; the tree never owns a second long-term copy of the config.
@@ -2076,6 +2124,7 @@ pub struct SchemaTree {
 impl SchemaTree {
     pub fn new(cx: &mut Context<Self>, editor_focus: FocusHandle) -> Self {
         Self {
+            scrollbar: crate::scrollbar::ScrollbarHandle::new(),
             // Overwritten by `main.rs`'s startup push of
             // `AppConfig::tree_grouping`; the original shape is the safe
             // value to hold for the frames before that lands.
@@ -2481,6 +2530,27 @@ impl SchemaTree {
     pub fn collapse_connection(&mut self, conn_id: &str, cx: &mut Context<Self>) {
         self.outer_expanded.remove(&OuterId::Connection(conn_id.to_string()));
         cx.notify();
+    }
+
+    /// Opens a connection row from OUTSIDE the chevron — the switch success
+    /// arm calls it so that „nastavit jako aktivní" reveals the server it
+    /// just made active instead of leaving the user to open it by hand.
+    ///
+    /// Deliberately does NOT fetch: it only states that the row is open.
+    /// Filling it is `load_missing_db_lists`' job (see
+    /// [`expanded_connections_without_db_list`]), which the same caller runs
+    /// straight after — one place decides „this row is open", one place
+    /// decides „an open row must have been asked for".
+    pub fn expand_connection(&mut self, conn_id: &str, cx: &mut Context<Self>) {
+        if self.outer_expanded.insert(OuterId::Connection(conn_id.to_string())) {
+            cx.notify();
+        }
+    }
+
+    /// See [`expanded_connections_without_db_list`] — the sidebar's own
+    /// answer to „which rows are open with nothing behind them".
+    pub fn connections_needing_db_list(&self) -> Vec<String> {
+        expanded_connections_without_db_list(&self.outer_expanded, &self.conns)
     }
 
     /// Mutable access to one `(conn, db)` schema slot (saved connections
@@ -3816,6 +3886,8 @@ impl Render for SchemaTree {
                     items
                 }),
             )
+            .track_scroll(&self.scrollbar.list)
+            .with_decoration(self.scrollbar.decoration())
             .flex_1(),
         );
 
@@ -4433,6 +4505,74 @@ mod sidebar_tests {
         assert!(active_slot.is_none());
         assert!(matches!(cli_slot, DbSchemaState::NotLoaded));
         assert!(selected.is_none(), "a selected row can name the old context's table");
+    }
+
+    /// The reported symptom, pinned at the render: a connection row whose
+    /// expand key exists but whose database list was never fetched draws a
+    /// „▾" chevron over NOTHING — one row, expandable, no children (user,
+    /// 2026-09-02: „tak se jako rozbalí, ale nerozbalí se reálně").
+    /// `expanded_connections_without_db_list` is what names that row so a
+    /// caller can fill it in without the user collapsing and re-expanding.
+    #[test]
+    fn an_expanded_connection_with_no_database_list_renders_open_and_empty() {
+        let conns_cfg = vec![conn_cfg("c1", "prod-pg", &[], Engine::Postgres, "sales")];
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Connection("c1".into()));
+        // Nothing was ever fetched for it — the state the switch path and
+        // session restore both leave behind.
+        let states: HashMap<String, ConnNode> = HashMap::new();
+
+        let rows = flatten_sidebar_g!(&grouped(&conns_cfg), &states, None,
+            &outer, "", None, &[], AdminEntry::Hidden, None);
+        let conn_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| matches!(&r.0, SidebarRow::Connection { .. }))
+            .collect();
+        assert_eq!(conn_rows.len(), 1);
+        assert!(conn_rows[0].3, "the row still claims to be expandable");
+        assert_eq!(
+            rows.len(),
+            1,
+            "and it is OPEN with nothing under it — that is the whole bug"
+        );
+
+        assert_eq!(
+            expanded_connections_without_db_list(&outer, &states),
+            vec!["c1".to_string()],
+            "so this row is exactly the one that needs a database-list fetch"
+        );
+    }
+
+    /// The three honest states are left alone — each already renders
+    /// something (databases, „Načítám databáze…", a red retry row), and
+    /// re-asking for them is what would turn a repair into a loop.
+    #[test]
+    fn only_a_not_loaded_list_under_an_expanded_connection_needs_a_fetch() {
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Connection("c1".into()));
+
+        let loaded = loaded_states("c1", "sales");
+        assert!(expanded_connections_without_db_list(&outer, &loaded).is_empty());
+
+        for state in [DbListState::Loading { generation: 1 }, DbListState::Error("nope".into())] {
+            let mut m = HashMap::new();
+            m.insert("c1".to_string(), ConnNode { version: None, dbs: state });
+            assert!(expanded_connections_without_db_list(&outer, &m).is_empty());
+        }
+    }
+
+    /// A COLLAPSED connection is not a promise of anything, so it is never
+    /// fetched for — the laziness of design §1.2 survives the repair. The
+    /// CLI root is out of scope too: its children are a schema slot.
+    #[test]
+    fn collapsed_connections_and_the_cli_root_are_never_fetched_for() {
+        let empty: HashMap<String, ConnNode> = HashMap::new();
+
+        assert!(expanded_connections_without_db_list(&HashSet::new(), &empty).is_empty());
+
+        let mut outer = HashSet::new();
+        outer.insert(OuterId::Connection(crate::CLI_CONN_IDENTITY.to_string()));
+        assert!(expanded_connections_without_db_list(&outer, &empty).is_empty());
     }
 
     /// The user-visible half of the same fix: after the reset, the SAME
