@@ -14609,6 +14609,11 @@ impl Render for AppView {
             );
         }
 
+        // With no result tab open the editor takes the whole column (user,
+        // 2026-09-02: „ta sekce pro psaní SQL je dost malá, když tam nic
+        // není"). Once a result exists it drops back to eight lines and the
+        // result gets the rest.
+        let has_results = self.editor().results.iter().next().is_some();
         column = column
             .child(
                 // Fixed height of 8 lines (SqlInput's own line_height is
@@ -14620,12 +14625,18 @@ impl Render for AppView {
                 // behavior whenever the popup is closed (plan T7 step 3,
                 // keyboard precedence item 3).
                 div()
-                    .h(px(20. * 8. + 4. * 2.))
-                    // T8 review: `.h()` is a flex BASE, and the default
-                    // `flex-shrink: 1` lets it collapse below eight lines
-                    // when the column is tight — likelier now that the
-                    // 22px caption strip is a sibling. Pin the height.
-                    .flex_shrink_0()
+                    .map(|d| {
+                        if has_results {
+                            // T8 review: `.h()` is a flex BASE, and the
+                            // default `flex-shrink: 1` lets it collapse below
+                            // eight lines when the column is tight — likelier
+                            // now that the 22px caption strip is a sibling.
+                            // Pin the height.
+                            d.h(px(20. * 8. + 4. * 2.)).flex_shrink_0()
+                        } else {
+                            d.flex_1().min_h_0()
+                        }
+                    })
                     .px_2()
                     .bg(theme.bg_app)
                     .on_action(cx.listener(Self::on_ac_up))
@@ -14636,13 +14647,13 @@ impl Render for AppView {
                     .child(self.editor().sql.clone()),
             );
 
-        // Tab strip only renders when there's at least one open tab (brief
-        // contract #2); with none, `render_tab_content` fills the area with
-        // a neutral placeholder instead.
-        if self.editor().results.iter().next().is_some() {
+        // Tab strip and content only render when there's at least one open
+        // tab (brief contract #2); with none, the editor above already fills
+        // the column, so no placeholder is drawn under it.
+        if has_results {
             column = column.child(self.render_tab_strip(cx));
+            column = column.child(self.render_tab_content(cx));
         }
-        column = column.child(self.render_tab_content(cx));
 
         // G2 Task 6: the schema tree panel sits LEFT of `column`,
         // collapsible via Ctrl+B (`ToggleTree`) — collapsed means not
