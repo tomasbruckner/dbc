@@ -147,17 +147,66 @@ fn stars_in(sql: &str, span: &Range<usize>) -> Vec<Star> {
             out.push(Star { at, qualifier: None, range: at..at + 1 });
             continue;
         }
-        // A bare `*` is only a select star right after SELECT or DISTINCT.
-        let mut w = p;
-        while w > span.start && is_ident_byte(bytes[w - 1]) {
-            w -= 1;
-        }
-        let word = sql.get(w..p).unwrap_or("").to_ascii_uppercase();
-        if word == "SELECT" || word == "DISTINCT" {
+        // A bare `*` is a select star when SELECT/DISTINCT is what stands
+        // before it — allowing for T-SQL's `TOP n [PERCENT] [WITH TIES]` in
+        // between (user, 2026-09-02: every MSSQL query they had was `SELECT
+        // TOP 1000 *` and none would expand).
+        if select_clause_precedes(bytes, span.start, p) {
             out.push(Star { at, qualifier: None, range: at..at + 1 });
         }
     }
     out
+}
+
+/// Does the text before `end` read `SELECT [DISTINCT|ALL] [TOP n|(n)
+/// [PERCENT] [WITH TIES]]`? Walked BACKWARDS one token at a time: anything
+/// that belongs to a TOP clause is stepped over, SELECT/DISTINCT/ALL
+/// decides yes, any other token decides no — so `2 * 3` stays arithmetic
+/// (the `2` is not preceded by TOP) and `TOP 2 *` is a star (it is).
+fn select_clause_precedes(bytes: &[u8], start: usize, end: usize) -> bool {
+    let mut p = end;
+    // The number in a TOP clause is only allowed once TOP has been seen
+    // ahead of it — but we walk backwards, so remember that the token just
+    // consumed was numeric and insist the next one back completes a TOP.
+    let mut pending_number = false;
+    loop {
+        while p > start && bytes[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        if p == start {
+            return false;
+        }
+        let (tok_start, tok) = match bytes[p - 1] {
+            b'(' | b')' => (p - 1, &bytes[p - 1..p]),
+            _ => {
+                let mut w = p;
+                while w > start && is_ident_byte(bytes[w - 1]) {
+                    w -= 1;
+                }
+                if w == p {
+                    return false; // some other punctuation: not a select clause
+                }
+                (w, &bytes[w..p])
+            }
+        };
+        let upper = std::str::from_utf8(tok).map(str::to_ascii_uppercase).unwrap_or_default();
+        p = tok_start;
+        if upper == "SELECT" || upper == "DISTINCT" || upper == "ALL" {
+            return !pending_number;
+        }
+        if upper == "TOP" {
+            pending_number = false;
+            continue;
+        }
+        if upper == "PERCENT" || upper == "WITH" || upper == "TIES" || upper == "(" || upper == ")" {
+            continue;
+        }
+        if tok.iter().all(u8::is_ascii_digit) {
+            pending_number = true;
+            continue;
+        }
+        return false;
+    }
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -422,6 +471,48 @@ mod tests {
         ] {
             assert!(!r.message().trim().is_empty(), "{r:?} has no message");
         }
+    }
+
+    /// User report 2026-09-02: „v mssql zmáčknu ctrl+shift+e, nic se
+    /// nestalo". Every query in their history reads `SELECT TOP 1000 * …` —
+    /// and the star finder only accepted a `*` written straight after
+    /// `SELECT`/`DISTINCT`, so T-SQL's `TOP n` in between made it NoStar.
+    #[test]
+    fn a_star_after_t_sql_top_is_a_select_star() {
+        for sql in [
+            "SELECT TOP 1000 * FROM C_Data_View",
+            "SELECT TOP (10) * FROM C_Data_View",
+            "SELECT TOP 10 PERCENT * FROM C_Data_View",
+            "SELECT TOP 5 WITH TIES * FROM C_Data_View",
+            "SELECT DISTINCT TOP 3 * FROM C_Data_View",
+        ] {
+            let at = sql.find('*').unwrap();
+            let e = expand_at(sql, at, Some(&snap()), Dialect::Mssql)
+                .unwrap_or_else(|r| panic!("{sql}: {r:?}"));
+            assert_eq!(e.text, "[Id], [Name], created_at", "{sql}");
+            assert_eq!(e.range, at..at + 1, "{sql}: only the star is replaced");
+        }
+    }
+
+    /// The other half of the same report: T-SQL names its tables
+    /// `[dbo].[C_Data_View]`, and the source scan did not know what a `[`
+    /// was — so even with the star found there was no table to expand it
+    /// against.
+    #[test]
+    fn bracketed_t_sql_table_names_resolve() {
+        let sql = "SELECT TOP 1000 * FROM [dbo].[C_Data_View]";
+        let e = expand_at(sql, 16, Some(&snap()), Dialect::Mssql).unwrap();
+        assert_eq!(e.text, "[Id], [Name], created_at");
+    }
+
+    /// Arithmetic after a number is still arithmetic: `TOP` is what makes
+    /// the number part of the select clause, not the number itself.
+    #[test]
+    fn a_number_times_star_is_still_not_a_select_star() {
+        assert_eq!(
+            expand_at("SELECT 2 * FROM t", 9, Some(&snap()), Dialect::Mssql),
+            Err(Refusal::NoStar)
+        );
     }
 
     #[test]
