@@ -19,7 +19,7 @@
 // every streamed result batch — see the review for the full call-site
 // list). `refresh_history_cache` is called from: startup once `history` has
 // opened (`main`), `record_history` after a successful `add`, the star
-// toggle's click handler, and `on_toggle_history` when flipping to visible.
+// toggle's click handler, and `open_history_tab` when the tab opens.
 //
 // The search `TextField` (`connections_ui::TextField`) has no on-change
 // hook to drive the refresh from directly — it's a plain get/set-text
@@ -37,8 +37,6 @@ use crate::theme::ActiveTheme;
 use crate::AppView;
 use crate::ui;
 
-/// Right-panel fixed width (brief contract #3), mirroring the schema tree
-/// panel's `w(px(260.))` in `main.rs`'s `render`.
 /// Fixed per-row height (brief: G3 final-review fix F4) — `uniform_list`
 /// (the same mechanism `grid.rs`/`schema_tree.rs` use for their scrollable
 /// rows) requires every row the same height; a two-line entry (SQL +
@@ -483,22 +481,17 @@ impl AppView {
 
         div()
             .id("history-panel")
-            // FILLS the wrapper, which is what owns the dragged width
-            // (`AppView::history_width`). This used to pin 280 px, so the
-            // splitter resized the container around an unchanged panel and
-            // dragging appeared to do nothing at all (user report,
-            // 2026-08-31). See `width_audit` below.
+            // FILLS whatever holds it — once a wrapper whose width a splitter
+            // dragged, since 2026-09-02 the result tab area. The tab strip
+            // already says „Historie", so there is no header of its own.
+            // See `width_audit` below.
             .w_full()
             .h_full()
-            .flex_shrink_0()
             .flex()
             .flex_col()
-            .border_l_1()
-            .border_color(cx.theme().border)
             .bg(cx.theme().bg_app)
             .text_color(cx.theme().text_primary)
-            .child(div().px_2().py_1().child("Historie"))
-            .child(div().px_2().pb_1().child(self.history_search.clone()))
+            .child(div().px_2().py_1().child(self.history_search.clone()))
             .child(list)
             .into_any_element()
     }

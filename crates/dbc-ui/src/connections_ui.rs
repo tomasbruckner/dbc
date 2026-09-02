@@ -2160,7 +2160,11 @@ impl AppView {
         let label = self.current_connection_label();
         let theme = *cx.theme();
         let format_enabled = self.active_engine().is_some();
-        let (tree_on, history_on) = (self.tree_visible, self.history_visible);
+        let tree_on = self.tree_visible;
+        // Lit while the history tab is the one on screen, so the button
+        // reads as "you are looking at it", the way it did for the panel.
+        let history_on =
+            matches!(self.editor().results.active().map(|t| &t.content), Some(crate::tabs::TabContent::History));
         let maximized = window.is_maximized();
 
         div()
@@ -2230,9 +2234,7 @@ impl AppView {
                 }),
             ))
             .child(ui::toolbar_button("top-bar-history", "Historie", history_on, true, theme).on_click(
-                cx.listener(|view, _, window, cx| {
-                    view.on_toggle_history(&crate::ToggleHistory, window, cx)
-                }),
+                cx.listener(|view, _, _window, cx| view.open_history_tab(cx)),
             ))
             .child(ui::toolbar_separator(theme))
             // „Formátovat" (user request 2026-08-28), Ctrl+Shift+F. Dimmed

@@ -74,6 +74,13 @@ pub enum TabContent {
     /// "tabs.rs stays GPUI-free beyond this type name" posture as `Grid`/
     /// `Compare`.
     Admin { view: Entity<crate::admin_panel::AdminPanel> },
+    /// The query history (2026-09-02: „ta historie by asi neměla být vidět
+    /// pořád, spíše jenom když se dá zobrazit historie jako nový tab") — a
+    /// tab instead of the permanent right-hand panel it used to be. One
+    /// per editor at a time (`preview_key = HISTORY_PREVIEW_KEY`, activated
+    /// on reopen; see `AppView::open_history_tab`). No payload: the search
+    /// field, cache and scroll state live on `AppView`, as they always did.
+    History,
 }
 
 /// G12 T3: outcome of a script/CSV-import run, driving the progress tab's

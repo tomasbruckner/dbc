@@ -102,7 +102,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     s("ctrl-shift-e", "Rozbalit * na sloupce", Scope::Global, true),
     s("ctrl-s", "Uložit skript", Scope::Global, false),
     s("ctrl-b", "Zobrazit/skrýt strom", Scope::Global, false),
-    s("ctrl-h", "Zobrazit/skrýt historii", Scope::Global, false),
+    s("ctrl-h", "Otevřít historii", Scope::Global, false),
     s("f1", "Přehled zkratek", Scope::Global, true),
     s("ctrl-1", "Přejít do editoru", Scope::Global, false),
     s("ctrl-2", "Přejít do stromu", Scope::Global, false),

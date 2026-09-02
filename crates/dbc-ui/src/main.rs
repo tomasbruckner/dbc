@@ -119,7 +119,7 @@ actions!(
         RunQueryUnlimited,
         CancelQuery,
         ToggleTree,
-        ToggleHistory,
+        ShowHistory,
         OpenPalette,
         OpenAutocomplete,
         /// The cheat sheet, rendered from `keymap::SHORTCUTS`.
@@ -2405,13 +2405,6 @@ struct AppView {
     /// drag STARTED, not against the previous move event, or rounding
     /// accumulates and the panel creeps away from the pointer.
     sidebar_resizing: Option<(f32, f32)>,
-    /// Current history-panel width in px, and the in-progress drag of its
-    /// splitter as `(pointer x at mouse-down, width at mouse-down)`. The
-    /// history splitter is on the panel's LEFT edge, so dragging right
-    /// makes it narrower — the sign is the only thing that differs from the
-    /// sidebar.
-    history_width: f32,
-    history_resizing: Option<(f32, f32)>,
     /// A context-menu action that needs a `Window` (dialog focus), parked
     /// by the cx-only tree subscription and drained at the top of `render`.
     /// Same shape as the queued cross-context preview open.
@@ -2445,9 +2438,6 @@ struct AppView {
     /// case the app stays fully functional, just without recording/search
     /// (`record_history` and the panel's search both no-op gracefully).
     history: Option<HistoryDb>,
-    /// Ctrl+H (`ToggleHistory`, app action, binding context `None`) — same
-    /// "not rendered at all when hidden" convention as `tree_visible`.
-    history_visible: bool,
     /// Search box for the history panel (unmasked `TextField`, reused from
     /// connections_ui.rs). Its text is polled (cheap string compare) at the
     /// start of every `render_history_panel` call against
@@ -2561,34 +2551,9 @@ const CLI_CONN_IDENTITY: &str = "cli";
 /// underneath.
 pub(crate) const LOG_PREVIEW_KEY: &str = "applog";
 
-/// The history panel's built-in width, used until the user drags its
-/// splitter. Was the hard-coded `280.`.
-pub(crate) const HISTORY_DEFAULT_W: f32 = 280.0;
-/// Narrow enough to still show a timestamp and a truncated statement.
-pub(crate) const HISTORY_MIN_W: f32 = 180.0;
-/// A history panel wider than this is a history panel that has eaten the
-/// results grid it exists to complement.
-pub(crate) const HISTORY_MAX_W: f32 = 700.0;
-
-/// Clamp a history width into [`HISTORY_MIN_W`]..=[`HISTORY_MAX_W`], mapping
-/// NaN to the default. Mirrors `clamp_sidebar_width` exactly, including the
-/// NaN arm: `f32::NAN.clamp(..)` returns NaN, and a NaN width silently
-/// renders a zero-width panel that cannot be dragged back.
-pub(crate) fn clamp_history_width(w: f32) -> f32 {
-    if w.is_nan() {
-        return HISTORY_DEFAULT_W;
-    }
-    w.clamp(HISTORY_MIN_W, HISTORY_MAX_W)
-}
-
-/// `AppConfig::history_width` (whole px, `None` = never resized) → the
-/// width to start the session with.
-pub(crate) fn history_width_from(stored: Option<u16>) -> f32 {
-    match stored {
-        Some(w) => clamp_history_width(f32::from(w)),
-        None => HISTORY_DEFAULT_W,
-    }
-}
+/// The history tab's `preview_key`: one per editor, re-activated on reopen
+/// (the same dedup `open_monitor_tab`/`open_admin_tab` use).
+pub(crate) const HISTORY_PREVIEW_KEY: &str = "history";
 
 /// The sidebar's built-in width, used until the user drags the splitter.
 /// Was the hard-coded `260.` in `render`.
@@ -3645,6 +3610,7 @@ impl AppView {
                                             }
                                             TabContent::Text { .. } => None,
                                             TabContent::Monitor { .. } => None,
+                                            TabContent::History => None,
                                             TabContent::Plan { .. } => None,
                                             TabContent::Diagram { .. } => None,
                                             TabContent::Compare { .. } => None,
@@ -6267,26 +6233,6 @@ impl AppView {
     /// The equality check is not an optimisation: a plain CLICK on the
     /// splitter — no movement at all — is a complete down/up pair, so
     /// without it every stray click would write `config.toml`.
-    /// Ends a history-panel drag and persists the result. Same contract as
-    /// [`AppView::end_sidebar_resize`] — persist on drag END only, and skip
-    /// the write when nothing changed so a stray click on the splitter does
-    /// not rewrite `config.toml`.
-    fn end_history_resize(&mut self, cx: &mut Context<Self>) {
-        self.history_resizing = None;
-        let width = clamp_history_width(self.history_width) as u16;
-        if self.config.history_width == Some(width) {
-            cx.notify();
-            return;
-        }
-        self.config.history_width = Some(width);
-        if let Some(guard) = self.guard_corrupt_config(cx) {
-            if let Err(e) = self.config.save(&self.config_path, &guard) {
-                self.editor_mut().status = format!("error: šířku historie se nepodařilo uložit: {e}");
-            }
-        }
-        cx.notify();
-    }
-
     fn end_sidebar_resize(&mut self, cx: &mut Context<Self>) {
         self.sidebar_resizing = None;
         let width = clamp_sidebar_width(self.sidebar_width) as u16;
@@ -6306,15 +6252,42 @@ impl AppView {
         cx.notify();
     }
 
-    fn on_toggle_history(&mut self, _: &ToggleHistory, _window: &mut Window, cx: &mut Context<Self>) {
-        self.history_visible = !self.history_visible;
-        if self.history_visible {
-            // The cache may be stale relative to runs recorded while the
-            // panel was hidden (record_history's own refresh still ran, but
-            // this is cheap insurance and matches the review's explicit
-            // "ToggleHistory-on" trigger list).
-            self.refresh_history_cache(cx);
+    fn on_show_history(&mut self, _: &ShowHistory, _window: &mut Window, cx: &mut Context<Self>) {
+        self.open_history_tab(cx);
+    }
+
+    /// Ctrl+H, the „Historie" button and the palette entry all land here:
+    /// the history opens as a result tab of the ACTIVE editor, or the one
+    /// already open is brought to the front (2026-09-02: „ta historie by
+    /// asi neměla být vidět pořád, spíše jenom když se dá zobrazit historie
+    /// jako nový tab"). One per editor, keyed by `HISTORY_PREVIEW_KEY`, the
+    /// same dedup the monitor and admin tabs use.
+    pub(crate) fn open_history_tab(&mut self, cx: &mut Context<Self>) {
+        let existing = self
+            .editor()
+            .results
+            .iter()
+            .find(|t| t.preview_key.as_deref() == Some(HISTORY_PREVIEW_KEY))
+            .map(|t| t.id);
+        if let Some(id) = existing {
+            self.editor_mut().results.activate(id);
+        } else {
+            let conn_identity = self.current_conn_identity();
+            self.editor_mut().results.open(ResultTab {
+                id: 0,
+                title: "Historie".to_string(),
+                pinned: false,
+                preview_key: Some(HISTORY_PREVIEW_KEY.to_string()),
+                conn_identity,
+                sql: None,
+                content: TabContent::History,
+            });
         }
+        // The cache may be stale relative to runs recorded while no history
+        // tab was on screen (record_history's own refresh still ran, but
+        // this is cheap insurance and matches the review's explicit
+        // "history-on" trigger list).
+        self.refresh_history_cache(cx);
         cx.notify();
     }
 
@@ -6567,12 +6540,7 @@ impl AppView {
                 PaletteAction::ToggleTree => {
                     self.tree_visible = !self.tree_visible;
                 }
-                PaletteAction::ToggleHistory => {
-                    self.history_visible = !self.history_visible;
-                    if self.history_visible {
-                        self.refresh_history_cache(cx);
-                    }
-                }
+                PaletteAction::ShowHistory => self.open_history_tab(cx),
                 PaletteAction::NewConnection => {
                     // Exactly the dropdown's "Nové spojení…" click — sets
                     // its own focus, which must win over anything below.
@@ -12005,6 +11973,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             TabContent::Grid { grid, .. } => (active.id, active.conn_identity.clone(), grid.clone()),
             TabContent::Text { .. } => return,
             TabContent::Monitor { .. } => return,
+            TabContent::History => return,
             TabContent::Plan { .. } => return,
             TabContent::Diagram { .. } => return,
             TabContent::Compare { .. } => return,
@@ -12805,6 +12774,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     ),
                     TabContent::Text { .. } => (None, false),
                     TabContent::Monitor { .. } => (None, false),
+                    TabContent::History => (None, false),
                     TabContent::Plan { .. } => (None, false),
                     TabContent::Diagram { .. } => (None, false),
                     TabContent::Compare { .. } => (None, false),
@@ -12909,6 +12879,12 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// no tabs open at all, renders a neutral placeholder.
     fn render_tab_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.theme();
+        // The history tab first: its panel is drawn by a `&mut self` method
+        // (the search box is polled for edits on every render), which the
+        // borrow of `active` below would forbid.
+        if matches!(self.editor().results.active().map(|t| &t.content), Some(TabContent::History)) {
+            return self.render_history_panel(cx);
+        }
         let Some(active) = self.editor().results.active() else {
             return div().flex_1().bg(theme.bg_panel).into_any_element();
         };
@@ -13085,6 +13061,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     .into_any_element()
             }
             TabContent::Monitor { view } => view.clone().into_any_element(),
+            // Drawn by the early return at the top of this method: the
+            // panel needs `&mut self`, which `active`'s borrow forbids here.
+            TabContent::History => div().into_any_element(),
             TabContent::Plan { view } => view.clone().into_any_element(),
             TabContent::Diagram { view } => {
                 // G8 T6: mirrors `ResultGrid`'s `status_note` idiom above —
@@ -13119,6 +13098,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     fn monitor_view_for_tab(&self, tab_id: u64) -> Option<Entity<monitor_view::MonitorView>> {
         self.editor().results.iter().find(|t| t.id == tab_id).and_then(|t| match &t.content {
             TabContent::Monitor { view } => Some(view.clone()),
+            TabContent::History => None,
             _ => None,
         })
     }
@@ -14700,41 +14680,8 @@ impl Render for AppView {
         }
         body = body.child(column);
 
-        // G3 Task 3: the history panel sits RIGHT of `column`, collapsible
-        // via Ctrl+H (`ToggleHistory`) — same collapse-to-0px convention as
-        // the schema tree panel above. THIS div owns the width: the panel
-        // inside fills it (`history_panel`'s `width_audit` keeps it that
-        // way), so the splitter below actually moves something.
-        if self.history_visible {
-            body = body.child(
-                div()
-                    .relative()
-                    .w(px(self.history_width))
-                    .h_full()
-                    .flex_shrink_0()
-                    .child(self.render_history_panel(cx))
-                    .child(
-                        // Mirror of the sidebar splitter, on the other edge.
-                        div()
-                            .id("history-splitter")
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .w(px(5.))
-                            .h_full()
-                            .occlude()
-                            .cursor_col_resize()
-                            .on_mouse_down(
-                                gpui::MouseButton::Left,
-                                cx.listener(|view, e: &gpui::MouseDownEvent, _w, cx| {
-                                    view.history_resizing =
-                                        Some((f32::from(e.position.x), view.history_width));
-                                    cx.notify();
-                                }),
-                            ),
-                    ),
-            );
-        }
+        // The history used to sit RIGHT of `column` as a panel with its own
+        // splitter; since 2026-09-02 it is a result tab (`open_history_tab`).
 
         let mut root = div()
             .relative()
@@ -14746,7 +14693,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_run_query_unlimited))
             .on_action(cx.listener(Self::on_cancel_query))
             .on_action(cx.listener(Self::on_toggle_tree))
-            .on_action(cx.listener(Self::on_toggle_history))
+            .on_action(cx.listener(Self::on_show_history))
             .on_action(cx.listener(Self::on_open_palette))
             .on_action(cx.listener(Self::on_open_autocomplete))
             .on_action(cx.listener(Self::on_save_script))
@@ -14770,27 +14717,6 @@ impl Render for AppView {
         // it did. `on_mouse_up_out` is the other half — releasing outside the
         // window must also end the drag, or the panel keeps following the
         // mouse after the button is up. Both learned from `grid.rs`.
-        if self.history_resizing.is_some() {
-            root = root
-                .on_mouse_move(cx.listener(|view, e: &gpui::MouseMoveEvent, _w, cx| {
-                    if let Some((start_x, start_w)) = view.history_resizing {
-                        // Minus, not plus: this splitter is on the LEFT edge
-                        // of the panel, so moving right shrinks it.
-                        view.history_width =
-                            clamp_history_width(start_w - (f32::from(e.position.x) - start_x));
-                        cx.notify();
-                    }
-                }))
-                .on_mouse_up(
-                    gpui::MouseButton::Left,
-                    cx.listener(|view, _e, _w, cx| view.end_history_resize(cx)),
-                )
-                .on_mouse_up_out(
-                    gpui::MouseButton::Left,
-                    cx.listener(|view, _e, _w, cx| view.end_history_resize(cx)),
-                );
-        }
-
         if self.sidebar_resizing.is_some() {
             root = root
                 .on_mouse_move(cx.listener(|view, e: &gpui::MouseMoveEvent, _w, cx| {
@@ -15243,7 +15169,7 @@ fn main() {
             KeyBinding::new("ctrl-shift-enter", RunQueryUnlimited, None),
             KeyBinding::new("escape", CancelQuery, None),
             KeyBinding::new("ctrl-b", ToggleTree, None),
-            KeyBinding::new("ctrl-h", ToggleHistory, None),
+            KeyBinding::new("ctrl-h", ShowHistory, None),
             KeyBinding::new("ctrl-k", OpenPalette, None),
             // Ctrl+P and Ctrl+Shift+P are what a hand reaches for after
             // any editor of the last decade (user report, 2026-08-30:
@@ -15421,7 +15347,6 @@ fn main() {
                         .detach();
                         // Read before `config` is moved into the struct below.
                         let sidebar_width = sidebar_width_from(config.sidebar_width);
-                        let history_width = history_width_from(config.history_width);
                         editors.active_mut().payload.status = status.clone();
                         AppView {
                             editors,
@@ -15456,8 +15381,6 @@ fn main() {
                             tree_visible: true,
                             sidebar_width,
                             sidebar_resizing: None,
-                            history_width,
-                            history_resizing: None,
                             pending_menu_action: None,
                             shortcuts_open: false,
                             app_menu_open: false,
@@ -15465,7 +15388,6 @@ fn main() {
                             sidebar_fetch_generation: 0,
                             compare_fetch_generation: 0,
                             history,
-                            history_visible: true,
                             history_search,
                             history_cache: Vec::new(),
                             history_rows: Vec::new(),
@@ -17126,18 +17048,6 @@ mod autocomplete_popup_width_tests {
 mod sidebar_width_tests {
     use super::*;
 
-    /// The history panel got the same treatment as the sidebar, so it gets
-    /// the same guarantees — including the NaN arm, which is the one that
-    /// would otherwise render a panel nobody can drag back.
-    #[test]
-    fn history_width_behaves_like_the_sidebar_width() {
-        assert_eq!(history_width_from(None), HISTORY_DEFAULT_W);
-        assert_eq!(history_width_from(Some(320)), 320.0);
-        assert_eq!(history_width_from(Some(0)), HISTORY_MIN_W);
-        assert_eq!(history_width_from(Some(u16::MAX)), HISTORY_MAX_W);
-        assert_eq!(clamp_history_width(f32::NAN), HISTORY_DEFAULT_W);
-    }
-
     #[test]
     fn an_unset_width_is_the_built_in_default() {
         assert_eq!(sidebar_width_from(None), SIDEBAR_DEFAULT_W);
@@ -17640,7 +17550,11 @@ mod config_save_guard_audit {
         // nothing else, which is why it needs no equality check of its own:
         // there is no continuous gesture behind it, only a click on
         // „Uložit".
-        assert_eq!(sites, 12, "config.toml writer count changed — re-audit, do not just bump");
+        //
+        // 12 → 11 on 2026-09-02: `end_history_resize` is gone with the
+        // history panel — the history is a result tab now and has no width
+        // of its own to persist. One writer fewer, nothing re-routed.
+        assert_eq!(sites, 11, "config.toml writer count changed — re-audit, do not just bump");
     }
 
     /// The widening is only worth anything if it actually reaches past the

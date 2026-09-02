@@ -112,7 +112,7 @@ pub enum PaletteMode {
 pub enum PaletteAction {
     RunQuery,
     ToggleTree,
-    ToggleHistory,
+    ShowHistory,
     NewConnection,
     RefreshSchema,
     OpenMonitor,
@@ -330,7 +330,7 @@ pub fn fixed_actions(
         ("Spustit dotaz".to_string(), PaletteAction::RunQuery),
         ("Vybrat databázi… (Ctrl+D)".to_string(), PaletteAction::PickDatabase),
         ("Přepnout strom".to_string(), PaletteAction::ToggleTree),
-        ("Přepnout historii".to_string(), PaletteAction::ToggleHistory),
+        ("Historie (Ctrl+H)".to_string(), PaletteAction::ShowHistory),
         ("Nové spojení…".to_string(), PaletteAction::NewConnection),
         ("Obnovit schéma".to_string(), PaletteAction::RefreshSchema),
         ("ER diagram".to_string(), PaletteAction::ShowErDiagram),
