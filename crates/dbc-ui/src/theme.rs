@@ -27,8 +27,9 @@ pub struct EditorSyntaxTheme {
     pub comment: Hsla,
     pub function: Hsla,
     pub type_: Hsla,
-    /// Not produced by any current capture — the color of un-highlighted
-    /// editor text; reserved so a future capture has a home.
+    /// Not produced by any capture: the editor's BASE text colour, what
+    /// `*`, commas, operators and aliases are drawn in (`sql_input.rs`
+    /// sets it as `text_color`; GPUI's default is black otherwise).
     pub identifier: Hsla,
 }
 

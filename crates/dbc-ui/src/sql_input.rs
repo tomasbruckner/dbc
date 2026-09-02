@@ -50,7 +50,7 @@
 use std::ops::Range;
 
 use gpui::{
-    actions, div, fill, hsla, point, prelude::*, px, relative, size, App, Bounds, ClipboardItem,
+    actions, div, fill, point, prelude::*, px, relative, size, App, Bounds, ClipboardItem,
     Context, CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
     Focusable, GlobalElementId, Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollDelta, ScrollWheelEvent,
@@ -1202,7 +1202,10 @@ impl Element for TextElement {
         let font = style.font();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
-        let selection_bg = cx.theme().bg_selection;
+        // `bg_input_selection`, not `bg_selection`: the latter is a 19 %
+        // tint meant for panels and all but vanishes on the dark input.
+        let selection_bg = cx.theme().bg_input_selection;
+        let placeholder_color = cx.theme().text_faint;
 
         let line_count = if text.is_empty() {
             1
@@ -1259,7 +1262,7 @@ impl Element for TextElement {
                 let is_placeholder = is_empty && idx == 0;
 
                 let (display_text, color): (SharedString, _) = if is_placeholder {
-                    (placeholder.clone(), hsla(0., 0., 0., 0.2))
+                    (placeholder.clone(), placeholder_color)
                 } else {
                     (line_text.to_string().into(), style.color)
                 };
@@ -1496,6 +1499,12 @@ impl Render for SqlInput {
             // From the theme: this was hard-coded white, which left the
             // editor a white slab in the dark theme (user, 2026-09-02).
             .bg(cx.theme().bg_input)
+            // Base colour for everything the highlighter does not capture
+            // (`*`, commas, operators, aliases). Nothing above this element
+            // sets one, so without it GPUI's default — black — applied, which
+            // was fine on the old white slab and invisible on `bg_input`
+            // (user, 2026-09-02: „v dark modu … * nejde vubec videt").
+            .text_color(cx.theme().syntax.identifier)
             .line_height(px(20.))
             .text_size(px(14.))
             .size_full()
@@ -1534,9 +1543,21 @@ mod theme_audit {
         let src = include_str!("sql_input.rs");
         let body = src.split("mod theme_audit").next().unwrap_or("");
         let rgb_needle = format!("{}(0x", "rgb");
-        for needle in ["gpui::white()", "gpui::black()", "gpui::blue()", rgb_needle.as_str()] {
+        for needle in ["gpui::white()", "gpui::black()", "gpui::blue()", "hsla(0., 0., 0.", rgb_needle.as_str()] {
             assert!(!body.contains(needle), "{needle} bypasses the theme");
         }
+    }
+
+    /// The editor inherits no text colour from anything above it, so it
+    /// must name its own — un-highlighted text (`*`, commas, operators) is
+    /// otherwise GPUI's default black, invisible on the dark input.
+    #[test]
+    fn the_editor_names_its_base_text_colour() {
+        let src = include_str!("sql_input.rs");
+        let body = src.split("mod theme_audit").next().unwrap_or("");
+        assert!(body.contains(".text_color(cx.theme().syntax.identifier)"));
+        assert!(body.contains("cx.theme().bg_input_selection"), "selection must be seen on the input");
+        assert!(!body.contains("cx.theme().bg_selection;"), "panel tint vanishes on the dark input");
     }
 }
 
