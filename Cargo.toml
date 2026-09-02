@@ -24,3 +24,10 @@ serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 zeroize = "1"
 similar = "2"
+
+# Argon2id compiled without optimisation is ~20× slower than shipped
+# (3.1 s vs 0.16 s per unlock at the old cost, measured 2026-09-02). The
+# vault is the one place a dev build must not feel different from a
+# release; this only touches that crate, so nothing else is rebuilt.
+[profile.dev.package.argon2]
+opt-level = 3

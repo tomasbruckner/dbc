@@ -380,7 +380,10 @@ async fn run_serve(config_path: &std::path::Path, vault_path: &std::path::Path) 
     let vault = match Vault::unlock_with_key(vault_path, &key) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("dbc-mcp: {e}");
+            // The stored key stops fitting when the master password changes
+            // or the app re-seals the vault under a new KDF cost; either
+            // way the cure is the same.
+            eprintln!("dbc-mcp: {e}\nRun `dbc-mcp setup` again to store the current key.");
             return ExitCode::FAILURE;
         }
     };

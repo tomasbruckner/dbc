@@ -1391,11 +1391,12 @@ pub enum ModalState {
         pending: PendingAfterUnlock,
         /// The Argon2id verification is running on a background thread.
         ///
-        /// It exists because that verification is DELIBERATELY slow — that
-        /// is what makes a stolen vault file expensive to guess against —
-        /// and it used to run on the UI thread, so the window simply froze
-        /// for about a second with no explanation (user report,
-        /// 2026-08-30: the app looked dead after pressing Enter).
+        /// It used to run on the UI thread, so the window simply froze for
+        /// about a second with no explanation (user report, 2026-08-30: the
+        /// app looked dead after pressing Enter). The cost was cut to a
+        /// blink on 2026-09-02, but a vault sealed under the old cost still
+        /// pays it ONCE, on the unlock that re-seals it — so the work stays
+        /// off the UI thread.
         verifying: bool,
     },
     CreateMasterPassword {
@@ -3548,11 +3549,11 @@ impl AppView {
 
     /// Verify the master password OFF the UI thread.
     ///
-    /// `Vault::unlock` runs Argon2id, which is slow on purpose — roughly a
-    /// second, by design, because that cost is exactly what protects a
-    /// stolen vault file from being guessed against. Running it inline
-    /// froze the window for that second with nothing on screen, so the app
-    /// looked hung. Now the modal flips to `verifying` and repaints FIRST
+    /// `Vault::unlock` runs Argon2id. Since 2026-09-02 the cost is light
+    /// (an unlock is a blink), but a vault sealed under the old cost pays
+    /// the old price once more on the unlock that re-seals it, and running
+    /// that inline froze the window with nothing on screen, so the app
+    /// looked hung. So the modal flips to `verifying` and repaints FIRST
     /// (that is the whole reason the work moves to the background executor
     /// — a label cannot render while the UI thread is busy), and the
     /// result is applied when it comes back.
@@ -4748,7 +4749,7 @@ fn render_master_password_panel(
         // Naming the reason turns a freeze into a feature: told that the
         // wait IS the protection, nobody suspects the app hung.
         panel = panel.child(div().text_color(cx.theme().text_muted).child(
-            "Ověřuji heslo… trvá to schválně — pomalé odvození klíče (Argon2id) je to, co chrání trezor proti hádání hesla.",
+            "Ověřuji heslo…",
         ));
     }
     panel = panel.child(

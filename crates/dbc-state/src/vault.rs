@@ -11,9 +11,32 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::StateError;
 
-const M_COST: u32 = 65536; // 64 MiB
-const T_COST: u32 = 3;
-const P_COST: u32 = 4;
+/// The Argon2id cost a NEW seal uses. Deliberately light (user, 2026-09-02:
+/// „nechci tam tyhle advanced algoritmy proti bruteforce protection, chci
+/// se lognout hned"): the previous 64 MiB / 3 passes / 4 lanes took 0.16 s
+/// in a release build and 3.1 s in the dev build the user actually runs.
+/// 8 MiB / 1 pass / 1 lane is ~20× cheaper — an unlock is now a blink —
+/// while still being Argon2id, so a stolen `vault.bin` is guessed at
+/// memory-hard speed, not SHA speed. Older vaults carry their own cost in
+/// the envelope and are re-sealed to this one the first time they open
+/// (`Vault::unlock`).
+const M_COST: u32 = 8192; // 8 MiB
+const T_COST: u32 = 1;
+const P_COST: u32 = 1;
+
+/// The KDF cost a key was derived with. Travels WITH the key: `persist`
+/// writes these, never the constants above, because a key derived under
+/// one cost and an envelope claiming another is a vault nobody can open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Kdf {
+    m_cost: u32,
+    t_cost: u32,
+    p_cost: u32,
+}
+
+impl Kdf {
+    const CURRENT: Kdf = Kdf { m_cost: M_COST, t_cost: T_COST, p_cost: P_COST };
+}
 
 #[derive(Serialize, Deserialize)]
 struct Envelope {
@@ -30,6 +53,8 @@ pub struct Vault {
     path: PathBuf,
     key: [u8; 32], // derived once per unlock; lives only in memory; zeroized on drop
     salt: [u8; 16],
+    /// The cost `key` was derived with — what `persist` writes back.
+    kdf: Kdf,
     secrets: BTreeMap<String, String>, // plaintext secrets; zeroized on drop
 }
 
@@ -97,8 +122,16 @@ pub(crate) fn text_is_sealed_envelope(text: &str) -> bool {
         && !env.ciphertext.is_empty()
 }
 
-fn derive_key(master: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<[u8; 32], StateError> {
-    let params = Params::new(m, t, p, Some(32)).map_err(|e| err(e.to_string()))?;
+fn fresh_salt() -> [u8; 16] {
+    use rand::RngCore as _;
+    let mut salt = [0u8; 16];
+    rand::rng().fill_bytes(&mut salt);
+    salt
+}
+
+fn derive_key(master: &str, salt: &[u8], kdf: Kdf) -> Result<[u8; 32], StateError> {
+    let params = Params::new(kdf.m_cost, kdf.t_cost, kdf.p_cost, Some(32))
+        .map_err(|e| err(e.to_string()))?;
     let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = [0u8; 32];
     a2.hash_password_into(master.as_bytes(), salt, &mut out)
@@ -110,16 +143,29 @@ impl Vault {
     pub fn exists(path: &Path) -> bool { path.exists() }
 
     pub fn create(path: &Path, master: &str) -> Result<Vault, StateError> {
-        let mut salt = [0u8; 16];
-        use rand::RngCore as _;
-        let mut rng = rand::rng();
-        rng.fill_bytes(&mut salt);
-        let key = derive_key(master, &salt, M_COST, T_COST, P_COST)?;
-        let mut v = Vault { path: path.to_path_buf(), key, salt, secrets: BTreeMap::new() };
+        Self::create_with(path, master, Kdf::CURRENT)
+    }
+
+    /// `create` with an explicit cost — how the tests below manufacture a
+    /// vault sealed under an OLDER cost than `Kdf::CURRENT`.
+    fn create_with(path: &Path, master: &str, kdf: Kdf) -> Result<Vault, StateError> {
+        let salt = fresh_salt();
+        let key = derive_key(master, &salt, kdf)?;
+        let mut v = Vault { path: path.to_path_buf(), key, salt, kdf, secrets: BTreeMap::new() };
         v.persist()?;
         Ok(v)
     }
 
+    /// Opens the vault with the master password.
+    ///
+    /// A vault sealed under a cost other than `Kdf::CURRENT` is re-sealed
+    /// under the current one here, silently, with a fresh salt — so the
+    /// one slow unlock a lighter cost inherits from an older file happens
+    /// exactly once. If the re-seal cannot be written (read-only profile,
+    /// full disk) the vault still opens, under its old key; the next unlock
+    /// simply tries again. A re-seal changes the derived key, so a copy
+    /// stored by `dbc login` / `dbc-mcp setup` stops fitting — both fall
+    /// back to asking for the password.
     pub fn unlock(path: &Path, master: &str) -> Result<Vault, StateError> {
         let env: Envelope = serde_json::from_str(&std::fs::read_to_string(path)?)
             .map_err(|_| err("vault unlock failed: corrupt envelope"))?;
@@ -132,7 +178,8 @@ impl Vault {
         if env.m_cost > 2 * 1024 * 1024 || env.t_cost > 64 || env.p_cost > 64 {
             return Err(err("vault unlock failed: implausible KDF params"));
         }
-        let key = derive_key(master, &salt, env.m_cost, env.t_cost, env.p_cost)?;
+        let kdf = Kdf { m_cost: env.m_cost, t_cost: env.t_cost, p_cost: env.p_cost };
+        let key = derive_key(master, &salt, kdf)?;
         let nonce_bytes = B64.decode(&env.nonce).map_err(|_| err("vault unlock failed: bad nonce"))?;
         let ct = B64.decode(&env.ciphertext).map_err(|_| err("vault unlock failed: bad ciphertext"))?;
         let nonce_arr: [u8; 12] = nonce_bytes.as_slice().try_into()
@@ -149,7 +196,31 @@ impl Vault {
         );
         let secrets: BTreeMap<String, String> =
             serde_json::from_slice(&plain).map_err(|_| err("vault unlock failed: bad payload"))?;
-        Ok(Vault { path: path.to_path_buf(), key, salt, secrets })
+        let mut v = Vault { path: path.to_path_buf(), key, salt, kdf, secrets };
+        if kdf != Kdf::CURRENT {
+            v.reseal(master);
+        }
+        Ok(v)
+    }
+
+    /// Re-derive the key under `Kdf::CURRENT` with a fresh salt and write
+    /// the vault back. Best effort: on a write failure the old key, salt
+    /// and cost are put back, so the open vault and the file on disk keep
+    /// agreeing. Whichever key ends up unused is scrubbed.
+    fn reseal(&mut self, master: &str) {
+        let new_salt = fresh_salt();
+        let Ok(new_key) = derive_key(master, &new_salt, Kdf::CURRENT) else { return };
+        let mut old_key = std::mem::replace(&mut self.key, new_key);
+        let old_salt = std::mem::replace(&mut self.salt, new_salt);
+        let old_kdf = std::mem::replace(&mut self.kdf, Kdf::CURRENT);
+        if self.persist().is_err() {
+            let mut unused = std::mem::replace(&mut self.key, old_key);
+            unused.zeroize();
+            self.salt = old_salt;
+            self.kdf = old_kdf;
+            return;
+        }
+        old_key.zeroize();
     }
 
     /// Curated unlock path (dbc-mcp): opens the vault with an
@@ -181,11 +252,12 @@ impl Vault {
         let plain: Zeroizing<Vec<u8>> = Zeroizing::new(
             cipher
                 .decrypt(&nonce, ct.as_ref())
-                .map_err(|_| err("vault unlock failed: wrong key or tampered file"))?,
+                .map_err(|_| err("vault unlock failed: wrong key, tampered file, or a vault re-sealed since the key was stored"))?,
         );
         let secrets: BTreeMap<String, String> =
             serde_json::from_slice(&plain).map_err(|_| err("vault unlock failed: bad payload"))?;
-        Ok(Vault { path: path.to_path_buf(), key, salt, secrets })
+        let kdf = Kdf { m_cost: env.m_cost, t_cost: env.t_cost, p_cost: env.p_cost };
+        Ok(Vault { path: path.to_path_buf(), key, salt, kdf, secrets })
     }
 
     /// Exports the raw 32-byte vault key derived at unlock time, for a
@@ -230,7 +302,8 @@ impl Vault {
         let ct = cipher.encrypt(&nonce, plain.as_slice()).map_err(|e| err(e.to_string()))?;
         let env = Envelope {
             kdf: "argon2id".into(),
-            m_cost: M_COST, t_cost: T_COST, p_cost: P_COST,
+            // The cost THIS key came from — not the constants. See `Kdf`.
+            m_cost: self.kdf.m_cost, t_cost: self.kdf.t_cost, p_cost: self.kdf.p_cost,
             salt: B64.encode(self.salt),
             nonce: B64.encode(nonce_arr),
             ciphertext: B64.encode(ct),
@@ -379,5 +452,100 @@ mod tests {
         v.set_secret("c1", "SUPERTAJNE123").unwrap();
         let raw = std::fs::read(&p).unwrap();
         assert!(!raw.windows(13).any(|w| w == b"SUPERTAJNE123"));
+    }
+
+    /// The cost every vault was sealed with before 2026-09-02.
+    const OLD: Kdf = Kdf { m_cost: 65536, t_cost: 3, p_cost: 4 };
+
+    fn cost_on_disk(p: &Path) -> Kdf {
+        let env: Envelope = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        Kdf { m_cost: env.m_cost, t_cost: env.t_cost, p_cost: env.p_cost }
+    }
+
+    fn salt_on_disk(p: &Path) -> String {
+        let env: Envelope = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        env.salt
+    }
+
+    /// The latent bug the lighter cost would have set off: `persist` used
+    /// to write the CONSTANTS while the key had been derived from the cost
+    /// in the file. Saving a password into an old vault would then have
+    /// produced an envelope claiming one cost and a ciphertext under
+    /// another — a vault nobody can open.
+    #[test]
+    fn persist_writes_the_cost_the_key_was_derived_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("vault.bin");
+        let mut v = Vault::create_with(&p, "pw", OLD).unwrap();
+        v.set_secret("c1", "x").unwrap();
+        assert_eq!(cost_on_disk(&p), OLD, "persist must not claim a cost the key does not have");
+        drop(v);
+        assert_eq!(Vault::unlock(&p, "pw").unwrap().get_secret("c1").as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn an_old_vault_is_resealed_under_the_current_cost_on_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("vault.bin");
+        let mut v = Vault::create_with(&p, "pw", OLD).unwrap();
+        v.set_secret("c1", "tajne").unwrap();
+        drop(v);
+        let salt_before = salt_on_disk(&p);
+
+        let v = Vault::unlock(&p, "pw").unwrap();
+        assert_eq!(v.kdf, Kdf::CURRENT, "the open vault must carry the cost it was re-sealed under");
+        assert_eq!(cost_on_disk(&p), Kdf::CURRENT, "the file must be re-sealed at once");
+        assert_ne!(salt_on_disk(&p), salt_before, "a re-seal takes a fresh salt");
+        assert_eq!(v.get_secret("c1").as_deref(), Some("tajne"));
+        drop(v);
+
+        // Second unlock: nothing left to migrate, secrets intact.
+        let v2 = Vault::unlock(&p, "pw").unwrap();
+        assert_eq!(v2.get_secret("c1").as_deref(), Some("tajne"));
+        assert_eq!(cost_on_disk(&p), Kdf::CURRENT);
+    }
+
+    #[test]
+    fn a_vault_already_at_the_current_cost_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("vault.bin");
+        drop(Vault::create(&p, "pw").unwrap());
+        let salt_before = salt_on_disk(&p);
+        let bytes_before = std::fs::read(&p).unwrap();
+        drop(Vault::unlock(&p, "pw").unwrap());
+        assert_eq!(salt_on_disk(&p), salt_before);
+        assert_eq!(std::fs::read(&p).unwrap(), bytes_before, "no rewrite without a reason");
+    }
+
+    /// A key exported under the old cost cannot open the re-sealed file —
+    /// and says so — while a key exported AFTER the re-seal can.
+    #[test]
+    fn a_stored_key_stops_fitting_once_the_vault_is_resealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("vault.bin");
+        let v = Vault::create_with(&p, "pw", OLD).unwrap();
+        let old_key = v.export_key();
+        drop(v);
+
+        let v = Vault::unlock(&p, "pw").unwrap(); // re-seals
+        let new_key = v.export_key();
+        drop(v);
+
+        let e = Vault::unlock_with_key(&p, &old_key).unwrap_err();
+        assert!(e.message.contains("re-sealed"), "got: {}", e.message);
+        assert!(Vault::unlock_with_key(&p, &new_key).is_ok());
+    }
+
+    /// The whole point of the lighter cost.
+    #[test]
+    fn a_current_unlock_is_quick() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("vault.bin");
+        drop(Vault::create(&p, "pw").unwrap());
+        let t = std::time::Instant::now();
+        drop(Vault::unlock(&p, "pw").unwrap());
+        // Loose on purpose: an unoptimised CI box, not a benchmark. The
+        // old cost took 3 s here.
+        assert!(t.elapsed() < std::time::Duration::from_millis(1500), "took {:?}", t.elapsed());
     }
 }
