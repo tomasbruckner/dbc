@@ -6,10 +6,18 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-09-03
+
+The first version shipped as a GitHub Release.
+
 ### Added / changed
 
-- a release build, an icon, and a README for colleagues
+- a release build (static CRT, no VC++ redistributable needed), an exe icon and version info, and a README for colleagues
 - what a public repository needs: LICENSE (MIT), SECURITY, CONTRIBUTING, CHANGELOG, CODEOWNERS, CI and a tag-driven release workflow
+
+### Fixed
+
+- CI failed on a CRLF checkout
 
 ## [0.31.0] - 2026-09-02
 

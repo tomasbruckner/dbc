@@ -4,7 +4,7 @@ members = ["crates/dbc-core", "crates/dbc-buffer", "crates/dbc-ui", "crates/dbc-
 
 [workspace.package]
 edition = "2021"
-version = "0.31.0"
+version = "0.32.0"
 license = "MIT"
 repository = "https://github.com/tomasbruckner/dbc"
 authors = ["Tomáš Bruckner"]

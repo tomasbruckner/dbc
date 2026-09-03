@@ -14,7 +14,9 @@ v [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Instalace (pro kolegy)
 
-1. Stáhni `dbc-<verze>-windows-x64.zip` a rozbal ho kamkoli, třeba do
+1. Stáhni `dbc-<verze>-windows-x64.zip` z
+   [poslední verze na GitHubu](https://github.com/tomasbruckner/dbc/releases/latest)
+   a rozbal ho kamkoli, třeba do
    `C:\Users\<ty>\Apps\dbc`. Uvnitř je `dbc-ui.exe` (aplikace), `dbc.exe`
    (příkazová řádka) a `dbc-mcp.exe` (MCP server pro AI nástroje).
 2. Spusť `dbc-ui.exe`. Windows SmartScreen se při prvním spuštění ozve,
