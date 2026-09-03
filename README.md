@@ -35,6 +35,31 @@ nainstaluje a aplikaci restartuje; kdo tlačítko ignoruje, dostane novou
 verzi při příštím spuštění, protože se nainstaluje po zavření. Nastavení
 i historie jsou v `%APPDATA%\dbc` a aktualizace se jich nedotkne.
 
+## Podepisování a soukromí (Code signing policy)
+
+Free code signing provided by [SignPath.io](https://signpath.io),
+certificate by [SignPath Foundation](https://signpath.org). Podpis se
+zapne, jakmile bude žádost schválená; do té doby jsou soubory
+nepodepsané (viz [SECURITY.md](SECURITY.md)).
+
+Tým a role (SignPath vyžaduje všechny tři):
+
+| role | kdo |
+|---|---|
+| Autor (committer) | [Tomáš Bruckner](https://github.com/tomasbruckner) |
+| Reviewer (kontrola cizích změn) | [Tomáš Bruckner](https://github.com/tomasbruckner) |
+| Schvalovatel podpisu | [Tomáš Bruckner](https://github.com/tomasbruckner) |
+
+Soukromí: dbc neposílá žádná data nikam kromě dvou případů, které
+vyplývají z toho, co dělá. (1) Připojuje se k databázovým serverům,
+které si sám nastavíš, a posílá jim tvoje dotazy. (2) Po startu se
+jednou zeptá GitHubu (`api.github.com`, `github.com`) na nejnovější
+vydání a případně ho stáhne; ten dotaz nenese žádný identifikátor kromě
+toho, co v každém HTTPS požadavku vidí server. Žádná telemetrie, žádné
+hlášení pádů, nic dalšího. *This program will not transfer any
+information to other networked systems unless specifically requested by
+the user, with the two exceptions above.*
+
 ## Kde jsou moje data
 
 Všechno je v `%APPDATA%\dbc`:
