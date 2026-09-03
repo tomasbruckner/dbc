@@ -6,6 +6,16 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-09-03
+
+The first version with the installer and in-app updates. Colleagues on the 0.32.0 zip: install `dbc-win-Setup.exe` once, from then on the app updates itself.
+
+### Added / changed
+
+- the app updates itself: Velopack installer (`dbc-win-Setup.exe`) and portable zip, a check on start, an „Aktualizovat" button in the top bar, and a quiet install on quit
+- every shipped exe carries the product name, version and icon (not just dbc-ui.exe)
+- the release workflow can sign the executables and the installer through SignPath once the repository has the secret
+
 ## [0.32.0] - 2026-09-03
 
 The first version shipped as a GitHub Release.
