@@ -27,6 +27,8 @@ env:
   TAG: ${{ inputs.tag || github.ref_name }}
   # `secrets` cannot be read in a step's `if`; an env var can.
   SIGN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+  # winget: a classic PAT with `public_repo`, owner of the winget-pkgs fork.
+  WINGET: ${{ secrets.WINGET_TOKEN != '' }}
 
 permissions:
   contents: write
@@ -155,3 +157,19 @@ jobs:
             "dist/releases/releases.win.json"
           ) + (Get-ChildItem dist/releases/*.nupkg).FullName
           gh release create $env:TAG @assets --title "dbc $env:TAG" --notes-file notes.md
+
+      # --- optional: winget ------------------------------------------------
+      # Opens a pull request in microsoft/winget-pkgs with this version's
+      # Setup.exe (Komac under the hood). Needs the package to exist there
+      # already — the first version was submitted by hand — and the
+      # WINGET_TOKEN secret. Until then the step is skipped.
+      - name: Publish to winget
+        if: env.WINGET == 'true'
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: TomasBruckner.dbc
+          release-tag: ${{ env.TAG }}
+          installers-regex: 'dbc-win-Setup\.exe$'
+          release-notes-url: https://github.com/tomasbruckner/dbc/releases/tag/${{ env.TAG }}
+          token: ${{ secrets.WINGET_TOKEN }}
+      # ---------------------------------------------------------------------
