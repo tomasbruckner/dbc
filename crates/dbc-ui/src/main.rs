@@ -18523,7 +18523,7 @@ mod script_binding_tests {
     #[test]
     fn running_a_library_script_never_auto_saves_first() {
         let src =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).map(|s| s.replace("\r\n", "\n")).unwrap();
         let run_fn = src
             .split("fn run_script_from_library")
             .nth(1)
@@ -18647,7 +18647,12 @@ mod editor_clobber_audit {
                 .replace('\\', "/");
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("audit cannot read {rel}: {e}"));
-            out.push((rel, text));
+            // The audits match `"\n    }\n"`-shaped patterns. A checkout
+            // with core.autocrlf=true (every hosted Windows runner, and
+            // whatever `git stash` touched locally) hands them CRLF and
+            // every such pattern silently misses — CI failed on exactly
+            // this on 2026-09-03. Normalise once, here.
+            out.push((rel, text.replace("\r\n", "\n")));
         }
         out.sort();
         out
@@ -19761,7 +19766,7 @@ more();");
     /// three functions that spawn such work.
     #[test]
     fn async_completions_resolve_their_editor_by_id() {
-        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).map(|s| s.replace("\r\n", "\n"))
             .expect("own source");
         for f in ["fn run_query_in(", "fn save_script(", "fn save_script_as(", "fn switch_to_database("] {
             let start = src.find(f).unwrap_or_else(|| panic!("{f} must exist"));
@@ -19788,7 +19793,7 @@ more();");
     /// through, because the owner is on the list.
     #[test]
     fn the_in_place_rewrite_takes_a_transform_and_never_a_string() {
-        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).map(|s| s.replace("\r\n", "\n"))
             .expect("own source");
         let lines = code_lines(&src);
         let start = lines
@@ -20188,7 +20193,7 @@ mod editor_tab_tests {
     /// (via the keymap audit) documented.
     #[test]
     fn editor_tab_actions_are_bound_and_handled() {
-        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).map(|s| s.replace("\r\n", "\n"))
             .expect("own source");
         for (chord, action, handler) in [
             ("ctrl-n", "NewEditorTab", "on_new_editor_tab"),

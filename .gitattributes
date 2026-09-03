@@ -1,0 +1,14 @@
+# Every text file is LF in the working tree, on every machine — including
+# a Windows checkout with core.autocrlf=true (the GitHub-hosted runners,
+# and this repo's own author). The source-scan audit tests in
+# crates/dbc-ui/src/main.rs match "\n"-shaped patterns and were failing
+# in CI on CRLF checkouts (2026-09-03).
+* text=auto eol=lf
+
+# Windows script: PowerShell is fine with LF, but keep it explicit.
+*.ps1 text eol=lf
+
+# Binaries: never touched.
+*.ico binary
+*.png binary
+*.jpg binary
