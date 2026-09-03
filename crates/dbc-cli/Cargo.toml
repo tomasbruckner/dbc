@@ -23,3 +23,7 @@ rpassword = "7"
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# Windows version resource + icon for the shipped exe (see build.rs).
+[build-dependencies]
+winresource = "0.1"

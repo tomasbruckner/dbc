@@ -14,21 +14,26 @@ v [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Instalace (pro kolegy)
 
-1. Stáhni `dbc-<verze>-windows-x64.zip` z
-   [poslední verze na GitHubu](https://github.com/tomasbruckner/dbc/releases/latest)
-   a rozbal ho kamkoli, třeba do
-   `C:\Users\<ty>\Apps\dbc`. Uvnitř je `dbc-ui.exe` (aplikace), `dbc.exe`
-   (příkazová řádka) a `dbc-mcp.exe` (MCP server pro AI nástroje).
-2. Spusť `dbc-ui.exe`. Windows SmartScreen se při prvním spuštění ozve,
-   protože exe není podepsané: klikni na **Další informace → Přesto
-   spustit**. Stane se to jednou.
+1. Z [poslední verze na GitHubu](https://github.com/tomasbruckner/dbc/releases/latest)
+   stáhni **`dbc-win-Setup.exe`** a spusť ho. Nainstaluje se do
+   `%LocalAppData%\dbc` a přidá zástupce do nabídky Start. Kdo nechce
+   instalovat, vezme `dbc-win-Portable.zip` a rozbalí ho kamkoli.
+   Vedle aplikace (`dbc-ui.exe`) je `dbc.exe` (příkazová řádka) a
+   `dbc-mcp.exe` (MCP server pro AI nástroje); po instalaci leží v
+   `%LocalAppData%\dbc\current\`, u portable verze ve složce `current\`.
+2. Windows SmartScreen se při prvním spuštění ozve, protože soubory
+   nejsou podepsané: klikni na **Další informace → Přesto spustit**.
+   Stane se to jednou.
 3. Pro **SQL Server** je potřeba mít nainstalovaný
    [ODBC Driver 18 for SQL Server](https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server)
    od Microsoftu. Bez něj připojení k MSSQL skončí hláškou, která na
    tenhle odkaz ukáže. PostgreSQL, SQLite a DuckDB nic nepotřebují.
 
-Aktualizace: zatím ručně, stáhni nový zip a přepiš soubory. Nastavení
-i historie zůstanou, nejsou u exe.
+Aktualizace: aplikace se po startu podívá na GitHub, novou verzi si
+stáhne a v horní liště ukáže tlačítko **Aktualizovat na vX.Y.Z**. Klik ji
+nainstaluje a aplikaci restartuje; kdo tlačítko ignoruje, dostane novou
+verzi při příštím spuštění, protože se nainstaluje po zavření. Nastavení
+i historie jsou v `%APPDATA%\dbc` a aktualizace se jich nedotkne.
 
 ## Kde jsou moje data
 
@@ -67,8 +72,13 @@ Rust (stable), GPUI (Zed, pinovaná revize). Buildy jdou do
 ```powershell
 cargo run -p dbc-ui          # dev build, data v .\data místo %APPDATA%
 cargo test --workspace       # ~1 800 testů, bez Dockeru
-.\release.ps1                # release zip do .\dist
+dotnet tool install -g vpk   # jednou: Velopack CLI
+.\release.ps1                # Setup.exe, Portable.zip a balíčky do .\dist\releases
 ```
 
-Verze je jen ve workspace `Cargo.toml`; do exe se dostane přes
-`crates/dbc-ui/build.rs` (version resource + ikona `assets/dbc.ico`).
+Verze je jen ve workspace `Cargo.toml`; do exe se dostane přes `build.rs`
+každého binárního crate (version resource + ikona
+`crates/dbc-ui/assets/dbc.ico`). Vydání = tag `vX.Y.Z` na commitu
+`chore: vX.Y.Z`; GitHub Actions z něj postaví Release, ze kterého se
+nainstalované aplikace aktualizují. Pro zkoušku aktualizace bez GitHubu
+nastav `DBC_UPDATE_SOURCE` na složku s výstupem `vpk pack`.

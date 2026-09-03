@@ -1,6 +1,6 @@
 [package]
 name = "dbc-mcp"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "MCP server exposing dbc's saved connections to LLM tools, read-only."
 license.workspace = true
@@ -36,3 +36,7 @@ zeroize.workspace = true
 tempfile.workspace = true
 rusqlite.workspace = true
 async-trait.workspace = true
+
+# Windows version resource + icon for the shipped exe (see build.rs).
+[build-dependencies]
+winresource = "0.1"

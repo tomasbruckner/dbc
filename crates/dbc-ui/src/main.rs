@@ -71,6 +71,7 @@ mod folders;
 mod keymap;
 mod sql_input;
 mod tabs;
+mod updater;
 mod text_model;
 mod text_view;
 mod theme;
@@ -2274,6 +2275,10 @@ pub(crate) struct PendingCompare {
 }
 
 struct AppView {
+    /// A newer version, downloaded and waiting (`updater.rs`). `Some`
+    /// lights the „Aktualizovat" button in the top bar; the quit path
+    /// applies it either way so the next launch is the new version.
+    update: Option<updater::ReadyUpdate>,
     /// Editor tabs (2026-09-02 design §1). Everything that used to assume
     /// one editor lives in the active tab's `EditorTab`; reach it through
     /// `editor()`/`editor_mut()`, or by id from an async completion.
@@ -7170,6 +7175,57 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// Best-effort, and deliberately silent. A session that cannot be
     /// written costs a window that opens blank next time; saying so during
     /// shutdown would be a message nobody is there to read.
+    /// The update check came back. Only a downloaded update changes
+    /// anything on screen; the rest goes to the log or nowhere.
+    fn finish_update_check(&mut self, outcome: updater::Outcome, cx: &mut Context<Self>) {
+        use dbc_state::applog::{log, Event};
+        match outcome {
+            updater::Outcome::Ready(update) => {
+                log(Event::UpdateReady { version: update.version.clone() });
+                self.update = Some(update);
+                cx.notify();
+            }
+            updater::Outcome::Failed(error) => log(Event::UpdateFailed { error }),
+            updater::Outcome::NotInstalled | updater::Outcome::UpToDate => {}
+        }
+    }
+
+    /// The „Aktualizovat" button: save, hand over to the updater, quit.
+    /// A failure stays in the app — the status line says so and the
+    /// button stays lit, so the user can try again or just keep working.
+    fn apply_update_and_restart(&mut self, cx: &mut Context<Self>) {
+        // `take()`, not a borrow: the quit that follows runs the quit
+        // hooks, and `apply_update_on_exit` must find nothing there —
+        // two updaters told to wait for the same process race, and the
+        // one that wins may be the one told not to restart (seen on the
+        // first live test, 2026-09-03: the update applied, the app stayed
+        // closed). On failure the update goes back, so the button stays
+        // lit and the quit path still applies it.
+        let Some(update) = self.update.take() else { return };
+        self.save_session(cx);
+        match update.apply_and_restart() {
+            Ok(()) => cx.quit(),
+            Err(e) => {
+                dbc_state::applog::log(dbc_state::applog::Event::UpdateFailed { error: e.clone() });
+                self.editors.active_mut().payload.status = format!("Aktualizace se nepodařila: {e}");
+                self.update = Some(update);
+                cx.notify();
+            }
+        }
+    }
+
+    /// The quit path: a downloaded update is applied after the process
+    /// ends, without a restart, so the next launch is the new version.
+    /// `take()` so the two quit hooks (window closed, app quit) cannot
+    /// launch the updater twice.
+    fn apply_update_on_exit(&mut self) {
+        if let Some(update) = self.update.take() {
+            if let Err(e) = update.apply_on_exit() {
+                dbc_state::applog::log(dbc_state::applog::Event::UpdateFailed { error: e });
+            }
+        }
+    }
+
     fn save_session(&self, cx: &App) {
         let state = self.capture_session(cx);
         // Logged because a restart that comes back blank is otherwise
@@ -15064,6 +15120,10 @@ mod plan_restore_tests {
 }
 
 fn main() {
+    // Velopack first, before the log, before anything: on the launch right
+    // after an install or an update it may finish that work and exit or
+    // restart the process. Nothing the app does before it would survive.
+    updater::startup();
     // The log goes in the PROFILE directory, not the workspace: it
     // describes what this machine did, and a workspace folder is meant to
     // be shared. Same reasoning as `history.sqlite`, which also stays put.
@@ -15331,7 +15391,10 @@ fn main() {
                         // byte-identical.
                         let weak = cx.weak_entity();
                         cx.on_window_closed(move |cx, _id| {
-                            let _ = weak.update(cx, |view: &mut AppView, cx| view.save_session(cx));
+                            let _ = weak.update(cx, |view: &mut AppView, cx| {
+                                view.save_session(cx);
+                                view.apply_update_on_exit();
+                            });
                         })
                         .detach();
                         cx.on_app_quit(|view, cx| {
@@ -15342,13 +15405,24 @@ fn main() {
                             // sixty times a second for a feature nobody
                             // notices until the next launch.
                             view.save_session(cx);
+                            view.apply_update_on_exit();
                             async {}
+                        })
+                        .detach();
+                        // The update check: one blocking call on a
+                        // background thread, then a field on the view.
+                        // Nothing on screen until it has actually
+                        // downloaded something.
+                        cx.spawn(async move |this, cx| {
+                            let outcome = cx.background_spawn(async { updater::check_and_download() }).await;
+                            let _ = this.update(cx, |view, cx| view.finish_update_check(outcome, cx));
                         })
                         .detach();
                         // Read before `config` is moved into the struct below.
                         let sidebar_width = sidebar_width_from(config.sidebar_width);
                         editors.active_mut().payload.status = status.clone();
                         AppView {
+                            update: None,
                             editors,
                             history_scrollbar: scrollbar::ScrollbarHandle::new(),
                             ac_scrollbar: scrollbar::ScrollbarHandle::new(),

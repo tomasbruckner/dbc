@@ -2166,6 +2166,10 @@ impl AppView {
         let history_on =
             matches!(self.editor().results.active().map(|t| &t.content), Some(crate::tabs::TabContent::History));
         let maximized = window.is_maximized();
+        // Lit only while a newer version sits downloaded on disk. Never a
+        // „checking…" state: the bar must look the same on a laptop
+        // without internet as on one with it.
+        let update_label = self.update.as_ref().map(|u| format!("Aktualizovat na v{}", u.version));
 
         div()
             .id("top-bar")
@@ -2249,6 +2253,10 @@ impl AppView {
                 ),
             )
             .child(ui::toolbar_separator(theme))
+            .children(update_label.map(|label| {
+                ui::toolbar_button("top-bar-update", label, true, true, theme)
+                    .on_click(cx.listener(|view, _, _, cx| view.apply_update_and_restart(cx)))
+            }))
             .child(
                 div()
                     .pr_2()

@@ -1,24 +1,32 @@
 name: Release
 
 # Push a tag `vX.Y.Z` (the same version as the workspace Cargo.toml) and
-# this builds the shipped zip with release.ps1 and attaches it to a GitHub
-# Release named after the tag. Nothing is signed; see README.
+# this builds the app, packs it with Velopack (release.ps1) and attaches
+# the installer, the portable zip and the update packages to a GitHub
+# Release named after the tag. The shipped app updates itself from that
+# Release (crates/dbc-ui/src/updater.rs).
 #
 # It can also be run by hand for a tag that already exists (Actions →
 # Release → Run workflow), so a failed run is repeated without deleting
 # and re-pushing the tag.
+#
+# Code signing is optional and off until the repository has the SignPath
+# secret; see SECURITY.md → „Code signing". With it, the three executables
+# are signed before packing and the installer after.
 on:
   push:
     tags: ["v*.*.*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to release, e.g. v0.32.0"
+        description: "Existing tag to release, e.g. v0.33.0"
         required: true
         type: string
 
 env:
   TAG: ${{ inputs.tag || github.ref_name }}
+  # `secrets` cannot be read in a step's `if`; an env var can.
+  SIGN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
 
 permissions:
   contents: write
@@ -51,9 +59,45 @@ jobs:
             throw "tag $env:TAG but Cargo.toml says $v — bump first (chore: vX.Y.Z)"
           }
 
-      - name: Build and zip
+      - name: Velopack CLI
         shell: pwsh
-        run: ./release.ps1
+        run: dotnet tool install -g vpk
+
+      - name: Build (dist/stage)
+        shell: pwsh
+        run: ./release.ps1 -SkipPack
+
+      # --- optional: sign the executables ---------------------------------
+      - name: Upload the unsigned executables
+        if: env.SIGN == 'true'
+        id: unsigned-exes
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-exes
+          path: dist/stage/*.exe
+
+      - name: Sign the executables (SignPath)
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.unsigned-exes.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist/signed-exes
+
+      - name: Use the signed executables
+        if: env.SIGN == 'true'
+        shell: pwsh
+        run: |
+          foreach ($exe in "dbc-ui.exe", "dbc.exe", "dbc-mcp.exe") {
+            $signed = Get-ChildItem -Recurse dist/signed-exes -Filter $exe | Select-Object -First 1
+            if (-not $signed) { throw "signed $exe missing" }
+            Copy-Item $signed.FullName "dist/stage/$exe" -Force
+          }
+      # ---------------------------------------------------------------------
 
       - name: Release notes from CHANGELOG.md
         shell: pwsh
@@ -64,10 +108,50 @@ jobs:
           $notes = if ($m.Success) { $m.Groups[1].Value.Trim() } else { "See CHANGELOG.md." }
           Set-Content -Path notes.md -Value $notes
 
+      - name: Pack (dist/releases)
+        shell: pwsh
+        run: ./release.ps1 -SkipBuild -ReleaseNotes notes.md
+
+      # --- optional: sign the installer -----------------------------------
+      - name: Upload the unsigned installer
+        if: env.SIGN == 'true'
+        id: unsigned-setup
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-setup
+          path: dist/releases/dbc-win-Setup.exe
+
+      - name: Sign the installer (SignPath)
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.unsigned-setup.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist/signed-setup
+
+      - name: Use the signed installer
+        if: env.SIGN == 'true'
+        shell: pwsh
+        run: |
+          $signed = Get-ChildItem -Recurse dist/signed-setup -Filter dbc-win-Setup.exe | Select-Object -First 1
+          if (-not $signed) { throw "signed dbc-win-Setup.exe missing" }
+          Copy-Item $signed.FullName dist/releases/dbc-win-Setup.exe -Force
+      # ---------------------------------------------------------------------
+
       - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          gh release create $env:TAG (Get-ChildItem dist/*.zip).FullName `
-            --title "dbc $env:TAG" --notes-file notes.md
+          # releases.win.json is what the app's updater reads; the nupkgs
+          # are what it downloads. Setup.exe and Portable.zip are for people.
+          $assets = @(
+            "dist/releases/dbc-win-Setup.exe",
+            "dist/releases/dbc-win-Portable.zip",
+            "dist/releases/releases.win.json"
+          ) + (Get-ChildItem dist/releases/*.nupkg).FullName
+          gh release create $env:TAG @assets --title "dbc $env:TAG" --notes-file notes.md

@@ -101,6 +101,14 @@ pub enum Event {
     /// loses the change.
     ConfigSaveFailed { error: String },
     Panicked { location: String, message: String },
+    /// A newer version was downloaded and is waiting to be applied — the
+    /// only trace of the update check when it succeeds, and the answer
+    /// to „why did the app restart into a new version?".
+    UpdateReady { version: String },
+    /// The update check or download failed. The user sees nothing (a
+    /// laptop without internet must not start with a warning), which is
+    /// exactly why it is written down.
+    UpdateFailed { error: String },
 }
 
 impl Event {
@@ -113,8 +121,9 @@ impl Event {
             | Event::SchemaPrefetched { .. }
             | Event::QueryOk { .. }
             | Event::WriteApplied { .. }
-            | Event::Action { .. } => Level::Info,
-            Event::Refused { .. } | Event::SchemaPrefetchFailed { .. } => Level::Warn,
+            | Event::Action { .. }
+            | Event::UpdateReady { .. } => Level::Info,
+            Event::Refused { .. } | Event::SchemaPrefetchFailed { .. } | Event::UpdateFailed { .. } => Level::Warn,
             Event::ConnectFailed { .. }
             | Event::SchemaFailed { .. }
             | Event::QueryFailed { .. }
@@ -207,6 +216,12 @@ impl Event {
             }
             Event::Panicked { location, message } => {
                 let _ = write!(s, "panic at={} message={}", q(location), q(message));
+            }
+            Event::UpdateReady { version } => {
+                let _ = write!(s, "update.ready version={}", q(version));
+            }
+            Event::UpdateFailed { error } => {
+                let _ = write!(s, "update.failed error={}", q(error));
             }
         }
         s

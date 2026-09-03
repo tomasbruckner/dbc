@@ -43,6 +43,7 @@ csv = "1"
 # building admin_sql's mutation builders (design §3/CURATION item 4) —
 # same discipline dbc-state's vault export_key and dbc-mcp already use.
 zeroize.workspace = true
+velopack = "1.2.0"
 
 # Windows version resource + icon for the shipped exe (see build.rs). The
 # version comes from this package, so `chore: vX.Y.Z` is the one bump.
