@@ -9,6 +9,10 @@ target-shared/
 # local dev: the app profile dir (DBC_DATA_DIR)
 /data/
 
+# release.ps1: its own target dir (static CRT rustflags) and the zips
+target-release/
+/dist/
+
 # settings bundles (dbc export). The vault inside stays encrypted, so this
 # is not a leak on its own — but a file whose whole purpose is to carry
 # every connection you have is not a thing to push by accident.

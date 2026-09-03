@@ -31,3 +31,14 @@ similar = "2"
 # release; this only touches that crate, so nothing else is rebuilt.
 [profile.dev.package.argon2]
 opt-level = 3
+
+# The shipped build (`release.ps1`). Thin LTO rather than fat: fat LTO over
+# GPUI + bundled DuckDB makes one link take many minutes for a few percent.
+# `strip = "symbols"` drops the symbol tables, not panic locations — those
+# come from `Location::caller`, so `dbc.log` still names file and line.
+# Panics stay `unwind`: the app's panic hook logs them, and a query thread
+# that panics must not take the window with it.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

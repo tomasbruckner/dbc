@@ -488,9 +488,9 @@ pub fn mssql_im002_hint(e: QueryError) -> QueryError {
     QueryError {
         code: e.code.clone(),
         message: format!(
-            "ODBC Driver 18 for SQL Server není nainstalován — nainstalujte balíček \
-             msodbcsql18 (nebo v nastavení připojení zadejte název nainstalovaného \
-             driveru): {}",
+            "ODBC Driver 18 for SQL Server není nainstalován — stáhněte ho z \
+             https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server \
+             (nebo v nastavení připojení zadejte název nainstalovaného driveru): {}",
             e.message
         ),
         position: e.position,

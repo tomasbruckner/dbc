@@ -40,6 +40,11 @@ csv = "1"
 # same discipline dbc-state's vault export_key and dbc-mcp already use.
 zeroize.workspace = true
 
+# Windows version resource + icon for the shipped exe (see build.rs). The
+# version comes from this package, so `chore: vX.Y.Z` is the one bump.
+[build-dependencies]
+winresource = "0.1"
+
 [dev-dependencies]
 tempfile.workspace = true
 async-trait.workspace = true
