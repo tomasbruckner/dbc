@@ -1,8 +1,16 @@
 # dbc
 
+[![CI](https://github.com/tomasbruckner/dbc/actions/workflows/ci.yml/badge.svg)](https://github.com/tomasbruckner/dbc/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Databázový klient pro Windows: SQL Server, PostgreSQL, SQLite a DuckDB
 v jednom okně. Editor s napovídáním, výsledky v mřížce, historie dotazů,
 plány, monitor serveru, správa uživatelů, zálohy, porovnání schémat.
+
+Rust + [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui).
+Rozhraní je česky. Licence MIT. Změny podle verzí v [CHANGELOG.md](CHANGELOG.md),
+hlášení bezpečnostních chyb v [SECURITY.md](SECURITY.md), jak přispět
+v [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Instalace (pro kolegy)
 

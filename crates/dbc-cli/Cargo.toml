@@ -3,6 +3,9 @@ name = "dbc-cli"
 version.workspace = true
 edition.workspace = true
 description = "Command line over the connections saved in the dbc app."
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 [[bin]]
 name = "dbc"

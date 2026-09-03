@@ -17,3 +17,7 @@ target-release/
 # is not a leak on its own — but a file whose whole purpose is to carry
 # every connection you have is not a thing to push by accident.
 *.dbcx
+
+# Design specs and implementation plans written with Claude (superpowers):
+# working notes, not part of the product. Untracked since 2026-09-03.
+docs/superpowers/

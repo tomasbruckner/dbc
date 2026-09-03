@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: cargo test (windows)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # GPUI and bundled DuckDB dominate a clean build; the cache turns a
+      # ~40-minute first run into a few minutes for every run after.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci
+
+      - name: cargo test --workspace
+        # Container-backed integration tests are #[ignore] and stay so
+        # here: no Docker on the hosted Windows runner.
+        run: cargo test --workspace --no-fail-fast

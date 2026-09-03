@@ -2,6 +2,10 @@
 name = "dbc-ui"
 version.workspace = true
 edition.workspace = true
+description = "dbc — a Windows database client for SQL Server, PostgreSQL, SQLite and DuckDB"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", rev = "907ed09c9f4476caf250e6ce4bbffb23b4622f3b" }

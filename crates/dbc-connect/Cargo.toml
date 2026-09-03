@@ -3,6 +3,9 @@ name = "dbc-connect"
 version.workspace = true
 edition.workspace = true
 description = "Opening a saved connection: one implementation, shared by the GUI and the CLI."
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 [dependencies]
 dbc-core = { path = "../dbc-core" }

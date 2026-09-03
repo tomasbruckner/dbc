@@ -3,6 +3,9 @@ name = "dbc-mcp"
 version = "0.1.0"
 edition.workspace = true
 description = "MCP server exposing dbc's saved connections to LLM tools, read-only."
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 [[bin]]
 name = "dbc-mcp"

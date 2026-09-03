@@ -1,0 +1,58 @@
+name: Release
+
+# Push a tag `vX.Y.Z` (the same version as the workspace Cargo.toml) and
+# this builds the shipped zip with release.ps1 and attaches it to a GitHub
+# Release named after the tag. Nothing is signed; see README.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: release.ps1 + GitHub Release
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+          # release.ps1 builds into its own dir with static-CRT rustflags.
+          workspaces: ". -> target-release"
+
+      - name: The tag must match Cargo.toml
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          if ("v$v" -ne "${{ github.ref_name }}") {
+            throw "tag ${{ github.ref_name }} but Cargo.toml says $v — bump first (chore: vX.Y.Z)"
+          }
+
+      - name: Build and zip
+        shell: pwsh
+        run: ./release.ps1
+
+      - name: Release notes from CHANGELOG.md
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          $text = Get-Content CHANGELOG.md -Raw
+          $m = [regex]::Match($text, "(?ms)^## \[$([regex]::Escape($v))\][^\n]*\n(.*?)(?=^## \[|\z)")
+          $notes = if ($m.Success) { $m.Groups[1].Value.Trim() } else { "See CHANGELOG.md." }
+          Set-Content -Path notes.md -Value $notes
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create "${{ github.ref_name }}" (Get-ChildItem dist/*.zip).FullName `
+            --title "dbc ${{ github.ref_name }}" --notes-file notes.md
