@@ -770,7 +770,44 @@ impl QueryRunner {
         let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
         let handle = self.handle();
         self.runtime.spawn(async move {
-            connect_and_run_many_inner(spec, statements, cancel, timeout_secs, handle, tx).await;
+            let _ = connect_and_run_many_inner(spec, statements, cancel, timeout_secs, handle, tx).await;
+        });
+        rx
+    }
+
+    /// The same SQL over many targets: `dbc_connect::fanout::run_targets`
+    /// around `connect_and_run_many_inner`, at most
+    /// `MAX_PARALLEL_TARGETS` connected at once. One channel; every event
+    /// carries its target index. No transaction is added per target
+    /// (spec §2).
+    pub fn run_on_targets(
+        &self,
+        runs: Vec<TargetRun>,
+        cancel: CancelToken,
+    ) -> tokio::sync::mpsc::Receiver<TargetQueryEvent> {
+        let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let handle = self.handle();
+        let n = runs.len();
+        let runs: std::sync::Arc<std::sync::Mutex<Vec<Option<TargetRun>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(runs.into_iter().map(Some).collect()));
+        let body_cancel = cancel.clone();
+        self.runtime.spawn(async move {
+            dbc_connect::fanout::run_targets(
+                n,
+                dbc_connect::fanout::MAX_PARALLEL_TARGETS,
+                cancel,
+                move |ix, inner_tx| {
+                    let run = runs.lock().expect("target list").get_mut(ix).and_then(Option::take);
+                    let handle = handle.clone();
+                    let cancel = body_cancel.clone();
+                    async move {
+                        let Some(run) = run else { return false };
+                        connect_and_run_many_inner(run.spec, run.statements, cancel, run.timeout_secs, handle, inner_tx).await
+                    }
+                },
+                tx,
+            )
+            .await;
         });
         rx
     }
@@ -2535,7 +2572,9 @@ async fn run_one_multi_statement(
 /// stopping at the first failure. Extracted from the `spawn` closure so
 /// it's directly testable — same "`_inner` function, driven under
 /// `#[tokio::test]` with `Handle::current()`" precedent as
-/// `run_write_transaction_inner`.
+/// `run_write_transaction_inner`. Returns `true` iff every statement
+/// finished (used by `QueryRunner::run_on_targets`, Task 4, as the fan-out
+/// body's `TargetOutcome::Ok`/`Failed` signal).
 async fn connect_and_run_many_inner(
     spec: ConnectSpec,
     statements: Vec<String>,
@@ -2543,9 +2582,9 @@ async fn connect_and_run_many_inner(
     timeout_secs: Option<u64>,
     handle: tokio::runtime::Handle,
     tx: tokio::sync::mpsc::Sender<MultiQueryEvent>,
-) {
+) -> bool {
     if cancel.is_cancelled() {
-        return;
+        return false;
     }
     // Captured BEFORE `spec` moves into `open_spec` — same convention
     // `run_script`/`open_monitor` use.
@@ -2558,28 +2597,40 @@ async fn connect_and_run_many_inner(
         Ok(o) => o,
         Err(e) => {
             let _ = tx.send(MultiQueryEvent::StatementFailed { index: 0, error: e }).await;
-            return;
+            return false;
         }
     };
     if cancel.is_cancelled() {
-        return;
+        return false;
     }
     let conn = &mut *opened.conn;
     let total = statements.len();
     for (index, sql) in statements.iter().enumerate() {
         if cancel.is_cancelled() {
-            return;
+            return false;
         }
         if run_one_multi_statement(conn, index, total, sql, read_only, dialect, timeout_secs, &cancel, &tx)
             .await
             .is_err()
         {
-            return; // stop on first error (design §4) — `opened` drops here.
+            return false; // stop on first error (design §4) — `opened` drops here.
         }
     }
     let _ = tx.send(MultiQueryEvent::RunFinished).await;
+    true
     // `opened` (connection + tunnel) drops here unconditionally.
 }
+
+/// One target of a multi-target run (spec §2): the connection spec, the
+/// statements ALREADY split and auto-limited by the caller for THIS
+/// target's dialect and config, and the per-statement timeout.
+pub struct TargetRun {
+    pub spec: ConnectSpec,
+    pub statements: Vec<String>,
+    pub timeout_secs: Option<u64>,
+}
+
+pub type TargetQueryEvent = dbc_connect::fanout::TargetEvent<MultiQueryEvent>;
 
 /// G12 T7: read-chunk producer channel depth — small and bounded (design
 /// §5: the producer never gets more than this many batches ahead of the
@@ -4845,6 +4896,75 @@ mod run_many_tests {
         // Statement 2 never dispatched — no third StatementStarted.
         assert!(!events.iter().any(|e| matches!(e, MultiQueryEvent::StatementStarted { index: 2, .. })));
         assert!(!events.iter().any(|e| matches!(e, MultiQueryEvent::RunFinished)));
+    }
+
+    /// Two SQLite files, one SQL, one run: each target gets its own
+    /// connection, events carry the target index, a failing target does
+    /// not stop the other (spec §2 isolation), and no transaction is
+    /// added (the second target's first statement stays committed after
+    /// its second statement fails).
+    ///
+    /// A plain, NON-async `#[test]` driven via `runner.handle().block_on`
+    /// — NOT `#[tokio::test]` — same hazard `monitor_pg_tests`'s module
+    /// doc comment explains: `QueryRunner::new()` builds its own
+    /// independent multi-thread `tokio::Runtime`, and dropping a
+    /// `Runtime` from inside an async context (e.g. at the end of a
+    /// `#[tokio::test]` fn, in that fn's own ambient runtime) panics.
+    #[test]
+    fn run_on_targets_isolates_targets_and_adds_no_transaction() {
+        use dbc_connect::fanout::{TargetEvent, TargetOutcome};
+        let runner = QueryRunner::new();
+        let handle = runner.handle();
+        handle.block_on(async {
+            let a = tempfile::NamedTempFile::new().unwrap();
+            let b = tempfile::NamedTempFile::new().unwrap();
+            for f in [&a, &b] {
+                let mut c = crate::connect::open(f.path().to_str().unwrap(), &handle).unwrap();
+                c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)", CancelToken::new()).await.unwrap();
+            }
+            // Only `b` gets the table the second statement needs to FAIL on.
+            {
+                let mut c = crate::connect::open(a.path().to_str().unwrap(), &handle).unwrap();
+                c.execute("CREATE TABLE u(x INTEGER)", CancelToken::new()).await.unwrap();
+            }
+            let stmts = vec![
+                "INSERT INTO t(n) VALUES ('one')".to_string(),
+                "INSERT INTO u(x) VALUES (1)".to_string(),
+                "SELECT n FROM t".to_string(),
+            ];
+            let runs = vec![
+                TargetRun { spec: ConnectSpec::Config { cfg: Box::new(sqlite_cfg(a.path().display().to_string(), false)), secret: None }, statements: stmts.clone(), timeout_secs: None },
+                TargetRun { spec: ConnectSpec::Config { cfg: Box::new(sqlite_cfg(b.path().display().to_string(), false)), secret: None }, statements: stmts, timeout_secs: None },
+            ];
+            let mut rx = runner.run_on_targets(runs, CancelToken::new());
+            let mut outcomes = [None, None];
+            let mut rows_for_0 = 0usize;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    TargetEvent::Finished { target_ix, outcome, .. } => outcomes[target_ix] = Some(outcome),
+                    TargetEvent::Inner { target_ix: 0, event: MultiQueryEvent::Batch(b) } => rows_for_0 += b.num_rows(),
+                    _ => {}
+                }
+            }
+            assert_eq!(outcomes, [Some(TargetOutcome::Ok), Some(TargetOutcome::Failed)]);
+            assert_eq!(rows_for_0, 1);
+            // `b`: statement 1 committed (no client transaction), statement 2 failed, statement 3 never ran.
+            let mut c = crate::connect::open(b.path().to_str().unwrap(), &handle).unwrap();
+            let mut s = c.query("SELECT count(*) FROM t", CancelToken::new()).await.unwrap();
+            let batch = s.batches.recv().await.unwrap().unwrap();
+            // `SqliteConnection::query` renders every column as text (see
+            // `dbc-driver-sqlite`'s `DataType::Utf8` schema), so the count
+            // comes back as a string, not an `Int64Array`.
+            let n: i64 = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<dbc_core::arrow::array::StringArray>()
+                .unwrap()
+                .value(0)
+                .parse()
+                .unwrap();
+            assert_eq!(n, 1);
+        });
     }
 }
 
