@@ -196,63 +196,71 @@ pub fn status_line(state: &MultiTargetState) -> String {
     parts.join(" · ")
 }
 
-/// Per-target inputs to the merged view: `(label, buffer)` for each
-/// target with rows, using the LAST result of a target with several.
-/// This is the GPUI-free seam `merged_plan_from`/`build_merged_from` are
-/// tested through — a real `ResultSlot` needs an `Entity<ResultGrid>`,
-/// which needs a window, so tests build `(String, Rc<RefCell<ResultBuffer>>)`
-/// pairs directly instead. The filter and iteration order here MUST match
-/// `merged_plan`'s so `build_merged_buffer`'s `src_ix` lines up with
-/// `plan.mapping`.
-fn merged_inputs(state: &MultiTargetState) -> Vec<(String, Rc<RefCell<ResultBuffer>>)> {
-    state
+/// Per-target inputs to the merged view: `(target_ix, label, buffer)` for
+/// each target with rows, using the LAST result of a target with several,
+/// already filtered to non-empty buffers via `nonempty`. This is the
+/// single source of truth `merged_plan` and `build_merged_buffer` both
+/// build from — `merged_plan` takes its `Vec<usize>` from the same
+/// filtered list that produces the column plan, so the two can never
+/// drift out of step (a target whose first statement had rows but whose
+/// LAST result is empty must vanish from both together, not from one and
+/// not the other).
+///
+/// This is also the GPUI-free seam `merged_plan_from`/`build_merged_from`
+/// are tested through — a real `ResultSlot` needs an `Entity<ResultGrid>`,
+/// which needs a window, so tests build `(usize, String,
+/// Rc<RefCell<ResultBuffer>>)` triples directly instead.
+fn merged_inputs(state: &MultiTargetState) -> Vec<(usize, String, Rc<RefCell<ResultBuffer>>)> {
+    let raw: Vec<(usize, String, Rc<RefCell<ResultBuffer>>)> = state
         .targets
         .iter()
-        .filter(|t| t.rows_returned > 0)
-        .filter_map(|t| t.results.last().map(|last| (t.label(), last.buffer.clone())))
-        .collect()
+        .enumerate()
+        .filter(|(_, t)| t.rows_returned > 0)
+        .filter_map(|(ix, t)| t.results.last().map(|last| (ix, t.label(), last.buffer.clone())))
+        .collect();
+    nonempty(&raw)
 }
 
 /// Drop any input whose buffer has no rows — a defensive filter so an
 /// empty last result (nothing pushed, or a statement that genuinely
 /// returned zero rows) does not pollute the union with its columns.
-/// `merged_plan_from` and `build_merged_from` both go through this so
-/// their `src_ix`/`plan.mapping` stay aligned.
-fn nonempty(inputs: &[(String, Rc<RefCell<ResultBuffer>>)]) -> Vec<(String, Rc<RefCell<ResultBuffer>>)> {
-    inputs.iter().filter(|(_, buf)| buf.borrow().row_count() > 0).cloned().collect()
+/// `merged_inputs`, `merged_plan_from`, and `build_merged_from` all go
+/// through this (the latter two redundantly, if fed already-filtered
+/// input — harmless) so `plan.mapping` and any index derived from the
+/// same filtered list stay aligned.
+fn nonempty(
+    inputs: &[(usize, String, Rc<RefCell<ResultBuffer>>)],
+) -> Vec<(usize, String, Rc<RefCell<ResultBuffer>>)> {
+    inputs.iter().filter(|(_, _, buf)| buf.borrow().row_count() > 0).cloned().collect()
 }
 
-/// The column plan for a set of `(label, buffer)` inputs, in the order
-/// given — `merged_plan` builds its inputs from `merged_inputs` and pairs
-/// this with the matching target indices.
-fn merged_plan_from(inputs: &[(String, Rc<RefCell<ResultBuffer>>)]) -> dbc_connect::targets::ColumnPlan {
+/// The column plan for a set of `(target_ix, label, buffer)` inputs, in
+/// the order given.
+fn merged_plan_from(inputs: &[(usize, String, Rc<RefCell<ResultBuffer>>)]) -> dbc_connect::targets::ColumnPlan {
     let schemas: Vec<Vec<String>> = nonempty(inputs)
         .iter()
-        .map(|(_, buf)| buf.borrow().schema().fields().iter().map(|f| f.name().to_string()).collect())
+        .map(|(_, _, buf)| buf.borrow().schema().fields().iter().map(|f| f.name().to_string()).collect())
         .collect();
     dbc_connect::targets::union_columns("zdroj", &schemas)
 }
 
 /// Which targets take part in the merged view (the ones with rows; the
 /// LAST result of a target with several) and how their columns line up.
+/// `ixs` and the plan are derived from the SAME `merged_inputs(state)`
+/// call, so `ixs.len() == plan.mapping.len()` always holds.
 pub fn merged_plan(state: &MultiTargetState) -> (dbc_connect::targets::ColumnPlan, Vec<usize>) {
-    let ixs = state
-        .targets
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| t.rows_returned > 0 && t.results.last().is_some())
-        .map(|(ix, _)| ix)
-        .collect();
-    (merged_plan_from(&merged_inputs(state)), ixs)
+    let inputs = merged_inputs(state);
+    let ixs = inputs.iter().map(|(ix, _, _)| *ix).collect();
+    (merged_plan_from(&inputs), ixs)
 }
 
-/// The merged buffer for a set of `(label, buffer)` inputs: every column
-/// Utf8 (see module doc), `zdroj` first. Built in 4096-row batches so a
-/// large union does not allocate one giant array set. A spill I/O failure
-/// (`RecordBatch::try_new` or `ResultBuffer::push`) is surfaced rather
-/// than swallowed — silently dropping up to 4096 rows from the merged
-/// view is worse than reporting the error.
-fn build_merged_from(inputs: &[(String, Rc<RefCell<ResultBuffer>>)]) -> Result<ResultBuffer, String> {
+/// The merged buffer for a set of `(target_ix, label, buffer)` inputs:
+/// every column Utf8 (see module doc), `zdroj` first. Built in 4096-row
+/// batches so a large union does not allocate one giant array set. A
+/// spill I/O failure (`RecordBatch::try_new` or `ResultBuffer::push`) is
+/// surfaced rather than swallowed — silently dropping up to 4096 rows
+/// from the merged view is worse than reporting the error.
+fn build_merged_from(inputs: &[(usize, String, Rc<RefCell<ResultBuffer>>)]) -> Result<ResultBuffer, String> {
     let inputs = nonempty(inputs);
     let plan = merged_plan_from(&inputs);
     let schema = std::sync::Arc::new(Schema::new(
@@ -272,7 +280,7 @@ fn build_merged_from(inputs: &[(String, Rc<RefCell<ResultBuffer>>)]) -> Result<R
         let batch = RecordBatch::try_new(schema.clone(), arrays).map_err(|e| e.to_string())?;
         out.push(batch).map_err(|e| e.to_string())
     };
-    for (src_ix, (label, buffer)) in inputs.iter().enumerate() {
+    for (src_ix, (_, label, buffer)) in inputs.iter().enumerate() {
         let mut buf = buffer.borrow_mut();
         for r in 0..buf.row_count() {
             cols[0].push(Some(label.clone()));
@@ -423,9 +431,9 @@ mod tests {
     fn merged_plan_skips_targets_without_rows_and_uses_last_result() {
         let empty_schema = Arc::new(Schema::new(vec![Field::new("whatever", DataType::Utf8, true)]));
         let inputs = vec![
-            ("prod/a".to_string(), Rc::new(RefCell::new(buffer_a()))),
-            ("prod/b".to_string(), Rc::new(RefCell::new(buffer_b()))),
-            ("x/c".to_string(), Rc::new(RefCell::new(ResultBuffer::new(empty_schema)))),
+            (0usize, "prod/a".to_string(), Rc::new(RefCell::new(buffer_a()))),
+            (1usize, "prod/b".to_string(), Rc::new(RefCell::new(buffer_b()))),
+            (2usize, "x/c".to_string(), Rc::new(RefCell::new(ResultBuffer::new(empty_schema)))),
         ];
 
         let plan = merged_plan_from(&inputs);
@@ -435,8 +443,8 @@ mod tests {
     #[test]
     fn build_merged_buffer_is_all_text_with_source_first() {
         let inputs = vec![
-            ("prod/a".to_string(), Rc::new(RefCell::new(buffer_a()))),
-            ("prod/b".to_string(), Rc::new(RefCell::new(buffer_b()))),
+            (0usize, "prod/a".to_string(), Rc::new(RefCell::new(buffer_a()))),
+            (1usize, "prod/b".to_string(), Rc::new(RefCell::new(buffer_b()))),
         ];
 
         let mut merged = build_merged_from(&inputs).expect("merge should succeed");
@@ -463,9 +471,32 @@ mod tests {
         buf.push(RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values)) as ArrayRef]).unwrap())
             .unwrap();
 
-        let inputs = vec![("prod/a".to_string(), Rc::new(RefCell::new(buf)))];
+        let inputs = vec![(0usize, "prod/a".to_string(), Rc::new(RefCell::new(buf)))];
         let mut merged = build_merged_from(&inputs).expect("merge should succeed");
         assert_eq!(merged.row_count(), 5000);
         assert_eq!(merged.cell_text(4999, 1), "4999");
+    }
+
+    /// Reproduces the desync the controller flagged: target index 1 has
+    /// rows overall (a prior statement returned some) but its LAST result
+    /// is an empty buffer. It must vanish from `ixs` and `plan.mapping`
+    /// together — a positional zip between them must never see one
+    /// without the other.
+    #[test]
+    fn merged_plan_indexes_match_its_mapping_when_last_result_is_empty() {
+        let empty_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let raw = vec![
+            (0usize, "prod/a".to_string(), Rc::new(RefCell::new(buffer_a()))),
+            (1usize, "prod/b".to_string(), Rc::new(RefCell::new(ResultBuffer::new(empty_schema)))),
+            (2usize, "x/c".to_string(), Rc::new(RefCell::new(buffer_b()))),
+        ];
+
+        let filtered = nonempty(&raw);
+        let ixs: Vec<usize> = filtered.iter().map(|(ix, _, _)| *ix).collect();
+        let plan = merged_plan_from(&filtered);
+
+        assert_eq!(ixs, vec![0, 2]);
+        assert!(!ixs.contains(&1));
+        assert_eq!(ixs.len(), plan.mapping.len());
     }
 }
