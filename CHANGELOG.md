@@ -6,6 +6,10 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.34.1] - 2026-09-14
+
+The scrollbar can be dragged again, anywhere.
+
 ### Fixed
 
 - the scrollbar thumb stopped following the pointer as soon as the list had scrolled, and let go the moment the pointer left the list
