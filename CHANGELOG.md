@@ -6,6 +6,10 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-09-14
+
+The same query over many databases, in the app and on the command line.
+
 ### Added / changed
 
 - the same query over many databases: `Ctrl+Shift+D` picks the targets, one result tab with a chip per target and a merged view, `Ctrl+Alt+Enter` re-runs over the last set; `dbc query --on conn/db … --on-file` on the command line, with globs in the database part
