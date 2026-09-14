@@ -10,11 +10,10 @@
 //! a documented deviation from the spec's „typ zachován" (see the
 //! spec's §8 note). Numbers still sort/copy as their text.
 //!
-//! Task 6/7 wire this module into `AppView`/the event loop; until then
-//! nothing in the binary constructs a `MultiTargetState`, hence the
-//! blanket `#[allow(dead_code)]`.
-
-#![allow(dead_code)]
+//! Task 6 wired the tab variant and its render into `AppView`; Task 7
+//! (the event-loop consumer) is what constructs a `MultiTargetState`,
+//! titles the tab and drives the statuses, so the handful of items only
+//! it touches carry a narrow, per-item `#[allow(dead_code)]` until then.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -34,6 +33,8 @@ pub enum TargetStatus {
     Running,
     Done,
     Failed,
+    // Task 7's event loop is the first to construct it.
+    #[allow(dead_code)]
     Cancelled,
 }
 
@@ -41,6 +42,9 @@ pub enum TargetStatus {
 pub struct ResultSlot {
     pub grid: Entity<ResultGrid>,
     pub buffer: Rc<RefCell<ResultBuffer>>,
+    /// The statement this grid came from — set by Task 7's event loop
+    /// (and `activate_merged_view` for the merged slot); no reader yet.
+    #[allow(dead_code)]
     pub sql: String,
 }
 
@@ -86,11 +90,17 @@ pub struct MultiTargetState {
     pub active: usize,
     pub merged: Option<ResultSlot>,
     pub show_merged: bool,
+    /// Written by `new` / Task 7's event loop; no reader yet.
+    #[allow(dead_code)]
     pub started_at: Instant,
+    /// Written by Task 7's event loop; no reader yet.
+    #[allow(dead_code)]
     pub finished: bool,
 }
 
 impl MultiTargetState {
+    // Task 7 (the event-loop consumer) is the first caller.
+    #[allow(dead_code)]
     pub fn new(sql: &str, targets: Vec<(String, String)>) -> Self {
         Self {
             sql: sql.to_string(),
@@ -109,6 +119,29 @@ impl MultiTargetState {
 
     pub fn any_rows(&self) -> bool {
         self.targets.iter().any(|t| t.rows_returned > 0)
+    }
+
+    /// The slot whose grid is on screen: the merged one while „Vše
+    /// sloučeně" is selected, otherwise the active chip's current
+    /// „Výsledek N". `None` while the active target has no grid yet
+    /// (pending / connecting / failed / no row-producing statement).
+    pub fn showing_slot(&self) -> Option<&ResultSlot> {
+        if self.show_merged {
+            self.merged.as_ref()
+        } else {
+            self.targets.get(self.active).and_then(|t| t.results.get(t.active_result))
+        }
+    }
+
+    /// The slot owning `grid` — any target's result or the merged one —
+    /// for callers handed a grid `Entity` by an event (the grid toolbar's
+    /// „Graf") that need its buffer back.
+    pub fn slot_for_grid(&self, grid: &Entity<ResultGrid>) -> Option<&ResultSlot> {
+        self.targets
+            .iter()
+            .flat_map(|t| t.results.iter())
+            .chain(self.merged.iter())
+            .find(|r| r.grid == *grid)
     }
 
     fn count(&self, s: TargetStatus) -> usize {
@@ -146,6 +179,8 @@ pub fn chip_text(slot: &TargetSlot) -> String {
     }
 }
 
+// Task 7 (the event-loop consumer) is the first caller.
+#[allow(dead_code)]
 pub fn tab_title(n: usize, sql: &str) -> String {
     format!("{n}× {}", collapse_title(sql))
 }
@@ -248,6 +283,9 @@ fn merged_plan_from(inputs: &[(usize, String, Rc<RefCell<ResultBuffer>>)]) -> db
 /// LAST result of a target with several) and how their columns line up.
 /// `ixs` and the plan are derived from the SAME `merged_inputs(state)`
 /// call, so `ixs.len() == plan.mapping.len()` always holds.
+// Public seam exercised by the tests; the binary goes straight through
+// `build_merged_buffer`.
+#[allow(dead_code)]
 pub fn merged_plan(state: &MultiTargetState) -> (dbc_connect::targets::ColumnPlan, Vec<usize>) {
     let inputs = merged_inputs(state);
     let ixs = inputs.iter().map(|(ix, _, _)| *ix).collect();

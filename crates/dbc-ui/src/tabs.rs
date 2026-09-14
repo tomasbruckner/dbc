@@ -74,6 +74,13 @@ pub enum TabContent {
     /// "tabs.rs stays GPUI-free beyond this type name" posture as `Grid`/
     /// `Compare`.
     Admin { view: Entity<crate::admin_panel::AdminPanel> },
+    /// Multi-target run (2026-09-14 design §3): one slot per target with
+    /// its own grids, chips above, a text-only merged view. Plain data
+    /// behind `Rc<RefCell<_>>` like `ScriptRun`; the event loop in
+    /// `AppView::run_on_targets_from_editor` mutates it. Constructed by
+    /// that loop (Task 7); rendered and matched everywhere already.
+    #[allow(dead_code)]
+    MultiTarget { state: Rc<RefCell<crate::multi_target::MultiTargetState>> },
     /// The query history (2026-09-02: „ta historie by asi neměla být vidět
     /// pořád, spíše jenom když se dá zobrazit historie jako nový tab") — a
     /// tab instead of the permanent right-hand panel it used to be. One

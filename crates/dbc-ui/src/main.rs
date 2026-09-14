@@ -976,6 +976,168 @@ fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<Ap
         .into_any_element()
 }
 
+/// `TabContent::MultiTarget`'s render — chips row, optional secondary
+/// „Výsledek 1 · 2 · 3" row, then the active grid / error / summary.
+/// A free function like `render_script_run_tab`, for the same borrow
+/// reason (see that function's comment at its call site).
+fn render_multi_target_tab(
+    state: Rc<RefCell<multi_target::MultiTargetState>>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    use multi_target::TargetStatus;
+    let theme = *cx.theme();
+    let s = state.borrow();
+
+    let mut chips = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap_1()
+        .px_2()
+        .py_1()
+        .border_b_1()
+        .border_color(theme.border);
+    for (ix, t) in s.targets.iter().enumerate() {
+        let selected = !s.show_merged && ix == s.active;
+        let color = match t.status {
+            TargetStatus::Done => theme.success,
+            TargetStatus::Failed => theme.danger,
+            TargetStatus::Running => theme.warn,
+            TargetStatus::Pending | TargetStatus::Cancelled => theme.text_muted,
+        };
+        let st = state.clone();
+        chips = chips.child(
+            div()
+                .id(("mt-chip", ix))
+                .px_2()
+                .py_0p5()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(if selected { theme.bg_selected } else { theme.bg_panel })
+                .border_1()
+                .border_color(if selected { theme.accent } else { theme.border })
+                .text_color(color)
+                .child(multi_target::chip_text(t))
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    {
+                        let mut s = st.borrow_mut();
+                        s.active = ix;
+                        s.show_merged = false;
+                    }
+                    view.editor_mut().status = multi_target::status_line(&st.borrow());
+                    cx.notify();
+                })),
+        );
+    }
+    let merged_enabled = s.all_finished() && s.any_rows();
+    let st = state.clone();
+    chips = chips.child(
+        div()
+            .id("mt-chip-merged")
+            .px_2()
+            .py_0p5()
+            .rounded_md()
+            .border_1()
+            .border_color(if s.show_merged { theme.accent } else { theme.border })
+            .bg(if s.show_merged { theme.bg_selected } else { theme.bg_panel })
+            .text_color(if merged_enabled { theme.text_primary } else { theme.text_disabled })
+            .when(merged_enabled, |d| d.cursor_pointer())
+            .child(if merged_enabled { "Vše sloučeně" } else { "Vše sloučeně (po dokončení)" })
+            .when(merged_enabled, |d| {
+                d.on_click(cx.listener(move |view, _, _, cx| {
+                    view.activate_merged_view(st.clone(), cx);
+                }))
+            }),
+    );
+
+    let mut body = div().flex().flex_col().flex_1().min_h_0();
+    if s.show_merged {
+        if let Some(m) = &s.merged {
+            body = body.child(m.grid.clone());
+        }
+    } else if let Some(t) = s.targets.get(s.active) {
+        if t.results.len() > 1 {
+            let mut sub = div().flex().flex_row().gap_2().px_2().py_1().text_color(theme.text_muted);
+            for (rix, _) in t.results.iter().enumerate() {
+                let st = state.clone();
+                let active = rix == t.active_result;
+                sub = sub.child(
+                    div()
+                        .id(("mt-result", rix))
+                        .cursor_pointer()
+                        .text_color(if active { theme.text_primary } else { theme.text_muted })
+                        .child(format!("Výsledek {}", rix + 1))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            // Read the CURRENT active target at click time,
+                            // not the one captured at render — one
+                            // `borrow_mut`, so no re-borrow underneath it.
+                            let mut s = st.borrow_mut();
+                            let active = s.active;
+                            if let Some(t) = s.targets.get_mut(active) {
+                                t.active_result = rix;
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+            body = body.child(sub);
+        }
+        match t.status {
+            TargetStatus::Failed => {
+                body = body.child(
+                    div().p_2().text_color(theme.danger).child(t.error.clone().unwrap_or_default()),
+                );
+            }
+            TargetStatus::Pending => {
+                body = body.child(div().p_2().text_color(theme.text_muted).child("Čeká na spuštění"));
+            }
+            TargetStatus::Running | TargetStatus::Done | TargetStatus::Cancelled => {
+                if let Some(r) = t.results.get(t.active_result) {
+                    body = body.child(r.grid.clone());
+                } else if t.status == TargetStatus::Running {
+                    body = body.child(
+                        div().p_2().text_color(theme.text_muted).child(format!("Připojuji k {}…", t.label())),
+                    );
+                } else if t.status == TargetStatus::Done {
+                    let e = t.elapsed.map(|d| format!("{:.1} s", d.as_secs_f32())).unwrap_or_default();
+                    body = body.child(div().p_2().text_color(theme.text_muted).child(format!(
+                        "{} příkazů · {} ovlivněno · {e}",
+                        t.statements_total, t.affected
+                    )));
+                } else {
+                    body = body.child(div().p_2().text_color(theme.text_muted).child("Zrušeno"));
+                }
+            }
+        }
+    }
+    drop(s);
+    div().flex().flex_col().size_full().child(chips).child(body).into_any_element()
+}
+
+/// The grid a tab is SHOWING, with its buffer: a `Grid` tab's own; for a
+/// `MultiTarget` tab the active chip's current „Výsledek N" grid, or the
+/// merged one while „Vše sloučeně" is selected; `None` for every tab kind
+/// that has no result grid. Backs `AppView::active_grid` and the palette
+/// path of `open_chart_picker`. Exhaustive on purpose — a new tab kind
+/// must decide here whether it has a grid.
+fn showing_grid(content: &TabContent) -> Option<(Entity<ResultGrid>, Rc<RefCell<ResultBuffer>>)> {
+    match content {
+        TabContent::Grid { grid, buffer } => Some((grid.clone(), buffer.clone())),
+        TabContent::MultiTarget { state } => {
+            state.borrow().showing_slot().map(|r| (r.grid.clone(), r.buffer.clone()))
+        }
+        TabContent::Text { .. }
+        | TabContent::Monitor { .. }
+        | TabContent::Plan { .. }
+        | TabContent::Diagram { .. }
+        | TabContent::Compare { .. }
+        | TabContent::Chart { .. }
+        | TabContent::ScriptRun { .. }
+        | TabContent::Admin { .. }
+        | TabContent::History => None,
+    }
+}
+
 /// G12 T4: any empty CSV field -> SQL NULL, any non-empty field -> a value
 /// (the `csv` crate 1.4.0's `StringRecord` unescapes fields and retains no
 /// "was this quoted" metadata, verified against the resolved crate's source
@@ -3623,6 +3785,7 @@ impl AppView {
                                             TabContent::Chart { .. } => None,
                                             TabContent::ScriptRun { .. } => None,
                                             TabContent::Admin { .. } => None,
+                                            TabContent::MultiTarget { .. } => None,
                                         }
                                     })
                                 });
@@ -3821,6 +3984,44 @@ impl AppView {
             content: TabContent::Grid { grid, buffer: buf.clone() },
         });
         (id, buf)
+    }
+
+    /// „Vše sloučeně" — builds the merged grid on first click (all-text,
+    /// see `multi_target` module doc) and shows it. Rebuilt on every
+    /// click while cheap enough; the run is finished by then, so the
+    /// input never changes underneath. A spill I/O failure inside the
+    /// merge is surfaced in the status line and the view stays on the
+    /// chip it was on (`show_merged` untouched).
+    fn activate_merged_view(
+        &mut self,
+        state: Rc<RefCell<multi_target::MultiTargetState>>,
+        cx: &mut Context<Self>,
+    ) {
+        let built = multi_target::build_merged_buffer(&state.borrow());
+        let buffer = match built {
+            Ok(b) => Rc::new(RefCell::new(b)),
+            Err(msg) => {
+                self.editor_mut().status = format!("error: sloučení selhalo: {msg}");
+                cx.notify();
+                return;
+            }
+        };
+        // Same grid setup sequence as `open_adhoc_result_tab`, minus the
+        // FK/dialect bits: a merged view is never editable or joinable.
+        let grid = cx.new(ResultGrid::new);
+        grid.update(cx, |g, cx| {
+            g.set_buffer(buffer.clone(), cx);
+            g.on_stream_finished();
+        });
+        cx.subscribe(&grid, AppView::on_grid_event).detach();
+        {
+            let mut s = state.borrow_mut();
+            let sql = s.sql.clone();
+            s.merged = Some(multi_target::ResultSlot { grid, buffer, sql });
+            s.show_merged = true;
+        }
+        self.editor_mut().status = multi_target::status_line(&state.borrow());
+        cx.notify();
     }
 
     /// `run_query_with`'s multi-statement dispatch (>1 statement after
@@ -5787,6 +5988,20 @@ impl AppView {
                         return;
                     }
                 }
+                // Same as the `Grid` arm, on whichever slot grid is
+                // showing (active chip / merged) — so Esc closes a Ctrl+F
+                // find bar there too. Cancelling the run itself is the
+                // editor's cancel token below; nothing per view.
+                TabContent::MultiTarget { state } => {
+                    let grid = state.borrow().showing_slot().map(|r| r.grid.clone());
+                    if let Some(grid) = grid {
+                        let closed = grid.update(cx, |g, _| g.close_overlay_if_open());
+                        if closed {
+                            cx.notify();
+                            return;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -5836,8 +6051,17 @@ impl AppView {
         cx.notify();
     }
 
+    /// The grid (and its buffer) the ACTIVE tab is showing — a `Grid`
+    /// tab's own, or, for a `MultiTarget` tab, the active chip's current
+    /// „Výsledek N" grid / the merged one. The one answer to „which grid
+    /// is on screen" for focus, Esc-overlay handling, the keymap scope and
+    /// the palette's „Graf", so those work on whichever grid is showing.
+    fn active_grid(&self) -> Option<(Entity<ResultGrid>, Rc<RefCell<ResultBuffer>>)> {
+        showing_grid(&self.editor().results.active()?.content)
+    }
+
     fn on_focus_results(&mut self, _: &FocusResults, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(TabContent::Grid { grid, .. }) = self.editor().results.active().map(|t| &t.content) {
+        if let Some((grid, _)) = self.active_grid() {
             let handle = grid.focus_handle(cx);
             window.focus(&handle, cx);
         } else {
@@ -5857,7 +6081,7 @@ impl AppView {
         if self.tree.focus_handle(cx).contains_focused(window, cx) {
             return keymap::Scope::Tree;
         }
-        if let Some(TabContent::Grid { grid, .. }) = self.editor().results.active().map(|t| &t.content) {
+        if let Some((grid, _)) = self.active_grid() {
             if grid.focus_handle(cx).contains_focused(window, cx) {
                 return keymap::Scope::Results;
             }
@@ -10855,24 +11079,23 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         }
         // Resolve the source tab: the one owning the emitting grid Entity, or
         // the active tab (palette path). Entity<T> is comparable by identity.
-        let source = self
-            .editor()
-            .results
-            .iter()
-            .find(|t| match (&t.content, &from_grid) {
-                (TabContent::Grid { grid, .. }, Some(g)) => grid == g,
-                (TabContent::Grid { .. }, None) => Some(t.id) == self.editor().results.active().map(|a| a.id),
-                _ => false,
-            })
-            .map(|t| {
-                (
-                    t.title.clone(),
-                    match &t.content {
-                        TabContent::Grid { buffer, .. } => buffer.clone(),
-                        _ => unreachable!("matched Grid above"),
-                    },
-                )
-            });
+        // A `MultiTarget` tab owns many grids (one per target result plus
+        // the merged one): the emitting one is looked up by identity, the
+        // palette path takes whichever is showing (`showing_grid`).
+        let active_id = self.editor().results.active().map(|a| a.id);
+        let source = self.editor().results.iter().find_map(|t| {
+            let buffer = match (&t.content, &from_grid) {
+                (TabContent::Grid { grid, buffer }, Some(g)) => (grid == g).then(|| buffer.clone()),
+                (TabContent::MultiTarget { state }, Some(g)) => {
+                    state.borrow().slot_for_grid(g).map(|r| r.buffer.clone())
+                }
+                (TabContent::Grid { .. } | TabContent::MultiTarget { .. }, None) => {
+                    (Some(t.id) == active_id).then(|| showing_grid(&t.content)).flatten().map(|(_, b)| b)
+                }
+                _ => None,
+            };
+            buffer.map(|b| (t.title.clone(), b))
+        });
         let Some((source_title, buffer)) = source else {
             self.editor_mut().status = "graf lze vytvořit jen z výsledkové mřížky".into();
             cx.notify();
@@ -12040,6 +12263,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             // (the panel's own "Aplikovat" click emits `AdminEvent::
             // RequestApply`), not this generic sandbox-grid path.
             TabContent::Admin { .. } => return,
+            // Multi-target grids are plain ad-hoc results (never
+            // editable), same as `ScriptRun` — nothing to apply.
+            TabContent::MultiTarget { .. } => return,
         };
         let current_identity = self.current_conn_identity();
         if !conn_identity_matches(&tab_conn_identity, &current_identity) {
@@ -12844,6 +13070,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     // definition `grid_dirty_change_count`'s `Admin` arm
                     // (the close-tab guard) already reads.
                     TabContent::Admin { view } => (None, view.read(cx).change_count() > 0),
+                    // Never editable, and the per-target counts live in
+                    // the chips, not the tab title.
+                    TabContent::MultiTarget { .. } => (None, false),
                 };
                 // G5 Task 3, brief contract #7: dirty (unapplied staged
                 // edits) tabs get a " •" title suffix — the apply bar
@@ -13142,6 +13371,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             // `self.editor().status`, never an opaque method call).
             TabContent::ScriptRun { state } => render_script_run_tab(state.clone(), cx),
             TabContent::Admin { view } => view.clone().into_any_element(),
+            // Same free-function shape as `ScriptRun` above, for the same
+            // borrow reason.
+            TabContent::MultiTarget { state } => render_multi_target_tab(state.clone(), cx),
         };
         if let Some(note) = pending_status {
             self.editor_mut().status = note;
