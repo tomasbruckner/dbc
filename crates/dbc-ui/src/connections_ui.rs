@@ -1349,6 +1349,17 @@ pub enum PendingAfterUnlock {
     /// CURRENT text via `to_form_data`, so whatever the user had typed
     /// stays intact across the detour through this prompt.
     TestConnection(Box<ConnectionDialogUi>),
+    /// Multi-target run (spec §3, review fix): a locked vault used to let
+    /// `dispatch_multi_target` fan out with an EMPTY secret for every
+    /// non-file target — an auth failure per chip instead of the master
+    /// password prompt a single run gets. Carries the post-params SQL,
+    /// the preflighted target list and the editor tab the run is for;
+    /// resume re-enters `run_on_targets_with_sql` for THAT tab (dropped if
+    /// it closed under the prompt), which re-runs the preflight, finds the
+    /// vault unlocked and continues into the write gate / dispatch.
+    /// Cancel drops the run; the tab's `last_targets` already remembers
+    /// the set (spec §5).
+    RunOnTargets { sql: String, targets: Vec<dbc_connect::targets::Target>, editor_id: u64 },
     /// App-wide master password UX design §2/§4: the proactive "Odemknout
     /// trezor" palette action has no interrupted action to resume — it
     /// opens the prompt on its own, not as a side effect of some other
@@ -3525,6 +3536,13 @@ impl AppView {
             PendingAfterUnlock::TestConnection(ui) => {
                 self.modal = Some(ModalState::ConnectionDialog(*ui));
                 self.on_test_clicked(window, cx);
+            }
+            // Resumes for the tab the run was started from, by id — the
+            // active tab may have changed while the prompt was up.
+            PendingAfterUnlock::RunOnTargets { sql, targets, editor_id } => {
+                if self.editor_by_id_mut(editor_id).is_some() {
+                    self.run_on_targets_with_sql(editor_id, sql, targets, cx);
+                }
             }
             // Design §4: the proactive unlock has nothing to resume — just
             // report the unlock itself.

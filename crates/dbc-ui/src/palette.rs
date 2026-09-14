@@ -276,10 +276,11 @@ fn database_label(s: &DatabaseSource) -> String {
     }
 }
 
-/// Empty query: everything, the current context first. Otherwise fuzzy
-/// over `"<connection> <database>"`, so „dev sal" finds dev/sales.
-pub fn rank_databases(query: &str, sources: &[DatabaseSource], cap: usize) -> Vec<PaletteItem> {
-    let mut scored: Vec<(i64, usize, &DatabaseSource)> = sources
+/// The `(score, source index, source)` triples `rank_databases` sorts —
+/// every source the query matches, before any cap. Shared with
+/// `count_database_matches` so the two agree on what "matches" means.
+fn score_databases<'a>(query: &str, sources: &'a [DatabaseSource]) -> Vec<(i64, usize, &'a DatabaseSource)> {
+    sources
         .iter()
         .enumerate()
         .filter_map(|(ix, s)| {
@@ -290,7 +291,19 @@ pub fn rank_databases(query: &str, sources: &[DatabaseSource], cap: usize) -> Ve
             };
             Some((score + if s.is_current { FAVOURITE_BONUS } else { 0 }, ix, s))
         })
-        .collect();
+        .collect()
+}
+
+/// How many sources `rank_databases` WOULD list for `query` without its
+/// cap — the `N` of the Targets footer's „zobrazeno 200 z N" (`cap_note`).
+pub fn count_database_matches(query: &str, sources: &[DatabaseSource]) -> usize {
+    score_databases(query, sources).len()
+}
+
+/// Empty query: everything, the current context first. Otherwise fuzzy
+/// over `"<connection> <database>"`, so „dev sal" finds dev/sales.
+pub fn rank_databases(query: &str, sources: &[DatabaseSource], cap: usize) -> Vec<PaletteItem> {
+    let mut scored = score_databases(query, sources);
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     scored
         .into_iter()
@@ -349,6 +362,28 @@ pub fn toggle_all_visible(checked: &mut BTreeSet<(String, String)>, visible: &[(
             checked.insert(v.clone());
         }
     }
+}
+
+/// Enter's run order: the checked pairs in the order `visible` (the
+/// picker's current rows, connection then database) lists them, then any
+/// checked pair the current filter hides, in the set's own order. So the
+/// chips read like the picker did, not like the connection ids sort.
+pub fn ordered_checked(
+    checked: &BTreeSet<(String, String)>,
+    visible: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = visible.iter().filter(|v| checked.contains(*v)).cloned().collect();
+    out.extend(checked.iter().filter(|c| !visible.contains(c)).cloned());
+    out
+}
+
+/// The Targets picker's cap cue: when the filter matches more sources
+/// than the list shows (`rank_databases`' cap), Ctrl+Shift+A „vše
+/// zobrazené" silently covers only the shown ones — so the footer says
+/// so and asks for a narrower filter. `None` when nothing is hidden.
+/// Appended to `targets_footer` by the render, not folded into it.
+pub fn cap_note(shown: usize, total: usize) -> Option<String> {
+    (total > shown).then(|| format!("zobrazeno {shown} z {total}, zpřesni filtr"))
 }
 
 /// The Targets picker's footer line (spec §3): what is checked, and the
@@ -603,8 +638,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", PaletteClose, Some("Palette")),
         // Targets mode (multi-target spec §3). `space` has no binding
         // anywhere else, so this ancestor-scoped one wins over plain text
-        // insertion into the palette's `TextField` (in Commands/Databases
-        // mode the handler is a no-op — fuzzy matching ignores spaces).
+        // insertion into the palette's `TextField`. In Commands/Databases
+        // mode `on_palette_toggle` calls `cx.propagate()` so the keystroke
+        // still reaches the field as a typed space — fuzzy matching does
+        // NOT ignore spaces („dev sal" finds dev/sales), so a swallowed
+        // space would break the filter, not just look odd.
         // `ctrl-shift-a`, NOT the spec's `ctrl-a`: sql_input.rs binds
         // `ctrl-a` unscoped and connections_ui.rs binds it for `TextField`
         // (the focused element); both outrank a Palette-scoped binding
@@ -1109,6 +1147,53 @@ mod targets_mode_tests {
         checked.insert(("c1".into(), "a".into()));
         toggle_all_visible(&mut checked, &visible);
         assert_eq!(checked.len(), 2, "partially selected → select all");
+    }
+
+    /// Review fix: Enter runs in the order the picker showed (connection,
+    /// then database), hidden-but-checked pairs after, in set order.
+    #[test]
+    fn ordered_checked_follows_visible_order_then_set_order() {
+        let mut checked = BTreeSet::new();
+        for (c, d) in [("z", "a"), ("a", "x"), ("m", "q"), ("b", "hidden")] {
+            checked.insert((c.to_string(), d.to_string()));
+        }
+        let visible: Vec<(String, String)> = [("m", "q"), ("z", "a"), ("z", "unchecked"), ("a", "x")]
+            .into_iter()
+            .map(|(c, d)| (c.to_string(), d.to_string()))
+            .collect();
+        let out = ordered_checked(&checked, &visible);
+        let out: Vec<(&str, &str)> = out.iter().map(|(c, d)| (c.as_str(), d.as_str())).collect();
+        assert_eq!(out, vec![("m", "q"), ("z", "a"), ("a", "x"), ("b", "hidden")]);
+        assert!(ordered_checked(&BTreeSet::new(), &visible).is_empty());
+    }
+
+    /// Review fix: Ctrl+Shift+A „vše zobrazené" is bounded by the 200-row
+    /// cap; the footer must say so whenever the filter matches more.
+    #[test]
+    fn cap_note_only_when_matches_exceed_shown() {
+        assert_eq!(cap_note(200, 200), None);
+        assert_eq!(cap_note(0, 0), None);
+        assert_eq!(cap_note(3, 3), None);
+        assert_eq!(cap_note(200, 201), Some("zobrazeno 200 z 201, zpřesni filtr".to_string()));
+        assert_eq!(cap_note(200, 1500), Some("zobrazeno 200 z 1500, zpřesni filtr".to_string()));
+    }
+
+    #[test]
+    fn count_database_matches_agrees_with_uncapped_ranking() {
+        let src: Vec<DatabaseSource> = [("c1", "dev", "sales"), ("c1", "dev", "hr"), ("c2", "prod", "sales")]
+            .into_iter()
+            .map(|(id, name, db)| DatabaseSource {
+                conn_id: id.into(),
+                conn_name: name.into(),
+                folder: Vec::new(),
+                db: db.into(),
+                is_current: false,
+            })
+            .collect();
+        assert_eq!(count_database_matches("", &src), 3);
+        assert_eq!(count_database_matches("dev sal", &src), rank_databases("dev sal", &src, usize::MAX).len());
+        assert_eq!(count_database_matches("sales", &src), 2);
+        assert_eq!(count_database_matches("zzz", &src), 0);
     }
 
     #[test]

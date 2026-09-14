@@ -202,6 +202,12 @@ struct PaletteState {
     /// checked. A `BTreeSet` so the run order and the footer's server
     /// count are deterministic. Empty in the other two modes.
     checked: BTreeSet<(String, String)>,
+    /// `Targets` mode only: how many databases the current filter matches
+    /// BEFORE `build_palette_items`' 200-row cap — the footer's
+    /// „zobrazeno 200 z N" cue (`palette::cap_note`) when `items` is
+    /// shorter, since Ctrl+Shift+A only sees `items`. 0 in the other
+    /// modes.
+    targets_matched: usize,
 }
 
 /// G6 T7: autocomplete popup state — `None` when closed. `candidates` is
@@ -822,6 +828,19 @@ fn multi_target_preflight(
 /// `multi_target_close_cancels_only_an_unfinished_run`.
 fn multi_target_close_should_cancel(all_finished: bool, has_cancel: bool) -> bool {
     !all_finished && has_cancel
+}
+
+/// A `StatementFailed` in a multi-target run that is the user's own
+/// Escape, not a real error: every driver reports a cancelled query as
+/// `QueryError { code: Some("cancelled"), .. }`, and the run's token is
+/// already tripped by then. Such a failure must NOT become the target's
+/// `error`, or the `Finished { Failed }` arm would render „✗ chyba" for a
+/// target the user stopped. Both halves are required — a driver may also
+/// hand back that code for a timeout the user never asked for, and a
+/// genuine error can land after Escape was pressed. Pure, pinned by
+/// `cancelled_statement_failure_is_not_an_error`.
+fn failed_statement_is_cancel(run_cancelled: bool, code: Option<&str>) -> bool {
+    run_cancelled && code == Some("cancelled")
 }
 
 /// G15 §2c: `SplitError` -> user-facing Czech text. Used by
@@ -2307,8 +2326,9 @@ pub(crate) struct EditorTab {
     /// Multi-target spec §5: the target set of this tab's last
     /// multi-target run, written by `run_on_targets_from_editor` so
     /// `Ctrl+Alt+Enter` (`on_run_on_last_targets`) can replay it without
-    /// the picker, and pre-checked when the picker opens. Per tab, never
-    /// persisted.
+    /// the picker, and pre-checked when the picker opens. Per tab, and
+    /// persisted with the session (`SessionEditor.targets`) so the set
+    /// survives a restart.
     pub last_targets: Vec<Target>,
 }
 
@@ -3343,7 +3363,10 @@ impl AppView {
                 // goes back onto that path (auto-limit is per target
                 // there, never bypassed).
                 match routed_targets {
-                    Some(targets) => self.run_on_targets_with_sql(final_sql, targets, cx),
+                    Some(targets) => {
+                        let editor_id = self.editor_id();
+                        self.run_on_targets_with_sql(editor_id, final_sql, targets, cx)
+                    }
                     None => self.run_query_with(final_sql, None, bypass_auto_limit, cx),
                 }
             }
@@ -4424,29 +4447,52 @@ impl AppView {
                     *t = Some(targets);
                 }
             }
-            _ => self.run_on_targets_with_sql(sql, targets, cx),
+            _ => {
+                let editor_id = self.editor_id();
+                self.run_on_targets_with_sql(editor_id, sql, targets, cx)
+            }
         }
     }
 
     /// Post-params half of `run_on_targets_from_editor` (also where
-    /// `confirm_query_params` re-enters with the substituted SQL): the
-    /// pure preflight decides read-only refusal / dropped targets from
-    /// config alone, then a writing run stops at the gate and a reading
-    /// one dispatches straight away.
-    fn run_on_targets_with_sql(&mut self, sql: String, targets: Vec<Target>, cx: &mut Context<Self>) {
-        let editor_id = self.editor_id();
+    /// `confirm_query_params` re-enters with the substituted SQL, and
+    /// where the vault prompt resumes via `PendingAfterUnlock::
+    /// RunOnTargets`): the pure preflight decides read-only refusal /
+    /// dropped targets from config alone, then the vault gate (the same
+    /// three-boolean predicate as a single connect's — a locked vault must
+    /// prompt, never fan out with empty secrets), then a writing run stops
+    /// at the gate and a reading one dispatches straight away. Takes the
+    /// editor BY ID so the vault re-entry lands in the tab the run was
+    /// started from, not whichever is active after the prompt.
+    fn run_on_targets_with_sql(&mut self, editor_id: u64, sql: String, targets: Vec<Target>, cx: &mut Context<Self>) {
         if self.tab_ref(editor_id).cancel.is_some() {
             return; // one run per editor tab at a time, same as `run_query_in`
         }
         let pre = match multi_target_preflight(&self.config, &sql, &targets) {
             Ok(p) => p,
             Err(msg) => {
-                self.editor_mut().status = msg;
+                self.tab(editor_id).status = msg;
                 cx.notify();
                 return;
             }
         };
         let targets: Vec<Target> = pre.per_target.iter().map(|p| p.target.clone()).collect();
+        // Vault gate (design §1.3/§4.4, review fix): any non-file target
+        // needs its stored secret. The preflight already dropped targets
+        // whose connection is gone, so the lookup cannot miss; a miss is
+        // treated as needing the vault anyway (the safe side).
+        let needs_secret = pre.per_target.iter().any(|p| {
+            self.config
+                .connections
+                .iter()
+                .find(|c| c.id == p.target.conn_id)
+                .is_none_or(|c| !connections_ui::engine_is_file_based(c.engine))
+        });
+        if connections_ui::connect_needs_vault_prompt(needs_secret, self.vault.is_some(), Vault::exists(&self.vault_path))
+        {
+            self.open_vault_prompt(connections_ui::PendingAfterUnlock::RunOnTargets { sql, targets, editor_id }, cx);
+            return;
+        }
         if pre.writes {
             self.modal = Some(connections_ui::ModalState::MultiTargetWriteConfirm { sql, targets, editor_id });
             // UX-polish §1.4: no-input modal, cx-only site — defer focus to
@@ -4567,14 +4613,24 @@ impl AppView {
             // from `status_line` on every event.
             let mut sort_notes: Vec<String> = Vec::new();
             // The closed-tab check both arms share: a closed result tab
-            // cancels the run (the token is THIS run's) and ends the loop.
-            let tab_closed_then_cancel = |view: &mut AppView, editor_id: u64| -> bool {
+            // cancels the run and ends the loop. Cancels the captured
+            // `cancel` — THIS run's token — never whatever `tab.cancel`
+            // holds now: by the time this event is consumed a newer run
+            // may own that slot (the strip's close click already cancelled
+            // this run and a new Ctrl+Enter followed), so the slot is
+            // cleared only under the same `run_generation` guard the
+            // loop's final `this.update` uses.
+            let cancel_for_close = cancel.clone();
+            let tab_closed_then_cancel = move |view: &mut AppView, editor_id: u64| -> bool {
                 let closed = view.tab_ref(editor_id).results.iter().all(|t| t.id != tab_id);
                 if closed {
-                    if let Some(tok) = view.tab(editor_id).cancel.take() {
-                        tok.cancel();
+                    cancel_for_close.cancel();
+                    let tab = view.tab(editor_id);
+                    if tab.run_generation == my_generation {
+                        tab.cancel = None;
+                        tab.started_at = None;
+                        tab.status = "zrušeno (tab zavřen)".into();
                     }
-                    view.tab(editor_id).status = "zrušeno (tab zavřen)".into();
                 }
                 closed
             };
@@ -4704,7 +4760,15 @@ impl AppView {
                                 MultiQueryEvent::StatementFailed { index, error } => {
                                     let t = &mut s.targets[target_ix];
                                     let err_text = error.to_string();
-                                    t.error = Some(err_text.clone());
+                                    // Escape mid-statement: the driver's
+                                    // "cancelled" failure is not this
+                                    // target's error — `error` stays `None`
+                                    // so `Finished { Failed }` below reads
+                                    // as `Cancelled`. History still gets
+                                    // the row, as for a single run.
+                                    if !failed_statement_is_cancel(cancel.is_cancelled(), error.code.as_deref()) {
+                                        t.error = Some(err_text.clone());
+                                    }
                                     current[target_ix] = None;
                                     let label = t.label();
                                     let stmt_sql =
@@ -4733,8 +4797,11 @@ impl AppView {
                                     TargetOutcome::Ok => TargetStatus::Done,
                                     // Task 4 ruling: a target that was RUNNING
                                     // when the user cancelled ends as `Failed`
-                                    // with no `StatementFailed` recorded —
-                                    // shown as cancelled, not as an error.
+                                    // with no `StatementFailed` recorded (or
+                                    // only the driver's "cancelled" one, which
+                                    // `failed_statement_is_cancel` kept out of
+                                    // `error`) — shown as cancelled, not as an
+                                    // error.
                                     TargetOutcome::Failed if t.error.is_none() && cancel.is_cancelled() => {
                                         TargetStatus::Cancelled
                                     }
@@ -7081,7 +7148,7 @@ impl AppView {
         self.dropdown_open = false;
         let input = cx.new(|cx| connections_ui::TextField::new(cx, "Ctrl+K – tabulky, historie, spojení, akce…", false));
         let focus = input.focus_handle(cx);
-        let items = self.build_palette_items("", cx);
+        let (items, _) = self.build_palette_items("", cx);
         self.palette = Some(PaletteState {
             input,
             items,
@@ -7089,6 +7156,7 @@ impl AppView {
             last_query: String::new(),
             mode: palette::PaletteMode::Commands,
             checked: BTreeSet::new(),
+            targets_matched: 0,
         });
         // G1 lesson (binding per the brief): focus must move to the
         // palette's own input in the SAME update the overlay appears in, or
@@ -7123,10 +7191,18 @@ impl AppView {
     }
 
     /// Space in the palette: in `Targets` mode flips the highlighted row's
-    /// checkbox; elsewhere a no-op (see `palette::bind_keys`).
+    /// checkbox. In the other modes the keystroke is handed on
+    /// (`cx.propagate()`) so it reaches the `TextField` as a typed space —
+    /// `on_action` stops propagation by default, and without this the
+    /// Ctrl+K / Ctrl+D filters could never contain a space (see
+    /// `palette::bind_keys`).
     fn on_palette_toggle(&mut self, _: &palette::PaletteToggle, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(p) = &mut self.palette else { return };
+        let Some(p) = &mut self.palette else {
+            cx.propagate();
+            return;
+        };
         if p.mode != palette::PaletteMode::Targets {
+            cx.propagate();
             return;
         }
         if let Some(PaletteItem::Database { conn_id, db, .. }) = p.items.get(p.selected) {
@@ -7142,9 +7218,15 @@ impl AppView {
     /// current filter shows, checked (or all unchecked when they already
     /// all are). Rows the filter hides keep their state, so a target
     /// checked under one filter survives the next.
+    /// Outside `Targets` mode the chord propagates, as `on_palette_toggle`
+    /// does, so it keeps whatever meaning the focused field gives it.
     fn on_palette_toggle_all(&mut self, _: &palette::PaletteToggleAll, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(p) = &mut self.palette else { return };
+        let Some(p) = &mut self.palette else {
+            cx.propagate();
+            return;
+        };
         if p.mode != palette::PaletteMode::Targets {
+            cx.propagate();
             return;
         }
         let visible: Vec<(String, String)> = p
@@ -7162,17 +7244,28 @@ impl AppView {
     /// Enter in Targets mode: run over the checked set (spec §3). Nothing
     /// checked → nothing happens; the footer already says so. A checked
     /// pair whose connection has since been deleted is skipped, exactly as
-    /// `target_sources` drops it from the list.
+    /// `target_sources` drops it from the list. The run (and so the chip
+    /// row) follows the order the picker SHOWED — connection, then
+    /// database — not the `BTreeSet`'s opaque connection-id order
+    /// (`palette::ordered_checked`); pairs the current filter hides come
+    /// after, in set order.
     fn confirm_targets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(p) = &self.palette else { return };
-        let targets: Vec<Target> = p
-            .checked
+        let visible: Vec<(String, String)> = p
+            .items
             .iter()
+            .filter_map(|i| match i {
+                PaletteItem::Database { conn_id, db, .. } => Some((conn_id.clone(), db.clone())),
+                _ => None,
+            })
+            .collect();
+        let targets: Vec<Target> = palette::ordered_checked(&p.checked, &visible)
+            .into_iter()
             .filter_map(|(c, d)| {
-                self.config.connections.iter().find(|cfg| &cfg.id == c).map(|cfg| Target {
+                self.config.connections.iter().find(|cfg| cfg.id == c).map(|cfg| Target {
                     conn_id: cfg.id.clone(),
                     conn_name: cfg.name.clone(),
-                    database: d.clone(),
+                    database: d,
                 })
             })
             .collect();
@@ -7200,9 +7293,10 @@ impl AppView {
     /// index meaningless.
     fn refresh_palette_items(&mut self, cx: &mut Context<Self>) {
         let Some(query) = self.palette.as_ref().map(|p| p.input.read(cx).text()) else { return };
-        let items = self.build_palette_items(&query, cx);
+        let (items, matched) = self.build_palette_items(&query, cx);
         if let Some(p) = &mut self.palette {
             p.items = items;
+            p.targets_matched = matched;
             p.selected = 0;
             p.last_query = query;
         }
@@ -7237,10 +7331,12 @@ impl AppView {
             last_query: String::new(),
             mode: palette::PaletteMode::Databases,
             checked: BTreeSet::new(),
+            targets_matched: 0,
         });
-        let items = self.build_palette_items("", cx);
+        let (items, matched) = self.build_palette_items("", cx);
         if let Some(p) = &mut self.palette {
             p.items = items;
+            p.targets_matched = matched;
         }
         window.focus(&focus, cx);
         cx.notify();
@@ -7287,10 +7383,12 @@ impl AppView {
             last_query: String::new(),
             mode: palette::PaletteMode::Targets,
             checked,
+            targets_matched: 0,
         });
-        let items = self.build_palette_items("", cx);
+        let (items, matched) = self.build_palette_items("", cx);
         if let Some(p) = &mut self.palette {
             p.items = items;
+            p.targets_matched = matched;
         }
         window.focus(&focus, cx);
         cx.notify();
@@ -7315,7 +7413,10 @@ impl AppView {
         self.run_on_targets_from_editor(targets, window, cx);
     }
 
-    fn build_palette_items(&self, query: &str, cx: &Context<Self>) -> Vec<PaletteItem> {
+    /// Returns the ranked rows and, for `Targets` mode, the number of
+    /// databases the filter matched before the cap (`targets_matched`;
+    /// 0 elsewhere).
+    fn build_palette_items(&self, query: &str, cx: &Context<Self>) -> (Vec<PaletteItem>, usize) {
         if self.palette.as_ref().is_some_and(|p| p.mode == palette::PaletteMode::Targets) {
             let db = self.effective_database();
             let current = self
@@ -7339,8 +7440,8 @@ impl AppView {
             // databases and Ctrl+Shift+A must see them all. With an empty
             // query `rank_databases` keeps source order, which
             // `database_sources` produces per connection — grouped reading
-            // for free.
-            return palette::rank_databases(query, &sources, 200);
+            // for free. The pre-cap match count feeds the footer's cap cue.
+            return (palette::rank_databases(query, &sources, 200), palette::count_database_matches(query, &sources));
         }
         if self.palette.as_ref().is_some_and(|p| p.mode == palette::PaletteMode::Databases) {
             let db = self.effective_database();
@@ -7354,7 +7455,7 @@ impl AppView {
                 dbc_state::conn_cache::databases,
                 current,
             );
-            return palette::rank_databases(query, &sources, 50);
+            return (palette::rank_databases(query, &sources, 50), 0);
         }
         let is_favourite_table = |schema: &Option<String>, name: &str| {
             self.editor().connection.as_deref().is_some_and(|conn_id| {
@@ -7410,7 +7511,7 @@ impl AppView {
         // locked; "Zamknout trezor" only while unlocked.
         let vault_unlockable = self.vault.is_none() && Vault::exists(&self.vault_path);
         let vault_lockable = self.vault.is_some();
-        palette::rank_items(
+        let items = palette::rank_items(
             query,
             &tables,
             &history,
@@ -7422,7 +7523,8 @@ impl AppView {
             chart_available,
             vault_unlockable,
             vault_lockable,
-        )
+        );
+        (items, 0)
     }
 
     /// Brief contract #4: execution routes through EXISTING paths only —
@@ -7639,6 +7741,9 @@ impl AppView {
         let input = p.input.clone();
         let targets_mode = p.mode == palette::PaletteMode::Targets;
         let checked = p.checked.clone();
+        // Cap cue (review fix): `items` is what Ctrl+Shift+A sees; when the
+        // filter matched more, the footer says so.
+        let cap_note = palette::cap_note(p.items.len(), p.targets_matched);
 
         let theme = *cx.theme();
         let mut list = div().id("palette-list").flex().flex_col().flex_1().overflow_hidden();
@@ -7706,7 +7811,10 @@ impl AppView {
                         .border_t_1()
                         .border_color(theme.border)
                         .text_color(theme.text_muted)
-                        .child(palette::targets_footer(&checked)),
+                        .child(match &cap_note {
+                            Some(note) => format!("{} · {note}", palette::targets_footer(&checked)),
+                            None => palette::targets_footer(&checked),
+                        }),
                 )
             });
 
@@ -17027,6 +17135,18 @@ mod multi_statement_tests {
         assert!(!multi_target_close_should_cancel(true, true), "finished tab, live later run");
         assert!(!multi_target_close_should_cancel(false, false), "nothing to cancel");
         assert!(!multi_target_close_should_cancel(true, false));
+    }
+
+    /// Review fix: Escape mid-statement used to read „✗ chyba" because the
+    /// driver's `code: "cancelled"` failure set `error` and defeated the
+    /// `Finished { Failed }` arm's cancel mapping.
+    #[test]
+    fn cancelled_statement_failure_is_not_an_error() {
+        assert!(failed_statement_is_cancel(true, Some("cancelled")));
+        assert!(!failed_statement_is_cancel(false, Some("cancelled")), "a timeout the user never asked for");
+        assert!(!failed_statement_is_cancel(true, Some("42P01")), "a real error landing after Escape");
+        assert!(!failed_statement_is_cancel(true, None));
+        assert!(!failed_statement_is_cancel(false, None));
     }
 }
 
