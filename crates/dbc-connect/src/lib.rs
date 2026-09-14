@@ -16,6 +16,7 @@
 //! and neither belongs in a connection opener.
 
 pub mod tunnel;
+pub mod targets;
 
 use tunnel::Tunnel;
 
