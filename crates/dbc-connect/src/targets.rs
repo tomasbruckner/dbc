@@ -98,6 +98,45 @@ pub fn refuse_read_only(writes: bool, conns: &[(&str, bool)]) -> Vec<String> {
     conns.iter().filter(|(_, ro)| *ro).map(|(name, _)| name.to_string()).collect()
 }
 
+/// How N result sets line up in one table (spec §1). A column's key is
+/// `(name, occurrence)`: `SELECT a.id, b.id` is `id` and `id#2`, and a
+/// second `id` in another source pairs with `id#2`, never with `id`. A
+/// user column named like the metadata column is displayed with `#2`
+/// appended; the metadata column is always first, under its own name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnPlan {
+    pub columns: Vec<String>,
+    pub mapping: Vec<Vec<Option<usize>>>,
+}
+
+pub fn union_columns(meta_name: &str, sources: &[Vec<String>]) -> ColumnPlan {
+    // Output keys after the meta column, in first-occurrence order.
+    let mut keys: Vec<String> = Vec::new();
+    let mut per_source_keys: Vec<Vec<String>> = Vec::with_capacity(sources.len());
+    for src in sources {
+        let mut counts = std::collections::HashMap::<&str, usize>::new();
+        let mut src_keys = Vec::with_capacity(src.len());
+        for name in src {
+            let n = counts.entry(name.as_str()).or_insert(0);
+            *n += 1;
+            let key = if *n == 1 { name.clone() } else { format!("{name}#{n}") };
+            if !keys.contains(&key) {
+                keys.push(key.clone());
+            }
+            src_keys.push(key);
+        }
+        per_source_keys.push(src_keys);
+    }
+    let mapping = per_source_keys
+        .iter()
+        .map(|src_keys| keys.iter().map(|k| src_keys.iter().position(|s| s == k)).collect())
+        .collect();
+    let mut columns = Vec::with_capacity(keys.len() + 1);
+    columns.push(meta_name.to_string());
+    columns.extend(keys.into_iter().map(|k| if k == meta_name { format!("{k}#2") } else { k }));
+    ColumnPlan { columns, mapping }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +213,39 @@ mod tests {
     #[test]
     fn label_is_name_slash_database() {
         assert_eq!(t("c1", "prod", "klient_a").label(), "prod/klient_a");
+    }
+
+    fn cols(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn union_orders_by_first_occurrence_and_fills_missing_with_none() {
+        let plan = union_columns("zdroj", &[cols(&["id", "name"]), cols(&["name", "extra"])]);
+        assert_eq!(plan.columns, cols(&["zdroj", "id", "name", "extra"]));
+        assert_eq!(plan.mapping[0], vec![Some(0), Some(1), None]);
+        assert_eq!(plan.mapping[1], vec![None, Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn union_keys_duplicate_names_by_occurrence() {
+        let plan = union_columns("zdroj", &[cols(&["id", "id"]), cols(&["id"])]);
+        assert_eq!(plan.columns, cols(&["zdroj", "id", "id#2"]));
+        assert_eq!(plan.mapping[0], vec![Some(0), Some(1)]);
+        assert_eq!(plan.mapping[1], vec![Some(0), None]);
+    }
+
+    #[test]
+    fn union_renames_user_column_colliding_with_meta() {
+        let plan = union_columns("source", &[cols(&["source", "n"])]);
+        assert_eq!(plan.columns, cols(&["source", "source#2", "n"]));
+        assert_eq!(plan.mapping[0], vec![Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn union_of_nothing_is_just_the_meta_column() {
+        let plan = union_columns("source", &[]);
+        assert_eq!(plan.columns, cols(&["source"]));
+        assert!(plan.mapping.is_empty());
     }
 }
