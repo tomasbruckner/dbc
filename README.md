@@ -35,6 +35,12 @@ nainstaluje a aplikaci restartuje; kdo tlačítko ignoruje, dostane novou
 verzi při příštím spuštění, protože se nainstaluje po zavření. Nastavení
 i historie jsou v `%APPDATA%\dbc` a aktualizace se jich nedotkne.
 
+Stejný dotaz nad více databázemi: v aplikaci `Ctrl+Shift+D` (výběr cílů,
+Enter spustí; `Ctrl+Alt+Enter` zopakuje nad stejnou sadou), v příkazové
+řádce `dbc query --on prod/klient_a --on 'prod2/klient_*' --sql "…"`.
+Výsledky jsou v jednom tabu s přepínačem cílů a sloučeným pohledem;
+zápis se potvrzuje a připojení jen pro čtení ho odmítne celý.
+
 ## Podepisování a soukromí (Code signing policy)
 
 Free code signing provided by [SignPath.io](https://signpath.io),

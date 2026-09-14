@@ -6,6 +6,10 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+### Added / changed
+
+- the same query over many databases: `Ctrl+Shift+D` picks the targets, one result tab with a chip per target and a merged view, `Ctrl+Alt+Enter` re-runs over the last set; `dbc query --on conn/db … --on-file` on the command line, with globs in the database part
+
 ## [0.33.0] - 2026-09-03
 
 The first version with the installer and in-app updates. Colleagues on the 0.32.0 zip: install `dbc-win-Setup.exe` once, from then on the app updates itself.
