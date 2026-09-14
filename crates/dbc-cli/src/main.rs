@@ -175,9 +175,16 @@ fn run(a: Args) -> Result<(), String> {
     }
 
     // Everything below needs an actual connection.
+    //
+    // `Command::Query { conn: None, .. }` means `--on`/`--on-file` was used
+    // instead of the positional connection — Task 11 rewrites this whole
+    // query branch to fan out over those targets. Until then, refuse: there
+    // is no single connection here for `pick::pick` to resolve.
     let asked_for = match &a.command {
-        Command::Databases { conn } | Command::Tables { conn, .. } | Command::Query { conn, .. } => {
-            conn.as_str()
+        Command::Databases { conn } | Command::Tables { conn, .. } => conn.as_str(),
+        Command::Query { conn: Some(c), .. } => c.as_str(),
+        Command::Query { conn: None, .. } => {
+            return Err("--on zatím není v tomhle běhu podporováno".to_string())
         }
         _ => unreachable!("handled above"),
     };

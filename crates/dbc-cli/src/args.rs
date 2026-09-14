@@ -49,7 +49,19 @@ pub enum Command {
     /// The tables in one database.
     Tables { conn: String, schema: Option<String> },
     /// Run SQL and print the result.
-    Query { conn: String, sql: SqlSource, write: bool },
+    ///
+    /// `conn` is the classic positional form (one connection, `--db`
+    /// overrides its database). `targets`/`targets_file` are the multi-target
+    /// form (`--on conn/db`, repeatable, or a file listing them one per
+    /// line) — the two forms are mutually exclusive, enforced right after
+    /// parsing rather than left for the caller to notice.
+    Query {
+        conn: Option<String>,
+        targets: Vec<String>,
+        targets_file: Option<PathBuf>,
+        sql: SqlSource,
+        write: bool,
+    },
     /// Write a portable settings bundle: connections + the SEALED vault.
     /// Needs no master password — nothing is decrypted.
     Export { file: PathBuf },
@@ -105,6 +117,8 @@ PŘÍKAZY
     query <conn> --sql <s>   spustí SQL a vypíše výsledek
     query <conn> --file <f>  spustí SQL ze souboru
     query <conn> -           spustí SQL ze standardního vstupu
+    query --on <conn/db> …   spustí SQL nad více databázemi (opakuj --on)
+    query --on-file <f>      cíle ze souboru, jeden conn/db na řádek
     login                    uloží odvozený klíč trezoru pro neinteraktivní běh
     logout                   uložený klíč smaže
     export <soubor>          vyveze připojení i trezor do jednoho souboru
@@ -114,6 +128,8 @@ PŘÍKAZY
 
 VOLBY
     --db <jméno>             databáze místo té uložené u připojení
+    --on <conn[/db]>         cíl běhu; opakovatelný; db smí být glob (klient_*)
+    --on-file <cesta>        cíle ze souboru (prázdné a # řádky se přeskočí)
     --schema <jméno>         u `tables`: jen tohle schéma
     --write                  povolí i zapisující příkazy (viz níže)
     --format table|json|csv  podoba výstupu (výchozí table)
@@ -130,6 +146,14 @@ ZÁPIS
     nic se neprovede. --write je v příkazové řádce obdobou potvrzovacího
     dialogu v aplikaci: musíš ho napsat ty, pro tenhle jeden běh.
     Připojení označené jen pro čtení --write NEPŘEBIJE.
+
+VÍC DATABÁZÍ NARÁZ
+    `--on prod/klient_a --on 'prod2/klient_*'` spustí stejné SQL nad každou
+    z vyjmenovaných databází, každou na vlastním spojení, nejvýš čtyři
+    naráz. Glob se rozbalí proti živému seznamu databází. Chyba jednoho
+    cíle ostatní nezastaví; výsledek je 1, pokud selhal aspoň jeden.
+    `--write` platí pro všechny cíle; připojení jen pro čtení odmítne
+    celý běh dřív, než se cokoli otevře.
 
 PŘENOS NA JINÝ POČÍTAČ
     `export` uloží připojení a trezor tak, jak je — trezor zůstane
@@ -154,6 +178,7 @@ PŘÍKLADY
     dbc query prodej --file report.sql --format csv > report.csv
     dbc tables prodej --db sklad --schema dbo
     dbc query prodej --file migrace.sql --write
+    dbc query --on prod/klient_a --on 'prod2/klient_*' --sql \"select count(*) from orders\" --format json
     dbc export prenos.dbcx
     dbc import prenos.dbcx --force
 ";
@@ -169,7 +194,10 @@ fn err(message: impl Into<String>) -> ParseError {
 }
 
 /// Pulls the value that follows a flag, naming the flag if it is missing.
-fn value(flag: &str, it: &mut std::vec::IntoIter<String>) -> Result<String, ParseError> {
+fn value(
+    flag: &str,
+    it: &mut std::iter::Peekable<std::vec::IntoIter<String>>,
+) -> Result<String, ParseError> {
     it.next().ok_or_else(|| err(format!("volbě {flag} chybí hodnota")))
 }
 
@@ -180,7 +208,7 @@ fn value(flag: &str, it: &mut std::vec::IntoIter<String>) -> Result<String, Pars
 /// error rather than a silent no-op — `dbc connections --write` says so
 /// instead of pretending it did something.
 pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
-    let mut it = argv.into_iter();
+    let mut it = argv.into_iter().peekable();
     let Some(first) = it.next() else {
         return Err(err("chybí příkaz — zkus `dbc --help`"));
     };
@@ -195,6 +223,8 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
     let mut write = false;
     let mut force = false;
     let mut sql: Option<SqlSource> = None;
+    let mut targets: Vec<String> = Vec::new();
+    let mut targets_file: Option<PathBuf> = None;
 
     let simple = |command| Args {
         command,
@@ -214,7 +244,7 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
     // The connection argument, for the commands that take one. Taken here
     // so a missing one is reported as a missing ARGUMENT rather than
     // surfacing later as an unknown flag.
-    let needs_conn = matches!(first.as_str(), "databases" | "tables" | "query");
+    let needs_conn = matches!(first.as_str(), "databases" | "tables");
     let mut conn = String::new();
     if needs_conn {
         conn = match it.next() {
@@ -224,6 +254,19 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
             }
             None => return Err(err(format!("{first} chce jméno připojení"))),
         };
+    }
+
+    // `query`'s positional connection is optional — `--on`/`--on-file` can
+    // supply the target instead. Only consumed when it looks like a name,
+    // never a flag, so `dbc query --on x/y` does not eat `--on` as if it
+    // were the connection.
+    let mut query_conn: Option<String> = None;
+    if first == "query" {
+        if let Some(next) = it.peek() {
+            if !next.starts_with('-') {
+                query_conn = it.next();
+            }
+        }
     }
 
     // Same shape for the bundle path: positional, taken here, missing =>
@@ -259,6 +302,8 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
             "-" => set_sql(SqlSource::Stdin, &mut sql)?,
             "--write" => write = true,
             "--force" => force = true,
+            "--on" => targets.push(value("--on", &mut it)?),
+            "--on-file" => targets_file = Some(PathBuf::from(value("--on-file", &mut it)?)),
             "--db" => database = Some(value("--db", &mut it)?),
             "--schema" => schema = Some(value("--schema", &mut it)?),
             "--config" => config = Some(PathBuf::from(value("--config", &mut it)?)),
@@ -297,7 +342,13 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
             let Some(sql) = sql else {
                 return Err(err("query chce SQL — použij --sql, --file, nebo -"));
             };
-            Command::Query { conn, sql, write }
+            Command::Query {
+                conn: query_conn,
+                targets: targets.clone(),
+                targets_file: targets_file.clone(),
+                sql,
+                write,
+            }
         }
         "export" => Command::Export { file },
         "import" => Command::Import { file, force },
@@ -317,6 +368,29 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
     }
     if force && !matches!(command, Command::Import { .. }) {
         return Err(err("--force dává smysl jen u import"));
+    }
+
+    // The positional connection and `--on`/`--on-file` are two different
+    // ways to say "where to run this" — accepting both would mean picking
+    // one silently, so it is refused instead. `--db` belongs to the
+    // positional form only: with `--on` the database is part of `conn/db`.
+    if let Command::Query { conn, targets, targets_file, .. } = &command {
+        let has_on = !targets.is_empty() || targets_file.is_some();
+        if conn.is_some() && has_on {
+            return Err(err("buď jméno připojení, nebo --on / --on-file — ne obojí"));
+        }
+        if database.is_some() && has_on {
+            return Err(err(
+                "--db patří k pozičnímu připojení; s --on napiš databázi za lomítko (conn/db)",
+            ));
+        }
+        if conn.is_none() && !has_on {
+            return Err(err("query chce jméno připojení, nebo --on conn/db"));
+        }
+    }
+    if (!targets.is_empty() || targets_file.is_some()) && !matches!(command, Command::Query { .. })
+    {
+        return Err(err("--on a --on-file dávají smysl jen u query"));
     }
 
     Ok(Args { command, database, format, row_limit, timeout_secs, config, vault })
@@ -371,13 +445,13 @@ mod tests {
 
     #[test]
     fn query_takes_its_sql_from_any_of_the_three_sources() {
-        let Command::Query { conn, sql, write } = p(&["query", "prod", "--sql", "select 1"])
+        let Command::Query { conn, sql, write, .. } = p(&["query", "prod", "--sql", "select 1"])
             .unwrap()
             .command
         else {
             panic!()
         };
-        assert_eq!(conn, "prod");
+        assert_eq!(conn, Some("prod".to_string()));
         assert_eq!(sql, SqlSource::Text("select 1".into()));
         assert!(!write);
 
@@ -407,6 +481,52 @@ mod tests {
     fn query_without_any_sql_is_refused() {
         let e = p(&["query", "prod"]).unwrap_err();
         assert!(e.message.contains("--sql"), "{}", e.message);
+    }
+
+    #[test]
+    fn query_accepts_repeated_on_without_positional_conn() {
+        let a = p(&["query", "--on", "prod/a", "--on", "prod2/klient_*", "--sql", "select 1"])
+            .unwrap();
+        match a.command {
+            Command::Query { conn, targets, targets_file, .. } => {
+                assert_eq!(conn, None);
+                assert_eq!(targets, vec!["prod/a", "prod2/klient_*"]);
+                assert_eq!(targets_file, None);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn query_on_file_is_recorded_not_read_here() {
+        let a = p(&["query", "--on-file", "t.txt", "--sql", "select 1"]).unwrap();
+        match a.command {
+            Command::Query { targets_file, .. } => assert_eq!(targets_file, Some(PathBuf::from("t.txt"))),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn positional_conn_and_on_together_are_a_usage_error() {
+        let e = p(&["query", "prod", "--on", "x/y", "--sql", "select 1"]).unwrap_err();
+        assert!(e.message.contains("--on"), "{}", e.message);
+    }
+
+    #[test]
+    fn db_with_on_is_a_usage_error() {
+        let e = p(&["query", "--on", "x/y", "--db", "z", "--sql", "select 1"]).unwrap_err();
+        assert!(e.message.contains("--db"), "{}", e.message);
+    }
+
+    #[test]
+    fn query_without_any_target_is_a_usage_error() {
+        let e = p(&["query", "--sql", "select 1"]).unwrap_err();
+        assert!(e.message.contains("připojení") || e.message.contains("--on"), "{}", e.message);
+    }
+
+    #[test]
+    fn on_is_refused_outside_query() {
+        assert!(p(&["tables", "prod", "--on", "x"]).is_err());
     }
 
     #[test]
@@ -495,8 +615,10 @@ mod tests {
         assert!(p(&["frobnicate"]).unwrap_err().message.contains("frobnicate"));
     }
 
-    /// A connection name is a positional, so a flag in its place is a
-    /// mistake worth naming rather than a connection called „--sql".
+    /// A flag where the positional connection would go is never swallowed
+    /// as if it were a connection called „--sql" — it is simply not a
+    /// connection, so `query` falls back to needing `--on`/`--on-file`
+    /// instead, and refuses when neither shows up either.
     #[test]
     fn a_flag_where_the_connection_should_be_is_refused() {
         let e = p(&["query", "--sql", "select 1"]).unwrap_err();
