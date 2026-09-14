@@ -101,8 +101,10 @@ pub fn refuse_read_only(writes: bool, conns: &[(&str, bool)]) -> Vec<String> {
 /// How N result sets line up in one table (spec §1). A column's key is
 /// `(name, occurrence)`: `SELECT a.id, b.id` is `id` and `id#2`, and a
 /// second `id` in another source pairs with `id#2`, never with `id`. A
-/// user column named like the metadata column is displayed with `#2`
-/// appended; the metadata column is always first, under its own name.
+/// user column named like the metadata column is displayed with a suffix
+/// `#N` where N is the lowest integer that keeps the name unique among
+/// the output columns; the metadata column is always first, under its own
+/// name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnPlan {
     pub columns: Vec<String>,
@@ -133,7 +135,22 @@ pub fn union_columns(meta_name: &str, sources: &[Vec<String>]) -> ColumnPlan {
         .collect();
     let mut columns = Vec::with_capacity(keys.len() + 1);
     columns.push(meta_name.to_string());
-    columns.extend(keys.into_iter().map(|k| if k == meta_name { format!("{k}#2") } else { k }));
+    let keys_set: std::collections::HashSet<_> = keys.iter().cloned().collect();
+    columns.extend(keys.into_iter().map(|k| {
+        if k == meta_name {
+            // Find a unique suffix when renaming a key that equals meta_name.
+            let mut suffix = 2;
+            loop {
+                let renamed = format!("{k}#{suffix}");
+                if !keys_set.contains(&renamed) {
+                    return renamed;
+                }
+                suffix += 1;
+            }
+        } else {
+            k
+        }
+    }));
     ColumnPlan { columns, mapping }
 }
 
@@ -247,5 +264,12 @@ mod tests {
         let plan = union_columns("source", &[]);
         assert_eq!(plan.columns, cols(&["source"]));
         assert!(plan.mapping.is_empty());
+    }
+
+    #[test]
+    fn union_meta_collision_stays_unique_with_duplicate_user_columns() {
+        let plan = union_columns("source", &[cols(&["source", "source"])]);
+        assert_eq!(plan.columns, cols(&["source", "source#3", "source#2"]));
+        assert_eq!(plan.mapping[0], vec![Some(0), Some(1)]);
     }
 }
