@@ -10,11 +10,9 @@
 //! a documented deviation from the spec's „typ zachován" (see the
 //! spec's §8 note). Numbers still sort/copy as their text.
 //!
-//! Task 6 wired the tab variant and its render into `AppView`; Task 7
-//! (the event-loop consumer) is what constructs a `MultiTargetState`,
-//! titles the tab and drives the statuses, so the three items only it
-//! can call (`new`, `tab_title`, `TargetStatus::Cancelled`) carry a
-//! per-item `#[allow(dead_code)]` until then.
+//! Task 6 wired the tab variant and its render into `AppView`; Task 7's
+//! event-loop consumer (`AppView::dispatch_multi_target`) constructs a
+//! `MultiTargetState`, titles the tab and drives the statuses.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -34,8 +32,6 @@ pub enum TargetStatus {
     Running,
     Done,
     Failed,
-    // Task 7's event loop is the first to construct it.
-    #[allow(dead_code)]
     Cancelled,
 }
 
@@ -92,8 +88,6 @@ pub struct MultiTargetState {
 }
 
 impl MultiTargetState {
-    // Task 7 (the event-loop consumer) is the first caller.
-    #[allow(dead_code)]
     pub fn new(targets: Vec<(String, String)>) -> Self {
         Self {
             targets: targets.iter().map(|(c, d)| TargetSlot::new(c, d)).collect(),
@@ -169,8 +163,6 @@ pub fn chip_text(slot: &TargetSlot) -> String {
     }
 }
 
-// Task 7 (the event-loop consumer) is the first caller.
-#[allow(dead_code)]
 pub fn tab_title(n: usize, sql: &str) -> String {
     format!("{n}× {}", collapse_title(sql))
 }

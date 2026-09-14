@@ -1415,7 +1415,11 @@ pub enum ModalState {
     /// SAME guard behavior the user originally asked for. `error` is set by
     /// `confirm_query_params` when `build_param_sql` refuses (design §5's
     /// mandatory post-substitution rescan) — shown in the dialog, dialog
-    /// stays open, nothing runs, nothing persists.
+    /// stays open, nothing runs, nothing persists. `targets` is `Some`
+    /// when the dialog interrupted a MULTI-TARGET run
+    /// (`AppView::run_on_targets_from_editor`): confirming then routes the
+    /// substituted SQL to `run_on_targets_with_sql` instead of the
+    /// single-connection `run_query_with`.
     QueryParams {
         names: Vec<String>,
         inputs: Vec<Entity<TextField>>,
@@ -1423,7 +1427,13 @@ pub enum ModalState {
         sql_template: String,
         bypass_auto_limit: bool,
         error: Option<String>,
+        targets: Option<Vec<dbc_connect::targets::Target>>,
     },
+    /// Multi-target write gate (2026-09-14 design §3): the last click
+    /// before the same writing SQL runs on N databases. Lists the
+    /// targets; Enter is NOT a shortcut past it (see the policy match
+    /// below), Esc closes it.
+    MultiTargetWriteConfirm { sql: String, targets: Vec<dbc_connect::targets::Target>, editor_id: u64 },
     /// G9: confirmed-admin-action dialog for kill (design §6). Reuses the
     /// single-modal-at-a-time infrastructure deliberately — `run_query_with`
     /// already refuses to run while `modal.is_some()`, and the
@@ -2013,6 +2023,10 @@ pub(crate) fn modal_confirm_kind(modal: &ModalState) -> ModalConfirmKind {
         ModalState::VisibilityPicker { .. }
         | ModalState::KillConfirm { .. }
         | ModalState::AnalyzeWriteConfirm { .. }
+        // Multi-target design §3: the LAST gate before the same writing
+        // SQL is dispatched to N databases at once — the button is the
+        // gate, same posture as AnalyzeWriteConfirm.
+        | ModalState::MultiTargetWriteConfirm { .. }
         | ModalState::BackupRestore(_)
         | ModalState::ScriptRun { .. }
         | ModalState::CsvImport { .. }
@@ -2072,6 +2086,9 @@ pub(crate) fn modal_is_blocking(modal: &ModalState) -> bool {
         | ModalState::ChangeServerPassword { .. }
         | ModalState::KillConfirm { .. }
         | ModalState::AnalyzeWriteConfirm { .. }
+        // Nothing is dispatched until „Zapsat" is clicked and nothing
+        // typed here is secret — Esc is simply „no".
+        | ModalState::MultiTargetWriteConfirm { .. }
         | ModalState::BackupRestore(_)
         | ModalState::ScriptRun { .. }
         // §W3.2: a live context is still fully behind this one, so Esc is
@@ -2335,6 +2352,9 @@ impl AppView {
             }
             ModalState::AnalyzeWriteConfirm { sql, engine, running, error } => {
                 render_analyze_write_confirm_panel(&sql, engine, running, &error, cx)
+            }
+            ModalState::MultiTargetWriteConfirm { sql, targets, .. } => {
+                render_multi_target_write_confirm_panel(&sql, &targets, cx)
             }
             ModalState::ChangeServerPassword {
                 kind, user, new1, new2, admin_user, admin_password, error, running, ..
@@ -5130,6 +5150,79 @@ fn render_analyze_write_confirm_panel(
     panel.into_any_element()
 }
 
+/// Multi-target design §3: the write gate — the same writing SQL is about
+/// to run on every listed target, each on its own connection with NO
+/// shared transaction (spec §2), so the dialog says so and lists the
+/// targets (capped at 12 rows, the rest as a count). Modelled on
+/// `render_analyze_write_confirm_panel` above: danger-tinted confirm,
+/// „Zrušit" just closes. Confirming dispatches
+/// `AppView::on_confirm_multi_target_write` (main.rs).
+fn render_multi_target_write_confirm_panel(
+    sql: &str,
+    targets: &[dbc_connect::targets::Target],
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let theme = *cx.theme();
+    let mut panel = ui::panel(520., theme)
+        .id("multi-target-write-confirm")
+        .child(div().text_size(px(16.)).child(format!("Zapsat do {} cílů", targets.len())))
+        .child(div().text_color(theme.warn).child(
+            "Tohle SQL zapisuje. Spustí se na každém z těchto cílů zvlášť, bez společné transakce.",
+        ));
+    let mut list = div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .p_1()
+        .bg(theme.bg_app)
+        .rounded_md()
+        .text_color(theme.text_muted);
+    for t in targets.iter().take(12) {
+        list = list.child(t.label());
+    }
+    if targets.len() > 12 {
+        list = list.child(format!("… a dalších {}", targets.len() - 12));
+    }
+    panel = panel.child(list).child(
+        div()
+            .id("multi-target-sql")
+            .p_1()
+            .bg(theme.bg_app)
+            .rounded_md()
+            .text_color(theme.text_muted)
+            .whitespace_normal()
+            .child(sql.to_string()),
+    );
+    panel = panel.child(
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .justify_end()
+            .mt_2()
+            .child(ui::button_state("multi-target-cancel", "Zrušit", true, theme).on_click(cx.listener(
+                |v, _, _, cx| {
+                    v.modal = None;
+                    cx.notify();
+                },
+            )))
+            .child(
+                div()
+                    .id("multi-target-confirm-btn")
+                    .cursor_pointer()
+                    // danger tint — DELETED_ROW_BG family, matches kill-confirm.
+                    .bg(theme.diff_deleted_bg)
+                    .text_color(theme.text_primary)
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .child("Zapsat")
+                    .on_click(cx.listener(|v, _, _, cx| v.on_confirm_multi_target_write(cx))),
+            ),
+    );
+    panel.into_any_element()
+}
+
 /// Design §W4 deliverable text — quoted verbatim in the spec, so it lives
 /// as a `const` with a byte-pinned test (`workspace_missing_text_tests`)
 /// rather than as a literal buried in a render fn no unit test can reach.
@@ -5614,6 +5707,8 @@ pub(crate) fn modal_blocks_context_switch(modal: Option<&ModalState>) -> bool {
         // entry it is about to delete may not even exist in the new one.
         | Some(ModalState::ConnectionDeleteConfirm { .. })
         | Some(ModalState::AnalyzeWriteConfirm { .. })
+        // Holds connection ids the swapped-in config may not contain.
+        | Some(ModalState::MultiTargetWriteConfirm { .. })
         | Some(ModalState::BackupRestore(_))
         | Some(ModalState::ScriptRun { .. })
         | Some(ModalState::CsvImport { .. })
@@ -5682,6 +5777,7 @@ pub(crate) fn modal_first_field(modal: &ModalState, cx: &App) -> Option<FocusHan
         | ModalState::Settings
         | ModalState::KillConfirm { .. }
         | ModalState::AnalyzeWriteConfirm { .. }
+        | ModalState::MultiTargetWriteConfirm { .. }
         | ModalState::CompareDialog { .. }
         | ModalState::BackupRestore(_)
         | ModalState::ScriptRun { .. }
@@ -6913,6 +7009,7 @@ mod modal_confirm_kind_tests {
             sql_template: String::new(),
             bypass_auto_limit: false,
             error: None,
+            targets: None,
         }
     }
 
@@ -7031,6 +7128,17 @@ mod modal_confirm_kind_tests {
     #[test]
     fn analyze_write_confirm_is_ignored() {
         assert!(matches!(modal_confirm_kind(&analyze_write()), ModalConfirmKind::Ignore));
+    }
+
+    #[test]
+    fn multi_target_write_confirm_is_ignored() {
+        let m = ModalState::MultiTargetWriteConfirm {
+            sql: "DELETE FROM t".into(),
+            targets: Vec::new(),
+            editor_id: 1,
+        };
+        assert!(matches!(modal_confirm_kind(&m), ModalConfirmKind::Ignore));
+        assert!(!modal_is_blocking(&m), "Esc must still close the write gate");
     }
 
     #[test]
@@ -7895,6 +8003,7 @@ mod analyze_write_confirm_tests {
             sql_template: "SELECT 1".into(),
             bypass_auto_limit: false,
             error: None,
+            targets: None,
         });
         assert_eq!(analyze_write_dispatch_sql(&modal), None);
     }

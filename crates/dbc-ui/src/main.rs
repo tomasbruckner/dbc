@@ -84,6 +84,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use dbc_buffer::ResultBuffer;
+use dbc_connect::targets::Target;
 use dbc_core::arrow::datatypes::SchemaRef;
 use dbc_core::{
     apply_auto_limit_d, find_params, is_read_statement_d, quote_qualified_d, substitute_params,
@@ -738,6 +739,67 @@ fn sql_dialect(engine: dbc_state::Engine) -> dbc_core::Dialect {
 /// Extracted so this is directly unit-testable without a GPUI `Context`.
 fn read_only_guard_rejects(sql: &str, read_only: bool, dialect: dbc_core::Dialect) -> bool {
     read_only && !is_read_statement_d(sql, dialect)
+}
+
+/// Per-target preparation for a multi-target run (spec §1, §2): the
+/// statements split with THIS target's dialect and auto-limited with
+/// THIS target's config, plus the run-wide "does it write" fact.
+struct PreparedTarget {
+    target: Target,
+    statements: Vec<String>,
+    limited: bool,
+    timeout_secs: Option<u64>,
+    read_only: bool,
+}
+
+struct MultiTargetPreflight {
+    per_target: Vec<PreparedTarget>,
+    writes: bool,
+}
+
+/// Decided from config + SQL only — never opens anything, never touches
+/// the vault. A target whose connection is no longer in the config is
+/// dropped silently (spec §5); no usable target left is an error. A
+/// writing run over any read-only connection refuses the WHOLE run,
+/// naming those connections (spec §1).
+fn multi_target_preflight(
+    config: &AppConfig,
+    sql: &str,
+    targets: &[Target],
+) -> Result<MultiTargetPreflight, String> {
+    let mut per_target = Vec::new();
+    let mut writes = false;
+    for t in targets {
+        let Some(cfg) = config.connections.iter().find(|c| c.id == t.conn_id) else { continue };
+        let Some(dialect) = dialect_for_engine(cfg.engine) else { continue };
+        let stmts = dbc_core::split_sql(sql, dialect)
+            .map_err(|e| format!("error: SQL nelze rozdělit na příkazy: {}", split_error_message(e)))?;
+        let stmts: Vec<String> = stmts.into_iter().filter(|s| !s.trim().is_empty()).collect();
+        if stmts.iter().any(|s| !is_read_statement_d(s, dialect)) {
+            writes = true;
+        }
+        let (statements, limited) = auto_limit_each(stmts, cfg.auto_limit, false, dialect);
+        per_target.push(PreparedTarget {
+            target: Target { conn_id: cfg.id.clone(), conn_name: cfg.name.clone(), database: t.database.clone() },
+            statements,
+            limited,
+            timeout_secs: cfg.timeout_secs,
+            read_only: cfg.read_only,
+        });
+    }
+    if per_target.is_empty() {
+        return Err("Žádný z vybraných cílů už neexistuje.".to_string());
+    }
+    let conns: Vec<(&str, bool)> =
+        per_target.iter().map(|p| (p.target.conn_name.as_str(), p.read_only)).collect();
+    let refused = dbc_connect::targets::refuse_read_only(writes, &conns);
+    if !refused.is_empty() {
+        let mut names = refused;
+        names.sort();
+        names.dedup();
+        return Err(format!("Zápis odmítnut — připojení jen pro čtení: {}", names.join(", ")));
+    }
+    Ok(MultiTargetPreflight { per_target, writes })
 }
 
 /// G15 §2c: `SplitError` -> user-facing Czech text. Used by
@@ -2220,6 +2282,15 @@ pub(crate) struct EditorTab {
     /// first activation (binding needs the file's text, which startup does
     /// not read for every tab).
     pub pending_script_path: Option<PathBuf>,
+    /// Multi-target spec §5: the target set of this tab's last
+    /// multi-target run, written by `run_on_targets_from_editor` so
+    /// „Spustit na posledních cílech" (Task 8's `Ctrl+Alt+Enter`) can
+    /// replay it without the picker. Per tab, never persisted.
+    ///
+    /// Allow dead_code: written here (Task 7), read by Task 8's
+    /// `on_run_on_last_targets` — remove once that lands.
+    #[allow(dead_code)]
+    pub last_targets: Vec<Target>,
 }
 
 impl EditorTab {
@@ -2244,6 +2315,7 @@ impl EditorTab {
             last_ac_cursor: 0,
             unverified: false,
             pending_script_path: None,
+            last_targets: Vec::new(),
         }
     }
 }
@@ -3160,6 +3232,7 @@ impl AppView {
             sql_template: sql,
             bypass_auto_limit,
             error: None,
+            targets: None,
         });
         if let Some(focus) = first_focus {
             window.focus(&focus, cx);
@@ -3190,6 +3263,7 @@ impl AppView {
             null_flags,
             sql_template,
             bypass_auto_limit,
+            targets: routed_targets,
             ..
         }) = self.modal.clone()
         else {
@@ -3232,7 +3306,14 @@ impl AppView {
                     self.editor_mut().status = msg;
                 }
                 self.modal = None;
-                self.run_query_with(final_sql, None, bypass_auto_limit, cx);
+                // Multi-target: the dialog interrupted
+                // `run_on_targets_from_editor`, so the substituted SQL
+                // goes back onto that path (auto-limit is per target
+                // there, never bypassed).
+                match routed_targets {
+                    Some(targets) => self.run_on_targets_with_sql(final_sql, targets, cx),
+                    None => self.run_query_with(final_sql, None, bypass_auto_limit, cx),
+                }
             }
             Err(msg) => {
                 if let Some(connections_ui::ModalState::QueryParams { error, .. }) = &mut self.modal {
@@ -4283,6 +4364,394 @@ impl AppView {
             });
         })
         .detach();
+    }
+
+    /// Multi-target run from the editor (design §3): parameters first
+    /// (same dialog as a single run, once for every target), then the
+    /// preflight, then either the write gate or the dispatch. Remembers
+    /// the target set on the tab (`last_targets`, spec §5) before any of
+    /// that, so a refused or cancelled run still counts as „the last".
+    ///
+    /// Allow dead_code: the entry point lands here (Task 7); Task 8's
+    /// palette `Targets` mode / `Ctrl+Alt+Enter` are its callers — remove
+    /// once that lands.
+    #[allow(dead_code)]
+    fn run_on_targets_from_editor(&mut self, targets: Vec<Target>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
+            return;
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let sql = self.editor().sql.read(cx).text();
+        if sql.trim().is_empty() {
+            return;
+        }
+        self.editor_mut().last_targets = targets.clone();
+        match find_params(&sql) {
+            Some(names) if !names.is_empty() => {
+                self.open_query_params_dialog(sql, names, false, window, cx);
+                if let Some(connections_ui::ModalState::QueryParams { targets: t, .. }) = &mut self.modal {
+                    *t = Some(targets);
+                }
+            }
+            _ => self.run_on_targets_with_sql(sql, targets, cx),
+        }
+    }
+
+    /// Post-params half of `run_on_targets_from_editor` (also where
+    /// `confirm_query_params` re-enters with the substituted SQL): the
+    /// pure preflight decides read-only refusal / dropped targets from
+    /// config alone, then a writing run stops at the gate and a reading
+    /// one dispatches straight away.
+    fn run_on_targets_with_sql(&mut self, sql: String, targets: Vec<Target>, cx: &mut Context<Self>) {
+        let editor_id = self.editor_id();
+        if self.tab_ref(editor_id).cancel.is_some() {
+            return; // one run per editor tab at a time, same as `run_query_in`
+        }
+        let pre = match multi_target_preflight(&self.config, &sql, &targets) {
+            Ok(p) => p,
+            Err(msg) => {
+                self.editor_mut().status = msg;
+                cx.notify();
+                return;
+            }
+        };
+        let targets: Vec<Target> = pre.per_target.iter().map(|p| p.target.clone()).collect();
+        if pre.writes {
+            self.modal = Some(connections_ui::ModalState::MultiTargetWriteConfirm { sql, targets, editor_id });
+            cx.notify();
+            return;
+        }
+        self.dispatch_multi_target(editor_id, sql, targets, cx);
+    }
+
+    /// „Zapsat" on the write gate — dispatches into the editor tab the
+    /// gate was opened for, which may no longer exist (closed under the
+    /// dialog); then the click is simply dropped.
+    fn on_confirm_multi_target_write(&mut self, cx: &mut Context<Self>) {
+        let Some(connections_ui::ModalState::MultiTargetWriteConfirm { sql, targets, editor_id }) =
+            self.modal.take()
+        else {
+            return;
+        };
+        if self.editor_by_id_mut(editor_id).is_none() {
+            cx.notify();
+            return; // the tab closed while the dialog was up
+        }
+        self.dispatch_multi_target(editor_id, sql, targets, cx);
+    }
+
+    /// After the gate: builds one `TargetRun` per target (spec resolved via
+    /// `resolve_active_from`, exactly the single-run path's resolution),
+    /// opens the `MultiTarget` tab and consumes the fan-out channel. No
+    /// client-side transaction is added per target (spec §2). Every
+    /// completion resolves its editor BY ID (`editor_by_id_mut`/`tab`/
+    /// `tab_ref`), never the active one. Closing the result tab mid-run
+    /// cancels the run — noticed here on the next event, and immediately
+    /// by the tab strip's close click (`cancel_run_if_multi_target_tab`).
+    /// History gets one entry per statement per target, labelled
+    /// `conn/db` like the CLI's `--db` runs.
+    fn dispatch_multi_target(&mut self, editor_id: u64, sql: String, targets: Vec<Target>, cx: &mut Context<Self>) {
+        if self.tab_ref(editor_id).cancel.is_some() {
+            return; // one run per editor tab at a time
+        }
+        // Re-run, not cached from the gate: the config may have changed
+        // while the dialog was up (a connection deleted, read-only
+        // flipped) and this is the decision that must hold at dispatch.
+        let pre = match multi_target_preflight(&self.config, &sql, &targets) {
+            Ok(p) => p,
+            Err(msg) => {
+                self.tab(editor_id).status = msg;
+                cx.notify();
+                return;
+            }
+        };
+        let mut runs = Vec::with_capacity(pre.per_target.len());
+        let mut slots = Vec::with_capacity(pre.per_target.len());
+        let mut dialects = Vec::with_capacity(pre.per_target.len());
+        let mut statements_per_target = Vec::with_capacity(pre.per_target.len());
+        let mut any_limited = false;
+        for p in pre.per_target {
+            let Some(a) =
+                resolve_active_from(&self.config, self.vault.as_ref(), &p.target.conn_id, Some(&p.target.database))
+            else {
+                continue;
+            };
+            dialects.push(sql_dialect(a.engine));
+            any_limited |= p.limited;
+            statements_per_target.push(p.statements.clone());
+            runs.push(runner::TargetRun { spec: a.into_spec(), statements: p.statements, timeout_secs: p.timeout_secs });
+            slots.push((p.target.conn_name.clone(), p.target.database.clone()));
+        }
+        if runs.is_empty() {
+            self.tab(editor_id).status = "Žádný z vybraných cílů už neexistuje.".into();
+            cx.notify();
+            return;
+        }
+        let n = runs.len();
+        let state = Rc::new(RefCell::new(multi_target::MultiTargetState::new(slots)));
+        for (ix, s) in statements_per_target.iter().enumerate() {
+            state.borrow_mut().targets[ix].statements_total = s.len();
+        }
+        let cancel = CancelToken::new();
+        self.tab(editor_id).cancel = Some(cancel.clone());
+        self.tab(editor_id).started_at = Some(std::time::Instant::now());
+        // Same run-identity discipline as `run_query_in` — see
+        // `run_generation`'s doc comment.
+        self.tab(editor_id).run_generation += 1;
+        let my_generation = self.tab_ref(editor_id).run_generation;
+        let limit_suffix = if any_limited { " · auto-LIMIT" } else { "" };
+        let tab_id = self.tab(editor_id).results.open(ResultTab {
+            id: 0,
+            title: multi_target::tab_title(n, &sql),
+            pinned: false,
+            preview_key: None,
+            conn_identity: String::new(), // never editable (spec §3)
+            sql: Some(sql.clone()),
+            content: TabContent::MultiTarget { state: state.clone() },
+        });
+        self.tab(editor_id).status = format!("{}{limit_suffix}", multi_target::status_line(&state.borrow()));
+        cx.notify();
+
+        let history_started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut rx = self.runner.run_on_targets(runs, cancel.clone());
+        // Same `handle` capture as `run_many`: `Batch` pushes go through
+        // `push_async_shared`, never inline on the foreground executor.
+        let handle = self.runner.handle();
+        cx.spawn(async move |this, cx| {
+            use dbc_connect::fanout::{TargetEvent, TargetOutcome};
+            use multi_target::TargetStatus;
+            // Per-target "current buffer" for Batch pushes, outside
+            // `this.update`. `None` between row-producing statements.
+            let mut current: Vec<Option<Rc<RefCell<ResultBuffer>>>> = vec![None; n];
+            // The closed-tab check both arms share: a closed result tab
+            // cancels the run (the token is THIS run's) and ends the loop.
+            let tab_closed_then_cancel = |view: &mut AppView, editor_id: u64| -> bool {
+                let closed = view.tab_ref(editor_id).results.iter().all(|t| t.id != tab_id);
+                if closed {
+                    if let Some(tok) = view.tab(editor_id).cancel.take() {
+                        tok.cancel();
+                    }
+                    view.tab(editor_id).status = "zrušeno (tab zavřen)".into();
+                }
+                closed
+            };
+            while let Some(ev) = rx.recv().await {
+                if let TargetEvent::Inner { target_ix, event: MultiQueryEvent::Batch(b) } = ev {
+                    let push = match current.get(target_ix).and_then(|c| c.as_ref()) {
+                        Some(buf) => Some(dbc_buffer::push_async_shared(buf, b, &handle).await),
+                        None => None,
+                    };
+                    let stop = this
+                        .update(cx, |view, cx| {
+                            if view.editor_by_id_mut(editor_id).is_none() {
+                                return true;
+                            }
+                            if tab_closed_then_cancel(view, editor_id) {
+                                cx.notify();
+                                return true;
+                            }
+                            if let Some(Err(e)) = push {
+                                // A spill failure is this target's error;
+                                // the runner keeps streaming, the buffer
+                                // simply stops growing (`current` cleared
+                                // so later batches are dropped).
+                                state.borrow_mut().targets[target_ix].error = Some(e.to_string());
+                                current[target_ix] = None;
+                            } else if let Some(r) = state.borrow().targets[target_ix].results.last() {
+                                r.grid.update(cx, |g, _| g.on_batch_grown());
+                            }
+                            cx.notify();
+                            false
+                        })
+                        .unwrap_or(true);
+                    if stop {
+                        break;
+                    }
+                    continue;
+                }
+                let stop = this
+                    .update(cx, |view, cx| {
+                        if view.editor_by_id_mut(editor_id).is_none() {
+                            return true;
+                        }
+                        if tab_closed_then_cancel(view, editor_id) {
+                            cx.notify();
+                            return true;
+                        }
+                        let mut s = state.borrow_mut();
+                        match ev {
+                            TargetEvent::Started { target_ix } => {
+                                s.targets[target_ix].status = TargetStatus::Running;
+                            }
+                            TargetEvent::Inner { target_ix, event } => match event {
+                                MultiQueryEvent::StatementStarted { columns: Some(cols), .. } => {
+                                    let buf = Rc::new(RefCell::new(ResultBuffer::new(cols)));
+                                    // Same grid setup as `open_adhoc_result_tab`
+                                    // minus FK info: a multi-target grid is
+                                    // never editable or joinable (spec §3).
+                                    let grid = cx.new(ResultGrid::new);
+                                    grid.update(cx, |g, cx| {
+                                        g.set_buffer(buf.clone(), cx);
+                                        g.set_dialect(dialects[target_ix]);
+                                    });
+                                    cx.subscribe(&grid, AppView::on_grid_event).detach();
+                                    let t = &mut s.targets[target_ix];
+                                    t.results.push(multi_target::ResultSlot { grid, buffer: buf.clone() });
+                                    t.active_result = t.results.len() - 1;
+                                    current[target_ix] = Some(buf);
+                                }
+                                MultiQueryEvent::StatementStarted { columns: None, .. } => {}
+                                MultiQueryEvent::Batch(_) => unreachable!("Batch handled before this match"),
+                                MultiQueryEvent::StatementFinished { index, affected, elapsed } => {
+                                    let t = &mut s.targets[target_ix];
+                                    // A read always has a `current` buffer
+                                    // (`StatementStarted { columns: Some }`
+                                    // precedes it) — unless the Batch arm
+                                    // dropped it on a spill failure. Then
+                                    // the statement ran but its rows are
+                                    // gone: history gets the spill error.
+                                    let mut spill_err: Option<String> = None;
+                                    let rows: i64 = match affected {
+                                        Some(a) => {
+                                            t.affected += a;
+                                            t.writes += 1;
+                                            a as i64
+                                        }
+                                        None => match current[target_ix].take() {
+                                            Some(b) => {
+                                                let r = b.borrow().row_count();
+                                                t.rows_returned += r as u64;
+                                                if let Some(slot) = t.results.last() {
+                                                    slot.grid.update(cx, |g, _| {
+                                                        g.on_stream_finished();
+                                                    });
+                                                }
+                                                r as i64
+                                            }
+                                            None => {
+                                                spill_err = t.error.clone();
+                                                0
+                                            }
+                                        },
+                                    };
+                                    let label = t.label();
+                                    let stmt_sql =
+                                        statements_per_target[target_ix].get(index).cloned().unwrap_or_default();
+                                    // `record_history` borrows the view, not
+                                    // `state` — the `RefMut` may stay live.
+                                    view.record_history(
+                                        &stmt_sql,
+                                        &label,
+                                        history_started_at,
+                                        spill_err.is_none().then(|| elapsed.as_millis() as i64),
+                                        spill_err.is_none().then_some(rows),
+                                        spill_err.as_deref(),
+                                        cx,
+                                    );
+                                }
+                                MultiQueryEvent::StatementFailed { index, error } => {
+                                    let t = &mut s.targets[target_ix];
+                                    let err_text = error.to_string();
+                                    t.error = Some(err_text.clone());
+                                    current[target_ix] = None;
+                                    let label = t.label();
+                                    let stmt_sql =
+                                        statements_per_target[target_ix].get(index).cloned().unwrap_or_default();
+                                    view.record_history(
+                                        &stmt_sql,
+                                        &label,
+                                        history_started_at,
+                                        None,
+                                        None,
+                                        Some(&err_text),
+                                        cx,
+                                    );
+                                }
+                                MultiQueryEvent::RunFinished => {}
+                            },
+                            TargetEvent::Finished { target_ix, outcome, elapsed } => {
+                                let t = &mut s.targets[target_ix];
+                                t.elapsed = Some(elapsed);
+                                t.status = match outcome {
+                                    // The runner saw every statement succeed,
+                                    // but a spill failure on this side (Batch
+                                    // arm) lost a result — the render shows
+                                    // `error` only under `Failed`.
+                                    TargetOutcome::Ok if t.error.is_some() => TargetStatus::Failed,
+                                    TargetOutcome::Ok => TargetStatus::Done,
+                                    // Task 4 ruling: a target that was RUNNING
+                                    // when the user cancelled ends as `Failed`
+                                    // with no `StatementFailed` recorded —
+                                    // shown as cancelled, not as an error.
+                                    TargetOutcome::Failed if t.error.is_none() && cancel.is_cancelled() => {
+                                        TargetStatus::Cancelled
+                                    }
+                                    TargetOutcome::Failed => TargetStatus::Failed,
+                                    TargetOutcome::Cancelled => TargetStatus::Cancelled,
+                                };
+                                if t.status == TargetStatus::Failed && t.error.is_none() {
+                                    t.error = Some("neznámá chyba".into());
+                                }
+                            }
+                        }
+                        let line = multi_target::status_line(&s);
+                        drop(s);
+                        view.tab(editor_id).status = format!("{line}{limit_suffix}");
+                        cx.notify();
+                        false
+                    })
+                    .unwrap_or(true);
+                if stop {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |view, cx| {
+                if let Some(tab) = view.editor_by_id_mut(editor_id) {
+                    if tab.run_generation == my_generation {
+                        tab.cancel = None;
+                        tab.started_at = None;
+                    }
+                }
+                // Whatever never reached `Finished` (the channel closed
+                // early, the tab was closed) reads as cancelled, so no
+                // chip is left saying „běží" forever.
+                let mut s = state.borrow_mut();
+                for t in s.targets.iter_mut() {
+                    if matches!(t.status, TargetStatus::Pending | TargetStatus::Running) {
+                        t.status = TargetStatus::Cancelled;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Closing a `MultiTarget` result tab from the strip while its run is
+    /// in flight cancels the run (design §3). The consumer loop in
+    /// `dispatch_multi_target` notices a closed tab only on its next
+    /// event, so a run producing none for a while (a slow connect, a long
+    /// write) needs the close itself to cancel. `cancel` on the ACTIVE
+    /// editor is that run's token: the strip only ever closes the active
+    /// editor's tabs.
+    fn cancel_run_if_multi_target_tab(&mut self, id: u64) {
+        let is_multi = self
+            .editor()
+            .results
+            .iter()
+            .any(|t| t.id == id && matches!(t.content, TabContent::MultiTarget { .. }));
+        if !is_multi {
+            return;
+        }
+        if let Some(tok) = self.editor_mut().cancel.take() {
+            tok.cancel();
+            self.editor_mut().status = "zrušeno (tab zavřen)".into();
+        }
     }
 
     // -----------------------------------------------------------------
@@ -5897,6 +6366,10 @@ impl AppView {
                 // always cancels the values dialog (no run, no persistence,
                 // same contract as its "Zrušit" button/`cancel_query_params`).
                 connections_ui::ModalState::QueryParams { .. } => true,
+                // Multi-target write gate: nothing is dispatched until
+                // „Zapsat" is clicked and nothing typed is secret — Esc is
+                // its „Zrušit".
+                connections_ui::ModalState::MultiTargetWriteConfirm { .. } => true,
                 // G11 T6: not closable while a backup/restore is actually
                 // running (design: Esc must never abandon a running
                 // pg_dump/pg_restore/psql child or an in-flight MSSQL/
@@ -13166,6 +13639,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                                     cx.notify();
                                     return;
                                 }
+                                view.cancel_run_if_multi_target_tab(id);
                                 view.editor_mut().results.close(id);
                                 cx.notify();
                             })),
@@ -16193,6 +16667,73 @@ mod multi_statement_tests {
         assert_eq!(out, "SELECT 'a;b'; UPDATE t SET x = 'a;b';");
         let stmts = dbc_core::split_sql(&out, dbc_core::Dialect::Sqlite).unwrap();
         assert_eq!(stmts, vec!["SELECT 'a;b'".to_string(), "UPDATE t SET x = 'a;b'".to_string()]);
+    }
+
+    /// Same field list as `runner.rs`'s `sqlite_cfg`, with the id/name the
+    /// preflight tests below match targets and refusal text against.
+    fn sqlite_cfg_for_tests(id: &str, name: &str, path: &str) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: id.into(),
+            name: name.into(),
+            folder: Vec::new(),
+            engine: dbc_state::Engine::Sqlite,
+            database: path.into(),
+            host: String::new(),
+            port: None,
+            user: String::new(),
+            read_only: false,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: None,
+        }
+    }
+
+    /// Multi-target spec §1: a writing run over ANY read-only connection
+    /// refuses the WHOLE run, naming only the read-only ones — decided
+    /// from config + SQL before anything is opened.
+    #[test]
+    fn multi_target_preflight_refuses_read_only_writes_before_anything() {
+        let mut ro = sqlite_cfg_for_tests("ro", "archiv", "a.db");
+        ro.read_only = true;
+        let rw = sqlite_cfg_for_tests("rw", "prod", "b.db");
+        let config = AppConfig { connections: vec![ro, rw], ..Default::default() };
+        let targets = vec![
+            Target { conn_id: "ro".into(), conn_name: "archiv".into(), database: "a.db".into() },
+            Target { conn_id: "rw".into(), conn_name: "prod".into(), database: "b.db".into() },
+        ];
+        match multi_target_preflight(&config, "DELETE FROM t", &targets) {
+            Err(msg) => assert!(msg.contains("archiv") && !msg.contains("prod"), "{msg}"),
+            Ok(_) => panic!("must refuse"),
+        }
+        let pre = multi_target_preflight(&config, "SELECT 1", &targets).unwrap();
+        assert!(!pre.writes);
+        assert_eq!(pre.per_target.len(), 2);
+        let pre = multi_target_preflight(&config, "DELETE FROM t", &targets[1..]).unwrap();
+        assert!(pre.writes);
+    }
+
+    /// Spec §5: a remembered target whose connection was deleted since is
+    /// dropped silently; the rest of the set still runs.
+    #[test]
+    fn multi_target_preflight_drops_targets_whose_connection_is_gone() {
+        let config =
+            AppConfig { connections: vec![sqlite_cfg_for_tests("rw", "prod", "b.db")], ..Default::default() };
+        let targets = vec![
+            Target { conn_id: "gone".into(), conn_name: "x".into(), database: "y".into() },
+            Target { conn_id: "rw".into(), conn_name: "prod".into(), database: "b.db".into() },
+        ];
+        let pre = multi_target_preflight(&config, "SELECT 1", &targets).unwrap();
+        assert_eq!(pre.per_target.len(), 1);
+        assert_eq!(pre.per_target[0].target.conn_id, "rw");
+    }
+
+    #[test]
+    fn multi_target_preflight_with_no_usable_target_is_an_error() {
+        let config = AppConfig::default();
+        let targets = vec![Target { conn_id: "gone".into(), conn_name: "x".into(), database: "y".into() }];
+        assert!(multi_target_preflight(&config, "SELECT 1", &targets).is_err());
     }
 }
 
