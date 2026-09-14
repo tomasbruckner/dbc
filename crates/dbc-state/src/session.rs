@@ -65,6 +65,15 @@ pub struct SessionTab {
     pub pinned: bool,
 }
 
+/// One entry of an editor's last target set — the last target set of
+/// Ctrl+Shift+D (2026-09-14 design §3). `connection` is an id, not a name —
+/// a rename must not break it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTarget {
+    pub connection: String,
+    pub database: String,
+}
+
 /// The whole restorable window state.
 ///
 /// Every field is a name, a path, an offset or SQL. If a future field is
@@ -88,6 +97,10 @@ pub struct SessionEditor {
     pub script_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tabs: Vec<SessionTab>,
+    /// The last target set of Ctrl+Shift+D (2026-09-14 design §3), empty
+    /// for an editor that never used it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<SessionTarget>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +161,7 @@ impl SessionState {
             database: self.database.clone(),
             script_path: None,
             tabs: self.tabs.clone(),
+            targets: Vec::new(),
         };
         (vec![one], 0)
     }
@@ -277,6 +291,7 @@ mod tests {
                     database: Some("sales".into()),
                     script_path: Some(PathBuf::from("D:/x/report.sql")),
                     tabs: vec![SessionTab { title: "t".into(), sql: "select 1".into(), pinned: true }],
+                    targets: Vec::new(),
                 },
                 SessionEditor { sql: "select 2".into(), ..Default::default() },
             ],
@@ -286,6 +301,25 @@ mod tests {
         let text = toml::to_string(&s).unwrap();
         let back: SessionState = toml::from_str(&text).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn editor_targets_round_trip_and_default_empty() {
+        let mut s = SessionState::default();
+        s.editors.push(SessionEditor {
+            sql: "select 1".into(),
+            targets: vec![
+                SessionTarget { connection: "c1".into(), database: "a".into() },
+                SessionTarget { connection: "c2".into(), database: "b".into() },
+            ],
+            ..Default::default()
+        });
+        let text = toml::to_string(&s).unwrap();
+        assert!(text.contains("[[editors.targets]]"), "{text}");
+        let back: SessionState = toml::from_str(&text).unwrap();
+        assert_eq!(back.editors[0].targets.len(), 2);
+        let legacy: SessionState = toml::from_str("[[editors]]\nsql = \"x\"\n").unwrap();
+        assert!(legacy.editors[0].targets.is_empty());
     }
 
     /// A session written before editors existed becomes editor 0 — and
@@ -373,6 +407,7 @@ mod tests {
                     database: Some("dw".into()),
                     script_path: Some(PathBuf::from("D:/scripts/report.sql")),
                     tabs: vec![SessionTab { title: "t".into(), sql: "SELECT 1".into(), pinned: false }],
+                    targets: vec![SessionTarget { connection: "conn-1".into(), database: "dw".into() }],
                 },
                 SessionEditor { sql: "SELECT 2".into(), ..Default::default() },
             ],

@@ -2372,6 +2372,9 @@ pub(crate) struct EditorSnapshot {
     pub database: Option<String>,
     pub script_path: Option<PathBuf>,
     pub tabs: Vec<dbc_state::session::SessionTab>,
+    /// The tab's `last_targets` (Ctrl+Shift+D), as `(connection id,
+    /// database)` pairs — GPUI-free, like the rest of this snapshot.
+    pub targets: Vec<(String, String)>,
 }
 
 /// The pre-editor-tabs top-level session fields, still written for the
@@ -2401,7 +2404,9 @@ pub(crate) fn session_editors(
         cursor: a.cursor,
         tabs: a.tabs.clone(),
     };
-    let needs_block = editors.len() > 1 || editors.iter().any(|e| e.script_path.is_some());
+    let needs_block = editors.len() > 1
+        || editors.iter().any(|e| e.script_path.is_some())
+        || editors.iter().any(|e| !e.targets.is_empty());
     let list = if needs_block {
         editors
             .iter()
@@ -2412,6 +2417,14 @@ pub(crate) fn session_editors(
                 database: e.database.clone(),
                 script_path: e.script_path.clone(),
                 tabs: e.tabs.clone(),
+                targets: e
+                    .targets
+                    .iter()
+                    .map(|(connection, database)| dbc_state::session::SessionTarget {
+                        connection: connection.clone(),
+                        database: database.clone(),
+                    })
+                    .collect(),
             })
             .collect()
     } else {
@@ -8081,6 +8094,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         .map(|b| b.path.clone())
                         .or_else(|| t.pending_script_path.clone()),
                     tabs: session_tabs(&t.results),
+                    targets: t
+                        .last_targets
+                        .iter()
+                        .map(|tg| (tg.conn_id.clone(), tg.database.clone()))
+                        .collect(),
                 }
             })
             .collect();
@@ -16287,6 +16305,22 @@ fn main() {
                             tab.unverified = e.connection.is_some();
                             tab.results = restored_tabs_from(&e.tabs);
                             tab.pending_script_path = e.script_path.clone();
+                            // A target whose connection is gone is dropped
+                            // silently (design §3) — resurrecting a stale
+                            // id would only misdirect the next dispatch.
+                            tab.last_targets = e
+                                .targets
+                                .iter()
+                                .filter_map(|t| {
+                                    config.connections.iter().find(|c| c.id == t.connection).map(
+                                        |c| Target {
+                                            conn_id: c.id.clone(),
+                                            conn_name: c.name.clone(),
+                                            database: t.database.clone(),
+                                        },
+                                    )
+                                })
+                                .collect();
                             match &mut editors {
                                 None => editors = Some(editor_tabs::EditorTabs::new(tab)),
                                 Some(ed) => {
@@ -18030,6 +18064,7 @@ mod session_restore_tests {
             database: database.map(str::to_string),
             script_path: None,
             tabs: Vec::new(),
+            targets: Vec::new(),
         }
     }
 
@@ -18064,6 +18099,26 @@ mod session_restore_tests {
         assert_eq!(list.len(), 1);
         assert!(list[0].script_path.is_some());
     }
+
+    /// One tab with a saved target set also forces the block, and the
+    /// pairs map straight into `SessionTarget` — a single-editor session
+    /// with a target set must not fall back to the legacy shape and lose
+    /// it (spec §3).
+    #[test]
+    fn a_target_set_forces_the_editors_block_even_for_one_tab() {
+        let mut one = snapshot("select 1", Some("c1"), None);
+        one.targets = vec![("c1".into(), "a".into()), ("c2".into(), "b".into())];
+        let (list, _) = session_editors(&[one], 0);
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            list[0].targets,
+            vec![
+                dbc_state::session::SessionTarget { connection: "c1".into(), database: "a".into() },
+                dbc_state::session::SessionTarget { connection: "c2".into(), database: "b".into() },
+            ]
+        );
+    }
+
     use dbc_state::session::{SessionState, SessionTab};
 
     fn text_tab(title: &str, sql: Option<&str>) -> ResultTab {
