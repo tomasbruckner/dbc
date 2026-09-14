@@ -24,7 +24,7 @@ pub enum TargetOutcome {
 #[derive(Debug)]
 pub enum TargetEvent<E> {
     /// The target acquired a slot and its body is about to run
-    /// („připojuji" in the GUI).
+    /// ("connecting" in the GUI).
     Started { target_ix: usize },
     Inner { target_ix: usize, event: E },
     Finished { target_ix: usize, outcome: TargetOutcome, elapsed: Duration },
@@ -35,9 +35,18 @@ pub enum TargetEvent<E> {
 /// channel; a forwarder task tags its events with the target index onto
 /// `tx`, so the body can reuse code written for a single-target channel.
 /// Once `cancel` fires, targets that have not acquired a slot yet are
-/// reported `Cancelled` without running; targets already running see the
-/// same token through their own `cancel` clone (the caller passes it into
-/// the body's captured state) and stop on their own.
+/// reported `Cancelled` without running (even while every slot is still
+/// busy — the drain does not wait for a free permit); targets already
+/// running see the same token through their own `cancel` clone (the
+/// caller passes it into the body's captured state) and stop on their
+/// own. A body that panics is reported `Failed`, same as one that
+/// returns `false`; either way exactly one `Finished` is sent per target.
+///
+/// Contract on `body`: it must let its `Sender<E>` drop when it
+/// completes (returns or panics). A body that stashes a clone of the
+/// sender somewhere longer-lived than its own future will hang the
+/// forwarder task — which never sees `recv() == None` — and hold its
+/// semaphore permit forever.
 pub async fn run_targets<F, Fut, E>(
     n: usize,
     max_parallel: usize,
@@ -53,10 +62,27 @@ pub async fn run_targets<F, Fut, E>(
     let body = Arc::new(body);
     let mut set = tokio::task::JoinSet::new();
     for ix in 0..n {
-        let permit = match sem.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => break,
+        // Race the cancel signal against permit acquisition, biased toward
+        // cancel: if every slot is busy when `cancel` fires, queued targets
+        // must still drain immediately rather than wait for a slot to free
+        // up (that slot may not free for as long as the running target's
+        // body takes).
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            acquired = sem.clone().acquire_owned() => acquired.ok(),
         };
+        let permit = match permit {
+            Some(p) => p,
+            None => {
+                let _ = tx
+                    .send(TargetEvent::Finished { target_ix: ix, outcome: TargetOutcome::Cancelled, elapsed: Duration::ZERO })
+                    .await;
+                continue;
+            }
+        };
+        // A permit can still land in the same instant `cancel` fires (the
+        // select above is racy by nature); re-check before admitting.
         if cancel.is_cancelled() {
             drop(permit);
             let _ = tx
@@ -79,8 +105,17 @@ pub async fn run_targets<F, Fut, E>(
                     }
                 }
             });
-            let ok = body(ix, inner_tx).await;
-            // The body dropped its sender; the forwarder drains and ends.
+            // Run the body in its own task so a panic unwinds only that
+            // task: `JoinHandle::await` turns it into `Err(JoinError)`
+            // instead of unwinding past the `Finished` send below and
+            // leaving this target without a terminal event.
+            let body_handle = tokio::spawn(body(ix, inner_tx));
+            let ok = match body_handle.await {
+                Ok(ok) => ok,
+                Err(_) => false,
+            };
+            // The body (or its panic unwinding) dropped its sender; the
+            // forwarder drains and ends.
             let _ = forwarder.await;
             let outcome = if ok { TargetOutcome::Ok } else { TargetOutcome::Failed };
             let _ = tx.send(TargetEvent::Finished { target_ix: ix, outcome, elapsed: started.elapsed() }).await;
@@ -171,6 +206,65 @@ mod tests {
         assert_eq!(cancelled, 4, "targets 1..4 never started");
         assert!(events.iter().any(|e| matches!(e, TargetEvent::Finished { target_ix: 0, outcome: TargetOutcome::Ok, .. })));
         assert_eq!(events.iter().filter(|e| matches!(e, TargetEvent::Started { .. })).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn panicking_body_reports_failed_and_run_completes() {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        run_targets(3, 4, dbc_core::CancelToken::new(), |ix, _inner: tokio::sync::mpsc::Sender<()>| async move {
+            if ix == 1 {
+                panic!("boom");
+            }
+            true
+        }, tx)
+        .await;
+        let events = collect::<()>(rx).await;
+        let outcome = |ix: usize| events.iter().find_map(|e| match e {
+            TargetEvent::Finished { target_ix, outcome, .. } if *target_ix == ix => Some(*outcome),
+            _ => None,
+        });
+        assert_eq!(outcome(0), Some(TargetOutcome::Ok));
+        assert_eq!(outcome(1), Some(TargetOutcome::Failed));
+        assert_eq!(outcome(2), Some(TargetOutcome::Ok));
+    }
+
+    #[tokio::test]
+    async fn cancel_drain_does_not_wait_for_a_free_permit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let cancel = dbc_core::CancelToken::new();
+        let c = cancel.clone();
+        let run = run_targets(5, 1, cancel, move |ix, _inner: tokio::sync::mpsc::Sender<()>| {
+            let c = c.clone();
+            async move {
+                if ix == 0 {
+                    c.cancel();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                true
+            }
+        }, tx);
+        let collector = async {
+            let mut out = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                out.push(ev);
+            }
+            out
+        };
+        let (_, events) = tokio::join!(run, collector);
+
+        let finished_pos = |ix: usize| {
+            events
+                .iter()
+                .position(|e| matches!(e, TargetEvent::Finished { target_ix, .. } if *target_ix == ix))
+                .unwrap_or_else(|| panic!("target {ix} never finished"))
+        };
+        let zero_finished_at = finished_pos(0);
+        for ix in 1..5 {
+            assert!(
+                finished_pos(ix) < zero_finished_at,
+                "target {ix}'s Cancelled should arrive before target 0's Finished, since the drain must not wait for a free permit"
+            );
+        }
     }
 
     #[tokio::test]
