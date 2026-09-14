@@ -802,6 +802,15 @@ fn multi_target_preflight(
     Ok(MultiTargetPreflight { per_target, writes })
 }
 
+/// Closing a `MultiTarget` tab: cancel the editor's live run ONLY when the
+/// closed tab's own run is still going (`all_finished == false`) and there
+/// is a token to cancel. A finished tab's close must never touch a later
+/// run's token (review fix round 1). Pure, so the decision is pinned by
+/// `multi_target_close_cancels_only_an_unfinished_run`.
+fn multi_target_close_should_cancel(all_finished: bool, has_cancel: bool) -> bool {
+    !all_finished && has_cancel
+}
+
 /// G15 §2c: `SplitError` -> user-facing Czech text. Used by
 /// `count_statements_in_file` and `run_query_with`'s `split_sql` `Err(e)`
 /// arm; `runner.rs`'s script path duplicates the one Czech literal
@@ -4420,6 +4429,10 @@ impl AppView {
         let targets: Vec<Target> = pre.per_target.iter().map(|p| p.target.clone()).collect();
         if pre.writes {
             self.modal = Some(connections_ui::ModalState::MultiTargetWriteConfirm { sql, targets, editor_id });
+            // UX-polish §1.4: no-input modal, cx-only site — defer focus to
+            // `AppView::render` via `modal_needs_focus`, so keystrokes under
+            // the gate do not edit the SQL beneath it.
+            self.modal_needs_focus = true;
             cx.notify();
             return;
         }
@@ -4528,6 +4541,11 @@ impl AppView {
             // Per-target "current buffer" for Batch pushes, outside
             // `this.update`. `None` between row-producing statements.
             let mut current: Vec<Option<Rc<RefCell<ResultBuffer>>>> = vec![None; n];
+            // `on_stream_finished`'s „seřazeno po dokončení" notes, one per
+            // grid the user sorted mid-stream, labelled by target — kept
+            // for the run's lifetime because the status line is rebuilt
+            // from `status_line` on every event.
+            let mut sort_notes: Vec<String> = Vec::new();
             // The closed-tab check both arms share: a closed result tab
             // cancels the run (the token is THIS run's) and ends the loop.
             let tab_closed_then_cancel = |view: &mut AppView, editor_id: u64| -> bool {
@@ -4555,15 +4573,23 @@ impl AppView {
                                 cx.notify();
                                 return true;
                             }
-                            if let Some(Err(e)) = push {
-                                // A spill failure is this target's error;
-                                // the runner keeps streaming, the buffer
-                                // simply stops growing (`current` cleared
-                                // so later batches are dropped).
-                                state.borrow_mut().targets[target_ix].error = Some(e.to_string());
-                                current[target_ix] = None;
-                            } else if let Some(r) = state.borrow().targets[target_ix].results.last() {
-                                r.grid.update(cx, |g, _| g.on_batch_grown());
+                            match push {
+                                Some(Err(e)) => {
+                                    // A spill failure is this target's error;
+                                    // the runner keeps streaming, the buffer
+                                    // simply stops growing (`current` cleared
+                                    // so later batches are dropped).
+                                    state.borrow_mut().targets[target_ix].error = Some(e.to_string());
+                                    current[target_ix] = None;
+                                }
+                                Some(Ok(())) => {
+                                    if let Some(r) = state.borrow().targets[target_ix].results.last() {
+                                        r.grid.update(cx, |g, _| g.on_batch_grown());
+                                    }
+                                }
+                                // No buffer to push into (a batch after a
+                                // spill failure) — dropped, nothing grew.
+                                None => {}
                             }
                             cx.notify();
                             false
@@ -4627,9 +4653,10 @@ impl AppView {
                                                 let r = b.borrow().row_count();
                                                 t.rows_returned += r as u64;
                                                 if let Some(slot) = t.results.last() {
-                                                    slot.grid.update(cx, |g, _| {
-                                                        g.on_stream_finished();
-                                                    });
+                                                    let note = slot.grid.update(cx, |g, _| g.on_stream_finished());
+                                                    if let Some(note) = note {
+                                                        sort_notes.push(format!("{}: {note}", t.label()));
+                                                    }
                                                 }
                                                 r as i64
                                             }
@@ -4699,9 +4726,12 @@ impl AppView {
                                 }
                             }
                         }
-                        let line = multi_target::status_line(&s);
+                        let mut line = format!("{}{limit_suffix}", multi_target::status_line(&s));
                         drop(s);
-                        view.tab(editor_id).status = format!("{line}{limit_suffix}");
+                        for note in &sort_notes {
+                            line.push_str(&format!(" · {note}"));
+                        }
+                        view.tab(editor_id).status = line;
                         cx.notify();
                         false
                     })
@@ -4732,20 +4762,22 @@ impl AppView {
         .detach();
     }
 
-    /// Closing a `MultiTarget` result tab from the strip while its run is
+    /// Closing a `MultiTarget` result tab from the strip while ITS run is
     /// in flight cancels the run (design §3). The consumer loop in
     /// `dispatch_multi_target` notices a closed tab only on its next
     /// event, so a run producing none for a while (a slow connect, a long
-    /// write) needs the close itself to cancel. `cancel` on the ACTIVE
-    /// editor is that run's token: the strip only ever closes the active
-    /// editor's tabs.
+    /// write) needs the close itself to cancel. Scoped to the closed
+    /// tab's own run by `multi_target_close_should_cancel`: an old,
+    /// finished `3×` tab must not kill whatever run is live now. `cancel`
+    /// on the ACTIVE editor is that run's token (one run per editor tab at
+    /// a time): the strip only ever closes the active editor's tabs.
     fn cancel_run_if_multi_target_tab(&mut self, id: u64) {
-        let is_multi = self
-            .editor()
-            .results
-            .iter()
-            .any(|t| t.id == id && matches!(t.content, TabContent::MultiTarget { .. }));
-        if !is_multi {
+        let all_finished = self.editor().results.iter().find(|t| t.id == id).and_then(|t| match &t.content {
+            TabContent::MultiTarget { state } => Some(state.borrow().all_finished()),
+            _ => None,
+        });
+        let Some(all_finished) = all_finished else { return };
+        if !multi_target_close_should_cancel(all_finished, self.editor().cancel.is_some()) {
             return;
         }
         if let Some(tok) = self.editor_mut().cancel.take() {
@@ -16734,6 +16766,16 @@ mod multi_statement_tests {
         let config = AppConfig::default();
         let targets = vec![Target { conn_id: "gone".into(), conn_name: "x".into(), database: "y".into() }];
         assert!(multi_target_preflight(&config, "SELECT 1", &targets).is_err());
+    }
+
+    /// Review fix round 1: closing an old, finished `3×` tab while a later
+    /// run (single or multi) is live must NOT cancel that run.
+    #[test]
+    fn multi_target_close_cancels_only_an_unfinished_run() {
+        assert!(multi_target_close_should_cancel(false, true));
+        assert!(!multi_target_close_should_cancel(true, true), "finished tab, live later run");
+        assert!(!multi_target_close_should_cancel(false, false), "nothing to cancel");
+        assert!(!multi_target_close_should_cancel(true, false));
     }
 }
 
