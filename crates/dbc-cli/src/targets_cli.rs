@@ -69,6 +69,20 @@ pub fn resolve_texts(config: &AppConfig, texts: &[String]) -> Result<Vec<Resolve
     Ok(out)
 }
 
+/// The positional form (`dbc query <conn> [--db <db>]`) as one resolved
+/// target. Built directly rather than formatted as `conn/db` and parsed
+/// back: a connection NAME may contain a slash and `--db` is always a
+/// literal name, never a glob — today's contract, kept verbatim.
+pub fn resolve_positional(
+    config: &AppConfig,
+    conn: &str,
+    db: Option<&str>,
+) -> Result<ResolvedText, String> {
+    let cfg = pick::pick(&config.connections, conn).map_err(|e| e.message(conn))?.clone();
+    let db = db.map(|d| DbPart::Named(d.to_string())).unwrap_or(DbPart::Default);
+    Ok(ResolvedText { cfg, db })
+}
+
 /// Step 2: `Ok(writes)`, decided from the SQL and the saved flags alone.
 ///
 /// Every mentioned connection classifies the SQL with its own dialect
@@ -243,6 +257,21 @@ mod tests {
         assert!(matches!(r[0].db, DbPart::Default));
         assert!(matches!(&r[1].db, DbPart::Named(n) if n == "a"));
         assert!(matches!(&r[2].db, DbPart::Glob(g) if g == "k_*"));
+    }
+
+    /// The positional form never goes through `conn/db` parsing: a name
+    /// with a slash resolves, and a `--db` with glob characters stays a
+    /// literal database name.
+    #[test]
+    fn resolve_positional_keeps_a_slashed_name_and_a_literal_db() {
+        let c = config(vec![cfg("c1", "a/b", false)]);
+        let r = resolve_positional(&c, "a/b", None).unwrap();
+        assert_eq!(r.cfg.id, "c1");
+        assert_eq!(r.db, DbPart::Default);
+        let r = resolve_positional(&c, "c1", Some("k_*")).unwrap();
+        assert_eq!(r.db, DbPart::Named("k_*".into()));
+        let e = resolve_positional(&c, "nope", None).unwrap_err();
+        assert!(e.contains("nope") && e.contains("a/b"), "{e}");
     }
 
     #[test]

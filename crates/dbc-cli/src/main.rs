@@ -263,18 +263,29 @@ fn query(
     write: bool,
 ) -> Result<(), String> {
     let a = ctx.a;
-    // 1. Target texts: positional + --db, or --on / --on-file.
-    let mut texts: Vec<String> = match conn {
-        Some(c) => vec![match &a.database {
-            Some(db) => format!("{c}/{db}"),
-            None => c.to_string(),
-        }],
-        None => targets.to_vec(),
+    // 1. Targets against the config: the positional connection (+ `--db`,
+    // taken verbatim), or the `--on` / `--on-file` texts.
+    let resolved = match conn {
+        Some(c) => vec![targets_cli::resolve_positional(ctx.config, c, a.database.as_deref())?],
+        None => {
+            let mut texts = targets.to_vec();
+            if let Some(f) = targets_file {
+                texts.extend(targets_cli::read_targets_file(f)?);
+            }
+            // A file of nothing but comments must not be a run of nothing
+            // that exits 0 — that is the run a script would never notice.
+            if texts.is_empty() {
+                return Err(match targets_file {
+                    Some(f) => format!(
+                        "žádný cíl ke spuštění — soubor {} neobsahuje žádný conn/db",
+                        f.display()
+                    ),
+                    None => "žádný cíl ke spuštění".to_string(),
+                });
+            }
+            targets_cli::resolve_texts(ctx.config, &texts)?
+        }
     };
-    if let Some(f) = targets_file {
-        texts.extend(targets_cli::read_targets_file(f)?);
-    }
-    let resolved = targets_cli::resolve_texts(ctx.config, &texts)?;
 
     // 2. DECIDED BEFORE ANYTHING IS OPENED.
     let text = read_sql(sql)?;
@@ -864,5 +875,148 @@ mod tests {
         let out = render::render(&connections_table(&config), Format::Table);
         assert!(!out.contains("leftover"), "{out}");
         assert!(out.contains("app.db"), "{out}");
+    }
+
+    /// A `dbc query` invocation without argv: the command is what the
+    /// parser would have produced, the paths are a temp dir's, and the
+    /// vault path does NOT exist — so a vault prompt is impossible and a
+    /// connect attempt is the only way a test here could stall.
+    struct Harness {
+        args: Args,
+        config: AppConfig,
+        dir: tempfile::TempDir,
+    }
+
+    impl Harness {
+        fn new(config: AppConfig, command: Command, database: Option<&str>) -> Harness {
+            Harness {
+                args: Args {
+                    command,
+                    database: database.map(str::to_string),
+                    format: Format::Csv,
+                    row_limit: args::DEFAULT_ROW_LIMIT,
+                    timeout_secs: args::DEFAULT_TIMEOUT_SECS,
+                    config: None,
+                    vault: None,
+                },
+                config,
+                dir: tempfile::tempdir().unwrap(),
+            }
+        }
+
+        fn run(&self) -> Result<(), String> {
+            let Command::Query { conn, targets, targets_file, sql, write } = &self.args.command
+            else {
+                unreachable!("harness builds a query")
+            };
+            let ctx = QueryContext {
+                a: &self.args,
+                config: &self.config,
+                vault_path: &self.dir.path().join("no-such-vault.bin"),
+                history_path: &self.dir.path().join("history.sqlite"),
+            };
+            query(&ctx, conn.as_deref(), targets, targets_file.as_deref(), sql, *write)
+        }
+    }
+
+    fn conn_cfg(id: &str, name: &str, engine: Engine, database: &str, ro: bool) -> dbc_state::ConnectionConfig {
+        dbc_state::ConnectionConfig {
+            id: id.into(),
+            name: name.into(),
+            folder: vec![],
+            engine,
+            // TEST-NET-3 (RFC 5737): never routable. Meaningless for a
+            // file engine, which is exactly the point — a file engine
+            // never looks at it.
+            host: "203.0.113.1".into(),
+            port: Some(5432),
+            database: database.into(),
+            user: "u".into(),
+            read_only: ro,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: None,
+        }
+    }
+
+    fn on(targets: &[&str], targets_file: Option<PathBuf>, sql: &str, write: bool) -> Command {
+        Command::Query {
+            conn: None,
+            targets: targets.iter().map(|s| s.to_string()).collect(),
+            targets_file,
+            sql: SqlSource::Text(sql.into()),
+            write,
+        }
+    }
+
+    /// Spec §4 ordering, through the REAL `query()`: a read-only server
+    /// connection on an unreachable host, named with a glob (which would
+    /// need the server's database list), and a write. The refusal must
+    /// come from the config alone — long before the connect timeout, and
+    /// with no vault to unlock. A connect attempt here would take the
+    /// driver's full timeout and fail the bound.
+    #[test]
+    fn query_refuses_a_read_only_write_before_any_connect_or_vault() {
+        let mut config = AppConfig::default();
+        config.connections.push(conn_cfg("c1", "archiv", Engine::Postgres, "db", true));
+        let h = Harness::new(config, on(&["archiv/klient_*"], None, "delete from t", true), None);
+        let clock = std::time::Instant::now();
+        let e = h.run().unwrap_err();
+        assert!(e.contains("jen pro čtení") && e.contains("archiv"), "{e}");
+        assert!(clock.elapsed() < std::time::Duration::from_secs(2), "a connection was attempted");
+    }
+
+    /// `--on-file` with nothing but comments is not a run of nothing that
+    /// exits 0; it is an error naming the file.
+    #[test]
+    fn query_refuses_an_empty_target_list() {
+        let mut config = AppConfig::default();
+        config.connections.push(conn_cfg("c1", "prod", Engine::Sqlite, "x.db", false));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("targets.txt");
+        std::fs::write(&file, "# nothing here\n\n   \n").unwrap();
+        let h = Harness::new(config, on(&[], Some(file.clone()), "select 1", false), None);
+        let e = h.run().unwrap_err();
+        assert!(e.contains("žádný cíl"), "{e}");
+        assert!(e.contains(&file.display().to_string()), "{e}");
+    }
+
+    /// The positional form resolves the NAME verbatim — a slash in it is
+    /// not a `conn/db` separator — and then really runs, end to end, on a
+    /// SQLite file the test owns.
+    #[test]
+    fn a_positional_connection_named_with_a_slash_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db").display().to_string();
+        let mut config = AppConfig::default();
+        config.connections.push(conn_cfg("c1", "a/b", Engine::Sqlite, &db, false));
+        let command = Command::Query {
+            conn: Some("a/b".into()),
+            targets: vec![],
+            targets_file: None,
+            sql: SqlSource::Text("select 1 as one".into()),
+            write: false,
+        };
+        let h = Harness::new(config, command, None);
+        h.run().unwrap();
+        // Same name with `--db`: the value is the database, taken as is
+        // (glob characters are illegal in a Windows file name, so the
+        // `k_*` → `Named` half lives in `targets_cli`'s unit test). A file
+        // that does not exist yet is created by SQLite, which is how the
+        // run proves which path it opened.
+        let literal = dir.path().join("k_x.db").display().to_string();
+        let mut config = AppConfig::default();
+        config.connections.push(conn_cfg("c1", "a/b", Engine::Sqlite, &db, false));
+        let command = Command::Query {
+            conn: Some("a/b".into()),
+            targets: vec![],
+            targets_file: None,
+            sql: SqlSource::Text("select 1 as one".into()),
+            write: false,
+        };
+        Harness::new(config, command, Some(&literal)).run().unwrap();
+        assert!(std::path::Path::new(&literal).exists());
     }
 }
