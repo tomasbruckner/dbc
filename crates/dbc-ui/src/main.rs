@@ -51,6 +51,7 @@ mod history_panel;
 mod monitor;
 mod monitor_sql;
 mod monitor_view;
+mod multi_target;
 mod palette;
 mod collate;
 mod plan;
