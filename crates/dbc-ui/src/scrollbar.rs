@@ -15,8 +15,12 @@
 //!
 //! Coordinates: `UniformList` hands its decoration bounds whose origin is
 //! ALREADY shifted by the scroll offset (the decoration lives in content
-//! space and scrolls with the rows), so everything that must stay put in
-//! the viewport is placed at `-scroll_offset.y + …`.
+//! space and scrolls with the rows), so the surface that must stay put in
+//! the viewport is placed at `-scroll_offset.y`. That shift needs a plain
+//! root above it: taffy pins a root node at (0, 0) whatever its inset says,
+//! which is how the drag surface once sat one scroll offset above the
+//! viewport and the thumb stopped following the pointer as soon as the
+//! list had scrolled (user, 2026-09-14).
 
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
@@ -139,7 +143,7 @@ impl UniformListDecoration for ListScrollbar {
         let track = div()
             .id("scrollbar-track")
             .absolute()
-            .top(px(offset))
+            .top(px(0.))
             .right(px(0.))
             .w(px(BAR_WIDTH))
             .h(px(viewport))
@@ -160,7 +164,7 @@ impl UniformListDecoration for ListScrollbar {
         let thumb = div()
             .id("scrollbar-thumb")
             .absolute()
-            .top(px(offset + start))
+            .top(px(start))
             .right(px(THUMB_INSET))
             .w(px(BAR_WIDTH - 2.0 * THUMB_INSET))
             .h(px(len))
@@ -172,15 +176,16 @@ impl UniformListDecoration for ListScrollbar {
                 cx.stop_propagation();
             });
 
-        // The root spans the viewport so a drag keeps reporting moves while
-        // the pointer is anywhere over the list, not just over the thumb.
-        // Its listeners never stop propagation, so rows underneath keep
-        // their clicks and hovers.
+        // The surface spans the viewport so a drag keeps reporting moves
+        // while the pointer is anywhere over the list, not just over the
+        // thumb. Its listeners never stop propagation, so rows underneath
+        // keep their clicks and hovers. It sits inside a plain root because
+        // only a child's `top()` moves it (see the module doc).
         let move_handle = self.handle.clone();
         let up_drag = self.handle.drag.clone();
         let up_out_drag = self.handle.drag.clone();
-        div()
-            .id("scrollbar-root")
+        let surface = div()
+            .id("scrollbar-surface")
             .absolute()
             .top(px(offset))
             .left(px(0.))
@@ -203,8 +208,8 @@ impl UniformListDecoration for ListScrollbar {
                 *up_out_drag.borrow_mut() = None;
             })
             .child(track)
-            .child(thumb)
-            .into_any_element()
+            .child(thumb);
+        div().w(px(width)).h(px(viewport)).child(surface).into_any_element()
     }
 }
 
@@ -259,5 +264,131 @@ mod tests {
         assert_eq!(offset_for_thumb_start(400.0, 800.0, 10_000.0), 400.0);
         // No overflow, no travel: the offset is always zero.
         assert_eq!(offset_for_thumb_start(400.0, 300.0, 50.0), 0.0);
+    }
+}
+
+/// The drag itself lives in GPUI mouse listeners, which the geometry tests
+/// above cannot reach — and that is exactly where it broke (user,
+/// 2026-09-14: „nemůžu ho chytnout a posunovat"). These drive the real
+/// `uniform_list` + decoration in a GPUI test window.
+#[cfg(test)]
+mod drag_tests {
+    use super::*;
+    use crate::theme::Theme;
+    use gpui::{size, uniform_list, Context, Modifiers, Render, TestAppContext, VisualTestContext};
+
+    const ROWS: usize = 1000;
+    const ROW_H: f32 = 20.0;
+    const WIN_W: f32 = 300.0;
+    const WIN_H: f32 = 400.0;
+    const CONTENT: f32 = ROWS as f32 * ROW_H;
+
+    struct List {
+        bar: ScrollbarHandle,
+    }
+
+    impl Render for List {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                uniform_list("rows", ROWS, |range, _, _| {
+                    range.map(|i| div().h(px(ROW_H)).w_full().child(format!("{i}"))).collect()
+                })
+                .track_scroll(&self.bar.list)
+                .with_decoration(self.bar.decoration())
+                .size_full(),
+            )
+        }
+    }
+
+    fn open(cx: &mut TestAppContext) -> (ScrollbarHandle, VisualTestContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let bar = ScrollbarHandle::new();
+        let handle = bar.clone();
+        let window = cx.open_window(size(px(WIN_W), px(WIN_H)), move |_, _| List { bar });
+        let vcx = VisualTestContext::from_window(*window, cx);
+        vcx.run_until_parked();
+        (handle, vcx)
+    }
+
+    fn offset(handle: &ScrollbarHandle) -> f32 {
+        -f32::from(handle.list.0.borrow().base_handle.offset().y)
+    }
+
+    /// Pointer x in the middle of the bar; y in the middle of the thumb
+    /// for the current offset.
+    fn thumb_centre(handle: &ScrollbarHandle) -> Point<Pixels> {
+        let (start, len) = thumb(WIN_H, CONTENT, offset(handle)).expect("overflows");
+        point(px(WIN_W - BAR_WIDTH / 2.0), px(start + len / 2.0))
+    }
+
+    #[gpui::test]
+    fn the_thumb_can_be_grabbed_and_keeps_following_the_pointer(cx: &mut TestAppContext) {
+        let (handle, mut cx) = open(cx);
+        let x = px(WIN_W - BAR_WIDTH / 2.0);
+        assert_eq!(offset(&handle), 0.0);
+
+        // Grab.
+        let grab_at = thumb_centre(&handle);
+        cx.simulate_mouse_down(grab_at, MouseButton::Left, Modifiers::none());
+        assert!(handle.drag.borrow().is_some(), "mouse down on the thumb starts a drag");
+
+        // First pull: 100px down the track.
+        let y1 = grab_at.y + px(100.0);
+        cx.simulate_mouse_move(point(x, y1), MouseButton::Left, Modifiers::none());
+        let (start0, _) = thumb(WIN_H, CONTENT, 0.0).unwrap();
+        let want1 = offset_for_thumb_start(WIN_H, CONTENT, start0 + 100.0);
+        let got1 = offset(&handle);
+        assert!((got1 - want1).abs() < 1.0, "first pull: got {got1}, want {want1}");
+
+        // Second pull, now that the list is scrolled: must keep following.
+        let y2 = y1 + px(100.0);
+        cx.simulate_mouse_move(point(x, y2), MouseButton::Left, Modifiers::none());
+        let want2 = offset_for_thumb_start(WIN_H, CONTENT, start0 + 200.0);
+        let got2 = offset(&handle);
+        assert!(
+            (got2 - want2).abs() < 1.0,
+            "second pull (list already scrolled): got {got2}, want {want2}"
+        );
+
+        // Release: further moves are plain hovering.
+        cx.simulate_mouse_up(point(x, y2), MouseButton::Left, Modifiers::none());
+        assert!(handle.drag.borrow().is_none(), "mouse up ends the drag");
+        cx.simulate_mouse_move(point(x, y2 + px(50.0)), None, Modifiers::none());
+        assert_eq!(offset(&handle), got2, "no drag, no scroll");
+    }
+
+    #[gpui::test]
+    fn a_scrolled_list_can_still_be_grabbed(cx: &mut TestAppContext) {
+        let (handle, mut cx) = open(cx);
+        handle.set_y(px(0.0), 8000.0);
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(offset(&handle), 8000.0);
+
+        let grab_at = thumb_centre(&handle);
+        cx.simulate_mouse_down(grab_at, MouseButton::Left, Modifiers::none());
+        assert!(handle.drag.borrow().is_some(), "mouse down on the thumb starts a drag");
+        cx.simulate_mouse_move(
+            grab_at - point(px(0.0), px(50.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        let (start, _) = thumb(WIN_H, CONTENT, 8000.0).unwrap();
+        let want = offset_for_thumb_start(WIN_H, CONTENT, start - 50.0);
+        let got = offset(&handle);
+        assert!((got - want).abs() < 1.0, "pull up from 8000: got {got}, want {want}");
+    }
+
+    #[gpui::test]
+    fn a_click_in_the_bare_track_pages_towards_it(cx: &mut TestAppContext) {
+        let (handle, mut cx) = open(cx);
+        let x = px(WIN_W - BAR_WIDTH / 2.0);
+        // Well below the thumb (which is at the top): one page down.
+        cx.simulate_click(point(x, px(WIN_H - 10.0)), Modifiers::none());
+        assert_eq!(offset(&handle), WIN_H * PAGE_FRACTION);
+        assert!(handle.drag.borrow().is_none(), "a track click is not a drag");
+        // Above the thumb: one page back up (clamped at the top).
+        cx.simulate_click(point(x, px(1.0)), Modifiers::none());
+        assert_eq!(offset(&handle), 0.0);
     }
 }

@@ -6,6 +6,10 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+### Fixed
+
+- the scrollbar thumb stopped following the pointer as soon as the list had scrolled
+
 ## [0.34.0] - 2026-09-14
 
 The same query over many databases, in the app and on the command line.
