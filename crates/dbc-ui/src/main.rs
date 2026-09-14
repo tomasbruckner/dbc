@@ -7251,12 +7251,21 @@ impl AppView {
             connections_ui::TextField::new(cx, "Ctrl+Shift+D – vyber databáze, Enter spustí…", false)
         });
         let focus = input.focus_handle(cx);
+        // Seed only pairs whose connection still exists: `target_sources`
+        // drops the rest from the list, and a checked row that is not
+        // listed could neither be seen nor unchecked (the footer would
+        // still count it).
+        let known = |id: &str| self.config.connections.iter().any(|c| c.id == id);
         let mut checked = BTreeSet::new();
         if let (Some(c), Some(d)) = (self.editor().connection.clone(), self.effective_database()) {
-            checked.insert((c, d));
+            if known(&c) {
+                checked.insert((c, d));
+            }
         }
         for t in &self.editor().last_targets {
-            checked.insert((t.conn_id.clone(), t.database.clone()));
+            if known(&t.conn_id) {
+                checked.insert((t.conn_id.clone(), t.database.clone()));
+            }
         }
         self.palette = Some(PaletteState {
             input,
@@ -7277,8 +7286,14 @@ impl AppView {
     /// Ctrl+Alt+Enter (spec §5): the active tab's last target set again,
     /// without the picker. A tab that never ran a multi-target query has
     /// no „last set", so the picker opens instead — the chord is never a
-    /// silent no-op.
+    /// silent no-op. While the picker is up the chord means what its
+    /// footer promises — run the CHECKED set — not the stale remembered
+    /// one underneath it.
     fn on_run_on_last_targets(&mut self, _: &RunOnLastTargets, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.as_ref().is_some_and(|p| p.mode == palette::PaletteMode::Targets) {
+            self.confirm_targets(window, cx);
+            return;
+        }
         let targets = self.editor().last_targets.clone();
         if targets.is_empty() {
             self.on_pick_targets(&PickTargets, window, cx);
@@ -16216,6 +16231,8 @@ fn main() {
             KeyBinding::new("ctrl-shift-tab", PrevEditorTab, None),
             KeyBinding::new("ctrl-d", PickDatabase, None),
             KeyBinding::new("ctrl-shift-d", PickTargets, None),
+            // AltGr+Enter on a Czech layout also fires this (GPUI reports
+            // AltGr as ctrl+alt); Enter types nothing under AltGr, accepted.
             KeyBinding::new("ctrl-alt-enter", RunOnLastTargets, None),
             // Scoped to the text tab body, the same posture as the grid's
             // own Ctrl+C: only reachable once that body holds focus, which
