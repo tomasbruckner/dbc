@@ -980,12 +980,22 @@ fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<Ap
 /// „Výsledek 1 · 2 · 3" row, then the active grid / error / summary.
 /// A free function like `render_script_run_tab`, for the same borrow
 /// reason (see that function's comment at its call site).
+/// `pending_status` is the caller's status-line slot: the showing slot
+/// grid's `status_note` is `take()`n into it exactly the way the `Grid`
+/// arm of `render_tab_content` does, so a large sort on a slot / merged
+/// grid surfaces its „řadím…" note once.
 fn render_multi_target_tab(
     state: Rc<RefCell<multi_target::MultiTargetState>>,
+    pending_status: &mut Option<String>,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     use multi_target::TargetStatus;
     let theme = *cx.theme();
+    if let Some(grid) = state.borrow().showing_slot().map(|r| r.grid.clone()) {
+        if let Some(note) = grid.update(cx, |g, _| g.status_note.take()) {
+            *pending_status = Some(note);
+        }
+    }
     let s = state.borrow();
 
     let mut chips = div()
@@ -1099,7 +1109,7 @@ fn render_multi_target_tab(
                         div().p_2().text_color(theme.text_muted).child(format!("Připojuji k {}…", t.label())),
                     );
                 } else if t.status == TargetStatus::Done {
-                    let e = t.elapsed.map(|d| format!("{:.1} s", d.as_secs_f32())).unwrap_or_default();
+                    let e = t.elapsed.map(multi_target::secs).unwrap_or_default();
                     body = body.child(div().p_2().text_color(theme.text_muted).child(format!(
                         "{} příkazů · {} ovlivněno · {e}",
                         t.statements_total, t.affected
@@ -3987,16 +3997,24 @@ impl AppView {
     }
 
     /// „Vše sloučeně" — builds the merged grid on first click (all-text,
-    /// see `multi_target` module doc) and shows it. Rebuilt on every
-    /// click while cheap enough; the run is finished by then, so the
-    /// input never changes underneath. A spill I/O failure inside the
-    /// merge is surfaced in the status line and the view stays on the
-    /// chip it was on (`show_merged` untouched).
+    /// see `multi_target` module doc) and shows it. A click while the
+    /// merged view is already showing is a no-op, so its sort / find /
+    /// scroll state survives; a click from a target chip after that
+    /// rebuilds (the run is finished by then, so the input never changes
+    /// underneath — cheap enough). A spill I/O failure inside the merge
+    /// is surfaced in the status line and the view stays on the chip it
+    /// was on (`show_merged` untouched).
     fn activate_merged_view(
         &mut self,
         state: Rc<RefCell<multi_target::MultiTargetState>>,
         cx: &mut Context<Self>,
     ) {
+        {
+            let s = state.borrow();
+            if s.show_merged && s.merged.is_some() {
+                return;
+            }
+        }
         let built = multi_target::build_merged_buffer(&state.borrow());
         let buffer = match built {
             Ok(b) => Rc::new(RefCell::new(b)),
@@ -4016,8 +4034,7 @@ impl AppView {
         cx.subscribe(&grid, AppView::on_grid_event).detach();
         {
             let mut s = state.borrow_mut();
-            let sql = s.sql.clone();
-            s.merged = Some(multi_target::ResultSlot { grid, buffer, sql });
+            s.merged = Some(multi_target::ResultSlot { grid, buffer });
             s.show_merged = true;
         }
         self.editor_mut().status = multi_target::status_line(&state.borrow());
@@ -13373,7 +13390,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             TabContent::Admin { view } => view.clone().into_any_element(),
             // Same free-function shape as `ScriptRun` above, for the same
             // borrow reason.
-            TabContent::MultiTarget { state } => render_multi_target_tab(state.clone(), cx),
+            TabContent::MultiTarget { state } => {
+                render_multi_target_tab(state.clone(), &mut pending_status, cx)
+            }
         };
         if let Some(note) = pending_status {
             self.editor_mut().status = note;

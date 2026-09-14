@@ -12,12 +12,13 @@
 //!
 //! Task 6 wired the tab variant and its render into `AppView`; Task 7
 //! (the event-loop consumer) is what constructs a `MultiTargetState`,
-//! titles the tab and drives the statuses, so the handful of items only
-//! it touches carry a narrow, per-item `#[allow(dead_code)]` until then.
+//! titles the tab and drives the statuses, so the three items only it
+//! can call (`new`, `tab_title`, `TargetStatus::Cancelled`) carry a
+//! per-item `#[allow(dead_code)]` until then.
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use dbc_buffer::ResultBuffer;
 use dbc_core::arrow::array::{ArrayRef, RecordBatch, StringArray};
@@ -42,10 +43,6 @@ pub enum TargetStatus {
 pub struct ResultSlot {
     pub grid: Entity<ResultGrid>,
     pub buffer: Rc<RefCell<ResultBuffer>>,
-    /// The statement this grid came from — set by Task 7's event loop
-    /// (and `activate_merged_view` for the merged slot); no reader yet.
-    #[allow(dead_code)]
-    pub sql: String,
 }
 
 pub struct TargetSlot {
@@ -84,32 +81,25 @@ impl TargetSlot {
     }
 }
 
+/// The query itself is NOT kept here — `ResultTab.sql` on the owning tab
+/// already carries it (titles, session persistence), and nothing in this
+/// state ever reads it back.
 pub struct MultiTargetState {
-    pub sql: String,
     pub targets: Vec<TargetSlot>,
     pub active: usize,
     pub merged: Option<ResultSlot>,
     pub show_merged: bool,
-    /// Written by `new` / Task 7's event loop; no reader yet.
-    #[allow(dead_code)]
-    pub started_at: Instant,
-    /// Written by Task 7's event loop; no reader yet.
-    #[allow(dead_code)]
-    pub finished: bool,
 }
 
 impl MultiTargetState {
     // Task 7 (the event-loop consumer) is the first caller.
     #[allow(dead_code)]
-    pub fn new(sql: &str, targets: Vec<(String, String)>) -> Self {
+    pub fn new(targets: Vec<(String, String)>) -> Self {
         Self {
-            sql: sql.to_string(),
             targets: targets.iter().map(|(c, d)| TargetSlot::new(c, d)).collect(),
             active: 0,
             merged: None,
             show_merged: false,
-            started_at: Instant::now(),
-            finished: false,
         }
     }
 
@@ -185,7 +175,9 @@ pub fn tab_title(n: usize, sql: &str) -> String {
     format!("{n}× {}", collapse_title(sql))
 }
 
-fn secs(d: Duration) -> String {
+/// `0,04 s` — the one elapsed format for the status line and the
+/// per-target Done summary in the render.
+pub(crate) fn secs(d: Duration) -> String {
     format!("{:.2} s", d.as_secs_f64()).replace('.', ",")
 }
 
@@ -234,12 +226,11 @@ pub fn status_line(state: &MultiTargetState) -> String {
 /// Per-target inputs to the merged view: `(target_ix, label, buffer)` for
 /// each target with rows, using the LAST result of a target with several,
 /// already filtered to non-empty buffers via `nonempty`. This is the
-/// single source of truth `merged_plan` and `build_merged_buffer` both
-/// build from — `merged_plan` takes its `Vec<usize>` from the same
-/// filtered list that produces the column plan, so the two can never
-/// drift out of step (a target whose first statement had rows but whose
-/// LAST result is empty must vanish from both together, not from one and
-/// not the other).
+/// single source of truth `build_merged_buffer` builds from — the column
+/// plan and the per-row `zdroj` labels both come from this one filtered
+/// list, so the two can never drift out of step (a target whose first
+/// statement had rows but whose LAST result is empty must vanish from
+/// both together, not from one and not the other).
 ///
 /// This is also the GPUI-free seam `merged_plan_from`/`build_merged_from`
 /// are tested through — a real `ResultSlot` needs an `Entity<ResultGrid>`,
@@ -277,19 +268,6 @@ fn merged_plan_from(inputs: &[(usize, String, Rc<RefCell<ResultBuffer>>)]) -> db
         .map(|(_, _, buf)| buf.borrow().schema().fields().iter().map(|f| f.name().to_string()).collect())
         .collect();
     dbc_connect::targets::union_columns("zdroj", &schemas)
-}
-
-/// Which targets take part in the merged view (the ones with rows; the
-/// LAST result of a target with several) and how their columns line up.
-/// `ixs` and the plan are derived from the SAME `merged_inputs(state)`
-/// call, so `ixs.len() == plan.mapping.len()` always holds.
-// Public seam exercised by the tests; the binary goes straight through
-// `build_merged_buffer`.
-#[allow(dead_code)]
-pub fn merged_plan(state: &MultiTargetState) -> (dbc_connect::targets::ColumnPlan, Vec<usize>) {
-    let inputs = merged_inputs(state);
-    let ixs = inputs.iter().map(|(ix, _, _)| *ix).collect();
-    (merged_plan_from(&inputs), ixs)
 }
 
 /// The merged buffer for a set of `(target_ix, label, buffer)` inputs:
@@ -390,7 +368,7 @@ mod tests {
 
     #[test]
     fn status_line_counts_and_names_active() {
-        let mut st = MultiTargetState::new("select 1", vec![("prod".into(), "a".into()), ("prod".into(), "b".into()), ("x".into(), "c".into())]);
+        let mut st = MultiTargetState::new(vec![("prod".into(), "a".into()), ("prod".into(), "b".into()), ("x".into(), "c".into())]);
         st.targets[0].status = TargetStatus::Done;
         st.targets[0].rows_returned = 2;
         st.targets[0].elapsed = Some(Duration::from_millis(40));
@@ -413,7 +391,7 @@ mod tests {
 
     #[test]
     fn all_finished_and_any_rows() {
-        let mut st = MultiTargetState::new("select 1", vec![("p".into(), "a".into()), ("p".into(), "b".into())]);
+        let mut st = MultiTargetState::new(vec![("p".into(), "a".into()), ("p".into(), "b".into())]);
         assert!(!st.all_finished());
         st.targets[0].status = TargetStatus::Done;
         st.targets[1].status = TargetStatus::Cancelled;
