@@ -2857,6 +2857,10 @@ pub(crate) const LOG_PREVIEW_KEY: &str = "applog";
 /// (the same dedup `open_monitor_tab`/`open_admin_tab` use).
 pub(crate) const HISTORY_PREVIEW_KEY: &str = "history";
 
+/// The splitter handle's width; the sidebar keeps this much clear of the
+/// tree so the handle never covers the tree's scrollbar.
+const SIDEBAR_SPLITTER_W: f32 = 5.0;
+
 /// The sidebar's built-in width, used until the user drags the splitter.
 /// Was the hard-coded `260.` in `render`.
 pub(crate) const SIDEBAR_DEFAULT_W: f32 = 260.0;
@@ -15801,6 +15805,12 @@ impl Render for AppView {
                     .flex_shrink_0()
                     .border_r_1()
                     .border_color(theme.border)
+                    // The splitter's 5 px are reserved: the tree — and
+                    // with it the scrollbar on its right edge — ends where
+                    // the handle begins. Before this the `.occlude()`d
+                    // handle lay over the bar and left 3 px of a 6 px
+                    // thumb to grab (user, 2026-09-14).
+                    .pr(px(SIDEBAR_SPLITTER_W))
                     .child(self.tree.clone())
                     .child(
                         // The splitter. A sibling of the tree rather than
@@ -15814,7 +15824,7 @@ impl Render for AppView {
                             .absolute()
                             .top_0()
                             .right_0()
-                            .w(px(5.))
+                            .w(px(SIDEBAR_SPLITTER_W))
                             .h_full()
                             .occlude()
                             .cursor_col_resize()

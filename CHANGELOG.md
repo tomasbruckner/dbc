@@ -8,7 +8,8 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ### Fixed
 
-- the scrollbar thumb stopped following the pointer as soon as the list had scrolled
+- the scrollbar thumb stopped following the pointer as soon as the list had scrolled, and let go the moment the pointer left the list
+- the sidebar splitter covered the tree's scrollbar and left 3 px of the thumb to grab
 
 ## [0.34.0] - 2026-09-14
 

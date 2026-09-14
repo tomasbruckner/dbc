@@ -15,19 +15,24 @@
 //!
 //! Coordinates: `UniformList` hands its decoration bounds whose origin is
 //! ALREADY shifted by the scroll offset (the decoration lives in content
-//! space and scrolls with the rows), so the surface that must stay put in
-//! the viewport is placed at `-scroll_offset.y`. That shift needs a plain
-//! root above it: taffy pins a root node at (0, 0) whatever its inset says,
-//! which is how the drag surface once sat one scroll offset above the
-//! viewport and the thumb stopped following the pointer as soon as the
-//! list had scrolled (user, 2026-09-14).
+//! space and scrolls with the rows), so everything that must stay put in
+//! the viewport is a CHILD placed at `-scroll_offset.y + …` — a child, not
+//! the root, because taffy pins a root node at (0, 0) whatever its inset
+//! says (the root's `top()` is silently ignored).
+//!
+//! The drag is window-wide: once the thumb is held, moves are read from a
+//! listener registered on the window itself (`Window::on_mouse_event`,
+//! reachable from a `canvas` paint), not from any element's hover. An
+//! element-bound listener stops the moment the pointer leaves the list —
+//! which it does on every real drag (user, 2026-09-14: „vyjedu myší do
+//! prostředního panelu a nefunguje").
 
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
 use gpui::{
-    div, point, prelude::*, px, AnyElement, App, Bounds, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, UniformListDecoration, UniformListScrollHandle,
-    Window,
+    canvas, div, point, prelude::*, px, AnyElement, App, Bounds, DispatchPhase, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, UniformListDecoration,
+    UniformListScrollHandle, Window,
 };
 
 use crate::theme::ActiveTheme;
@@ -143,7 +148,7 @@ impl UniformListDecoration for ListScrollbar {
         let track = div()
             .id("scrollbar-track")
             .absolute()
-            .top(px(0.))
+            .top(px(offset))
             .right(px(0.))
             .w(px(BAR_WIDTH))
             .h(px(viewport))
@@ -164,7 +169,7 @@ impl UniformListDecoration for ListScrollbar {
         let thumb = div()
             .id("scrollbar-thumb")
             .absolute()
-            .top(px(start))
+            .top(px(offset + start))
             .right(px(THUMB_INSET))
             .w(px(BAR_WIDTH - 2.0 * THUMB_INSET))
             .h(px(len))
@@ -176,40 +181,45 @@ impl UniformListDecoration for ListScrollbar {
                 cx.stop_propagation();
             });
 
-        // The surface spans the viewport so a drag keeps reporting moves
-        // while the pointer is anywhere over the list, not just over the
-        // thumb. Its listeners never stop propagation, so rows underneath
-        // keep their clicks and hovers. It sits inside a plain root because
-        // only a child's `top()` moves it (see the module doc).
+        // The drag itself: window-wide listeners, alive for one frame and
+        // re-registered on every paint (see the module doc). They do nothing
+        // unless a drag is on, and never stop propagation, so rows and
+        // everything else keep their clicks and hovers. A move without the
+        // button held ends a drag whose release was never seen (the pointer
+        // left the window).
         let move_handle = self.handle.clone();
         let up_drag = self.handle.drag.clone();
-        let up_out_drag = self.handle.drag.clone();
-        let surface = div()
-            .id("scrollbar-surface")
-            .absolute()
-            .top(px(offset))
-            .left(px(0.))
+        let listeners = canvas(
+            |_, _, _| (),
+            move |_, _, window, _| {
+                window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, _cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    let Some(drag) = *move_handle.drag.borrow() else { return };
+                    if ev.pressed_button != Some(MouseButton::Left) {
+                        *move_handle.drag.borrow_mut() = None;
+                        return;
+                    }
+                    let start = f32::from(ev.position.y) - viewport_top - drag.grab;
+                    move_handle.set_y(x, offset_for_thumb_start(viewport, content, start));
+                    window.refresh();
+                });
+                window.on_mouse_event(move |ev: &MouseUpEvent, _phase, _window, _cx| {
+                    if ev.button == MouseButton::Left {
+                        *up_drag.borrow_mut() = None;
+                    }
+                });
+            },
+        );
+
+        div()
             .w(px(width))
             .h(px(viewport))
-            .on_mouse_move(move |ev: &MouseMoveEvent, window, _cx| {
-                let Some(drag) = *move_handle.drag.borrow() else { return };
-                if ev.pressed_button != Some(MouseButton::Left) {
-                    *move_handle.drag.borrow_mut() = None;
-                    return;
-                }
-                let start = f32::from(ev.position.y) - viewport_top - drag.grab;
-                move_handle.set_y(x, offset_for_thumb_start(viewport, content, start));
-                window.refresh();
-            })
-            .on_mouse_up(MouseButton::Left, move |_: &MouseUpEvent, _window, _cx| {
-                *up_drag.borrow_mut() = None;
-            })
-            .on_mouse_up_out(MouseButton::Left, move |_: &MouseUpEvent, _window, _cx| {
-                *up_out_drag.borrow_mut() = None;
-            })
             .child(track)
-            .child(thumb);
-        div().w(px(width)).h(px(viewport)).child(surface).into_any_element()
+            .child(thumb)
+            .child(listeners)
+            .into_any_element()
     }
 }
 
@@ -279,8 +289,11 @@ mod drag_tests {
 
     const ROWS: usize = 1000;
     const ROW_H: f32 = 20.0;
+    /// The list's width; the window is wider, with a plain panel beside it
+    /// standing in for the editor.
     const WIN_W: f32 = 300.0;
     const WIN_H: f32 = 400.0;
+    const PANEL_W: f32 = 300.0;
     const CONTENT: f32 = ROWS as f32 * ROW_H;
 
     struct List {
@@ -289,14 +302,20 @@ mod drag_tests {
 
     impl Render for List {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(
-                uniform_list("rows", ROWS, |range, _, _| {
-                    range.map(|i| div().h(px(ROW_H)).w_full().child(format!("{i}"))).collect()
-                })
-                .track_scroll(&self.bar.list)
-                .with_decoration(self.bar.decoration())
-                .size_full(),
-            )
+            div()
+                .flex()
+                .flex_row()
+                .size_full()
+                .child(
+                    uniform_list("rows", ROWS, |range, _, _| {
+                        range.map(|i| div().h(px(ROW_H)).w_full().child(format!("{i}"))).collect()
+                    })
+                    .track_scroll(&self.bar.list)
+                    .with_decoration(self.bar.decoration())
+                    .w(px(WIN_W))
+                    .h_full(),
+                )
+                .child(div().id("panel").w(px(PANEL_W)).h_full().on_mouse_move(|_, _, _| {}))
         }
     }
 
@@ -304,7 +323,8 @@ mod drag_tests {
         cx.update(|cx| cx.set_global(Theme::dark()));
         let bar = ScrollbarHandle::new();
         let handle = bar.clone();
-        let window = cx.open_window(size(px(WIN_W), px(WIN_H)), move |_, _| List { bar });
+        let window =
+            cx.open_window(size(px(WIN_W + PANEL_W), px(WIN_H)), move |_, _| List { bar });
         let vcx = VisualTestContext::from_window(*window, cx);
         vcx.run_until_parked();
         (handle, vcx)
@@ -377,6 +397,30 @@ mod drag_tests {
         let want = offset_for_thumb_start(WIN_H, CONTENT, start - 50.0);
         let got = offset(&handle);
         assert!((got - want).abs() < 1.0, "pull up from 8000: got {got}, want {want}");
+    }
+
+    /// User, 2026-09-14: „když ho chytnu a vyjedu myší do prostředního
+    /// panelu, tak to nefunguje". A drag is a window-wide affair.
+    #[gpui::test]
+    fn the_drag_survives_the_pointer_leaving_the_list(cx: &mut TestAppContext) {
+        let (handle, mut cx) = open(cx);
+        let grab_at = thumb_centre(&handle);
+        cx.simulate_mouse_down(grab_at, MouseButton::Left, Modifiers::none());
+        assert!(handle.drag.borrow().is_some());
+
+        // Straight into the panel beside the list, 100px further down.
+        let over_panel = point(px(WIN_W + PANEL_W / 2.0), grab_at.y + px(100.0));
+        cx.simulate_mouse_move(over_panel, MouseButton::Left, Modifiers::none());
+        let (start0, _) = thumb(WIN_H, CONTENT, 0.0).unwrap();
+        let want = offset_for_thumb_start(WIN_H, CONTENT, start0 + 100.0);
+        let got = offset(&handle);
+        assert!((got - want).abs() < 1.0, "pull over the panel: got {got}, want {want}");
+
+        // Released over the panel: the drag ends there too.
+        cx.simulate_mouse_up(over_panel, MouseButton::Left, Modifiers::none());
+        assert!(handle.drag.borrow().is_none(), "mouse up over the panel ends the drag");
+        cx.simulate_mouse_move(over_panel + point(px(0.0), px(50.0)), None, Modifiers::none());
+        assert_eq!(offset(&handle), got, "no drag, no scroll");
     }
 
     #[gpui::test]
