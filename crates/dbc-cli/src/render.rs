@@ -7,6 +7,7 @@
 //! from meaning something subtly different per command.
 
 use crate::args::Format;
+use crate::targets_cli::TargetReport;
 
 /// A finished result: column names, and rows of already-stringified cells.
 ///
@@ -43,6 +44,106 @@ pub fn render(table: &Table, format: Format) -> String {
         Format::Json => render_json(table),
         Format::Csv => render_csv(table),
     }
+}
+
+/// Many targets, one stdout (spec §4). The three formats disagree on
+/// purpose about where a failed target goes: a person reading `table`
+/// wants the error in its place, a script reading `json` wants every
+/// target present with `error` set, and `csv` is one merged table that
+/// cannot carry an error row — failed targets are stderr's business
+/// there, and the caller prints them.
+pub fn render_targets(reports: &[TargetReport], format: Format) -> String {
+    match format {
+        Format::Table => {
+            let mut out = String::new();
+            for r in reports {
+                match (&r.table, &r.error) {
+                    (_, Some(e)) => out.push_str(&format!("== {} — chyba: {e}\n\n", r.label)),
+                    (Some(t), None) => {
+                        out.push_str(&format!(
+                            "== {} ({} řádků, {} s)\n",
+                            r.label,
+                            t.rows.len(),
+                            seconds_cs(r.elapsed_ms)
+                        ));
+                        out.push_str(&render_table(t));
+                        out.push('\n');
+                    }
+                    (None, None) => out.push_str(&format!("== {} (bez výsledku)\n\n", r.label)),
+                }
+            }
+            out
+        }
+        Format::Json => {
+            let items: Vec<serde_json::Value> = reports
+                .iter()
+                .map(|r| {
+                    let (columns, rows, truncated) = match &r.table {
+                        Some(t) => (serde_json::json!(t.columns), json_rows(t), t.truncated),
+                        None => (serde_json::json!([]), serde_json::json!([]), false),
+                    };
+                    serde_json::json!({
+                        "target": r.label,
+                        "columns": columns,
+                        "rows": rows,
+                        "truncated": truncated,
+                        "error": r.error,
+                    })
+                })
+                .collect();
+            format!("{}\n", serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".into()))
+        }
+        Format::Csv => {
+            // Only targets that produced rows take part in the union: a
+            // target that failed or wrote has no columns to contribute,
+            // and letting it in would widen the header for nothing.
+            let with_rows: Vec<(&str, &Table)> = reports
+                .iter()
+                .filter(|r| r.error.is_none())
+                .filter_map(|r| r.table.as_ref().map(|t| (r.label.as_str(), t)))
+                .filter(|(_, t)| !t.rows.is_empty())
+                .collect();
+            let schemas: Vec<Vec<String>> =
+                with_rows.iter().map(|(_, t)| t.columns.clone()).collect();
+            let plan = dbc_connect::targets::union_columns("source", &schemas);
+            let mut merged = Table::new(plan.columns.clone());
+            for (i, (label, t)) in with_rows.iter().enumerate() {
+                for row in &t.rows {
+                    let mut cells: Vec<Option<String>> = vec![Some(label.to_string())];
+                    for m in &plan.mapping[i] {
+                        cells.push(m.and_then(|c| row.get(c).cloned().flatten()));
+                    }
+                    merged.rows.push(cells);
+                }
+            }
+            merged.truncated = with_rows.iter().any(|(_, t)| t.truncated);
+            render_csv(&merged)
+        }
+    }
+}
+
+/// `0,04` — seconds with two decimals and the Czech decimal comma.
+fn seconds_cs(ms: u128) -> String {
+    format!("{:.2}", ms as f64 / 1000.0).replace('.', ",")
+}
+
+fn json_rows(table: &Table) -> serde_json::Value {
+    serde_json::Value::Array(
+        table
+            .rows
+            .iter()
+            .map(|r| {
+                serde_json::Value::Array(
+                    r.iter()
+                        .map(|c| match c {
+                            Some(s) => serde_json::Value::String(s.clone()),
+                            None => serde_json::Value::Null,
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// Display width in terminal cells.
@@ -104,23 +205,9 @@ fn render_table(table: &Table) -> String {
 }
 
 fn render_json(table: &Table) -> String {
-    let rows: Vec<serde_json::Value> = table
-        .rows
-        .iter()
-        .map(|r| {
-            serde_json::Value::Array(
-                r.iter()
-                    .map(|c| match c {
-                        Some(s) => serde_json::Value::String(s.clone()),
-                        None => serde_json::Value::Null,
-                    })
-                    .collect(),
-            )
-        })
-        .collect();
     let value = serde_json::json!({
         "columns": table.columns,
-        "rows": rows,
+        "rows": json_rows(table),
         "row_count": table.rows.len(),
         "truncated": table.truncated,
     });
@@ -263,5 +350,78 @@ mod tests {
         assert!(out.contains("(0 řádků)"), "{out}");
         assert!(out.starts_with('a'), "{out}");
         assert_eq!(render(&t, Format::Csv), "a,b\n");
+    }
+
+    fn two_reports() -> Vec<crate::targets_cli::TargetReport> {
+        let mut t = Table::new(vec!["n".into(), "source".into()]);
+        t.push_str_row(vec!["1".into(), "x".into()]);
+        vec![
+            crate::targets_cli::TargetReport { label: "prod/a".into(), table: Some(t), error: None, affected: vec![], history: vec![], elapsed_ms: 0 },
+            crate::targets_cli::TargetReport { label: "prod/b".into(), table: None, error: Some("boom".into()), affected: vec![], history: vec![], elapsed_ms: 0 },
+        ]
+    }
+
+    #[test]
+    fn targets_table_has_a_section_per_target() {
+        let out = render_targets(&two_reports(), Format::Table);
+        assert!(out.contains("== prod/a (1 řádků, 0,00 s"), "{out}");
+        assert!(out.contains("== prod/b — chyba: boom"), "{out}");
+    }
+
+    #[test]
+    fn targets_json_is_an_array_with_error_field() {
+        let out = render_targets(&two_reports(), Format::Json);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v[0]["target"], "prod/a");
+        assert_eq!(v[1]["error"], "boom");
+        assert_eq!(v[0]["error"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn targets_csv_is_one_merged_table_without_failed_targets() {
+        let out = render_targets(&two_reports(), Format::Csv);
+        let mut lines = out.lines();
+        assert_eq!(lines.next().unwrap(), "source,n,source#2");
+        assert_eq!(lines.next().unwrap(), "prod/a,1,x");
+        assert!(lines.next().is_none());
+    }
+
+    /// Spec §4: when no target returned rows, CSV is the `source` header
+    /// alone — a write-only batch and a failed target contribute nothing.
+    #[test]
+    fn targets_csv_without_rows_is_the_source_header_only() {
+        let mut reports = two_reports();
+        reports[0].table = Some(Table::new(vec!["n".into()]));
+        assert_eq!(render_targets(&reports, Format::Csv), "source
+");
+        reports[0].table = None;
+        assert_eq!(render_targets(&reports, Format::Csv), "source
+");
+    }
+
+    #[test]
+    fn targets_table_says_when_a_target_had_no_result() {
+        let mut reports = two_reports();
+        reports[0].table = None;
+        let out = render_targets(&reports, Format::Table);
+        assert!(out.contains("== prod/a (bez výsledku)"), "{out}");
+    }
+
+    #[test]
+    fn targets_json_reports_columns_rows_and_truncation_per_target() {
+        let mut reports = two_reports();
+        reports[0].table.as_mut().unwrap().truncated = true;
+        let v: serde_json::Value = serde_json::from_str(&render_targets(&reports, Format::Json)).unwrap();
+        assert_eq!(v[0]["columns"], serde_json::json!(["n", "source"]));
+        assert_eq!(v[0]["rows"][0][0], "1");
+        assert_eq!(v[0]["truncated"], true);
+        assert_eq!(v[1]["columns"], serde_json::json!([]));
+        assert_eq!(v[1]["rows"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn the_elapsed_header_uses_a_decimal_comma() {
+        assert_eq!(seconds_cs(40), "0,04");
+        assert_eq!(seconds_cs(1234), "1,23");
     }
 }

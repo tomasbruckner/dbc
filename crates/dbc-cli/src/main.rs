@@ -23,6 +23,7 @@ mod hist;
 mod pick;
 mod policy;
 mod render;
+mod targets_cli;
 mod vault_key;
 
 use std::path::Path;
@@ -127,7 +128,7 @@ fn load_config(path: &Path) -> Result<AppConfig, String> {
         .map_err(|e| format!("config.toml ({}) nejde přečíst: {}", path.display(), e.message))
 }
 
-fn dialect_for(engine: Engine) -> Dialect {
+pub(crate) fn dialect_for(engine: Engine) -> Dialect {
     match engine {
         Engine::Postgres => Dialect::Postgres,
         Engine::Mssql => Dialect::Mssql,
@@ -174,39 +175,26 @@ fn run(a: Args) -> Result<(), String> {
         return Ok(());
     }
 
+    // Every query — one positional connection or many `--on` targets — goes
+    // through the same path, so the safety order below holds for both.
+    if let Command::Query { conn, targets, targets_file, sql, write } = &a.command {
+        let ctx = QueryContext {
+            a: &a,
+            config: &config,
+            vault_path: &vault_path,
+            history_path: &history_path,
+        };
+        return query(&ctx, conn.as_deref(), targets, targets_file.as_deref(), sql, *write);
+    }
+
     // Everything below needs an actual connection.
-    //
-    // `Command::Query { conn: None, .. }` means `--on`/`--on-file` was used
-    // instead of the positional connection — Task 11 rewrites this whole
-    // query branch to fan out over those targets. Until then, refuse: there
-    // is no single connection here for `pick::pick` to resolve.
     let asked_for = match &a.command {
         Command::Databases { conn } | Command::Tables { conn, .. } => conn.as_str(),
-        Command::Query { conn: Some(c), .. } => c.as_str(),
-        Command::Query { conn: None, .. } => {
-            return Err("--on zatím není v tomhle běhu podporováno".to_string())
-        }
         _ => unreachable!("handled above"),
     };
     let cfg = pick::pick(&config.connections, asked_for)
         .map_err(|e| e.message(asked_for))?
         .clone();
-
-    // DECIDED BEFORE ANYTHING IS OPENED. A refused write must not have
-    // cost a master-password prompt and a connection first — the refusal
-    // depends only on the SQL, the dialect and the connection's saved
-    // read-only flag, all of which are known here, and being asked for a
-    // password before being told „no" teaches people to type it reflexively.
-    let plan = match &a.command {
-        Command::Query { sql, write, .. } => {
-            let text = read_sql(sql)?;
-            Some(
-                policy::plan(&text, dialect_for(cfg.engine), cfg.read_only, *write)
-                    .map_err(|e| e.message())?,
-            )
-        }
-        _ => None,
-    };
 
     // The vault is opened only when there is a secret to fetch. A SQLite
     // file has no password, and demanding a master password to list its
@@ -235,32 +223,308 @@ fn run(a: Args) -> Result<(), String> {
     let mut conn = opened.conn;
 
     let table = match &a.command {
-        Command::Databases { .. } => Some(databases_table(&runtime, &mut *conn, &target)?),
-        Command::Tables { schema, .. } => {
-            Some(tables_table(&runtime, &mut *conn, schema.as_deref())?)
-        }
-        Command::Query { .. } => {
-            let plan = plan.as_deref().expect("built above for exactly this command");
-            // The label the app's history panel will show. `--db` is part
-            // of it: „produkce" and „produkce/sklad" are different runs
-            // and a history that called them both „produkce" would be
-            // lying about which server was touched.
-            let label = dbc_state::conn_label(
-                &cfg.name,
-                a.database.as_deref().filter(|db| *db != cfg.database),
-            );
-            let mut recorder = hist::Recorder::open(&history_path);
-            query_table(&runtime, &mut *conn, plan, &a, &mut recorder, &label)?
-        }
+        Command::Databases { .. } => databases_table(&runtime, &mut *conn, &target)?,
+        Command::Tables { schema, .. } => tables_table(&runtime, &mut *conn, schema.as_deref())?,
         _ => unreachable!("handled above"),
     };
-    // `None` = a batch of pure writes. Their affected-row counts already
-    // went to stderr; printing an empty table with a made-up column would
-    // put a fake result in the pipe.
-    if let Some(table) = table {
-        print!("{}", render::render(&table, a.format));
+    print!("{}", render::render(&table, a.format));
+    Ok(())
+}
+
+/// What `query` needs from the invocation besides the command itself.
+struct QueryContext<'a> {
+    a: &'a Args,
+    config: &'a AppConfig,
+    vault_path: &'a Path,
+    history_path: &'a Path,
+}
+
+/// `dbc query`, over one target or many. The order is a safety property
+/// (spec §4), not a convenience:
+///
+/// 1. every named connection is looked up in the config;
+/// 2. the run is DECIDED from the SQL and the saved read-only flags — a
+///    refused write must not have cost a master-password prompt or a
+///    connection, and being asked for a password before being told „no"
+///    teaches people to type it reflexively;
+/// 3. the vault is opened once, and only if some connection needs it;
+/// 4. globs are expanded live, one enumeration per connection;
+/// 5. everything runs through the shared fan-out.
+///
+/// The positional form (`dbc query prod --db sklad`) is exactly one target
+/// and prints what it always printed; only the `--on` form gets the
+/// per-target sections.
+fn query(
+    ctx: &QueryContext,
+    conn: Option<&str>,
+    targets: &[String],
+    targets_file: Option<&Path>,
+    sql: &SqlSource,
+    write: bool,
+) -> Result<(), String> {
+    let a = ctx.a;
+    // 1. Target texts: positional + --db, or --on / --on-file.
+    let mut texts: Vec<String> = match conn {
+        Some(c) => vec![match &a.database {
+            Some(db) => format!("{c}/{db}"),
+            None => c.to_string(),
+        }],
+        None => targets.to_vec(),
+    };
+    if let Some(f) = targets_file {
+        texts.extend(targets_cli::read_targets_file(f)?);
+    }
+    let resolved = targets_cli::resolve_texts(ctx.config, &texts)?;
+
+    // 2. DECIDED BEFORE ANYTHING IS OPENED.
+    let text = read_sql(sql)?;
+    targets_cli::preflight(&text, &resolved, write)?;
+
+    // 3. The vault, once, only if some connection needs a secret.
+    let needs_vault = resolved.iter().any(|r| !dbc_state::engine_is_file_based(r.cfg.engine))
+        && Vault::exists(ctx.vault_path);
+    let vault = if needs_vault { Some(vault_key::unlock(ctx.vault_path)?) } else { None };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    // 4. Globs, live — the same enumeration `dbc databases` prints.
+    let list_dbs = |cfg: &dbc_state::ConnectionConfig| -> Result<(Vec<String>, bool), String> {
+        let secret = dbc_connect::resolve_secret_for_connect(vault.as_ref(), cfg);
+        let opened =
+            dbc_connect::open_config(cfg, secret, runtime.handle()).map_err(|e| e.message)?;
+        let mut conn = opened.conn;
+        let t = databases_table(&runtime, &mut *conn, cfg)?;
+        let names = t.rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect();
+        Ok((names, t.truncated))
+    };
+    let plan_targets = targets_cli::expand(resolved, list_dbs)?;
+
+    // 5. Run, then record. History is written here rather than inside the
+    // targets because the recorder is not `Send`, and each target ran on
+    // a runtime worker.
+    let reports =
+        run_targets_cli(&runtime, ctx.config, vault.as_ref(), &text, write, a, plan_targets)?;
+    let mut recorder = hist::Recorder::open(ctx.history_path);
+    for r in &reports {
+        for h in &r.history {
+            recorder.record(&h.sql, &r.label, h.started_at, h.ms, h.rows, h.error.as_deref());
+        }
+        for (i, n) in &r.affected {
+            eprintln!("{}: příkaz {}: {} řádků změněno", r.label, i + 1, n);
+        }
+    }
+
+    if conn.is_some() && reports.len() == 1 {
+        // The pre-existing shape on stdout, byte for byte; a failure is
+        // the plain `dbc: …` line and exit 1, as it always was.
+        let r = &reports[0];
+        if let Some(e) = &r.error {
+            return Err(e.clone());
+        }
+        // `None` = a batch of pure writes. Their affected-row counts already
+        // went to stderr; printing an empty table with a made-up column
+        // would put a fake result in the pipe.
+        if let Some(t) = &r.table {
+            print!("{}", render::render(t, a.format));
+        }
+        return Ok(());
+    }
+
+    for r in &reports {
+        if let Some(e) = &r.error {
+            eprintln!("{}: chyba: {e}", r.label);
+        }
+    }
+    print!("{}", render::render_targets(&reports, a.format));
+    let failed = reports.iter().filter(|r| r.error.is_some()).count();
+    if failed > 0 {
+        return Err(format!("{failed} z {} cílů selhalo", reports.len()));
     }
     Ok(())
+}
+
+/// Every target on its own connection, at most `MAX_PARALLEL_TARGETS` at
+/// once, each producing one `TargetReport`. The body is `run_one_target`,
+/// which runs on a runtime worker instead of under `block_on`, so four
+/// targets really are in flight together.
+fn run_targets_cli(
+    runtime: &tokio::runtime::Runtime,
+    config: &AppConfig,
+    vault: Option<&Vault>,
+    sql: &str,
+    write: bool,
+    a: &Args,
+    targets: Vec<dbc_connect::targets::Target>,
+) -> Result<Vec<targets_cli::TargetReport>, String> {
+    use dbc_connect::fanout::{run_targets, TargetEvent, MAX_PARALLEL_TARGETS};
+
+    // One plan per target: its own dialect and read-only flag. The
+    // preflight already decided the run may happen; this only re-derives
+    // the statement list each target executes.
+    let mut jobs = Vec::with_capacity(targets.len());
+    for t in &targets {
+        let saved = config
+            .connections
+            .iter()
+            .find(|c| c.id == t.conn_id)
+            .ok_or_else(|| format!("připojení {} zmizelo z configu", t.conn_name))?;
+        let mut cfg = saved.clone();
+        cfg.database = t.database.clone();
+        let plan = policy::plan(sql, dialect_for(cfg.engine), cfg.read_only, write)
+            .map_err(|e| e.message())?;
+        let secret = dbc_connect::resolve_secret_for_connect(vault, &cfg);
+        jobs.push(Some((t.label(), cfg, secret, plan)));
+    }
+    let n = jobs.len();
+    let jobs = std::sync::Arc::new(std::sync::Mutex::new(jobs));
+    let limits = Limits {
+        row_limit: if a.row_limit == 0 { usize::MAX } else { a.row_limit },
+        timeout_secs: a.timeout_secs,
+    };
+    let handle = runtime.handle().clone();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let mut reports: Vec<Option<targets_cli::TargetReport>> = (0..n).map(|_| None).collect();
+    runtime.block_on(async {
+        let driver = tokio::spawn(run_targets(
+            n,
+            MAX_PARALLEL_TARGETS,
+            CancelToken::new(),
+            move |ix, inner| {
+                let job = jobs.lock().unwrap().get_mut(ix).and_then(Option::take);
+                let handle = handle.clone();
+                async move {
+                    let Some((label, cfg, secret, plan)) = job else { return false };
+                    let report = run_one_target(&handle, label, cfg, secret, &plan, limits).await;
+                    let ok = report.error.is_none();
+                    // The body owns the only sender; it drops when this
+                    // future ends, which is what lets the fan-out finish.
+                    let _ = inner.send(report).await;
+                    ok
+                }
+            },
+            tx,
+        ));
+        // The channel closes once every sender is gone, i.e. once the
+        // fan-out and all its forwarders have ended.
+        while let Some(ev) = rx.recv().await {
+            if let TargetEvent::Inner { target_ix, event } = ev {
+                reports[target_ix] = Some(event);
+            }
+        }
+        let _ = driver.await;
+    });
+    Ok(reports
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            r.unwrap_or_else(|| {
+                targets_cli::TargetReport::failed(targets[i].label(), "cíl neproběhl".into())
+            })
+        })
+        .collect())
+}
+
+/// The per-target caps, copied out of `Args` so the fan-out body can be
+/// `'static`.
+#[derive(Clone, Copy)]
+struct Limits {
+    row_limit: usize,
+    timeout_secs: u64,
+}
+
+/// One target: connect, run the planned batch, report.
+///
+/// The LAST statement that returns rows is what gets printed. A `.sql`
+/// file that ends in a `SELECT` therefore prints that select, which is
+/// what a person running a script expects; writes collect their affected
+/// row counts for stderr, so a pipe carrying the result stays clean. The
+/// first failing statement ends the target — recorded first, with its
+/// error, then reported — and clears any earlier result, so an error never
+/// arrives with a half-result beside it.
+async fn run_one_target(
+    handle: &tokio::runtime::Handle,
+    label: String,
+    cfg: dbc_state::ConnectionConfig,
+    secret: Option<String>,
+    plan: &[policy::Stmt],
+    limits: Limits,
+) -> targets_cli::TargetReport {
+    let clock_all = std::time::Instant::now();
+    // `open_config` does blocking I/O (tunnels, handshakes) and says so.
+    let h = handle.clone();
+    let opened =
+        tokio::task::spawn_blocking(move || dbc_connect::open_config(&cfg, secret, &h)).await;
+    let mut opened = match opened {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return targets_cli::TargetReport::failed(label, e.message),
+        Err(_) => return targets_cli::TargetReport::failed(label, "připojování selhalo".into()),
+    };
+    let conn = &mut *opened.conn;
+    let mut report = targets_cli::TargetReport {
+        label,
+        table: None,
+        error: None,
+        affected: Vec::new(),
+        history: Vec::new(),
+        elapsed_ms: 0,
+    };
+    let timeout = std::time::Duration::from_secs(limits.timeout_secs);
+    for (i, stmt) in plan.iter().enumerate() {
+        let started_at = hist::Recorder::now_secs();
+        let clock = std::time::Instant::now();
+        let expired =
+            || format!("příkaz {} překročil {} s (--timeout)", i + 1, limits.timeout_secs);
+        // `(rows to print, rows to record)` — a write has no table but
+        // does have an affected-row count, and history wants that number
+        // just as much as a select's.
+        let outcome: Result<(Option<Table>, Option<i64>), String> = if stmt.is_read {
+            match tokio::time::timeout(timeout, drain(conn, &stmt.sql, limits.row_limit)).await {
+                Err(_) => Err(expired()),
+                Ok(Err(e)) => Err(e.message),
+                Ok(Ok(d)) => {
+                    let mut t = Table::new(d.columns);
+                    t.rows = d.rows;
+                    t.truncated = d.truncated;
+                    let n = t.rows.len() as i64;
+                    Ok((Some(t), Some(n)))
+                }
+            }
+        } else {
+            match tokio::time::timeout(timeout, conn.execute(&stmt.sql, CancelToken::new())).await
+            {
+                Err(_) => Err(expired()),
+                Ok(Err(e)) => Err(e.message),
+                Ok(Ok(n)) => {
+                    report.affected.push((i, n));
+                    Ok((None, Some(n as i64)))
+                }
+            }
+        };
+        let ms = Some(clock.elapsed().as_millis() as i64);
+        // Each statement of a batch is its own history row, a FAILED one
+        // too — that is the run you most want to find again.
+        report.history.push(targets_cli::HistRow {
+            sql: stmt.sql.clone(),
+            started_at,
+            ms,
+            rows: outcome.as_ref().ok().and_then(|(_, rows)| *rows),
+            error: outcome.as_ref().err().cloned(),
+        });
+        match outcome {
+            Ok((Some(t), _)) => report.table = Some(t),
+            Ok(_) => {}
+            Err(e) => {
+                report.table = None;
+                report.error = Some(e);
+                break;
+            }
+        }
+    }
+    report.elapsed_ms = clock_all.elapsed().as_millis();
+    report
 }
 
 fn login(vault_path: &Path) -> Result<(), String> {
@@ -490,90 +754,6 @@ async fn drain(
         rows.push(row);
     }
     Ok(Drained { columns, rows, truncated })
-}
-
-/// Run a planned batch.
-///
-/// The LAST statement that returns rows is what gets printed. A `.sql`
-/// file that ends in a `SELECT` therefore prints that select, which is
-/// what a person running a script expects; writes report their affected
-/// row counts on stderr as they go, so a pipe carrying the result stays
-/// clean. A batch with no reads in it at all returns `None` — stdout stays
-/// empty rather than carrying an invented header.
-fn query_table(
-    runtime: &tokio::runtime::Runtime,
-    conn: &mut dyn Connection,
-    plan: &[policy::Stmt],
-    a: &Args,
-    recorder: &mut hist::Recorder,
-    conn_label: &str,
-) -> Result<Option<Table>, String> {
-    let row_limit = if a.row_limit == 0 { usize::MAX } else { a.row_limit };
-    let timeout = std::time::Duration::from_secs(a.timeout_secs);
-    let mut last: Option<Table> = None;
-    for (i, stmt) in plan.iter().enumerate() {
-        let started_at = hist::Recorder::now_secs();
-        let clock = std::time::Instant::now();
-        let expired = || {
-            dbc_core::QueryError::msg(format!(
-                "příkaz {} překročil {} s (--timeout)",
-                i + 1,
-                a.timeout_secs
-            ))
-        };
-
-        // Each statement of a batch is its own history row. A `.sql` file
-        // is a sequence of things that happened, not one thing, and a
-        // single row holding all of it could not be clicked back into the
-        // editor as anything runnable.
-        // `(rows to print, rows to record)` — a write has no table but
-        // does have an affected-row count, and history wants that number
-        // just as much as a select's.
-        let outcome: Result<(Option<Table>, Option<i64>), String> = if stmt.is_read {
-            runtime
-                .block_on(async {
-                    tokio::time::timeout(timeout, drain(conn, &stmt.sql, row_limit))
-                        .await
-                        .map_err(|_| expired())?
-                })
-                .map(|drained| {
-                    let mut t = Table::new(drained.columns);
-                    t.rows = drained.rows;
-                    t.truncated = drained.truncated;
-                    let counted = t.rows.len() as i64;
-                    (Some(t), Some(counted))
-                })
-                .map_err(|e| e.message)
-        } else {
-            let cancel = CancelToken::new();
-            runtime
-                .block_on(async {
-                    tokio::time::timeout(timeout, conn.execute(&stmt.sql, cancel))
-                        .await
-                        .map_err(|_| expired())?
-                })
-                .map(|affected| {
-                    eprintln!("příkaz {}: {} řádků změněno", i + 1, affected);
-                    (None, Some(affected as i64))
-                })
-                .map_err(|e| e.message)
-        };
-        let ms = Some(clock.elapsed().as_millis() as i64);
-
-        // A FAILED statement is recorded too, with its error — that is the
-        // run you most want to find again, and it is what the app's own
-        // recorder does.
-        match &outcome {
-            Ok((_, rows)) => recorder.record(&stmt.sql, conn_label, started_at, ms, *rows, None),
-            Err(e) => recorder.record(&stmt.sql, conn_label, started_at, ms, None, Some(e)),
-        }
-        // Only NOW may the error end the batch: recorded first, propagated
-        // second.
-        if let (Some(table), _) = outcome? {
-            last = Some(table);
-        }
-    }
-    Ok(last)
 }
 
 fn read_sql(source: &SqlSource) -> Result<String, String> {
