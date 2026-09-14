@@ -196,50 +196,84 @@ pub fn status_line(state: &MultiTargetState) -> String {
     parts.join(" · ")
 }
 
+/// Per-target inputs to the merged view: `(label, buffer)` for each
+/// target with rows, using the LAST result of a target with several.
+/// This is the GPUI-free seam `merged_plan_from`/`build_merged_from` are
+/// tested through — a real `ResultSlot` needs an `Entity<ResultGrid>`,
+/// which needs a window, so tests build `(String, Rc<RefCell<ResultBuffer>>)`
+/// pairs directly instead. The filter and iteration order here MUST match
+/// `merged_plan`'s so `build_merged_buffer`'s `src_ix` lines up with
+/// `plan.mapping`.
+fn merged_inputs(state: &MultiTargetState) -> Vec<(String, Rc<RefCell<ResultBuffer>>)> {
+    state
+        .targets
+        .iter()
+        .filter(|t| t.rows_returned > 0)
+        .filter_map(|t| t.results.last().map(|last| (t.label(), last.buffer.clone())))
+        .collect()
+}
+
+/// Drop any input whose buffer has no rows — a defensive filter so an
+/// empty last result (nothing pushed, or a statement that genuinely
+/// returned zero rows) does not pollute the union with its columns.
+/// `merged_plan_from` and `build_merged_from` both go through this so
+/// their `src_ix`/`plan.mapping` stay aligned.
+fn nonempty(inputs: &[(String, Rc<RefCell<ResultBuffer>>)]) -> Vec<(String, Rc<RefCell<ResultBuffer>>)> {
+    inputs.iter().filter(|(_, buf)| buf.borrow().row_count() > 0).cloned().collect()
+}
+
+/// The column plan for a set of `(label, buffer)` inputs, in the order
+/// given — `merged_plan` builds its inputs from `merged_inputs` and pairs
+/// this with the matching target indices.
+fn merged_plan_from(inputs: &[(String, Rc<RefCell<ResultBuffer>>)]) -> dbc_connect::targets::ColumnPlan {
+    let schemas: Vec<Vec<String>> = nonempty(inputs)
+        .iter()
+        .map(|(_, buf)| buf.borrow().schema().fields().iter().map(|f| f.name().to_string()).collect())
+        .collect();
+    dbc_connect::targets::union_columns("zdroj", &schemas)
+}
+
 /// Which targets take part in the merged view (the ones with rows; the
 /// LAST result of a target with several) and how their columns line up.
 pub fn merged_plan(state: &MultiTargetState) -> (dbc_connect::targets::ColumnPlan, Vec<usize>) {
-    let mut ixs = Vec::new();
-    let mut schemas: Vec<Vec<String>> = Vec::new();
-    for (ix, t) in state.targets.iter().enumerate() {
-        if t.rows_returned == 0 {
-            continue;
-        }
-        let Some(last) = t.results.last() else { continue };
-        ixs.push(ix);
-        schemas.push(last.buffer.borrow().schema().fields().iter().map(|f| f.name().to_string()).collect());
-    }
-    (dbc_connect::targets::union_columns("zdroj", &schemas), ixs)
+    let ixs = state
+        .targets
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.rows_returned > 0 && t.results.last().is_some())
+        .map(|(ix, _)| ix)
+        .collect();
+    (merged_plan_from(&merged_inputs(state)), ixs)
 }
 
-/// The merged buffer: every column Utf8 (see module doc), `zdroj` first.
-/// Built in 4096-row batches so a large union does not allocate one
-/// giant array set.
-pub fn build_merged_buffer(state: &MultiTargetState) -> ResultBuffer {
-    let (plan, ixs) = merged_plan(state);
+/// The merged buffer for a set of `(label, buffer)` inputs: every column
+/// Utf8 (see module doc), `zdroj` first. Built in 4096-row batches so a
+/// large union does not allocate one giant array set. A spill I/O failure
+/// (`RecordBatch::try_new` or `ResultBuffer::push`) is surfaced rather
+/// than swallowed — silently dropping up to 4096 rows from the merged
+/// view is worse than reporting the error.
+fn build_merged_from(inputs: &[(String, Rc<RefCell<ResultBuffer>>)]) -> Result<ResultBuffer, String> {
+    let inputs = nonempty(inputs);
+    let plan = merged_plan_from(&inputs);
     let schema = std::sync::Arc::new(Schema::new(
         plan.columns.iter().map(|c| Field::new(c, DataType::Utf8, true)).collect::<Vec<_>>(),
     ));
     let mut out = ResultBuffer::new(schema.clone());
     let ncols = plan.columns.len();
     let mut cols: Vec<Vec<Option<String>>> = vec![Vec::new(); ncols];
-    let flush = |cols: &mut Vec<Vec<Option<String>>>, out: &mut ResultBuffer| {
+    let flush = |cols: &mut Vec<Vec<Option<String>>>, out: &mut ResultBuffer| -> Result<(), String> {
         if cols[0].is_empty() {
-            return;
+            return Ok(());
         }
         let arrays: Vec<ArrayRef> = cols
             .iter_mut()
             .map(|c| std::sync::Arc::new(StringArray::from(std::mem::take(c))) as ArrayRef)
             .collect();
-        if let Ok(batch) = RecordBatch::try_new(schema.clone(), arrays) {
-            let _ = out.push(batch);
-        }
+        let batch = RecordBatch::try_new(schema.clone(), arrays).map_err(|e| e.to_string())?;
+        out.push(batch).map_err(|e| e.to_string())
     };
-    for (src_ix, target_ix) in ixs.iter().enumerate() {
-        let t = &state.targets[*target_ix];
-        let label = t.label();
-        let Some(last) = t.results.last() else { continue };
-        let mut buf = last.buffer.borrow_mut();
+    for (src_ix, (label, buffer)) in inputs.iter().enumerate() {
+        let mut buf = buffer.borrow_mut();
         for r in 0..buf.row_count() {
             cols[0].push(Some(label.clone()));
             for (j, m) in plan.mapping[src_ix].iter().enumerate() {
@@ -250,17 +284,27 @@ pub fn build_merged_buffer(state: &MultiTargetState) -> ResultBuffer {
                 cols[j + 1].push(cell);
             }
             if cols[0].len() >= 4096 {
-                flush(&mut cols, &mut out);
+                flush(&mut cols, &mut out)?;
             }
         }
     }
-    flush(&mut cols, &mut out);
-    out
+    flush(&mut cols, &mut out)?;
+    Ok(out)
+}
+
+/// The merged buffer: every column Utf8 (see module doc), `zdroj` first.
+/// Built in 4096-row batches so a large union does not allocate one
+/// giant array set. Propagates the first spill I/O failure instead of
+/// silently dropping rows.
+pub fn build_merged_buffer(state: &MultiTargetState) -> Result<ResultBuffer, String> {
+    build_merged_from(&merged_inputs(state))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dbc_core::arrow::array::Int64Array;
+    use std::sync::Arc;
 
     fn slot(label: &str, status: TargetStatus) -> TargetSlot {
         let mut s = TargetSlot::new(label.split('/').next().unwrap(), label.split('/').nth(1).unwrap());
@@ -331,5 +375,97 @@ mod tests {
         assert!(!st.any_rows());
         st.targets[0].rows_returned = 1;
         assert!(st.any_rows());
+    }
+
+    /// `id:Int64, name:Utf8` with one row `(1, "x")`.
+    fn buffer_a() -> ResultBuffer {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let mut buf = ResultBuffer::new(schema.clone());
+        buf.push(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        buf
+    }
+
+    /// `name:Utf8, extra:Int64` with one row `("y", 2)`.
+    fn buffer_b() -> ResultBuffer {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("extra", DataType::Int64, true),
+        ]));
+        let mut buf = ResultBuffer::new(schema.clone());
+        buf.push(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["y"])) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        buf
+    }
+
+    #[test]
+    fn merged_plan_skips_targets_without_rows_and_uses_last_result() {
+        let empty_schema = Arc::new(Schema::new(vec![Field::new("whatever", DataType::Utf8, true)]));
+        let inputs = vec![
+            ("prod/a".to_string(), Rc::new(RefCell::new(buffer_a()))),
+            ("prod/b".to_string(), Rc::new(RefCell::new(buffer_b()))),
+            ("x/c".to_string(), Rc::new(RefCell::new(ResultBuffer::new(empty_schema)))),
+        ];
+
+        let plan = merged_plan_from(&inputs);
+        assert_eq!(plan.columns, vec!["zdroj", "id", "name", "extra"]);
+    }
+
+    #[test]
+    fn build_merged_buffer_is_all_text_with_source_first() {
+        let inputs = vec![
+            ("prod/a".to_string(), Rc::new(RefCell::new(buffer_a()))),
+            ("prod/b".to_string(), Rc::new(RefCell::new(buffer_b()))),
+        ];
+
+        let mut merged = build_merged_from(&inputs).expect("merge should succeed");
+        assert_eq!(merged.row_count(), 2);
+        for f in merged.schema().fields() {
+            assert_eq!(*f.data_type(), DataType::Utf8);
+        }
+        // columns: zdroj, id, name, extra
+        assert_eq!(merged.cell_text(0, 0), "prod/a");
+        assert_eq!(merged.cell_text(0, 1), "1");
+        assert_eq!(merged.cell_text(0, 2), "x");
+        assert!(merged.cell_is_null(0, 3));
+        assert_eq!(merged.cell_text(1, 0), "prod/b");
+        assert!(merged.cell_is_null(1, 1));
+        assert_eq!(merged.cell_text(1, 2), "y");
+        assert_eq!(merged.cell_text(1, 3), "2");
+    }
+
+    #[test]
+    fn build_merged_buffer_batches_beyond_4096_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let mut buf = ResultBuffer::new(schema.clone());
+        let values: Vec<i64> = (0..5000).collect();
+        buf.push(RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values)) as ArrayRef]).unwrap())
+            .unwrap();
+
+        let inputs = vec![("prod/a".to_string(), Rc::new(RefCell::new(buf)))];
+        let mut merged = build_merged_from(&inputs).expect("merge should succeed");
+        assert_eq!(merged.row_count(), 5000);
+        assert_eq!(merged.cell_text(4999, 1), "4999");
     }
 }
