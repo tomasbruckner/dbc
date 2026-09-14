@@ -17,6 +17,7 @@
 
 pub mod tunnel;
 pub mod targets;
+pub mod fanout;
 
 use tunnel::Tunnel;
 
