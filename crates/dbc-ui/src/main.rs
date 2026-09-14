@@ -80,6 +80,7 @@ mod transfer_ui;
 mod ui;
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -155,7 +156,14 @@ actions!(
         PrevEditorTab,
         /// Ctrl+D — pick `connection / database` for the active tab
         /// (2026-09-02 design §5).
-        PickDatabase
+        PickDatabase,
+        /// Ctrl+Shift+D — the multi-select target picker (multi-target
+        /// spec §3): the same palette overlay in `Targets` mode, Enter
+        /// runs the editor's SQL over every checked database.
+        PickTargets,
+        /// Ctrl+Alt+Enter — re-run over the active tab's `last_targets`
+        /// (spec §5); opens the picker instead when the tab has none.
+        RunOnLastTargets
     ]
 );
 
@@ -187,8 +195,13 @@ struct PaletteState {
     /// The text `items` was last computed from — compared against `input`'s
     /// live text each render to detect an edit.
     last_query: String,
-    /// Commands (Ctrl+K) or the database picker (Ctrl+D) — design §5.
+    /// Commands (Ctrl+K), the database picker (Ctrl+D) — design §5 — or
+    /// the multi-select target picker (Ctrl+Shift+D, multi-target spec §3).
     mode: palette::PaletteMode,
+    /// `Targets` mode only: the `(conn_id, database)` pairs currently
+    /// checked. A `BTreeSet` so the run order and the footer's server
+    /// count are deterministic. Empty in the other two modes.
+    checked: BTreeSet<(String, String)>,
 }
 
 /// G6 T7: autocomplete popup state — `None` when closed. `candidates` is
@@ -2293,12 +2306,9 @@ pub(crate) struct EditorTab {
     pub pending_script_path: Option<PathBuf>,
     /// Multi-target spec §5: the target set of this tab's last
     /// multi-target run, written by `run_on_targets_from_editor` so
-    /// „Spustit na posledních cílech" (Task 8's `Ctrl+Alt+Enter`) can
-    /// replay it without the picker. Per tab, never persisted.
-    ///
-    /// Allow dead_code: written here (Task 7), read by Task 8's
-    /// `on_run_on_last_targets` — remove once that lands.
-    #[allow(dead_code)]
+    /// `Ctrl+Alt+Enter` (`on_run_on_last_targets`) can replay it without
+    /// the picker, and pre-checked when the picker opens. Per tab, never
+    /// persisted.
     pub last_targets: Vec<Target>,
 }
 
@@ -4380,11 +4390,8 @@ impl AppView {
     /// preflight, then either the write gate or the dispatch. Remembers
     /// the target set on the tab (`last_targets`, spec §5) before any of
     /// that, so a refused or cancelled run still counts as „the last".
-    ///
-    /// Allow dead_code: the entry point lands here (Task 7); Task 8's
-    /// palette `Targets` mode / `Ctrl+Alt+Enter` are its callers — remove
-    /// once that lands.
-    #[allow(dead_code)]
+    /// Callers: the palette's `Targets` mode (`confirm_targets`) and
+    /// `Ctrl+Alt+Enter` (`on_run_on_last_targets`).
     fn run_on_targets_from_editor(&mut self, targets: Vec<Target>, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
             return;
@@ -7068,6 +7075,7 @@ impl AppView {
             selected: 0,
             last_query: String::new(),
             mode: palette::PaletteMode::Commands,
+            checked: BTreeSet::new(),
         });
         // G1 lesson (binding per the brief): focus must move to the
         // palette's own input in the SAME update the overlay appears in, or
@@ -7093,8 +7101,78 @@ impl AppView {
     }
 
     fn on_palette_confirm(&mut self, _: &palette::PaletteConfirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.as_ref().is_some_and(|p| p.mode == palette::PaletteMode::Targets) {
+            self.confirm_targets(window, cx);
+            return;
+        }
         let Some(item) = self.palette.as_ref().and_then(|p| p.items.get(p.selected).cloned()) else { return };
         self.execute_palette_item(item, window, cx);
+    }
+
+    /// Space in the palette: in `Targets` mode flips the highlighted row's
+    /// checkbox; elsewhere a no-op (see `palette::bind_keys`).
+    fn on_palette_toggle(&mut self, _: &palette::PaletteToggle, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = &mut self.palette else { return };
+        if p.mode != palette::PaletteMode::Targets {
+            return;
+        }
+        if let Some(PaletteItem::Database { conn_id, db, .. }) = p.items.get(p.selected) {
+            let key = (conn_id.clone(), db.clone());
+            if !p.checked.remove(&key) {
+                p.checked.insert(key);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+Shift+A in the palette: `Targets` mode only — every row the
+    /// current filter shows, checked (or all unchecked when they already
+    /// all are). Rows the filter hides keep their state, so a target
+    /// checked under one filter survives the next.
+    fn on_palette_toggle_all(&mut self, _: &palette::PaletteToggleAll, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = &mut self.palette else { return };
+        if p.mode != palette::PaletteMode::Targets {
+            return;
+        }
+        let visible: Vec<(String, String)> = p
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                PaletteItem::Database { conn_id, db, .. } => Some((conn_id.clone(), db.clone())),
+                _ => None,
+            })
+            .collect();
+        palette::toggle_all_visible(&mut p.checked, &visible);
+        cx.notify();
+    }
+
+    /// Enter in Targets mode: run over the checked set (spec §3). Nothing
+    /// checked → nothing happens; the footer already says so. A checked
+    /// pair whose connection has since been deleted is skipped, exactly as
+    /// `target_sources` drops it from the list.
+    fn confirm_targets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = &self.palette else { return };
+        let targets: Vec<Target> = p
+            .checked
+            .iter()
+            .filter_map(|(c, d)| {
+                self.config.connections.iter().find(|cfg| &cfg.id == c).map(|cfg| Target {
+                    conn_id: cfg.id.clone(),
+                    conn_name: cfg.name.clone(),
+                    database: d.clone(),
+                })
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        self.palette = None;
+        // The picker's field had the focus; the caret belongs back in the
+        // editor the run is for (same as a Ctrl+D pick), and a parameter
+        // dialog opened by the run must not find the palette's dead field.
+        let focus = self.editor().sql.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        self.run_on_targets_from_editor(targets, window, cx);
     }
 
     fn on_palette_close(&mut self, _: &palette::PaletteClose, _window: &mut Window, cx: &mut Context<Self>) {
@@ -7145,6 +7223,7 @@ impl AppView {
             selected: 0,
             last_query: String::new(),
             mode: palette::PaletteMode::Databases,
+            checked: BTreeSet::new(),
         });
         let items = self.build_palette_items("", cx);
         if let Some(p) = &mut self.palette {
@@ -7154,7 +7233,87 @@ impl AppView {
         cx.notify();
     }
 
+    /// Ctrl+Shift+D (multi-target spec §3): the palette overlay in
+    /// `Targets` mode, pre-checked with the active tab's current database
+    /// and its `last_targets`. A toggle, like Ctrl+D — Ctrl+Shift+D on an
+    /// open picker closes it.
+    fn on_pick_targets(&mut self, _: &PickTargets, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.as_ref().is_some_and(|p| p.mode == palette::PaletteMode::Targets) {
+            self.palette = None;
+            cx.notify();
+            return;
+        }
+        if self.modal.is_some() || self.apply_dialog.is_some() || self.discard_confirm.is_some() {
+            return;
+        }
+        self.dropdown_open = false;
+        let input = cx.new(|cx| {
+            connections_ui::TextField::new(cx, "Ctrl+Shift+D – vyber databáze, Enter spustí…", false)
+        });
+        let focus = input.focus_handle(cx);
+        let mut checked = BTreeSet::new();
+        if let (Some(c), Some(d)) = (self.editor().connection.clone(), self.effective_database()) {
+            checked.insert((c, d));
+        }
+        for t in &self.editor().last_targets {
+            checked.insert((t.conn_id.clone(), t.database.clone()));
+        }
+        self.palette = Some(PaletteState {
+            input,
+            items: Vec::new(),
+            selected: 0,
+            last_query: String::new(),
+            mode: palette::PaletteMode::Targets,
+            checked,
+        });
+        let items = self.build_palette_items("", cx);
+        if let Some(p) = &mut self.palette {
+            p.items = items;
+        }
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Ctrl+Alt+Enter (spec §5): the active tab's last target set again,
+    /// without the picker. A tab that never ran a multi-target query has
+    /// no „last set", so the picker opens instead — the chord is never a
+    /// silent no-op.
+    fn on_run_on_last_targets(&mut self, _: &RunOnLastTargets, window: &mut Window, cx: &mut Context<Self>) {
+        let targets = self.editor().last_targets.clone();
+        if targets.is_empty() {
+            self.on_pick_targets(&PickTargets, window, cx);
+            return;
+        }
+        self.run_on_targets_from_editor(targets, window, cx);
+    }
+
     fn build_palette_items(&self, query: &str, cx: &Context<Self>) -> Vec<PaletteItem> {
+        if self.palette.as_ref().is_some_and(|p| p.mode == palette::PaletteMode::Targets) {
+            let db = self.effective_database();
+            let current = self
+                .editor()
+                .connection
+                .as_deref()
+                .and_then(|c| db.as_deref().map(|d| (c, d)));
+            let remembered: Vec<(String, String)> = self
+                .editor()
+                .last_targets
+                .iter()
+                .map(|t| (t.conn_id.clone(), t.database.clone()))
+                .collect();
+            let sources = palette::target_sources(
+                &self.config.connections,
+                dbc_state::conn_cache::databases,
+                current,
+                &remembered,
+            );
+            // Cap 200, not Ctrl+D's 50: a tenant server has more than 50
+            // databases and Ctrl+Shift+A must see them all. With an empty
+            // query `rank_databases` keeps source order, which
+            // `database_sources` produces per connection — grouped reading
+            // for free.
+            return palette::rank_databases(query, &sources, 200);
+        }
         if self.palette.as_ref().is_some_and(|p| p.mode == palette::PaletteMode::Databases) {
             let db = self.effective_database();
             let current = self
@@ -7289,6 +7448,7 @@ impl AppView {
             PaletteItem::Action { action, .. } => match action {
                 PaletteAction::RunQuery => self.run_query(false, window, cx),
                 PaletteAction::PickDatabase => self.on_pick_database(&PickDatabase, window, cx),
+                PaletteAction::PickTargets => self.on_pick_targets(&PickTargets, window, cx),
                 PaletteAction::ToggleTree => {
                     self.tree_visible = !self.tree_visible;
                 }
@@ -7449,11 +7609,24 @@ impl AppView {
         let items = p.items.clone();
         let selected = p.selected;
         let input = p.input.clone();
+        let targets_mode = p.mode == palette::PaletteMode::Targets;
+        let checked = p.checked.clone();
 
         let theme = *cx.theme();
         let mut list = div().id("palette-list").flex().flex_col().flex_1().overflow_hidden();
         for (ix, item) in items.into_iter().enumerate() {
-            let label = palette::display_label(&item);
+            let mut label = palette::display_label(&item);
+            // Targets mode (spec §3): a checkbox in front of every row,
+            // and a click toggles it instead of executing — running is
+            // Enter's job, over the whole checked set.
+            let toggle_key = match (&item, targets_mode) {
+                (PaletteItem::Database { conn_id, db, .. }, true) => {
+                    let key = (conn_id.clone(), db.clone());
+                    label = format!("{}{label}", if checked.contains(&key) { "☑ " } else { "☐ " });
+                    Some(key)
+                }
+                _ => None,
+            };
             let is_selected = ix == selected;
             let bg = if is_selected { theme.bg_selected } else { theme.bg_panel };
             list = list.child(
@@ -7467,7 +7640,17 @@ impl AppView {
                     .hover(|s| s.bg(theme.bg_hover))
                     .child(label)
                     .on_click(cx.listener(move |view, _, window, cx| {
-                        view.execute_palette_item(item.clone(), window, cx);
+                        if let Some(key) = &toggle_key {
+                            if let Some(p) = &mut view.palette {
+                                p.selected = ix;
+                                if !p.checked.remove(key) {
+                                    p.checked.insert(key.clone());
+                                }
+                            }
+                            cx.notify();
+                        } else {
+                            view.execute_palette_item(item.clone(), window, cx);
+                        }
                     })),
             );
         }
@@ -7483,8 +7666,21 @@ impl AppView {
             .on_action(cx.listener(Self::on_palette_down))
             .on_action(cx.listener(Self::on_palette_confirm))
             .on_action(cx.listener(Self::on_palette_close))
+            .on_action(cx.listener(Self::on_palette_toggle))
+            .on_action(cx.listener(Self::on_palette_toggle_all))
             .child(div().px_2().py_2().border_b_1().border_color(theme.border).child(input))
-            .child(list);
+            .child(list)
+            .when(targets_mode, |panel| {
+                panel.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .text_color(theme.text_muted)
+                        .child(palette::targets_footer(&checked)),
+                )
+            });
 
         Some(
             div()
@@ -15522,6 +15718,8 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_next_editor_tab))
             .on_action(cx.listener(Self::on_prev_editor_tab))
             .on_action(cx.listener(Self::on_pick_database))
+            .on_action(cx.listener(Self::on_pick_targets))
+            .on_action(cx.listener(Self::on_run_on_last_targets))
             .child(self.render_top_bar(window, cx))
             .child(body);
 
@@ -16017,6 +16215,8 @@ fn main() {
             KeyBinding::new("ctrl-tab", NextEditorTab, None),
             KeyBinding::new("ctrl-shift-tab", PrevEditorTab, None),
             KeyBinding::new("ctrl-d", PickDatabase, None),
+            KeyBinding::new("ctrl-shift-d", PickTargets, None),
+            KeyBinding::new("ctrl-alt-enter", RunOnLastTargets, None),
             // Scoped to the text tab body, the same posture as the grid's
             // own Ctrl+C: only reachable once that body holds focus, which
             // happens when you click into it.

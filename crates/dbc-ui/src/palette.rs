@@ -22,6 +22,7 @@
 
 use dbc_state::ConnectionConfig;
 use gpui::{actions, App, KeyBinding};
+use std::collections::BTreeSet;
 
 /// Case-insensitive subsequence match: every character of `query` must
 /// appear in `target`, in order (not necessarily contiguous), or this
@@ -101,11 +102,14 @@ pub enum PaletteItem {
 }
 
 /// Which list the one palette overlay is showing (design §5): Ctrl+K's
-/// commands, or Ctrl+D's `connection / database` rows.
+/// commands, Ctrl+D's `connection / database` rows, or Ctrl+Shift+D's
+/// multi-select target picker (multi-target spec §3) — the same rows as
+/// `Databases`, each with a checkbox, Enter runs over the checked set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteMode {
     Commands,
     Databases,
+    Targets,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +198,9 @@ pub enum PaletteAction {
     /// Ctrl+D from inside the commands list — so the picker is
     /// discoverable without knowing its chord.
     PickDatabase,
+    /// Ctrl+Shift+D from inside the commands list — the multi-target
+    /// picker (multi-target spec §3), discoverable the same way.
+    PickTargets,
 }
 
 /// One table/view from the current schema snapshot, plus whether it's
@@ -296,6 +303,74 @@ pub fn rank_databases(query: &str, sources: &[DatabaseSource], cap: usize) -> Ve
         .collect()
 }
 
+/// Ctrl+Shift+D's sources: every cached database (as Ctrl+D), plus the
+/// current database and the remembered set when the cache does not list
+/// them (spec §3: every selected target is always visible and
+/// uncheckable). A remembered target whose connection is gone is dropped.
+pub fn target_sources(
+    connections: &[ConnectionConfig],
+    cached: impl Fn(&str) -> Option<Vec<String>>,
+    current: Option<(&str, &str)>,
+    remembered: &[(String, String)],
+) -> Vec<DatabaseSource> {
+    let mut out = database_sources(connections, cached, current);
+    let mut extra: Vec<(&str, &str, bool)> = Vec::new();
+    if let Some((c, d)) = current {
+        extra.push((c, d, true));
+    }
+    for (c, d) in remembered {
+        extra.push((c, d, false));
+    }
+    for (conn_id, db, is_current) in extra {
+        if out.iter().any(|s| s.conn_id == conn_id && s.db == db) {
+            continue;
+        }
+        let Some(c) = connections.iter().find(|c| c.id == conn_id) else { continue };
+        out.push(DatabaseSource {
+            conn_id: c.id.clone(),
+            conn_name: c.name.clone(),
+            folder: c.folder.clone(),
+            db: db.to_string(),
+            is_current,
+        });
+    }
+    out
+}
+
+/// Ctrl+Shift+A: everything the filter shows becomes checked; when it all
+/// already is, it all becomes unchecked.
+pub fn toggle_all_visible(checked: &mut BTreeSet<(String, String)>, visible: &[(String, String)]) {
+    if visible.iter().all(|v| checked.contains(v)) {
+        for v in visible {
+            checked.remove(v);
+        }
+    } else {
+        for v in visible {
+            checked.insert(v.clone());
+        }
+    }
+}
+
+/// The Targets picker's footer line (spec §3): what is checked, and the
+/// two chords the picker adds on top of Ctrl+D's.
+pub fn targets_footer(checked: &BTreeSet<(String, String)>) -> String {
+    if checked.is_empty() {
+        return "Nic nevybráno · mezerník přepíná · Ctrl+Shift+A vše zobrazené · Esc zavře".to_string();
+    }
+    let servers = checked.iter().map(|(c, _)| c).collect::<BTreeSet<_>>().len();
+    let n = checked.len();
+    let noun = match n {
+        1 => "cíl",
+        2..=4 => "cíle",
+        _ => "cílů",
+    };
+    let srv = match servers {
+        1 => "serveru",
+        _ => "serverech",
+    };
+    format!("Vybráno {n} {noun} na {servers} {srv} · Enter spustí · příště Ctrl+Alt+Enter spustí nad stejnou sadou")
+}
+
 /// The fixed action rows, in display order, with their Czech labels (brief
 /// contract #3). `monitor_available` gates the monitor entry per the ACTIVE
 /// connection's engine (design §7): absent entirely — not disabled-but-
@@ -329,6 +404,7 @@ pub fn fixed_actions(
     let mut actions = vec![
         ("Spustit dotaz".to_string(), PaletteAction::RunQuery),
         ("Vybrat databázi… (Ctrl+D)".to_string(), PaletteAction::PickDatabase),
+        ("Spustit nad více databázemi… (Ctrl+Shift+D)".to_string(), PaletteAction::PickTargets),
         ("Přepnout strom".to_string(), PaletteAction::ToggleTree),
         ("Historie (Ctrl+H)".to_string(), PaletteAction::ShowHistory),
         ("Nové spojení…".to_string(), PaletteAction::NewConnection),
@@ -517,7 +593,7 @@ pub fn display_label(item: &PaletteItem) -> String {
 // Up/Down/Enter/Escape bindings of its own) still resolves them.
 // ---------------------------------------------------------------------
 
-actions!(palette, [PaletteUp, PaletteDown, PaletteConfirm, PaletteClose]);
+actions!(palette, [PaletteUp, PaletteDown, PaletteConfirm, PaletteClose, PaletteToggle, PaletteToggleAll]);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -525,6 +601,16 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("down", PaletteDown, Some("Palette")),
         KeyBinding::new("enter", PaletteConfirm, Some("Palette")),
         KeyBinding::new("escape", PaletteClose, Some("Palette")),
+        // Targets mode (multi-target spec §3). `space` has no binding
+        // anywhere else, so this ancestor-scoped one wins over plain text
+        // insertion into the palette's `TextField` (in Commands/Databases
+        // mode the handler is a no-op — fuzzy matching ignores spaces).
+        // `ctrl-shift-a`, NOT the spec's `ctrl-a`: sql_input.rs binds
+        // `ctrl-a` unscoped and connections_ui.rs binds it for `TextField`
+        // (the focused element); both outrank a Palette-scoped binding
+        // (see `on_cancel_query`'s `bindings_for_input` note in main.rs).
+        KeyBinding::new("space", PaletteToggle, Some("Palette")),
+        KeyBinding::new("ctrl-shift-a", PaletteToggleAll, Some("Palette")),
     ]);
 }
 
@@ -643,8 +729,10 @@ mod rank_items_tests {
         // the log viewer (`ShowLog`) + the two settings-transfer rows
         // (`ExportSettings`/`ImportSettings`) — all unconditional, unlike
         // `OpenMonitor` which is engine-gated (monitor_available=false).
-        // + „Vybrat databázi… (Ctrl+D)" (`PickDatabase`, 2026-09-02).
-        assert_eq!(items.len(), 2 + 2 + 1 + 16);
+        // + „Vybrat databázi… (Ctrl+D)" (`PickDatabase`, 2026-09-02)
+        // + „Spustit nad více databázemi… (Ctrl+Shift+D)" (`PickTargets`,
+        // multi-target 2026-09-14).
+        assert_eq!(items.len(), 2 + 2 + 1 + 17);
     }
 
     #[test]
@@ -966,5 +1054,76 @@ mod database_picker_tests {
         let src = database_sources(&conns, |_| None, Some(("c1", "sales")));
         let items = rank_databases("", &src, 50);
         assert_eq!(display_label(&items[0]), "● prod · sales  (dw/eu)");
+    }
+}
+
+#[cfg(test)]
+mod targets_mode_tests {
+    use super::*;
+    use dbc_state::Engine;
+    use std::collections::BTreeSet;
+
+    fn cfg(id: &str, name: &str, db: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            id: id.into(),
+            name: name.into(),
+            folder: Vec::new(),
+            engine: Engine::Postgres,
+            host: "h".into(),
+            port: None,
+            database: db.into(),
+            user: "u".into(),
+            read_only: false,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: None,
+        }
+    }
+
+    #[test]
+    fn target_sources_adds_remembered_and_current_missing_from_cache() {
+        let conns = vec![cfg("c1", "prod", "main")];
+        let cached = |id: &str| if id == "c1" { Some(vec!["main".to_string()]) } else { None };
+        let remembered =
+            vec![("c1".to_string(), "klient_z".to_string()), ("gone".to_string(), "x".to_string())];
+        let out = target_sources(&conns, cached, Some(("c1", "adhoc")), &remembered);
+        let dbs: Vec<&str> = out.iter().map(|s| s.db.as_str()).collect();
+        assert_eq!(
+            dbs,
+            vec!["main", "adhoc", "klient_z"],
+            "cache first, then current, then remembered; unknown connection dropped"
+        );
+        assert!(out.iter().find(|s| s.db == "adhoc").unwrap().is_current);
+    }
+
+    #[test]
+    fn toggle_all_visible_selects_then_clears() {
+        let mut checked = BTreeSet::new();
+        let visible = vec![("c1".to_string(), "a".to_string()), ("c1".to_string(), "b".to_string())];
+        toggle_all_visible(&mut checked, &visible);
+        assert_eq!(checked.len(), 2);
+        toggle_all_visible(&mut checked, &visible);
+        assert!(checked.is_empty());
+        checked.insert(("c1".into(), "a".into()));
+        toggle_all_visible(&mut checked, &visible);
+        assert_eq!(checked.len(), 2, "partially selected → select all");
+    }
+
+    #[test]
+    fn footer_counts_targets_and_servers() {
+        let mut checked = BTreeSet::new();
+        assert_eq!(
+            targets_footer(&checked),
+            "Nic nevybráno · mezerník přepíná · Ctrl+Shift+A vše zobrazené · Esc zavře"
+        );
+        checked.insert(("c1".to_string(), "a".to_string()));
+        checked.insert(("c1".to_string(), "b".to_string()));
+        checked.insert(("c2".to_string(), "a".to_string()));
+        assert_eq!(
+            targets_footer(&checked),
+            "Vybráno 3 cíle na 2 serverech · Enter spustí · příště Ctrl+Alt+Enter spustí nad stejnou sadou"
+        );
     }
 }

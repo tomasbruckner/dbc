@@ -113,6 +113,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     s("ctrl-tab", "Další tab", Scope::Global, false),
     s("ctrl-shift-tab", "Předchozí tab", Scope::Global, false),
     s("ctrl-d", "Vybrat databázi", Scope::Global, false),
+    s("ctrl-shift-d", "Spustit nad více databázemi", Scope::Global, false),
     // --- Results ---
     // Not „Ctrl+C kopíruje". THAT the grid has a search, that Enter walks
     // the hits, and that Delete stages a row deletion rather than doing one
@@ -161,6 +162,10 @@ pub const UNDOCUMENTED_GLOBALS: &[&str] = &[
     // documented because it does nothing on the platform this ships on —
     // listing a dead key in the cheat sheet would be its own kind of lie.
     "ctrl-cmd-space",
+    // Ctrl+Alt+Enter re-runs the editor's SQL over the tab's last target
+    // set; shown in the target picker's footer instead of the sheet (spec
+    // §3).
+    "ctrl-alt-enter",
 ];
 
 /// The shortcuts to show in the always-visible strip for `focus`.
@@ -231,7 +236,7 @@ mod tests {
     /// question that keeps the list useful.
     #[test]
     fn the_sheet_stays_short_enough_to_read() {
-        assert!(SHORTCUTS.len() <= 24, "{} shortcuts is a manual, not a sheet", SHORTCUTS.len());
+        assert!(SHORTCUTS.len() <= 25, "{} shortcuts is a manual, not a sheet", SHORTCUTS.len());
     }
 
     /// The universal chords must be bound-but-unlisted, never listed. If one
