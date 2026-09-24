@@ -26,9 +26,9 @@ use std::time::Duration;
 
 use dbc_core::{Connection, QueryError};
 use dbc_driver_duckdb::DuckdbConnection;
-use dbc_driver_postgres::PostgresConnection;
+use dbc_driver_postgres::{PgSsl, PostgresConnection};
 use dbc_driver_sqlite::SqliteConnection;
-use dbc_state::{ConnectionConfig, Engine};
+use dbc_state::{ConnectionConfig, Engine, PgSslMode};
 
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_PG_PORT: u16 = 5432;
@@ -110,7 +110,15 @@ pub async fn open_for_mcp(
             if let Some(pw) = &secret {
                 config.password(pw);
             }
-            let conn = PostgresConnection::connect_with_config(config).await?;
+            // Same sslmode mapping as dbc-connect's `pg_ssl` (kept local,
+            // like the rest of this near-duplicate — see module doc).
+            let ssl = match cfg.pg_ssl_mode() {
+                PgSslMode::Disable => PgSsl::Disable,
+                PgSslMode::Prefer => PgSsl::Prefer,
+                PgSslMode::Require => PgSsl::Require,
+                PgSslMode::VerifyFull => PgSsl::VerifyFull,
+            };
+            let conn = PostgresConnection::connect_with_config(config, ssl).await?;
             Ok(Box::new(conn))
         }
     }
@@ -137,6 +145,7 @@ mod tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 

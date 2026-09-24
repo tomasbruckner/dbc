@@ -1048,6 +1048,7 @@ mod database_picker_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 
@@ -1117,6 +1118,7 @@ mod targets_mode_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 

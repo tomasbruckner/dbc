@@ -485,6 +485,7 @@ mod tests {
             },
             favourite: true,
             mssql: None,
+            postgres: None,
         }
     }
 

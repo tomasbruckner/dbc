@@ -14859,7 +14859,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     backup::BackupStatus::Running,
                     cx,
                 );
-                let (mut rx, handle) = self.runner.run_external_tool(program, args, secret.clone());
+                let (mut rx, handle) = self.runner.run_external_tool(program, args, secret.clone(), backup::pg_tool_env(&cfg));
                 // BackupHandle wired into the session's cancel slot RIGHT
                 // HERE, before this method returns — every teardown path
                 // that can observe `self.modal` after this point can also
@@ -15323,7 +15323,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     backup::BackupStatus::Running,
                     cx,
                 );
-                let (mut rx, handle) = self.runner.run_external_tool(program, args, secret.clone());
+                let (mut rx, handle) = self.runner.run_external_tool(program, args, secret.clone(), backup::pg_tool_env(&cfg));
                 *cancel_slot.borrow_mut() = Some(Rc::new(move || handle.cancel()));
                 let started = std::time::Instant::now();
                 cx.spawn(async move |this, cx| {
@@ -16151,6 +16151,7 @@ mod plan_restore_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 
@@ -17088,6 +17089,7 @@ mod multi_statement_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 
@@ -17520,7 +17522,7 @@ mod identity_widening_tests {
             engine: dbc_state::Engine::Postgres, host: "localhost".into(),
             port: Some(5432), database: db.into(), user: "u".into(),
             read_only: true, timeout_secs: Some(30), auto_limit: Some(500),
-            ssh: None, favourite: false, mssql: None,
+            ssh: None, favourite: false, mssql: None, postgres: None,
         }
     }
 

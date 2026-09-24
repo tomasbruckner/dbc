@@ -90,6 +90,7 @@ mod tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 

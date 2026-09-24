@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use dbc_buffer::ResultBuffer;
-use dbc_state::{ConnectionConfig, Engine, MssqlOptions, SshTunnelConfig, Vault};
+use dbc_state::{ConnectionConfig, Engine, MssqlOptions, PgOptions, PgSslMode, SshTunnelConfig, Vault};
 use gpui::{
     actions, div, fill, hsla, point, prelude::*, px, relative, size, App, AnyElement,
     Bounds, ClipboardItem, Context, CursorStyle, Div, ElementId, ElementInputHandler, Entity,
@@ -203,6 +203,7 @@ mod grouping_tests {
             ssh: None,
             favourite,
             mssql: None,
+            postgres: None,
         }
     }
 
@@ -1122,6 +1123,7 @@ pub struct ConnectionDialogUi {
     pub ssh_enabled: bool,
     pub mssql_encrypt: bool,
     pub mssql_trust_cert: bool,
+    pub pg_ssl_mode: PgSslMode,
     pub test_result: Option<TestOutcome>,
     /// `true` while a Test-button connect dispatched via
     /// `QueryRunner::test_connect` is in flight (Task 8 review issue #1) —
@@ -1175,6 +1177,10 @@ impl ConnectionDialogUi {
         } else {
             None
         };
+        // Same contract as `mssql` above: only a Postgres connection
+        // carries Postgres options.
+        let postgres = (self.engine == Engine::Postgres)
+            .then_some(PgOptions { ssl_mode: self.pg_ssl_mode });
         ConnectionFormData {
             id,
             name: self.name.read(cx).text(),
@@ -1191,6 +1197,7 @@ impl ConnectionDialogUi {
             auto_limit: parse_u64(&self.auto_limit.read(cx).text()),
             ssh,
             mssql,
+            postgres,
         }
     }
 }
@@ -1217,6 +1224,7 @@ pub struct ConnectionFormData {
     pub auto_limit: Option<u64>,
     pub ssh: Option<SshTunnelConfig>,
     pub mssql: Option<MssqlOptions>,
+    pub postgres: Option<PgOptions>,
 }
 
 /// Hand-written `Debug` (instead of `#[derive(Debug)]`) so `password` is
@@ -1242,6 +1250,7 @@ impl std::fmt::Debug for ConnectionFormData {
             .field("auto_limit", &self.auto_limit)
             .field("ssh", &self.ssh)
             .field("mssql", &self.mssql)
+            .field("postgres", &self.postgres)
             .finish()
     }
 }
@@ -1263,6 +1272,7 @@ impl ConnectionFormData {
             ssh: self.ssh.clone(),
             favourite: self.favourite,
             mssql: self.mssql.clone(),
+            postgres: self.postgres.clone(),
         }
     }
 }
@@ -1292,7 +1302,16 @@ mod form_data_mssql_tests {
             } else {
                 None
             },
+            postgres: (engine == Engine::Postgres)
+                .then_some(PgOptions { ssl_mode: PgSslMode::Require }),
         }
+    }
+
+    #[test]
+    fn form_data_carries_postgres_options_through_to_config() {
+        let pg_cfg = base_form_data(Engine::Postgres).to_connection_config();
+        assert_eq!(pg_cfg.pg_ssl_mode(), PgSslMode::Require);
+        assert_eq!(base_form_data(Engine::Mssql).to_connection_config().postgres, None);
     }
 
     #[test]
@@ -1843,6 +1862,18 @@ pub(crate) fn script_delete_dirty_line() -> &'static str {
 /// It says what is NOT destroyed, because that is the question: deleting a
 /// connection removes an entry from this app's own list and leaves the
 /// database, its data and the server account exactly as they were.
+/// One line under the SSL row saying what the picked mode actually buys —
+/// the libpq names alone do not tell a user that `require` still trusts
+/// any certificate.
+pub(crate) fn pg_ssl_mode_hint(mode: PgSslMode) -> &'static str {
+    match mode {
+        PgSslMode::Disable => "bez šifrování",
+        PgSslMode::Prefer => "šifrovat, pokud to server umí; certifikát se neověřuje",
+        PgSslMode::Require => "vždy šifrovat; certifikát se neověřuje",
+        PgSslMode::VerifyFull => "vždy šifrovat a ověřit certifikát i název serveru (úložiště Windows)",
+    }
+}
+
 pub(crate) fn connection_delete_text(name: &str) -> String {
     format!("Smazat připojení {name}? Databáze ani její data se nijak nezmění — mizí jen tento záznam v aplikaci.")
 }
@@ -2702,7 +2733,7 @@ impl AppView {
         let ssh_key_path = cx.new(|cx| TextField::form_field(cx, "~/.ssh/id_ed25519", false));
         let mssql_driver = cx.new(|cx| TextField::form_field(cx, "ODBC Driver 18 for SQL Server", false));
 
-        let (editing_id, engine, read_only, favourite, ssh_enabled, mssql_encrypt, mssql_trust_cert) = if let Some(c) = &editing {
+        let (editing_id, engine, read_only, favourite, ssh_enabled, mssql_encrypt, mssql_trust_cert, pg_ssl_mode) = if let Some(c) = &editing {
             name.update(cx, |f, cx| f.set_text(&c.name, cx));
             host.update(cx, |f, cx| f.set_text(&c.host, cx));
             port.update(cx, |f, cx| f.set_text(&c.port.map(|p| p.to_string()).unwrap_or_default(), cx));
@@ -2730,6 +2761,7 @@ impl AppView {
                 ssh_enabled,
                 mssql_opts.encrypt,
                 mssql_opts.trust_server_certificate,
+                c.pg_ssl_mode(),
             )
         } else {
             let defaults = MssqlOptions::default();
@@ -2738,7 +2770,7 @@ impl AppView {
             // engine is switched — and stops the moment the user types
             // something of their own (`may_replace_database`).
             database.update(cx, |f, cx| f.set_text(default_database_for(Engine::Postgres), cx));
-            (None, Engine::Postgres, false, false, false, defaults.encrypt, defaults.trust_server_certificate)
+            (None, Engine::Postgres, false, false, false, defaults.encrypt, defaults.trust_server_certificate, PgSslMode::default())
         };
 
         let name_focus = name.focus_handle(cx);
@@ -2764,6 +2796,7 @@ impl AppView {
             ssh_enabled,
             mssql_encrypt,
             mssql_trust_cert,
+            pg_ssl_mode,
             test_result: None,
             testing: false,
         };
@@ -3083,6 +3116,12 @@ impl AppView {
     fn toggle_mssql_trust(&mut self, cx: &mut Context<Self>) {
         if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
             ui.mssql_trust_cert = !ui.mssql_trust_cert;
+        }
+        cx.notify();
+    }
+    fn set_pg_ssl_mode(&mut self, mode: PgSslMode, cx: &mut Context<Self>) {
+        if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
+            ui.pg_ssl_mode = mode;
         }
         cx.notify();
     }
@@ -4139,6 +4178,7 @@ mod test_vault_prompt_tests {
                 auto_limit: None,
                 ssh: None,
                 mssql: None,
+                postgres: None,
             }
         ))));
     }
@@ -4341,6 +4381,26 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
             .child(ui::field_row("SSH port", ui.ssh_port.clone(), *cx.theme()))
             .child(ui::field_row("SSH uživatel", ui.ssh_user.clone(), *cx.theme()))
             .child(ui::field_row("SSH klíč (cesta)", ui.ssh_key_path.clone(), *cx.theme()));
+    }
+
+    if ui.engine == Engine::Postgres {
+        panel = panel
+            .child(
+                ui::labelled_row("SSL", ui::FIELD_LABEL_W, *cx.theme()).child(
+                    PgSslMode::ALL.iter().fold(div().flex().gap_1(), |row, &m| {
+                        row.child(
+                            ui::segmented_option(
+                                SharedString::from(format!("pg-ssl-{}", m.as_libpq())),
+                                m.as_libpq(),
+                                ui.pg_ssl_mode == m,
+                                *cx.theme(),
+                            )
+                            .on_click(cx.listener(move |view, _, _, cx| view.set_pg_ssl_mode(m, cx))),
+                        )
+                    }),
+                ),
+            )
+            .child(div().text_color(cx.theme().text_muted).child(pg_ssl_mode_hint(ui.pg_ssl_mode)));
     }
 
     if ui.engine == Engine::Mssql {

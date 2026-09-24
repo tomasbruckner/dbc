@@ -1,3 +1,4 @@
+mod tls;
 mod types;
 
 use std::collections::HashMap;
@@ -12,7 +13,8 @@ use dbc_core::{
     TableKind, TriggerInfo, BATCH_LATENCY, BATCH_ROWS, CHANNEL_CAPACITY,
 };
 use futures_util::StreamExt;
-use tokio_postgres::NoTls;
+pub use tls::PgSsl;
+use tls::MakeRustlsConnect;
 use types::{arrow_type, ColBuilder};
 
 /// Re-exported so callers outside this crate (`dbc-ui`'s `connect::open_config`)
@@ -25,6 +27,7 @@ use types::{arrow_type, ColBuilder};
 /// the exact same type as `tokio_postgres::Config`, just reachable through
 /// this crate's public API instead.
 pub use tokio_postgres::Config as PgConfig;
+pub use tokio_postgres::config::Host as PgHost;
 
 /// Every catalog query in `schema()` excludes these — internal Postgres
 /// namespaces, not user objects. This also excludes session-temp namespaces
@@ -39,6 +42,10 @@ const SCHEMA_EXCLUDE: &str = "n.nspname NOT IN ('pg_catalog', 'information_schem
 
 pub struct PostgresConnection {
     client: Arc<tokio_postgres::Client>,
+    /// The connector the session was opened with — a protocol-level
+    /// cancel opens a SECOND connection, which must be allowed through the
+    /// same `pg_hba.conf` line, i.e. use TLS iff the session did.
+    tls: MakeRustlsConnect,
 }
 
 fn pg_err(e: tokio_postgres::Error) -> QueryError {
@@ -53,18 +60,40 @@ fn pg_err(e: tokio_postgres::Error) -> QueryError {
             code: Some(if code == "57014" { "cancelled".into() } else { code }),
         }
     } else {
-        QueryError::msg(e.to_string())
+        QueryError::msg(with_sources(&e))
     }
 }
 
+/// `tokio_postgres::Error`'s Display stops at its own kind — „error
+/// performing TLS handshake" says nothing about WHICH certificate problem
+/// it was. Append the source chain so the user sees the actual reason.
+fn with_sources(e: &dyn std::error::Error) -> String {
+    let mut msg = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        let part = s.to_string();
+        if !msg.contains(&part) {
+            msg.push_str(": ");
+            msg.push_str(&part);
+        }
+        src = s.source();
+    }
+    msg
+}
+
 impl PostgresConnection {
+    /// URL form. The URL's own `sslmode` (default `prefer`) decides
+    /// whether TLS is used; the certificate is never verified here — a URL
+    /// cannot say `verify-full` to `tokio_postgres`.
     pub async fn connect(url: &str) -> Result<Self, QueryError> {
-        let (client, connection) = tokio_postgres::connect(url, NoTls).await.map_err(pg_err)?;
+        let tls = MakeRustlsConnect::new(PgSsl::Require).map_err(QueryError::msg)?;
+        let (client, connection) =
+            tokio_postgres::connect(url, tls.clone()).await.map_err(pg_err)?;
         // The connection object drives the socket; it must be polled.
         tokio::spawn(async move {
             let _ = connection.await; // errors surface on the client side
         });
-        Ok(Self { client: Arc::new(client) })
+        Ok(Self { client: Arc::new(client), tls })
     }
 
     /// Like [`Self::connect`], but takes a `tokio_postgres::Config` builder
@@ -72,12 +101,24 @@ impl PostgresConnection {
     /// (`dbc-ui`'s `connect::open_config`) so a password containing `@`,
     /// `/`, or other URL-special characters never has to be percent-encoded
     /// into a connection string in the first place.
-    pub async fn connect_with_config(config: tokio_postgres::Config) -> Result<Self, QueryError> {
-        let (client, connection) = config.connect(NoTls).await.map_err(pg_err)?;
+    ///
+    /// `ssl` overrides whatever sslmode `config` carried: it decides both
+    /// whether TLS is negotiated and whether the certificate is verified.
+    /// The TLS server name is `config`'s host — so an SSH-tunnelled
+    /// connection should put the tunnel end in `hostaddr` and keep the
+    /// real server name in `host`, or `verify-full` would check the
+    /// certificate against `127.0.0.1`.
+    pub async fn connect_with_config(
+        mut config: tokio_postgres::Config,
+        ssl: PgSsl,
+    ) -> Result<Self, QueryError> {
+        config.ssl_mode(ssl.protocol_mode());
+        let tls = MakeRustlsConnect::new(ssl).map_err(QueryError::msg)?;
+        let (client, connection) = config.connect(tls.clone()).await.map_err(pg_err)?;
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        Ok(Self { client: Arc::new(client) })
+        Ok(Self { client: Arc::new(client), tls })
     }
 }
 
@@ -107,12 +148,13 @@ impl Connection for PostgresConnection {
         // connection's backend process id, potentially killing an unrelated
         // query that's since started using the same connection.
         let cancel_handle = self.client.cancel_token();
+        let cancel_tls = self.tls.clone();
         let watcher_cancel = cancel.clone();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             tokio::select! {
                 _ = watcher_cancel.cancelled() => {
-                    let _ = cancel_handle.cancel_query(NoTls).await;
+                    let _ = cancel_handle.cancel_query(cancel_tls).await;
                 }
                 _ = done_rx => {
                     // Query already finished; nothing to cancel.
@@ -253,12 +295,13 @@ impl Connection for PostgresConnection {
         }
 
         let cancel_handle = self.client.cancel_token();
+        let cancel_tls = self.tls.clone();
         let watcher_cancel = cancel.clone();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             tokio::select! {
                 _ = watcher_cancel.cancelled() => {
-                    let _ = cancel_handle.cancel_query(NoTls).await;
+                    let _ = cancel_handle.cancel_query(cancel_tls).await;
                 }
                 _ = done_rx => {
                     // Statement already finished; nothing to cancel.

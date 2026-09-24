@@ -902,11 +902,12 @@ impl QueryRunner {
         program: String,
         args: Vec<String>,
         password: Option<String>,
+        env: Vec<(&'static str, &'static str)>,
     ) -> (tokio::sync::mpsc::Receiver<backup::BackupEvent>, backup::BackupHandle) {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let (std_tx, std_rx) = std::sync::mpsc::channel::<backup::BackupEvent>();
 
-        let handle = backup::run_and_stream(&program, &args, password.as_deref(), &std_tx);
+        let handle = backup::run_and_stream(&program, &args, password.as_deref(), &env, &std_tx);
 
         // Forwarding loop: blocking std channel -> tokio channel, off any
         // runtime worker thread (a blocking `std_rx.recv()` must never run
@@ -3087,6 +3088,7 @@ mod db_list_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 
@@ -3637,6 +3639,7 @@ mod write_transaction_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         };
         assert!(spec_is_read_only(&ConnectSpec::Config { cfg: Box::new(cfg.clone()), secret: None }));
         let mut cfg2 = cfg;
@@ -3666,6 +3669,7 @@ mod write_transaction_tests {
                 ssh: None,
                 favourite: false,
                 mssql: None,
+                postgres: None,
             }
         }
         assert_eq!(
@@ -3817,6 +3821,7 @@ mod write_transaction_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         };
         let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
         // Exercises `run_write_transaction_inner` (the same body
@@ -3852,6 +3857,7 @@ mod write_transaction_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         };
         let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
         let handle = tokio::runtime::Handle::current();
@@ -3969,6 +3975,7 @@ mod write_transaction_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         };
         let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
         let stmts = admin_sql::drop_role(dbc_state::Engine::Postgres, "bob");
@@ -4258,6 +4265,7 @@ mod analyze_write_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         };
         let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
         let handle = tokio::runtime::Handle::current();
@@ -4762,6 +4770,7 @@ mod run_many_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 
@@ -4992,6 +5001,7 @@ mod csv_import_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 
@@ -6507,6 +6517,7 @@ mod backup_runner_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 
@@ -6776,6 +6787,7 @@ mod backup_runner_tests {
                 "cmd".to_string(),
                 vec!["/C".to_string(), "echo hello 1>&2".to_string()],
                 None,
+                vec![],
             );
             let mut saw_log = false;
             let mut saw_finished = false;
@@ -6800,7 +6812,7 @@ mod backup_runner_tests {
         let handle = runner.handle();
         handle.block_on(async {
             let (mut rx, _handle) =
-                runner.run_external_tool("definitely-not-a-real-binary-xyz".to_string(), vec![], None);
+                runner.run_external_tool("definitely-not-a-real-binary-xyz".to_string(), vec![], None, vec![]);
             let ev = rx.recv().await.unwrap();
             assert!(matches!(ev, backup::BackupEvent::Failed(_)));
         });
@@ -6836,7 +6848,7 @@ mod backup_runner_tests {
             let args = vec!["/C".to_string(), "echo %PGPASSWORD% 1>&2".to_string()];
             assert!(!args.iter().any(|a| a.contains(NASTY_PASSWORD)));
             let (mut rx, _handle) =
-                runner.run_external_tool("cmd".to_string(), args, Some(NASTY_PASSWORD.to_string()));
+                runner.run_external_tool("cmd".to_string(), args, Some(NASTY_PASSWORD.to_string()), vec![]);
             let mut saw_env_value = false;
             while let Some(ev) = rx.recv().await {
                 match ev {
@@ -6879,6 +6891,7 @@ mod mssql_plan_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 
@@ -7044,6 +7057,7 @@ mod backup_docker_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 
@@ -7109,7 +7123,7 @@ mod backup_docker_tests {
             )
             .expect("dbname passes validate_pg_dbname");
 
-            let (mut rx, _handle) = runner.run_external_tool(pg_dump, args, Some("postgres".to_string()));
+            let (mut rx, _handle) = runner.run_external_tool(pg_dump, args, Some("postgres".to_string()), vec![]);
             let mut finished = false;
             while let Some(ev) = rx.recv().await {
                 match ev {
@@ -7153,7 +7167,7 @@ mod backup_docker_tests {
             .expect("dbname passes validate_pg_dbname");
 
             let (mut rx2, _h2) =
-                runner.run_external_tool(pg_restore, restore_args, Some("postgres".to_string()));
+                runner.run_external_tool(pg_restore, restore_args, Some("postgres".to_string()), vec![]);
             let mut restored = false;
             while let Some(ev) = rx2.recv().await {
                 match ev {
@@ -7223,7 +7237,7 @@ mod backup_docker_tests {
 
             const WRONG_PASSWORD: &str = "definitely-the-wrong-password-42";
             let (mut rx, _handle) =
-                runner.run_external_tool(pg_dump, args, Some(WRONG_PASSWORD.to_string()));
+                runner.run_external_tool(pg_dump, args, Some(WRONG_PASSWORD.to_string()), vec![]);
             let mut failure_text = String::new();
             let mut saw_finished = false;
             while let Some(ev) = rx.recv().await {
@@ -7747,6 +7761,7 @@ mod mssql_docker_tests {
                 trust_server_certificate: true,
                 driver: None,
             }),
+            postgres: None,
         }
     }
 
@@ -8919,6 +8934,7 @@ mod duckdb_backup_restore_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 
@@ -9228,6 +9244,7 @@ mod duckdb_runner_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 

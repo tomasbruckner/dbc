@@ -2,7 +2,7 @@
 //! orchestration (T3, appended below). Pure half has zero I/O — no
 //! `std::process`, no `std::fs` reads beyond what's handed in as `&[u8]`.
 
-use dbc_state::{ConnectionConfig, Engine};
+use dbc_state::{ConnectionConfig, Engine, PgSslMode};
 
 fn sql_string_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -514,7 +514,29 @@ mod pure_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
+    }
+
+    #[test]
+    fn pg_tool_env_carries_the_connection_sslmode() {
+        // Nothing saved = prefer, same as the app's own connection.
+        assert_eq!(pg_tool_env(&cfg()), vec![("PGSSLMODE", "prefer")]);
+        let mut c = cfg();
+        c.postgres = Some(dbc_state::PgOptions { ssl_mode: PgSslMode::Require });
+        assert_eq!(pg_tool_env(&c), vec![("PGSSLMODE", "require")]);
+        c.postgres = Some(dbc_state::PgOptions { ssl_mode: PgSslMode::Disable });
+        assert_eq!(pg_tool_env(&c), vec![("PGSSLMODE", "disable")]);
+    }
+
+    #[test]
+    fn pg_tool_env_verify_full_trusts_the_system_store() {
+        let mut c = cfg();
+        c.postgres = Some(dbc_state::PgOptions { ssl_mode: PgSslMode::VerifyFull });
+        assert_eq!(
+            pg_tool_env(&c),
+            vec![("PGSSLMODE", "verify-full"), ("PGSSLROOTCERT", "system")]
+        );
     }
 
     // --- SECURITY: PGPASSWORD never in argv ---
@@ -1020,6 +1042,24 @@ impl BackupHandle {
     }
 }
 
+/// The libpq environment that makes pg_dump / pg_restore / psql talk to the
+/// server the way the app's own connection does. Only sslmode: everything
+/// else already travels as arguments (`build_*_args`), and the password
+/// separately as `PGPASSWORD`.
+///
+/// `verify-full` also needs a trust root; `PGSSLROOTCERT=system` points
+/// libpq at the OS store, like the app's own `verify-full` does. That value
+/// is understood by libpq 16 and newer — an older pg_dump reports it as a
+/// missing file, which at least says what is wrong.
+pub fn pg_tool_env(cfg: &ConnectionConfig) -> Vec<(&'static str, &'static str)> {
+    let mode = cfg.pg_ssl_mode();
+    let mut env = vec![("PGSSLMODE", mode.as_libpq())];
+    if mode == PgSslMode::VerifyFull {
+        env.push(("PGSSLROOTCERT", "system"));
+    }
+    env
+}
+
 /// Spawns `program` with `args`, `PGPASSWORD` (when `password` is `Some`)
 /// set on the CHILD'S ENVIRONMENT ONLY, stdin closed, stderr piped and
 /// streamed line-by-line as `BackupEvent::Log` — mirrors
@@ -1050,6 +1090,7 @@ pub fn run_and_stream(
     program: &str,
     args: &[String],
     password: Option<&str>,
+    env: &[(&str, &str)],
     tx: &Sender<BackupEvent>,
 ) -> BackupHandle {
     let slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
@@ -1080,6 +1121,10 @@ pub fn run_and_stream(
         // SECURITY: env-only, never argv (see `args` above), never logged
         // (this line itself never gets sent as a BackupEvent).
         cmd.env("PGPASSWORD", pw);
+    }
+    // Non-secret libpq settings (`PGSSLMODE` & co., see `pg_tool_env`).
+    for (k, v) in env {
+        cmd.env(k, v);
     }
     #[cfg(windows)]
     {
@@ -1230,7 +1275,7 @@ mod process_tests {
     #[test]
     fn missing_binary_is_a_failed_event_not_a_panic() {
         let (tx, rx) = std::sync::mpsc::channel();
-        run_and_stream("definitely-not-a-real-binary-xyz", &[], None, &tx);
+        run_and_stream("definitely-not-a-real-binary-xyz", &[], None, &[], &tx);
         let ev = rx.recv().unwrap();
         assert!(matches!(ev, BackupEvent::Failed(msg) if msg.contains("definitely-not-a-real-binary-xyz")));
     }
@@ -1238,7 +1283,7 @@ mod process_tests {
     #[test]
     fn missing_binary_error_never_contains_the_password() {
         let (tx, rx) = std::sync::mpsc::channel();
-        run_and_stream("definitely-not-a-real-binary-xyz", &[], Some("hunter2"), &tx);
+        run_and_stream("definitely-not-a-real-binary-xyz", &[], Some("hunter2"), &[], &tx);
         let ev = rx.recv().unwrap();
         if let BackupEvent::Failed(msg) = ev {
             assert!(!msg.contains("hunter2"));
@@ -1251,7 +1296,7 @@ mod process_tests {
     #[test]
     fn program_with_interior_nul_is_rejected_before_spawn() {
         let (tx, rx) = std::sync::mpsc::channel();
-        run_and_stream("cmd\0evil", &[], None, &tx);
+        run_and_stream("cmd\0evil", &[], None, &[], &tx);
         let ev = rx.recv().unwrap();
         assert!(matches!(ev, BackupEvent::Failed(_)));
     }
@@ -1259,7 +1304,7 @@ mod process_tests {
     #[test]
     fn arg_with_interior_nul_is_rejected_before_spawn() {
         let (tx, rx) = std::sync::mpsc::channel();
-        run_and_stream("cmd", &["/C".to_string(), "echo\0evil".to_string()], None, &tx);
+        run_and_stream("cmd", &["/C".to_string(), "echo\0evil".to_string()], None, &[], &tx);
         let ev = rx.recv().unwrap();
         assert!(matches!(ev, BackupEvent::Failed(_)));
     }
@@ -1267,7 +1312,7 @@ mod process_tests {
     #[test]
     fn interior_nul_rejection_never_contains_the_password() {
         let (tx, rx) = std::sync::mpsc::channel();
-        run_and_stream("cmd", &["\0".to_string()], Some("hunter2"), &tx);
+        run_and_stream("cmd", &["\0".to_string()], Some("hunter2"), &[], &tx);
         let ev = rx.recv().unwrap();
         if let BackupEvent::Failed(msg) = ev {
             assert!(!msg.contains("hunter2"));
@@ -1291,6 +1336,7 @@ mod process_tests {
             "cmd",
             &["/C".to_string(), "echo line1 1>&2 & echo line2 1>&2".to_string()],
             None,
+            &[],
             &tx,
         );
         let mut lines = Vec::new();
@@ -1310,6 +1356,28 @@ mod process_tests {
         assert!(lines.iter().any(|l| l.contains("line2")));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn env_pairs_reach_the_child() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        run_and_stream(
+            "cmd",
+            &["/C".to_string(), "echo mode=%PGSSLMODE% 1>&2".to_string()],
+            None,
+            &[("PGSSLMODE", "require")],
+            &tx,
+        );
+        let mut lines = Vec::new();
+        while let Ok(ev) = rx.recv() {
+            match ev {
+                BackupEvent::Log(l) => lines.push(l),
+                BackupEvent::Finished => break,
+                BackupEvent::Failed(m) => panic!("unexpected failure: {m}"),
+            }
+        }
+        assert!(lines.iter().any(|l| l.contains("mode=require")), "{lines:?}");
+    }
+
     #[test]
     #[cfg(windows)]
     fn cancel_kills_a_long_running_process_before_it_finishes() {
@@ -1320,7 +1388,7 @@ mod process_tests {
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let handle_slot2 = handle_slot.clone();
         let t = std::thread::spawn(move || {
-            let h = run_and_stream(&program, &args, None, &tx);
+            let h = run_and_stream(&program, &args, None, &[], &tx);
             *handle_slot2.lock().unwrap() = Some(h);
         });
         // Give the process a moment to actually spawn before cancelling.

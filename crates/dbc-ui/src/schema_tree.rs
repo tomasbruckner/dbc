@@ -4434,7 +4434,7 @@ mod sidebar_tests {
             folder: folder.iter().map(|s| s.to_string()).collect(),
             engine, host: "h".into(), port: None, database: db.into(),
             user: "u".into(), read_only: false, timeout_secs: None,
-            auto_limit: None, ssh: None, favourite: false, mssql: None,
+            auto_limit: None, ssh: None, favourite: false, mssql: None, postgres: None,
         }
     }
 

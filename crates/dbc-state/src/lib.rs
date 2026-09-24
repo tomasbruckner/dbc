@@ -14,7 +14,7 @@ mod config;
 pub use config::{
     engine_is_file_based,
     default_config_path, AppConfig, ConfigSaveGuard, ConfigVerdict, ConnectionConfig, Engine,
-    FavouriteObject, HiddenNodes, MssqlOptions, SshTunnelConfig, StateError, ThemeMode,
+    FavouriteObject, HiddenNodes, MssqlOptions, PgOptions, PgSslMode, SshTunnelConfig, StateError, ThemeMode,
     TreeGrouping,
 };
 

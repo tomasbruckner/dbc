@@ -2357,9 +2357,12 @@ dependencies = [
  "dbc-core",
  "futures-util",
  "rust_decimal",
+ "rustls",
+ "rustls-native-certs",
  "testcontainers-modules",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls",
  "tokio-util",
  "uuid",
 ]

@@ -26,9 +26,9 @@ use std::time::Duration;
 use dbc_core::{Connection, QueryError};
 use dbc_driver_duckdb::DuckdbConnection;
 use dbc_driver_mssql::{MssqlConfig, MssqlConnection};
-use dbc_driver_postgres::{PgConfig, PostgresConnection};
+use dbc_driver_postgres::{PgConfig, PgSsl, PostgresConnection};
 use dbc_driver_sqlite::SqliteConnection;
-use dbc_state::{ConnectionConfig, Engine, Vault};
+use dbc_state::{ConnectionConfig, Engine, PgSslMode, Vault};
 
 
 /// Fallback bound for `PgConfig::connect_timeout` when a saved
@@ -216,40 +216,72 @@ pub fn open_config(
             Ok(OpenConnection { conn: Box::new(conn), _tunnel: None })
         }
         Engine::Postgres => {
-            let default_port = 5432u16;
-            let (target_host, target_port, tunnel) = if let Some(ssh) = &cfg.ssh {
-                let port = cfg.port.unwrap_or(default_port);
-                let tunnel = Tunnel::open(ssh, &cfg.host, port).map_err(QueryError::msg)?;
-                ("127.0.0.1".to_string(), tunnel.local_port(), Some(tunnel))
-            } else {
-                (cfg.host.clone(), cfg.port.unwrap_or(default_port), None)
+            let tunnel = match &cfg.ssh {
+                Some(ssh) => Some(
+                    Tunnel::open(ssh, &cfg.host, cfg.port.unwrap_or(DEFAULT_PG_PORT))
+                        .map_err(QueryError::msg)?,
+                ),
+                None => None,
             };
-
-            let mut config = PgConfig::new();
-            config
-                .host(&target_host)
-                .port(target_port)
-                .dbname(&cfg.database)
-                .user(&cfg.user)
-                .connect_timeout(Duration::from_secs(
-                    cfg.timeout_secs.unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
-                ));
-            if let Some(pw) = &secret {
-                config.password(pw);
-            }
-            if cfg.read_only {
-                // Server-side enforcement (Task 6 security review
-                // requirement): applies for the whole session, before any
-                // client SQL runs, independent of the client-side
-                // `is_read_statement` guard.
-                config.options("-c default_transaction_read_only=on");
-            }
-
-            let conn = runtime
-                .block_on(async move { PostgresConnection::connect_with_config(config).await })?;
+            let config = pg_config_from_config(cfg, secret.as_deref(), tunnel.as_ref().map(Tunnel::local_port));
+            let ssl = pg_ssl(cfg.pg_ssl_mode());
+            let conn = runtime.block_on(async move {
+                PostgresConnection::connect_with_config(config, ssl).await
+            })?;
             Ok(OpenConnection { conn: Box::new(conn), _tunnel: tunnel })
         }
     }
+}
+
+const DEFAULT_PG_PORT: u16 = 5432;
+
+/// Saved sslmode → the driver's. Two enums because neither crate depends
+/// on the other; the spellings are libpq's on both sides.
+pub fn pg_ssl(mode: PgSslMode) -> PgSsl {
+    match mode {
+        PgSslMode::Disable => PgSsl::Disable,
+        PgSslMode::Prefer => PgSsl::Prefer,
+        PgSslMode::Require => PgSsl::Require,
+        PgSslMode::VerifyFull => PgSsl::VerifyFull,
+    }
+}
+
+/// The `PgConfig` for a saved Postgres connection. `tunnel_port` is the
+/// local end of an SSH tunnel, when there is one: the socket then goes to
+/// `127.0.0.1:<tunnel_port>` via `hostaddr`, while `host` stays the REAL
+/// server name — it is what TLS sends as SNI and what `verify-full`
+/// checks the certificate against, and the certificate was issued for the
+/// server, not for the loopback end of a tunnel.
+pub fn pg_config_from_config(
+    cfg: &ConnectionConfig,
+    secret: Option<&str>,
+    tunnel_port: Option<u16>,
+) -> PgConfig {
+    let mut config = PgConfig::new();
+    config
+        .host(&cfg.host)
+        .dbname(&cfg.database)
+        .user(&cfg.user)
+        .connect_timeout(Duration::from_secs(cfg.timeout_secs.unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS)));
+    match tunnel_port {
+        Some(port) => {
+            config.hostaddr(std::net::Ipv4Addr::LOCALHOST.into()).port(port);
+        }
+        None => {
+            config.port(cfg.port.unwrap_or(DEFAULT_PG_PORT));
+        }
+    }
+    if let Some(pw) = secret {
+        config.password(pw);
+    }
+    if cfg.read_only {
+        // Server-side enforcement (Task 6 security review
+        // requirement): applies for the whole session, before any
+        // client SQL runs, independent of the client-side
+        // `is_read_statement` guard.
+        config.options("-c default_transaction_read_only=on");
+    }
+    config
 }
 
 /// G16 §3: `:memory:` (and an empty path) is refused for DuckDB BEFORE the
@@ -520,6 +552,7 @@ mod duckdb_connect_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 
@@ -742,6 +775,87 @@ mod mssql_host_tests {
 }
 
 #[cfg(test)]
+mod pg_config_tests {
+    use super::*;
+    use dbc_driver_postgres::{PgConfig, PgHost};
+    use dbc_state::PgOptions;
+
+    fn pg_cfg() -> ConnectionConfig {
+        ConnectionConfig {
+            id: "p1".into(),
+            name: "pg".into(),
+            folder: vec![],
+            engine: Engine::Postgres,
+            host: "db.example.com".into(),
+            port: Some(6543),
+            database: "powercontrol".into(),
+            user: "pwrctrl".into(),
+            read_only: false,
+            timeout_secs: None,
+            auto_limit: None,
+            ssh: None,
+            favourite: false,
+            mssql: None,
+            postgres: None,
+        }
+    }
+
+    fn host_names(c: &PgConfig) -> Vec<String> {
+        c.get_hosts()
+            .iter()
+            .map(|h| match h {
+                PgHost::Tcp(s) => s.clone(),
+                #[allow(unreachable_patterns)] // `Unix` exists only on unix
+                _ => panic!("unexpected non-TCP host"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn direct_connection_goes_to_host_and_port() {
+        let c = pg_config_from_config(&pg_cfg(), None, None);
+        assert_eq!(host_names(&c), vec!["db.example.com".to_string()]);
+        assert!(c.get_hostaddrs().is_empty());
+        assert_eq!(c.get_ports(), &[6543]);
+    }
+
+    /// The tunnel carries the SOCKET; the certificate is still checked
+    /// against the real server name — otherwise verify-full through SSH
+    /// could never pass (no certificate is issued for 127.0.0.1).
+    #[test]
+    fn tunnelled_connection_dials_loopback_but_keeps_the_real_tls_name() {
+        let c = pg_config_from_config(&pg_cfg(), None, Some(40001));
+        assert_eq!(host_names(&c), vec!["db.example.com".to_string()]);
+        assert_eq!(c.get_hostaddrs(), &[std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST)]);
+        assert_eq!(c.get_ports(), &[40001]);
+    }
+
+    #[test]
+    fn read_only_is_enforced_server_side() {
+        let mut cfg = pg_cfg();
+        cfg.read_only = true;
+        let c = pg_config_from_config(&cfg, Some("pw"), None);
+        assert_eq!(c.get_options(), Some("-c default_transaction_read_only=on"));
+        assert_eq!(c.get_password(), Some(&b"pw"[..]));
+    }
+
+    #[test]
+    fn saved_ssl_mode_maps_one_to_one_and_missing_means_prefer() {
+        assert_eq!(pg_ssl(pg_cfg().pg_ssl_mode()), PgSsl::Prefer);
+        for (saved, driver) in [
+            (PgSslMode::Disable, PgSsl::Disable),
+            (PgSslMode::Prefer, PgSsl::Prefer),
+            (PgSslMode::Require, PgSsl::Require),
+            (PgSslMode::VerifyFull, PgSsl::VerifyFull),
+        ] {
+            let mut cfg = pg_cfg();
+            cfg.postgres = Some(PgOptions { ssl_mode: saved });
+            assert_eq!(pg_ssl(cfg.pg_ssl_mode()), driver);
+        }
+    }
+}
+
+#[cfg(test)]
 mod mssql_connect_tests {
     use super::*;
     use dbc_state::{Engine, MssqlOptions, SshTunnelConfig};
@@ -762,6 +876,7 @@ mod mssql_connect_tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 

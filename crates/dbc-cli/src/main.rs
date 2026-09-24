@@ -840,6 +840,7 @@ mod tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         });
         let out = render::render(&connections_table(&config), Format::Table);
         assert!(out.contains("prod"), "{out}");
@@ -871,6 +872,7 @@ mod tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         });
         let out = render::render(&connections_table(&config), Format::Table);
         assert!(!out.contains("leftover"), "{out}");
@@ -938,6 +940,7 @@ mod tests {
             ssh: None,
             favourite: false,
             mssql: None,
+            postgres: None,
         }
     }
 

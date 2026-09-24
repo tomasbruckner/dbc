@@ -66,6 +66,46 @@ impl Default for MssqlOptions {
     }
 }
 
+/// Postgres `sslmode`, with libpq's meaning for each value. `Prefer` and
+/// `Require` encrypt WITHOUT verifying the server certificate (as psql
+/// does); only `VerifyFull` checks the chain against the Windows store and
+/// the host name. `verify-ca` is deliberately absent — it would need a CA
+/// file setting this app does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PgSslMode {
+    Disable,
+    #[default]
+    Prefer,
+    Require,
+    VerifyFull,
+}
+
+impl PgSslMode {
+    pub const ALL: [PgSslMode; 4] =
+        [PgSslMode::Disable, PgSslMode::Prefer, PgSslMode::Require, PgSslMode::VerifyFull];
+
+    /// The libpq spelling — also what `PGSSLMODE` takes for pg_dump & co.
+    pub fn as_libpq(self) -> &'static str {
+        match self {
+            PgSslMode::Disable => "disable",
+            PgSslMode::Prefer => "prefer",
+            PgSslMode::Require => "require",
+            PgSslMode::VerifyFull => "verify-full",
+        }
+    }
+}
+
+/// Postgres-only connection options. `None` on `ConnectionConfig::postgres`
+/// means all defaults (`sslmode=prefer`), so config files written before
+/// SSL support load unchanged — and start trying TLS, which is exactly what
+/// psql would have done with them all along.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PgOptions {
+    #[serde(default)]
+    pub ssl_mode: PgSslMode,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     pub id: String,
@@ -89,6 +129,16 @@ pub struct ConnectionConfig {
     /// see `MssqlOptions`'s doc comment.
     #[serde(default)]
     pub mssql: Option<MssqlOptions>,
+    /// Postgres-only options (sslmode). `None` = defaults, see `PgOptions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres: Option<PgOptions>,
+}
+
+impl ConnectionConfig {
+    /// The effective sslmode — `Prefer` when nothing was ever saved.
+    pub fn pg_ssl_mode(&self) -> PgSslMode {
+        self.postgres.as_ref().map(|p| p.ssl_mode).unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,6 +561,7 @@ mod tests {
                 }),
                 favourite: false,
                 mssql: None,
+                postgres: None,
             }],
             favourite_objects: vec![],
             theme: ThemeMode::Dark,
@@ -1025,6 +1076,42 @@ user = ""
         config.save(&p, &AppConfig::verify_savable(&p).unwrap()).unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
         assert!(raw.contains(r#"engine = "duckdb""#), "raw: {raw}");
+    }
+
+    #[test]
+    fn old_config_without_postgres_options_means_prefer() {
+        let toml_str = r#"
+[[connections]]
+id = "c1"
+name = "demo"
+engine = "postgres"
+host = "localhost"
+database = "postgres"
+user = "postgres"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.connections[0].postgres, None);
+        assert_eq!(config.connections[0].pg_ssl_mode(), PgSslMode::Prefer);
+        // And it saves back without growing a `[connections.postgres]` table.
+        let back = toml::to_string_pretty(&config).unwrap();
+        assert!(!back.contains("postgres]"), "raw: {back}");
+    }
+
+    #[test]
+    fn pg_ssl_mode_serde_spelling_is_libpq() {
+        // Saved-config contract: the TOML spelling is libpq's, verify-full
+        // included — a variant rename must not break existing files.
+        for mode in PgSslMode::ALL {
+            let toml_str = format!(
+                "[[connections]]\nid = \"c1\"\nname = \"d\"\nengine = \"postgres\"\nhost = \"h\"\n\
+                 database = \"d\"\nuser = \"u\"\n\n[connections.postgres]\nssl_mode = \"{}\"\n",
+                mode.as_libpq()
+            );
+            let config: AppConfig = toml::from_str(&toml_str).unwrap();
+            assert_eq!(config.connections[0].pg_ssl_mode(), mode);
+            let back = toml::to_string_pretty(&config).unwrap();
+            assert!(back.contains(&format!("ssl_mode = \"{}\"", mode.as_libpq())), "raw: {back}");
+        }
     }
 
     #[test]
