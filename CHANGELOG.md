@@ -6,6 +6,20 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-09-24
+
+Postgres over SSL.
+
+### Added
+
+- Postgres connections can use SSL: a new „SSL" choice in the connection dialog (disable / prefer / require / verify-full); connections saved without one use prefer, like psql
+- backup and restore through pg_dump / pg_restore / psql use the same SSL mode as the connection
+
+### Fixed
+
+- a server that accepts only encrypted connections refused dbc with „no pg_hba.conf entry … no encryption"
+- a failed TLS handshake now says why, not just „error performing TLS handshake"
+
 ## [0.34.1] - 2026-09-14
 
 The scrollbar can be dragged again, anywhere.
