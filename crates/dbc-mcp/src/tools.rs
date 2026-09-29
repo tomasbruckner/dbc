@@ -59,10 +59,24 @@ impl McpServer {
         Self { config, vault }
     }
 
+    /// Only a connection the user opened to MCP; any other id is
+    /// indistinguishable from one that does not exist.
     fn find_connection(&self, id: &str) -> Option<ConnectionConfig> {
-        self.config.connections.iter().find(|c| c.id == id).cloned()
+        self.config.connections.iter().find(|c| c.id == id && mcp_visible(c)).cloned()
     }
 }
+
+/// The one gate for every tool: the user ticked „Dostupné pro AI (MCP)"
+/// on the connection, and it is not a kind MCP cannot open anyway (SSH
+/// tunnels are a v1 non-goal, design doc §1; MSSQL is refused in
+/// `connect.rs`). Listing those would only produce ids that fail.
+pub(crate) fn mcp_visible(c: &ConnectionConfig) -> bool {
+    c.mcp && c.ssh.is_none() && c.engine != dbc_state::Engine::Mssql
+}
+
+/// What `list_connections` says when there is nothing to list, so the
+/// model can tell the user where the switch is instead of guessing.
+const NO_CONNECTIONS_HINT: &str = "No connection is enabled for MCP. The user enables one in dbc: edit the connection and turn on \"Dostupné pro AI (MCP)\". SQL Server and SSH-tunneled connections are not available over MCP.";
 
 fn query_error_result(e: &QueryError) -> CallToolResult {
     CallToolResult::structured_error(json!({
@@ -78,13 +92,18 @@ fn query_error_result(e: &QueryError) -> CallToolResult {
 /// finding #1's stated minimum bar).
 ///
 /// Base shape: `tool=<name> connection=<name> rows=<n> duration_ms=<n>`,
-/// with `sql=<text>` appended when `sql` is `Some` (only `run_query` ever
-/// passes one — §4's "SQL text yes" logging policy, matching the GUI's own
-/// `HistoryEntry` policy: SQL yes, connection name yes, never row data,
-/// never a password) and `error=<msg>` appended when `error` is `Some`.
+/// with `kind=<SELECT…> sql_len=<chars>` appended when `sql` is `Some`
+/// (only `run_query` ever passes one) and `error=<msg>` appended when
+/// `error` is `Some`.
+///
+/// The SQL TEXT itself is never written (privacy review 2026-09-29,
+/// replacing §4's original "SQL text yes"): stderr goes wherever the MCP
+/// client puts it, often a log file we do not control, and a literal in a
+/// WHERE clause is as sensitive as a result row. Same rule as `dbc.log`,
+/// which logs `statement_kind` and nothing more.
 ///
 /// SECURITY: callers must only ever pass the SQL text itself (never row
-/// data) and a `QueryError`'s own message or a short fixed reason string
+/// data; it is reduced to kind + length here) and a `QueryError`'s own message or a short fixed reason string
 /// for `error` — never a secret. No call site in this crate passes a
 /// connection password or vault key into either parameter.
 fn audit_line(
@@ -98,8 +117,10 @@ fn audit_line(
     let rows = rows.map(|r| r.to_string()).unwrap_or_else(|| "-".to_string());
     let mut line = format!("tool={tool} connection={connection} rows={rows} duration_ms={duration_ms}");
     if let Some(sql) = sql {
-        line.push_str(" sql=");
-        line.push_str(sql);
+        line.push_str(" kind=");
+        line.push_str(dbc_core::format::statement_kind(sql));
+        line.push_str(" sql_len=");
+        line.push_str(&sql.chars().count().to_string());
     }
     if let Some(e) = error {
         line.push_str(" error=");
@@ -199,7 +220,7 @@ async fn drain_query(
 #[tool_router(server_handler)]
 impl McpServer {
     #[tool(
-        description = "List saved connections (id, name, engine, folder, read_only, favourite). No secrets, no host/user/database — use get_schema/run_query with the id to explore a specific connection."
+        description = "List the connections the user enabled for MCP in dbc (id, name, engine, folder, read_only, favourite). No secrets, no host/user/database — use get_schema/run_query with the id to explore a specific connection."
     )]
     async fn list_connections(
         &self,
@@ -210,7 +231,7 @@ impl McpServer {
             .config
             .connections
             .iter()
-            .filter(|c| c.ssh.is_none()) // v1 non-goal: SSH-tunneled connections (design doc §1)
+            .filter(|c| mcp_visible(c))
             .map(|c| {
                 json!({
                     "id": c.id,
@@ -232,6 +253,9 @@ impl McpServer {
             start.elapsed().as_millis() as u64,
             None,
         );
+        if items.is_empty() {
+            return Ok(CallToolResult::structured(json!({ "connections": items, "hint": NO_CONNECTIONS_HINT })));
+        }
         Ok(CallToolResult::structured(json!({ "connections": items })))
     }
 
@@ -260,11 +284,6 @@ impl McpServer {
                 ));
             }
         };
-        if cfg.ssh.is_some() {
-            let msg = "SSH-tunneled connections are not available over MCP (v1 non-goal)";
-            log_tool_call("get_schema", &cfg.name, None, None, start.elapsed().as_millis() as u64, Some(msg));
-            return Ok(CallToolResult::structured_error(json!({ "error": msg })));
-        }
 
         let secret = self.vault.get_secret(&cfg.id);
         let mut conn = match open_for_mcp(&cfg, secret).await {
@@ -346,18 +365,6 @@ impl McpServer {
                 ));
             }
         };
-        if cfg.ssh.is_some() {
-            let msg = "SSH-tunneled connections are not available over MCP (v1 non-goal)";
-            log_tool_call(
-                "run_query",
-                &cfg.name,
-                Some(&p.sql),
-                None,
-                tool_start.elapsed().as_millis() as u64,
-                Some(msg),
-            );
-            return Ok(CallToolResult::structured_error(json!({ "error": msg })));
-        }
 
         let (row_limit, row_limit_clamped) = clamp_row_limit(p.row_limit);
         let (timeout_secs, _timeout_clamped) = clamp_timeout(p.timeout_secs);
@@ -486,7 +493,67 @@ mod tests {
             favourite: true,
             mssql: None,
             postgres: None,
+            mcp: true,
         }
+    }
+
+    fn hidden(mut c: ConnectionConfig) -> ConnectionConfig {
+        c.mcp = false;
+        c
+    }
+
+    #[tokio::test]
+    async fn connections_not_enabled_for_mcp_are_invisible_to_every_tool() {
+        let (_f, path) = sqlite_fixture();
+        let config = AppConfig {
+            connections: vec![cfg("c1", &path, false, false), hidden(cfg("c2", &path, false, false))],
+            ..Default::default()
+        };
+        let server = McpServer::new(config, test_vault());
+
+        let list = server.list_connections(Parameters(ListConnectionsParams {})).await.unwrap();
+        let conns = list.structured_content.unwrap()["connections"].as_array().unwrap().clone();
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0]["id"], "c1");
+
+        // Same answer as for an id that never existed: the model cannot
+        // tell a disabled connection from a made-up one.
+        let schema = server
+            .get_schema(Parameters(GetSchemaParams { connection_id: "c2".into(), schema: None, include_ddl: None }))
+            .await;
+        assert!(schema.unwrap_err().message.contains("unknown connection_id"));
+        let query = server
+            .run_query(Parameters(RunQueryParams {
+                connection_id: "c2".into(),
+                sql: "SELECT 1".into(),
+                row_limit: None,
+                timeout_secs: None,
+            }))
+            .await;
+        assert!(query.unwrap_err().message.contains("unknown connection_id"));
+    }
+
+    #[tokio::test]
+    async fn mssql_connections_are_never_listed() {
+        let (_f, path) = sqlite_fixture();
+        let mut ms = cfg("c9", &path, false, false);
+        ms.engine = Engine::Mssql;
+        let config = AppConfig { connections: vec![ms], ..Default::default() };
+        let server = McpServer::new(config, test_vault());
+        let list = server.list_connections(Parameters(ListConnectionsParams {})).await.unwrap();
+        let body = list.structured_content.unwrap();
+        assert!(body["connections"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_list_tells_the_model_how_the_user_enables_access() {
+        let (_f, path) = sqlite_fixture();
+        let config = AppConfig { connections: vec![hidden(cfg("c1", &path, false, false))], ..Default::default() };
+        let server = McpServer::new(config, test_vault());
+        let list = server.list_connections(Parameters(ListConnectionsParams {})).await.unwrap();
+        let body = list.structured_content.unwrap();
+        assert!(body["connections"].as_array().unwrap().is_empty());
+        assert!(body["hint"].as_str().unwrap().contains("MCP"), "{body}");
     }
 
     fn test_vault() -> Vault {
@@ -775,9 +842,18 @@ mod audit_log_tests {
     }
 
     #[test]
-    fn audit_line_appends_sql_and_error_when_present() {
+    fn audit_line_appends_statement_kind_and_error_when_present() {
         let line = audit_line("run_query", "prod-db", Some("SELECT 1"), None, 5, Some("syntax error"));
-        assert_eq!(line, "tool=run_query connection=prod-db rows=- duration_ms=5 sql=SELECT 1 error=syntax error");
+        assert_eq!(line, "tool=run_query connection=prod-db rows=- duration_ms=5 kind=SELECT sql_len=8 error=syntax error");
+    }
+
+    #[test]
+    fn audit_line_never_carries_the_sql_text() {
+        // Privacy policy: the MCP client may keep our stderr on disk, and a
+        // literal in a WHERE clause is as sensitive as a result row.
+        let line = audit_line("run_query", "c1", Some("select * from users where email = 'jan@x.cz'"), None, 1, None);
+        assert!(!line.contains("jan@x.cz"), "{line}");
+        assert!(!line.contains("users"), "{line}");
     }
 
     #[test]

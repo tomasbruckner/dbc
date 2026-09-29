@@ -204,6 +204,7 @@ mod grouping_tests {
             favourite,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 
@@ -1120,6 +1121,8 @@ pub struct ConnectionDialogUi {
     pub engine: Engine,
     pub read_only: bool,
     pub favourite: bool,
+    /// „Dostupné pro AI (MCP)" — `ConnectionConfig::mcp`.
+    pub mcp: bool,
     pub ssh_enabled: bool,
     pub mssql_encrypt: bool,
     pub mssql_trust_cert: bool,
@@ -1193,6 +1196,7 @@ impl ConnectionDialogUi {
             folder: parse_folder(&self.folder.read(cx).text()),
             read_only: self.read_only,
             favourite: self.favourite,
+            mcp: self.mcp,
             timeout_secs: parse_u64(&self.timeout_secs.read(cx).text()),
             auto_limit: parse_u64(&self.auto_limit.read(cx).text()),
             ssh,
@@ -1220,6 +1224,7 @@ pub struct ConnectionFormData {
     pub folder: Vec<String>,
     pub read_only: bool,
     pub favourite: bool,
+    pub mcp: bool,
     pub timeout_secs: Option<u64>,
     pub auto_limit: Option<u64>,
     pub ssh: Option<SshTunnelConfig>,
@@ -1246,6 +1251,7 @@ impl std::fmt::Debug for ConnectionFormData {
             .field("folder", &self.folder)
             .field("read_only", &self.read_only)
             .field("favourite", &self.favourite)
+            .field("mcp", &self.mcp)
             .field("timeout_secs", &self.timeout_secs)
             .field("auto_limit", &self.auto_limit)
             .field("ssh", &self.ssh)
@@ -1273,6 +1279,7 @@ impl ConnectionFormData {
             favourite: self.favourite,
             mssql: self.mssql.clone(),
             postgres: self.postgres.clone(),
+            mcp: self.mcp,
         }
     }
 }
@@ -1294,6 +1301,7 @@ mod form_data_mssql_tests {
             folder: vec![],
             read_only: false,
             favourite: false,
+            mcp: false,
             timeout_secs: None,
             auto_limit: None,
             ssh: None,
@@ -1312,6 +1320,14 @@ mod form_data_mssql_tests {
         let pg_cfg = base_form_data(Engine::Postgres).to_connection_config();
         assert_eq!(pg_cfg.pg_ssl_mode(), PgSslMode::Require);
         assert_eq!(base_form_data(Engine::Mssql).to_connection_config().postgres, None);
+    }
+
+    #[test]
+    fn form_data_carries_the_mcp_switch_through_to_config() {
+        let mut data = base_form_data(Engine::Postgres);
+        assert!(!data.to_connection_config().mcp);
+        data.mcp = true;
+        assert!(data.to_connection_config().mcp);
     }
 
     #[test]
@@ -2667,6 +2683,19 @@ impl AppView {
             }
         };
 
+        // „Aktualizace" — the one switch that decides whether dbc talks to
+        // GitHub at all (PRIVACY.md, „Updates").
+        panel = panel
+            .child(div().mt_2().text_color(cx.theme().text_muted).child("Aktualizace"))
+            .child(
+                ui::checkbox(
+                    "settings-update-check",
+                    "Kontrolovat aktualizace při startu (GitHub)",
+                    !self.config.disable_update_check,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_update_check(cx))),
+            );
+
         // „Přenos na jiný počítač" (bundle). Last block, above Zavřít:
         // rarely used, and the one whose Import button replaces everything
         // above it — so it does not sit next to the theme radios.
@@ -2733,7 +2762,7 @@ impl AppView {
         let ssh_key_path = cx.new(|cx| TextField::form_field(cx, "~/.ssh/id_ed25519", false));
         let mssql_driver = cx.new(|cx| TextField::form_field(cx, "ODBC Driver 18 for SQL Server", false));
 
-        let (editing_id, engine, read_only, favourite, ssh_enabled, mssql_encrypt, mssql_trust_cert, pg_ssl_mode) = if let Some(c) = &editing {
+        let (editing_id, engine, read_only, favourite, mcp, ssh_enabled, mssql_encrypt, mssql_trust_cert, pg_ssl_mode) = if let Some(c) = &editing {
             name.update(cx, |f, cx| f.set_text(&c.name, cx));
             host.update(cx, |f, cx| f.set_text(&c.host, cx));
             port.update(cx, |f, cx| f.set_text(&c.port.map(|p| p.to_string()).unwrap_or_default(), cx));
@@ -2758,6 +2787,7 @@ impl AppView {
                 c.engine,
                 c.read_only,
                 c.favourite,
+                c.mcp,
                 ssh_enabled,
                 mssql_opts.encrypt,
                 mssql_opts.trust_server_certificate,
@@ -2770,7 +2800,7 @@ impl AppView {
             // engine is switched — and stops the moment the user types
             // something of their own (`may_replace_database`).
             database.update(cx, |f, cx| f.set_text(default_database_for(Engine::Postgres), cx));
-            (None, Engine::Postgres, false, false, false, defaults.encrypt, defaults.trust_server_certificate, PgSslMode::default())
+            (None, Engine::Postgres, false, false, false, false, defaults.encrypt, defaults.trust_server_certificate, PgSslMode::default())
         };
 
         let name_focus = name.focus_handle(cx);
@@ -2793,6 +2823,7 @@ impl AppView {
             engine,
             read_only,
             favourite,
+            mcp,
             ssh_enabled,
             mssql_encrypt,
             mssql_trust_cert,
@@ -3098,6 +3129,12 @@ impl AppView {
     fn toggle_favourite(&mut self, cx: &mut Context<Self>) {
         if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
             ui.favourite = !ui.favourite;
+        }
+        cx.notify();
+    }
+    fn toggle_mcp(&mut self, cx: &mut Context<Self>) {
+        if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
+            ui.mcp = !ui.mcp;
         }
         cx.notify();
     }
@@ -4179,6 +4216,7 @@ mod test_vault_prompt_tests {
                 ssh: None,
                 mssql: None,
                 postgres: None,
+                mcp: false,
             }
         ))));
     }
@@ -4368,8 +4406,20 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
         .child(
             ui::checkbox_row()
                 .child(ui::checkbox("chk-read-only", "Pouze pro čtení", ui.read_only).on_click(cx.listener(|v, _, _, cx| v.toggle_read_only(cx))))
-                .child(ui::checkbox("chk-favourite", "Oblíbené", ui.favourite).on_click(cx.listener(|v, _, _, cx| v.toggle_favourite(cx)))),
-        )
+                .child(ui::checkbox("chk-favourite", "Oblíbené", ui.favourite).on_click(cx.listener(|v, _, _, cx| v.toggle_favourite(cx))))
+                .child(ui::checkbox("chk-mcp", "Dostupné pro AI (MCP)", ui.mcp).on_click(cx.listener(|v, _, _, cx| v.toggle_mcp(cx)))),
+        );
+    // The switch stays clickable — the choice is remembered — but a ticked
+    // box that `dbc-mcp` will ignore anyway must say so (`mcp_visible` in
+    // dbc-mcp is the rule this mirrors).
+    if ui.mcp && (ui.engine == Engine::Mssql || ui.ssh_enabled) {
+        panel = panel.child(
+            div()
+                .text_color(cx.theme().text_muted)
+                .child("MCP zatím neumí SQL Server ani připojení přes SSH tunel — AI toto připojení neuvidí"),
+        );
+    }
+    panel = panel
         .child(
             ui::checkbox("chk-ssh", "SSH tunel (jen klíč/agent)", ui.ssh_enabled)
                 .on_click(cx.listener(|v, _, _, cx| v.toggle_ssh_enabled(cx))),

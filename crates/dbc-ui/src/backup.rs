@@ -515,6 +515,7 @@ mod pure_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 

@@ -349,7 +349,7 @@ fn run_setup(vault_path: &std::path::Path, remove: bool) -> ExitCode {
     match entry.set_secret(key.as_slice()) {
         Ok(()) => {
             eprintln!(
-                "dbc-mcp: vault key stored. Register the server with no secrets in its config, e.g.:\n  claude mcp add dbc -- dbc-mcp"
+                "dbc-mcp: vault key stored. Register the server with no secrets in its config, e.g.:\n  claude mcp add dbc -- dbc-mcp\nThe AI client sees only connections with \"Dostupné pro AI (MCP)\" turned on in dbc."
             );
             ExitCode::SUCCESS
         }

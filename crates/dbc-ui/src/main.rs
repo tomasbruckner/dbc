@@ -2761,6 +2761,10 @@ struct AppView {
     /// against `history_search`'s live text each render to decide whether a
     /// refresh is needed (see `history_search`'s doc comment).
     last_history_query: String,
+    /// The history tab's „Vymazat historii…" asked and is waiting for the
+    /// answer (all / keep ★ / cancel). Inline in the tab rather than a
+    /// modal: the question is about the list right under it.
+    history_clear_confirm: bool,
     // --- G3 Task 5: Ctrl+K command palette ---
     /// `None` when the palette isn't open — same "not rendered at all"
     /// convention as `modal`, and mutually exclusive with it (see
@@ -7587,6 +7591,11 @@ impl AppView {
                     self.tree_visible = !self.tree_visible;
                 }
                 PaletteAction::ShowHistory => self.open_history_tab(cx),
+                PaletteAction::ClearHistory => {
+                    self.open_history_tab(cx);
+                    self.history_clear_confirm = true;
+                    cx.notify();
+                }
                 PaletteAction::NewConnection => {
                     // Exactly the dropdown's "Nové spojení…" click — sets
                     // its own focus, which must win over anything below.
@@ -7711,6 +7720,25 @@ impl AppView {
         // keystroke), then repaint everything.
         self.editor().sql.update(cx, |sql, cx| sql.kick_highlight(cx));
         cx.refresh_windows(); // NOT cx.refresh() — doesn't exist at rev 907ed09
+        cx.notify();
+    }
+
+    /// „Kontrolovat aktualizace při startu" in Settings. Takes effect at the
+    /// next launch: turning it off must not cancel a download already
+    /// under way, and turning it on does not need an immediate check —
+    /// the next start makes one.
+    pub(crate) fn toggle_update_check(&mut self, cx: &mut Context<Self>) {
+        self.config.disable_update_check = !self.config.disable_update_check;
+        // Same corrupt-config gate as `set_theme` above.
+        if let Some(guard) = self.guard_corrupt_config(cx) {
+            self.editor_mut().status = match self.config.save(&self.config_path, &guard) {
+                Ok(()) if self.config.disable_update_check => {
+                    "kontrola aktualizací vypnuta — dbc se už nebude ptát GitHubu".to_string()
+                }
+                Ok(()) => "kontrola aktualizací zapnuta — proběhne při příštím startu".to_string(),
+                Err(e) => format!("error: nastavení se nepodařilo uložit ({e})"),
+            };
+        }
         cx.notify();
     }
 
@@ -16152,6 +16180,7 @@ mod plan_restore_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 
@@ -16540,12 +16569,15 @@ fn main() {
                         // The update check: one blocking call on a
                         // background thread, then a field on the view.
                         // Nothing on screen until it has actually
-                        // downloaded something.
-                        cx.spawn(async move |this, cx| {
-                            let outcome = cx.background_spawn(async { updater::check_and_download() }).await;
-                            let _ = this.update(cx, |view, cx| view.finish_update_check(outcome, cx));
-                        })
-                        .detach();
+                        // downloaded something. Switched off in Settings,
+                        // it makes no request at all (privacy policy).
+                        if !config.disable_update_check {
+                            cx.spawn(async move |this, cx| {
+                                let outcome = cx.background_spawn(async { updater::check_and_download() }).await;
+                                let _ = this.update(cx, |view, cx| view.finish_update_check(outcome, cx));
+                            })
+                            .detach();
+                        }
                         // Read before `config` is moved into the struct below.
                         let sidebar_width = sidebar_width_from(config.sidebar_width);
                         editors.active_mut().payload.status = status.clone();
@@ -16594,6 +16626,7 @@ fn main() {
                             history_cache: Vec::new(),
                             history_rows: Vec::new(),
                             last_history_query: String::new(),
+                            history_clear_confirm: false,
                             palette: None,
                             view_prefs,
                             param_values,
@@ -17090,6 +17123,7 @@ mod multi_statement_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 
@@ -17522,7 +17556,7 @@ mod identity_widening_tests {
             engine: dbc_state::Engine::Postgres, host: "localhost".into(),
             port: Some(5432), database: db.into(), user: "u".into(),
             read_only: true, timeout_secs: Some(30), auto_limit: Some(500),
-            ssh: None, favourite: false, mssql: None, postgres: None,
+            ssh: None, favourite: false, mssql: None, postgres: None, mcp: false,
         }
     }
 
@@ -18867,7 +18901,15 @@ mod config_save_guard_audit {
         // 12 → 11 on 2026-09-02: `end_history_resize` is gone with the
         // history panel — the history is a result tab now and has no width
         // of its own to persist. One writer fewer, nothing re-routed.
-        assert_eq!(sites, 11, "config.toml writer count changed — re-audit, do not just bump");
+        //
+        // 11 → 12 on 2026-09-29: `toggle_update_check` persists the
+        // „Kontrolovat aktualizace při startu" switch. Re-audited, not
+        // bumped: the write is inside the
+        // `if let Some(guard) = self.guard_corrupt_config(cx)` arm
+        // (position-verified by this test's own loop) — the same shape as
+        // `set_theme`, whose posture it copies: a refused save leaves the
+        // flip session-only, and the guard sets its own status.
+        assert_eq!(sites, 12, "config.toml writer count changed — re-audit, do not just bump");
     }
 
     /// The widening is only worth anything if it actually reaches past the

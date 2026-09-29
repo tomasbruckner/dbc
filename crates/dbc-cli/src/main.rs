@@ -165,6 +165,13 @@ fn run(a: Args) -> Result<(), String> {
         // and the vault inside it is never unsealed.
         Command::Export { file } => return export(&paths, file),
         Command::Import { file, force } => return import(&paths, file, *force),
+        // Opens only the history file: no config, no vault, no password.
+        Command::HistoryClear { keep_starred } => {
+            let mut db = dbc_state::HistoryDb::open(&history_path).map_err(|e| e.message)?;
+            let n = db.clear(*keep_starred).map_err(|e| e.message)?;
+            println!("historie vymazána ({n} položek)");
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -841,6 +848,7 @@ mod tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         });
         let out = render::render(&connections_table(&config), Format::Table);
         assert!(out.contains("prod"), "{out}");
@@ -873,6 +881,7 @@ mod tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         });
         let out = render::render(&connections_table(&config), Format::Table);
         assert!(!out.contains("leftover"), "{out}");
@@ -941,6 +950,7 @@ mod tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 

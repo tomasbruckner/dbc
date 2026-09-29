@@ -253,6 +253,33 @@ impl HistoryDb {
         }
     }
 
+    /// Removes one entry. The FTS delete trigger keeps the index in step.
+    pub fn delete(&mut self, id: i64) -> Result<(), StateError> {
+        let n = self.conn.execute("DELETE FROM entries WHERE id = ?1", params![id])?;
+        if n == 0 {
+            return Err(err(format!("history entry {id} not found")));
+        }
+        Ok(())
+    }
+
+    /// Removes every entry (or every unstarred one) and returns how many
+    /// went. Privacy, not tidiness, is the point, so the deleted text must
+    /// not survive anywhere in the file: an FTS5 delete only appends a
+    /// tombstone next to the old tokens, and a DELETE leaves the rows in
+    /// free pages. Hence the index rebuild from what is left, then VACUUM.
+    pub fn clear(&mut self, keep_starred: bool) -> Result<usize, StateError> {
+        let n = if keep_starred {
+            self.conn.execute("DELETE FROM entries WHERE starred = 0", [])?
+        } else {
+            self.conn.execute("DELETE FROM entries", [])?
+        };
+        if self.mode == SearchMode::Fts5 {
+            self.conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('rebuild')", [])?;
+        }
+        self.conn.execute_batch("VACUUM")?;
+        Ok(n)
+    }
+
     pub fn set_starred(&mut self, id: i64, starred: bool) -> Result<(), StateError> {
         let n = self.conn.execute(
             "UPDATE entries SET starred = ?1 WHERE id = ?2",
@@ -318,6 +345,57 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let h = HistoryDb::open(&d.path().join("h.sqlite")).unwrap();
         (d, h)
+    }
+
+    #[test]
+    fn delete_removes_one_entry_and_its_fulltext() {
+        let (_d, mut h) = db();
+        let a = h.add("select * from orders", "demo", 1000, None, None, None).unwrap();
+        h.add("select * from invoices", "demo", 2000, None, None, None).unwrap();
+        h.delete(a).unwrap();
+        let r = h.search("", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].sql, "select * from invoices");
+        assert!(h.search("orders", 10).unwrap().is_empty());
+        assert!(h.delete(a).is_err()); // already gone
+    }
+
+    #[test]
+    fn clear_all_empties_history_and_fulltext() {
+        let (_d, mut h) = db();
+        let a = h.add("select * from orders", "demo", 1000, None, None, None).unwrap();
+        h.add("select * from invoices", "demo", 2000, None, None, None).unwrap();
+        h.set_starred(a, true).unwrap();
+        assert_eq!(h.clear(false).unwrap(), 2);
+        assert!(h.search("", 10).unwrap().is_empty());
+        assert!(h.search("orders", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_keeping_starred_leaves_only_starred() {
+        let (_d, mut h) = db();
+        let a = h.add("select * from orders", "demo", 1000, None, None, None).unwrap();
+        h.add("select * from invoices", "demo", 2000, None, None, None).unwrap();
+        h.set_starred(a, true).unwrap();
+        assert_eq!(h.clear(true).unwrap(), 1);
+        let r = h.search("", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].sql, "select * from orders");
+        assert!(h.search("invoices", 10).unwrap().is_empty());
+        assert_eq!(h.search("orders", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn clear_leaves_no_deleted_text_in_the_file() {
+        // Privacy: a DELETE alone leaves the old rows in SQLite's free
+        // pages, readable with a hex editor. `clear` must VACUUM.
+        let (d, mut h) = db();
+        h.add("select secret_marker_zq9 from t", "demo", 1000, None, None, None).unwrap();
+        h.clear(false).unwrap();
+        drop(h);
+        let bytes = std::fs::read(d.path().join("h.sqlite")).unwrap();
+        let needle = b"secret_marker_zq9";
+        assert!(!bytes.windows(needle.len()).any(|w| w == needle));
     }
 
     #[test]

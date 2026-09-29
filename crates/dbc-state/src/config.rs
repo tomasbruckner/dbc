@@ -132,6 +132,13 @@ pub struct ConnectionConfig {
     /// Postgres-only options (sslmode). `None` = defaults, see `PgOptions`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub postgres: Option<PgOptions>,
+    /// Whether `dbc-mcp` may see and query this connection. Opt-in by user
+    /// decision (2026-09-29, privacy review): an AI client reaches nothing
+    /// until the user ticks it, and config files written before the field
+    /// existed load as `false` — MCP goes dark after the update instead of
+    /// silently keeping access nobody granted explicitly.
+    #[serde(default)]
+    pub mcp: bool,
 }
 
 impl ConnectionConfig {
@@ -240,6 +247,12 @@ pub struct AppConfig {
     /// shown, and why it sits here rather than on [`ConnectionConfig`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub hidden: std::collections::BTreeMap<String, HiddenNodes>,
+    /// The user turned the start-up update check off, so the app makes no
+    /// request to GitHub at all. Stored negated on purpose: `AppConfig`
+    /// derives `Default`, and a positive `check_updates` would come out
+    /// `false` on a fresh install that has no `config.toml` yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_update_check: bool,
 }
 
 /// The databases and schemas a connection keeps OUT of the sidebar (user
@@ -562,6 +575,7 @@ mod tests {
                 favourite: false,
                 mssql: None,
                 postgres: None,
+                mcp: true,
             }],
             favourite_objects: vec![],
             theme: ThemeMode::Dark,
@@ -583,6 +597,7 @@ mod tests {
                     )]),
                 },
             )]),
+            disable_update_check: true,
         }
     }
 
@@ -1095,6 +1110,27 @@ user = "postgres"
         // And it saves back without growing a `[connections.postgres]` table.
         let back = toml::to_string_pretty(&config).unwrap();
         assert!(!back.contains("postgres]"), "raw: {back}");
+    }
+
+    #[test]
+    fn old_config_hides_every_connection_from_mcp_and_keeps_update_check_on() {
+        let toml_str = r#"
+[[connections]]
+id = "c1"
+name = "demo"
+engine = "postgres"
+host = "localhost"
+database = "postgres"
+user = "postgres"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.connections[0].mcp);
+        assert!(!config.disable_update_check);
+        // A fresh install has no file at all — the same must hold.
+        assert!(!AppConfig::default().disable_update_check);
+        // And the default does not grow a key in the saved file.
+        let back = toml::to_string_pretty(&config).unwrap();
+        assert!(!back.contains("disable_update_check"), "raw: {back}");
     }
 
     #[test]

@@ -117,6 +117,9 @@ pub enum PaletteAction {
     RunQuery,
     ToggleTree,
     ShowHistory,
+    /// Opens the history tab with its „delete what?" question already
+    /// showing — deleting needs the list in view, not a blind action.
+    ClearHistory,
     NewConnection,
     RefreshSchema,
     OpenMonitor,
@@ -459,6 +462,7 @@ pub fn fixed_actions(
         ("Přepnout motiv".to_string(), PaletteAction::ToggleTheme),
         ("Otevřít log".to_string(), PaletteAction::ShowLog),
         ("Vymazat mezipaměť schémat".to_string(), PaletteAction::ClearSchemaCache),
+        ("Vymazat historii dotazů…".to_string(), PaletteAction::ClearHistory),
         // Unconditional: export refuses on its own terms when there is
         // nothing saved (with a sentence naming the profile), and import
         // is exactly what an EMPTY app needs most.
@@ -770,7 +774,8 @@ mod rank_items_tests {
         // + „Vybrat databázi… (Ctrl+D)" (`PickDatabase`, 2026-09-02)
         // + „Spustit nad více databázemi… (Ctrl+Shift+D)" (`PickTargets`,
         // multi-target 2026-09-14).
-        assert_eq!(items.len(), 2 + 2 + 1 + 17);
+        // + „Vymazat historii dotazů…" (`ClearHistory`, 2026-09-29).
+        assert_eq!(items.len(), 2 + 2 + 1 + 18);
     }
 
     #[test]
@@ -1049,6 +1054,7 @@ mod database_picker_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 
@@ -1119,6 +1125,7 @@ mod targets_mode_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 

@@ -73,6 +73,9 @@ pub enum Command {
     Login,
     /// Remove it again.
     Logout,
+    /// Delete the query history (this machine's `history.sqlite`), or all
+    /// of it but the starred entries.
+    HistoryClear { keep_starred: bool },
     /// Usage was ASKED for: goes to stdout, exit 0.
     Help,
     /// Version was asked for.
@@ -121,6 +124,7 @@ PŘÍKAZY
     query --on-file <f>      cíle ze souboru, jeden conn/db na řádek
     login                    uloží odvozený klíč trezoru pro neinteraktivní běh
     logout                   uložený klíč smaže
+    history clear            smaže historii dotazů (i z aplikace)
     export <soubor>          vyveze připojení i trezor do jednoho souboru
     import <soubor>          nahradí nastavení tímhle souborem
 
@@ -136,6 +140,7 @@ VOLBY
     --limit <n>              strop řádků (výchozí 1000, 0 = bez stropu)
     --timeout <s>            časový limit na příkaz (výchozí 60)
     --force                  u `import`: přepiš i existující nastavení
+    --keep-starred           u `history clear`: ponech položky s ★
     --config <cesta>         jiný config.toml
     --vault <cesta>          jiný soubor trezoru
     -h, --help               tato nápověda
@@ -222,6 +227,7 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
     let mut vault = None;
     let mut write = false;
     let mut force = false;
+    let mut keep_starred = false;
     let mut sql: Option<SqlSource> = None;
     let mut targets: Vec<String> = Vec::new();
     let mut targets_file: Option<PathBuf> = None;
@@ -285,6 +291,16 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
         };
     }
 
+    // `history` has exactly one subcommand today; naming it keeps room for
+    // more without a second meaning for the bare word.
+    if first == "history" {
+        match it.next().as_deref() {
+            Some("clear") => {}
+            Some(other) => return Err(err(format!("neznámé history {other} — umím jen `history clear`"))),
+            None => return Err(err("history chce podpříkaz — `history clear`")),
+        }
+    }
+
     let set_sql = |src: SqlSource, sql: &mut Option<SqlSource>| -> Result<(), ParseError> {
         if sql.is_some() {
             return Err(err("SQL je zadané dvakrát — vyber jeden zdroj (--sql, --file, nebo -)"));
@@ -302,6 +318,7 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
             "-" => set_sql(SqlSource::Stdin, &mut sql)?,
             "--write" => write = true,
             "--force" => force = true,
+            "--keep-starred" => keep_starred = true,
             "--on" => targets.push(value("--on", &mut it)?),
             "--on-file" => targets_file = Some(PathBuf::from(value("--on-file", &mut it)?)),
             "--db" => database = Some(value("--db", &mut it)?),
@@ -354,6 +371,7 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
         "import" => Command::Import { file, force },
         "login" => Command::Login,
         "logout" => Command::Logout,
+        "history" => Command::HistoryClear { keep_starred },
         other => return Err(err(format!("neznámý příkaz {other} — zkus `dbc --help`"))),
     };
 
@@ -368,6 +386,9 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
     }
     if force && !matches!(command, Command::Import { .. }) {
         return Err(err("--force dává smysl jen u import"));
+    }
+    if keep_starred && !matches!(command, Command::HistoryClear { .. }) {
+        return Err(err("--keep-starred dává smysl jen u history clear"));
     }
 
     // The positional connection and `--on`/`--on-file` are two different
@@ -636,6 +657,26 @@ mod tests {
         assert_eq!(a.config, Some(PathBuf::from("c.toml")));
         assert_eq!(a.vault, Some(PathBuf::from("v.bin")));
         assert_eq!(a.command, Command::Tables { conn: "prod".into(), schema: Some("dbo".into()) });
+    }
+
+    #[test]
+    fn history_clear_parses_with_and_without_keep_starred() {
+        assert_eq!(p(&["history", "clear"]).unwrap().command, Command::HistoryClear { keep_starred: false });
+        assert_eq!(
+            p(&["history", "clear", "--keep-starred"]).unwrap().command,
+            Command::HistoryClear { keep_starred: true }
+        );
+    }
+
+    #[test]
+    fn history_wants_a_known_subcommand() {
+        assert!(p(&["history"]).unwrap_err().message.contains("clear"));
+        assert!(p(&["history", "show"]).unwrap_err().message.contains("clear"));
+    }
+
+    #[test]
+    fn keep_starred_belongs_to_history_clear_only() {
+        assert!(p(&["connections", "--keep-starred"]).is_err());
     }
 
     #[test]

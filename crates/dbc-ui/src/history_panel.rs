@@ -309,6 +309,78 @@ impl AppView {
         self.last_history_query = query;
     }
 
+    /// „Vymazat historii" answered. Deletes for real — `HistoryDb::clear`
+    /// also rebuilds the index and VACUUMs, so the text is gone from the
+    /// file, not just from the list (PRIVACY.md, „Query history").
+    pub(crate) fn clear_history(&mut self, keep_starred: bool, cx: &mut Context<Self>) {
+        self.history_clear_confirm = false;
+        let status = match self.history.as_mut() {
+            Some(h) => match h.clear(keep_starred) {
+                Ok(n) => format!("historie vymazána ({n} položek)"),
+                Err(e) => format!("error: historii se nepodařilo vymazat ({})", e.message),
+            },
+            None => "historie není k dispozici".to_string(),
+        };
+        self.editor_mut().status = status;
+        self.refresh_history_cache(cx);
+        cx.notify();
+    }
+
+    /// One row's „✕". No confirmation: it is one line the user is pointing
+    /// at, and re-running the query brings it back.
+    pub(crate) fn delete_history_entry(&mut self, id: i64, cx: &mut Context<Self>) {
+        if let Some(h) = self.history.as_mut() {
+            if let Err(e) = h.delete(id) {
+                self.editor_mut().status = format!("error: položku se nepodařilo smazat ({})", e.message);
+            }
+        }
+        self.refresh_history_cache(cx);
+        cx.notify();
+    }
+
+    /// Search box plus „Vymazat…", or — while that asks — the question
+    /// with its three answers in the same strip.
+    fn render_history_toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .flex_none()
+                .px_2()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(theme.text_muted)
+                .hover(move |s| s.bg(theme.bg_hover).text_color(theme.text_primary))
+                .child(label)
+        };
+        let strip = div().px_2().py_1().flex().flex_row().items_center().gap_2();
+        if self.history_clear_confirm {
+            return strip
+                .child(div().flex_1().min_w_0().text_color(theme.text_primary).child("Smazat historii dotazů?"))
+                .child(
+                    button("history-clear-all", "Vše")
+                        .text_color(theme.danger)
+                        .on_click(cx.listener(|view, _, _, cx| view.clear_history(false, cx))),
+                )
+                .child(
+                    button("history-clear-keep", "Kromě ★")
+                        .on_click(cx.listener(|view, _, _, cx| view.clear_history(true, cx))),
+                )
+                .child(button("history-clear-cancel", "Zrušit").on_click(cx.listener(|view, _, _, cx| {
+                    view.history_clear_confirm = false;
+                    cx.notify();
+                })))
+                .into_any_element();
+        }
+        strip
+            .child(div().flex_1().min_w_0().child(self.history_search.clone()))
+            .child(button("history-clear", "Vymazat…").on_click(cx.listener(|view, _, _, cx| {
+                view.history_clear_confirm = true;
+                cx.notify();
+            })))
+            .into_any_element()
+    }
+
     /// Connection name to record with a run (brief contract #2): the active
     /// saved connection's `name` — „{name}/{db}" when the active database
     /// ≠ default (sidebar rework, design §5 row 8) — or `"cli"` for the
@@ -469,6 +541,19 @@ impl AppView {
                                     .child(div().text_color(cx.theme().text_primary).child(line1))
                                     .child(div().text_size(px(11.)).text_color(line2_color).child(line2)),
                             )
+                            .child(
+                                div()
+                                    .id(("history-delete", id as usize))
+                                    .px_1()
+                                    .cursor_pointer()
+                                    .text_color(cx.theme().text_disabled)
+                                    .hover(|s| s.text_color(cx.theme().danger))
+                                    .child("✕")
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        cx.stop_propagation();
+                                        view.delete_history_entry(id, cx);
+                                    })),
+                            )
                             .into_any_element(),
                     );
                 }
@@ -491,7 +576,7 @@ impl AppView {
             .flex_col()
             .bg(cx.theme().bg_app)
             .text_color(cx.theme().text_primary)
-            .child(div().px_2().py_1().child(self.history_search.clone()))
+            .child(self.render_history_toolbar(cx))
             .child(list)
             .into_any_element()
     }

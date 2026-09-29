@@ -553,6 +553,7 @@ mod duckdb_connect_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 
@@ -797,6 +798,7 @@ mod pg_config_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 
@@ -877,6 +879,7 @@ mod mssql_connect_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 

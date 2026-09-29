@@ -3089,6 +3089,7 @@ mod db_list_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 
@@ -3640,6 +3641,7 @@ mod write_transaction_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         };
         assert!(spec_is_read_only(&ConnectSpec::Config { cfg: Box::new(cfg.clone()), secret: None }));
         let mut cfg2 = cfg;
@@ -3670,6 +3672,7 @@ mod write_transaction_tests {
                 favourite: false,
                 mssql: None,
                 postgres: None,
+                mcp: false,
             }
         }
         assert_eq!(
@@ -3822,6 +3825,7 @@ mod write_transaction_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         };
         let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
         // Exercises `run_write_transaction_inner` (the same body
@@ -3858,6 +3862,7 @@ mod write_transaction_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         };
         let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
         let handle = tokio::runtime::Handle::current();
@@ -3976,6 +3981,7 @@ mod write_transaction_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         };
         let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
         let stmts = admin_sql::drop_role(dbc_state::Engine::Postgres, "bob");
@@ -4266,6 +4272,7 @@ mod analyze_write_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         };
         let spec = ConnectSpec::Config { cfg: Box::new(cfg), secret: None };
         let handle = tokio::runtime::Handle::current();
@@ -4771,6 +4778,7 @@ mod run_many_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 
@@ -5002,6 +5010,7 @@ mod csv_import_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 
@@ -6518,6 +6527,7 @@ mod backup_runner_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 
@@ -6892,6 +6902,7 @@ mod mssql_plan_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 
@@ -7058,6 +7069,7 @@ mod backup_docker_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 
@@ -7762,6 +7774,7 @@ mod mssql_docker_tests {
                 driver: None,
             }),
             postgres: None,
+            mcp: false,
         }
     }
 
@@ -8935,6 +8948,7 @@ mod duckdb_backup_restore_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 
@@ -9245,6 +9259,7 @@ mod duckdb_runner_tests {
             favourite: false,
             mssql: None,
             postgres: None,
+            mcp: false,
         }
     }
 
