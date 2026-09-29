@@ -6,30 +6,26 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
-Privacy: a published policy, and switches for what it promises.
+## [0.36.0] - 2026-09-29
+
+Privacy: a published policy and the switches it promises, plus Postgres over SSL (0.35.0 was never released; its changes ship here).
 
 ### Added
 
 - PRIVACY.md: what dbc stores, where, and what leaves the computer
 - query history can be deleted: „Vymazat…" in the history tab (all, or all but ★), ✕ on one entry, the palette, and `dbc history clear [--keep-starred]`; the text is removed from the file, not just hidden
 - „Kontrolovat aktualizace při startu" in Settings; off means no request to GitHub at all
+- Postgres connections can use SSL: a new „SSL" choice in the connection dialog (disable / prefer / require / verify-full); connections saved without one use prefer, like psql
+- backup and restore through pg_dump / pg_restore / psql use the same SSL mode as the connection
 
 ### Changed
 
 - MCP is opt-in per connection: „Dostupné pro AI (MCP)" in the connection dialog, off by default — **after updating, dbc-mcp sees no connection until you turn it on**
 - dbc-mcp no longer writes SQL text to its log, only the statement kind and length
 
-## [0.35.0] - 2026-09-24
-
-Postgres over SSL.
-
-### Added
-
-- Postgres connections can use SSL: a new „SSL" choice in the connection dialog (disable / prefer / require / verify-full); connections saved without one use prefer, like psql
-- backup and restore through pg_dump / pg_restore / psql use the same SSL mode as the connection
-
 ### Fixed
 
+- dialogs taller than the window (Settings, the connection dialog, … in a window that is not maximised) were cut off at both ends; they now scroll, with a scrollbar
 - a server that accepts only encrypted connections refused dbc with „no pg_hba.conf entry … no encryption"
 - a failed TLS handshake now says why, not just „error performing TLS handshake"
 
