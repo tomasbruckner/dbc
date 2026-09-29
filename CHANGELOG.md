@@ -6,6 +6,19 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+Privacy: a published policy, and switches for what it promises.
+
+### Added
+
+- PRIVACY.md: what dbc stores, where, and what leaves the computer
+- query history can be deleted: „Vymazat…" in the history tab (all, or all but ★), ✕ on one entry, the palette, and `dbc history clear [--keep-starred]`; the text is removed from the file, not just hidden
+- „Kontrolovat aktualizace při startu" in Settings; off means no request to GitHub at all
+
+### Changed
+
+- MCP is opt-in per connection: „Dostupné pro AI (MCP)" in the connection dialog, off by default — **after updating, dbc-mcp sees no connection until you turn it on**
+- dbc-mcp no longer writes SQL text to its log, only the statement kind and length
+
 ## [0.35.0] - 2026-09-24
 
 Postgres over SSL.

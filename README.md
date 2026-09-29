@@ -21,6 +21,8 @@ v [CONTRIBUTING.md](CONTRIBUTING.md).
    Vedle aplikace (`dbc-ui.exe`) je `dbc.exe` (příkazová řádka) a
    `dbc-mcp.exe` (MCP server pro AI nástroje); po instalaci leží v
    `%LocalAppData%\dbc\current\`, u portable verze ve složce `current\`.
+   AI přes MCP uvidí jen připojení, u kterých zapneš **Dostupné pro AI
+   (MCP)**.
 2. Windows SmartScreen se při prvním spuštění ozve, protože soubory
    nejsou podepsané: klikni na **Další informace → Přesto spustit**.
    Stane se to jednou.
@@ -29,7 +31,7 @@ v [CONTRIBUTING.md](CONTRIBUTING.md).
    od Microsoftu. Bez něj připojení k MSSQL skončí hláškou, která na
    tenhle odkaz ukáže. PostgreSQL, SQLite a DuckDB nic nepotřebují.
 
-Aktualizace: aplikace se po startu podívá na GitHub, novou verzi si
+Aktualizace (jdou vypnout v Nastavení): aplikace se po startu podívá na GitHub, novou verzi si
 stáhne a v horní liště ukáže tlačítko **Aktualizovat na vX.Y.Z**. Klik ji
 nainstaluje a aplikaci restartuje; kdo tlačítko ignoruje, dostane novou
 verzi při příštím spuštění, protože se nainstaluje po zavření. Nastavení
@@ -64,7 +66,7 @@ vydání a případně ho stáhne; ten dotaz nenese žádný identifikátor krom
 toho, co v každém HTTPS požadavku vidí server. Žádná telemetrie, žádné
 hlášení pádů, nic dalšího. *This program will not transfer any
 information to other networked systems unless specifically requested by
-the user, with the two exceptions above.*
+the user, with the two exceptions above.* Úplné znění: [PRIVACY.md](PRIVACY.md).
 
 ## Kde jsou moje data
 
@@ -75,7 +77,16 @@ Všechno je v `%APPDATA%\dbc`:
 | `config.toml` | připojení, složky, vzhled |
 | `vault.bin` | hesla, šifrovaná master heslem (Argon2id + ChaCha20-Poly1305) |
 | `history.sqlite` | historie dotazů, jen na tomhle počítači |
-| `dbc.log` | log aplikace, sem se dívej, když se něco pokazí |
+| `dbc.log`, `dbc.log.1` | log aplikace, sem se dívej, když se něco pokazí |
+| `sessions\` | otevřené taby včetně neuloženého SQL, obnoví se při startu |
+| `params.toml` | naposledy zadané hodnoty `:parametrů` |
+| `views.toml` | rozvržení mřížky po tabulkách (skryté sloupce, šířky, řazení) |
+| `schema-cache\` | struktura databází pro napovídání, žádná data z tabulek |
+| `connection-cache.json` | verze serveru a seznam databází po připojeních |
+| `workspace.toml` | cesta k pracovnímu prostoru, pokud ho používáš |
+
+Historii smažeš v tabu Historie (**Vymazat…**) nebo `dbc history clear`.
+Co přesně se kde ukládá a co kam odchází: [PRIVACY.md](PRIVACY.md).
 
 Nastavení jde přenést jinam přes **☰ → Export nastavení**, hesla jdou
 s ním jen zašifrovaně.
