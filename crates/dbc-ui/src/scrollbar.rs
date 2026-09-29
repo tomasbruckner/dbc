@@ -30,9 +30,9 @@
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
 use gpui::{
-    canvas, div, point, prelude::*, px, AnyElement, App, Bounds, DispatchPhase, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, UniformListDecoration,
-    UniformListScrollHandle, Window,
+    canvas, div, fill, point, prelude::*, px, size, AnyElement, App, Bounds, DispatchPhase,
+    ElementId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollHandle, UniformListDecoration, UniformListScrollHandle, Window,
 };
 
 use crate::theme::ActiveTheme;
@@ -221,6 +221,133 @@ impl UniformListDecoration for ListScrollbar {
             .child(listeners)
             .into_any_element()
     }
+}
+
+/// Vertical scrolling for an ordinary `div` — the dialog case, where the
+/// content is one tall panel rather than `uniform_list` rows. Capped at
+/// the parent's height (`max_h_full`), so a panel that fits looks exactly
+/// as before and one that does not scrolls instead of hanging off both
+/// ends of the window (user, 2026-09-29).
+///
+/// Same bar as [`ListScrollbar`]: overlaid on the right edge, draggable,
+/// click-to-page. It is painted by a `canvas` that reads the div's
+/// `ScrollHandle` at paint time — after the div's prepaint has measured
+/// it, so the numbers are this frame's — and its listeners are
+/// window-wide for the same reason as the list's (see the module doc).
+///
+/// The handle and drag live in `use_keyed_state` under `id`, so a caller
+/// that renders a fresh element every frame (every modal does) keeps its
+/// scroll position without a field of its own. The id must therefore be
+/// stable across frames and unique among what is on screen together.
+#[derive(IntoElement)]
+pub struct ScrollY {
+    id: ElementId,
+    child: AnyElement,
+}
+
+pub fn scroll_y(id: impl Into<ElementId>, child: impl IntoElement) -> ScrollY {
+    ScrollY { id: id.into(), child: child.into_any_element() }
+}
+
+struct ScrollYState {
+    handle: ScrollHandle,
+    drag: Rc<RefCell<Option<Drag>>>,
+}
+
+impl RenderOnce for ScrollY {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let state = window.use_keyed_state(self.id.clone(), cx, |_, _| ScrollYState {
+            handle: ScrollHandle::new(),
+            drag: Rc::new(RefCell::new(None)),
+        });
+        let (handle, drag) = {
+            let s = state.read(cx);
+            (s.handle.clone(), s.drag.clone())
+        };
+        let theme = *cx.theme();
+        let bar_handle = handle.clone();
+        div()
+            .id(self.id)
+            .max_h_full()
+            .overflow_y_scroll()
+            .track_scroll(&handle)
+            .child(self.child)
+            .child(
+                canvas(|_, _, _| (), move |_, _, window, _| paint_y_bar(&bar_handle, &drag, theme, window))
+                    .absolute()
+                    .size_0(),
+            )
+    }
+}
+
+fn paint_y_bar(
+    handle: &ScrollHandle,
+    drag: &Rc<RefCell<Option<Drag>>>,
+    theme: crate::theme::Theme,
+    window: &mut Window,
+) {
+    let b = handle.bounds();
+    let viewport = f32::from(b.size.height);
+    let content = viewport + f32::from(handle.max_offset().y);
+    let offset = -f32::from(handle.offset().y);
+    let Some((start, len)) = thumb(viewport, content, offset) else {
+        *drag.borrow_mut() = None;
+        return;
+    };
+    let top = f32::from(b.origin.y);
+    let right = f32::from(b.origin.x) + f32::from(b.size.width);
+    let track = Bounds::new(point(px(right - BAR_WIDTH), px(top)), size(px(BAR_WIDTH), px(viewport)));
+    let thumb_bounds = Bounds::new(
+        point(px(right - BAR_WIDTH + THUMB_INSET), px(top + start)),
+        size(px(BAR_WIDTH - 2.0 * THUMB_INSET), px(len)),
+    );
+    window.paint_quad(fill(track, theme.scrollbar_track));
+    window.paint_quad(fill(thumb_bounds, theme.scrollbar_thumb).corner_radii(px(3.)));
+
+    let set_y = {
+        let handle = handle.clone();
+        move |y_offset: f32| {
+            let x = handle.offset().x;
+            handle.set_offset(point(x, px(-y_offset)));
+        }
+    };
+    let down_drag = drag.clone();
+    let down_set = set_y.clone();
+    window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
+        if phase != DispatchPhase::Bubble || ev.button != MouseButton::Left || !track.contains(&ev.position) {
+            return;
+        }
+        let y = f32::from(ev.position.y) - top;
+        if y >= start && y <= start + len {
+            *down_drag.borrow_mut() = Some(Drag { grab: y - start });
+        } else {
+            let page = viewport * PAGE_FRACTION;
+            let next = if y < start { offset - page } else { offset + page };
+            down_set(next.clamp(0.0, content - viewport));
+        }
+        cx.stop_propagation();
+        window.refresh();
+    });
+    let move_drag = drag.clone();
+    window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, _cx| {
+        if phase != DispatchPhase::Bubble {
+            return;
+        }
+        let Some(d) = *move_drag.borrow() else { return };
+        if ev.pressed_button != Some(MouseButton::Left) {
+            *move_drag.borrow_mut() = None;
+            return;
+        }
+        let start = f32::from(ev.position.y) - top - d.grab;
+        set_y(offset_for_thumb_start(viewport, content, start));
+        window.refresh();
+    });
+    let up_drag = drag.clone();
+    window.on_mouse_event(move |ev: &MouseUpEvent, _phase, _window, _cx| {
+        if ev.button == MouseButton::Left {
+            *up_drag.borrow_mut() = None;
+        }
+    });
 }
 
 #[cfg(test)]
@@ -434,5 +561,104 @@ mod drag_tests {
         // Above the thumb: one page back up (clamped at the top).
         cx.simulate_click(point(x, px(1.0)), Modifiers::none());
         assert_eq!(offset(&handle), 0.0);
+    }
+}
+
+/// Modal dialogs taller than the window (user, 2026-09-29: „když nemám
+/// okno ve full screen a otevřu nastavení, tak je to uříznuté"). The
+/// overlays centre their panel, so an oversized one hangs off BOTH ends.
+#[cfg(test)]
+mod scroll_y_tests {
+    use super::*;
+    use crate::theme::Theme;
+    use gpui::{
+        size, Context, Modifiers, Render, ScrollDelta, ScrollWheelEvent, TestAppContext,
+        TouchPhase, VisualTestContext,
+    };
+
+    const WIN: f32 = 400.0;
+    const PANEL_W: f32 = 300.0;
+
+    /// The shape of every modal overlay: a full-window backdrop centring
+    /// one fixed-width panel, the panel wrapped in [`scroll_y`].
+    struct Overlay {
+        filler: f32,
+    }
+
+    impl Render for Overlay {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let panel = div()
+                .w(px(PANEL_W))
+                .flex()
+                .flex_col()
+                .child(div().h(px(20.)).debug_selector(|| "top".into()))
+                .child(div().h(px(self.filler)))
+                .child(div().h(px(20.)).debug_selector(|| "bottom".into()));
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(scroll_y("modal", panel))
+        }
+    }
+
+    fn open(cx: &mut TestAppContext, filler: f32) -> VisualTestContext {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let window = cx.open_window(size(px(WIN), px(WIN)), move |_, _| Overlay { filler });
+        let vcx = VisualTestContext::from_window(*window, cx);
+        vcx.run_until_parked();
+        vcx
+    }
+
+    fn y(cx: &mut VisualTestContext, sel: &'static str) -> Bounds<Pixels> {
+        cx.debug_bounds(sel).expect("marker painted")
+    }
+
+    /// Right edge of the panel, where the bar sits.
+    const BAR_X: f32 = (WIN + PANEL_W) / 2.0 - BAR_WIDTH / 2.0;
+
+    #[gpui::test]
+    fn an_oversized_panel_starts_at_its_top(cx: &mut TestAppContext) {
+        let mut cx = open(cx, 800.0);
+        let top = y(&mut cx, "top");
+        assert!(f32::from(top.origin.y) >= 0.0, "panel top is above the window: {top:?}");
+    }
+
+    #[gpui::test]
+    fn the_wheel_reaches_the_bottom_of_an_oversized_panel(cx: &mut TestAppContext) {
+        let mut cx = open(cx, 800.0);
+        assert!(f32::from(y(&mut cx, "bottom").bottom()) > WIN, "starts off-screen");
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(WIN / 2.0), px(WIN / 2.0)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-2000.))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        let bottom = y(&mut cx, "bottom");
+        assert!(f32::from(bottom.bottom()) <= WIN + 0.5, "bottom still off-screen: {bottom:?}");
+    }
+
+    #[gpui::test]
+    fn the_bar_can_be_dragged(cx: &mut TestAppContext) {
+        let mut cx = open(cx, 800.0);
+        let top0 = f32::from(y(&mut cx, "top").origin.y);
+        // Content 840 in a 400 viewport: the thumb starts at the top.
+        let (_, len) = thumb(WIN, 840.0, 0.0).unwrap();
+        let grab = point(px(BAR_X), px(len / 2.0));
+        cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(grab + point(px(0.), px(100.)), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(grab + point(px(0.), px(100.)), MouseButton::Left, Modifiers::none());
+        let want = offset_for_thumb_start(WIN, 840.0, 100.0);
+        let moved = top0 - f32::from(y(&mut cx, "top").origin.y);
+        assert!((moved - want).abs() < 1.0, "scrolled {moved}, want {want}");
+    }
+
+    #[gpui::test]
+    fn a_panel_that_fits_stays_centred(cx: &mut TestAppContext) {
+        let mut cx = open(cx, 100.0);
+        // 140 tall in 400: centred means 130 above.
+        let top = y(&mut cx, "top");
+        assert_eq!(f32::from(top.origin.y), 130.0);
     }
 }

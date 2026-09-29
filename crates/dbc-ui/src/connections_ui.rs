@@ -2570,7 +2570,8 @@ impl AppView {
                 .on_action(cx.listener(AppView::on_modal_focus_next))
                 .on_action(cx.listener(AppView::on_modal_focus_prev))
                 .occlude()
-                .child(panel)
+                .py_4()
+                .child(crate::scrollbar::scroll_y("modal-main", panel))
                 .into_any_element(),
         )
     }

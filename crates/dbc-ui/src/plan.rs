@@ -2226,7 +2226,8 @@ impl Render for PlanView {
                     .justify_center()
                     .bg(theme.bg_backdrop)
                     .occlude()
-                    .child(panel),
+                    .py_4()
+                    .child(crate::scrollbar::scroll_y("modal-plan", panel)),
             );
         }
         root

@@ -6872,7 +6872,8 @@ impl AppView {
                     cx.notify();
                 }),
             )
-            .child(panel)
+            .py_4()
+            .child(crate::scrollbar::scroll_y("modal-about", panel))
             .into_any_element()
     }
 
@@ -6968,7 +6969,8 @@ impl AppView {
                     cx.notify();
                 }),
             )
-            .child(panel)
+            .py_4()
+            .child(crate::scrollbar::scroll_y("modal-shortcuts", panel))
             .into_any_element()
     }
 
@@ -7862,7 +7864,8 @@ impl AppView {
                 .justify_center()
                 .bg(theme.bg_backdrop)
                 .occlude()
-                .child(panel)
+                .py_4()
+                .child(crate::scrollbar::scroll_y("modal-main-b", panel))
                 .into_any_element(),
         )
     }
@@ -14430,7 +14433,8 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // on discard-confirm (§3-novela / Global Constraints).
                 .track_focus(&self.modal_focus_handle)
                 .occlude()
-                .child(panel)
+                .py_4()
+                .child(crate::scrollbar::scroll_y("modal-main-c", panel))
                 .into_any_element(),
         )
     }
@@ -14551,7 +14555,8 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 .justify_center()
                 .bg(theme.bg_backdrop)
                 .occlude()
-                .child(panel)
+                .py_4()
+                .child(crate::scrollbar::scroll_y("modal-main-d", panel))
                 .into_any_element(),
         )
     }

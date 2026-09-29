@@ -692,7 +692,8 @@ impl MonitorView {
                 .justify_center()
                 .bg(theme.bg_backdrop)
                 .occlude()
-                .child(panel)
+                .py_4()
+                .child(crate::scrollbar::scroll_y("modal-monitor", panel))
                 .into_any_element(),
         )
     }

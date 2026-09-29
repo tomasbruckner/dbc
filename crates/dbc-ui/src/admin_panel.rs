@@ -2278,7 +2278,8 @@ impl AdminPanel {
                 .on_action(cx.listener(Self::on_modal_focus_next))
                 .on_action(cx.listener(Self::on_modal_focus_prev))
                 .occlude()
-                .child(panel)
+                .py_4()
+                .child(crate::scrollbar::scroll_y("modal-admin", panel))
                 .into_any_element(),
         )
     }

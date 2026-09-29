@@ -2079,7 +2079,8 @@ impl ResultGrid {
                 .justify_center()
                 .bg(theme.bg_backdrop)
                 .occlude()
-                .child(panel)
+                .py_4()
+                .child(crate::scrollbar::scroll_y("modal-grid-a", panel))
                 .into_any_element(),
         )
     }
@@ -2364,7 +2365,8 @@ impl ResultGrid {
                 .justify_center()
                 .bg(theme.bg_backdrop)
                 .occlude()
-                .child(panel)
+                .py_4()
+                .child(crate::scrollbar::scroll_y("modal-grid-b", panel))
                 .into_any_element(),
         )
     }
