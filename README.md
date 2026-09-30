@@ -85,6 +85,12 @@ Všechno je v `%APPDATA%\dbc`:
 | `connection-cache.json` | verze serveru a seznam databází po připojeních |
 | `workspace.toml` | cesta k pracovnímu prostoru, pokud ho používáš |
 
+Mimo `%APPDATA%` jen na tvoje výslovné přání: klíč k trezoru (nikdy master
+heslo) ve Windows Credential Manageru. Pro aplikaci ho uložíš zaškrtnutím
+**Zapamatovat na tomto počítači** při odemykání (položka `dbc-ui`, smažeš
+v Nastavení → **Zapomenout uložený klíč**), pro CLI přes `dbc login` (`dbc-cli`)
+a pro MCP přes `dbc-mcp setup` (`dbc-mcp`).
+
 Historii smažeš v tabu Historie (**Vymazat…**) nebo `dbc history clear`.
 Co přesně se kde ukládá a co kam odchází: [PRIVACY.md](PRIVACY.md).
 

@@ -2441,6 +2441,7 @@ dependencies = [
  "dirs",
  "gpui",
  "gpui_platform",
+ "keyring",
  "quick-xml",
  "serde",
  "serde_json",

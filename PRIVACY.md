@@ -60,10 +60,16 @@ scripts.
 - While the vault is unlocked, the app keeps the key and the passwords
   in memory; they are wiped from memory when the vault is locked or the
   app exits.
-- The desktop app does not use the Windows Credential Manager.
-- The command line and the MCP server can, if you ask them to, store the
-  derived vault key (never the master password) in the **Windows
-  Credential Manager**, so they can run without prompting:
+- The desktop app, the command line and the MCP server can, if you ask
+  them to, store the derived vault key (never the master password) in the
+  **Windows Credential Manager**, so they can run without prompting. Each
+  has its own entry, so removing one does not affect the others:
+  - The desktop app stores it under the name `dbc-ui` when you tick
+    „Zapamatovat na tomto počítači" while unlocking (off by default). It is
+    used once, when the app starts; after „Zamknout trezor" the app asks
+    for the master password again until the next start. Settings →
+    „Zapomenout uložený klíč" removes it, as does unticking the box at the
+    next unlock.
   - `dbc login` stores it under the name `dbc-cli`; `dbc logout` removes it.
   - `dbc-mcp setup` stores it under the name `dbc-mcp`;
     `dbc-mcp setup --remove` removes it.

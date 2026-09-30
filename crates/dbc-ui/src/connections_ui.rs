@@ -2397,7 +2397,7 @@ impl AppView {
         let panel = match modal {
             ModalState::ConnectionDialog(ui) => render_connection_dialog_panel(ui, cx),
             ModalState::MasterPasswordPrompt { input, error, verifying, .. } => {
-                render_master_password_panel(input, error, verifying, cx)
+                render_master_password_panel(input, error, verifying, self.remember_vault_key, cx)
             }
             ModalState::CreateMasterPassword { input1, input2, error, .. } => {
                 render_create_master_password_panel(input1, input2, error, cx)
@@ -2683,6 +2683,22 @@ impl AppView {
                     )
             }
         };
+
+        // „Trezor" — the auto-unlock consent (PRIVACY.md, „Credentials").
+        // It is GIVEN in the unlock prompt; this is where it is taken back.
+        panel = panel.child(div().mt_2().text_color(cx.theme().text_muted).child("Trezor")).child(
+            div().child(if self.vault_key_stored {
+                "Klíč k trezoru je uložen ve Windows Credential Manageru — trezor se při startu odemkne sám."
+            } else {
+                "Klíč k trezoru není uložen — master heslo se zadává při každém spuštění."
+            }),
+        );
+        if self.vault_key_stored {
+            panel = panel.child(
+                ui::row_button("settings-forget-vault-key", "Zapomenout uložený klíč", *cx.theme())
+                    .on_click(cx.listener(|this, _, _, cx| this.forget_vault_key(cx))),
+            );
+        }
 
         // „Aktualizace" — the one switch that decides whether dbc talks to
         // GitHub at all (PRIVACY.md, „Updates").
@@ -3562,6 +3578,93 @@ impl AppView {
         cx.notify();
     }
 
+    /// „Zapamatovat na tomto počítači", the launch half: if a `dbc-ui` key
+    /// is stored, open the vault with it — once, at startup, never again
+    /// this run (see `vault_key`'s module doc for why not on demand).
+    ///
+    /// Both the credential-store read and the decrypt run off the UI
+    /// thread. A key that no longer opens the vault is silent: the first
+    /// secret-needing action shows the ordinary prompt, with the box
+    /// already ticked, and that unlock stores the fresh key.
+    pub(crate) fn start_auto_unlock(&mut self, cx: &mut Context<Self>) {
+        if !Vault::exists(&self.vault_path) {
+            return;
+        }
+        let path = self.vault_path.clone();
+        // Outer None = nothing stored; inner None = stored but stale.
+        let task = cx.background_executor().spawn(async move {
+            let key = zeroize::Zeroizing::new(crate::vault_key::stored_key()?);
+            Some(Vault::unlock_with_key(&path, &key).ok())
+        });
+        cx.spawn(async move |this, cx| {
+            let Some(result) = task.await else { return };
+            let _ = this.update_in(cx, |view, window, cx| {
+                view.vault_key_stored = true;
+                view.remember_vault_key = true;
+                let Some(vault) = result else { return };
+                if view.vault.is_some() {
+                    return;
+                }
+                view.vault = Some(vault);
+                // A prompt opened while the store was being read has just
+                // been answered — unless a typed password is already being
+                // verified, in which case that result lands and resumes.
+                if matches!(view.modal, Some(ModalState::MasterPasswordPrompt { verifying: false, .. })) {
+                    if let Some(ModalState::MasterPasswordPrompt { pending, .. }) = view.modal.take() {
+                        view.resume_pending(pending, window, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The unlock prompt's „Zapamatovat na tomto počítači" box.
+    pub(crate) fn toggle_remember_vault_key(&mut self, cx: &mut Context<Self>) {
+        self.remember_vault_key = !self.remember_vault_key;
+        cx.notify();
+    }
+
+    /// Apply the box after a successful PASSWORD unlock (`vault_key::
+    /// after_unlock`). Returns the failure to report, if any — the vault
+    /// is open either way, so a credential-store error is a warning, not
+    /// a failed unlock.
+    fn apply_remember_choice(&mut self, vault: &Vault) -> Option<String> {
+        use crate::vault_key::{after_unlock, KeyAction};
+        match after_unlock(self.remember_vault_key, self.vault_key_stored) {
+            KeyAction::Store => match crate::vault_key::store_key(&vault.export_key()) {
+                Ok(()) => {
+                    self.vault_key_stored = true;
+                    None
+                }
+                Err(e) => Some(format!("trezor odemčen, ale klíč se nepodařilo uložit ({e})")),
+            },
+            KeyAction::Forget => self.forget_vault_key_inner(),
+            KeyAction::Nothing => None,
+        }
+    }
+
+    fn forget_vault_key_inner(&mut self) -> Option<String> {
+        match crate::vault_key::forget_key() {
+            Ok(()) => {
+                self.vault_key_stored = false;
+                self.remember_vault_key = false;
+                None
+            }
+            Err(e) => Some(format!("error: uložený klíč se nepodařilo smazat ({e})")),
+        }
+    }
+
+    /// Settings' „Zapomenout uložený klíč". Does NOT lock an open vault —
+    /// it revokes the next launch's auto-unlock, which is what was asked.
+    pub(crate) fn forget_vault_key(&mut self, cx: &mut Context<Self>) {
+        self.editor_mut().status = self
+            .forget_vault_key_inner()
+            .unwrap_or_else(|| "uložený klíč smazán — příští start se zeptá na master heslo".to_string());
+        cx.notify();
+    }
+
     pub(crate) fn on_dropdown_item_click(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let needs_secret = self
             .config
@@ -3711,9 +3814,14 @@ impl AppView {
                 }
                 match result {
                     Ok(vault) => {
+                        let warning = view.apply_remember_choice(&vault);
                         view.vault = Some(vault);
                         view.modal = None;
                         view.resume_pending(pending, window, cx);
+                        if let Some(w) = warning {
+                            view.editor_mut().status = w;
+                            cx.notify();
+                        }
                     }
                     Err(e) => {
                         input.update(cx, |f, cx| f.set_text("", cx));
@@ -4887,10 +4995,15 @@ fn render_settings_import_panel(
         .into_any_element()
 }
 
+const REMEMBER_VAULT_KEY_LABEL: &str = "Zapamatovat na tomto počítači (Windows Credential Manager)";
+const REMEMBER_VAULT_KEY_NOTE: &str = "Trezor se pak při startu odemkne sám — kdokoli přihlášený \
+     pod vaším účtem Windows otevře i uložená hesla. Zrušit jde v Nastavení.";
+
 fn render_master_password_panel(
     input: Entity<TextField>,
     error: Option<String>,
     verifying: bool,
+    remember: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let mut panel: Div = ui::panel(360., *cx.theme())
@@ -4900,7 +5013,15 @@ fn render_master_password_panel(
                 .text_color(cx.theme().text_muted)
                 .child("Master heslo platí pro celou aplikaci — zadáte ho nejvýše jednou za spuštění."),
         )
-        .child(ui::field_row("Heslo", input, *cx.theme()));
+        .child(ui::field_row("Heslo", input, *cx.theme()))
+        .child(
+            ui::checkbox("mpp-remember", REMEMBER_VAULT_KEY_LABEL, remember)
+                .on_click(cx.listener(|v, _, _, cx| v.toggle_remember_vault_key(cx))),
+        );
+    if remember {
+        // The cost of the convenience, on screen before the choice is made.
+        panel = panel.child(div().text_color(cx.theme().text_muted).child(REMEMBER_VAULT_KEY_NOTE));
+    }
     if let Some(e) = error {
         panel = panel.child(div().text_color(cx.theme().danger).child(e));
     }

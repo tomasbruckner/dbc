@@ -6,6 +6,10 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+### Added
+
+- „Zapamatovat na tomto počítači" when unlocking the vault: the app stores the derived vault key (never the master password) in the Windows Credential Manager as `dbc-ui` and unlocks by itself at the next start; off by default, „Zapomenout uložený klíč" in Settings takes it back
+
 ## [0.36.0] - 2026-09-29
 
 Privacy: a published policy and the switches it promises, plus Postgres over SSL (0.35.0 was never released; its changes ship here).

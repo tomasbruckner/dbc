@@ -73,6 +73,7 @@ mod keymap;
 mod sql_input;
 mod tabs;
 mod updater;
+mod vault_key;
 mod text_model;
 mod text_view;
 mod theme;
@@ -2656,6 +2657,16 @@ struct AppView {
     /// Unlocked vault, kept for the session once the user has entered the
     /// master password once (brief: prompt on first use, not at startup).
     vault: Option<Vault>,
+    /// Is a `dbc-ui` key in the Windows Credential Manager (`vault_key`)?
+    /// Learned by the startup auto-unlock, kept current by every store /
+    /// forget — Settings shows „Zapomenout" only when there is something
+    /// to forget.
+    vault_key_stored: bool,
+    /// The unlock prompt's „Zapamatovat na tomto počítači" box. Starts
+    /// ticked exactly when a key is stored, so a stale key (vault re-sealed
+    /// or replaced by an import) gets refreshed by the next password unlock
+    /// without the user having to opt in a second time.
+    remember_vault_key: bool,
     /// A `prefetch::may_prefetch` gate and the loop's own „one at a time"
     /// rule (see `prefetch`'s module doc). Set when a prefetch fetch is
     /// dispatched, cleared when it lands — success or failure.
@@ -16608,6 +16619,8 @@ fn main() {
                             ],
                             workspace_panel_focus: cx.focus_handle(),
                             vault: None,
+                            vault_key_stored: false,
+                            remember_vault_key: false,
                             prefetch_in_flight: false,
                             prefetch_armed: false,
                             switch_generation: 0,
@@ -16667,6 +16680,9 @@ fn main() {
             // the tree and every dialog for focus.
             let editor_focus = view.editor().sql.focus_handle(cx);
             window.focus(&editor_focus, cx);
+            // Opt-in „Zapamatovat na tomto počítači": the ONE auto-unlock
+            // of this run (vault_key.rs). Background; silent on no key.
+            view.start_auto_unlock(cx);
             let grouped = view.grouped_cache.clone();
             let hidden = view.config.hidden.clone();
             view.tree.update(cx, |t, cx| {
