@@ -6,6 +6,10 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-09-30
+
+The app can remember the vault key, so it opens without the master password.
+
 ### Added
 
 - „Zapamatovat na tomto počítači" when unlocking the vault: the app stores the derived vault key (never the master password) in the Windows Credential Manager as `dbc-ui` and unlocks by itself at the next start; off by default, „Zapomenout uložený klíč" in Settings takes it back
