@@ -234,6 +234,7 @@ pub fn open_config(
 }
 
 const DEFAULT_PG_PORT: u16 = 5432;
+const DEFAULT_MSSQL_PORT: u16 = 1433;
 
 /// Saved sslmode → the driver's. Two enums because neither crate depends
 /// on the other; the spellings are libpq's on both sides.
@@ -432,15 +433,20 @@ pub fn normalise_mssql_host(
         )));
     }
 
+    // The dialog prefills the Port field with 1433, so 1433 there says
+    // nothing about what the user wanted — a port pasted into Host wins
+    // over it instead of being reported as a contradiction.
     let resolved = match (embedded_port, port) {
-        (Some(from_host), Some(from_field)) if from_host != from_field => {
+        (Some(from_host), Some(from_field))
+            if from_host != from_field && from_field != DEFAULT_MSSQL_PORT =>
+        {
             return Err(QueryError::msg(format!(
                 "MSSQL: port je zadaný dvakrát a pokaždé jinak — v Hostu {from_host},                  v poli Port {from_field}. Nech ho jen na jednom místě."
             )))
         }
         (Some(from_host), _) => from_host,
         (None, Some(from_field)) => from_field,
-        (None, None) => 1433,
+        (None, None) => DEFAULT_MSSQL_PORT,
     };
     Ok((addr.to_string(), resolved))
 }
@@ -755,8 +761,18 @@ mod mssql_host_tests {
     /// typed on purpose.
     #[test]
     fn a_port_given_twice_and_differently_is_refused_rather_than_guessed() {
-        let e = normalise_mssql_host("srv,1113", Some(1433)).unwrap_err().to_string();
-        assert!(e.contains("1113") && e.contains("1433"), "{e}");
+        let e = normalise_mssql_host("srv,1113", Some(1434)).unwrap_err().to_string();
+        assert!(e.contains("1113") && e.contains("1434"), "{e}");
+    }
+
+    /// 1433 in the Port field is the dialog's prefill, not a choice — a
+    /// port pasted into Host overrides it.
+    #[test]
+    fn a_port_in_host_overrides_the_prefilled_default() {
+        assert_eq!(
+            normalise_mssql_host("srv,1113", Some(1433)).unwrap(),
+            ("srv".to_string(), 1113)
+        );
     }
 
     /// An IPv6 literal is bracketed and full of colons; tearing it apart at

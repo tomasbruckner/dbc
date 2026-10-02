@@ -348,6 +348,21 @@ mod clipboard_guard_tests {
         }
     }
 
+    #[test]
+    fn switching_engines_overwrites_only_the_apps_own_default_ports() {
+        assert_eq!(default_port_for(Engine::Postgres), "5432");
+        assert_eq!(default_port_for(Engine::Mssql), "1433");
+        for e in ALL_ENGINES {
+            assert_eq!(default_port_for(e).is_empty(), engine_is_file_based(e), "{e:?}");
+        }
+        assert!(may_replace_port(""));
+        assert!(may_replace_port("5432"));
+        assert!(may_replace_port(" 1433 "));
+        for typed in ["15432", "1434", "5433"] {
+            assert!(!may_replace_port(typed), "{typed:?} is the user's port");
+        }
+    }
+
     /// The field's selection colour moved into the theme
     /// (`bg_input_selection`); its visibility contract — opaque, distinct
     /// from the field — is pinned there, per theme, in
@@ -2817,6 +2832,7 @@ impl AppView {
             // engine is switched — and stops the moment the user types
             // something of their own (`may_replace_database`).
             database.update(cx, |f, cx| f.set_text(default_database_for(Engine::Postgres), cx));
+            port.update(cx, |f, cx| f.set_text(default_port_for(Engine::Postgres), cx));
             (None, Engine::Postgres, false, false, false, false, defaults.encrypt, defaults.trust_server_certificate, PgSslMode::default())
         };
 
@@ -3132,6 +3148,13 @@ impl AppView {
             let current = field.read(cx).text();
             if may_replace_database(&current) {
                 let default = default_database_for(engine).to_string();
+                field.update(cx, |f, cx| f.set_text(&default, cx));
+            }
+            // Same deal for the port.
+            let field = ui.port.clone();
+            let current = field.read(cx).text();
+            if may_replace_port(&current) {
+                let default = default_port_for(engine).to_string();
                 field.update(cx, |f, cx| f.set_text(&default, cx));
             }
         }
@@ -3975,6 +3998,29 @@ pub(crate) fn may_replace_database(current: &str) -> bool {
     }
     ALL_ENGINES.iter().any(|&e| {
         let d = default_database_for(e);
+        !d.is_empty() && d == t
+    })
+}
+
+/// The port a fresh connection to this engine should start with — the
+/// server's well-known one. Empty for the file engines, which have none.
+pub(crate) fn default_port_for(e: Engine) -> &'static str {
+    match e {
+        Engine::Postgres => "5432",
+        Engine::Mssql => "1433",
+        Engine::Sqlite | Engine::Duckdb => "",
+    }
+}
+
+/// May switching the engine overwrite what is in the port field? The same
+/// rule as `may_replace_database`: only empty or another engine's default.
+pub(crate) fn may_replace_port(current: &str) -> bool {
+    let t = current.trim();
+    if t.is_empty() {
+        return true;
+    }
+    ALL_ENGINES.iter().any(|&e| {
+        let d = default_port_for(e);
         !d.is_empty() && d == t
     })
 }
