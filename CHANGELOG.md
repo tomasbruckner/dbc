@@ -6,6 +6,15 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.38.1] - 2026-10-02
+
+Slow servers (Azure SQL) connect instead of timing out, and the monitor recovers from a failed connect.
+
+### Fixed
+
+- default connect timeout is 60s instead of 15s (an empty Timeout field; queries stay unlimited), and the field's hint says so instead of showing a misleading 30
+- the server monitor tries to connect again on the next refresh after a failed connect, instead of staying on the error until the tab is closed; the error can be copied
+
 ## [0.38.0] - 2026-10-02
 
 New connections no longer start with an empty port.
