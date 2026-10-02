@@ -51,6 +51,7 @@ pub enum MultiQueryEvent {
 /// Where to connect from for a `connect_and_run` dispatch: either a saved
 /// [`ConnectionConfig`] (Task 7's connection manager — may carry a secret
 /// and/or an SSH tunnel), or the back-compat CLI-arg connection string.
+#[derive(Clone)]
 pub enum ConnectSpec {
     Config { cfg: Box<ConnectionConfig>, secret: Option<String> },
     Url(String),
@@ -624,26 +625,32 @@ impl QueryRunner {
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
         let handle = self.handle();
         self.runtime.spawn(async move {
-            let opened = match open_spec(spec, handle).await {
-                Ok(o) => o,
-                Err(e) => {
-                    // Report against the FIRST dispatched command's
-                    // generation (MonitorView sends Refresh{1} immediately
-                    // on open, T4) so the view's generation match doesn't
-                    // silently drop the connect error. If the tab already
-                    // closed, just exit.
-                    if let Some(cmd) = cmd_rx.recv().await {
+            // Connect lazily, on the command that needs it, and again on the
+            // next one if that failed — the view keeps ticking after an
+            // Error and promises „další pokus za Ns"; a single failed open
+            // (an Azure gateway timeout, a database waking up) must not
+            // leave the tab dead until it is closed.
+            let (opened, first) = loop {
+                let Some(cmd) = cmd_rx.recv().await else {
+                    return; // tab closed before we ever connected
+                };
+                match open_spec(spec.clone(), handle.clone()).await {
+                    Ok(o) => break (o, cmd),
+                    Err(e) => {
+                        // Report against THIS command's generation so the
+                        // view's generation match doesn't drop it.
                         let generation = match cmd {
                             MonitorCmd::Refresh { generation } | MonitorCmd::Kill { generation, .. } => generation,
                         };
-                        let _ = event_tx.send(MonitorEvent::Error { generation, message: e.message }).await;
+                        if event_tx.send(MonitorEvent::Error { generation, message: e.message }).await.is_err() {
+                            return;
+                        }
                     }
-                    return;
                 }
             };
             // Keep the tunnel (if any) alive for the whole loop lifetime.
             let _tunnel = opened._tunnel;
-            monitor_loop(opened.conn, engine, read_only, cmd_rx, event_tx).await;
+            monitor_loop(opened.conn, engine, read_only, Some(first), cmd_rx, event_tx).await;
             // conn + _tunnel drop here — DB session closed (design §4's
             // "no explicit Close command needed").
         });
@@ -3392,10 +3399,11 @@ async fn monitor_loop(
     mut conn: Box<dyn Connection>,
     engine: dbc_state::Engine,
     read_only: bool,
+    first: Option<MonitorCmd>,
     mut cmd_rx: tokio::sync::mpsc::Receiver<MonitorCmd>,
     event_tx: tokio::sync::mpsc::Sender<MonitorEvent>,
 ) {
-    let mut pending: Option<MonitorCmd> = None;
+    let mut pending: Option<MonitorCmd> = first;
     loop {
         let cmd = match pending.take() {
             Some(c) => c,
@@ -5354,6 +5362,7 @@ mod monitor_tests {
             Box::new(conn),
             dbc_state::Engine::Postgres,
             /* read_only */ true,
+            None,
             cmd_rx,
             event_tx,
         ));
@@ -5395,6 +5404,7 @@ mod monitor_tests {
             Box::new(conn),
             dbc_state::Engine::Postgres,
             /* read_only */ false,
+            None,
             cmd_rx,
             event_tx,
         ));
@@ -5436,6 +5446,7 @@ mod monitor_tests {
             dbc_state::Engine::Mssql,
             /* read_only */ false, // a writable connection — proves the
             // refusal is about the pid, not read-only.
+            None,
             cmd_rx,
             event_tx,
         ));
@@ -5468,6 +5479,29 @@ mod monitor_tests {
         tokio::time::timeout(Duration::from_secs(5), loop_task).await.unwrap().unwrap();
     }
 
+    /// A failed open must not kill the monitor: the view keeps ticking and
+    /// says „další pokus za Ns", so every later Refresh tries to connect
+    /// again and answers. Before the fix the task answered the first one
+    /// and exited, and the tab stayed on that error until it was closed.
+    #[test]
+    fn open_monitor_retries_the_connect_on_every_refresh() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let unreachable = dir.path().join("no").join("such").join("dir").join("x.db");
+        let runner = QueryRunner::new();
+        let (cmd_tx, mut event_rx) = runner.open_monitor(
+            ConnectSpec::Url(unreachable.to_str().expect("utf8 path").into()),
+            false,
+            dbc_state::Engine::Postgres,
+        );
+        for generation in 1..=2 {
+            cmd_tx.blocking_send(MonitorCmd::Refresh { generation }).expect("task still alive");
+            match event_rx.blocking_recv() {
+                Some(MonitorEvent::Error { generation: g, .. }) => assert_eq!(g, generation),
+                other => panic!("refresh {generation}: expected Error, got {other:?}"),
+            }
+        }
+    }
+
     /// End-to-end all-failed path without docker: a real sqlite connection
     /// can't run any pg catalog query, so every drain fails and the loop
     /// must send Error (with the dispatched generation), not Data and not
@@ -5485,6 +5519,7 @@ mod monitor_tests {
             conn,
             dbc_state::Engine::Postgres,
             false,
+            None,
             cmd_rx,
             event_tx,
         ));
@@ -5522,6 +5557,7 @@ mod monitor_tests {
             Box::new(conn),
             dbc_state::Engine::Mssql,
             /* read_only */ false,
+            None,
             cmd_rx,
             event_tx,
         ));
@@ -5552,6 +5588,7 @@ mod monitor_tests {
             Box::new(conn),
             dbc_state::Engine::Mssql,
             /* read_only */ true,
+            None,
             cmd_rx,
             event_tx,
         ));
@@ -5879,6 +5916,7 @@ mod monitor_pg_tests {
                 mon,
                 dbc_state::Engine::Postgres,
                 /* read_only */ false,
+                None,
                 cmd_rx,
                 event_tx,
             ));
@@ -5995,6 +6033,7 @@ mod monitor_pg_tests {
                 mon,
                 dbc_state::Engine::Postgres,
                 /* read_only */ false,
+                None,
                 cmd_rx,
                 event_tx,
             ));
@@ -8236,7 +8275,7 @@ mod mssql_docker_tests {
             // the server.
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
             let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
-            let loop_task = tokio::spawn(monitor_loop(monitor_conn.conn, engine, false, cmd_rx, event_tx));
+            let loop_task = tokio::spawn(monitor_loop(monitor_conn.conn, engine, false, None, cmd_rx, event_tx));
             cmd_tx.send(MonitorCmd::Kill { generation: 1, pid: blocker_spid }).await.unwrap();
             let ev = tokio::time::timeout(Duration::from_secs(15), event_rx.recv())
                 .await

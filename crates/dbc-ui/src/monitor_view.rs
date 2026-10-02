@@ -716,10 +716,18 @@ impl Render for MonitorView {
             root = root.child(
                 div()
                     .p_2()
-                    .text_color(theme.warn)
-                    .child(format!(
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap_2()
+                    .child(div().flex_1().text_color(theme.warn).child(format!(
                         "aktualizace selhala ({err}) · další pokus za {}s",
                         self.interval_secs
+                    )))
+                    .child(ui::button("mon-error-copy", "Kopírovat chybu", theme).on_click(
+                        cx.listener(move |_, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(err.clone()));
+                        }),
                     )),
             );
         }
