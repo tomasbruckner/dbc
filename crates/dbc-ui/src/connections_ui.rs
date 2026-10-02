@@ -2786,7 +2786,7 @@ impl AppView {
         let user = cx.new(|cx| TextField::form_field(cx, "", false));
         let password = cx.new(|cx| TextField::form_field(cx, "", true));
         let folder = cx.new(|cx| TextField::form_field(cx, "a/b", false));
-        let timeout_secs = cx.new(|cx| TextField::form_field(cx, "30", false));
+        let timeout_secs = cx.new(|cx| TextField::form_field(cx, "prázdné = připojení 60 s, dotazy bez limitu", false));
         let auto_limit = cx.new(|cx| TextField::form_field(cx, "1000", false));
         let ssh_host = cx.new(|cx| TextField::form_field(cx, "", false));
         let ssh_port = cx.new(|cx| TextField::form_field(cx, "22", false));

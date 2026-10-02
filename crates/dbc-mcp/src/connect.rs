@@ -30,7 +30,7 @@ use dbc_driver_postgres::{PgSsl, PostgresConnection};
 use dbc_driver_sqlite::SqliteConnection;
 use dbc_state::{ConnectionConfig, Engine, PgSslMode};
 
-const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_PG_PORT: u16 = 5432;
 
 /// Twin of `dbc-ui`'s `connect::is_in_memory_duckdb_path` — deliberately

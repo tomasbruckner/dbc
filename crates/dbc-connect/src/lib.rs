@@ -36,8 +36,9 @@ use dbc_state::{ConnectionConfig, Engine, PgSslMode, Vault};
 /// the query-side watchdog in `runner::connect_and_run`). Keeps the TCP
 /// handshake from hanging for the OS's own default timeout (tens of seconds
 /// to minutes on a black-holed/firewalled host) — see task-8-review.md
-/// issue #1.
-const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
+/// issue #1. 60s rather than 15s: an Azure SQL database waking from
+/// serverless pause, or a slow Azure gateway, needs longer than 15s.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 60;
 
 /// Dispatch a connection string to the right driver.
 ///
@@ -482,7 +483,7 @@ pub fn mssql_config_from_config(
     )
     .encrypt(opts.encrypt)
     .trust_server_certificate(opts.trust_server_certificate)
-    // Same 15s fallback bound the pg arm uses, rendered as ODBC
+    // Same 60s fallback bound the pg arm uses, rendered as ODBC
     // `Connection Timeout` so an unreachable host fails inside the same
     // envelope instead of hanging for the OS TCP timeout.
     .connect_timeout_sec(
