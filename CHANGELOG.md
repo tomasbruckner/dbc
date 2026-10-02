@@ -6,6 +6,18 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-10-02
+
+New connections no longer start with an empty port.
+
+### Added
+
+- the connection dialog prefills the engine's default port (5432 Postgres, 1433 SQL Server) and switches it with the engine, unless you typed your own
+
+### Changed
+
+- SQL Server: a port written into Host (`srv,1113`) now overrides 1433 in the Port field instead of being refused as a contradiction
+
 ## [0.37.0] - 2026-09-30
 
 The app can remember the vault key, so it opens without the master password.
