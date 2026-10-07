@@ -165,7 +165,10 @@ jobs:
       # WINGET_TOKEN secret. Until then the step is skipped.
       - name: Publish to winget
         if: env.WINGET == 'true'
-        uses: vedantmgoyal9/winget-releaser@v2
+        # Pinned to a commit, not `@v2`: upstream moved the v2 tag on
+        # 2026-10-07 to a commit whose action.yml does not load, and a broken
+        # action fails the whole job at setup even when this step is skipped.
+        uses: vedantmgoyal9/winget-releaser@a8fff44b123f115ce4c21543edf8b677376fc7e0 # v2 as of 2026-09-20
         with:
           identifier: TomasBruckner.dbc
           release-tag: ${{ env.TAG }}
