@@ -12,6 +12,13 @@
 // `fn`-spelling probes), so this costs nothing now and makes adding any
 // later a deliberate, visible act.
 #![forbid(unsafe_code)]
+// A GUI app, not a console one. Without this the exe is linked for the
+// console subsystem and Windows gives it a console window of its own
+// whenever it is started from outside a terminal — Start menu shortcut,
+// winget, Velopack's restart after an update — so a user saw a stray
+// terminal next to the app. Release only: a debug build run from a
+// terminal keeps its stderr, which is where `cargo run` output goes.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 // Two clippy lints this crate answers with a decision rather than a fix,
 // stated once here instead of thirteen times inline.
 //
