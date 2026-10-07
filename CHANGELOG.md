@@ -6,6 +6,14 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.38.2] - 2026-10-07
+
+The app no longer opens a terminal window alongside itself.
+
+### Fixed
+
+- starting the app from the Start menu, after a winget install or after an update no longer opens an extra console window next to it
+
 ## [0.38.1] - 2026-10-02
 
 Slow servers (Azure SQL) connect instead of timing out, and the monitor recovers from a failed connect.
