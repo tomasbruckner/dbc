@@ -6,6 +6,15 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-10-12
+
+`dbc` works in a terminal after installing.
+
+### Added
+
+- `dbc` works in a terminal after installing (also via winget): the install folder goes on the user's PATH after install and after every update, and comes off it on uninstall; existing installs get it with their next update
+- `dbc ui` starts the app
+
 ## [0.38.2] - 2026-10-07
 
 The app no longer opens a terminal window alongside itself.
