@@ -80,6 +80,8 @@ pub enum Command {
     Help,
     /// Version was asked for.
     Version,
+    /// Start the app (`dbc-ui.exe` beside this exe) and return at once.
+    Ui,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +127,7 @@ PŘÍKAZY
     login                    uloží odvozený klíč trezoru pro neinteraktivní běh
     logout                   uložený klíč smaže
     history clear            smaže historii dotazů (i z aplikace)
+    ui                       spustí aplikaci
     export <soubor>          vyveze připojení i trezor do jednoho souboru
     import <soubor>          nahradí nastavení tímhle souborem
 
@@ -244,6 +247,14 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
     match first.as_str() {
         "-h" | "--help" | "help" => return Ok(simple(Command::Help)),
         "-V" | "--version" | "version" => return Ok(simple(Command::Version)),
+        // Takes nothing: every flag below describes a database run, and the
+        // app picks its own connection.
+        "ui" => {
+            return match it.next() {
+                None => Ok(simple(Command::Ui)),
+                Some(other) => Err(err(format!("ui nebere žádné argumenty, ne {other}"))),
+            }
+        }
         _ => {}
     }
 
@@ -439,6 +450,13 @@ mod tests {
         for flag in ["-V", "--version", "version"] {
             assert_eq!(p(&[flag]).unwrap().command, Command::Version);
         }
+    }
+
+    #[test]
+    fn ui_is_a_command_and_takes_nothing() {
+        assert_eq!(p(&["ui"]).unwrap().command, Command::Ui);
+        let e = p(&["ui", "--write"]).unwrap_err();
+        assert!(e.message.contains("--write"), "{}", e.message);
     }
 
     /// `--help` must work AFTER a command too — that is where a hand

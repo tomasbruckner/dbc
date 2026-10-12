@@ -39,8 +39,19 @@ pub const REPO_URL: &str = "https://github.com/tomasbruckner/dbc";
 pub const SOURCE_ENV: &str = "DBC_UPDATE_SOURCE";
 
 /// Velopack's own startup work. Call it before anything else in `main`.
+///
+/// The hooks put the install folder on the user's PATH (see `user_path`).
+/// The update hook runs it too, so installs older than that module get the
+/// entry on their first update rather than never.
 pub fn startup() {
-    VelopackApp::build().run();
+    let app = VelopackApp::build();
+    #[cfg(windows)]
+    let app = app
+        .on_after_install_fast_callback(|_| crate::user_path::add_install_dir())
+        .on_after_update_fast_callback(|_| crate::user_path::add_install_dir())
+        .on_before_uninstall_fast_callback(|_| crate::user_path::remove_install_dir());
+    let mut app = app;
+    app.run();
 }
 
 /// What [`check_and_download`] found.

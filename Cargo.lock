@@ -2453,6 +2453,7 @@ dependencies = [
  "tree-sitter-sequel",
  "unicode-segmentation",
  "velopack",
+ "winreg",
  "winresource",
  "zeroize",
 ]

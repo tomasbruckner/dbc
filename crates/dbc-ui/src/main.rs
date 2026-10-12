@@ -80,6 +80,7 @@ mod keymap;
 mod sql_input;
 mod tabs;
 mod updater;
+mod user_path;
 mod vault_key;
 mod text_model;
 mod text_view;

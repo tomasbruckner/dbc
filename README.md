@@ -21,6 +21,9 @@ v [CONTRIBUTING.md](CONTRIBUTING.md).
    Vedle aplikace (`dbc-ui.exe`) je `dbc.exe` (příkazová řádka) a
    `dbc-mcp.exe` (MCP server pro AI nástroje); po instalaci leží v
    `%LocalAppData%\dbc\current\`, u portable verze ve složce `current\`.
+   Instalace (i přes winget) tu složku přidá do uživatelské PATH, takže
+   v novém terminálu funguje `dbc …` a `dbc ui` spustí aplikaci. Starší
+   instalace to dostanou s první aktualizací; portable verze PATH nemění.
    AI přes MCP uvidí jen připojení, u kterých zapneš **Dostupné pro AI
    (MCP)**.
 2. Windows SmartScreen se při prvním spuštění ozve, protože soubory

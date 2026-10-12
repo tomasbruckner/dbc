@@ -117,6 +117,28 @@ fn resolve_paths(a: &Args) -> Result<dbc_state::workspace::Paths, String> {
     Ok(paths)
 }
 
+/// `dbc ui`: start the app that ships beside this exe and return at once.
+///
+/// Beside THIS exe, not whatever `dbc-ui` PATH finds: the install puts the
+/// three binaries in one folder, and `dbc ui` from one version must not
+/// open another. The app is not waited for — the terminal is free again
+/// the moment the window is on its way.
+fn launch_ui() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("nevím, kde leží dbc: {e}"))?;
+    let name = if cfg!(windows) { "dbc-ui.exe" } else { "dbc-ui" };
+    let ui = exe.with_file_name(name);
+    if !ui.is_file() {
+        return Err(format!("aplikace tu není: {}", ui.display()));
+    }
+    std::process::Command::new(&ui)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{} nejde spustit: {e}", ui.display()))
+}
+
 /// A missing `config.toml` reads as „no connections saved yet" — that is
 /// what `AppConfig::load` already does, and a first run has nothing to
 /// report. Anything else is refused rather than rescued: falling back to
@@ -146,6 +168,7 @@ fn run(a: Args) -> Result<(), String> {
             println!("dbc {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        Command::Ui => return launch_ui(),
         _ => {}
     }
 
@@ -154,7 +177,7 @@ fn run(a: Args) -> Result<(), String> {
         (paths.config.clone(), paths.vault.clone(), paths.history.clone());
 
     match &a.command {
-        Command::Help | Command::Version => unreachable!("handled above"),
+        Command::Help | Command::Version | Command::Ui => unreachable!("handled above"),
         Command::Login => return login(&vault_path),
         Command::Logout => {
             vault_key::forget_key()?;

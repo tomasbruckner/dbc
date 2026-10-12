@@ -49,6 +49,11 @@ velopack = "1.2.0"
 # same crate and version as dbc-cli / dbc-mcp (vault_key.rs).
 keyring = "4"
 
+# The install folder on the user's PATH from the Velopack hooks (user_path.rs):
+# HKCU\Environment read and written raw, so REG_EXPAND_SZ stays what it is.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
 # Windows version resource + icon for the shipped exe (see build.rs). The
 # version comes from this package, so `chore: vX.Y.Z` is the one bump.
 [build-dependencies]
