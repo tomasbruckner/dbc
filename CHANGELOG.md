@@ -6,6 +6,10 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.39.1] - 2026-10-13
+
+A new version shows in the top bar while it downloads.
+
 ### Changed
 
 - a new version shows in the top bar as soon as it is found, with the download percentage, instead of only once it is fully downloaded
