@@ -6,6 +6,10 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+### Changed
+
+- a new version shows in the top bar as soon as it is found, with the download percentage, instead of only once it is fully downloaded
+
 ## [0.39.0] - 2026-10-12
 
 `dbc` works in a terminal after installing.

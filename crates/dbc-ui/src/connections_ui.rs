@@ -2256,10 +2256,13 @@ impl AppView {
         let history_on =
             matches!(self.editor().results.active().map(|t| &t.content), Some(crate::tabs::TabContent::History));
         let maximized = window.is_maximized();
-        // Lit only while a newer version sits downloaded on disk. Never a
+        // Lit only while a newer version sits downloaded on disk. Before
+        // that, while it downloads, a plain label with the percentage —
+        // the version is known, it just cannot be applied yet. Never a
         // „checking…" state: the bar must look the same on a laptop
         // without internet as on one with it.
-        let update_label = self.update.as_ref().map(|u| format!("Aktualizovat na v{}", u.version));
+        let (update_progress, update_label) =
+            update_bar(self.update.as_ref().map(|u| u.version.as_str()), self.update_downloading.as_ref());
 
         div()
             .id("top-bar")
@@ -2343,6 +2346,7 @@ impl AppView {
                 ),
             )
             .child(ui::toolbar_separator(theme))
+            .children(update_progress.map(|label| div().px_2().text_color(theme.text_muted).child(label)))
             .children(update_label.map(|label| {
                 ui::toolbar_button("top-bar-update", label, true, true, theme)
                     .on_click(cx.listener(|view, _, _, cx| view.apply_update_and_restart(cx)))
@@ -8320,5 +8324,38 @@ mod analyze_write_confirm_tests {
         // is what makes a second dispatch impossible now.
         let modal = analyze_confirm("UPDATE t SET x = 1", true);
         assert_eq!(analyze_write_dispatch_sql(&modal), None);
+    }
+}
+
+/// The top bar's update slot: `(label, button)` — at most one is `Some`.
+/// A downloaded update is a button; one still downloading is a plain
+/// label with the percentage; otherwise nothing.
+fn update_bar(ready: Option<&str>, downloading: Option<&(String, i16)>) -> (Option<String>, Option<String>) {
+    match (ready, downloading) {
+        (Some(version), _) => (None, Some(format!("Aktualizovat na v{version}"))),
+        (None, Some((version, percent))) => (Some(format!("v{version} · stahuje se {percent} %")), None),
+        (None, None) => (None, None),
+    }
+}
+
+#[cfg(test)]
+mod update_bar_tests {
+    use super::update_bar;
+
+    #[test]
+    fn nothing_known_shows_nothing() {
+        assert_eq!(update_bar(None, None), (None, None));
+    }
+
+    #[test]
+    fn downloading_is_a_label_with_the_percentage() {
+        let d = ("0.40.0".to_string(), 35);
+        assert_eq!(update_bar(None, Some(&d)), (Some("v0.40.0 · stahuje se 35 %".into()), None));
+    }
+
+    #[test]
+    fn downloaded_is_the_button_even_if_a_progress_is_left() {
+        let d = ("0.40.0".to_string(), 100);
+        assert_eq!(update_bar(Some("0.40.0"), Some(&d)), (None, Some("Aktualizovat na v0.40.0".into())));
     }
 }

@@ -2585,6 +2585,10 @@ struct AppView {
     /// lights the „Aktualizovat" button in the top bar; the quit path
     /// applies it either way so the next launch is the new version.
     update: Option<updater::ReadyUpdate>,
+    /// A newer version being downloaded right now: its number and the
+    /// last percentage Velopack reported. Shown in the top bar until
+    /// `update` takes over (or the download fails and both stay empty).
+    update_downloading: Option<(String, i16)>,
     /// Editor tabs (2026-09-02 design §1). Everything that used to assume
     /// one editor lives in the active tab's `EditorTab`; reach it through
     /// `editor()`/`editor_mut()`, or by id from an async completion.
@@ -8313,19 +8317,73 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// Best-effort, and deliberately silent. A session that cannot be
     /// written costs a window that opens blank next time; saying so during
     /// shutdown would be a message nobody is there to read.
-    /// The update check came back. Only a downloaded update changes
-    /// anything on screen; the rest goes to the log or nowhere.
-    fn finish_update_check(&mut self, outcome: updater::Outcome, cx: &mut Context<Self>) {
+    /// The update check, start to finish, on its own task: ask the feed,
+    /// and if there is something newer, say so in the top bar at once and
+    /// download it with the percentage showing (2026-10-13 — before, the
+    /// bar stayed blank for the whole 50 MB, and a user who looked during
+    /// that minute concluded there was no update). Nothing is shown while
+    /// merely asking, and a failure only goes to the log: the bar must
+    /// look the same on a laptop without internet as on one with it.
+    fn spawn_update_check(cx: &mut Context<Self>) {
         use dbc_state::applog::{log, Event};
-        match outcome {
-            updater::Outcome::Ready(update) => {
-                log(Event::UpdateReady { version: update.version.clone() });
-                self.update = Some(update);
+        use std::sync::mpsc::TryRecvError;
+        cx.spawn(async move |this, cx| {
+            let found = match cx.background_spawn(async { updater::check() }).await {
+                updater::Check::Found(found) => found,
+                updater::Check::Failed(error) => return log(Event::UpdateFailed { error }),
+                updater::Check::NotInstalled | updater::Check::UpToDate => return,
+            };
+            let version = found.version.clone();
+            let shown = this.update(cx, |view, cx| {
+                view.update_downloading = Some((version, 0));
                 cx.notify();
+            });
+            if shown.is_err() {
+                return;
             }
-            updater::Outcome::Failed(error) => log(Event::UpdateFailed { error }),
-            updater::Outcome::NotInstalled | updater::Outcome::UpToDate => {}
-        }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let download = cx.background_spawn(async move { found.download(tx) });
+            // The sender lives inside the download call, so the channel
+            // closing IS the download returning.
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+                let mut latest = None;
+                let done = loop {
+                    match rx.try_recv() {
+                        Ok(p) => latest = Some(p),
+                        Err(TryRecvError::Empty) => break false,
+                        Err(TryRecvError::Disconnected) => break true,
+                    }
+                };
+                if let Some(p) = latest {
+                    let alive = this.update(cx, |view, cx| {
+                        if let Some((_, percent)) = &mut view.update_downloading {
+                            *percent = p;
+                            cx.notify();
+                        }
+                    });
+                    if alive.is_err() {
+                        return;
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+            let result = download.await;
+            let _ = this.update(cx, |view, cx| {
+                view.update_downloading = None;
+                match result {
+                    Ok(update) => {
+                        log(Event::UpdateReady { version: update.version.clone() });
+                        view.update = Some(update);
+                    }
+                    Err(error) => log(Event::UpdateFailed { error }),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The „Aktualizovat" button: save, hand over to the updater, quit.
@@ -16596,17 +16654,14 @@ fn main() {
                         // downloaded something. Switched off in Settings,
                         // it makes no request at all (privacy policy).
                         if !config.disable_update_check {
-                            cx.spawn(async move |this, cx| {
-                                let outcome = cx.background_spawn(async { updater::check_and_download() }).await;
-                                let _ = this.update(cx, |view, cx| view.finish_update_check(outcome, cx));
-                            })
-                            .detach();
+                            AppView::spawn_update_check(cx);
                         }
                         // Read before `config` is moved into the struct below.
                         let sidebar_width = sidebar_width_from(config.sidebar_width);
                         editors.active_mut().payload.status = status.clone();
                         AppView {
                             update: None,
+                            update_downloading: None,
                             editors,
                             history_scrollbar: scrollbar::ScrollbarHandle::new(),
                             ac_scrollbar: scrollbar::ScrollbarHandle::new(),

@@ -9,15 +9,18 @@
 //!    downloaded last time but never applied, to apply it now. It may exit
 //!    the process; that is by design. In a dev run or from a plain copy of
 //!    the exe it is a no-op.
-//! 2. [`check_and_download`] — one blocking call for a background thread:
-//!    ask the feed, download what is newer, report. It never shows
+//! 2. [`check`] then [`FoundUpdate::download`] — two blocking calls for a
+//!    background thread: ask the feed, then download what is newer while
+//!    reporting progress. Two calls, not one, so the UI can say „a new
+//!    version is coming" the moment it is known instead of only after a
+//!    50 MB download it gave no sign of (2026-10-13). Neither shows
 //!    anything; the caller decides what to do with the outcome.
 //! 3. [`ReadyUpdate`] — a downloaded update the UI can apply: on click,
 //!    restart into the new version; on quit, apply quietly so the next
 //!    launch is the new one.
 //!
 //! **Not installed is not an error.** `cargo run`, a test, an exe copied
-//! out of the install folder: all of those make [`Outcome::NotInstalled`],
+//! out of the install folder: all of those make [`Check::NotInstalled`],
 //! and the UI shows nothing. The check is also entirely silent on network
 //! failure — a laptop without internet must not start with a warning.
 //!
@@ -27,7 +30,7 @@
 //! Releases of [`REPO_URL`].
 
 use velopack::sources::{FileSource, GithubSource, UpdateSource};
-use velopack::{UpdateCheck, UpdateManager, VelopackApp, VelopackAsset};
+use velopack::{UpdateCheck, UpdateInfo, UpdateManager, VelopackApp, VelopackAsset};
 
 /// Where the shipped app looks for new versions. Public repo, no token:
 /// GitHub allows 60 anonymous API calls an hour per address, and the app
@@ -54,16 +57,36 @@ pub fn startup() {
     app.run();
 }
 
-/// What [`check_and_download`] found.
-pub enum Outcome {
+/// What [`check`] found.
+pub enum Check {
     /// Not a Velopack install (dev run, copied exe). Show nothing.
     NotInstalled,
     /// The feed had nothing newer.
     UpToDate,
-    /// A newer version is downloaded and waiting in the packages folder.
-    Ready(ReadyUpdate),
-    /// The feed or the download failed. Worth a log line, not a dialog.
+    /// The feed has a newer version; nothing is downloaded yet.
+    Found(FoundUpdate),
+    /// The feed could not be read. Worth a log line, not a dialog.
     Failed(String),
+}
+
+/// A newer version the feed announced, not downloaded yet.
+pub struct FoundUpdate {
+    /// The version on offer, e.g. `0.39.0`.
+    pub version: String,
+    manager: UpdateManager,
+    info: Box<UpdateInfo>,
+}
+
+impl FoundUpdate {
+    /// Blocking: download into the packages folder. `progress` gets 0–100
+    /// as it goes — not always rising: a delta that fails to apply falls
+    /// back to the full package, which starts from 0 again. The sender is
+    /// dropped when this returns, so a receiver sees the channel close.
+    pub fn download(self, progress: std::sync::mpsc::Sender<i16>) -> Result<ReadyUpdate, String> {
+        self.manager.download_updates(&self.info, Some(progress)).map_err(|e| e.to_string())?;
+        let asset = self.info.TargetFullRelease.clone();
+        Ok(ReadyUpdate { version: asset.Version.clone(), manager: self.manager, asset })
+    }
 }
 
 /// A downloaded update the UI may apply.
@@ -100,24 +123,22 @@ fn source() -> Box<dyn UpdateSource> {
     }
 }
 
-/// Blocking: builds the manager, asks the feed, downloads. Run it on a
-/// background thread; it can take as long as a 45 MB download.
-pub fn check_and_download() -> Outcome {
+/// Blocking: builds the manager and asks the feed. Run it on a background
+/// thread — it is one HTTP request, but on a bad network a slow one.
+pub fn check() -> Check {
     let manager = match UpdateManager::new_boxed(source(), None, None) {
         Ok(m) => m,
-        Err(velopack::Error::NotInstalled(_)) => return Outcome::NotInstalled,
-        Err(e) => return Outcome::Failed(e.to_string()),
+        Err(velopack::Error::NotInstalled(_)) => return Check::NotInstalled,
+        Err(e) => return Check::Failed(e.to_string()),
     };
-    let info = match manager.check_for_updates() {
-        Ok(UpdateCheck::UpdateAvailable(info)) => info,
-        Ok(UpdateCheck::NoUpdateAvailable) | Ok(UpdateCheck::RemoteIsEmpty) => return Outcome::UpToDate,
-        Err(e) => return Outcome::Failed(e.to_string()),
-    };
-    if let Err(e) = manager.download_updates(&info, None) {
-        return Outcome::Failed(e.to_string());
+    match manager.check_for_updates() {
+        Ok(UpdateCheck::UpdateAvailable(info)) => {
+            let version = info.TargetFullRelease.Version.clone();
+            Check::Found(FoundUpdate { version, manager, info })
+        }
+        Ok(UpdateCheck::NoUpdateAvailable) | Ok(UpdateCheck::RemoteIsEmpty) => Check::UpToDate,
+        Err(e) => Check::Failed(e.to_string()),
     }
-    let asset = info.TargetFullRelease.clone();
-    Outcome::Ready(ReadyUpdate { version: asset.Version.clone(), manager, asset })
 }
 
 #[cfg(test)]
@@ -128,6 +149,6 @@ mod tests {
     /// fail loudly. Nothing here is a Velopack install.
     #[test]
     fn a_dev_run_is_not_installed() {
-        assert!(matches!(check_and_download(), Outcome::NotInstalled));
+        assert!(matches!(check(), Check::NotInstalled));
     }
 }
