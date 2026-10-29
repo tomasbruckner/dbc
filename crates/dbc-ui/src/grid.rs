@@ -33,6 +33,77 @@ const H_BAR_HEIGHT: f32 = 10.0;
 /// two-pixel thumb is not a control, it is a decoration you cannot grab.
 const H_THUMB_MIN: f32 = 32.0;
 
+/// Double-click on a column's resize handle fits the column to its content
+/// (user report, 2026-10-27: „dvojklik na roztažení sloupce nezvětší
+/// sloupec podle obsahu nejdelší buňky"). Bounded on both axes: at most
+/// this many display rows are read, starting from the top of the current
+/// view — a 5M-row result must not freeze the UI thread for a gesture that
+/// is meant to be instant …
+const AUTOFIT_SAMPLE_ROWS: usize = 2_000;
+/// … and only the longest few (by char count) are actually shaped. Char
+/// count is a proxy for width, not the width itself, so it is a handful
+/// rather than one: `WWWW` is wider than `iiiiii`.
+const AUTOFIT_SHAPED: usize = 24;
+/// A single 40 kB JSON cell must not produce a column wider than the
+/// screen; the cell-detail popup (double-click on the cell) is for that.
+const AUTOFIT_MAX_W: f32 = 800.0;
+/// Same floor as a resize drag.
+const COL_MIN_W: f32 = 40.0;
+/// `px_2` on both sides of a cell's text, plus a hair so the last glyph
+/// is not clipped by sub-pixel rounding.
+const CELL_PAD_W: f32 = 8.0 * 2.0 + 4.0;
+/// A header also has room for the sort arrow and, on FK columns, the ☰.
+const HEADER_EXTRA_W: f32 = 32.0;
+
+/// What a cell DRAWS for a value. The grid has one line per row, so a line
+/// break in the value used to cut the rest of it off silently — the second
+/// line was laid out below the row and clipped, with nothing to say it was
+/// there (user report, 2026-10-27: „nejde poznat, že zobrazený text není
+/// celý"). Breaks become a visible `↵`, other control chars a space; the
+/// value itself (copy, cell detail, editing) is untouched.
+///
+/// Takes and returns `String` so the common case — no control char at all
+/// — allocates nothing on the per-visible-cell render path.
+pub(crate) fn cell_display_text(s: String) -> String {
+    if !s.chars().any(char::is_control) {
+        return s;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('↵');
+            }
+            '\n' => out.push('↵'),
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The `k` longest texts by char count, longest first — the only ones the
+/// autofit shapes (see `AUTOFIT_SHAPED`).
+pub(crate) fn autofit_candidates(mut texts: Vec<String>, k: usize) -> Vec<String> {
+    texts.sort_by_key(|t| std::cmp::Reverse(t.chars().count()));
+    texts.truncate(k);
+    texts
+}
+
+/// Measured text widths → the column width: the widest of the cells and
+/// the header (each with its own padding), clamped.
+pub(crate) fn autofit_width(widest_cell: f32, header: f32) -> f32 {
+    let w = (widest_cell + CELL_PAD_W).max(header + CELL_PAD_W + HEADER_EXTRA_W);
+    if w.is_nan() {
+        return DEFAULT_COL_WIDTH;
+    }
+    w.clamp(COL_MIN_W, AUTOFIT_MAX_W)
+}
+
 /// Where the horizontal scrollbar's thumb goes: `(x, width)` within a track
 /// as wide as the viewport, or `None` when everything already fits.
 ///
@@ -720,6 +791,57 @@ impl ResultGrid {
             w += self.col_widths.get(ncols + vi).copied().unwrap_or(DEFAULT_COL_WIDTH);
         }
         w
+    }
+
+    /// Fits SOURCE column `col` to its widest value (double-click on the
+    /// resize handle). Sampled and bounded — see `AUTOFIT_SAMPLE_ROWS`.
+    /// Measures what the cell DRAWS (`cell_display_text`), with the same
+    /// text style the grid renders in (it sets none of its own).
+    fn autofit_column(&mut self, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(buf) = self.buffer.clone() else { return };
+        let header = {
+            let b = buf.borrow();
+            if col >= b.column_count() {
+                return;
+            }
+            b.schema().fields().get(col).map(|f| f.name().clone()).unwrap_or_default()
+        };
+        let rows = self.view.len().min(AUTOFIT_SAMPLE_ROWS);
+        let texts: Vec<String> = {
+            let mut b = buf.borrow_mut();
+            (0..rows).map(|r| cell_display_text(b.cell_text(self.view.source_row(r), col))).collect()
+        };
+
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let mut measure = |text: String| -> f32 {
+            if text.is_empty() {
+                return 0.0;
+            }
+            let run = gpui::TextRun {
+                len: text.len(),
+                font: style.font(),
+                color: style.color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(window.text_system().shape_line(text.into(), font_size, &[run], None).width)
+        };
+        let widest_cell = autofit_candidates(texts, AUTOFIT_SHAPED)
+            .into_iter()
+            .map(&mut measure)
+            .fold(0.0, f32::max);
+        let header_w = measure(cell_display_text(header));
+
+        if let Some(w) = self.col_widths.get_mut(col) {
+            *w = autofit_width(widest_cell, header_w);
+        }
+        // Same PREVIEW-only persistence as the end of a resize drag.
+        if self.is_preview {
+            cx.emit(GridEvent::ViewChanged);
+        }
+        cx.notify();
     }
 
     /// Sum of the visible SOURCE column widths strictly before `col` — used
@@ -2431,7 +2553,7 @@ impl ResultGrid {
                         .id(("header-label", i))
                         .px_2()
                         .h(px(ROW_HEIGHT))
-                        .overflow_hidden()
+                        .truncate()
                         .cursor_pointer()
                         .child(label)
                         .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -2454,7 +2576,16 @@ impl ResultGrid {
                         .cursor_col_resize()
                         .on_mouse_down(
                             gpui::MouseButton::Left,
-                            cx.listener(move |this, e: &gpui::MouseDownEvent, _w, cx| {
+                            cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                                // The first click of the pair already
+                                // started (and its mouse-up ended) a
+                                // zero-length drag; the second one fits
+                                // instead of starting another.
+                                if e.click_count >= 2 {
+                                    this.resizing = None;
+                                    this.autofit_column(i, window, cx);
+                                    return;
+                                }
                                 this.resizing =
                                     Some((i, f32::from(e.position.x), this.col_widths[i]));
                                 cx.notify();
@@ -2510,7 +2641,7 @@ impl ResultGrid {
                             .id(("header-label-v", vi))
                             .px_2()
                             .h(px(ROW_HEIGHT))
-                            .overflow_hidden()
+                            .truncate()
                             .cursor_pointer()
                             .child(label)
                             .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -2976,7 +3107,11 @@ impl Render for ResultGrid {
                                     .w(px(widths.get(col).copied().unwrap_or(DEFAULT_COL_WIDTH)))
                                     .flex_none()
                                     .px_2()
-                                    .overflow_hidden()
+                                    // `…` where the column cuts the value
+                                    // off — `overflow_hidden` alone clipped
+                                    // mid-glyph with no sign anything was
+                                    // missing.
+                                    .truncate()
                                     .text_color(theme.text_primary)
                                     .on_mouse_down(
                                         gpui::MouseButton::Left,
@@ -3079,7 +3214,7 @@ impl Render for ResultGrid {
                                             cx.notify();
                                         }),
                                     )
-                                    .child(text);
+                                    .child(cell_display_text(text));
                                 if is_deleted {
                                     cell = cell.bg(theme.diff_deleted_bg);
                                 } else if is_find_match {
@@ -3186,7 +3321,7 @@ impl Render for ResultGrid {
                     if let Some((col, start_x, start_w)) = this.resizing {
                         let dx: f32 = f32::from(e.position.x) - start_x;
                         if let Some(w) = this.col_widths.get_mut(col) {
-                            *w = (start_w + dx).max(40.0);
+                            *w = (start_w + dx).max(COL_MIN_W);
                         }
                         cx.notify();
                     }
@@ -3467,5 +3602,47 @@ mod first_visible_col_tests {
     #[test]
     fn zero_cols_returns_none() {
         assert_eq!(first_visible_col(0, &[]), None);
+    }
+}
+
+#[cfg(test)]
+mod cell_fit_tests {
+    use super::*;
+
+    #[test]
+    fn plain_text_is_drawn_as_is() {
+        assert_eq!(cell_display_text("abc čšř".into()), "abc čšř");
+        assert_eq!(cell_display_text(String::new()), "");
+    }
+
+    /// The bug: a second line used to be laid out below the 24 px row and
+    /// clipped, so a multi-line value looked complete.
+    #[test]
+    fn every_line_break_style_is_visible_on_one_line() {
+        assert_eq!(cell_display_text("a\nb".into()), "a↵b");
+        assert_eq!(cell_display_text("a\r\nb".into()), "a↵b", "CRLF is ONE break");
+        assert_eq!(cell_display_text("a\rb".into()), "a↵b");
+        assert_eq!(cell_display_text("a\n\nb\n".into()), "a↵↵b↵");
+        assert_eq!(cell_display_text("a\tb\u{0}c".into()), "a b c");
+    }
+
+    #[test]
+    fn candidates_are_the_longest_by_chars_not_bytes() {
+        let texts = vec!["ab".into(), "čččč".into(), "abc".into(), String::new()];
+        assert_eq!(autofit_candidates(texts, 2), vec!["čččč".to_string(), "abc".to_string()]);
+        assert_eq!(autofit_candidates(vec!["x".into()], 5), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn width_covers_the_widest_of_cells_and_header() {
+        assert_eq!(autofit_width(200.0, 10.0), 200.0 + CELL_PAD_W);
+        assert_eq!(autofit_width(10.0, 200.0), 200.0 + CELL_PAD_W + HEADER_EXTRA_W);
+    }
+
+    #[test]
+    fn width_is_clamped_and_never_nan() {
+        assert_eq!(autofit_width(0.0, 0.0), COL_MIN_W.max(CELL_PAD_W + HEADER_EXTRA_W));
+        assert_eq!(autofit_width(1e9, 0.0), AUTOFIT_MAX_W, "one huge JSON cell");
+        assert_eq!(autofit_width(f32::NAN, f32::NAN), DEFAULT_COL_WIDTH);
     }
 }

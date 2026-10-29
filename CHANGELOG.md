@@ -6,6 +6,15 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+### Added
+
+- the editor above a result can be resized: drag the line between the editor and the result; the height is remembered
+- double-clicking a column's resize handle fits the column to its longest value (sampled from the first 2 000 rows, at most 800 px)
+
+### Fixed
+
+- a cell or column header that does not fit ends in `…` instead of being cut off silently, and a line break inside a value shows as `↵` instead of hiding everything after it
+
 ## [0.39.1] - 2026-10-13
 
 A new version shows in the top bar while it downloads.

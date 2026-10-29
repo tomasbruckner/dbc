@@ -223,6 +223,12 @@ pub struct AppConfig {
     /// to write `config.toml` at all stays exact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar_width: Option<u16>,
+    /// Height of the SQL editor above an open result, in logical pixels —
+    /// the splitter between them (user report, 2026-10-27: „nejde zmenšit
+    /// okno s výsledky"). Same posture as `sidebar_width`: global chrome,
+    /// whole pixels, `None` = never dragged, use the built-in eight lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_height: Option<u16>,
     // `history_width` lived here until 2026-09-02, when the history panel
     // became a result tab. An old `config.toml` still carrying the key
     // parses fine — unknown keys are ignored — and the next save drops it.
@@ -585,6 +591,7 @@ mod tests {
             // loaded value against this one, so a field left at its default
             // would round-trip even if `save` dropped it entirely.
             sidebar_width: Some(317),
+            editor_height: Some(333),
             folders: vec![vec!["work".into()]],
             tree_grouping: TreeGrouping::Kind,
             hidden: std::collections::BTreeMap::from([(
@@ -689,6 +696,7 @@ mod tests {
         std::fs::write(&p, "theme = \"dark\"\n").unwrap();
         let loaded = AppConfig::load(&p).unwrap();
         assert_eq!(loaded.sidebar_width, None, "never resized = no stored width");
+        assert_eq!(loaded.editor_height, None, "never dragged = the built-in eight lines");
         assert_eq!(loaded.tree_grouping, TreeGrouping::Schema, "the original tree shape");
     }
 

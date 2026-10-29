@@ -2730,6 +2730,13 @@ struct AppView {
     /// drag STARTED, not against the previous move event, or rounding
     /// accumulates and the panel creeps away from the pointer.
     sidebar_resizing: Option<(f32, f32)>,
+    /// The editor's height above an open result — `AppConfig::editor_height`
+    /// at startup, changed by the editor/result splitter, persisted on drag
+    /// END. Stored unclamped; `clamp_editor_height` fits it to the window.
+    editor_height: f32,
+    /// `(mouse y at mouse-down, editor height at mouse-down)` while the
+    /// editor/result splitter is dragged — same shape as `sidebar_resizing`.
+    editor_resizing: Option<(f32, f32)>,
     /// A context-menu action that needs a `Window` (dialog focus), parked
     /// by the cx-only tree subscription and drained at the top of `render`.
     /// Same shape as the queued cross-context preview open.
@@ -2918,6 +2925,42 @@ pub(crate) fn sidebar_width_from(stored: Option<u16>) -> f32 {
         Some(w) => clamp_sidebar_width(f32::from(w)),
         None => SIDEBAR_DEFAULT_W,
     }
+}
+
+/// The editor/result splitter's height.
+const EDITOR_SPLITTER_H: f32 = 5.0;
+/// The editor's height above an open result until the user drags the
+/// splitter: eight lines (SqlInput's line_height is px(20.), see
+/// sql_input.rs render()) plus the input's vertical padding. Was the
+/// hard-coded height in `render`.
+pub(crate) const EDITOR_DEFAULT_H: f32 = 20. * 8. + 4. * 2.;
+/// Two lines: still a place to click and type into, never a sliver the
+/// splitter can no longer be found above.
+pub(crate) const EDITOR_MIN_H: f32 = 20. * 2. + 4. * 2.;
+/// What the editor always leaves to the rest of the window: top bar,
+/// editor tab strip, result tab strip, grid toolbar and header, a few
+/// rows, status bar and hint strip. Dragging the editor down stops here so
+/// the result — and the splitter under the editor — stays on screen.
+const EDITOR_RESERVED_H: f32 = 260.0;
+
+/// The ONE clamp for the editor height, against the CURRENT window height:
+/// a height dragged on a tall monitor must not push the result off a short
+/// one. Applied on every drag move, on render and before saving.
+pub(crate) fn clamp_editor_height(h: f32, window_h: f32) -> f32 {
+    // `f32::max` already drops a NaN window height (→ the minimum), so
+    // `max` is never NaN; `h` can be — and `f32::clamp` panics on NaN, same
+    // reasoning as `clamp_sidebar_width`.
+    let max = (window_h - EDITOR_RESERVED_H).max(EDITOR_MIN_H);
+    if h.is_nan() {
+        return EDITOR_DEFAULT_H;
+    }
+    h.clamp(EDITOR_MIN_H, max)
+}
+
+/// `AppConfig::editor_height` → the working (unclamped) `f32`. The clamp
+/// needs the window, so it happens at render, not here.
+pub(crate) fn editor_height_from(stored: Option<u16>) -> f32 {
+    stored.map(f32::from).unwrap_or(EDITOR_DEFAULT_H)
 }
 
 /// Design §2.3: the widened connection identity. `\u{1F}` (unit separator)
@@ -7119,6 +7162,27 @@ impl AppView {
         if let Some(guard) = self.guard_corrupt_config(cx) {
             if let Err(e) = self.config.save(&self.config_path, &guard) {
                 self.editor_mut().status = format!("error: šířku panelu se nepodařilo uložit: {e}");
+            }
+        }
+        cx.notify();
+    }
+
+    /// Ends an editor/result splitter drag and persists the result — the
+    /// mirror of `end_sidebar_resize`: drag END only, and the equality
+    /// check keeps a bare click on the splitter from writing anything.
+    /// Saves the height the user actually SAW (clamped to this window).
+    fn end_editor_resize(&mut self, window_h: f32, cx: &mut Context<Self>) {
+        self.editor_resizing = None;
+        self.editor_height = clamp_editor_height(self.editor_height, window_h);
+        let height = self.editor_height as u16;
+        if self.config.editor_height == Some(height) {
+            cx.notify();
+            return;
+        }
+        self.config.editor_height = Some(height);
+        if let Some(guard) = self.guard_corrupt_config(cx) {
+            if let Err(e) = self.config.save(&self.config_path, &guard) {
+                self.editor_mut().status = format!("error: výšku editoru se nepodařilo uložit: {e}");
             }
         }
         cx.notify();
@@ -15859,6 +15923,8 @@ impl Render for AppView {
         // není"). Once a result exists it drops back to eight lines and the
         // result gets the rest.
         let has_results = self.editor().results.iter().next().is_some();
+        let window_h = f32::from(window.viewport_size().height);
+        let editor_h = clamp_editor_height(self.editor_height, window_h);
         column = column
             .child(
                 // Fixed height of 8 lines (SqlInput's own line_height is
@@ -15877,7 +15943,10 @@ impl Render for AppView {
                             // eight lines when the column is tight — likelier
                             // now that the 22px caption strip is a sibling.
                             // Pin the height.
-                            d.h(px(20. * 8. + 4. * 2.)).flex_shrink_0()
+                            //
+                            // The height itself is the user's since
+                            // 2026-10-27 (the splitter below).
+                            d.h(px(editor_h)).flex_shrink_0()
                         } else {
                             d.flex_1().min_h_0()
                         }
@@ -15896,6 +15965,28 @@ impl Render for AppView {
         // tab (brief contract #2); with none, the editor above already fills
         // the column, so no placeholder is drawn under it.
         if has_results {
+            // The editor/result splitter (user report, 2026-10-27: „nejde
+            // zmenšit okno s výsledky" — the editor was a fixed eight
+            // lines and the result took whatever was left). A row of its
+            // own, `.occlude()`d like the sidebar splitter so a drag can
+            // never also land on the tab strip underneath.
+            column = column.child(
+                div()
+                    .id("editor-splitter")
+                    .h(px(EDITOR_SPLITTER_H))
+                    .w_full()
+                    .flex_shrink_0()
+                    .bg(theme.border)
+                    .occlude()
+                    .cursor_row_resize()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |view, e: &gpui::MouseDownEvent, _w, cx| {
+                            view.editor_resizing = Some((f32::from(e.position.y), editor_h));
+                            cx.notify();
+                        }),
+                    ),
+            );
             column = column.child(self.render_tab_strip(cx));
             column = column.child(self.render_tab_content(cx));
         }
@@ -16006,6 +16097,31 @@ impl Render for AppView {
                 .on_mouse_up_out(
                     gpui::MouseButton::Left,
                     cx.listener(|view, _e, _w, cx| view.end_sidebar_resize(cx)),
+                );
+        }
+        // Same root-level tracking for the editor/result splitter.
+        if self.editor_resizing.is_some() {
+            root = root
+                .on_mouse_move(cx.listener(|view, e: &gpui::MouseMoveEvent, window, cx| {
+                    if let Some((start_y, start_h)) = view.editor_resizing {
+                        view.editor_height = clamp_editor_height(
+                            start_h + (f32::from(e.position.y) - start_y),
+                            f32::from(window.viewport_size().height),
+                        );
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|view, _e, window, cx| {
+                        view.end_editor_resize(f32::from(window.viewport_size().height), cx)
+                    }),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|view, _e, window, cx| {
+                        view.end_editor_resize(f32::from(window.viewport_size().height), cx)
+                    }),
                 );
         }
 
@@ -16658,6 +16774,7 @@ fn main() {
                         }
                         // Read before `config` is moved into the struct below.
                         let sidebar_width = sidebar_width_from(config.sidebar_width);
+                        let editor_height = editor_height_from(config.editor_height);
                         editors.active_mut().payload.status = status.clone();
                         AppView {
                             update: None,
@@ -16696,6 +16813,8 @@ fn main() {
                             tree_visible: true,
                             sidebar_width,
                             sidebar_resizing: None,
+                            editor_height,
+                            editor_resizing: None,
                             pending_menu_action: None,
                             shortcuts_open: false,
                             app_menu_open: false,
@@ -18476,6 +18595,40 @@ mod autocomplete_popup_width_tests {
 }
 
 #[cfg(test)]
+mod editor_height_tests {
+    use super::*;
+
+    #[test]
+    fn an_unset_height_is_eight_lines() {
+        assert_eq!(editor_height_from(None), EDITOR_DEFAULT_H);
+        assert_eq!(clamp_editor_height(EDITOR_DEFAULT_H, 900.0), EDITOR_DEFAULT_H);
+    }
+
+    #[test]
+    fn a_stored_height_round_trips_when_the_window_has_room() {
+        assert_eq!(clamp_editor_height(editor_height_from(Some(333)), 900.0), 333.0);
+    }
+
+    /// Dragged on a tall monitor, reopened on a short one: the result and
+    /// the splitter must still be on screen.
+    #[test]
+    fn the_editor_always_leaves_room_for_the_result() {
+        assert_eq!(clamp_editor_height(2000.0, 900.0), 900.0 - EDITOR_RESERVED_H);
+        assert_eq!(clamp_editor_height(0.0, 900.0), EDITOR_MIN_H, "dragged far up");
+        assert_eq!(clamp_editor_height(-500.0, 900.0), EDITOR_MIN_H);
+    }
+
+    /// A window shorter than the reserve must not invert the range —
+    /// `f32::clamp` panics when min > max.
+    #[test]
+    fn a_tiny_window_does_not_panic() {
+        assert_eq!(clamp_editor_height(500.0, 100.0), EDITOR_MIN_H);
+        assert_eq!(clamp_editor_height(f32::NAN, 900.0), EDITOR_DEFAULT_H);
+        assert_eq!(clamp_editor_height(300.0, f32::NAN), EDITOR_MIN_H);
+    }
+}
+
+#[cfg(test)]
 mod sidebar_width_tests {
     use super::*;
 
@@ -18993,7 +19146,13 @@ mod config_save_guard_audit {
         // (position-verified by this test's own loop) — the same shape as
         // `set_theme`, whose posture it copies: a refused save leaves the
         // flip session-only, and the guard sets its own status.
-        assert_eq!(sites, 12, "config.toml writer count changed — re-audit, do not just bump");
+        //
+        // 12 → 13 on 2026-10-27: `end_editor_resize` persists the height of
+        // the editor above a result. Re-audited, not bumped: the exact
+        // mirror of `end_sidebar_resize` — guarded arm (position-verified
+        // by this test's own loop), drag END only, and the same equality
+        // check so a bare click on the splitter writes nothing.
+        assert_eq!(sites, 13, "config.toml writer count changed — re-audit, do not just bump");
     }
 
     /// The widening is only worth anything if it actually reaches past the
