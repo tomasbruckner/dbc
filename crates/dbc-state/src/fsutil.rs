@@ -42,7 +42,7 @@ pub fn join_component(base: &Path, component: &str) -> Result<PathBuf, StateErro
         || component.contains(':')
         || component.chars().any(char::is_control)
     {
-        return Err(err("neplatná cesta"));
+        return Err(err(dbc_i18n::tr!("neplatná cesta", "invalid path")));
     }
     Ok(base.join(component))
 }
@@ -125,11 +125,11 @@ pub fn conflicting_entry_ci(
     ignore_exact: Option<&str>,
 ) -> Result<Option<String>, StateError> {
     let rd = fs::read_dir(parent)
-        .map_err(|e| err(format!("nelze číst složku {}: {e}", parent.display())))?;
+        .map_err(|e| err(dbc_i18n::trf!("nelze číst složku {}: {e}", "cannot read folder {}: {e}", parent.display())))?;
     let want = fold_name(name);
     for ent in rd {
         let ent =
-            ent.map_err(|e| err(format!("nelze číst složku {}: {e}", parent.display())))?;
+            ent.map_err(|e| err(dbc_i18n::trf!("nelze číst složku {}: {e}", "cannot read folder {}: {e}", parent.display())))?;
         let existing = ent.file_name().to_string_lossy().into_owned();
         if ignore_exact.is_some_and(|ex| ex == existing.as_str()) {
             continue;
@@ -215,11 +215,11 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
     })();
     if let Err(e) = write {
         let _ = fs::remove_file(&tmp);
-        return Err(err(format!("uložení selhalo: {e}")));
+        return Err(err(dbc_i18n::trf!("uložení selhalo: {e}", "save failed: {e}")));
     }
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
-        err(format!("uložení selhalo: {e}"))
+        err(dbc_i18n::trf!("uložení selhalo: {e}", "save failed: {e}"))
     })
 }
 

@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+dbc-i18n = { path = "../dbc-i18n" }
 serde.workspace = true
 toml.workspace = true
 dirs.workspace = true

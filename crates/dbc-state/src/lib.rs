@@ -15,7 +15,7 @@ pub use config::{
     engine_is_file_based,
     default_config_path, AppConfig, ConfigSaveGuard, ConfigVerdict, ConnectionConfig, Engine,
     FavouriteObject, HiddenNodes, MssqlOptions, PgOptions, PgSslMode, SshTunnelConfig, StateError, ThemeMode,
-    TreeGrouping,
+    TreeGrouping, UiLanguage,
 };
 
 pub mod applog;

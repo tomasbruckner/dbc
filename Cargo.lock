@@ -2297,6 +2297,7 @@ dependencies = [
  "dbc-driver-mssql",
  "dbc-driver-postgres",
  "dbc-driver-sqlite",
+ "dbc-i18n",
  "dbc-state",
  "tempfile",
  "tokio",
@@ -2379,6 +2380,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbc-i18n"
+version = "0.1.0"
+
+[[package]]
 name = "dbc-mcp"
 version = "0.39.1"
 dependencies = [
@@ -2413,6 +2418,7 @@ dependencies = [
  "argon2",
  "base64 0.22.1",
  "chacha20poly1305",
+ "dbc-i18n",
  "dirs",
  "rand 0.9.5",
  "rusqlite",
@@ -2437,6 +2443,7 @@ dependencies = [
  "dbc-driver-mssql",
  "dbc-driver-postgres",
  "dbc-driver-sqlite",
+ "dbc-i18n",
  "dbc-state",
  "dirs",
  "gpui",

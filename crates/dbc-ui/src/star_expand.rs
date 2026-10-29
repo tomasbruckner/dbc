@@ -60,13 +60,13 @@ pub enum Refusal {
 impl Refusal {
     pub fn message(&self) -> String {
         match self {
-            Refusal::NoStar => "Kurzor není u hvězdičky v seznamu sloupců.".into(),
-            Refusal::NoSchema => "Schéma není načtené — rozbalit hvězdičku zatím nejde.".into(),
+            Refusal::NoStar => dbc_i18n::tr!("Kurzor není u hvězdičky v seznamu sloupců.", "The cursor is not on a star in the column list.").into(),
+            Refusal::NoSchema => dbc_i18n::tr!("Schéma není načtené — rozbalit hvězdičku zatím nejde.", "The schema is not loaded — the star cannot be expanded yet.").into(),
             Refusal::Ambiguous => {
-                "Dotaz obsahuje poddotaz nebo nejednoznačný alias — nebudu hádat.".into()
+                dbc_i18n::tr!("Dotaz obsahuje poddotaz nebo nejednoznačný alias — nebudu hádat.", "The query contains a subquery or an ambiguous alias — I will not guess.").into()
             }
-            Refusal::UnknownQualifier(q) => format!("`{q}` není tabulka ani alias v tomto dotazu."),
-            Refusal::UnknownTable(t) => format!("Pro tabulku `{t}` nemám ve schématu sloupce."),
+            Refusal::UnknownQualifier(q) => dbc_i18n::trf!("`{q}` není tabulka ani alias v tomto dotazu.", "`{q}` is neither a table nor an alias in this query."),
+            Refusal::UnknownTable(t) => dbc_i18n::trf!("Pro tabulku `{t}` nemám ve schématu sloupce.", "I have no columns for table `{t}` in the schema."),
         }
     }
 }

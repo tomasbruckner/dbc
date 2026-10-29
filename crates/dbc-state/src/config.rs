@@ -170,6 +170,16 @@ pub enum ThemeMode {
     Light,
 }
 
+/// The UI language the user picked in Settings. Absent from `config.toml`
+/// (`AppConfig::language == None`) means „same as Windows" — see
+/// `dbc_i18n::system_lang`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiLanguage {
+    Cs,
+    En,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ToolPaths {
     #[serde(default)]
@@ -229,6 +239,13 @@ pub struct AppConfig {
     /// whole pixels, `None` = never dragged, use the built-in eight lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_height: Option<u16>,
+    /// UI language (2026-10-27, for colleagues and winget users who do not
+    /// read Czech). `None` = never picked: follow the Windows display
+    /// language, so an existing Czech install stays Czech and a fresh one
+    /// on an English Windows comes up in English. Global chrome, like
+    /// `theme`, and stored next to it for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<UiLanguage>,
     // `history_width` lived here until 2026-09-02, when the history panel
     // became a result tab. An old `config.toml` still carrying the key
     // parses fine — unknown keys are ignored — and the next save drops it.
@@ -457,8 +474,9 @@ impl AppConfig {
         // does not. Fail-safe either way: a mismatch refuses.
         if guard.0 != path {
             return Err(StateError {
-                message: format!(
+                message: dbc_i18n::trf!(
                     "interní chyba: potvrzení o config.toml patří jinému souboru ({})",
+                    "internal error: the confirmation for config.toml belongs to a different file ({})",
                     guard.0.display()
                 ),
             });
@@ -592,6 +610,7 @@ mod tests {
             // would round-trip even if `save` dropped it entirely.
             sidebar_width: Some(317),
             editor_height: Some(333),
+            language: Some(UiLanguage::En),
             folders: vec![vec!["work".into()]],
             tree_grouping: TreeGrouping::Kind,
             hidden: std::collections::BTreeMap::from([(
@@ -697,6 +716,7 @@ mod tests {
         let loaded = AppConfig::load(&p).unwrap();
         assert_eq!(loaded.sidebar_width, None, "never resized = no stored width");
         assert_eq!(loaded.editor_height, None, "never dragged = the built-in eight lines");
+        assert_eq!(loaded.language, None, "never picked = follow Windows");
         assert_eq!(loaded.tree_grouping, TreeGrouping::Schema, "the original tree shape");
     }
 

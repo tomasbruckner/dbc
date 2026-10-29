@@ -46,7 +46,25 @@ use crate::ui;
 
 /// Shown in place of a routine/trigger's DDL when the driver didn't provide
 /// one (`RoutineInfo::ddl`/`TriggerInfo::ddl` is `None`).
-pub const DDL_FALLBACK: &str = "-- DDL není k dispozici";
+pub fn ddl_fallback() -> &'static str {
+    dbc_i18n::tr!("-- DDL není k dispozici", "-- DDL is not available")
+}
+
+/// The section header as the user reads it. The `NodeId::Section` name stays
+/// the Czech identifier (it keys expansion state and the session file); only
+/// the displayed text is translated.
+fn section_title(id: &str) -> &'static str {
+    match id {
+        "Tabulky" => dbc_i18n::tr!("Tabulky", "Tables"),
+        "Pohledy" => dbc_i18n::tr!("Pohledy", "Views"),
+        "Funkce" => dbc_i18n::tr!("Funkce", "Functions"),
+        "Procedury" => dbc_i18n::tr!("Procedury", "Procedures"),
+        "Triggery" => dbc_i18n::tr!("Triggery", "Triggers"),
+        "Indexy" => dbc_i18n::tr!("Indexy", "Indexes"),
+        "Sekvence" => dbc_i18n::tr!("Sekvence", "Sequences"),
+        _ => "",
+    }
+}
 
 /// Stable, path-based node identity — NOT index-based, so `expanded`,
 /// `selected`, and speed-search filtering stay meaningful across a refresh
@@ -384,7 +402,7 @@ fn emit_table_like_section(
         return;
     }
     let section_id = NodeId::Section(ctx.section_owner.to_string(), label);
-    out.push((section_id.clone(), depth, format!("{label} ({})", filtered.len()), true));
+    out.push((section_id.clone(), depth, format!("{} ({})", section_title(label), filtered.len()), true));
     if !is_expanded(expanded, filter_active, &section_id) {
         return;
     }
@@ -433,7 +451,7 @@ fn emit_routine_section(
         return;
     }
     let section_id = NodeId::Section(ctx.section_owner.to_string(), label);
-    out.push((section_id.clone(), depth, format!("{label} ({})", filtered.len()), true));
+    out.push((section_id.clone(), depth, format!("{} ({})", section_title(label), filtered.len()), true));
     if !is_expanded(expanded, filter_active, &section_id) {
         return;
     }
@@ -458,7 +476,7 @@ fn emit_trigger_section(
         return;
     }
     let section_id = NodeId::Section(ctx.section_owner.to_string(), "Triggery");
-    out.push((section_id.clone(), depth, format!("Triggery ({})", filtered.len()), true));
+    out.push((section_id.clone(), depth, format!("{} ({})", section_title("Triggery"), filtered.len()), true));
     if !is_expanded(expanded, filter_active, &section_id) {
         return;
     }
@@ -495,7 +513,7 @@ fn emit_index_section(
         return;
     }
     let section_id = NodeId::Section(ctx.section_owner.to_string(), "Indexy");
-    out.push((section_id.clone(), depth, format!("Indexy ({})", filtered.len()), true));
+    out.push((section_id.clone(), depth, format!("{} ({})", section_title("Indexy"), filtered.len()), true));
     if !is_expanded(expanded, filter_active, &section_id) {
         return;
     }
@@ -522,7 +540,7 @@ fn emit_sequence_section(
         return;
     }
     let section_id = NodeId::Section(ctx.section_owner.to_string(), "Sekvence");
-    out.push((section_id.clone(), depth, format!("Sekvence ({})", filtered.len()), true));
+    out.push((section_id.clone(), depth, format!("{} ({})", section_title("Sekvence"), filtered.len()), true));
     if !is_expanded(expanded, filter_active, &section_id) {
         return;
     }
@@ -1600,7 +1618,7 @@ pub fn emit_scripts_section(
     outer_expanded: &HashSet<OuterId>,
     filter: &str,
 ) {
-    out.push((SidebarRow::ScriptsRoot, 0, "Skripty".to_string(), true));
+    out.push((SidebarRow::ScriptsRoot, 0, dbc_i18n::tr!("Skripty", "Scripts").to_string(), true));
     if !outer_expanded.contains(&OuterId::Scripts) {
         return;
     }
@@ -1608,19 +1626,19 @@ pub fn emit_scripts_section(
         out.push((SidebarRow::ScriptNotice { text: text.clone(), open_settings }, 1, text, false));
     }
     if !configured {
-        notice(out, "složka skriptů není nastavena — klikněte pro Nastavení".to_string(), true);
+        notice(out, dbc_i18n::tr!("složka skriptů není nastavena — klikněte pro Nastavení", "script folder is not set — click to open Settings").to_string(), true);
         return;
     }
     match state {
         // The expand handler is dispatching the scan; nothing to show yet.
         ScriptsListState::NotLoaded => {}
-        ScriptsListState::Loading => notice(out, "Načítám skripty…".to_string(), false),
+        ScriptsListState::Loading => notice(out, dbc_i18n::tr!("Načítám skripty…", "Loading scripts…").to_string(), false),
         // The `error:` prefix is the Notice COLOR SENTINEL (the row render
         // dispatches on it literally) — never reword it away.
         ScriptsListState::Error(e) => notice(out, format!("error: {e}"), false),
         ScriptsListState::Loaded { entries, truncated, depth_clipped } => {
             if entries.is_empty() {
-                notice(out, "žádné skripty (*.sql)".to_string(), false);
+                notice(out, dbc_i18n::tr!("žádné skripty (*.sql)", "no scripts (*.sql)").to_string(), false);
             }
             let filter_lc = filter.to_lowercase();
             let filter_active = !filter_lc.is_empty();
@@ -1646,14 +1664,22 @@ pub fn emit_scripts_section(
             if *truncated {
                 notice(
                     out,
-                    "… zobrazeno prvních 2000 položek — zmenšete knihovnu skriptů".to_string(),
+                    dbc_i18n::tr!(
+                        "… zobrazeno prvních 2000 položek — zmenšete knihovnu skriptů",
+                        "… showing the first 2000 items — shrink the script library"
+                    )
+                    .to_string(),
                     false,
                 );
             }
             if *depth_clipped {
                 notice(
                     out,
-                    "… některé podsložky jsou příliš hluboko (limit 12 úrovní)".to_string(),
+                    dbc_i18n::tr!(
+                        "… některé podsložky jsou příliš hluboko (limit 12 úrovní)",
+                        "… some subfolders are too deep (limit 12 levels)"
+                    )
+                    .to_string(),
                     false,
                 );
             }
@@ -1726,7 +1752,7 @@ pub fn flatten_sidebar(
 
     // Pinned rows — active context only, ONCE, above everything (design §1.1).
     if admin != AdminEntry::Hidden {
-        out.push((SidebarRow::Pinned(NodeId::AdminRoot), 0, "Správa serveru".to_string(), false));
+        out.push((SidebarRow::Pinned(NodeId::AdminRoot), 0, dbc_i18n::tr!("Správa serveru", "Server administration").to_string(), false));
     }
     if let Some(scope) = active {
         let items: Vec<&FavouriteObject> =
@@ -1735,7 +1761,7 @@ pub fn flatten_sidebar(
             out.push((
                 SidebarRow::Pinned(NodeId::FavouriteSection),
                 0,
-                format!("Oblíbené ({})", items.len()),
+                dbc_i18n::trf!("Oblíbené ({})", "Favourites ({})", items.len()),
                 true,
             ));
             if outer_expanded.contains(&OuterId::Favourites) {
@@ -1794,7 +1820,7 @@ pub fn flatten_sidebar(
         let mut label =
             format!("{} ({})", c.name, crate::server_version::engine_segment(c.engine, version));
         if c.read_only {
-            label.push_str(" (pouze pro čtení)");
+            label.push_str(dbc_i18n::tr!(" (pouze pro čtení)", " (read-only)"));
         }
         let conn_expanded = outer_expanded.contains(&OuterId::Connection(c.id.clone()));
         let start = out.len();
@@ -1806,11 +1832,11 @@ pub fn flatten_sidebar(
                     SidebarRow::Notice {
                         conn_id: c.id.clone(),
                         db: None,
-                        text: "Načítám databáze…".into(),
+                        text: dbc_i18n::tr!("Načítám databáze…", "Loading databases…").into(),
                         retry: false,
                     },
                     depth + 1,
-                    "Načítám databáze…".into(),
+                    dbc_i18n::tr!("Načítám databáze…", "Loading databases…").into(),
                     false,
                 )),
                 DbListState::Error(e) => out.push((
@@ -1836,7 +1862,7 @@ pub fn flatten_sidebar(
                         }
                         let mut db_label = display_db_name(c.engine, &d.name);
                         if d.is_default {
-                            db_label.push_str(" (výchozí)");
+                            db_label.push_str(dbc_i18n::tr!(" (výchozí)", " (default)"));
                         }
                         let db_start = out.len();
                         out.push((
@@ -1871,8 +1897,11 @@ pub fn flatten_sidebar(
                     }
                     if *truncated {
                         let text =
-                            "… zobrazeno prvních 2000 databází — použijte výchozí databázi nebo filtr"
-                                .to_string();
+                            dbc_i18n::tr!(
+                                "… zobrazeno prvních 2000 databází — použijte výchozí databázi nebo filtr",
+                                "… showing the first 2000 databases — use the default database or a filter"
+                            )
+                            .to_string();
                         out.push((
                             SidebarRow::Notice {
                                 conn_id: c.id.clone(),
@@ -1960,11 +1989,11 @@ fn emit_schema_slot(
             SidebarRow::Notice {
                 conn_id: conn_id.to_string(),
                 db: Some(db.to_string()),
-                text: "Načítám schéma…".into(),
+                text: dbc_i18n::tr!("Načítám schéma…", "Loading schema…").into(),
                 retry: false,
             },
             base_depth,
-            "Načítám schéma…".into(),
+            dbc_i18n::tr!("Načítám schéma…", "Loading schema…").into(),
             false,
         )),
         DbSchemaState::Error(e) => out.push((
@@ -2827,13 +2856,13 @@ impl SchemaTree {
                 NodeId::Routine(schema, name) => {
                     let ddl = self
                         .find_routine_ddl_in(conn_id, db, schema, name)
-                        .unwrap_or_else(|| DDL_FALLBACK.to_string());
+                        .unwrap_or_else(|| ddl_fallback().to_string());
                     cx.emit(TreeEvent::OpenDdl { title: name.clone(), ddl });
                 }
                 NodeId::Trigger(schema, name) => {
                     let ddl = self
                         .find_trigger_ddl_in(conn_id, db, schema, name)
-                        .unwrap_or_else(|| DDL_FALLBACK.to_string());
+                        .unwrap_or_else(|| ddl_fallback().to_string());
                     cx.emit(TreeEvent::OpenDdl { title: name.clone(), ddl });
                 }
                 // Everything else (Schema/Section/Column/Index/…): toggle
@@ -2864,13 +2893,13 @@ impl SchemaTree {
                         "routine" => {
                             let ddl = self
                                 .find_routine_ddl_in(&scope.conn_id, &scope.db, schema, name)
-                                .unwrap_or_else(|| DDL_FALLBACK.to_string());
+                                .unwrap_or_else(|| ddl_fallback().to_string());
                             cx.emit(TreeEvent::OpenDdl { title: name.clone(), ddl });
                         }
                         "trigger" => {
                             let ddl = self
                                 .find_trigger_ddl_in(&scope.conn_id, &scope.db, schema, name)
-                                .unwrap_or_else(|| DDL_FALLBACK.to_string());
+                                .unwrap_or_else(|| ddl_fallback().to_string());
                             cx.emit(TreeEvent::OpenDdl { title: name.clone(), ddl });
                         }
                         _ => {}
@@ -3433,7 +3462,7 @@ impl Render for SchemaTree {
             && self.cli_url.is_none();
 
         let header_label =
-            if self.filter.is_empty() { "Strom schémat".to_string() } else { format!("Strom schémat [{}]", self.filter) };
+            if self.filter.is_empty() { dbc_i18n::tr!("Strom schémat", "Schema tree").to_string() } else { dbc_i18n::trf!("Strom schémat [{}]", "Schema tree [{}]", self.filter) };
         // Task 7 contract #3: enabled only when the current selection is a
         // table/view (`selected_table`, not merely `self.selected.is_some()`
         // — e.g. a selected column or routine leaves it disabled).
@@ -3559,7 +3588,7 @@ impl Render for SchemaTree {
             // S §1.4's pointer row exists for. Rendering the hint INSTEAD
             // of the list would have hidden the whole scripts library from
             // that user.
-            root = root.child(div().px_2().py_1().text_color(cx.theme().text_disabled).child("Bez připojení"));
+            root = root.child(div().px_2().py_1().text_color(cx.theme().text_disabled).child(dbc_i18n::tr!("Bez připojení", "No connection")));
         }
         root = root.child(
             uniform_list(
@@ -3773,7 +3802,7 @@ impl Render for SchemaTree {
                         let admin_disabled =
                             is_admin_root && this.admin_entry == AdminEntry::Disabled;
                         let label = if admin_disabled {
-                            format!("{label} (pouze pro čtení)")
+                            dbc_i18n::trf!("{label} (pouze pro čtení)", "{label} (read-only)")
                         } else {
                             label
                         };
@@ -5528,7 +5557,7 @@ mod sidebar_tests {
         assert_eq!(
             rows[1].0,
             SidebarRow::ScriptNotice {
-                text: "složka skriptů není nastavena — klikněte pro Nastavení".to_string(),
+                text: dbc_i18n::tr!("složka skriptů není nastavena — klikněte pro Nastavení", "script folder is not set — click to open Settings").to_string(),
                 open_settings: true,
             }
         );

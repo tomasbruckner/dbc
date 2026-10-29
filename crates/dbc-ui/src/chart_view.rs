@@ -150,8 +150,8 @@ impl Render for ChartView {
         let kind = self.kind;
         let source_title = self.source_title.clone();
         let kind_label = match kind {
-            ChartKind::Bar => "sloupcový",
-            ChartKind::Line => "spojnicový",
+            ChartKind::Bar => dbc_i18n::tr!("sloupcový", "bar"),
+            ChartKind::Line => dbc_i18n::tr!("spojnicový", "line"),
         };
 
         let header = div()
@@ -164,9 +164,9 @@ impl Render for ChartView {
             .py_1()
             .bg(theme.bg_app)
             .text_color(theme.text_muted)
-            .child(format!("Graf: {source_title} ({kind_label})"))
+            .child(dbc_i18n::trf!("Graf: {source_title} ({kind_label})", "Chart: {source_title} ({kind_label})"))
             .child(
-                ui::button("chart-view-edit", "Upravit…", theme)
+                ui::button("chart-view-edit", dbc_i18n::tr!("Upravit…", "Edit…"), theme)
                     .on_click(cx.listener(|_this, _, _window, cx| {
                         cx.emit(ChartViewEvent::ReopenPicker);
                     })),
@@ -236,7 +236,7 @@ fn paint_chart(
     ));
 
     let Some(raw_range) = chart_data::value_range(&data.series) else {
-        paint_label(plot.origin, "žádná číselná data k vykreslení", theme.text_muted, window, app);
+        paint_label(plot.origin, dbc_i18n::tr!("žádná číselná data k vykreslení", "no numeric data to plot"), theme.text_muted, window, app);
         return;
     };
     let range = match kind {
@@ -320,7 +320,7 @@ fn paint_chart(
     if shown < data.total_rows {
         paint_label(
             point(plot.left(), bounds.top()),
-            &format!("zobrazeno prvních {shown} z {} řádků", data.total_rows),
+            &dbc_i18n::trf!("zobrazeno prvních {shown} z {} řádků", "showing the first {shown} of {} rows", data.total_rows),
             theme.warn,
             window,
             app,

@@ -8,6 +8,8 @@ use gpui::{
     div, prelude::*, px, uniform_list, AnyElement, ClipboardItem, Context, Div, EventEmitter, Hsla, Window,
 };
 
+use dbc_i18n::{tr, trf};
+
 use crate::monitor;
 use crate::monitor_sql;
 use crate::runner;
@@ -318,8 +320,8 @@ impl MonitorView {
         let theme = *cx.theme();
         let pause_icon = if self.paused { "▶" } else { "⏸" };
         let freshness = match self.last_refresh_at {
-            Some(t) => format!("aktualizace před {} s", t.elapsed().as_secs()),
-            None => "načítám…".to_string(),
+            Some(t) => trf!("aktualizace před {} s", "updated {} s ago", t.elapsed().as_secs()),
+            None => tr!("načítám…", "loading…").to_string(),
         };
         div()
             .flex()
@@ -356,17 +358,18 @@ impl MonitorView {
         let snap = self.snapshot.as_ref();
 
         let conn_body = match snap.and_then(|s| s.connections.as_ref()) {
-            Some(t) => format!(
+            Some(t) => trf!(
                 "{} aktivní · {} idle / max {}",
+                "{} active · {} idle / max {}",
                 t.active,
                 t.idle,
-                t.max.map(|m| m.to_string()).unwrap_or_else(|| "neomezeno".into())
+                t.max.map(|m| m.to_string()).unwrap_or_else(|| tr!("neomezeno", "unlimited").into())
             ),
             None => "n/a".to_string(),
         };
 
         let locks_body = match snap.and_then(|s| s.locks.as_ref()) {
-            Some(l) => format!("{} čeká na zámek · {} deadlocků", l.waiting, l.deadlocks_since_reset),
+            Some(l) => trf!("{} čeká na zámek · {} deadlocků", "{} waiting for a lock · {} deadlocks", l.waiting, l.deadlocks_since_reset),
             None => "n/a".to_string(),
         };
 
@@ -398,16 +401,16 @@ impl MonitorView {
             .flex_wrap()
             .gap_2()
             .p_2()
-            .child(card(theme).child(card_title("Připojení")).child(conn_body))
+            .child(card(theme).child(card_title(tr!("Připojení", "Connections"))).child(conn_body))
             .child(
                 card(theme)
-                    .child(card_title("Zámky"))
+                    .child(card_title(tr!("Zámky", "Locks")))
                     .child(locks_body)
-                    .child(div().text_color(theme.text_disabled).child("od posledního resetu statistik")),
+                    .child(div().text_color(theme.text_disabled).child(tr!("od posledního resetu statistik", "since the last statistics reset"))),
             )
             .child(
                 card(theme)
-                    .child(card_title("Velikost DB"))
+                    .child(card_title(tr!("Velikost DB", "DB size")))
                     .child(
                         div()
                             .flex()
@@ -419,15 +422,15 @@ impl MonitorView {
                     )
                     .child(size_label),
             )
-            .child(card(theme).child(card_title("Výkon")).child(perf_body))
+            .child(card(theme).child(card_title(tr!("Výkon", "Performance"))).child(perf_body))
             .into_any_element()
     }
 
     fn render_running(&self, cx: &mut Context<Self>) -> AnyElement {
         let running = self.snapshot.as_ref().and_then(|s| s.running.as_ref());
         let header = match running {
-            Some(rows) => format!("Běžící dotazy ({})", rows.len()),
-            None => "Běžící dotazy: n/a".to_string(),
+            Some(rows) => trf!("Běžící dotazy ({})", "Running queries ({})", rows.len()),
+            None => tr!("Běžící dotazy: n/a", "Running queries: n/a").to_string(),
         };
         let rows_len = running.map(|r| r.len()).unwrap_or(0);
 
@@ -457,11 +460,12 @@ impl MonitorView {
                         div()
                             .id(("mon-kill", pid as usize))
                             .text_color(theme.text_disabled)
-                            .child("✕ pouze pro čtení")
+                            .child(tr!("✕ pouze pro čtení", "✕ read-only"))
                             .into_any_element()
                     } else {
-                        let label = format!(
+                        let label = trf!(
                             "{} · {} · běží {:.0}s",
+                            "{} · {} · running {:.0}s",
                             row.user.clone().unwrap_or_else(|| "?".into()),
                             row.application.clone().unwrap_or_else(|| "?".into()),
                             row.duration_secs
@@ -536,7 +540,7 @@ impl MonitorView {
         match self.snapshot.as_ref().and_then(|s| s.blocking.as_ref()) {
             None => body.push(div().px_2().child("n/a").into_any_element()),
             Some(roots) if roots.is_empty() => {
-                body.push(div().px_2().child("žádné blokace").into_any_element())
+                body.push(div().px_2().child(tr!("žádné blokace", "no blocking")).into_any_element())
             }
             Some(roots) => {
                 for (ix, row) in flatten_blocking_tree(roots).into_iter().enumerate() {
@@ -545,7 +549,7 @@ impl MonitorView {
                     let mut label =
                         format!("{} · wait {}s · {}", row.pid, wait, truncate_query(&query_text));
                     if row.cycle {
-                        label.push_str(" (cyklus — možný deadlock)");
+                        label.push_str(tr!(" (cyklus — možný deadlock)", " (cycle — possible deadlock)"));
                     }
                     let color = if row.cycle { tier_color(Tier::Crit, &theme) } else { theme.text_primary };
                     let detail_text = row.query;
@@ -572,7 +576,7 @@ impl MonitorView {
                 div()
                     .px_2()
                     .text_color(theme.warn)
-                    .child("strom blokací je příliš velký — zobrazena je jen jeho část")
+                    .child(tr!("strom blokací je příliš velký — zobrazena je jen jeho část", "blocking tree is too large — only part of it is shown"))
                     .into_any_element(),
             );
         }
@@ -580,7 +584,7 @@ impl MonitorView {
             .flex()
             .flex_col()
             .p_2()
-            .child(div().font_weight(gpui::FontWeight::BOLD).child("Blokace"))
+            .child(div().font_weight(gpui::FontWeight::BOLD).child(tr!("Blokace", "Blocking")))
             .children(body)
             .into_any_element()
     }
@@ -590,7 +594,7 @@ impl MonitorView {
         match self.snapshot.as_ref().and_then(|s| s.tables.as_ref()) {
             None => body.push(div().px_2().child("n/a").into_any_element()),
             Some(rows) if rows.is_empty() => {
-                body.push(div().px_2().child("žádné tabulky").into_any_element())
+                body.push(div().px_2().child(tr!("žádné tabulky", "no tables")).into_any_element())
             }
             Some(rows) => {
                 let max_in_set =
@@ -612,7 +616,7 @@ impl MonitorView {
                         .child(div().w(px(80.)).child(monitor::fmt_bytes(r.data_bytes)))
                         .child(div().w(px(80.)).child(monitor::fmt_bytes(r.index_bytes)))
                         .child(div().w(px(80.)).child(monitor::fmt_bytes(r.toast_bytes)))
-                        .child(div().w(px(110.)).child(format!("~{} řádků", r.row_estimate)))
+                        .child(div().w(px(110.)).child(trf!("~{} řádků", "~{} rows", r.row_estimate)))
                         .child(div().h(px(6.)).w(px(160. * frac)).bg(theme.accent));
                     body.push(row_el.into_any_element());
                 }
@@ -622,7 +626,7 @@ impl MonitorView {
             .flex()
             .flex_col()
             .p_2()
-            .child(div().font_weight(gpui::FontWeight::BOLD).child("Velikosti tabulek"))
+            .child(div().font_weight(gpui::FontWeight::BOLD).child(tr!("Velikosti tabulek", "Table sizes")))
             .children(body)
             .into_any_element()
     }
@@ -666,13 +670,13 @@ impl MonitorView {
                     .gap_2()
                     .p_2()
                     .child(
-                        ui::button("mon-detail-copy", "Kopírovat", theme)
+                        ui::button("mon-detail-copy", tr!("Kopírovat", "Copy"), theme)
                             .on_click(cx.listener(move |_, _, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(text_for_copy.clone()));
                             })),
                     )
                     .child(
-                        ui::button("mon-detail-close", "Zavřít", theme)
+                        ui::button("mon-detail-close", tr!("Zavřít", "Close"), theme)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.detail = None;
                                 cx.notify();
@@ -720,11 +724,12 @@ impl Render for MonitorView {
                     .flex_row()
                     .items_start()
                     .gap_2()
-                    .child(div().flex_1().text_color(theme.warn).child(format!(
+                    .child(div().flex_1().text_color(theme.warn).child(trf!(
                         "aktualizace selhala ({err}) · další pokus za {}s",
+                        "update failed ({err}) · next attempt in {}s",
                         self.interval_secs
                     )))
-                    .child(ui::button("mon-error-copy", "Kopírovat chybu", theme).on_click(
+                    .child(ui::button("mon-error-copy", tr!("Kopírovat chybu", "Copy error"), theme).on_click(
                         cx.listener(move |_, _, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(err.clone()));
                         }),

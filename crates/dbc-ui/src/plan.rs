@@ -397,6 +397,7 @@ pub fn analyze_gate(sql: &str, read_only: bool, dialect: dbc_core::Dialect) -> A
     }
 }
 
+use dbc_i18n::{tr, trf};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 use quick_xml::XmlVersion;
@@ -526,9 +527,10 @@ fn close_missing_index_group(cur_hint: &mut Option<PendingHint>, hints: &mut Vec
     if let Some((impact, db, schema, table, cols)) = cur_hint.take() {
         let col_list = cols.join(", ");
         hints.push(PlanHint {
-            message: format!("Chybějící index: dopad {impact:.1}%"),
-            detail: Some(format!(
-                "-- návrh, ověřte před spuštěním:\nCREATE INDEX ix_suggested ON {db}.{schema}.{table} ({col_list});"
+            message: trf!("Chybějící index: dopad {impact:.1}%", "Missing index: impact {impact:.1}%"),
+            detail: Some(trf!(
+                "-- návrh, ověřte před spuštěním:\nCREATE INDEX ix_suggested ON {db}.{schema}.{table} ({col_list});",
+                "-- suggestion, verify before running:\nCREATE INDEX ix_suggested ON {db}.{schema}.{table} ({col_list});"
             )),
         });
     }
@@ -571,12 +573,12 @@ pub fn parse_mssql_xml(is_analyze: bool, raw_text: &str) -> Result<PlanResult, S
     let mut cur_hint: Option<PendingHint> = None;
 
     loop {
-        match reader.read_event().map_err(|e| format!("chyba XML plánu: {e}"))? {
+        match reader.read_event().map_err(|e| trf!("chyba XML plánu: {e}", "XML plan error: {e}"))? {
             Event::Eof => break,
             Event::Start(e) => {
                 depth += 1;
                 if depth > MAX_XML_DEPTH {
-                    return Err(format!("XML plán překročil maximální hloubku {MAX_XML_DEPTH}"));
+                    return Err(trf!("XML plán překročil maximální hloubku {MAX_XML_DEPTH}", "XML plan exceeded the maximum depth {MAX_XML_DEPTH}"));
                 }
                 match e.name().as_ref() {
                     b"RelOp" => stack.push(new_relop_frame(&e)),
@@ -597,7 +599,7 @@ pub fn parse_mssql_xml(is_analyze: bool, raw_text: &str) -> Result<PlanResult, S
             Event::Empty(e) => {
                 depth += 1;
                 if depth > MAX_XML_DEPTH {
-                    return Err(format!("XML plán překročil maximální hloubku {MAX_XML_DEPTH}"));
+                    return Err(trf!("XML plán překročil maximální hloubku {MAX_XML_DEPTH}", "XML plan exceeded the maximum depth {MAX_XML_DEPTH}"));
                 }
                 match e.name().as_ref() {
                     b"RelOp" => {
@@ -620,7 +622,7 @@ pub fn parse_mssql_xml(is_analyze: bool, raw_text: &str) -> Result<PlanResult, S
                 depth = depth.saturating_sub(1);
                 match e.name().as_ref() {
                     b"RelOp" => {
-                        let frame = stack.pop().ok_or_else(|| "nepárový </RelOp>".to_string())?;
+                        let frame = stack.pop().ok_or_else(|| tr!("nepárový </RelOp>", "unpaired </RelOp>").to_string())?;
                         close_relop_frame(frame, &mut stack, &mut root, is_analyze);
                     }
                     b"MissingIndexGroup" => close_missing_index_group(&mut cur_hint, &mut hints),
@@ -632,9 +634,9 @@ pub fn parse_mssql_xml(is_analyze: bool, raw_text: &str) -> Result<PlanResult, S
     }
 
     if !stack.is_empty() {
-        return Err("neuzavřené <RelOp> elementy (neplatné XML)".to_string());
+        return Err(tr!("neuzavřené <RelOp> elementy (neplatné XML)", "unclosed <RelOp> elements (invalid XML)").to_string());
     }
-    let root = root.ok_or_else(|| "v XML plánu nebyl nalezen žádný <RelOp>".to_string())?;
+    let root = root.ok_or_else(|| tr!("v XML plánu nebyl nalezen žádný <RelOp>", "no <RelOp> found in the XML plan").to_string())?;
     Ok(PlanResult {
         root,
         is_analyze,
@@ -813,8 +815,8 @@ fn convert_pg_tree(root: PgPlanJson) -> PlanNode {
 
 pub fn parse_pg_json(is_analyze: bool, raw_text: &str) -> Result<PlanResult, String> {
     let roots: Vec<PgExplainRoot> =
-        serde_json::from_str(raw_text).map_err(|e| format!("neplatný JSON plánu: {e}"))?;
-    let root_json = roots.into_iter().next().ok_or_else(|| "prázdné pole v odpovědi EXPLAIN".to_string())?;
+        serde_json::from_str(raw_text).map_err(|e| trf!("neplatný JSON plánu: {e}", "invalid plan JSON: {e}"))?;
+    let root_json = roots.into_iter().next().ok_or_else(|| tr!("prázdné pole v odpovědi EXPLAIN", "empty array in the EXPLAIN response").to_string())?;
     let planning_time = finite(root_json.planning_time);
     let execution_time = finite(root_json.execution_time);
     Ok(PlanResult {
@@ -975,11 +977,11 @@ pub fn parse_duckdb_json(is_analyze: bool, raw_text: &str) -> Result<PlanResult,
         Ok(v) => v,
         Err(_) => vec![
             serde_json::from_str::<DuckPlanJson>(raw_text)
-                .map_err(|e| format!("neplatný JSON plánu: {e}"))?,
+                .map_err(|e| trf!("neplatný JSON plánu: {e}", "invalid plan JSON: {e}"))?,
         ],
     };
     let root_json =
-        roots.into_iter().next().ok_or_else(|| "prázdné pole v odpovědi EXPLAIN".to_string())?;
+        roots.into_iter().next().ok_or_else(|| tr!("prázdné pole v odpovědi EXPLAIN", "empty array in the EXPLAIN response").to_string())?;
     let total_execution_time_ms = finite(root_json.latency.map(|s| s * 1000.0));
     Ok(PlanResult {
         root: convert_duckdb_tree(root_json),
@@ -1029,7 +1031,7 @@ pub fn parse_plan(engine: dbc_state::Engine, is_analyze: bool, raw_text: &str) -
 pub fn parse_duckdb_raw(is_analyze: bool, raw_text: &str) -> PlanResult {
     PlanResult {
         root: PlanNode {
-            operation: "DuckDB plán".to_string(),
+            operation: tr!("DuckDB plán", "DuckDB plan").to_string(),
             target: None,
             est_cost: None,
             est_rows: None,
@@ -2027,7 +2029,7 @@ fn fmt_metric(v: Option<f64>) -> String {
 impl Render for PlanView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
-        let badge = if self.result.is_analyze { "Skutečný plán" } else { "Odhadovaný plán" };
+        let badge = if self.result.is_analyze { tr!("Skutečný plán", "Actual plan") } else { tr!("Odhadovaný plán", "Estimated plan") };
         let header = div()
             .h(px(28.))
             .px_2()
@@ -2040,8 +2042,8 @@ impl Render for PlanView {
             .child(format!(
                 "{badge}{}",
                 match (self.result.total_planning_time_ms, self.result.total_execution_time_ms) {
-                    (Some(p), Some(e)) => format!(" · plánování {p:.2} ms · běh {e:.2} ms"),
-                    (None, Some(e)) => format!(" · běh {e:.2} ms"),
+                    (Some(p), Some(e)) => trf!(" · plánování {p:.2} ms · běh {e:.2} ms", " · planning {p:.2} ms · run {e:.2} ms"),
+                    (None, Some(e)) => trf!(" · běh {e:.2} ms", " · run {e:.2} ms"),
                     _ => String::new(),
                 }
             ))
@@ -2050,7 +2052,7 @@ impl Render for PlanView {
                     .id("plan-raw-toggle")
                     .cursor_pointer()
                     .px_1()
-                    .child(if self.show_raw { "Strom" } else { "Raw" })
+                    .child(if self.show_raw { tr!("Strom", "Tree") } else { "Raw" })
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                         this.show_raw = !this.show_raw;
                         cx.notify();
@@ -2205,7 +2207,7 @@ impl Render for PlanView {
                 )
                 .child(
                     div().flex().flex_row().justify_end().gap_2().p_2().child(
-                        ui::button("plan-node-detail-close", "Zavřít", theme)
+                        ui::button("plan-node-detail-close", tr!("Zavřít", "Close"), theme)
                             .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                 this.node_detail = None;
                                 cx.notify();

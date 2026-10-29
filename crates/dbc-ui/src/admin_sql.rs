@@ -9,6 +9,7 @@
 //! called from `main`. Remove this allow once T3+ wire it in.
 #![allow(dead_code)]
 
+use dbc_i18n::tr;
 use dbc_state::Engine;
 
 /// DEPRECATED-IN-COMMENT (G15 §2a): delegating wrapper over
@@ -612,18 +613,18 @@ pub fn object_privilege(
     target: CellState,
 ) -> Result<WriteStatement, String> {
     if privs.is_empty() {
-        return Err("žádná oprávnění ke změně".to_string());
+        return Err(tr!("žádná oprávnění ke změně", "no privileges to change").to_string());
     }
     if engine == Engine::Sqlite {
-        return Err("SQLite nemá serverová oprávnění".to_string());
+        return Err(tr!("SQLite nemá serverová oprávnění", "SQLite has no server privileges").to_string());
     }
     // G16: own message rather than widening the sqlite `if` — the existing
     // tests pin the sqlite text exactly.
     if engine == Engine::Duckdb {
-        return Err("DuckDB nemá serverová oprávnění".to_string());
+        return Err(tr!("DuckDB nemá serverová oprávnění", "DuckDB has no server privileges").to_string());
     }
     if engine == Engine::Postgres && target == CellState::Denied {
-        return Err("DENY na PostgreSQL neexistuje".to_string());
+        return Err(tr!("DENY na PostgreSQL neexistuje", "DENY does not exist in PostgreSQL").to_string());
     }
     let list = privs.join(", ");
     let obj = quote_qualified_for(engine, schema, object);
@@ -639,15 +640,15 @@ pub fn object_privilege(
 /// pg: GRANT USAGE ON SCHEMA "s" TO "g". MSSQL: GRANT … ON SCHEMA::[s] TO [g].
 pub fn schema_privilege(engine: Engine, schema: &str, priv_name: &str, grantee: &str, target: CellState) -> Result<WriteStatement, String> {
     if engine == Engine::Sqlite {
-        return Err("SQLite nemá serverová oprávnění".to_string());
+        return Err(tr!("SQLite nemá serverová oprávnění", "SQLite has no server privileges").to_string());
     }
     // G16: own message rather than widening the sqlite `if` — the existing
     // tests pin the sqlite text exactly.
     if engine == Engine::Duckdb {
-        return Err("DuckDB nemá serverová oprávnění".to_string());
+        return Err(tr!("DuckDB nemá serverová oprávnění", "DuckDB has no server privileges").to_string());
     }
     if engine == Engine::Postgres && target == CellState::Denied {
-        return Err("DENY na PostgreSQL neexistuje".to_string());
+        return Err(tr!("DENY na PostgreSQL neexistuje", "DENY does not exist in PostgreSQL").to_string());
     }
     let g = quote_ident_for(engine, grantee);
     let sql = match engine {
@@ -675,7 +676,7 @@ pub fn schema_privilege(engine: Engine, schema: &str, priv_name: &str, grantee: 
 /// pg-only (design §2: db-level row is pg only): GRANT CONNECT ON DATABASE "d" TO "g".
 pub fn database_privilege_pg(database: &str, priv_name: &str, grantee: &str, target: CellState) -> Result<WriteStatement, String> {
     if target == CellState::Denied {
-        return Err("DENY na PostgreSQL neexistuje".to_string());
+        return Err(tr!("DENY na PostgreSQL neexistuje", "DENY does not exist in PostgreSQL").to_string());
     }
     let ident = quote_ident_for(Engine::Postgres, database);
     let g = quote_ident_for(Engine::Postgres, grantee);

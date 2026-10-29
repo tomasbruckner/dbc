@@ -636,7 +636,7 @@ impl ResultGrid {
         self.view_generation += 1;
         self.filters_open = false;
         self.filter_inputs =
-            (0..ncols).map(|_| cx.new(|cx| TextField::new(cx, "filtr…", false))).collect();
+            (0..ncols).map(|_| cx.new(|cx| TextField::new(cx, dbc_i18n::tr!("filtr…", "filter…"), false))).collect();
         self.filter_cache = vec![String::new(); ncols];
         self.find = None;
         self.cell_detail = None;
@@ -932,7 +932,7 @@ impl ResultGrid {
         }
         let Some(fk) = self.fk_info.get(col).cloned().flatten() else { return };
         let Some(distinct) = self.collect_distinct_fk_values(col) else {
-            self.status_note = Some("příliš mnoho hodnot pro dočasný join".to_string());
+            self.status_note = Some(dbc_i18n::tr!("příliš mnoho hodnot pro dočasný join", "too many values for a temporary join").to_string());
             cx.notify();
             return;
         };
@@ -1093,7 +1093,7 @@ impl ResultGrid {
         self.filter_inputs.truncate(ncols);
         self.filter_cache.truncate(ncols);
         while self.filter_inputs.len() < total {
-            self.filter_inputs.push(cx.new(|cx| TextField::new(cx, "filtr…", false)));
+            self.filter_inputs.push(cx.new(|cx| TextField::new(cx, dbc_i18n::tr!("filtr…", "filter…"), false)));
             self.filter_cache.push(String::new());
         }
         // A source-column filter/sort surviving a virtual-column add/remove
@@ -1127,7 +1127,7 @@ impl ResultGrid {
         let Some(buf) = self.buffer.clone() else { return };
         let rows = buf.borrow().row_count();
         self.status_note =
-            if rows > LARGE_SORT_ROWS { Some("řadím…".to_string()) } else { None };
+            if rows > LARGE_SORT_ROWS { Some(dbc_i18n::tr!("řadím…", "sorting…").to_string()) } else { None };
         let ncols = buf.borrow().column_count();
         // G4 Task 5: `virtual_cols` borrowed as its OWN field (disjoint from
         // `self.view`, which `self.view.rebuild(..)` below borrows
@@ -1189,7 +1189,7 @@ impl ResultGrid {
         }
         self.dirty = false;
         self.rebuild_view();
-        Some("seřazeno po dokončení".to_string())
+        Some(dbc_i18n::tr!("seřazeno po dokončení", "sorted when finished").to_string())
     }
 
     /// Header click (outside the resize-handle strip): cycles this
@@ -1335,7 +1335,7 @@ impl ResultGrid {
             window.focus(&f.input.focus_handle(cx), cx);
             return;
         }
-        let input = cx.new(|cx| TextField::new(cx, "Hledat…", false));
+        let input = cx.new(|cx| TextField::new(cx, dbc_i18n::tr!("Hledat…", "Search…"), false));
         let focus = input.focus_handle(cx);
         self.find = Some(FindState {
             input,
@@ -1595,7 +1595,7 @@ impl ResultGrid {
         let Some(buf) = self.buffer.clone() else { return };
         let (headers, cols) = self.export_headers_and_cols();
         if headers.is_empty() {
-            self.status_note = Some("error: žádné viditelné sloupce k exportu".to_string());
+            self.status_note = Some(dbc_i18n::tr!("error: žádné viditelné sloupce k exportu", "error: no visible columns to export").to_string());
             cx.notify();
             return;
         }
@@ -1607,7 +1607,7 @@ impl ResultGrid {
 
         // Fix 1a: resolve the destination FIRST — cancelling the dialog now
         // costs nothing since no snapshot work has happened yet.
-        self.status_note = Some("volím cíl exportu…".to_string());
+        self.status_note = Some(dbc_i18n::tr!("volím cíl exportu…", "choosing export destination…").to_string());
         cx.notify();
         let dialog = cx.prompt_for_new_path(&std::path::PathBuf::new(), Some(&suggested_name));
         cx.spawn(async move |this, cx| {
@@ -1620,7 +1620,7 @@ impl ResultGrid {
                 Ok(Ok(Some(p))) => p,
                 Ok(Ok(None)) => {
                     let _ = this.update(cx, |g, cx| {
-                        g.status_note = Some("export zrušen".to_string());
+                        g.status_note = Some(dbc_i18n::tr!("export zrušen", "export cancelled").to_string());
                         cx.notify();
                     });
                     return;
@@ -1635,8 +1635,9 @@ impl ResultGrid {
                         Some(dir) => dir.join(format!("dbc-export-{}.{ext}", export_timestamp())),
                         None => {
                             let _ = this.update(cx, |g, cx| {
-                                g.status_note = Some(format!(
-                                    "error: dialog pro uložení selhal ({e}) a složka Stažené není dostupná"
+                                g.status_note = Some(dbc_i18n::trf!(
+                                    "error: dialog pro uložení selhal ({e}) a složka Stažené není dostupná",
+                                    "error: the save dialog failed ({e}) and the Downloads folder is not available"
                                 ));
                                 cx.notify();
                             });
@@ -1653,7 +1654,10 @@ impl ResultGrid {
                     None => {
                         let _ = this.update(cx, |g, cx| {
                             g.status_note =
-                                Some("error: dialog pro uložení i složka Stažené nejsou dostupné".to_string());
+                                Some(dbc_i18n::tr!(
+                                    "error: dialog pro uložení i složka Stažené nejsou dostupné",
+                                    "error: the save dialog and the Downloads folder are both unavailable"
+                                ).to_string());
                             cx.notify();
                         });
                         return;
@@ -1666,7 +1670,7 @@ impl ResultGrid {
             // the synchronous snapshot loop had already completed).
             if this
                 .update(cx, |g, cx| {
-                    g.status_note = Some(format!("exportuji… ({n} řádků)"));
+                    g.status_note = Some(dbc_i18n::trf!("exportuji… ({n} řádků)", "exporting… ({n} rows)"));
                     cx.notify();
                 })
                 .is_err()
@@ -1721,7 +1725,7 @@ impl ResultGrid {
                     Ok(None) => {
                         let _ = this.update(cx, |g, cx| {
                             g.status_note =
-                                Some("export přerušen: data se mezitím změnila".to_string());
+                                Some(dbc_i18n::tr!("export přerušen: data se mezitím změnila", "export interrupted: the data changed in the meantime").to_string());
                             cx.notify();
                         });
                         return;
@@ -1751,11 +1755,12 @@ impl ResultGrid {
             let _ = this.update(cx, |g, cx| {
                 g.status_note = Some(match result {
                     Ok(()) => match &dialog_error {
-                        Some(err) => format!(
+                        Some(err) => dbc_i18n::trf!(
                             "exportováno (dialog pro uložení selhal: {err}; použita složka Stažené): {} ({n} řádků)",
+                            "exported (the save dialog failed: {err}; Downloads folder used): {} ({n} rows)",
                             path.display()
                         ),
-                        None => format!("exportováno: {} ({n} řádků)", path.display()),
+                        None => dbc_i18n::trf!("exportováno: {} ({n} řádků)", "exported: {} ({n} rows)", path.display()),
                     },
                     Err(e) => format!("error: {e}"),
                 });
@@ -1856,7 +1861,7 @@ impl ResultGrid {
                     .px_2()
                     .rounded_md()
                     .bg(if filters_open { theme.bg_selected } else { theme.bg_hover })
-                    .child("Filtr")
+                    .child(dbc_i18n::tr!("Filtr", "Filter"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_filters(cx);
                     })),
@@ -1880,7 +1885,7 @@ impl ResultGrid {
                     .px_2()
                     .rounded_md()
                     .bg(if self.columns_open { theme.bg_selected } else { theme.bg_hover })
-                    .child("Sloupce ▾")
+                    .child(dbc_i18n::tr!("Sloupce ▾", "Columns ▾"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_columns_menu(cx);
                     })),
@@ -1895,7 +1900,7 @@ impl ResultGrid {
                     .rounded_md()
                     .bg(theme.bg_hover)
                     .hover(|s| s.bg(theme.bg_selected))
-                    .child("Graf")
+                    .child(dbc_i18n::tr!("Graf", "Chart"))
                     .on_click(cx.listener(|_this, _, _, cx| {
                         cx.emit(GridEvent::OpenChart);
                     })),
@@ -1910,7 +1915,7 @@ impl ResultGrid {
                     .px_2()
                     .rounded_md()
                     .bg(theme.bg_hover)
-                    .child("+ řádek")
+                    .child(dbc_i18n::tr!("+ řádek", "+ row"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.add_insert_row(window, cx);
                     })),
@@ -1938,20 +1943,21 @@ impl ResultGrid {
         }
 
         if filtered {
-            row = row.child(format!("{shown} / {total} řádků"));
+            row = row.child(dbc_i18n::trf!("{shown} / {total} řádků", "{shown} / {total} rows"));
         }
 
         row = row.child(div().flex_1()); // spacer, pushes the find bar to the right
 
         if let Some(f) = &self.find {
             let count_label = match f.current {
-                Some(ix) => format!(
+                Some(ix) => dbc_i18n::trf!(
                     "{} z {}{}",
+                    "{} of {}{}",
                     ix + 1,
                     f.matches.len(),
                     if f.capped { "+" } else { "" }
                 ),
-                None => format!("0 z {}", f.matches.len()),
+                None => dbc_i18n::trf!("0 z {}", "0 of {}", f.matches.len()),
             };
             row = row
                 .child(div().w(px(180.)).child(f.input.clone()))
@@ -2176,12 +2182,12 @@ impl ResultGrid {
             .child(body)
             .child(
                 div().flex().flex_row().justify_end().gap_2().p_2().child(
-                    ui::button("cell-detail-copy", "Kopírovat", theme)
+                    ui::button("cell-detail-copy", dbc_i18n::tr!("Kopírovat", "Copy"), theme)
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(text_for_copy.clone()));
                         })),
                 ).child(
-                    ui::button("cell-detail-close", "Zavřít", theme)
+                    ui::button("cell-detail-close", dbc_i18n::tr!("Zavřít", "Close"), theme)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.cell_detail = None;
                             cx.notify();
@@ -2368,7 +2374,7 @@ impl ResultGrid {
                 Some(Some(None))
             ),
         };
-        let input = cx.new(|cx| TextField::new(cx, "hodnota…", false));
+        let input = cx.new(|cx| TextField::new(cx, dbc_i18n::tr!("hodnota…", "value…"), false));
         input.update(cx, |f, cx| f.set_text(&prefill, cx));
         let focus = input.focus_handle(cx);
         self.cell_editor =
@@ -2443,7 +2449,7 @@ impl ResultGrid {
                     .text_color(theme.text_muted)
                     .whitespace_normal()
                     .child(if original_text.is_empty() {
-                        "(prázdné/NULL)".to_string()
+                        dbc_i18n::tr!("(prázdné/NULL)", "(empty/NULL)").to_string()
                     } else {
                         original_text
                     }),
@@ -2455,19 +2461,22 @@ impl ResultGrid {
                 d.child(
                     div()
                         .text_color(theme.danger)
-                        .child("aktuálně: (NULL) — prázdné Uložit přepíše na '', ne NULL"),
+                        .child(dbc_i18n::tr!(
+                            "aktuálně: (NULL) — prázdné Uložit přepíše na '', ne NULL",
+                            "currently: (NULL) — Save with an empty value overwrites it with '', not NULL"
+                        )),
                 )
             })
             .child(div().w_full().child(input))
             .child(
                 div().flex().flex_row().justify_end().gap_2().child(
-                    ui::button("cell-editor-save", "Uložit", theme)
+                    ui::button("cell-editor-save", dbc_i18n::tr!("Uložit", "Save"), theme)
                         .on_click(cx.listener(|this, _, _, cx| this.commit_cell_editor(cx))),
                 ).child(
                     ui::button("cell-editor-null", "NULL", theme)
                         .on_click(cx.listener(|this, _, _, cx| this.commit_cell_editor_null(cx))),
                 ).child(
-                    ui::button("cell-editor-cancel", "Zrušit", theme)
+                    ui::button("cell-editor-cancel", dbc_i18n::tr!("Zrušit", "Cancel"), theme)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.cell_editor = None;
                             cx.notify();
@@ -2693,7 +2702,7 @@ impl ResultGrid {
                 div()
                     .px_2()
                     .text_color(theme.text_muted)
-                    .child(format!("Přidat sloupce z {}", fk.table)),
+                    .child(dbc_i18n::trf!("Přidat sloupce z {}", "Add columns from {}", fk.table)),
             );
         for c in ref_cols {
             let is_checked = checked.contains(&c);
@@ -2999,7 +3008,7 @@ impl Render for ResultGrid {
                                                     this.open_cell_editor(
                                                         EditTarget::Insert { ins_ix, col },
                                                         column_name.clone(),
-                                                        "(nový řádek)".to_string(),
+                                                        dbc_i18n::tr!("(nový řádek)", "(new row)").to_string(),
                                                         window,
                                                         cx,
                                                     );

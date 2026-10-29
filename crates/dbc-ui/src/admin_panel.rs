@@ -35,6 +35,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use dbc_i18n::{tr, trf};
 use dbc_core::SchemaSnapshot;
 use dbc_state::Engine;
 use gpui::{
@@ -1194,8 +1195,8 @@ impl AdminPanel {
         if self.modal.is_some() {
             return;
         }
-        let name = cx.new(|cx| connections_ui::TextField::form_field(cx, "název role", false));
-        let password = cx.new(|cx| connections_ui::TextField::form_field(cx, "heslo", true));
+        let name = cx.new(|cx| connections_ui::TextField::form_field(cx, tr!("název role", "role name"), false));
+        let password = cx.new(|cx| connections_ui::TextField::form_field(cx, tr!("heslo", "password"), true));
         let focus = name.focus_handle(cx);
         self.modal = Some(AdminModal::NewRole {
             name,
@@ -1214,7 +1215,7 @@ impl AdminPanel {
         if self.modal.is_some() {
             return;
         }
-        let password = cx.new(|cx| connections_ui::TextField::form_field(cx, "nové heslo", true));
+        let password = cx.new(|cx| connections_ui::TextField::form_field(cx, tr!("nové heslo", "new password"), true));
         let focus = password.focus_handle(cx);
         self.modal = Some(AdminModal::ChangePassword { role, password });
         window.focus(&focus, cx);
@@ -1366,7 +1367,7 @@ impl AdminPanel {
         if self.modal.is_some() {
             return;
         }
-        let name = cx.new(|cx| connections_ui::TextField::form_field(cx, "název schématu", false));
+        let name = cx.new(|cx| connections_ui::TextField::form_field(cx, tr!("název schématu", "schema name"), false));
         let focus = name.focus_handle(cx);
         self.modal = Some(AdminModal::NewSchema { name });
         window.focus(&focus, cx);
@@ -1432,7 +1433,7 @@ impl AdminPanel {
             cx.notify();
             return;
         }
-        let warning = cascade.then(|| "tato akce je nevratná a smaže i obsah schématu".to_string());
+        let warning = cascade.then(|| tr!("tato akce je nevratná a smaže i obsah schématu", "this action is irreversible and also deletes the contents of the schema").to_string());
         cx.emit(AdminEvent::RequestApply { statements, warning });
         cx.notify();
     }
@@ -1494,9 +1495,9 @@ impl AdminPanel {
     fn render_sub_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
         let tabs = [
-            (AdminSubView::Roles, "Role a členství"),
-            (AdminSubView::Privileges, "Oprávnění"),
-            (AdminSubView::Databases, "Databáze a schémata"),
+            (AdminSubView::Roles, tr!("Role a členství", "Roles and membership")),
+            (AdminSubView::Privileges, tr!("Oprávnění", "Privileges")),
+            (AdminSubView::Databases, tr!("Databáze a schémata", "Databases and schemas")),
         ];
         let mut row = div().flex().flex_row().gap_2().px_2().py_1().bg(theme.bg_app);
         for (view, label) in tabs {
@@ -1558,7 +1559,7 @@ impl AdminPanel {
 
             // "Členem v" — one checkbox per known role name, plus (MSSQL)
             // a second heading for server-scoped roles.
-            detail = detail.child(div().mt_2().text_color(theme.text_muted).child("Členem v"));
+            detail = detail.child(div().mt_2().text_color(theme.text_muted).child(tr!("Členem v", "Member of")));
             let mut member_list = div().flex().flex_col();
             for (ix, r) in roles.iter().filter(|r| &r.name != sel).enumerate() {
                 member_list = member_list.child(self.render_membership_checkbox(
@@ -1575,7 +1576,7 @@ impl AdminPanel {
                 let server_roles: Vec<String> =
                     self.server_memberships.iter().map(|m| m.role.clone()).collect();
                 if !server_roles.is_empty() {
-                    detail = detail.child(div().mt_2().text_color(theme.text_muted).child("Členem v (server)"));
+                    detail = detail.child(div().mt_2().text_color(theme.text_muted).child(tr!("Členem v (server)", "Member of (server)")));
                     let mut srv_list = div().flex().flex_col();
                     for (ix, role_name) in server_roles.into_iter().enumerate() {
                         srv_list = srv_list.child(self.render_membership_checkbox(
@@ -1590,7 +1591,7 @@ impl AdminPanel {
                 }
             }
         } else {
-            detail = detail.child(div().text_color(theme.text_disabled).child("Vyberte roli vlevo."));
+            detail = detail.child(div().text_color(theme.text_disabled).child(tr!("Vyberte roli vlevo.", "Select a role on the left.")));
         }
 
         let buttons = div()
@@ -1606,7 +1607,7 @@ impl AdminPanel {
                     .px_2()
                     .rounded_md()
                     .text_color(theme.text_primary)
-                    .child("Nová role…")
+                    .child(tr!("Nová role…", "New role…"))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.open_new_role_modal(window, cx);
                     })),
@@ -1619,7 +1620,7 @@ impl AdminPanel {
                     .px_2()
                     .rounded_md()
                     .text_color(if selected.is_some() { theme.danger } else { theme.text_disabled })
-                    .child("Smazat roli")
+                    .child(tr!("Smazat roli", "Delete role"))
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                         this.stage_drop_role(cx);
                     })),
@@ -1632,7 +1633,7 @@ impl AdminPanel {
                     .px_2()
                     .rounded_md()
                     .text_color(if selected.is_some() { theme.text_primary } else { theme.text_disabled })
-                    .child("Změnit heslo…")
+                    .child(tr!("Změnit heslo…", "Change password…"))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.open_change_password_modal(window, cx);
                     })),
@@ -1663,7 +1664,7 @@ impl AdminPanel {
         let selected_grantee = self.selected_grantee.clone();
 
         let mut schema_row = div().flex().flex_row().items_center().flex_wrap().gap_1().px_2().py_1();
-        schema_row = schema_row.child(div().text_color(theme.text_muted).child("Schéma:"));
+        schema_row = schema_row.child(div().text_color(theme.text_muted).child(tr!("Schéma:", "Schema:")));
         for (ix, s) in schemas.iter().enumerate() {
             let is_sel = selected_schema.as_deref() == Some(s.as_str());
             let s_for_click = s.clone();
@@ -1711,12 +1712,12 @@ impl AdminPanel {
 
         let Some(schema) = selected_schema.clone() else {
             return root
-                .child(div().flex_1().p_2().text_color(theme.text_disabled).child("Vyberte schéma a roli."))
+                .child(div().flex_1().p_2().text_color(theme.text_disabled).child(tr!("Vyberte schéma a roli.", "Select a schema and a role.")))
                 .into_any_element();
         };
         if selected_grantee.is_none() {
             return root
-                .child(div().flex_1().p_2().text_color(theme.text_disabled).child("Vyberte roli."))
+                .child(div().flex_1().p_2().text_color(theme.text_disabled).child(tr!("Vyberte roli.", "Select a role.")))
                 .into_any_element();
         }
 
@@ -1728,7 +1729,7 @@ impl AdminPanel {
         let engine = self.engine;
         let mut scope_row =
             div().flex().flex_row().items_center().flex_wrap().gap_2().px_2().py_1().bg(theme.bg_app);
-        scope_row = scope_row.child(div().text_color(theme.text_muted).child(format!("Schéma \"{schema}\":")));
+        scope_row = scope_row.child(div().text_color(theme.text_muted).child(trf!("Schéma \"{schema}\":", "Schema \"{schema}\":")));
         for (ix, &priv_name) in admin_sql::SCHEMA_PRIVS.iter().enumerate() {
             let committed = self.matrix.schema_current.get(priv_name).copied().unwrap_or(CellState::NotSet);
             let state = self.matrix.schema_staged.get(priv_name).copied().unwrap_or(committed);
@@ -1749,7 +1750,7 @@ impl AdminPanel {
             );
         }
         if self.engine == Engine::Postgres {
-            scope_row = scope_row.child(div().text_color(theme.text_muted).child("Databáze:"));
+            scope_row = scope_row.child(div().text_color(theme.text_muted).child(tr!("Databáze:", "Database:")));
             for (ix, &priv_name) in admin_sql::PG_DATABASE_PRIVS.iter().enumerate() {
                 let committed = self.matrix.db_current.get(priv_name).copied().unwrap_or(CellState::NotSet);
                 let state = self.matrix.db_staged.get(priv_name).copied().unwrap_or(committed);
@@ -1783,12 +1784,12 @@ impl AdminPanel {
 
         if n_objects == 0 {
             return root
-                .child(div().flex_1().p_2().text_color(theme.text_disabled).child("Žádné objekty v tomto schématu."))
+                .child(div().flex_1().p_2().text_color(theme.text_disabled).child(tr!("Žádné objekty v tomto schématu.", "No objects in this schema.")))
                 .into_any_element();
         }
 
         let mut header = div().flex().flex_row().px_2().py_1().bg(theme.bg_app).text_color(theme.text_muted);
-        header = header.child(div().w(px(220.)).child("Objekt"));
+        header = header.child(div().w(px(220.)).child(tr!("Objekt", "Object")));
         for &p in priv_columns {
             header = header.child(div().w(px(80.)).child(p));
         }
@@ -1868,8 +1869,8 @@ impl AdminPanel {
     fn render_databases_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.theme();
         let headline = match &self.current_db_size_label {
-            Some(label) => format!("Aktuální databáze: {label}"),
-            None => "Aktuální databáze: …".to_string(),
+            Some(label) => trf!("Aktuální databáze: {label}", "Current database: {label}"),
+            None => tr!("Aktuální databáze: …", "Current database: …").to_string(),
         };
 
         let db_sizes = self.db_sizes.clone();
@@ -1927,7 +1928,7 @@ impl AdminPanel {
                     .px_2()
                     .rounded_md()
                     .text_color(theme.text_primary)
-                    .child("Nové schéma…")
+                    .child(tr!("Nové schéma…", "New schema…"))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.open_new_schema_modal(window, cx);
                     })),
@@ -1940,7 +1941,7 @@ impl AdminPanel {
                     .px_2()
                     .rounded_md()
                     .text_color(if drop_enabled { theme.danger } else { theme.text_disabled })
-                    .child("Smazat schéma")
+                    .child(tr!("Smazat schéma", "Delete schema"))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.open_drop_schema_modal(window, cx);
                     })),
@@ -1953,9 +1954,9 @@ impl AdminPanel {
             .overflow_hidden()
             .child(div().px_2().py_1().text_color(theme.text_primary).child(headline))
             .child(buttons)
-            .child(div().px_2().text_color(theme.text_muted).child("Databáze"))
+            .child(div().px_2().text_color(theme.text_muted).child(tr!("Databáze", "Databases")))
             .child(db_list)
-            .child(div().px_2().text_color(theme.text_muted).child("Schémata"))
+            .child(div().px_2().text_color(theme.text_muted).child(tr!("Schémata", "Schemas")))
             .child(schema_list)
             .into_any_element()
     }
@@ -2017,7 +2018,7 @@ impl AdminPanel {
                 .py_1()
                 .bg(theme.bg_app)
                 .text_color(theme.warn)
-                .child(format!("{n} změn"))
+                .child(trf!("{n} změn", "{n} changes"))
                 .child(
                     div()
                         .id("admin-apply")
@@ -2026,7 +2027,7 @@ impl AdminPanel {
                         .px_2()
                         .rounded_md()
                         .text_color(theme.success)
-                        .child("Aplikovat")
+                        .child(tr!("Aplikovat", "Apply"))
                         .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.request_apply(cx))),
                 )
                 .child(
@@ -2037,7 +2038,7 @@ impl AdminPanel {
                         .px_2()
                         .rounded_md()
                         .text_color(theme.text_primary)
-                        .child("Zahodit")
+                        .child(tr!("Zahodit", "Discard"))
                         .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.discard_staged(cx))),
                 )
                 .into_any_element(),
@@ -2077,7 +2078,7 @@ impl AdminPanel {
                     .p_2()
                     .gap_2()
                     .text_color(theme.text_primary)
-                    .child("Nová role")
+                    .child(tr!("Nová role", "New role"))
                     .child(name.clone())
                     .child(password.clone())
                     .child(flags_row)
@@ -2095,7 +2096,7 @@ impl AdminPanel {
                                     .px_2()
                                     .rounded_md()
                                     .text_color(theme.success)
-                                    .child("Vytvořit")
+                                    .child(tr!("Vytvořit", "Create"))
                                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                         this.confirm_new_role(cx);
                                     })),
@@ -2108,7 +2109,7 @@ impl AdminPanel {
                                     .px_2()
                                     .rounded_md()
                                     .text_color(theme.text_primary)
-                                    .child("Zrušit")
+                                    .child(tr!("Zrušit", "Cancel"))
                                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                         this.close_modal(cx);
                                     })),
@@ -2123,7 +2124,7 @@ impl AdminPanel {
                 .p_2()
                 .gap_2()
                 .text_color(theme.text_primary)
-                .child(format!("Změnit heslo — {role}"))
+                .child(trf!("Změnit heslo — {role}", "Change password — {role}"))
                 .child(password.clone())
                 .child(
                     div()
@@ -2139,7 +2140,7 @@ impl AdminPanel {
                                 .px_2()
                                 .rounded_md()
                                 .text_color(theme.success)
-                                .child("Změnit")
+                                .child(tr!("Změnit", "Change"))
                                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                     this.confirm_change_password(cx);
                                 })),
@@ -2152,7 +2153,7 @@ impl AdminPanel {
                                 .px_2()
                                 .rounded_md()
                                 .text_color(theme.text_primary)
-                                .child("Zrušit")
+                                .child(tr!("Zrušit", "Cancel"))
                                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                     this.close_modal(cx);
                                 })),
@@ -2166,7 +2167,7 @@ impl AdminPanel {
                 .p_2()
                 .gap_2()
                 .text_color(theme.text_primary)
-                .child("Nové schéma")
+                .child(tr!("Nové schéma", "New schema"))
                 .child(name.clone())
                 .child(
                     div()
@@ -2182,7 +2183,7 @@ impl AdminPanel {
                                 .px_2()
                                 .rounded_md()
                                 .text_color(theme.success)
-                                .child("Vytvořit")
+                                .child(tr!("Vytvořit", "Create"))
                                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                     this.confirm_new_schema(cx);
                                 })),
@@ -2195,7 +2196,7 @@ impl AdminPanel {
                                 .px_2()
                                 .rounded_md()
                                 .text_color(theme.text_primary)
-                                .child("Zrušit")
+                                .child(tr!("Zrušit", "Cancel"))
                                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                     this.close_modal(cx);
                                 })),
@@ -2211,7 +2212,7 @@ impl AdminPanel {
                     .p_2()
                     .gap_2()
                     .text_color(theme.text_primary)
-                    .child(format!("Smazat schéma — {schema}"))
+                    .child(trf!("Smazat schéma — {schema}", "Delete schema — {schema}"))
                     .child(
                         div()
                             .id("admin-drop-schema-cascade")
@@ -2220,7 +2221,7 @@ impl AdminPanel {
                             .flex_row()
                             .gap_1()
                             .text_color(theme.warn)
-                            .child(format!("{mark} včetně CASCADE (smaže i obsah schématu)"))
+                            .child(trf!("{mark} včetně CASCADE (smaže i obsah schématu)", "{mark} including CASCADE (also deletes the contents of the schema)"))
                             .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                 this.toggle_drop_schema_cascade(cx);
                             })),
@@ -2239,7 +2240,7 @@ impl AdminPanel {
                                     .px_2()
                                     .rounded_md()
                                     .text_color(theme.danger)
-                                    .child("Smazat")
+                                    .child(tr!("Smazat", "Delete"))
                                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                         this.confirm_drop_schema(cx);
                                     })),
@@ -2252,7 +2253,7 @@ impl AdminPanel {
                                     .px_2()
                                     .rounded_md()
                                     .text_color(theme.text_primary)
-                                    .child("Zrušit")
+                                    .child(tr!("Zrušit", "Cancel"))
                                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                         this.close_modal(cx);
                                     })),
@@ -2315,7 +2316,7 @@ impl AdminPanel {
                         .p_2()
                         .gap_2()
                         .text_color(theme.text_primary)
-                        .child(format!("Zahodit neuložené změny? ({n})"))
+                        .child(trf!("Zahodit neuložené změny? ({n})", "Discard unsaved changes? ({n})"))
                         .child(
                             div()
                                 .flex()
@@ -2330,7 +2331,7 @@ impl AdminPanel {
                                         .px_2()
                                         .rounded_md()
                                         .text_color(theme.danger)
-                                        .child("Zahodit")
+                                        .child(tr!("Zahodit", "Discard"))
                                         .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                             this.discard_confirm_yes(cx);
                                         })),
@@ -2343,7 +2344,7 @@ impl AdminPanel {
                                         .px_2()
                                         .rounded_md()
                                         .text_color(theme.text_primary)
-                                        .child("Zpět")
+                                        .child(tr!("Zpět", "Back"))
                                         .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                             this.discard_confirm_no(cx);
                                         })),
@@ -2373,11 +2374,11 @@ impl Render for AdminPanel {
             .flex_col()
             .size_full()
             .bg(theme.bg_panel)
-            .child(div().h(px(28.)).px_2().flex().items_center().text_color(theme.text_primary).child("Správa serveru"))
+            .child(div().h(px(28.)).px_2().flex().items_center().text_color(theme.text_primary).child(tr!("Správa serveru", "Server administration")))
             .child(self.render_sub_nav(cx));
 
         if self.loading {
-            root = root.child(div().px_2().py_1().text_color(theme.text_muted).child("Načítám…"));
+            root = root.child(div().px_2().py_1().text_color(theme.text_muted).child(tr!("Načítám…", "Loading…")));
         }
         if let Some(err) = self.error.clone() {
             root = root.child(div().px_2().py_1().text_color(theme.danger).child(format!("error: {err}")));

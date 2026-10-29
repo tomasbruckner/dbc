@@ -123,7 +123,7 @@ pub fn derive_title(bound_file: Option<&str>, sql: &str, ordinal: u64) -> String
     }
     let line = sql.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
     if line.is_empty() {
-        return format!("Dotaz {ordinal}");
+        return dbc_i18n::trf!("Dotaz {ordinal}", "Query {ordinal}");
     }
     let mut out: String = line.chars().take(TITLE_MAX_CHARS).collect();
     if line.chars().count() > TITLE_MAX_CHARS {

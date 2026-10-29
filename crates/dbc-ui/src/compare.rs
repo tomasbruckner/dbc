@@ -25,6 +25,8 @@
 
 use std::collections::HashSet;
 
+use dbc_i18n::{tr, trf};
+
 use dbc_core::arrow::array::{Array, RecordBatch, StringArray};
 use dbc_core::arrow::datatypes::SchemaRef;
 use dbc_core::{synthesize_create_table, QueryError, RoutineInfo, TableInfo, TriggerInfo};
@@ -121,12 +123,12 @@ fn trigger_ddl_text(t: &TriggerInfo) -> String {
 fn table_field_rows(t: &TableDiff) -> Vec<(String, FieldChange)> {
     let mut rows = Vec::new();
     for fc in &t.table_fields {
-        rows.push(("tabulka".to_string(), fc.clone()));
+        rows.push((tr!("tabulka", "table").to_string(), fc.clone()));
     }
     for c in &t.columns {
         if let ObjectDiff::Changed { left, fields, .. } = c {
             for fc in fields {
-                rows.push((format!("sloupec {}", left.name), fc.clone()));
+                rows.push((trf!("sloupec {}", "column {}", left.name), fc.clone()));
             }
         }
     }
@@ -140,7 +142,7 @@ fn table_field_rows(t: &TableDiff) -> Vec<(String, FieldChange)> {
     for c in &t.constraints {
         if let ObjectDiff::Changed { left, fields, .. } = c {
             for fc in fields {
-                rows.push((format!("omezení {}", left.name), fc.clone()));
+                rows.push((trf!("omezení {}", "constraint {}", left.name), fc.clone()));
             }
         }
     }
@@ -154,8 +156,8 @@ fn table_existence_rows(t: &TableDiff) -> (Vec<String>, Vec<String>) {
     let mut removed = Vec::new();
     for c in &t.columns {
         match c {
-            ObjectDiff::Added(x) => added.push(format!("sloupec {}", x.name)),
-            ObjectDiff::Removed(x) => removed.push(format!("sloupec {}", x.name)),
+            ObjectDiff::Added(x) => added.push(trf!("sloupec {}", "column {}", x.name)),
+            ObjectDiff::Removed(x) => removed.push(trf!("sloupec {}", "column {}", x.name)),
             _ => {}
         }
     }
@@ -168,8 +170,8 @@ fn table_existence_rows(t: &TableDiff) -> (Vec<String>, Vec<String>) {
     }
     for c in &t.constraints {
         match c {
-            ObjectDiff::Added(x) => added.push(format!("omezení {}", x.name)),
-            ObjectDiff::Removed(x) => removed.push(format!("omezení {}", x.name)),
+            ObjectDiff::Added(x) => added.push(trf!("omezení {}", "constraint {}", x.name)),
+            ObjectDiff::Removed(x) => removed.push(trf!("omezení {}", "constraint {}", x.name)),
             _ => {}
         }
     }
@@ -411,8 +413,8 @@ impl CompareView {
         result_b: Result<Result<(String, SchemaRef, dbc_buffer::ResultBuffer), QueryError>, tokio::sync::oneshot::error::RecvError>,
         cx: &mut Context<Self>,
     ) {
-        let a = result_a.unwrap_or_else(|_| Err(QueryError::msg("fetch zrušen".to_string())));
-        let b = result_b.unwrap_or_else(|_| Err(QueryError::msg("fetch zrušen".to_string())));
+        let a = result_a.unwrap_or_else(|_| Err(QueryError::msg(tr!("fetch zrušen", "fetch cancelled").to_string())));
+        let b = result_b.unwrap_or_else(|_| Err(QueryError::msg(tr!("fetch zrušen", "fetch cancelled").to_string())));
         let (sql_a, schema_a, mut buf_a, sql_b, schema_b, mut buf_b) = match (a, b) {
             (Ok((sql_a, schema_a, buf_a)), Ok((sql_b, schema_b, buf_b))) => (sql_a, schema_a, buf_a, sql_b, schema_b, buf_b),
             (Err(e), _) | (_, Err(e)) => {
@@ -428,7 +430,7 @@ impl CompareView {
 
         if left_pk.is_empty() || right_pk.is_empty() {
             self.data_diff = DataDiffState::Error(QueryError::msg(
-                "primární klíč nebyl nalezen mezi sloupci výsledku — porovnání dat přerušeno".to_string(),
+                tr!("primární klíč nebyl nalezen mezi sloupci výsledku — porovnání dat přerušeno", "primary key not found among the result columns — data comparison aborted").to_string(),
             ));
             cx.notify();
             return;
@@ -554,7 +556,7 @@ impl Render for CompareView {
                 .flex_1()
                 .p_4()
                 .text_color(theme.text_primary)
-                .child("Načítám schéma…")
+                .child(tr!("Načítám schéma…", "Loading schema…"))
                 .into_any_element(),
             CompareLoadState::Error { a, b } => render_error_banner(a, b, &theme).into_any_element(),
             CompareLoadState::Ready { diff, mode } => self.render_ready(diff, *mode, cx),
@@ -566,10 +568,10 @@ impl Render for CompareView {
 fn render_error_banner(a: &Option<QueryError>, b: &Option<QueryError>, theme: &Theme) -> impl IntoElement {
     let mut banner = div().flex().flex_col().gap_1().p_4().text_color(theme.danger);
     if let Some(e) = a {
-        banner = banner.child(format!("Databáze A: error: {e}"));
+        banner = banner.child(trf!("Databáze A: error: {e}", "Database A: error: {e}"));
     }
     if let Some(e) = b {
-        banner = banner.child(format!("Databáze B: error: {e}"));
+        banner = banner.child(trf!("Databáze B: error: {e}", "Database B: error: {e}"));
     }
     banner
 }
@@ -599,7 +601,7 @@ impl CompareView {
         if mode == CompareMode::CrossEngine {
             root = root.child(
                 div().p_1().bg(theme.bg_warn_banner).text_color(theme.warn).child(
-                    "porovnání mezi různými databázovými systémy: typy a výchozí hodnoty sloupců se neporovnávají",
+                    tr!("porovnání mezi různými databázovými systémy: typy a výchozí hodnoty sloupců se neporovnávají", "comparison across different database systems: column types and default values are not compared"),
                 ),
             );
         }
@@ -639,7 +641,7 @@ impl CompareView {
         let show_unchanged = self.show_unchanged.tables;
         let unchanged = diff.tables.iter().filter(|t| t.status == TableStatus::Unchanged).count();
         let mut section = div().flex().flex_col().gap_1().child(section_header(
-            "Tabulky",
+            tr!("Tabulky", "Tables"),
             unchanged,
             show_unchanged,
             &theme,
@@ -672,7 +674,7 @@ impl CompareView {
         }
         if visible.len() > shown {
             section = section.child(
-                div().text_color(theme.text_disabled).child(format!("… a {} dalších", visible.len() - shown)),
+                div().text_color(theme.text_disabled).child(trf!("… a {} dalších", "… and {} more", visible.len() - shown)),
             );
         }
         section
@@ -683,7 +685,7 @@ impl CompareView {
         let show_unchanged = self.show_unchanged.routines;
         let unchanged = diff.routines.iter().filter(|r| matches!(r, ObjectDiff::Unchanged(_))).count();
         let mut section = div().flex().flex_col().gap_1().child(section_header(
-            "Funkce/procedury",
+            tr!("Funkce/procedury", "Functions/procedures"),
             unchanged,
             show_unchanged,
             &theme,
@@ -716,7 +718,7 @@ impl CompareView {
         }
         if visible.len() > shown {
             section = section.child(
-                div().text_color(theme.text_disabled).child(format!("… a {} dalších", visible.len() - shown)),
+                div().text_color(theme.text_disabled).child(trf!("… a {} dalších", "… and {} more", visible.len() - shown)),
             );
         }
         section
@@ -727,7 +729,7 @@ impl CompareView {
         let show_unchanged = self.show_unchanged.triggers;
         let unchanged = diff.triggers.iter().filter(|t| matches!(t, ObjectDiff::Unchanged(_))).count();
         let mut section = div().flex().flex_col().gap_1().child(section_header(
-            "Triggery",
+            tr!("Triggery", "Triggers"),
             unchanged,
             show_unchanged,
             &theme,
@@ -760,7 +762,7 @@ impl CompareView {
         }
         if visible.len() > shown {
             section = section.child(
-                div().text_color(theme.text_disabled).child(format!("… a {} dalších", visible.len() - shown)),
+                div().text_color(theme.text_disabled).child(trf!("… a {} dalších", "… and {} more", visible.len() - shown)),
             );
         }
         section
@@ -776,7 +778,7 @@ impl CompareView {
         let show_unchanged = self.show_unchanged.sequences;
         let unchanged = diff.sequences.iter().filter(|s| matches!(s, ObjectDiff::Unchanged(_))).count();
         let mut section = div().flex().flex_col().gap_1().child(section_header(
-            "Sekvence",
+            tr!("Sekvence", "Sequences"),
             unchanged,
             show_unchanged,
             &theme,
@@ -802,7 +804,7 @@ impl CompareView {
         }
         if visible.len() > shown {
             section = section.child(
-                div().text_color(theme.text_disabled).child(format!("… a {} dalších", visible.len() - shown)),
+                div().text_color(theme.text_disabled).child(trf!("… a {} dalších", "… and {} more", visible.len() - shown)),
             );
         }
         section
@@ -821,7 +823,7 @@ impl CompareView {
             .text_color(theme.text_primary);
         match self.selection {
             CompareSelection::None => {
-                pane = pane.child(div().text_color(theme.text_disabled).child("Vyber objekt vlevo."));
+                pane = pane.child(div().text_color(theme.text_disabled).child(tr!("Vyber objekt vlevo.", "Select an object on the left.")));
             }
             CompareSelection::Table(ix) => {
                 if let Some(t) = diff.tables.get(ix).cloned() {
@@ -887,7 +889,7 @@ impl CompareView {
                     detail = detail.child(field_change_table(&field_rows, &theme));
                 }
                 if let (Some(l), Some(r)) = (&t.left, &t.right) {
-                    let toggle_label = if self.show_ddl_diff { "Skrýt DDL diff" } else { "Zobrazit DDL diff" };
+                    let toggle_label = if self.show_ddl_diff { tr!("Skrýt DDL diff", "Hide DDL diff") } else { tr!("Zobrazit DDL diff", "Show DDL diff") };
                     detail = detail.child(
                         div()
                             .id("compare-ddl-diff-toggle")
@@ -912,7 +914,7 @@ impl CompareView {
             detail = detail.child(self.render_data_diff_section(cx));
         } else if matches!(t.status, TableStatus::Changed | TableStatus::Unchanged) {
             detail = detail.child(
-                div().text_color(theme.text_disabled).child("Porovnání dat: tabulka nemá primární klíč na obou stranách"),
+                div().text_color(theme.text_disabled).child(tr!("Porovnání dat: tabulka nemá primární klíč na obou stranách", "Data comparison: the table has no primary key on both sides")),
             );
         }
 
@@ -923,7 +925,7 @@ impl CompareView {
         let theme = *cx.theme();
         let mut section =
             div().flex().flex_col().gap_2().mt_2().p_2().border_1().border_color(theme.border_subtle).rounded_md();
-        section = section.child(div().text_color(theme.accent).child("Porovnání dat"));
+        section = section.child(div().text_color(theme.accent).child(tr!("Porovnání dat", "Data comparison")));
 
         let where_text = self.data_where.clone();
         section = section.child(
@@ -941,12 +943,12 @@ impl CompareView {
                         .bg(theme.bg_app)
                         .rounded_md()
                         .text_color(theme.text_primary)
-                        .child(if where_text.is_empty() { "(bez omezení)".to_string() } else { where_text }),
+                        .child(if where_text.is_empty() { tr!("(bez omezení)", "(no limit)").to_string() } else { where_text }),
                 ),
         );
 
         section = section.child(
-            crate::ui::button("compare-run-data-diff", "Porovnat data", theme).w(px(140.)).on_click(cx.listener(
+            crate::ui::button("compare-run-data-diff", tr!("Porovnat data", "Compare data"), theme).w(px(140.)).on_click(cx.listener(
                 |_v, _, _, cx| {
                     cx.emit(CompareViewEvent::DataDiffRequested);
                 },
@@ -956,7 +958,7 @@ impl CompareView {
         match &self.data_diff {
             DataDiffState::Idle => {}
             DataDiffState::Loading => {
-                section = section.child(div().text_color(theme.warn).child("Načítám data…"));
+                section = section.child(div().text_color(theme.warn).child(tr!("Načítám data…", "Loading data…")));
             }
             DataDiffState::Error(e) => {
                 section = section.child(div().text_color(theme.danger).child(format!("error: {e}")));
@@ -981,16 +983,17 @@ impl CompareView {
 /// counts — cheap `usize` fields, not a re-scan of the row list.
 fn render_data_diff_outcome(summary: &DataDiffSummary, sql_a: &str, sql_b: &str, theme: &Theme) -> impl IntoElement {
     let mut block = div().flex().flex_col().gap_2();
-    block = block.child(div().text_color(theme.text_muted).child(format!(
+    block = block.child(div().text_color(theme.text_muted).child(trf!(
         "{} přidáno, {} odebráno, {} změněno (z {} řádků na levé straně)",
+        "{} added, {} removed, {} changed (of {} rows on the left side)",
         summary.added, summary.removed, summary.changed, summary.total_left
     )));
     block = block.child(ddl_block(&format!("A: {sql_a}"), theme));
     block = block.child(ddl_block(&format!("B: {sql_b}"), theme));
 
-    block = block.child(row_id_list("Přidané řádky", theme.diff_inserted_bg, &summary.added_shown, summary.added, theme));
+    block = block.child(row_id_list(tr!("Přidané řádky", "Added rows"), theme.diff_inserted_bg, &summary.added_shown, summary.added, theme));
     block = block.child(row_id_list(
-        "Odebrané řádky",
+        tr!("Odebrané řádky", "Removed rows"),
         theme.diff_deleted_bg,
         &summary.removed_shown,
         summary.removed,
@@ -1005,7 +1008,7 @@ fn render_data_diff_outcome(summary: &DataDiffSummary, sql_a: &str, sql_b: &str,
 /// a read of the precomputed cache, no `build_changed_batch` call here.
 fn render_changed_rows_display(summary: &DataDiffSummary, theme: &Theme) -> impl IntoElement {
     let mut block = div().flex().flex_col().gap_1();
-    block = block.child(div().text_color(theme.diff_staged_bg).child("Změněné řádky"));
+    block = block.child(div().text_color(theme.diff_staged_bg).child(tr!("Změněné řádky", "Changed rows")));
     if summary.changed_rows_shown.is_empty() {
         return block;
     }
@@ -1032,7 +1035,7 @@ fn render_changed_rows_display(summary: &DataDiffSummary, theme: &Theme) -> impl
         block = block.child(
             div()
                 .text_color(theme.text_disabled)
-                .child(format!("… zobrazeno prvních {shown} z {} změněných řádků", summary.changed)),
+                .child(trf!("… zobrazeno prvních {shown} z {} změněných řádků", "… showing the first {shown} of {} changed rows", summary.changed)),
         );
     }
     block
@@ -1050,13 +1053,13 @@ fn row_id_list(title: &str, tint: Hsla, shown_indices: &[usize], total: usize, t
     let mut block = div().flex().flex_col().gap_1();
     block = block.child(div().text_color(tint).child(title.to_string()));
     for &ix in shown_indices {
-        block = block.child(div().text_color(theme.text_muted).child(format!("řádek {ix}")));
+        block = block.child(div().text_color(theme.text_muted).child(trf!("řádek {ix}", "row {ix}")));
     }
     if total > shown_indices.len() {
         block = block.child(
             div()
                 .text_color(theme.text_disabled)
-                .child(format!("… zobrazeno prvních {} z {total} řádků", shown_indices.len())),
+                .child(trf!("… zobrazeno prvních {} z {total} řádků", "… showing the first {} of {total} rows", shown_indices.len())),
         );
     }
     block
@@ -1069,7 +1072,7 @@ fn section_header(
     theme: &Theme,
     on_toggle: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
-    let toggle_label = format!("Zobrazit beze změn ({unchanged_count})");
+    let toggle_label = trf!("Zobrazit beze změn ({unchanged_count})", "Show unchanged ({unchanged_count})");
     div()
         .flex()
         .flex_row()
@@ -1126,7 +1129,7 @@ fn render_ddl_or_diff(left_text: Option<&str>, right_text: Option<&str>, theme: 
         (Some(l), Some(r)) => ddl_diff_block(&diff_lines(l, r), theme).into_any_element(),
         (Some(l), None) => ddl_block(l, theme).into_any_element(),
         (None, Some(r)) => ddl_block(r, theme).into_any_element(),
-        (None, None) => div().text_color(theme.text_disabled).child("(bez DDL)").into_any_element(),
+        (None, None) => div().text_color(theme.text_disabled).child(tr!("(bez DDL)", "(no DDL)")).into_any_element(),
     }
 }
 
@@ -1138,7 +1141,7 @@ fn field_change_table(rows: &[(String, FieldChange)], theme: &Theme) -> impl Int
             .flex_row()
             .gap_2()
             .text_color(theme.text_disabled)
-            .child(div().w(px(180.)).child("pole"))
+            .child(div().w(px(180.)).child(tr!("pole", "field")))
             .child(div().w(px(200.)).child("A"))
             .child(div().flex_1().child("B")),
     );

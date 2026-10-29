@@ -34,16 +34,16 @@ pub struct TargetText<'a> {
 pub fn parse_target_text(s: &str) -> Result<TargetText<'_>, String> {
     let s = s.trim();
     if s.is_empty() {
-        return Err("prázdný cíl — čekám conn nebo conn/db".to_string());
+        return Err(dbc_i18n::tr!("prázdný cíl — čekám conn nebo conn/db", "empty target — expected conn or conn/db").to_string());
     }
     match s.split_once('/') {
         None => Ok(TargetText { conn: s, db: None }),
         Some((conn, db)) => {
             if conn.is_empty() {
-                return Err(format!("cíl {s}: chybí jméno připojení před lomítkem"));
+                return Err(dbc_i18n::trf!("cíl {s}: chybí jméno připojení před lomítkem", "target {s}: connection name missing before the slash"));
             }
             if db.is_empty() {
-                return Err(format!("cíl {s}: chybí databáze za lomítkem"));
+                return Err(dbc_i18n::trf!("cíl {s}: chybí databáze za lomítkem", "target {s}: database missing after the slash"));
             }
             Ok(TargetText { conn, db: Some(db) })
         }

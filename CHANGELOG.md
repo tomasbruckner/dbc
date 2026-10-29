@@ -8,6 +8,7 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ### Added
 
+- English UI: Settings → „Jazyk / Language" switches between Czech and English; until you pick one, dbc follows the Windows display language (Czech or Slovak Windows → Czech, anything else → English)
 - the editor above a result can be resized: drag the line between the editor and the result; the height is remembered
 - double-clicking a column's resize handle fits the column to its longest value (sampled from the first 2 000 rows, at most 800 px)
 

@@ -149,15 +149,15 @@ pub fn group_thousands(n: u64) -> String {
 pub fn chip_text(slot: &TargetSlot) -> String {
     let label = slot.label();
     match slot.status {
-        TargetStatus::Pending => format!("{label} · čeká"),
-        TargetStatus::Running => format!("{label} · běží"),
-        TargetStatus::Failed => format!("✗ {label} · chyba"),
-        TargetStatus::Cancelled => format!("{label} · zrušeno"),
+        TargetStatus::Pending => dbc_i18n::trf!("{label} · čeká", "{label} · pending"),
+        TargetStatus::Running => dbc_i18n::trf!("{label} · běží", "{label} · running"),
+        TargetStatus::Failed => dbc_i18n::trf!("✗ {label} · chyba", "✗ {label} · error"),
+        TargetStatus::Cancelled => dbc_i18n::trf!("{label} · zrušeno", "{label} · cancelled"),
         TargetStatus::Done => {
             if slot.rows_returned == 0 && slot.writes > 0 {
-                format!("✓ {label} · {} ovlivněno", group_thousands(slot.affected))
+                dbc_i18n::trf!("✓ {label} · {} ovlivněno", "✓ {label} · {} affected", group_thousands(slot.affected))
             } else {
-                format!("✓ {label} · {} ř.", group_thousands(slot.rows_returned))
+                dbc_i18n::trf!("✓ {label} · {} ř.", "✓ {label} · {} rows", group_thousands(slot.rows_returned))
             }
         }
     }
@@ -175,41 +175,41 @@ pub(crate) fn secs(d: Duration) -> String {
 
 pub fn status_line(state: &MultiTargetState) -> String {
     let mut parts = vec![
-        format!("{} cílů", state.targets.len()),
-        format!("{} hotovo", state.count(TargetStatus::Done)),
-        format!("{} chyba", state.count(TargetStatus::Failed)),
-        format!("{} běží", state.count(TargetStatus::Running)),
+        dbc_i18n::trf!("{} cílů", "{} targets", state.targets.len()),
+        dbc_i18n::trf!("{} hotovo", "{} done", state.count(TargetStatus::Done)),
+        dbc_i18n::trf!("{} chyba", "{} failed", state.count(TargetStatus::Failed)),
+        dbc_i18n::trf!("{} běží", "{} running", state.count(TargetStatus::Running)),
     ];
     if state.show_merged {
-        parts.push("sloučeno".to_string());
+        parts.push(dbc_i18n::tr!("sloučeno", "merged").to_string());
         let failed = state.count(TargetStatus::Failed);
         if failed > 0 {
             let noun = match failed {
-                1 => "cíl s chybou není",
-                2..=4 => "cíle s chybou nejsou",
-                _ => "cílů s chybou není",
+                1 => dbc_i18n::tr!("cíl s chybou není", "target with an error is not"),
+                2..=4 => dbc_i18n::tr!("cíle s chybou nejsou", "targets with errors are not"),
+                _ => dbc_i18n::tr!("cílů s chybou není", "targets with errors are not"),
             };
-            parts.push(format!("{failed} {noun} ve sloučení"));
+            parts.push(dbc_i18n::trf!("{failed} {noun} ve sloučení", "{failed} {noun} in the merge"));
         }
         return parts.join(" · ");
     }
     if let Some(t) = state.targets.get(state.active) {
         parts.push(t.label());
         match t.status {
-            TargetStatus::Failed => parts.push("chyba".to_string()),
+            TargetStatus::Failed => parts.push(dbc_i18n::tr!("chyba", "error").to_string()),
             TargetStatus::Done => {
                 if t.rows_returned == 0 && t.writes > 0 {
-                    parts.push(format!("{} ovlivněno", group_thousands(t.affected)));
+                    parts.push(dbc_i18n::trf!("{} ovlivněno", "{} affected", group_thousands(t.affected)));
                 } else {
-                    parts.push(format!("{} ř.", group_thousands(t.rows_returned)));
+                    parts.push(dbc_i18n::trf!("{} ř.", "{} rows", group_thousands(t.rows_returned)));
                 }
                 if let Some(e) = t.elapsed {
                     parts.push(secs(e));
                 }
             }
-            TargetStatus::Running => parts.push("běží".to_string()),
-            TargetStatus::Pending => parts.push("čeká".to_string()),
-            TargetStatus::Cancelled => parts.push("zrušeno".to_string()),
+            TargetStatus::Running => parts.push(dbc_i18n::tr!("běží", "running").to_string()),
+            TargetStatus::Pending => parts.push(dbc_i18n::tr!("čeká", "pending").to_string()),
+            TargetStatus::Cancelled => parts.push(dbc_i18n::tr!("zrušeno", "cancelled").to_string()),
         }
     }
     parts.join(" · ")
@@ -259,7 +259,7 @@ fn merged_plan_from(inputs: &[(usize, String, Rc<RefCell<ResultBuffer>>)]) -> db
         .iter()
         .map(|(_, _, buf)| buf.borrow().schema().fields().iter().map(|f| f.name().to_string()).collect())
         .collect();
-    dbc_connect::targets::union_columns("zdroj", &schemas)
+    dbc_connect::targets::union_columns(dbc_i18n::tr!("zdroj", "source"), &schemas)
 }
 
 /// The merged buffer for a set of `(target_ix, label, buffer)` inputs:

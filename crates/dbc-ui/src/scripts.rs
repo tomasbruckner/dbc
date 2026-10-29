@@ -86,11 +86,11 @@ fn is_sql_name(name: &str) -> bool {
 /// entry — the app shows what the user put there but never adds hidden
 /// entries itself.
 fn list_dir_sorted(dir: &Path, rel_prefix: &str, depth: usize) -> Result<Vec<ScriptEntry>, String> {
-    let rd = fs::read_dir(dir).map_err(|e| format!("nelze číst složku {}: {e}", dir.display()))?;
+    let rd = fs::read_dir(dir).map_err(|e| dbc_i18n::trf!("nelze číst složku {}: {e}", "cannot read folder {}: {e}", dir.display()))?;
     let mut folders: Vec<String> = Vec::new();
     let mut files: Vec<String> = Vec::new();
     for ent in rd {
-        let ent = ent.map_err(|e| format!("nelze číst složku {}: {e}", dir.display()))?;
+        let ent = ent.map_err(|e| dbc_i18n::trf!("nelze číst složku {}: {e}", "cannot read folder {}: {e}", dir.display()))?;
         let Some(name) = ent.file_name().to_str().map(str::to_string) else { continue };
         let Ok(ft) = ent.file_type() else { continue };
         if ft.is_symlink() {
@@ -129,7 +129,7 @@ fn list_dir_sorted(dir: &Path, rel_prefix: &str, depth: usize) -> Result<Vec<Scr
 /// Vec already in render order.
 pub fn scan_scripts(root: &Path) -> Result<ScriptScan, String> {
     if !root.is_dir() {
-        return Err(format!("složka neexistuje: {}", root.display()));
+        return Err(dbc_i18n::trf!("složka neexistuje: {}", "folder does not exist: {}", root.display()));
     }
     let mut entries: Vec<ScriptEntry> = Vec::new();
     let mut truncated = false;
@@ -201,7 +201,7 @@ pub fn resolve_rel(root: &Path, rel: &str) -> Result<PathBuf, String> {
 /// writers over this root (config, vault, prefs) inherit it.
 pub fn resolve_entry_rel(root: &Path, rel: &str) -> Result<PathBuf, String> {
     if rel.trim().is_empty() {
-        return Err("kořen knihovny nelze měnit".to_string());
+        return Err(dbc_i18n::tr!("kořen knihovny nelze měnit", "the library root cannot be changed").to_string());
     }
     resolve_rel(root, rel)
 }
@@ -221,28 +221,32 @@ const RESERVED_NAMES: [&str; 28] = [
 pub fn validate_script_name(name: &str, is_file: bool) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() {
-        return Err("zadejte název".to_string());
+        return Err(dbc_i18n::tr!("zadejte název", "enter a name").to_string());
     }
     let mut full = name.to_string();
     if is_file && !is_sql_name(&full) {
         full.push_str(".sql");
     }
     if full.chars().count() > SCRIPT_NAME_CAP {
-        return Err(format!("název je příliš dlouhý (limit {SCRIPT_NAME_CAP} znaků)"));
+        return Err(dbc_i18n::trf!("název je příliš dlouhý (limit {SCRIPT_NAME_CAP} znaků)", "name is too long (limit {SCRIPT_NAME_CAP} characters)"));
     }
     if full
         .chars()
         .any(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control())
     {
-        return Err("název obsahuje nepovolené znaky".to_string());
+        return Err(dbc_i18n::tr!("název obsahuje nepovolené znaky", "name contains disallowed characters").to_string());
     }
     if full.starts_with('.') || full.ends_with('.') || full.starts_with(' ') || full.ends_with(' ')
     {
-        return Err("název nesmí začínat ani končit tečkou nebo mezerou".to_string());
+        return Err(dbc_i18n::tr!(
+            "název nesmí začínat ani končit tečkou nebo mezerou",
+            "name must not start or end with a dot or a space"
+        )
+        .to_string());
     }
     let stem = full.split('.').next().unwrap_or("");
     if RESERVED_NAMES.contains(&stem.to_ascii_uppercase().as_str()) {
-        return Err("název je rezervovaný systémem".to_string());
+        return Err(dbc_i18n::tr!("název je rezervovaný systémem", "name is reserved by the system").to_string());
     }
     Ok(full)
 }
@@ -279,7 +283,7 @@ pub fn create_script(root: &Path, parent_rel: &str, name: &str) -> Result<String
     let file = validate_script_name(name, true)?;
     let parent = resolve_rel(root, parent_rel)?;
     if conflicting_name(&parent, &file, None)?.is_some() {
-        return Err("název už existuje".to_string());
+        return Err(dbc_i18n::tr!("název už existuje", "name already exists").to_string());
     }
     write_script(&parent.join(&file), "")?;
     Ok(joined_rel(parent_rel, &file))
@@ -290,9 +294,9 @@ pub fn create_folder(root: &Path, parent_rel: &str, name: &str) -> Result<String
     let folder = validate_script_name(name, false)?;
     let parent = resolve_rel(root, parent_rel)?;
     if conflicting_name(&parent, &folder, None)?.is_some() {
-        return Err("název už existuje".to_string());
+        return Err(dbc_i18n::tr!("název už existuje", "name already exists").to_string());
     }
-    fs::create_dir(parent.join(&folder)).map_err(|e| format!("vytvoření složky selhalo: {e}"))?;
+    fs::create_dir(parent.join(&folder)).map_err(|e| dbc_i18n::trf!("vytvoření složky selhalo: {e}", "creating the folder failed: {e}"))?;
     Ok(joined_rel(parent_rel, &folder))
 }
 
@@ -306,9 +310,9 @@ pub fn rename_entry(root: &Path, rel: &str, new_name: &str, is_dir: bool) -> Res
     let (parent_rel, old_name) = rel.rsplit_once('/').unwrap_or(("", rel));
     let parent = resolve_rel(root, parent_rel)?;
     if conflicting_name(&parent, &new_file, Some(old_name))?.is_some() {
-        return Err("název už existuje".to_string());
+        return Err(dbc_i18n::tr!("název už existuje", "name already exists").to_string());
     }
-    fs::rename(&old, parent.join(&new_file)).map_err(|e| format!("přejmenování selhalo: {e}"))?;
+    fs::rename(&old, parent.join(&new_file)).map_err(|e| dbc_i18n::trf!("přejmenování selhalo: {e}", "rename failed: {e}"))?;
     Ok(joined_rel(parent_rel, &new_file))
 }
 
@@ -319,13 +323,17 @@ pub fn delete_entry(root: &Path, rel: &str, is_dir: bool) -> Result<(), String> 
     let p = resolve_entry_rel(root, rel)?;
     if is_dir {
         let mut rd =
-            fs::read_dir(&p).map_err(|e| format!("nelze číst složku {}: {e}", p.display()))?;
+            fs::read_dir(&p).map_err(|e| dbc_i18n::trf!("nelze číst složku {}: {e}", "cannot read folder {}: {e}", p.display()))?;
         if rd.next().is_some() {
-            return Err("složka není prázdná — smažte nejdřív její obsah".to_string());
+            return Err(dbc_i18n::tr!(
+                "složka není prázdná — smažte nejdřív její obsah",
+                "folder is not empty — delete its contents first"
+            )
+            .to_string());
         }
-        fs::remove_dir(&p).map_err(|e| format!("smazání selhalo: {e}"))
+        fs::remove_dir(&p).map_err(|e| dbc_i18n::trf!("smazání selhalo: {e}", "delete failed: {e}"))
     } else {
-        fs::remove_file(&p).map_err(|e| format!("smazání selhalo: {e}"))
+        fs::remove_file(&p).map_err(|e| dbc_i18n::trf!("smazání selhalo: {e}", "delete failed: {e}"))
     }
 }
 
@@ -343,17 +351,19 @@ pub fn write_script(path: &Path, text: &str) -> Result<(), String> {
 /// Reads a script for the EDITOR: refuses symlinks, > `SCRIPT_OPEN_CAP`,
 /// and non-UTF-8 (an error, not a lossy mangle — design §5.1).
 pub fn read_script(path: &Path) -> Result<String, String> {
-    let meta = fs::symlink_metadata(path).map_err(|e| format!("soubor nelze otevřít: {e}"))?;
+    let meta = fs::symlink_metadata(path).map_err(|e| dbc_i18n::trf!("soubor nelze otevřít: {e}", "cannot open file: {e}"))?;
     if meta.file_type().is_symlink() {
-        return Err("symbolické odkazy nejsou podporovány".to_string());
+        return Err(dbc_i18n::tr!("symbolické odkazy nejsou podporovány", "symbolic links are not supported").to_string());
     }
     if meta.len() > SCRIPT_OPEN_CAP {
-        return Err(
-            "soubor je příliš velký pro editor (limit 1 MiB) — spusťte jej jako skript".to_string(),
-        );
+        return Err(dbc_i18n::tr!(
+            "soubor je příliš velký pro editor (limit 1 MiB) — spusťte jej jako skript",
+            "file is too large for the editor (limit 1 MiB) — run it as a script"
+        )
+        .to_string());
     }
-    let bytes = fs::read(path).map_err(|e| format!("soubor nelze otevřít: {e}"))?;
-    String::from_utf8(bytes).map_err(|_| "soubor není platné UTF-8".to_string())
+    let bytes = fs::read(path).map_err(|e| dbc_i18n::trf!("soubor nelze otevřít: {e}", "cannot open file: {e}"))?;
+    String::from_utf8(bytes).map_err(|_| dbc_i18n::tr!("soubor není platné UTF-8", "file is not valid UTF-8").to_string())
 }
 
 #[cfg(test)]

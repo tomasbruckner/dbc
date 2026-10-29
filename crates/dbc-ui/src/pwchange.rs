@@ -33,10 +33,10 @@ pub fn detect(engine: Engine, err: &QueryError) -> Option<PwChangeKind> {
 
 pub fn validate_new_password(new1: &str, new2: &str) -> Result<(), String> {
     if new1.is_empty() {
-        return Err("zadejte nové heslo".to_string());
+        return Err(dbc_i18n::tr!("zadejte nové heslo", "enter a new password").to_string());
     }
     if new1 != new2 {
-        return Err("hesla se neshodují".to_string());
+        return Err(dbc_i18n::tr!("hesla se neshodují", "the passwords do not match").to_string());
     }
     Ok(())
 }
@@ -45,7 +45,7 @@ pub fn validate_new_password(new1: &str, new2: &str) -> Result<(), String> {
 /// UŽIVATEL je vždy chyba.
 pub fn validate_pg_admin(admin_user: &str) -> Result<(), String> {
     if admin_user.trim().is_empty() {
-        return Err("zadejte administrátorský účet".to_string());
+        return Err(dbc_i18n::tr!("zadejte administrátorský účet", "enter an administrator account").to_string());
     }
     Ok(())
 }
@@ -59,14 +59,19 @@ pub fn esc_closable(all_password_fields_empty: bool, running: bool) -> bool {
 
 pub fn dialog_body(kind: PwChangeKind, user: &str) -> String {
     match kind {
-        PwChangeKind::MssqlMustChange => format!(
+        PwChangeKind::MssqlMustChange => dbc_i18n::trf!(
             "Server vyžaduje změnu hesla pro přihlášení „{user}“. Změna proběhne \
-             při přihlášení (ODBC mechanismus, žádné SQL) a nové heslo se uloží do trezoru."
+             při přihlášení (ODBC mechanismus, žádné SQL) a nové heslo se uloží do trezoru.",
+            "The server requires a password change for login “{user}”. The change happens \
+             during sign-in (ODBC mechanism, no SQL) and the new password is saved to the vault."
         ),
-        PwChangeKind::PgMaybeExpired => format!(
+        PwChangeKind::PgMaybeExpired => dbc_i18n::trf!(
             "Přihlášení uživatele „{user}“ selhalo — heslo je nesprávné, nebo mu \
              vypršela platnost (PostgreSQL to nerozlišuje). Změnu provede zadaný \
-             účet s právem CREATEROLE; nové heslo se uloží do trezoru."
+             účet s právem CREATEROLE; nové heslo se uloží do trezoru.",
+            "Login for user “{user}” failed — the password is wrong or has \
+             expired (PostgreSQL does not distinguish). The change is made by the given \
+             account with the CREATEROLE privilege; the new password is saved to the vault."
         ),
     }
 }
@@ -74,7 +79,7 @@ pub fn dialog_body(kind: PwChangeKind, user: &str) -> String {
 /// Redigovaný příkaz pro transparentní zobrazení v dialogu — display_sql
 /// nikdy nezávisí na skutečném hesle, proto prázdný placeholder.
 pub fn pg_rescue_display(user: &str) -> String {
-    format!("Příkaz: {}", crate::admin_sql::alter_password_rescue_pg(user, "").display_sql)
+    dbc_i18n::trf!("Příkaz: {}", "Statement: {}", crate::admin_sql::alter_password_rescue_pg(user, "").display_sql)
 }
 
 /// Tlačítko „Test" v dialogu připojení modal otevřít nesmí (single-modal
@@ -84,12 +89,14 @@ pub fn enrich_test_error(engine: Engine, err: &QueryError) -> String {
         return format!("{err}\n{hint}");
     }
     match detect(engine, err) {
-        Some(PwChangeKind::MssqlMustChange) => format!(
+        Some(PwChangeKind::MssqlMustChange) => dbc_i18n::trf!(
             "{err}\nserver vyžaduje změnu hesla — zavři tento dialog a přepni se na připojení \
-             (pravý klik na řádek → „Nastavit jako aktivní“); teprve pak aplikace nabídne změnu"
+             (pravý klik na řádek → „Nastavit jako aktivní“); teprve pak aplikace nabídne změnu",
+            "{err}\nthe server requires a password change — close this dialog and switch to the connection \
+             (right-click the row → “Set as active”); only then will the app offer the change"
         ),
         Some(PwChangeKind::PgMaybeExpired) => {
-            format!("{err}\npokud heslu vypršela platnost, aplikace při přepnutí na připojení nabídne změnu")
+            dbc_i18n::trf!("{err}\npokud heslu vypršela platnost, aplikace při přepnutí na připojení nabídne změnu", "{err}\nif the password has expired, the app will offer a change when you switch to the connection")
         }
         None => err.to_string(),
     }
@@ -113,10 +120,15 @@ fn network_address_hint(engine: Engine, err: &QueryError) -> Option<String> {
         return None;
     }
     Some(
-        "adresu serveru odmítla síťová vrstva SQL Serveru — na přihlášení vůbec nedošlo, \
-         takže to není heslem ani databází. Zkontroluj Host (jen jméno serveru nebo IP) \
-         a Port."
-            .to_string(),
+        dbc_i18n::tr!(
+            "adresu serveru odmítla síťová vrstva SQL Serveru — na přihlášení vůbec nedošlo, \
+             takže to není heslem ani databází. Zkontroluj Host (jen jméno serveru nebo IP) \
+             a Port.",
+            "the SQL Server network layer rejected the server address — login was never attempted, \
+             so it is not the password or the database. Check Host (server name or IP only) \
+             and Port."
+        )
+        .to_string(),
     )
 }
 

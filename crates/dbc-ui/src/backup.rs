@@ -85,8 +85,9 @@ pub fn backup_restore_available(engine: Engine) -> bool {
 /// only to the value given via `-d`/`--dbname`, never to `-h`/`-p`/`-U`.
 pub fn validate_pg_dbname(name: &str) -> Result<(), String> {
     if name.contains('=') || name.contains("://") {
-        Err(format!(
-            "neplatný název databáze (obsahuje '=' nebo '://', což by mohlo být vyloženo jako connection string): {name}"
+        Err(dbc_i18n::trf!(
+            "neplatný název databáze (obsahuje '=' nebo '://', což by mohlo být vyloženo jako connection string): {name}",
+            "invalid database name (contains '=' or '://', which could be read as a connection string): {name}"
         ))
     } else {
         Ok(())
@@ -433,7 +434,7 @@ pub fn backup_exempt_from_read_only(op: BackupOp) -> bool {
 /// module stays free of any `Connection`/async dependency).
 pub fn guard_backup_restore_read_only(op: BackupOp, read_only: bool) -> Result<(), String> {
     if read_only && !backup_exempt_from_read_only(op) {
-        Err("připojení je jen pro čtení".to_string())
+        Err(dbc_i18n::tr!("připojení je jen pro čtení", "the connection is read-only").to_string())
     } else {
         Ok(())
     }
@@ -1107,7 +1108,10 @@ pub fn run_and_stream(
     // dialog) regardless of platform.
     if program.contains('\0') || args.iter().any(|a| a.contains('\0')) {
         let _ = tx.send(BackupEvent::Failed(redact_secret(
-            "neplatná cesta nebo argument: obsahuje NUL bajt",
+            dbc_i18n::tr!(
+                "neplatná cesta nebo argument: obsahuje NUL bajt",
+                "invalid path or argument: contains a NUL byte"
+            ),
             password,
         )));
         return handle;
@@ -1181,7 +1185,7 @@ pub fn run_and_stream(
                 }
                 Ok(status) => {
                     let _ = tx_bg.send(BackupEvent::Failed(redact_secret(
-                        &format!("{program_owned} skončil s chybou ({status})"),
+                        &dbc_i18n::trf!("{program_owned} skončil s chybou ({status})", "{program_owned} exited with an error ({status})"),
                         password_owned.as_deref(),
                     )));
                 }
@@ -1194,7 +1198,7 @@ pub fn run_and_stream(
             },
             None => {
                 // Cancelled mid-stream — `cancel()` already killed+waited it.
-                let _ = tx_bg.send(BackupEvent::Failed("přerušeno uživatelem".to_string()));
+                let _ = tx_bg.send(BackupEvent::Failed(dbc_i18n::tr!("přerušeno uživatelem", "cancelled by the user").to_string()));
             }
         }
     });

@@ -36,6 +36,7 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 
+mod i18n_audit;
 mod admin_panel;
 mod admin_sql;
 mod autocomplete;
@@ -95,6 +96,7 @@ use std::rc::Rc;
 
 use dbc_buffer::ResultBuffer;
 use dbc_connect::targets::Target;
+use dbc_i18n::{tr, trf};
 use dbc_core::arrow::datatypes::SchemaRef;
 use dbc_core::{
     apply_auto_limit_d, find_params, is_read_statement_d, quote_qualified_d, substitute_params,
@@ -338,18 +340,18 @@ fn build_param_sql(
         Some((text, false)) => sandbox::sql_value(Some(text.as_str()), true),
         None => sandbox::sql_value(None, true), // unreachable: every :name in sql_template is in `names`
     })
-    .ok_or_else(|| "nepodařilo se sestavit SQL".to_string())?;
+    .ok_or_else(|| tr!("nepodařilo se sestavit SQL", "could not build the SQL").to_string())?;
 
     match find_params(&substituted) {
         Some(remaining) if !remaining.is_empty() => {
-            Err("po dosazení hodnot zůstal v SQL neplatný parametr — spuštění zrušeno".to_string())
+            Err(tr!("po dosazení hodnot zůstal v SQL neplatný parametr — spuštění zrušeno", "an invalid parameter remained in the SQL after substitution — run cancelled").to_string())
         }
         Some(_) => Ok(substituted),
         // Fail closed: an unscannable substitution result (e.g. a value that
         // re-opened a dollar-quote, `$tag:x$` + `1` → `$tag1$…`) means the
         // rescan proved nothing — refuse rather than hand the driver SQL the
         // guard chain could not inspect.
-        None => Err("po dosazení hodnot nelze SQL znovu ověřit — spuštění zrušeno".to_string()),
+        None => Err(tr!("po dosazení hodnot nelze SQL znovu ověřit — spuštění zrušeno", "the SQL cannot be re-verified after substitution — run cancelled").to_string()),
     }
 }
 
@@ -801,7 +803,7 @@ fn multi_target_preflight(
         let Some(cfg) = config.connections.iter().find(|c| c.id == t.conn_id) else { continue };
         let Some(dialect) = dialect_for_engine(cfg.engine) else { continue };
         let stmts = dbc_core::split_sql(sql, dialect)
-            .map_err(|e| format!("error: SQL nelze rozdělit na příkazy: {}", split_error_message(e)))?;
+            .map_err(|e| trf!("error: SQL nelze rozdělit na příkazy: {}", "error: could not split SQL into statements: {}", split_error_message(e)))?;
         let stmts: Vec<String> = stmts.into_iter().filter(|s| !s.trim().is_empty()).collect();
         if stmts.iter().any(|s| !is_read_statement_d(s, dialect)) {
             writes = true;
@@ -816,7 +818,7 @@ fn multi_target_preflight(
         });
     }
     if per_target.is_empty() {
-        return Err("Žádný z vybraných cílů už neexistuje.".to_string());
+        return Err(tr!("Žádný z vybraných cílů už neexistuje.", "None of the selected targets exist any more.").to_string());
     }
     let conns: Vec<(&str, bool)> =
         per_target.iter().map(|p| (p.target.conn_name.as_str(), p.read_only)).collect();
@@ -825,7 +827,7 @@ fn multi_target_preflight(
         let mut names = refused;
         names.sort();
         names.dedup();
-        return Err(format!("Zápis odmítnut — připojení jen pro čtení: {}", names.join(", ")));
+        return Err(trf!("Zápis odmítnut — připojení jen pro čtení: {}", "Write refused — read-only connection: {}", names.join(", ")));
     }
     Ok(MultiTargetPreflight { per_target, writes })
 }
@@ -859,7 +861,7 @@ fn failed_statement_is_cancel(run_cancelled: bool, code: Option<&str>) -> bool {
 pub(crate) fn split_error_message(e: dbc_core::SplitError) -> String {
     match e {
         dbc_core::SplitError::UnsupportedGoCount => {
-            "GO s počtem opakování není podporováno".to_string()
+            tr!("GO s počtem opakování není podporováno", "GO with a repeat count is not supported").to_string()
         }
         other => format!("{other:?}"),
     }
@@ -964,13 +966,15 @@ fn script_options_valid(scope: runner::TxScope, policy: runner::ErrorPolicy) -> 
 fn script_history_sql(files: &[(PathBuf, usize)], statements_run: usize, statements_failed: usize) -> String {
     let total: usize = files.iter().map(|(_, n)| n).sum();
     if files.len() == 1 {
-        format!(
+        trf!(
             "[skript] {} — {total} příkazů, {statements_run} OK, {statements_failed} chyb",
+            "[script] {} — {total} statements, {statements_run} OK, {statements_failed} errors",
             files[0].0.display()
         )
     } else {
-        format!(
+        trf!(
             "[skript] {} souborů, {total} příkazů, {statements_run} OK, {statements_failed} chyb",
+            "[script] {} files, {total} statements, {statements_run} OK, {statements_failed} errors",
             files.len()
         )
     }
@@ -997,14 +1001,14 @@ fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<Ap
     let running = matches!(s.outcome, ScriptRunOutcome::Running);
     let theme = *cx.theme();
     let (outcome_label, outcome_color) = match s.outcome {
-        ScriptRunOutcome::Running => ("běží…", theme.warn),
-        ScriptRunOutcome::Done => ("Hotovo", theme.success),
-        ScriptRunOutcome::Failed => ("Selhalo", theme.danger),
+        ScriptRunOutcome::Running => (tr!("běží…", "running…"), theme.warn),
+        ScriptRunOutcome::Done => (tr!("Hotovo", "Done"), theme.success),
+        ScriptRunOutcome::Failed => (tr!("Selhalo", "Failed"), theme.danger),
         // G14 T9: no Rulebook-listed field for this exact hex (0x9399b2,
         // Catppuccin overlay2) — nearest role match is the general
         // secondary/de-emphasized text field, kept distinct from
         // warn/success/danger used by the other three arms above.
-        ScriptRunOutcome::Cancelled => ("Zrušeno", theme.text_muted),
+        ScriptRunOutcome::Cancelled => (tr!("Zrušeno", "Cancelled"), theme.text_muted),
     };
 
     let mut header = div()
@@ -1015,10 +1019,10 @@ fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<Ap
         .p_2()
         .bg(theme.bg_app)
         .text_color(theme.text_primary)
-        .child(format!("{files_done}/{files_total} souborů"))
-        .child(format!("{}/{} příkazů", s.statements_run, s.total_statements));
+        .child(trf!("{files_done}/{files_total} souborů", "{files_done}/{files_total} files"))
+        .child(trf!("{}/{} příkazů", "{}/{} statements", s.statements_run, s.total_statements));
     if let Some((done, total)) = s.progress_rows {
-        header = header.child(format!("{done}/{total} řádků"));
+        header = header.child(trf!("{done}/{total} řádků", "{done}/{total} rows"));
     }
     header = header
         .child(format!("{:.1}s", elapsed.as_secs_f32()))
@@ -1032,7 +1036,7 @@ fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<Ap
                 .py_1()
                 .bg(theme.diff_deleted_bg)
                 .rounded_md()
-                .child("Zrušit")
+                .child(tr!("Zrušit", "Cancel"))
                 .on_click(cx.listener(|view, _, _, cx| {
                     if let Some(c) = view.editor_mut().cancel.take() {
                         c.cancel();
@@ -1057,8 +1061,9 @@ fn render_script_run_tab(state: Rc<RefCell<ScriptRunState>>, cx: &mut Context<Ap
                 .flex()
                 .flex_row()
                 .gap_2()
-                .child(format!(
+                .child(trf!(
                     "{glyph} {} ({} OK, {} chyb)",
+                    "{glyph} {} ({} OK, {} errors)",
                     f.name, f.statements_run, f.statements_failed
                 )),
         );
@@ -1164,7 +1169,7 @@ fn render_multi_target_tab(
             .bg(if s.show_merged { theme.bg_selected } else { theme.bg_panel })
             .text_color(if merged_enabled { theme.text_primary } else { theme.text_disabled })
             .when(merged_enabled, |d| d.cursor_pointer())
-            .child(if merged_enabled { "Vše sloučeně" } else { "Vše sloučeně (po dokončení)" })
+            .child(if merged_enabled { tr!("Vše sloučeně", "All merged") } else { tr!("Vše sloučeně (po dokončení)", "All merged (when finished)") })
             .when(merged_enabled, |d| {
                 d.on_click(cx.listener(move |view, _, _, cx| {
                     view.activate_merged_view(st.clone(), cx);
@@ -1188,7 +1193,7 @@ fn render_multi_target_tab(
                         .id(("mt-result", rix))
                         .cursor_pointer()
                         .text_color(if active { theme.text_primary } else { theme.text_muted })
-                        .child(format!("Výsledek {}", rix + 1))
+                        .child(trf!("Výsledek {}", "Result {}", rix + 1))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             // Read the CURRENT active target at click time,
                             // not the one captured at render — one
@@ -1211,23 +1216,24 @@ fn render_multi_target_tab(
                 );
             }
             TargetStatus::Pending => {
-                body = body.child(div().p_2().text_color(theme.text_muted).child("Čeká na spuštění"));
+                body = body.child(div().p_2().text_color(theme.text_muted).child(tr!("Čeká na spuštění", "Waiting to run")));
             }
             TargetStatus::Running | TargetStatus::Done | TargetStatus::Cancelled => {
                 if let Some(r) = t.results.get(t.active_result) {
                     body = body.child(r.grid.clone());
                 } else if t.status == TargetStatus::Running {
                     body = body.child(
-                        div().p_2().text_color(theme.text_muted).child(format!("Připojuji k {}…", t.label())),
+                        div().p_2().text_color(theme.text_muted).child(trf!("Připojuji k {}…", "Connecting to {}…", t.label())),
                     );
                 } else if t.status == TargetStatus::Done {
                     let e = t.elapsed.map(multi_target::secs).unwrap_or_default();
-                    body = body.child(div().p_2().text_color(theme.text_muted).child(format!(
+                    body = body.child(div().p_2().text_color(theme.text_muted).child(trf!(
                         "{} příkazů · {} ovlivněno · {e}",
+                        "{} statements · {} affected · {e}",
                         t.statements_total, t.affected
                     )));
                 } else {
-                    body = body.child(div().p_2().text_color(theme.text_muted).child("Zrušeno"));
+                    body = body.child(div().p_2().text_color(theme.text_muted).child(tr!("Zrušeno", "Cancelled")));
                 }
             }
         }
@@ -1727,9 +1733,9 @@ fn script_caption_rel(path: &Path, root: Option<&Path>) -> String {
 /// see `tabs::collapse_title`'s callers).
 fn script_caption(rel: &str, dirty: bool) -> String {
     if dirty {
-        format!("Skript: {rel} •")
+        trf!("Skript: {rel} •", "Script: {rel} •")
     } else {
-        format!("Skript: {rel}")
+        trf!("Skript: {rel}", "Script: {rel}")
     }
 }
 
@@ -1899,7 +1905,9 @@ fn script_binding_retarget(
 /// T9 review MAJOR-1: the refusal when Ctrl+S arrives while a dialog owns
 /// the screen. Like [`SCRIPT_SAVE_IN_FLIGHT`] it is deliberately NOT an
 /// „error:" — nothing failed, and the way out is one Esc away.
-pub(crate) const SCRIPT_SAVE_BLOCKED: &str = "nejprve zavřete otevřený dialog";
+pub(crate) fn script_save_blocked() -> &'static str {
+    tr!("nejprve zavřete otevřený dialog", "close the open dialog first")
+}
 
 /// FINAL-REVIEW MAJOR-2 — the Ctrl+S guard, as a TYPE the compiler
 /// enforces instead of a regex a reviewer can walk around.
@@ -2141,7 +2149,9 @@ use save_guard::{with_save_permission, SaveAllowed};
 /// flight. Not an „error:" — nothing failed; the user's keystroke simply
 /// arrived while the previous write was still fsyncing, and the „ •" stays
 /// up so they can see the buffer is not yet on disk.
-pub(crate) const SCRIPT_SAVE_IN_FLIGHT: &str = "ukládání skriptu už probíhá";
+pub(crate) fn script_save_in_flight() -> &'static str {
+    tr!("ukládání skriptu už probíhá", "a script save is already in progress")
+}
 
 /// RE-VERIFY: the refusal when something tries to replace the editor's
 /// buffer while it holds unsaved changes nobody agreed to lose.
@@ -2149,8 +2159,12 @@ pub(crate) const SCRIPT_SAVE_IN_FLIGHT: &str = "ukládání skriptu už probíh�
 /// Unreachable through `editor_load_guarded`, which is the point — this is
 /// what a NEW path that forgot the guard now hits instead of silently
 /// destroying the user's text. Not an „error:": nothing failed.
-pub(crate) const SCRIPT_LOAD_BLOCKED: &str =
-    "editor má neuložené změny — nejprve je uložte nebo zahoďte";
+pub(crate) fn script_load_blocked() -> &'static str {
+    tr!(
+        "editor má neuložené změny — nejprve je uložte nebo zahoďte",
+        "the editor has unsaved changes — save or discard them first"
+    )
+}
 
 /// May an in-flight `open_script` still replace the editor's buffer?
 ///
@@ -2199,13 +2213,13 @@ fn script_open_abort_reason(
     // difference needs a re-pick that spells the same folder differently),
     // but „harmless today" is how the last fold divergence started.
     if !root_now.is_some_and(|r| same_path_ci(r, root_dispatched)) {
-        return Some("otevření skriptu zrušeno — složka skriptů se mezitím změnila");
+        return Some(tr!("otevření skriptu zrušeno — složka skriptů se mezitím změnila", "script open cancelled — the scripts folder changed in the meantime"));
     }
     if binding_now != binding_dispatched {
-        return Some("otevření skriptu zrušeno — editor se mezitím změnil");
+        return Some(tr!("otevření skriptu zrušeno — editor se mezitím změnil", "script open cancelled — the editor changed in the meantime"));
     }
     if text_now != text_dispatched {
-        return Some("otevření skriptu zrušeno — mezitím jste psali do editoru");
+        return Some(tr!("otevření skriptu zrušeno — mezitím jste psali do editoru", "script open cancelled — you typed in the editor in the meantime"));
     }
     None
 }
@@ -2216,8 +2230,8 @@ fn script_open_abort_reason(
 /// the count IS the information and „(1)" would be a downgrade.
 fn discard_confirm_question(script_rel: Option<&str>, change_count: usize) -> String {
     match script_rel {
-        Some(rel) => format!("Neuložené změny skriptu {rel} budou zahozeny."),
-        None => format!("Neuložené změny ({change_count}) — zahodit?"),
+        Some(rel) => trf!("Neuložené změny skriptu {rel} budou zahozeny.", "Unsaved changes to script {rel} will be discarded."),
+        None => trf!("Neuložené změny ({change_count}) — zahodit?", "Unsaved changes ({change_count}) — discard?"),
     }
 }
 
@@ -2957,6 +2971,16 @@ pub(crate) fn clamp_editor_height(h: f32, window_h: f32) -> f32 {
     h.clamp(EDITOR_MIN_H, max)
 }
 
+/// `AppConfig::language` → the process-wide UI language. `None` (never
+/// picked in Settings) follows the Windows display language.
+pub(crate) fn apply_language(config: &AppConfig) {
+    dbc_i18n::set_lang(match config.language {
+        Some(dbc_state::UiLanguage::Cs) => dbc_i18n::Lang::Cs,
+        Some(dbc_state::UiLanguage::En) => dbc_i18n::Lang::En,
+        None => dbc_i18n::system_lang(),
+    });
+}
+
 /// `AppConfig::editor_height` → the working (unclamped) `f32`. The clamp
 /// needs the window, so it happens at render, not here.
 pub(crate) fn editor_height_from(stored: Option<u16>) -> f32 {
@@ -3424,7 +3448,7 @@ impl AppView {
                             // shouldn't stop the others from persisting.
                             // Last error wins in the status line (matches
                             // `save_view_prefs_for_grid`'s posture).
-                            save_error = Some(format!("error ukládání parametrů: {}", e.message));
+                            save_error = Some(trf!("error ukládání parametrů: {}", "error saving parameters: {}", e.message));
                         }
                     }
                 }
@@ -3528,7 +3552,7 @@ impl AppView {
             let conn_meta = Some((false, engine_from_url(&url)));
             (false, None, None, conn_meta, ConnectSpec::Url(url))
         } else {
-            self.tab(editor_id).status = "Bez připojení — vyberte připojení nahoře.".into();
+            self.tab(editor_id).status = tr!("Bez připojení — vyberte připojení nahoře.", "No connection — pick a connection above.").into();
             cx.notify();
             return;
         };
@@ -3548,7 +3572,7 @@ impl AppView {
                 match dbc_core::split_sql(&sql, dialect) {
                     Err(e) => {
                         self.tab(editor_id).status =
-                            format!("error: SQL nelze rozdělit na příkazy: {}", split_error_message(e));
+                            trf!("error: SQL nelze rozdělit na příkazy: {}", "error: could not split SQL into statements: {}", split_error_message(e));
                         cx.notify();
                         return;
                     }
@@ -3727,7 +3751,7 @@ impl AppView {
                                 if let Some(token) = view.tab(editor_id).cancel.take() {
                                     token.cancel();
                                 }
-                                view.tab(editor_id).status = "zrušeno (tab zavřen)".into();
+                                view.tab(editor_id).status = tr!("zrušeno (tab zavřen)", "cancelled (tab closed)").into();
                             } else if let Some(Err(e)) = push_result {
                                 let err_text = e.to_string();
                                 view.tab(editor_id).status = format!("error: {err_text}");
@@ -3930,7 +3954,7 @@ impl AppView {
                                 // status note in this file).
                                 if no_pk_notice {
                                     view.tab(editor_id).status =
-                                        "tabulka nemá primární klíč — jen pro čtení".to_string();
+                                        tr!("tabulka nemá primární klíč — jen pro čtení", "table has no primary key — read-only").to_string();
                                 }
                             }
                             // I2: `Batch` is handled above, before this
@@ -4090,7 +4114,7 @@ impl AppView {
                                             }
                                             RetriggerAction::SkipDirty => {
                                                 view.tab(editor_id).status =
-                                                    "FK joins neaktualizovány — máš rozpracované změny"
+                                                    tr!("FK joins neaktualizovány — máš rozpracované změny", "FK joins not updated — you have pending changes")
                                                         .to_string();
                                             }
                                             RetriggerAction::SkipClosed => {}
@@ -4229,7 +4253,7 @@ impl AppView {
         let buffer = match built {
             Ok(b) => Rc::new(RefCell::new(b)),
             Err(msg) => {
-                self.editor_mut().status = format!("error: sloučení selhalo: {msg}");
+                self.editor_mut().status = trf!("error: sloučení selhalo: {msg}", "error: merge failed: {msg}");
                 cx.notify();
                 return;
             }
@@ -4325,7 +4349,7 @@ impl AppView {
                                 if let Some(token) = view.editor_mut().cancel.take() {
                                     token.cancel();
                                 }
-                                view.editor_mut().status = "zrušeno (tab zavřen)".into();
+                                view.editor_mut().status = tr!("zrušeno (tab zavřen)", "cancelled (tab closed)").into();
                             } else if let Some(Err(e)) = push_result {
                                 let err_text = e.to_string();
                                 view.editor_mut().status = format!("error: {err_text}");
@@ -4369,10 +4393,10 @@ impl AppView {
                                 tab_id = Some(id);
                                 buffer = Some(buf);
                                 with_rows += 1;
-                                view.editor_mut().status = format!("příkaz {}/{total}…{limit_suffix}", index + 1);
+                                view.editor_mut().status = trf!("příkaz {}/{total}…{limit_suffix}", "statement {}/{total}…{limit_suffix}", index + 1);
                             }
                             MultiQueryEvent::StatementStarted { index, total, columns: None } => {
-                                view.editor_mut().status = format!("příkaz {}/{total}…{limit_suffix}", index + 1);
+                                view.editor_mut().status = trf!("příkaz {}/{total}…{limit_suffix}", "statement {}/{total}…{limit_suffix}", index + 1);
                             }
                             // I2: `Batch` handled above, before this
                             // `this.update` call — see the `if let
@@ -4382,8 +4406,9 @@ impl AppView {
                             MultiQueryEvent::StatementFinished { index, affected: Some(n), elapsed } => {
                                 total_affected += n;
                                 writes += 1;
-                                view.editor_mut().status = format!(
+                                view.editor_mut().status = trf!(
                                     "příkaz {} dokončen ({n} řádků, {elapsed:.2?}){limit_suffix}",
+                                    "statement {} finished ({n} rows, {elapsed:.2?}){limit_suffix}",
                                     index + 1
                                 );
                             }
@@ -4405,15 +4430,16 @@ impl AppView {
                                         });
                                     }
                                 }
-                                view.editor_mut().status = format!(
+                                view.editor_mut().status = trf!(
                                     "příkaz {} dokončen ({rows} řádků, {elapsed:.2?}){limit_suffix}",
+                                    "statement {} finished ({rows} rows, {elapsed:.2?}){limit_suffix}",
                                     index + 1
                                 );
                             }
                             MultiQueryEvent::StatementFailed { index, error } => {
                                 match &errored {
                                     None => {
-                                        view.editor_mut().status = format!("selhalo na příkazu #{}: {error}", index + 1);
+                                        view.editor_mut().status = trf!("selhalo na příkazu #{}: {error}", "failed on statement #{}: {error}", index + 1);
                                         let err_text = error.to_string();
                                         view.record_history(
                                             &sql,
@@ -4447,9 +4473,11 @@ impl AppView {
                                     .unwrap_or(0);
                                 match &errored {
                                     None => {
-                                        view.editor_mut().status = format!(
+                                        view.editor_mut().status = trf!(
                                             "{total_statements} příkazů, {with_rows} s výsledky, \
-                                             {writes} zápisů ({total_affected} řádků) — hotovo{limit_suffix}"
+                                             {writes} zápisů ({total_affected} řádků) — hotovo{limit_suffix}",
+                                            "{total_statements} statements, {with_rows} with results, \
+                                             {writes} writes ({total_affected} rows) — done{limit_suffix}"
                                         );
                                         let row_count = rows_returned as i64 + total_affected as i64;
                                         view.record_history(
@@ -4638,7 +4666,7 @@ impl AppView {
             slots.push((p.target.conn_name.clone(), p.target.database.clone()));
         }
         if runs.is_empty() {
-            self.tab(editor_id).status = "Žádný z vybraných cílů už neexistuje.".into();
+            self.tab(editor_id).status = tr!("Žádný z vybraných cílů už neexistuje.", "None of the selected targets exist any more.").into();
             cx.notify();
             return;
         }
@@ -4703,7 +4731,7 @@ impl AppView {
                     if tab.run_generation == my_generation {
                         tab.cancel = None;
                         tab.started_at = None;
-                        tab.status = "zrušeno (tab zavřen)".into();
+                        tab.status = tr!("zrušeno (tab zavřen)", "cancelled (tab closed)").into();
                     }
                 }
                 closed
@@ -4883,7 +4911,7 @@ impl AppView {
                                     TargetOutcome::Cancelled => TargetStatus::Cancelled,
                                 };
                                 if t.status == TargetStatus::Failed && t.error.is_none() {
-                                    t.error = Some("neznámá chyba".into());
+                                    t.error = Some(tr!("neznámá chyba", "unknown error").into());
                                 }
                             }
                         }
@@ -4943,7 +4971,7 @@ impl AppView {
         }
         if let Some(tok) = self.editor_mut().cancel.take() {
             tok.cancel();
-            self.editor_mut().status = "zrušeno (tab zavřen)".into();
+            self.editor_mut().status = tr!("zrušeno (tab zavřen)", "cancelled (tab closed)").into();
         }
     }
 
@@ -4973,7 +5001,7 @@ impl AppView {
             return; // resolve_spec_for_explain already set self.editor().status
         };
         let Some(dialect) = dialect_for_engine(engine) else {
-            self.editor_mut().status = "error: skripty nejsou podporovány pro tento engine".to_string();
+            self.editor_mut().status = tr!("error: skripty nejsou podporovány pro tento engine", "error: scripts are not supported for this engine").to_string();
             cx.notify();
             return;
         };
@@ -4986,7 +5014,7 @@ impl AppView {
         // dispatching anything.
         let conn_identity = self.current_conn_identity();
 
-        self.editor_mut().status = "výběr souboru…".to_string();
+        self.editor_mut().status = tr!("výběr souboru…", "choosing a file…").to_string();
         cx.notify();
         // Grounding (design §7 spike, RESOLVED — no extension-filter API
         // exists at the pinned rev: `PathPromptOptions` has no filter field,
@@ -4996,28 +5024,28 @@ impl AppView {
             files: !folder,
             directories: folder,
             multiple: false,
-            prompt: Some("Spustit".into()),
+            prompt: Some(tr!("Spustit", "Run").into()),
         });
         cx.spawn(async move |this, cx| {
             let picked = match dialog.await {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
                 Ok(Ok(_)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = "výběr zrušen".to_string();
+                        view.editor_mut().status = tr!("výběr zrušen", "selection cancelled").to_string();
                         cx.notify();
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = format!("error: dialog selhal: {e}");
+                        view.editor_mut().status = trf!("error: dialog selhal: {e}", "error: dialog failed: {e}");
                         cx.notify();
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = "error: dialog není dostupný".to_string();
+                        view.editor_mut().status = tr!("error: dialog není dostupný", "error: dialog is not available").to_string();
                         cx.notify();
                     });
                     return;
@@ -5033,7 +5061,7 @@ impl AppView {
                     if folder {
                         let files = list_sql_files(&picked)?;
                         if files.is_empty() {
-                            return Err("složka neobsahuje žádné .sql soubory".to_string());
+                            return Err(tr!("složka neobsahuje žádné .sql soubory", "the folder contains no .sql files").to_string());
                         }
                         let mut counts = Vec::with_capacity(files.len());
                         for f in &files {
@@ -5043,11 +5071,11 @@ impl AppView {
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| picked.display().to_string());
-                        let label = format!("{name}/ ({} souborů)", files.len());
+                        let label = trf!("{name}/ ({} souborů)", "{name}/ ({} files)", files.len());
                         Ok((label, files, counts))
                     } else {
                         if !crate::scripts::is_sql_path(&picked) {
-                            return Err("vyberte soubor .sql".to_string());
+                            return Err(tr!("vyberte soubor .sql", "pick a .sql file").to_string());
                         }
                         let count = count_statements_in_file(&picked, dialect)?;
                         let name = picked
@@ -5101,7 +5129,7 @@ impl AppView {
         // WHILE the pick/pre-scan was in flight wins — don't clobber it
         // with a stale script-run pick.
         if self.modal.is_some() {
-            self.editor_mut().status = "výběr skriptu zahozen — je otevřený jiný dialog".to_string();
+            self.editor_mut().status = tr!("výběr skriptu zahozen — je otevřený jiný dialog", "script selection discarded — another dialog is open").to_string();
             cx.notify();
             return;
         }
@@ -5112,7 +5140,7 @@ impl AppView {
         // same identity again regardless (the actual guard), so this is
         // purely the faster/friendlier refusal.
         if !conn_identity_matches(&conn_identity, &self.current_conn_identity()) {
-            self.editor_mut().status = "připojení se během výběru změnilo — spuštění zrušeno".to_string();
+            self.editor_mut().status = tr!("připojení se během výběru změnilo — spuštění zrušeno", "the connection changed during selection — run cancelled").to_string();
             cx.notify();
             return;
         }
@@ -5167,7 +5195,7 @@ impl AppView {
             return;
         }
         let Some(root) = self.effective_scripts_root() else {
-            self.editor_mut().status = "error: nastavte složku skriptů v Nastavení".to_string();
+            self.editor_mut().status = tr!("error: nastavte složku skriptů v Nastavení", "error: set the scripts folder in Settings").to_string();
             cx.notify();
             return;
         };
@@ -5176,7 +5204,7 @@ impl AppView {
             return; // resolve_spec_for_explain already set self.editor().status
         };
         let Some(dialect) = dialect_for_engine(engine) else {
-            self.editor_mut().status = "error: skripty nejsou podporovány pro tento engine".to_string();
+            self.editor_mut().status = tr!("error: skripty nejsou podporovány pro tento engine", "error: scripts are not supported for this engine").to_string();
             cx.notify();
             return;
         };
@@ -5189,12 +5217,12 @@ impl AppView {
                 .background_spawn(async move {
                     let path = crate::scripts::resolve_rel(&root, &rel)?;
                     if !crate::scripts::is_sql_path(&path) {
-                        return Err("vyberte soubor .sql".to_string());
+                        return Err(tr!("vyberte soubor .sql", "pick a .sql file").to_string());
                     }
                     // A stale tree (an external delete since the last scan)
                     // is a Czech error plus a rescan, never a corruption.
                     if !path.is_file() {
-                        return Err("soubor už neexistuje".to_string());
+                        return Err(tr!("soubor už neexistuje", "the file no longer exists").to_string());
                     }
                     let count = count_statements_in_file(&path, dialect)?;
                     let name = path
@@ -5288,7 +5316,7 @@ impl AppView {
         // clear `self.modal`) so the user can retry once the other run
         // finishes.
         if self.editor().cancel.is_some() {
-            self.editor_mut().status = "jiný dotaz stále běží — počkejte na dokončení".to_string();
+            self.editor_mut().status = tr!("jiný dotaz stále běží — počkejte na dokončení", "another query is still running — wait for it to finish").to_string();
             cx.notify();
             return;
         }
@@ -5299,7 +5327,7 @@ impl AppView {
         // `self.runner.run_script` is never reached.
         if !script_run_dispatch_allowed(&conn_identity, &self.current_conn_identity()) {
             self.modal = None;
-            self.editor_mut().status = "připojení se během výběru změnilo — spuštění zrušeno".to_string();
+            self.editor_mut().status = tr!("připojení se během výběru změnilo — spuštění zrušeno", "the connection changed during selection — run cancelled").to_string();
             cx.notify();
             return;
         }
@@ -5308,7 +5336,7 @@ impl AppView {
             return;
         };
         let Some(dialect) = dialect_for_engine(engine) else {
-            self.editor_mut().status = "error: skripty nejsou podporovány pro tento engine".to_string();
+            self.editor_mut().status = tr!("error: skripty nejsou podporovány pro tento engine", "error: scripts are not supported for this engine").to_string();
             self.modal = None;
             cx.notify();
             return;
@@ -5348,7 +5376,7 @@ impl AppView {
         let conn_identity = self.current_conn_identity();
         self.editor_mut().results.open(ResultTab {
             id: 0,
-            title: format!("Skript: {source_label}"),
+            title: trf!("Skript: {source_label}", "Script: {source_label}"),
             pinned: false,
             preview_key: None,
             conn_identity,
@@ -5360,7 +5388,7 @@ impl AppView {
         self.editor_mut().cancel = Some(cancel.clone());
         self.editor_mut().run_generation += 1;
         let my_generation = self.editor().run_generation;
-        self.editor_mut().status = format!("skript {source_label}…");
+        self.editor_mut().status = trf!("skript {source_label}…", "script {source_label}…");
         cx.notify();
 
         let history_started_at = std::time::SystemTime::now()
@@ -5389,11 +5417,11 @@ impl AppView {
                                     .file_name()
                                     .map(|n| n.to_string_lossy().to_string())
                                     .unwrap_or_else(|| path.display().to_string());
-                                s.push_log(format!("▶ soubor {}/{total_files}: {name}", index + 1));
+                                s.push_log(trf!("▶ soubor {}/{total_files}: {name}", "▶ file {}/{total_files}: {name}", index + 1));
                             }
                             ScriptEvent::StatementStarted { stmt_index, sql_preview } => {
                                 last_preview = sql_preview;
-                                view.editor_mut().status = format!("skript {source_label}: příkaz {}…", stmt_index + 1);
+                                view.editor_mut().status = trf!("skript {source_label}: příkaz {}…", "script {source_label}: statement {}…", stmt_index + 1);
                             }
                             ScriptEvent::StatementFinished { stmt_index, affected, elapsed } => {
                                 let mut s = state.borrow_mut();
@@ -5407,7 +5435,7 @@ impl AppView {
                                     }
                                 }
                                 let rows_note =
-                                    affected.map(|n| format!(", {n} řádků")).unwrap_or_default();
+                                    affected.map(|n| trf!(", {n} řádků", ", {n} rows")).unwrap_or_default();
                                 s.push_log(format!(
                                     "✓ #{} {last_preview} ({} ms{rows_note})",
                                     stmt_index + 1,
@@ -5422,8 +5450,9 @@ impl AppView {
                                         row.statements_failed += 1;
                                     }
                                 }
-                                s.push_log(format!(
+                                s.push_log(trf!(
                                     "✗ #{} {last_preview} — chyba: {error}",
+                                    "✗ #{} {last_preview} — error: {error}",
                                     stmt_index + 1
                                 ));
                             }
@@ -5442,8 +5471,9 @@ impl AppView {
                                     .file_name()
                                     .map(|n| n.to_string_lossy().to_string())
                                     .unwrap_or_else(|| path.display().to_string());
-                                s.push_log(format!(
+                                s.push_log(trf!(
                                     "— {name} dokončen: {statements_run} OK, {statements_failed} chyb ({} ms)",
+                                    "— {name} finished: {statements_run} OK, {statements_failed} errors ({} ms)",
                                     elapsed.as_millis()
                                 ));
                             }
@@ -5481,7 +5511,7 @@ impl AppView {
                                     statements_failed,
                                 );
                                 let err_opt: Option<String> =
-                                    if aborted { Some("běh přerušen".to_string()) } else { None };
+                                    if aborted { Some(tr!("běh přerušen", "run aborted").to_string()) } else { None };
                                 view.record_history(
                                     &hist_sql,
                                     &history_conn_name,
@@ -5492,12 +5522,14 @@ impl AppView {
                                     cx,
                                 );
                                 view.editor_mut().status = if aborted {
-                                    format!(
-                                        "skript {source_label}: přerušeno ({files_run} souborů, {statements_run}/{total_statements} příkazů)"
+                                    trf!(
+                                        "skript {source_label}: přerušeno ({files_run} souborů, {statements_run}/{total_statements} příkazů)",
+                                        "script {source_label}: aborted ({files_run} files, {statements_run}/{total_statements} statements)"
                                     )
                                 } else {
-                                    format!(
-                                        "skript {source_label}: hotovo ({files_run} souborů, {statements_run} příkazů, {statements_failed} chyb)"
+                                    trf!(
+                                        "skript {source_label}: hotovo ({files_run} souborů, {statements_run} příkazů, {statements_failed} chyb)",
+                                        "script {source_label}: done ({files_run} files, {statements_run} statements, {statements_failed} errors)"
                                     )
                                 };
                                 if view.editor().run_generation == my_generation {
@@ -5545,17 +5577,17 @@ impl AppView {
             return;
         }
         if self.active_read_only() {
-            self.editor_mut().status = "error: připojení je jen pro čtení".to_string();
+            self.editor_mut().status = tr!("error: připojení je jen pro čtení", "error: connection is read-only").to_string();
             cx.notify();
             return;
         }
         let Some(snapshot) = self.tree.read(cx).snapshot() else {
-            self.editor_mut().status = "error: schéma není načteno".to_string();
+            self.editor_mut().status = tr!("error: schéma není načteno", "error: schema is not loaded").to_string();
             cx.notify();
             return;
         };
         let Some(t) = snapshot.tables.iter().find(|t| t.schema == schema && t.name == table) else {
-            self.editor_mut().status = "error: tabulka nenalezena ve schématu".to_string();
+            self.editor_mut().status = tr!("error: tabulka nenalezena ve schématu", "error: table not found in schema").to_string();
             cx.notify();
             return;
         };
@@ -5586,7 +5618,7 @@ impl AppView {
         // parity holds because both resolve from the same connection.
         let dialect = self.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres);
 
-        self.editor_mut().status = "výběr CSV souboru…".to_string();
+        self.editor_mut().status = tr!("výběr CSV souboru…", "choosing a CSV file…").to_string();
         cx.notify();
         let dialog = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -5599,21 +5631,21 @@ impl AppView {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
                 Ok(Ok(_)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = "výběr zrušen".to_string();
+                        view.editor_mut().status = tr!("výběr zrušen", "selection cancelled").to_string();
                         cx.notify();
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = format!("error: dialog selhal: {e}");
+                        view.editor_mut().status = trf!("error: dialog selhal: {e}", "error: dialog failed: {e}");
                         cx.notify();
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = "error: dialog není dostupný".to_string();
+                        view.editor_mut().status = tr!("error: dialog není dostupný", "error: dialog is not available").to_string();
                         cx.notify();
                     });
                     return;
@@ -5625,7 +5657,7 @@ impl AppView {
                 .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
             if !is_csv {
                 let _ = this.update(cx, |view, cx| {
-                    view.editor_mut().status = "error: vyberte soubor .csv".to_string();
+                    view.editor_mut().status = tr!("error: vyberte soubor .csv", "error: pick a .csv file").to_string();
                     cx.notify();
                 });
                 return;
@@ -5678,7 +5710,7 @@ impl AppView {
                     // it with a stale CSV-import pick.
                     if view.modal.is_some() {
                         view.editor_mut().status =
-                            "výběr CSV zahozen — je otevřený jiný dialog".to_string();
+                            tr!("výběr CSV zahozen — je otevřený jiný dialog", "CSV selection discarded — another dialog is open").to_string();
                         cx.notify();
                         return;
                     }
@@ -5692,7 +5724,7 @@ impl AppView {
                     // refusal, not the enforcement point.
                     if !conn_identity_matches(&conn_identity, &view.current_conn_identity()) {
                         view.editor_mut().status =
-                            "připojení se během importu změnilo — import zrušen".to_string();
+                            tr!("připojení se během importu změnilo — import zrušen", "the connection changed during import — import cancelled").to_string();
                         cx.notify();
                         return;
                     }
@@ -5778,7 +5810,7 @@ impl AppView {
                 Ok(stmts) => {
                     *sample_sql = stmts.into_iter().next().map(cap_sql_sample);
                     *error = if sample_sql.is_none() {
-                        Some("žádný sloupec není namapován".to_string())
+                        Some(tr!("žádný sloupec není namapován", "no column is mapped").to_string())
                     } else {
                         None
                     };
@@ -5829,13 +5861,13 @@ impl AppView {
         // and silently orphan the first token. Refuse and keep the modal
         // open.
         if self.editor().cancel.is_some() {
-            self.editor_mut().status = "jiný dotaz stále běží — počkejte na dokončení".to_string();
+            self.editor_mut().status = tr!("jiný dotaz stále běží — počkejte na dokončení", "another query is still running — wait for it to finish").to_string();
             cx.notify();
             return;
         }
         if !csv_import_dispatch_allowed(&conn_identity, &self.current_conn_identity()) {
             self.modal = None;
-            self.editor_mut().status = "připojení se během importu změnilo — import zrušen".to_string();
+            self.editor_mut().status = tr!("připojení se během importu změnilo — import zrušen", "the connection changed during import — import cancelled").to_string();
             cx.notify();
             return;
         }
@@ -5899,14 +5931,15 @@ impl AppView {
                         match ev {
                             CsvImportEvent::BatchStarted { batch_index, rows_in_batch } => {
                                 let mut s = state.borrow_mut();
-                                s.push_log(format!("▶ dávka #{} ({rows_in_batch} řádků)", batch_index + 1));
+                                s.push_log(trf!("▶ dávka #{} ({rows_in_batch} řádků)", "▶ batch #{} ({rows_in_batch} rows)", batch_index + 1));
                             }
                             CsvImportEvent::BatchFinished { batch_index, rows_committed_so_far } => {
                                 let mut s = state.borrow_mut();
                                 s.statements_run += 1;
                                 s.progress_rows = Some((rows_committed_so_far, row_count as u64));
-                                s.push_log(format!(
+                                s.push_log(trf!(
                                     "✓ dávka #{} — celkem {rows_committed_so_far} řádků",
+                                    "✓ batch #{} — {rows_committed_so_far} rows total",
                                     batch_index + 1
                                 ));
                             }
@@ -5919,8 +5952,9 @@ impl AppView {
                                     } else {
                                         ScriptRunOutcome::Failed
                                     };
-                                    s.push_log(format!(
-                                        "✗ chyba: {error} — import zrušen, žádná data nezapsána"
+                                    s.push_log(trf!(
+                                        "✗ chyba: {error} — import zrušen, žádná data nezapsána",
+                                        "✗ error: {error} — import cancelled, no data written"
                                     ));
                                 }
                                 let err_text = error.to_string();
@@ -5933,7 +5967,7 @@ impl AppView {
                                     Some(&err_text),
                                     cx,
                                 );
-                                view.editor_mut().status = format!("CSV import selhal: {error}");
+                                view.editor_mut().status = trf!("CSV import selhal: {error}", "CSV import failed: {error}");
                                 if view.editor().run_generation == my_generation {
                                     view.editor_mut().cancel = None;
                                 }
@@ -5945,8 +5979,9 @@ impl AppView {
                                     s.elapsed = Some(elapsed);
                                     s.progress_rows = Some((rows_imported, row_count as u64));
                                 }
-                                let hist_sql = format!(
+                                let hist_sql = trf!(
                                     "[CSV import] {} → {table} ({rows_imported} řádků, dávka {})",
+                                    "[CSV import] {} → {table} ({rows_imported} rows, batch {})",
                                     path.display(),
                                     csv_import::CSV_IMPORT_BATCH_SIZE
                                 );
@@ -5959,7 +5994,7 @@ impl AppView {
                                     None,
                                     cx,
                                 );
-                                view.editor_mut().status = format!("CSV import hotovo: {rows_imported} řádků");
+                                view.editor_mut().status = trf!("CSV import hotovo: {rows_imported} řádků", "CSV import done: {rows_imported} rows");
                                 if view.editor().run_generation == my_generation {
                                     view.editor_mut().cancel = None;
                                 }
@@ -6008,7 +6043,7 @@ impl AppView {
         } else if let Some(url) = self.conn_url.clone() {
             Some((false, None, engine_from_url(&url), ConnectSpec::Url(url)))
         } else {
-            self.editor_mut().status = "Bez připojení — vyberte připojení nahoře.".into();
+            self.editor_mut().status = tr!("Bez připojení — vyberte připojení nahoře.", "No connection — pick a connection above.").into();
             cx.notify();
             None
         }
@@ -6047,7 +6082,7 @@ impl AppView {
         if !is_analyze {
             if engine == dbc_state::Engine::Mssql {
                 if !plan::mssql_plan_dispatch_available() {
-                    self.editor_mut().status = "plán pro MSSQL zatím není k dispozici".to_string();
+                    self.editor_mut().status = tr!("plán pro MSSQL zatím není k dispozici", "plan for MSSQL is not available yet").to_string();
                     cx.notify();
                     return;
                 }
@@ -6063,7 +6098,7 @@ impl AppView {
             plan::AnalyzeGate::Run => {
                 if engine == dbc_state::Engine::Mssql {
                     if !plan::mssql_plan_dispatch_available() {
-                        self.editor_mut().status = "plán pro MSSQL zatím není k dispozici".to_string();
+                        self.editor_mut().status = tr!("plán pro MSSQL zatím není k dispozici", "plan for MSSQL is not available yet").to_string();
                         cx.notify();
                         return;
                     }
@@ -6074,7 +6109,7 @@ impl AppView {
                 self.dispatch_plan_query(spec, explain_sql, engine, true, timeout_secs, cx);
             }
             plan::AnalyzeGate::Blocked => {
-                self.editor_mut().status = "error: připojení je jen pro čtení".to_string();
+                self.editor_mut().status = tr!("error: připojení je jen pro čtení", "error: connection is read-only").to_string();
                 cx.notify();
             }
             plan::AnalyzeGate::NeedsConfirm => {
@@ -6089,7 +6124,7 @@ impl AppView {
                     // transaction: the write would durably COMMIT while the
                     // UI claims "změny vráceny zpět". Refuse honestly.
                     // Pinned by runner.rs::duckdb_query_sessions_do_not_see_execute_transactions.
-                    self.editor_mut().status = "error: EXPLAIN ANALYZE zápisu není pro DuckDB podporováno — analyzovaný zápis nelze bezpečně vrátit".to_string();
+                    self.editor_mut().status = tr!("error: EXPLAIN ANALYZE zápisu není pro DuckDB podporováno — analyzovaný zápis nelze bezpečně vrátit", "error: EXPLAIN ANALYZE of a write is not supported for DuckDB — an analyzed write cannot be safely rolled back").to_string();
                     cx.notify();
                     return;
                 }
@@ -6125,10 +6160,10 @@ impl AppView {
         self.editor_mut().cancel = Some(cancel.clone());
         self.editor_mut().run_generation += 1;
         let my_generation = self.editor().run_generation;
-        self.editor_mut().status = if is_analyze { "analyzuji plán…".to_string() } else { "vysvětluji plán…".to_string() };
+        self.editor_mut().status = if is_analyze { tr!("analyzuji plán…", "analyzing plan…").to_string() } else { tr!("vysvětluji plán…", "explaining plan…").to_string() };
         cx.notify();
 
-        let sql_title = format!("Plán: {}", collapse_title(&wrapped_sql));
+        let sql_title = trf!("Plán: {}", "Plan: {}", collapse_title(&wrapped_sql));
         let conn_identity = self.current_conn_identity();
         let mut rx = self.runner.connect_and_run(spec, wrapped_sql, cancel, timeout_secs);
         // Phase-3 follow-up I2: EXPLAIN output is always tiny (one row/JSON
@@ -6172,7 +6207,7 @@ impl AppView {
                         // (not `unreachable!()`) rather than assumed away.
                         QueryEvent::WriteFinished { .. } => {
                             failed = Some(QueryError::msg(
-                                "interní chyba: plán vrátil zápis místo výsledku",
+                                tr!("interní chyba: plán vrátil zápis místo výsledku", "internal error: the plan returned a write instead of a result"),
                             ));
                             true
                         }
@@ -6198,7 +6233,7 @@ impl AppView {
                     return;
                 }
                 let Some(mut buf) = buffer else {
-                    view.editor_mut().status = "prázdná odpověď EXPLAIN".to_string();
+                    view.editor_mut().status = tr!("prázdná odpověď EXPLAIN", "empty EXPLAIN response").to_string();
                     cx.notify();
                     return;
                 };
@@ -6228,7 +6263,7 @@ impl AppView {
                     // the SECOND column (capture-pinned); pg stays 0.
                     let payload_col = plan::plan_payload_col(engine);
                     let raw_text = if buf.row_count() == 0 || buf.cell_is_null(0, payload_col) {
-                        Err("EXPLAIN nevrátil žádný řádek".to_string())
+                        Err(tr!("EXPLAIN nevrátil žádný řádek", "EXPLAIN returned no rows").to_string())
                     } else {
                         Ok(buf.cell_text(0, payload_col))
                     };
@@ -6249,10 +6284,10 @@ impl AppView {
                             content: TabContent::Plan { view: view_entity },
                         };
                         view.editor_mut().results.open(tab);
-                        view.editor_mut().status = "hotovo".to_string();
+                        view.editor_mut().status = tr!("hotovo", "done").to_string();
                     }
                     Err(e) => {
-                        view.editor_mut().status = format!("error parsování plánu: {e}");
+                        view.editor_mut().status = trf!("error parsování plánu: {e}", "error parsing plan: {e}");
                     }
                 }
                 cx.notify();
@@ -6284,10 +6319,10 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         self.editor_mut().status =
-            if is_analyze { "analyzuji plán…".to_string() } else { "vysvětluji plán…".to_string() };
+            if is_analyze { tr!("analyzuji plán…", "analyzing plan…").to_string() } else { tr!("vysvětluji plán…", "explaining plan…").to_string() };
         cx.notify();
 
-        let sql_title = format!("Plán: {}", collapse_title(&sql));
+        let sql_title = trf!("Plán: {}", "Plan: {}", collapse_title(&sql));
         let conn_identity = self.current_conn_identity();
         let rx = self.runner.run_mssql_plan(spec, sql.clone(), is_analyze, timeout_secs);
         cx.spawn(async move |this, cx| {
@@ -6314,13 +6349,13 @@ impl AppView {
                                     content: TabContent::Plan { view: view_entity },
                                 });
                                 view.editor_mut().status = if via_confirm_modal {
-                                    "hotovo (změny vráceny zpět)".to_string()
+                                    tr!("hotovo (změny vráceny zpět)", "done (changes rolled back)").to_string()
                                 } else {
-                                    "hotovo".to_string()
+                                    tr!("hotovo", "done").to_string()
                                 };
                             }
                             Err(e) => {
-                                view.editor_mut().status = format!("error parsování plánu: {e}");
+                                view.editor_mut().status = trf!("error parsování plánu: {e}", "error parsing plan: {e}");
                                 if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
                                     running,
                                     error,
@@ -6328,7 +6363,7 @@ impl AppView {
                                 }) = &mut view.modal
                                 {
                                     *running = false;
-                                    *error = Some(format!("error parsování plánu: {e}"));
+                                    *error = Some(trf!("error parsování plánu: {e}", "error parsing plan: {e}"));
                                 }
                             }
                         }
@@ -6346,7 +6381,7 @@ impl AppView {
                         }
                     }
                     Err(_canceled) => {
-                        view.editor_mut().status = "error: plán zrušen".to_string();
+                        view.editor_mut().status = tr!("error: plán zrušen", "error: plan cancelled").to_string();
                         if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
                             running,
                             error,
@@ -6354,7 +6389,7 @@ impl AppView {
                         }) = &mut view.modal
                         {
                             *running = false;
-                            *error = Some("analýza zrušena".to_string());
+                            *error = Some(tr!("analýza zrušena", "analysis cancelled").to_string());
                         }
                     }
                 }
@@ -6429,7 +6464,7 @@ impl AppView {
                     &mut self.modal
                 {
                     *running = false;
-                    *error = Some("plán pro MSSQL zatím není k dispozici".to_string());
+                    *error = Some(tr!("plán pro MSSQL zatím není k dispozici", "plan for MSSQL is not available yet").to_string());
                 }
                 cx.notify();
                 return;
@@ -6440,7 +6475,7 @@ impl AppView {
 
         let Some(explain_sql) = plan::explain_analyze_sql(engine, &sql) else { return };
 
-        let sql_title = format!("Plán: {}", collapse_title(&sql));
+        let sql_title = trf!("Plán: {}", "Plan: {}", collapse_title(&sql));
         let conn_identity = self.current_conn_identity();
         let rx = self.runner.run_analyze_write(spec, explain_sql, timeout_secs);
         cx.spawn(async move |this, cx| {
@@ -6464,7 +6499,7 @@ impl AppView {
                                 sql: None,
                                 content: TabContent::Plan { view: view_entity },
                             });
-                            view.editor_mut().status = "hotovo (změny vráceny zpět)".to_string();
+                            view.editor_mut().status = tr!("hotovo (změny vráceny zpět)", "done (changes rolled back)").to_string();
                         }
                         Err(e) => {
                             if let Some(connections_ui::ModalState::AnalyzeWriteConfirm {
@@ -6474,7 +6509,7 @@ impl AppView {
                             }) = &mut view.modal
                             {
                                 *running = false;
-                                *error = Some(format!("error parsování plánu: {e}"));
+                                *error = Some(trf!("error parsování plánu: {e}", "error parsing plan: {e}"));
                             }
                         }
                     },
@@ -6497,7 +6532,7 @@ impl AppView {
                         }) = &mut view.modal
                         {
                             *running = false;
-                            *error = Some("analýza zrušena".to_string());
+                            *error = Some(tr!("analýza zrušena", "analysis cancelled").to_string());
                         }
                     }
                 }
@@ -6748,7 +6783,7 @@ impl AppView {
             let handle = grid.focus_handle(cx);
             window.focus(&handle, cx);
         } else {
-            self.editor_mut().status = "Žádný výsledek k zaměření".to_string();
+            self.editor_mut().status = tr!("Žádný výsledek k zaměření", "No result to focus").to_string();
         }
         cx.notify();
     }
@@ -6801,7 +6836,7 @@ impl AppView {
                     .flex_row()
                     .gap_1()
                     .child(div().text_color(theme.text_primary).child(keymap::pretty(sc.chord)))
-                    .child(div().child(sc.label)),
+                    .child(div().child(sc.label())),
             );
         }
         strip.into_any_element()
@@ -6846,14 +6881,14 @@ impl AppView {
                 view.app_menu_open = false;
                 cx.notify();
             }))
-            .child(item("menu-about", "O aplikaci", None).on_click(cx.listener(
+            .child(item("menu-about", tr!("O aplikaci", "About"), None).on_click(cx.listener(
                 |view, _, _, cx| {
                     view.app_menu_open = false;
                     view.about_open = true;
                     cx.notify();
                 },
             )))
-            .child(item("menu-shortcuts", "Klávesové zkratky", Some("f1")).on_click(cx.listener(
+            .child(item("menu-shortcuts", tr!("Klávesové zkratky", "Keyboard shortcuts"), Some("f1")).on_click(cx.listener(
                 |view, _, _, cx| {
                     view.app_menu_open = false;
                     view.shortcuts_open = true;
@@ -6861,30 +6896,30 @@ impl AppView {
                 },
             )))
             .child(div().h(px(1.)).my_1().mx_2().bg(theme.border))
-            .child(item("menu-settings", "Nastavení…", None).on_click(cx.listener(
+            .child(item("menu-settings", tr!("Nastavení…", "Settings…"), None).on_click(cx.listener(
                 |view, _, _, cx| {
                     view.app_menu_open = false;
                     view.open_settings(cx);
                 },
             )))
-            .child(item("menu-palette", "Paleta příkazů", Some("ctrl-k")).on_click(cx.listener(
+            .child(item("menu-palette", tr!("Paleta příkazů", "Command palette"), Some("ctrl-k")).on_click(cx.listener(
                 |view, _, window, cx| {
                     view.app_menu_open = false;
                     view.on_open_palette(&OpenPalette, window, cx);
                 },
             )))
             .child(div().h(px(1.)).my_1().mx_2().bg(theme.border))
-            .child(item("menu-log", "Otevřít log", None).on_click(cx.listener(
+            .child(item("menu-log", tr!("Otevřít log", "Open log"), None).on_click(cx.listener(
                 |view, _, _, cx| {
                     view.app_menu_open = false;
                     view.open_log_tab(cx);
                 },
             )))
-            .child(item("menu-clear-cache", "Vymazat mezipaměť schémat", None).on_click(
+            .child(item("menu-clear-cache", tr!("Vymazat mezipaměť schémat", "Clear schema cache"), None).on_click(
                 cx.listener(|view, _, _, cx| {
                     view.app_menu_open = false;
                     dbc_state::schema_cache::clear();
-                    view.editor_mut().status = "Mezipaměť schémat vymazána".to_string();
+                    view.editor_mut().status = tr!("Mezipaměť schémat vymazána", "Schema cache cleared").to_string();
                     cx.notify();
                 }),
             ));
@@ -6909,7 +6944,7 @@ impl AppView {
             .workspace_root
             .as_ref()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(žádný)".to_string());
+            .unwrap_or_else(|| tr!("(žádný)", "(none)").to_string());
         let panel = ui::surface(theme)
             .w(px(620.))
             .p_4()
@@ -6917,11 +6952,11 @@ impl AppView {
             .flex_col()
             .gap_2()
             .child(div().text_size(px(16.)).text_color(theme.text_primary).child("dbc"))
-            .child(row("Verze", env!("CARGO_PKG_VERSION").to_string()))
-            .child(row("Profil", profile))
+            .child(row(tr!("Verze", "Version"), env!("CARGO_PKG_VERSION").to_string()))
+            .child(row(tr!("Profil", "Profile"), profile))
             .child(row("Log", log))
-            .child(row("Pracovní prostor", workspace))
-            .child(div().mt_2().text_color(theme.text_faint).child("Esc zavře"));
+            .child(row(tr!("Pracovní prostor", "Workspace"), workspace))
+            .child(div().mt_2().text_color(theme.text_faint).child(tr!("Esc zavře", "Esc closes")));
         div()
             .absolute()
             .top_0()
@@ -6961,12 +6996,12 @@ impl AppView {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .child(div().text_size(px(16.)).child("Klávesové zkratky"))
+                    .child(div().text_size(px(16.)).child(tr!("Klávesové zkratky", "Keyboard shortcuts")))
                     .child(
                         div()
                             .ml_auto()
                             .text_color(theme.text_muted)
-                            .child("F1 nebo Esc zavře"),
+                            .child(tr!("F1 nebo Esc zavře", "F1 or Esc closes")),
                     ),
             );
         // Balance by ROW COUNT, not by scope count: „Kdekoliv" alone is
@@ -7005,7 +7040,7 @@ impl AppView {
                                     .text_color(theme.text_primary)
                                     .child(keymap::pretty(sc.chord)),
                             )
-                            .child(div().text_color(theme.text_muted).child(sc.label)),
+                            .child(div().text_color(theme.text_muted).child(sc.label())),
                     );
                 }
             }
@@ -7052,7 +7087,7 @@ impl AppView {
             return;
         }
         let Some(engine) = self.active_engine() else {
-            self.editor_mut().status = "error: rozbalení hvězdičky potřebuje aktivní připojení".into();
+            self.editor_mut().status = tr!("error: rozbalení hvězdičky potřebuje aktivní připojení", "error: expanding * needs an active connection").into();
             cx.notify();
             return;
         };
@@ -7080,7 +7115,7 @@ impl AppView {
             }
         });
         self.editor_mut().status = match outcome {
-            Ok(n) => format!("Rozbaleno na {n} sloupců"),
+            Ok(n) => trf!("Rozbaleno na {n} sloupců", "Expanded to {n} columns"),
             Err(r) => format!("error: {}", r.message()),
         };
         cx.notify();
@@ -7091,14 +7126,14 @@ impl AppView {
             return;
         }
         let Some(engine) = self.active_engine() else {
-            self.editor_mut().status = "error: formátování potřebuje aktivní připojení (určuje dialekt)".into();
+            self.editor_mut().status = tr!("error: formátování potřebuje aktivní připojení (určuje dialekt)", "error: formatting needs an active connection (it determines the dialect)").into();
             cx.notify();
             return;
         };
         let dialect = sql_dialect(engine);
         let changed = rewrite_buffer_in_place(self, cx, |sql| dbc_core::format::format_sql(sql, dialect));
         self.editor_mut().status =
-            if changed { "SQL naformátováno".into() } else { "SQL už je naformátované".into() };
+            if changed { tr!("SQL naformátováno", "SQL formatted").into() } else { tr!("SQL už je naformátované", "SQL is already formatted").into() };
         cx.notify();
     }
 
@@ -7122,15 +7157,15 @@ impl AppView {
         self.config.tree_grouping = next;
         self.tree.update(cx, |t, cx| t.set_grouping(next, cx));
         self.editor_mut().status = match next {
-            dbc_state::TreeGrouping::Schema => "strom: podle schémat".to_string(),
-            dbc_state::TreeGrouping::Kind => "strom: podle typu objektu".to_string(),
+            dbc_state::TreeGrouping::Schema => tr!("strom: podle schémat", "tree: by schema").to_string(),
+            dbc_state::TreeGrouping::Kind => tr!("strom: podle typu objektu", "tree: by object type").to_string(),
         };
         // Same posture as `set_theme` and `end_sidebar_resize`: the guard
         // gates the WRITE only, the session already switched above, and a
         // refusal leaves its own status in place.
         if let Some(guard) = self.guard_corrupt_config(cx) {
             if let Err(e) = self.config.save(&self.config_path, &guard) {
-                self.editor_mut().status = format!("error: režim stromu se nepodařilo uložit: {e}");
+                self.editor_mut().status = trf!("error: režim stromu se nepodařilo uložit: {e}", "error: could not save tree mode: {e}");
             }
         }
         cx.notify();
@@ -7161,7 +7196,7 @@ impl AppView {
         // failure degrades to session-only plus the guard's own status.
         if let Some(guard) = self.guard_corrupt_config(cx) {
             if let Err(e) = self.config.save(&self.config_path, &guard) {
-                self.editor_mut().status = format!("error: šířku panelu se nepodařilo uložit: {e}");
+                self.editor_mut().status = trf!("error: šířku panelu se nepodařilo uložit: {e}", "error: could not save panel width: {e}");
             }
         }
         cx.notify();
@@ -7182,7 +7217,7 @@ impl AppView {
         self.config.editor_height = Some(height);
         if let Some(guard) = self.guard_corrupt_config(cx) {
             if let Err(e) = self.config.save(&self.config_path, &guard) {
-                self.editor_mut().status = format!("error: výšku editoru se nepodařilo uložit: {e}");
+                self.editor_mut().status = trf!("error: výšku editoru se nepodařilo uložit: {e}", "error: could not save editor height: {e}");
             }
         }
         cx.notify();
@@ -7211,7 +7246,7 @@ impl AppView {
             let conn_identity = self.current_conn_identity();
             self.editor_mut().results.open(ResultTab {
                 id: 0,
-                title: "Historie".to_string(),
+                title: tr!("Historie", "History").to_string(),
                 pinned: false,
                 preview_key: Some(HISTORY_PREVIEW_KEY.to_string()),
                 conn_identity,
@@ -7243,7 +7278,7 @@ impl AppView {
             return;
         }
         self.dropdown_open = false;
-        let input = cx.new(|cx| connections_ui::TextField::new(cx, "Ctrl+K – tabulky, historie, spojení, akce…", false));
+        let input = cx.new(|cx| connections_ui::TextField::new(cx, tr!("Ctrl+K – tabulky, historie, spojení, akce…", "Ctrl+K – tables, history, connections, actions…"), false));
         let focus = input.focus_handle(cx);
         let (items, _) = self.build_palette_items("", cx);
         self.palette = Some(PaletteState {
@@ -7419,7 +7454,7 @@ impl AppView {
         }
         self.dropdown_open = false;
         let input =
-            cx.new(|cx| connections_ui::TextField::new(cx, "Ctrl+D – připojení / databáze…", false));
+            cx.new(|cx| connections_ui::TextField::new(cx, tr!("Ctrl+D – připojení / databáze…", "Ctrl+D – connection / database…"), false));
         let focus = input.focus_handle(cx);
         self.palette = Some(PaletteState {
             input,
@@ -7454,7 +7489,7 @@ impl AppView {
         }
         self.dropdown_open = false;
         let input = cx.new(|cx| {
-            connections_ui::TextField::new(cx, "Ctrl+Shift+D – vyber databáze, Enter spustí…", false)
+            connections_ui::TextField::new(cx, tr!("Ctrl+Shift+D – vyber databáze, Enter spustí…", "Ctrl+Shift+D – pick databases, Enter runs…"), false)
         });
         let focus = input.focus_handle(cx);
         // Seed only pairs whose connection still exists: `target_sources`
@@ -7714,7 +7749,7 @@ impl AppView {
                         Some(schema) => self.open_er_diagram(schema, cx),
                         None => {
                             self.editor_mut().status =
-                                "Vyberte schéma ve stromu (klikněte na ikonu vedle schématu)"
+                                tr!("Vyberte schéma ve stromu (klikněte na ikonu vedle schématu)", "Select a schema in the tree (click the icon next to the schema)")
                                     .to_string();
                             cx.notify();
                         }
@@ -7727,7 +7762,7 @@ impl AppView {
                     // clears what is on DISK, and throwing away the schema
                     // the user is currently looking at would be a
                     // surprising second effect. The next expand refetches.
-                    self.editor_mut().status = "Mezipaměť schémat vymazána".to_string();
+                    self.editor_mut().status = tr!("Mezipaměť schémat vymazána", "Schema cache cleared").to_string();
                     cx.notify();
                 }
                 // Same two handlers the Settings buttons call — one code
@@ -7791,14 +7826,15 @@ impl AppView {
             // so nothing here overwrites it.
             if let Some(guard) = self.guard_corrupt_config(cx) {
                 self.editor_mut().status = match self.config.save(&self.config_path, &guard) {
-                    Ok(()) => format!(
+                    Ok(()) => trf!(
                         "motiv: {}",
+                        "theme: {}",
                         match mode {
-                            dbc_state::ThemeMode::Dark => "tmavý",
-                            dbc_state::ThemeMode::Light => "světlý",
+                            dbc_state::ThemeMode::Dark => tr!("tmavý", "dark"),
+                            dbc_state::ThemeMode::Light => tr!("světlý", "light"),
                         }
                     ),
-                    Err(e) => format!("error: motiv se nepodařilo uložit ({e})"),
+                    Err(e) => trf!("error: motiv se nepodařilo uložit ({e})", "error: could not save theme ({e})"),
                 };
             }
         }
@@ -7812,6 +7848,29 @@ impl AppView {
         cx.notify();
     }
 
+    /// The language radios in Settings. Same posture as `set_theme`: the
+    /// switch happens for the session regardless, the corrupt-config guard
+    /// gates only the write. Everything rendered from now on is in the new
+    /// language; texts already built into state (the status line, an open
+    /// result's messages) keep theirs until they are rebuilt.
+    pub(crate) fn set_language(&mut self, language: Option<dbc_state::UiLanguage>, cx: &mut Context<Self>) {
+        if self.config.language != language {
+            self.config.language = language;
+            apply_language(&self.config);
+            if let Some(guard) = self.guard_corrupt_config(cx) {
+                self.editor_mut().status = match self.config.save(&self.config_path, &guard) {
+                    Ok(()) => dbc_i18n::tr!("jazyk: čeština", "language: English").to_string(),
+                    Err(e) => dbc_i18n::trf!(
+                        "error: jazyk se nepodařilo uložit ({e})",
+                        "error: could not save the language ({e})"
+                    ),
+                };
+            }
+        }
+        cx.refresh_windows();
+        cx.notify();
+    }
+
     /// „Kontrolovat aktualizace při startu" in Settings. Takes effect at the
     /// next launch: turning it off must not cancel a download already
     /// under way, and turning it on does not need an immediate check —
@@ -7822,10 +7881,10 @@ impl AppView {
         if let Some(guard) = self.guard_corrupt_config(cx) {
             self.editor_mut().status = match self.config.save(&self.config_path, &guard) {
                 Ok(()) if self.config.disable_update_check => {
-                    "kontrola aktualizací vypnuta — dbc se už nebude ptát GitHubu".to_string()
+                    tr!("kontrola aktualizací vypnuta — dbc se už nebude ptát GitHubu", "update check disabled — dbc will no longer ask GitHub").to_string()
                 }
-                Ok(()) => "kontrola aktualizací zapnuta — proběhne při příštím startu".to_string(),
-                Err(e) => format!("error: nastavení se nepodařilo uložit ({e})"),
+                Ok(()) => tr!("kontrola aktualizací zapnuta — proběhne při příštím startu", "update check enabled — it will run at the next start").to_string(),
+                Err(e) => trf!("error: nastavení se nepodařilo uložit ({e})", "error: could not save settings ({e})"),
             };
         }
         cx.notify();
@@ -8003,11 +8062,11 @@ impl AppView {
         // line rewritten on every keystroke would be noise.
         if candidates.is_empty() {
             self.editor_mut().status = if suppressed {
-                "napovídání: kurzor je v řetězci nebo komentáři".into()
+                tr!("napovídání: kurzor je v řetězci nebo komentáři", "completion: the cursor is inside a string or comment").into()
             } else if !had_snapshot {
-                "napovídání: schéma není načtené — rozbalte databázi v panelu vlevo".into()
+                tr!("napovídání: schéma není načtené — rozbalte databázi v panelu vlevo", "completion: schema is not loaded — expand the database in the left panel").into()
             } else {
-                "napovídání: nic nevyhovuje".into()
+                tr!("napovídání: nic nevyhovuje", "completion: nothing matches").into()
             };
         }
         self.editor_mut().autocomplete =
@@ -8467,7 +8526,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             Ok(()) => cx.quit(),
             Err(e) => {
                 dbc_state::applog::log(dbc_state::applog::Event::UpdateFailed { error: e.clone() });
-                self.editors.active_mut().payload.status = format!("Aktualizace se nepodařila: {e}");
+                self.editors.active_mut().payload.status = trf!("Aktualizace se nepodařila: {e}", "Update failed: {e}");
                 self.update = Some(update);
                 cx.notify();
             }
@@ -8648,7 +8707,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 }
                 match result {
                     Ok(Ok(())) => {
-                        view.tab(editor_id).status = format!("Připojeno ({engine_lbl})");
+                        view.tab(editor_id).status = trf!("Připojeno ({engine_lbl})", "Connected ({engine_lbl})");
                         view.tab(editor_id).connection = Some(target_id.clone());
                         view.tab(editor_id).database = db.clone();
                         view.tab(editor_id).unverified = false;
@@ -8710,7 +8769,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         }
                     }
                     Err(_) => {
-                        view.tab(editor_id).status = "error: connect zrušen".into();
+                        view.tab(editor_id).status = tr!("error: connect zrušen", "error: connect cancelled").into();
                     }
                 }
                 cx.notify();
@@ -8737,7 +8796,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     fn new_editor_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editors.len() >= editor_tabs::MAX_EDITOR_TABS {
             self.editor_mut().status =
-                format!("error: maximum je {} tabů", editor_tabs::MAX_EDITOR_TABS);
+                trf!("error: maximum je {} tabů", "error: the maximum is {} tabs", editor_tabs::MAX_EDITOR_TABS);
             cx.notify();
             return;
         }
@@ -8840,7 +8899,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             Ok(saved_text) => self.set_script_binding(Some(ScriptBinding { path, saved_text })),
             Err(_) => {
                 self.editor_mut().status =
-                    format!("error: vázaný skript nenalezen: {}", path.display());
+                    trf!("error: vázaný skript nenalezen: {}", "error: bound script not found: {}", path.display());
             }
         }
         cx.notify();
@@ -8888,11 +8947,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         if self.modal.is_some() {
             return;
         }
-        let new1 = cx.new(|cx| connections_ui::TextField::form_field(cx, "nové heslo", true));
-        let new2 = cx.new(|cx| connections_ui::TextField::form_field(cx, "nové heslo znovu", true));
+        let new1 = cx.new(|cx| connections_ui::TextField::form_field(cx, tr!("nové heslo", "new password"), true));
+        let new2 = cx.new(|cx| connections_ui::TextField::form_field(cx, tr!("nové heslo znovu", "repeat new password"), true));
         let admin_user = cx.new(|cx| connections_ui::TextField::form_field(cx, "postgres", false));
         let admin_password =
-            cx.new(|cx| connections_ui::TextField::form_field(cx, "heslo administrátora", true));
+            cx.new(|cx| connections_ui::TextField::form_field(cx, tr!("heslo administrátora", "administrator password"), true));
         self.modal = Some(connections_ui::ModalState::ChangeServerPassword {
             conn_id,
             kind,
@@ -8943,7 +9002,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             return;
         }
         let Some(cfg) = self.config.connections.iter().find(|c| c.id == conn_id).cloned() else {
-            self.pw_change_set_error("připojení nenalezeno".to_string(), cx);
+            self.pw_change_set_error(tr!("připojení nenalezeno", "connection not found").to_string(), cx);
             return;
         };
         if self.vault.is_none() {
@@ -8951,7 +9010,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             // kdyby přesto nebyl, neměníme heslo, které bychom neuměli
             // hned uložit.
             self.pw_change_set_error(
-                "trezor není odemčený — odemkněte ho a zkuste znovu".to_string(),
+                tr!("trezor není odemčený — odemkněte ho a zkuste znovu", "the vault is locked — unlock it and try again").to_string(),
                 cx,
             );
             return;
@@ -8960,7 +9019,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             pwchange::PwChangeKind::MssqlMustChange => {
                 let Some(old) = self.vault.as_ref().and_then(|v| v.get_secret(&conn_id)) else {
                     self.pw_change_set_error(
-                        "současné heslo není v trezoru — uložte ho v dialogu připojení".to_string(),
+                        tr!("současné heslo není v trezoru — uložte ho v dialogu připojení", "the current password is not in the vault — save it in the connection dialog").to_string(),
                         cx,
                     );
                     return;
@@ -8991,7 +9050,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                             ),
                             Ok(Err(e)) => view.pw_change_set_error(e.to_string(), cx),
                             Err(_) => {
-                                view.pw_change_set_error("změna hesla zrušena".to_string(), cx)
+                                view.pw_change_set_error(tr!("změna hesla zrušena", "password change cancelled").to_string(), cx)
                             }
                         }
                         cx.notify();
@@ -9064,7 +9123,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                             }
                             Ok(Err(e)) => view.pw_change_set_error(e.to_string(), cx),
                             Err(_) => {
-                                view.pw_change_set_error("změna hesla zrušena".to_string(), cx)
+                                view.pw_change_set_error(tr!("změna hesla zrušena", "password change cancelled").to_string(), cx)
                             }
                         }
                         cx.notify();
@@ -9088,18 +9147,20 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     ) {
         let saved = match self.vault.as_mut() {
             Some(v) => v.set_secret(conn_id, new_password).map_err(|e| e.message),
-            None => Err("trezor není odemčený".to_string()),
+            None => Err(tr!("trezor není odemčený", "the vault is locked").to_string()),
         };
         match saved {
             Ok(()) => {
                 self.modal = None;
-                self.editor_mut().status = "heslo změněno a uloženo do trezoru".to_string();
+                self.editor_mut().status = tr!("heslo změněno a uloženo do trezoru", "password changed and saved to the vault").to_string();
                 self.switch_to_database(conn_id, retry_db, None, cx);
             }
             Err(m) => self.pw_change_set_error(
-                format!(
+                trf!(
                     "heslo na serveru ZMĚNĚNO, ale uložení do trezoru selhalo: {m} — \
-                     uložte nové heslo v dialogu připojení"
+                     uložte nové heslo v dialogu připojení",
+                    "password CHANGED on the server, but saving to the vault failed: {m} — \
+                     save the new password in the connection dialog"
                 ),
                 cx,
             ),
@@ -9122,7 +9183,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     }
 
     fn open_vault_prompt(&mut self, pending: connections_ui::PendingAfterUnlock, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| connections_ui::TextField::form_field(cx, "Heslo", true));
+        let input = cx.new(|cx| connections_ui::TextField::form_field(cx, tr!("Heslo", "Password"), true));
         self.modal = Some(connections_ui::ModalState::MasterPasswordPrompt {
             input,
             error: None,
@@ -9242,7 +9303,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Vybrat".into()),
+            prompt: Some(tr!("Vybrat", "Select").into()),
         });
         cx.spawn(async move |this, cx| {
             // DEVIATION from the plan snippet's `let … else { return }`: a
@@ -9253,21 +9314,21 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
                 Ok(Ok(_)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = "výběr zrušen".to_string();
+                        view.editor_mut().status = tr!("výběr zrušen", "selection cancelled").to_string();
                         cx.notify();
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = format!("error: dialog selhal: {e}");
+                        view.editor_mut().status = trf!("error: dialog selhal: {e}", "error: dialog failed: {e}");
                         cx.notify();
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = "error: dialog není dostupný".to_string();
+                        view.editor_mut().status = tr!("error: dialog není dostupný", "error: dialog is not available").to_string();
                         cx.notify();
                     });
                     return;
@@ -9300,7 +9361,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // for an invariant we can read directly.
                 if view.workspace_root.is_some() {
                     view.editor_mut().status =
-                        connections_ui::SCRIPTS_PICK_DISCARDED_WORKSPACE.to_string();
+                        connections_ui::scripts_pick_discarded_workspace().to_string();
                     cx.notify();
                     return;
                 }
@@ -9312,8 +9373,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // U+FFFD and reporting SUCCESS would put a path that does
                 // not exist in `config.toml` and then blame the scan for it.
                 let Some(picked_str) = picked.to_str() else {
-                    view.editor_mut().status = format!(
+                    view.editor_mut().status = trf!(
                         "error: cesta ke složce skriptů obsahuje znaky, které nelze uložit: {}",
+                        "error: the scripts folder path contains characters that cannot be saved: {}",
                         picked.display()
                     );
                     cx.notify();
@@ -9327,8 +9389,8 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 let Some(guard) = view.guard_corrupt_config(cx) else { return };
                 view.config.scripts_dir = Some(picked_str.to_string());
                 view.editor_mut().status = match view.config.save(&view.config_path, &guard) {
-                    Ok(()) => format!("složka skriptů: {picked_str}"),
-                    Err(e) => format!("error: nastavení se nepodařilo uložit ({e})"),
+                    Ok(()) => trf!("složka skriptů: {picked_str}", "scripts folder: {picked_str}"),
+                    Err(e) => trf!("error: nastavení se nepodařilo uložit ({e})", "error: could not save settings ({e})"),
                 };
                 // T7 review MINOR-3: the ROOT just changed (A -> B). The
                 // per-folder expand keys are `OuterId::ScriptFolder(rel)`
@@ -9363,8 +9425,8 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let Some(guard) = self.guard_corrupt_config(cx) else { return };
         self.config.scripts_dir = None;
         self.editor_mut().status = match self.config.save(&self.config_path, &guard) {
-            Ok(()) => "složka skriptů odebrána".to_string(),
-            Err(e) => format!("error: nastavení se nepodařilo uložit ({e})"),
+            Ok(()) => tr!("složka skriptů odebrána", "scripts folder removed").to_string(),
+            Err(e) => trf!("error: nastavení se nepodařilo uložit ({e})", "error: could not save settings ({e})"),
         };
         self.start_scripts_scan(cx); // no root => resets the tree slot
         cx.notify();
@@ -9415,7 +9477,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             return;
         }
         if self.effective_scripts_root().is_none() {
-            self.editor_mut().status = "error: nastavte složku skriptů v Nastavení".to_string();
+            self.editor_mut().status = tr!("error: nastavte složku skriptů v Nastavení", "error: set the scripts folder in Settings").to_string();
             cx.notify();
             return;
         }
@@ -9430,7 +9492,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             _ => String::new(),
         };
         let field = cx.new(|cx| {
-            let mut f = connections_ui::TextField::form_field(cx, "např. trzby", false);
+            let mut f = connections_ui::TextField::form_field(cx, tr!("např. trzby", "e.g. sales"), false);
             f.set_text(&prefill, cx);
             f
         });
@@ -9461,7 +9523,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             return;
         }
         if self.effective_scripts_root().is_none() {
-            self.editor_mut().status = "error: nastavte složku skriptů v Nastavení".to_string();
+            self.editor_mut().status = tr!("error: nastavte složku skriptů v Nastavení", "error: set the scripts folder in Settings").to_string();
             cx.notify();
             return;
         }
@@ -9632,7 +9694,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             (*mode, parent_rel.clone(), target_rel.clone(), *is_dir, field.clone());
         let name = field.read(cx).text();
         let Some(root) = self.effective_scripts_root() else {
-            self.set_script_name_error("nastavte složku skriptů v Nastavení".to_string(), cx);
+            self.set_script_name_error(tr!("nastavte složku skriptů v Nastavení", "set the scripts folder in Settings").to_string(), cx);
             return;
         };
         // SINGLE WRITER PER PATH (T8's `fsutil::write_atomic` contract):
@@ -9642,7 +9704,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // way `save_script` serializes against itself — this is a refusal
         // the user can retry, not an error, so it reuses that wording.
         if self.editor().script_save_in_flight {
-            self.set_script_name_error(SCRIPT_SAVE_IN_FLIGHT.to_string(), cx);
+            self.set_script_name_error(script_save_in_flight().to_string(), cx);
             return;
         }
         if let Some(connections_ui::ModalState::ScriptName { running, error, .. }) = &mut self.modal
@@ -9703,9 +9765,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // „script" over a folder. A false noun in the one line confirming
         // a filesystem mutation is not a nit.
         self.editor_mut().status = match mode {
-            connections_ui::ScriptNameMode::Rename => format!("přejmenováno: {name}"),
-            connections_ui::ScriptNameMode::NewFolder => format!("složka vytvořena: {name}"),
-            connections_ui::ScriptNameMode::NewScript => format!("skript vytvořen: {name}"),
+            connections_ui::ScriptNameMode::Rename => trf!("přejmenováno: {name}", "renamed: {name}"),
+            connections_ui::ScriptNameMode::NewFolder => trf!("složka vytvořena: {name}", "folder created: {name}"),
+            connections_ui::ScriptNameMode::NewScript => trf!("skript vytvořen: {name}", "script created: {name}"),
         };
         if mine {
             self.close_modal(cx);
@@ -9752,14 +9814,14 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         }
         let (rel, is_dir) = (rel.clone(), *is_dir);
         let Some(root) = self.effective_scripts_root() else {
-            self.set_script_delete_error("nastavte složku skriptů v Nastavení".to_string(), cx);
+            self.set_script_delete_error(tr!("nastavte složku skriptů v Nastavení", "set the scripts folder in Settings").to_string(), cx);
             return;
         };
         // Same single-writer serialization as the name dialog: removing a
         // file whose atomic save is still fsyncing would race the rename
         // half of that write and could resurrect it a moment later.
         if self.editor().script_save_in_flight {
-            self.set_script_delete_error(SCRIPT_SAVE_IN_FLIGHT.to_string(), cx);
+            self.set_script_delete_error(script_save_in_flight().to_string(), cx);
             return;
         }
         // FINAL-REVIEW MAJOR-1: the binding question is deliberately NOT
@@ -9828,7 +9890,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             self.set_script_binding(None);
         }
         let name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
-        self.editor_mut().status = format!("smazáno: {name}");
+        self.editor_mut().status = trf!("smazáno: {name}", "deleted: {name}");
         if mine {
             self.close_modal(cx);
         }
@@ -9919,7 +9981,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         if permitted.is_none() {
             // Unreachable through the guard, and a silent no-op is the
             // shape this phase keeps banning, so it says so.
-            self.editor_mut().status = SCRIPT_LOAD_BLOCKED.to_string();
+            self.editor_mut().status = script_load_blocked().to_string();
         }
         cx.notify();
     }
@@ -9942,7 +10004,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // „do it anyway". Refusing out loud, because a silent no-op is the
         // other thing this phase keeps banning.
         if self.discard_confirm.is_some() {
-            self.editor_mut().status = "nejprve dokončete rozpracované úpravy".to_string();
+            self.editor_mut().status = tr!("nejprve dokončete rozpracované úpravy", "finish the pending edits first").to_string();
             cx.notify();
             return;
         }
@@ -9981,7 +10043,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     view.set_script_binding(None);
                 });
                 if permitted.is_none() {
-                    self.editor_mut().status = SCRIPT_LOAD_BLOCKED.to_string();
+                    self.editor_mut().status = script_load_blocked().to_string();
                 }
                 cx.notify();
             }
@@ -9994,7 +10056,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// second size probe here.
     fn open_script(&mut self, rel: String, cx: &mut Context<Self>) {
         let Some(root) = self.effective_scripts_root() else {
-            self.editor_mut().status = "error: nastavte složku skriptů v Nastavení".to_string();
+            self.editor_mut().status = tr!("error: nastavte složku skriptů v Nastavení", "error: set the scripts folder in Settings").to_string();
             cx.notify();
             return;
         };
@@ -10100,7 +10162,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         cx: &mut Context<Self>,
     ) {
         if self.editor().script_save_in_flight {
-            self.editor_mut().status = SCRIPT_SAVE_IN_FLIGHT.to_string();
+            self.editor_mut().status = script_save_in_flight().to_string();
             cx.notify();
             return;
         }
@@ -10132,10 +10194,10 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                                 path: path.clone(),
                                 saved_text: text.clone(),
                             }));
-                            view.tab(editor_id).status = format!("skript uložen: {name}");
+                            view.tab(editor_id).status = trf!("skript uložen: {name}", "script saved: {name}");
                         } else {
                             view.tab(editor_id).status =
-                                format!("skript uložen: {name} — editor se mezitím změnil");
+                                trf!("skript uložen: {name} — editor se mezitím změnil", "script saved: {name} — the editor changed in the meantime");
                         }
                         // T8 review MINOR-2: the rescan is INDEPENDENT of
                         // the re-bind decision and lives outside it. A
@@ -10163,12 +10225,12 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     fn save_script_as(&mut self, cx: &mut Context<Self>) {
         let text = self.editor().sql.read(cx).text();
         if text.trim().is_empty() {
-            self.editor_mut().status = "editor je prázdný".to_string();
+            self.editor_mut().status = tr!("editor je prázdný", "the editor is empty").to_string();
             cx.notify();
             return;
         }
         let Some(root) = self.effective_scripts_root() else {
-            self.editor_mut().status = "error: nastavte složku skriptů v Nastavení".to_string();
+            self.editor_mut().status = tr!("error: nastavte složku skriptů v Nastavení", "error: set the scripts folder in Settings").to_string();
             cx.notify();
             return;
         };
@@ -10201,7 +10263,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         if view.editor_by_id_mut(editor_id).is_none() {
                             return; // the tab that saved is gone — design §2
                         }
-                        view.tab(editor_id).status = "uložení zrušeno".to_string();
+                        view.tab(editor_id).status = tr!("uložení zrušeno", "save cancelled").to_string();
                         cx.notify();
                     });
                     return;
@@ -10211,7 +10273,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         if view.editor_by_id_mut(editor_id).is_none() {
                             return; // the tab that saved is gone — design §2
                         }
-                        view.tab(editor_id).status = format!("error: dialog pro uložení selhal ({e})");
+                        view.tab(editor_id).status = trf!("error: dialog pro uložení selhal ({e})", "error: save dialog failed ({e})");
                         cx.notify();
                     });
                     return;
@@ -10221,7 +10283,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         if view.editor_by_id_mut(editor_id).is_none() {
                             return; // the tab that saved is gone — design §2
                         }
-                        view.tab(editor_id).status = "error: dialog pro uložení není dostupný".to_string();
+                        view.tab(editor_id).status = tr!("error: dialog pro uložení není dostupný", "error: save dialog is not available").to_string();
                         cx.notify();
                     });
                     return;
@@ -10239,7 +10301,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // captured text to a NEW path — and then binding to it —
                 // would be a silent context change on both ends.
                 if view.tab_ref(editor_id).script_binding_generation != dispatched {
-                    view.tab(editor_id).status = "uložení zrušeno — editor se mezitím změnil".to_string();
+                    view.tab(editor_id).status = tr!("uložení zrušeno — editor se mezitím změnil", "save cancelled — the editor changed in the meantime").to_string();
                     cx.notify();
                     return;
                 }
@@ -10261,7 +10323,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // event. Nothing is lost: the editor is untouched, no file
                 // is created, and Ctrl+S re-opens the picker.
                 if view.tab_ref(editor_id).sql.read(cx).text() != text {
-                    view.tab(editor_id).status = "uložení zrušeno — mezitím jste psali do editoru".to_string();
+                    view.tab(editor_id).status = tr!("uložení zrušeno — mezitím jste psali do editoru", "save cancelled — you typed in the editor in the meantime").to_string();
                     cx.notify();
                     return;
                 }
@@ -10309,7 +10371,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 })
                 .is_none()
                 {
-                    view.tab(editor_id).status = SCRIPT_SAVE_BLOCKED.to_string();
+                    view.tab(editor_id).status = script_save_blocked().to_string();
                     cx.notify();
                 }
             });
@@ -10351,7 +10413,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             None => view.save_script_as(cx),
         });
         if permitted.is_none() {
-            self.editor_mut().status = SCRIPT_SAVE_BLOCKED.to_string();
+            self.editor_mut().status = script_save_blocked().to_string();
             cx.notify();
         }
     }
@@ -10397,7 +10459,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Otevřít".into()),
+            prompt: Some(tr!("Otevřít", "Open").into()),
         });
         cx.spawn(async move |this, cx| {
             let picked = match dialog.await {
@@ -10405,13 +10467,13 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 Ok(Ok(_)) => return, // cancelled: the modal stays up
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.set_workspace_missing_error(format!("dialog selhal: {e}"), cx);
+                        view.set_workspace_missing_error(trf!("dialog selhal: {e}", "dialog failed: {e}"), cx);
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.set_workspace_missing_error("dialog není dostupný".into(), cx);
+                        view.set_workspace_missing_error(tr!("dialog není dostupný", "dialog is not available").into(), cx);
                     });
                     return;
                 }
@@ -10428,13 +10490,17 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     async move {
                         match dbc_state::workspace::classify(&picked) {
                             dbc_state::workspace::Classification::Workspace => Ok(()),
-                            dbc_state::workspace::Classification::FutureFormat(f) => Err(format!(
-                                "pracovní prostor vyžaduje novější verzi aplikace (formát {f})"
+                            dbc_state::workspace::Classification::FutureFormat(f) => Err(trf!(
+                                "pracovní prostor vyžaduje novější verzi aplikace (formát {f})",
+                                "the workspace requires a newer version of the app (format {f})"
                             )),
                             dbc_state::workspace::Classification::Unreadable(m) => Err(m),
                             _ => Err(
-                                "vybraná složka není pracovní prostor dbc — vyberte složku s dbc-workspace.toml"
-                                    .to_string(),
+                                tr!(
+                                    "vybraná složka není pracovní prostor dbc — vyberte složku s dbc-workspace.toml",
+                                    "the selected folder is not a dbc workspace — pick a folder containing dbc-workspace.toml"
+                                )
+                                .to_string(),
                             ),
                         }
                     }
@@ -10618,21 +10684,21 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 Ok(Ok(Some(p))) => p,
                 Ok(Ok(None)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = "výběr zrušen".to_string();
+                        view.editor_mut().status = tr!("výběr zrušen", "selection cancelled").to_string();
                         cx.notify();
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = format!("error: dialog selhal: {e}");
+                        view.editor_mut().status = trf!("error: dialog selhal: {e}", "error: dialog failed: {e}");
                         cx.notify();
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = "error: dialog není dostupný".to_string();
+                        view.editor_mut().status = tr!("error: dialog není dostupný", "error: dialog is not available").to_string();
                         cx.notify();
                     });
                     return;
@@ -10672,28 +10738,28 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Načíst".into()),
+            prompt: Some(tr!("Načíst", "Load").into()),
         });
         cx.spawn(async move |this, cx| {
             let picked = match dialog.await {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
                 Ok(Ok(_)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = "výběr zrušen".to_string();
+                        view.editor_mut().status = tr!("výběr zrušen", "selection cancelled").to_string();
                         cx.notify();
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = format!("error: dialog selhal: {e}");
+                        view.editor_mut().status = trf!("error: dialog selhal: {e}", "error: dialog failed: {e}");
                         cx.notify();
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = "error: dialog není dostupný".to_string();
+                        view.editor_mut().status = tr!("error: dialog není dostupný", "error: dialog is not available").to_string();
                         cx.notify();
                     });
                     return;
@@ -10808,14 +10874,14 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Použít".into()),
+            prompt: Some(tr!("Použít", "Select").into()),
         });
         cx.spawn(async move |this, cx| {
             let picked = match dialog.await {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
                 Ok(Ok(_)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.set_workspace_pick_status(my_generation, "výběr zrušen".into(), cx);
+                        view.set_workspace_pick_status(my_generation, tr!("výběr zrušen", "selection cancelled").into(), cx);
                     });
                     return;
                 }
@@ -10823,7 +10889,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     let _ = this.update(cx, |view, cx| {
                         view.set_workspace_pick_status(
                             my_generation,
-                            format!("error: dialog selhal: {e}"),
+                            trf!("error: dialog selhal: {e}", "error: dialog failed: {e}"),
                             cx,
                         );
                     });
@@ -10833,7 +10899,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     let _ = this.update(cx, |view, cx| {
                         view.set_workspace_pick_status(
                             my_generation,
-                            "error: dialog není dostupný".into(),
+                            tr!("error: dialog není dostupný", "error: dialog is not available").into(),
                             cx,
                         );
                     });
@@ -10855,7 +10921,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         return; // superseded — silent, like the Ok arm
                     }
                     view.workspace_pick_error = Some(e);
-                    view.editor_mut().status = connections_ui::WORKSPACE_PICK_FAILED_STATUS.to_string();
+                    view.editor_mut().status = connections_ui::workspace_pick_failed_status().to_string();
                     cx.notify();
                 }
             });
@@ -10924,7 +10990,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             // The user has already reached a newer, explicit decision.
             WorkspacePickVerdict::Superseded => return,
             WorkspacePickVerdict::OtherDialog => {
-                self.editor_mut().status = connections_ui::WORKSPACE_PICK_DISCARDED.to_string();
+                self.editor_mut().status = connections_ui::workspace_pick_discarded().to_string();
                 cx.notify();
                 return;
             }
@@ -10981,7 +11047,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 .background_spawn(async move {
                     match mode {
                         connections_ui::WorkspaceConfirmMode::Init => {
-                            let root = job_root.ok_or("chybí cílová složka")?;
+                            let root = job_root.ok_or(tr!("chybí cílová složka", "target folder is missing"))?;
                             // Copies + scripts/ + .gitignore + MARKER LAST.
                             // Every write inside goes through the shared
                             // rails (`fsutil::write_atomic` /
@@ -10993,7 +11059,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                                 .map_err(|e| e.message)
                         }
                         connections_ui::WorkspaceConfirmMode::Adopt => {
-                            let root = job_root.ok_or("chybí cílová složka")?;
+                            let root = job_root.ok_or(tr!("chybí cílová složka", "target folder is missing"))?;
                             // §W3.3: NOTHING is written but the pointer.
                             dbc_state::workspace::write_pointer(&pointer, &root)
                                 .map_err(|e| e.message)
@@ -11107,6 +11173,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         };
         self.config = config;
         self.config_load_error = config_load_error;
+        apply_language(&self.config);
         // Existing degrade-to-None postures, unchanged.
         self.view_prefs = ViewPrefsStore::load(&paths.views).ok();
         self.param_values = ParamValuesStore::load(&paths.params).ok();
@@ -11158,12 +11225,14 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         self.set_script_binding(None);
         self.supersede_script_continuations();
         self.editor_mut().status = match &root {
-            Some(r) => format!("pracovní prostor: {}", r.display()),
-            None => "lokální profil obnoven".to_string(),
+            Some(r) => trf!("pracovní prostor: {}", "workspace: {}", r.display()),
+            None => tr!("lokální profil obnoven", "local profile restored").to_string(),
         };
         if let Some(detail) = self.config_load_error.clone() {
-            self.editor_mut().status =
-                format!("error: config.toml je poškozený – oprav nebo smaž soubor ({detail})");
+            self.editor_mut().status = trf!(
+                "error: config.toml je poškozený – oprav nebo smaž soubor ({detail})",
+                "error: config.toml is corrupted – fix or delete the file ({detail})"
+            );
         }
         cx.notify();
     }
@@ -11333,7 +11402,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 let result = match result {
                     Ok(Ok(r)) => Ok(r),
                     Ok(Err(e)) => Err(e.to_string()),
-                    Err(_) => Err("výpis databází zrušen".to_string()),
+                    Err(_) => Err(tr!("výpis databází zrušen", "database listing cancelled").to_string()),
                 };
                 // Expanding a connection is the FIRST thing that touches the
                 // server, so this is where a bad host, a refused login or an
@@ -11511,7 +11580,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     Err(_) => log(Event::SchemaPrefetchFailed {
                         conn: conn_id,
                         db,
-                        error: "fetch zrušen".to_string(),
+                        error: tr!("fetch zrušen", "fetch cancelled").to_string(),
                     }),
                 }
             });
@@ -11604,7 +11673,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 let result = match result {
                     Ok(Ok(s)) => Ok(s),
                     Ok(Err(e)) => Err(e.to_string()),
-                    Err(_) => Err("fetch zrušen".to_string()),
+                    Err(_) => Err(tr!("fetch zrušen", "fetch cancelled").to_string()),
                 };
                 let ok = result.is_ok();
                 {
@@ -11641,7 +11710,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // in the status bar, and in the log by the arm above.
                 if result.is_err() && served_from_cache.get() {
                     if let Err(e) = &result {
-                        view.editor_mut().status = format!("error: schéma se nepodařilo obnovit ({e}) — zobrazeno z mezipaměti");
+                        view.editor_mut().status = trf!("error: schéma se nepodařilo obnovit ({e}) — zobrazeno z mezipaměti", "error: could not refresh the schema ({e}) — shown from cache");
                     }
                     cx.notify();
                 } else {
@@ -11892,7 +11961,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let Some(store) = self.view_prefs.as_mut() else { return };
         let prefs = prefs_from_grid_state(&headers, sort, &hidden, &widths, fk_joins);
         if let Err(e) = store.set(&conn_id, schema.as_deref(), &table, prefs) {
-            self.editor_mut().status = format!("error ukládání view prefs: {}", e.message);
+            self.editor_mut().status = trf!("error ukládání view prefs: {}", "error saving view prefs: {}", e.message);
         }
     }
 
@@ -11939,11 +12008,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     fn start_lookup(&mut self, grid: Entity<ResultGrid>, req: LookupRequest, cx: &mut Context<Self>) {
         let LookupRequest { sql, ref_table, wanted_cols, src_col, generation } = req;
         let Some(spec) = self.active_conn_spec() else {
-            self.editor_mut().status = "Bez připojení — vyberte připojení nahoře.".into();
+            self.editor_mut().status = tr!("Bez připojení — vyberte připojení nahoře.", "No connection — pick a connection at the top.").into();
             cx.notify();
             return;
         };
-        self.editor_mut().status = "hledám hodnoty pro join…".into();
+        self.editor_mut().status = tr!("hledám hodnoty pro join…", "looking up values for join…").into();
         cx.notify();
         let rx = self.runner.fetch_lookup(spec, sql);
         cx.spawn(async move |this, cx| {
@@ -11986,13 +12055,13 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         grid.update(cx, |g, cx| {
                             g.set_virtual_cols_for_src(src_col, virtual_cols, cx);
                         });
-                        view.editor_mut().status = "join přidán".into();
+                        view.editor_mut().status = tr!("join přidán", "join added").into();
                     }
                     Ok(Err(e)) => {
                         view.editor_mut().status = format!("error: {e}");
                     }
                     Err(_) => {
-                        view.editor_mut().status = "lookup zrušen".into();
+                        view.editor_mut().status = tr!("lookup zrušen", "lookup cancelled").into();
                     }
                 }
                 cx.notify();
@@ -12022,7 +12091,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // request with no trace.
                 if self.modal.is_some() || self.editor().cancel.is_some() {
                     emitter.update(cx, |g, cx| g.revert_fk_toggle(*col, ref_col, cx));
-                    self.editor_mut().status = "počkejte — běží dotaz".into();
+                    self.editor_mut().status = tr!("počkejte — běží dotaz", "wait — a query is running").into();
                     cx.notify();
                     return;
                 }
@@ -12087,7 +12156,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // non-read-only preview) AND the runner's own up-front
                 // guard in `run_csv_import`.
                 if self.active_read_only() {
-                    self.editor_mut().status = "error: připojení je jen pro čtení".to_string();
+                    self.editor_mut().status = tr!("error: připojení je jen pro čtení", "error: connection is read-only").to_string();
                     cx.notify();
                     return;
                 }
@@ -12108,7 +12177,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// same guard every other opener in `connections_ui.rs` applies.
     fn open_chart_picker(&mut self, from_grid: Option<Entity<ResultGrid>>, cx: &mut Context<Self>) {
         if self.modal.is_some() {
-            self.editor_mut().status = "zavřete nejprve otevřený dialog".into();
+            self.editor_mut().status = tr!("zavřete nejprve otevřený dialog", "close the open dialog first").into();
             cx.notify();
             return;
         }
@@ -12132,7 +12201,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             buffer.map(|b| (t.title.clone(), b))
         });
         let Some((source_title, buffer)) = source else {
-            self.editor_mut().status = "graf lze vytvořit jen z výsledkové mřížky".into();
+            self.editor_mut().status = tr!("graf lze vytvořit jen z výsledkové mřížky", "a chart can only be created from the result grid").into();
             cx.notify();
             return;
         };
@@ -12146,7 +12215,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             .map(|f| (f.name().clone(), f.data_type().is_numeric()))
             .collect();
         if !columns.iter().any(|(_, numeric)| *numeric) {
-            self.editor_mut().status = "výsledek nemá žádný číselný sloupec — graf nelze vytvořit".into();
+            self.editor_mut().status = tr!("výsledek nemá žádný číselný sloupec — graf nelze vytvořit", "the result has no numeric column — cannot create a chart").into();
             cx.notify();
             return;
         }
@@ -12182,7 +12251,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 if y_selected.iter().any(|on| *on)
         );
         if !valid {
-            self.editor_mut().status = "vyberte alespoň jeden číselný sloupec pro osu Y".into();
+            self.editor_mut().status = tr!("vyberte alespoň jeden číselný sloupec pro osu Y", "select at least one numeric column for the Y axis").into();
             cx.notify();
             return;
         }
@@ -12221,7 +12290,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 let conn_identity = self.current_conn_identity();
                 self.editor_mut().results.open(ResultTab {
                     id: 0, // Tabs::open assigns
-                    title: tabs::collapse_title(&format!("Graf: {source_title}")),
+                    title: tabs::collapse_title(&trf!("Graf: {source_title}", "Chart: {source_title}")),
                     pinned: false,
                     preview_key: None, // stacked like ad-hoc tabs, Plan precedent
                     conn_identity,
@@ -12243,7 +12312,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         cx: &mut Context<Self>,
     ) {
         if self.modal.is_some() {
-            self.editor_mut().status = "zavřete nejprve otevřený dialog".into();
+            self.editor_mut().status = tr!("zavřete nejprve otevřený dialog", "close the open dialog first").into();
             cx.notify();
             return;
         }
@@ -12339,7 +12408,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let sql = preview_sql(dialect, schema.as_deref(), &table);
         let key = format!("{}.{table}", schema.clone().unwrap_or_default());
         let preview = PreviewTarget {
-            title: format!("Náhled: {table}"),
+            title: trf!("Náhled: {table}", "Preview: {table}"),
             key: key.clone(),
             table,
             schema,
@@ -12552,7 +12621,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let engine = self.active_engine();
         let read_only = self.active_read_only();
         if admin_panel::admin_entry_state(engine, read_only) != admin_panel::AdminEntry::Enabled {
-            self.editor_mut().status = "správa serveru není pro toto připojení dostupná".to_string();
+            self.editor_mut().status = tr!("správa serveru není pro toto připojení dostupná", "server administration is not available for this connection").to_string();
             cx.notify();
             return;
         }
@@ -12582,7 +12651,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         cx.subscribe(&panel, Self::on_admin_event).detach();
         self.editor_mut().results.open(ResultTab {
             id: 0,
-            title: "Správa serveru".to_string(),
+            title: tr!("Správa serveru", "Server administration").to_string(),
             pinned: false,
             preview_key: Some(admin_panel::ADMIN_PREVIEW_KEY.to_string()),
             conn_identity: identity,
@@ -12650,12 +12719,12 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         if !conn_identity_matches(&panel_conn_identity, &current_identity) {
             let from = self.conn_name_for_identity(&panel_conn_identity);
             panel.update(cx, |p, cx| {
-                p.set_error(&format!("data pocházejí z jiného připojení ({from}) — přepni se zpět"), cx)
+                p.set_error(&trf!("data pocházejí z jiného připojení ({from}) — přepni se zpět", "data comes from another connection ({from}) — switch back"), cx)
             });
             return;
         }
         let Some((spec, _timeout)) = self.apply_conn_spec() else {
-            panel.update(cx, |p, cx| p.set_error("Bez připojení — vyberte připojení nahoře.", cx));
+            panel.update(cx, |p, cx| p.set_error(tr!("Bez připojení — vyberte připojení nahoře.", "No connection — pick a connection at the top."), cx));
             return;
         };
         panel.update(cx, |p, cx| p.set_loading(cx));
@@ -12665,7 +12734,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             panel.update(cx, |p, cx| match result {
                 Ok(Ok(rows)) => p.apply_catalog(rows, cx),
                 Ok(Err(e)) => p.set_error(&e.to_string(), cx),
-                Err(_) => p.set_error("dotaz zrušen", cx),
+                Err(_) => p.set_error(tr!("dotaz zrušen", "query cancelled"), cx),
             });
         })
         .detach();
@@ -12677,14 +12746,14 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// reopening just ACTIVATES the existing tab (design §5).
     fn open_monitor_tab(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.active_engine() else {
-            self.editor_mut().status = "Bez připojení — vyberte připojení nahoře.".into();
+            self.editor_mut().status = tr!("Bez připojení — vyberte připojení nahoře.", "No connection — pick a connection at the top.").into();
             cx.notify();
             return;
         };
         if !monitor::monitor_available(engine) {
             // The palette already hides the entry (build_palette_items);
             // this is the belt for any other entry point.
-            self.editor_mut().status = "monitor serveru není pro tento engine k dispozici".into();
+            self.editor_mut().status = tr!("monitor serveru není pro tento engine k dispozici", "server monitor is not available for this engine").into();
             cx.notify();
             return;
         }
@@ -12697,7 +12766,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             return;
         }
         let Some(spec) = self.active_conn_spec() else {
-            self.editor_mut().status = "Bez připojení — vyberte připojení nahoře.".into();
+            self.editor_mut().status = tr!("Bez připojení — vyberte připojení nahoře.", "No connection — pick a connection at the top.").into();
             cx.notify();
             return;
         };
@@ -12742,7 +12811,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     fn save_folder_state(&mut self, cx: &mut Context<Self>) {
         if let Some(guard) = self.guard_corrupt_config(cx) {
             if let Err(e) = self.config.save(&self.config_path, &guard) {
-                self.editor_mut().status = format!("error: složky se nepodařilo uložit: {e}");
+                self.editor_mut().status = trf!("error: složky se nepodařilo uložit: {e}", "error: could not save folders: {e}");
                 return;
             }
         }
@@ -12764,7 +12833,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         cx: &mut Context<Self>,
     ) {
         let initial = rename_of.as_ref().and_then(|p| p.last().cloned()).unwrap_or_default();
-        let field = cx.new(|cx| connections_ui::TextField::form_field(cx, "Název", false));
+        let field = cx.new(|cx| connections_ui::TextField::form_field(cx, tr!("Název", "Name"), false));
         field.update(cx, |f, cx| f.set_text(&initial, cx));
         self.modal = Some(connections_ui::ModalState::FolderName {
             rename_of,
@@ -12796,8 +12865,8 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 self.config.folders = folders;
                 self.modal = None;
                 self.editor_mut().status = match rename_of {
-                    Some(_) => "Složka přejmenována".to_string(),
-                    None => "Složka vytvořena".to_string(),
+                    Some(_) => tr!("Složka přejmenována", "Folder renamed").to_string(),
+                    None => tr!("Složka vytvořena", "Folder created").to_string(),
                 };
                 self.save_folder_state(cx);
             }
@@ -12834,8 +12903,16 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         self.config.folders = folders;
         self.modal = None;
         self.editor_mut().status = match moved {
-            0 => "Složka smazána".to_string(),
-            n => format!("Složka smazána, {n} připojení přesunuto o úroveň výš"),
+            0 => tr!("Složka smazána", "Folder deleted").to_string(),
+            1 => tr!(
+                "Složka smazána, 1 připojení přesunuto o úroveň výš",
+                "Folder deleted, 1 connection moved up a level"
+            )
+            .to_string(),
+            n => trf!(
+                "Složka smazána, {n} připojení přesunuto o úroveň výš",
+                "Folder deleted, {n} connections moved up a level"
+            ),
         };
         self.save_folder_state(cx);
     }
@@ -12895,11 +12972,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         self.config.connections.retain(|c| c.id != conn_id);
         self.config.favourite_objects.retain(|f| f.connection_id != conn_id);
         self.editor_mut().status = match (self.config.save(&self.config_path, &guard), secret_error) {
-            (Err(e), _) => format!("error: připojení se nepodařilo smazat: {}", e.message),
+            (Err(e), _) => trf!("error: připojení se nepodařilo smazat: {}", "error: could not delete the connection: {}", e.message),
             (Ok(()), Some(e)) => {
-                format!("Připojení {name} smazáno, ale heslo v trezoru zůstalo: {e}")
+                trf!("Připojení {name} smazáno, ale heslo v trezoru zůstalo: {e}", "Connection {name} deleted, but its password stayed in the vault: {e}")
             }
-            (Ok(()), None) => format!("Připojení {name} smazáno"),
+            (Ok(()), None) => trf!("Připojení {name} smazáno", "Connection {name} deleted"),
         };
         self.refresh_grouped_cache(cx);
         let grouped = self.grouped_cache.clone();
@@ -12923,7 +13000,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             return;
         }
         self.config.connections = folders::move_connection(&self.config.connections, &conn_id, &folder);
-        self.editor_mut().status = format!("Přesunuto do {}", crate::folders::label(&folder));
+        self.editor_mut().status = trf!("Přesunuto do {}", "Moved to {}", crate::folders::label(&folder));
         self.save_folder_state(cx);
     }
 
@@ -12976,9 +13053,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let whole = selection.is_none_or(|r| r.is_empty());
         cx.write_to_clipboard(ClipboardItem::new_string(out));
         self.editor_mut().status = if whole {
-            format!("Zkopírováno celé ({chars} znaků)")
+            trf!("Zkopírováno celé ({chars} znaků)", "Copied in full ({chars} characters)")
         } else {
-            format!("Zkopírován výběr ({chars} znaků)")
+            trf!("Zkopírován výběr ({chars} znaků)", "Copied selection ({chars} characters)")
         };
         cx.notify();
     }
@@ -13012,12 +13089,14 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         self.editor_mut().results.close_by_preview_key(LOG_PREVIEW_KEY);
         let where_ = dbc_state::applog::path()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(log není k dispozici)".to_string());
+            .unwrap_or_else(|| tr!("(log není k dispozici)", "(log is not available)").to_string());
         let tail = dbc_state::applog::tail(TAIL_BYTES);
         let body = if tail.trim().is_empty() {
-            format!("{where_}
+            trf!("{where_}
 
-(zatím prázdný)")
+(zatím prázdný)", "{where_}
+
+(empty so far)")
         } else {
             format!("{where_}
 
@@ -13048,7 +13127,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// codebase (strict, no "public" guessing).
     fn open_er_diagram(&mut self, schema: Option<String>, cx: &mut Context<Self>) {
         let Some(snapshot) = self.tree.read(cx).snapshot() else {
-            self.editor_mut().status = "Nejprve načtěte schéma".to_string();
+            self.editor_mut().status = tr!("Nejprve načtěte schéma", "Load the schema first").to_string();
             dbc_state::applog::log(dbc_state::applog::Event::Refused {
                 what: "er_diagram".into(),
                 reason: "no schema snapshot loaded".into(),
@@ -13070,21 +13149,22 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 ),
             });
             self.editor_mut().status = match &schema {
-                Some(s) => format!("Schéma {s} nemá žádné tabulky — není co nakreslit"),
-                None => "Snímek schématu nemá žádné tabulky — není co nakreslit".to_string(),
+                Some(s) => trf!("Schéma {s} nemá žádné tabulky — není co nakreslit", "Schema {s} has no tables — nothing to draw"),
+                None => tr!("Snímek schématu nemá žádné tabulky — není co nakreslit", "The schema snapshot has no tables — nothing to draw").to_string(),
             };
             cx.notify();
             return;
         }
         let (scoped, hidden) = er_diagram_view::cap_tables(scoped, er_diagram_view::DIAGRAM_TABLE_CAP);
         let truncated_notice = hidden.map(|hidden| {
-            format!(
+            trf!(
                 "Schéma má {} tabulek — zobrazeno prvních {} podle názvu; použijte filtr.",
+                "The schema has {} tables — showing the first {} by name; use the filter.",
                 hidden + er_diagram_view::DIAGRAM_TABLE_CAP,
                 er_diagram_view::DIAGRAM_TABLE_CAP
             )
         });
-        let label = schema.clone().unwrap_or_else(|| "(bez schématu)".to_string());
+        let label = schema.clone().unwrap_or_else(|| tr!("(bez schématu)", "(no schema)").to_string());
         let graph = dbc_core::erd::build_graph(&scoped);
         let layout = dbc_core::erd::layout::compute_layout(&graph);
         let view = cx.new(|_cx| {
@@ -13103,7 +13183,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             sql: None,
             content: TabContent::Diagram { view },
         });
-        self.editor_mut().status = "ER diagram otevřen".to_string();
+        self.editor_mut().status = tr!("ER diagram otevřen", "ER diagram opened").to_string();
         cx.notify();
     }
 
@@ -13127,7 +13207,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 sql: None,
                 content: TabContent::Text { text: text_view::normalize(ddl), scroll_lines: 0 },
             });
-            self.editor_mut().status = format!("DDL otevřeno: {title}");
+            self.editor_mut().status = trf!("DDL otevřeno: {title}", "DDL opened: {title}");
             cx.notify();
         }
     }
@@ -13231,7 +13311,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         // out-of-cycle refresh MonitorView already
                         // dispatched shows the truth momentarily (design
                         // §6).
-                        self.editor_mut().status = format!("proces {pid} ukončen");
+                        self.editor_mut().status = trf!("proces {pid} ukončen", "process {pid} terminated");
                     }
                     Err(msg) => {
                         if matches_open_dialog {
@@ -13305,7 +13385,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let current_identity = self.current_conn_identity();
         if !conn_identity_matches(&tab_conn_identity, &current_identity) {
             let from = self.conn_name_for_identity(&tab_conn_identity);
-            self.editor_mut().status = format!("změny pocházejí z jiného připojení ({from}) — přepni se zpět");
+            self.editor_mut().status = trf!("změny pocházejí z jiného připojení ({from}) — přepni se zpět", "changes come from another connection ({from}) — switch back");
             cx.notify();
             return;
         }
@@ -13390,7 +13470,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             let from = self.conn_name_for_identity(&dialog_conn_identity);
             if let Some(ad) = &mut self.apply_dialog {
                 ad.error =
-                    Some(format!("změny pocházejí z jiného připojení ({from}) — přepni se zpět"));
+                    Some(trf!("změny pocházejí z jiného připojení ({from}) — přepni se zpět", "changes come from another connection ({from}) — switch back"));
             }
             cx.notify();
             return;
@@ -13398,7 +13478,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
 
         let Some((spec, timeout_secs)) = self.apply_conn_spec() else {
             if let Some(ad) = &mut self.apply_dialog {
-                ad.error = Some("Bez připojení — vyberte připojení nahoře.".to_string());
+                ad.error = Some(tr!("Bez připojení — vyberte připojení nahoře.", "No connection — pick a connection at the top.").to_string());
             }
             cx.notify();
             return;
@@ -13450,7 +13530,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                                         grid.clone().update(cx, |g, cx| g.clear_edits(cx));
                                     }
                                 }
-                                view.editor_mut().status = format!("aplikováno ({n_statements} příkazů)");
+                                view.editor_mut().status = if n_statements == 1 {
+                                    tr!("aplikováno (1 příkaz)", "applied (1 statement)").to_string()
+                                } else {
+                                    trf!("aplikováno ({n_statements} příkazů)", "applied ({n_statements} statements)")
+                                };
                                 // Re-run the preview via the EXISTING
                                 // pipeline (brief: "preserves joins via
                                 // from_join_change=false machinery" —
@@ -13472,7 +13556,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                                     view.active_engine().map(sql_dialect).unwrap_or(dbc_core::Dialect::Postgres);
                                 let sql = preview_sql(dialect, schema.as_deref(), &table);
                                 let key = format!("{}.{table}", schema.clone().unwrap_or_default());
-                                let title = format!("Náhled: {table}");
+                                let title = trf!("Náhled: {table}", "Preview: {table}");
                                 let preview = PreviewTarget {
                                     title,
                                     key,
@@ -13484,7 +13568,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                                 view.run_query_with(sql, Some(preview), true, cx);
                             }
                             ApplyTarget::Tree => {
-                                view.editor_mut().status = "provedeno".into();
+                                view.editor_mut().status = tr!("provedeno", "done").into();
                                 // The dropped/emptied object must leave the
                                 // tree, or the next click acts on something
                                 // that no longer exists.
@@ -13500,7 +13584,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                                 // — the admin equivalent of "re-run the
                                 // preview".
                                 panel.clone().update(cx, |p, cx| p.on_apply_success(cx));
-                                view.editor_mut().status = format!("aplikováno ({n_statements} příkazů)");
+                                view.editor_mut().status = if n_statements == 1 {
+                                    tr!("aplikováno (1 příkaz)", "applied (1 statement)").to_string()
+                                } else {
+                                    trf!("aplikováno ({n_statements} příkazů)", "applied ({n_statements} statements)")
+                                };
                             }
                         }
                         // Record ONE history entry for the write itself
@@ -13541,7 +13629,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     Err(_) => {
                         if let Some(ad) = &mut view.apply_dialog {
                             ad.running = false;
-                            ad.error = Some("apply zrušeno".to_string());
+                            ad.error = Some(tr!("apply zrušeno", "apply cancelled").to_string());
                         }
                     }
                 }
@@ -13578,7 +13666,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let current_identity = self.current_conn_identity();
         if !conn_identity_matches(&panel_conn_identity, &current_identity) {
             let from = self.conn_name_for_identity(&panel_conn_identity);
-            self.editor_mut().status = format!("změny pocházejí z jiného připojení ({from}) — přepni se zpět");
+            self.editor_mut().status = trf!("změny pocházejí z jiného připojení ({from}) — přepni se zpět", "changes come from another connection ({from}) — switch back");
             cx.notify();
             return;
         }
@@ -13614,7 +13702,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         cx: &mut Context<Self>,
     ) {
         let (result_a, result_b) = result.unwrap_or_else(|_| {
-            let cancelled = || Err(QueryError::msg("fetch zrušen".to_string()));
+            let cancelled = || Err(QueryError::msg(tr!("fetch zrušen", "fetch cancelled").to_string()));
             (cancelled(), cancelled())
         });
         let (engine_a, engine_b) = pending.view.read(cx).engines();
@@ -13634,7 +13722,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             v.state = state;
             cx.notify();
         });
-        self.editor_mut().status = "Porovnání schématu dokončeno".to_string();
+        self.editor_mut().status = tr!("Porovnání schématu dokončeno", "Schema comparison finished").to_string();
         cx.notify();
     }
 
@@ -13717,7 +13805,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     sql: None,
                     content: TabContent::Text { text: text_view::normalize(ddl), scroll_lines: 0 },
                 });
-                self.editor_mut().status = format!("DDL otevřeno: {title}");
+                self.editor_mut().status = trf!("DDL otevřeno: {title}", "DDL opened: {title}");
                 cx.notify();
             }
             // Sidebar rework: ⟳ refreshes the ACTIVE slot (a `Loading`
@@ -13750,7 +13838,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // `toggle_favourite_distinguishes_databases` pin).
                 self.config.toggle_favourite(fav.clone());
                 self.editor_mut().status = match self.config.save(&self.config_path, &guard) {
-                    Ok(()) => "Uloženo".to_string(),
+                    Ok(()) => tr!("Uloženo", "Saved").to_string(),
                     Err(e) => format!("error saving config: {}", e.message),
                 };
                 self.refresh_tree_context(cx);
@@ -13827,23 +13915,23 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             // --- Context menu (2026-08-29) ---
             TreeEvent::CopyText { what, text } => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                self.editor_mut().status = format!("{what} zkopírováno");
+                self.editor_mut().status = trf!("{what} zkopírováno", "{what} copied");
                 cx.notify();
             }
             TreeEvent::InsertAtCursor { text } => {
                 let text = text.clone();
                 self.editor().sql.update(cx, |input, cx| input.insert_text(&text, cx));
-                self.editor_mut().status = "vloženo do editoru".into();
+                self.editor_mut().status = tr!("vloženo do editoru", "inserted into the editor").into();
                 cx.notify();
             }
             TreeEvent::GenerateSql { kind, sql } => {
                 let sql = sql.clone();
                 let changed = rewrite_buffer_in_place(self, cx, move |_| sql);
                 self.editor_mut().status = match kind {
-                    schema_tree::GenKind::Select if changed => "SELECT vygenerován".into(),
-                    schema_tree::GenKind::Insert if changed => "INSERT vygenerován".into(),
-                    schema_tree::GenKind::Update if changed => "UPDATE vygenerován".into(),
-                    _ => "editor už obsahuje tento dotaz".into(),
+                    schema_tree::GenKind::Select if changed => tr!("SELECT vygenerován", "SELECT generated").into(),
+                    schema_tree::GenKind::Insert if changed => tr!("INSERT vygenerován", "INSERT generated").into(),
+                    schema_tree::GenKind::Update if changed => tr!("UPDATE vygenerován", "UPDATE generated").into(),
+                    _ => tr!("editor už obsahuje tento dotaz", "the editor already contains this query").into(),
                 };
                 cx.notify();
             }
@@ -13860,7 +13948,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // is on screen, rather than a second, silently different
                 // extraction path.
                 self.open_table_preview(schema.clone(), table.clone(), cx);
-                self.editor_mut().status = "data otevřena — export je v panelu výsledku".into();
+                self.editor_mut().status = tr!("data otevřena — export je v panelu výsledku", "data opened — export is in the result panel").into();
                 cx.notify();
             }
             // These need a `Window` (dialog focus) and this subscription is
@@ -13886,7 +13974,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     /// and an appended `LIMIT` would be noise in the history entry.
     fn run_count_rows(&mut self, schema: Option<String>, table: String, cx: &mut Context<Self>) {
         let Some(engine) = self.active_engine() else {
-            self.editor_mut().status = "error: není aktivní připojení".into();
+            self.editor_mut().status = tr!("error: není aktivní připojení", "error: no active connection").into();
             cx.notify();
             return;
         };
@@ -13965,7 +14053,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             Some(d) => self.config.set_hidden_schemas(&conn_id, d, hidden),
         }
         self.editor_mut().status = match self.config.save(&self.config_path, &guard) {
-            Ok(()) => "Uloženo".to_string(),
+            Ok(()) => tr!("Uloženo", "Saved").to_string(),
             Err(e) => format!("error saving config: {}", e.message),
         };
         let hidden_map = self.config.hidden.clone();
@@ -13992,7 +14080,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     // The row was built from this list, so a miss means the
                     // config changed under the open menu.
                     None => {
-                        self.editor_mut().status = "error: připojení už neexistuje".into();
+                        self.editor_mut().status = tr!("error: připojení už neexistuje", "error: the connection no longer exists").into();
                         cx.notify();
                     }
                 }
@@ -14000,7 +14088,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             TreeEvent::DropObject { kind, schema, name } => {
                 self.open_destructive_confirm(
                     |d| tree_menu::drop_sql(kind, d, schema.as_deref(), &name),
-                    format!("Objekt {name} bude nenávratně odstraněn."),
+                    trf!("Objekt {name} bude nenávratně odstraněn.", "Object {name} will be permanently removed."),
                     window,
                     cx,
                 );
@@ -14008,7 +14096,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             TreeEvent::TruncateTable { schema, table } => {
                 self.open_destructive_confirm(
                     |d| tree_menu::truncate_sql(d, schema.as_deref(), &table),
-                    format!("Všechna data v tabulce {table} budou nenávratně smazána."),
+                    trf!("Všechna data v tabulce {table} budou nenávratně smazána.", "All data in table {table} will be permanently deleted."),
                     window,
                     cx,
                 );
@@ -14039,7 +14127,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         cx: &mut Context<Self>,
     ) {
         let Some(engine) = self.active_engine() else {
-            self.editor_mut().status = "error: není aktivní připojení".into();
+            self.editor_mut().status = tr!("error: není aktivní připojení", "error: no active connection").into();
             cx.notify();
             return;
         };
@@ -14047,7 +14135,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             // Belt-and-braces: `tree_menu` already omits these items on a
             // read-only connection, so reaching here means the flag changed
             // between the menu opening and the click.
-            self.editor_mut().status = "error: připojení je jen pro čtení".into();
+            self.editor_mut().status = tr!("error: připojení je jen pro čtení", "error: connection is read-only").into();
             cx.notify();
             return;
         }
@@ -14346,7 +14434,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 let mut header = div().flex().flex_row().justify_end().gap_2().p_1();
                 if let Some(sql) = restored_sql {
                     header = header.child(
-                        ui::button("tab-restored-run", "Spustit", theme)
+                        ui::button("tab-restored-run", tr!("Spustit", "Run"), theme)
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 // Straight through the ordinary run path, so
                                 // the read-only guard, the auto-limit and the
@@ -14358,7 +14446,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 }
                 if is_log {
                     header = header.child(
-                        ui::button("tab-log-refresh", "Obnovit", theme)
+                        ui::button("tab-log-refresh", tr!("Obnovit", "Refresh"), theme)
                             .on_click(cx.listener(|view, _, _, cx| view.open_log_tab(cx))),
                     );
                 }
@@ -14370,7 +14458,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     .bg(theme.bg_panel)
                     .child(
                         header.child(
-                            ui::button("tab-copy", "Kopírovat", theme)
+                            ui::button("tab-copy", tr!("Kopírovat", "Copy"), theme)
                                 // The same funnel as Ctrl+C, so the two can
                                 // never disagree about what „copy" means
                                 // when something is selected.
@@ -14463,7 +14551,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 .gap_2()
                 .bg(theme.bg_warn_banner)
                 .text_color(theme.warn)
-                .child(format!("{n} změn"))
+                .child(if n == 1 {
+                    tr!("1 změn", "1 change").to_string()
+                } else {
+                    trf!("{n} změn", "{n} changes")
+                })
                 .child(
                     div()
                         .id("apply-bar-apply")
@@ -14477,13 +14569,13 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         .rounded_md()
                         .bg(theme.bg_selected)
                         .text_color(if identity_ok { theme.success } else { theme.text_disabled })
-                        .child("Aplikovat"),
+                        .child(tr!("Aplikovat", "Apply")),
                 )
                 .when(!identity_ok, |d| {
                     d.child(
                         div()
                             .text_color(theme.text_disabled)
-                            .child("(jiné připojení — přepni se zpět)"),
+                            .child(tr!("(jiné připojení — přepni se zpět)", "(another connection — switch back)")),
                     )
                 })
                 .child(
@@ -14494,7 +14586,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         .rounded_md()
                         .bg(theme.bg_selected)
                         .text_color(theme.danger)
-                        .child("Zahodit")
+                        .child(tr!("Zahodit", "Discard"))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             grid_for_discard.update(cx, |g, cx| g.clear_edits(cx));
                         })),
@@ -14547,11 +14639,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                             .text_color(theme.danger)
                             .px_2()
                             .rounded_md()
-                            .child("Zahodit")
+                            .child(tr!("Zahodit", "Discard"))
                             .on_click(cx.listener(|view, _, _, cx| view.on_discard_confirm_yes(cx))),
                     )
                     .child(
-                        ui::button("discard-confirm-no", "Zrušit", theme)
+                        ui::button("discard-confirm-no", tr!("Zrušit", "Cancel"), theme)
                             .on_click(cx.listener(|view, _, _, cx| view.on_discard_confirm_no(cx))),
                     ),
             );
@@ -14633,7 +14725,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             .p_2()
             .gap_2()
             .text_color(theme.text_primary)
-            .child(format!("Aplikovat {} příkazů", lines.len()))
+            .child(if lines.len() == 1 {
+                tr!("Aplikovat 1 příkaz", "Apply 1 statement").to_string()
+            } else {
+                trf!("Aplikovat {} příkazů", "Apply {} statements", lines.len())
+            })
             .child(body);
 
         // G10 T6: the CASCADE-drop red warning line, above the buttons —
@@ -14642,7 +14738,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             panel = panel.child(div().text_color(theme.danger).child(w.clone()));
         }
         if running {
-            panel = panel.child(div().text_color(theme.warn).child("aplikuji…"));
+            panel = panel.child(div().text_color(theme.warn).child(tr!("aplikuji…", "applying…")));
         }
         if let Some(err) = &error {
             panel = panel.child(div().text_color(theme.danger).child(format!("error: {err}")));
@@ -14665,7 +14761,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         .text_color(if running { theme.text_disabled } else { theme.success })
                         .px_2()
                         .rounded_md()
-                        .child("Potvrdit a spustit"),
+                        .child(tr!("Potvrdit a spustit", "Confirm and run")),
                 )
                 .child(
                     div()
@@ -14680,7 +14776,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         .text_color(if running { theme.text_disabled } else { theme.text_primary })
                         .px_2()
                         .rounded_md()
-                        .child("Zrušit"),
+                        .child(tr!("Zrušit", "Cancel")),
                 ),
         );
 
@@ -14894,7 +14990,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             return;
         }
         let Some((cfg, _secret)) = self.resolve_conn_for_backup(&connection_id) else {
-            self.editor_mut().status = "error: připojení nenalezeno".to_string();
+            self.editor_mut().status = tr!("error: připojení nenalezeno", "error: connection not found").to_string();
             cx.notify();
             return;
         };
@@ -14905,13 +15001,13 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // source of truth both paths must respect. See
         // `backup::backup_restore_available`'s doc comment for why.
         if !backup::backup_restore_available(cfg.engine) {
-            self.editor_mut().status = "zálohování pro MSSQL zatím není k dispozici".to_string();
+            self.editor_mut().status = tr!("zálohování pro MSSQL zatím není k dispozici", "backup for MSSQL is not available yet").to_string();
             cx.notify();
             return;
         }
         let ext = backup_file_ext(cfg.engine);
         let suggested_name = format!("{}-{}.{ext}", cfg.database, backup_timestamp());
-        self.editor_mut().status = "volím cíl zálohy…".to_string();
+        self.editor_mut().status = tr!("volím cíl zálohy…", "choosing the backup target…").to_string();
         cx.notify();
         let dialog = cx.prompt_for_new_path(&std::path::PathBuf::new(), Some(&suggested_name));
         cx.spawn(async move |this, cx| {
@@ -14919,21 +15015,21 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 Ok(Ok(Some(p))) => p,
                 Ok(Ok(None)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = "záloha zrušena".to_string();
+                        view.editor_mut().status = tr!("záloha zrušena", "backup cancelled").to_string();
                         cx.notify();
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = format!("error: dialog pro uložení selhal ({e})");
+                        view.editor_mut().status = trf!("error: dialog pro uložení selhal ({e})", "error: the save dialog failed ({e})");
                         cx.notify();
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = "error: dialog pro uložení není dostupný".to_string();
+                        view.editor_mut().status = tr!("error: dialog pro uložení není dostupný", "error: the save dialog is not available").to_string();
                         cx.notify();
                     });
                     return;
@@ -14947,7 +15043,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // arm) — don't let `run_backup_now`/`start_backup_session`
                 // clobber it by unconditionally overwriting `self.modal`.
                 if view.modal.is_some() {
-                    view.editor_mut().status = "záloha zahozena — je otevřený jiný dialog".to_string();
+                    view.editor_mut().status = tr!("záloha zahozena — je otevřený jiný dialog", "backup discarded — another dialog is open").to_string();
                     cx.notify();
                     return;
                 }
@@ -14957,12 +15053,12 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // arbitrarily long.
                 let current_ids: Vec<String> = view.config.connections.iter().map(|c| c.id.clone()).collect();
                 if !backup::backup_dispatch_allowed(&connection_id, &current_ids) {
-                    view.editor_mut().status = "připojení se během výběru změnilo — akce zrušena".to_string();
+                    view.editor_mut().status = tr!("připojení se během výběru změnilo — akce zrušena", "the connection changed during selection — action cancelled").to_string();
                     cx.notify();
                     return;
                 }
                 let Some((cfg, secret)) = view.resolve_conn_for_backup(&connection_id) else {
-                    view.editor_mut().status = "error: připojení nenalezeno".to_string();
+                    view.editor_mut().status = tr!("error: připojení nenalezeno", "error: connection not found").to_string();
                     cx.notify();
                     return;
                 };
@@ -14998,9 +15094,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                 // tunnel inline or silently dialing the untunneled host
                 // with the real password in the child's env.
                 if cfg.ssh.is_some() {
-                    self.editor_mut().status =
-                        "error: zálohování přes SSH tunel zatím není podporováno pro tento engine — použij přímé připojení"
-                            .to_string();
+                    self.editor_mut().status = tr!(
+                        "error: zálohování přes SSH tunel zatím není podporováno pro tento engine — použij přímé připojení",
+                        "error: backup over an SSH tunnel is not supported for this engine yet — use a direct connection"
+                    )
+                    .to_string();
                     cx.notify();
                     return;
                 }
@@ -15232,12 +15330,12 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             return;
         }
         let Some((cfg, _secret)) = self.resolve_conn_for_backup(&connection_id) else {
-            self.editor_mut().status = "error: připojení nenalezeno".to_string();
+            self.editor_mut().status = tr!("error: připojení nenalezeno", "error: connection not found").to_string();
             cx.notify();
             return;
         };
         if cfg.read_only {
-            self.editor_mut().status = "error: připojení je pouze pro čtení — obnovu nelze spustit".to_string();
+            self.editor_mut().status = tr!("error: připojení je pouze pro čtení — obnovu nelze spustit", "error: the connection is read-only — restore cannot be started").to_string();
             cx.notify();
             return;
         }
@@ -15245,7 +15343,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // `open_backup_dialog` checks — see `backup::backup_restore_available`'s
         // doc comment.
         if !backup::backup_restore_available(cfg.engine) {
-            self.editor_mut().status = "obnova pro MSSQL zatím není k dispozici".to_string();
+            self.editor_mut().status = tr!("obnova pro MSSQL zatím není k dispozici", "restore for MSSQL is not available yet").to_string();
             cx.notify();
             return;
         }
@@ -15254,40 +15352,42 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // Postgres/SSH combination that's guaranteed to be refused once
         // they actually confirm.
         if cfg.engine == dbc_state::Engine::Postgres && cfg.ssh.is_some() {
-            self.editor_mut().status =
-                "error: obnova přes SSH tunel zatím není podporována pro tento engine — použij přímé připojení"
-                    .to_string();
+            self.editor_mut().status = tr!(
+                "error: obnova přes SSH tunel zatím není podporována pro tento engine — použij přímé připojení",
+                "error: restore over an SSH tunnel is not supported for this engine yet — use a direct connection"
+            )
+            .to_string();
             cx.notify();
             return;
         }
-        self.editor_mut().status = "volím zdroj obnovy…".to_string();
+        self.editor_mut().status = tr!("volím zdroj obnovy…", "choosing the restore source…").to_string();
         cx.notify();
         let dialog = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Obnovit ze zálohy".into()),
+            prompt: Some(tr!("Obnovit ze zálohy", "Restore from backup").into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let path = match dialog.await {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
                 Ok(Ok(_)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = "obnova zrušena".to_string();
+                        view.editor_mut().status = tr!("obnova zrušena", "restore cancelled").to_string();
                         cx.notify();
                     });
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = format!("error: dialog pro výběr souboru selhal ({e})");
+                        view.editor_mut().status = trf!("error: dialog pro výběr souboru selhal ({e})", "error: the file picker failed ({e})");
                         cx.notify();
                     });
                     return;
                 }
                 Err(_canceled) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.editor_mut().status = "error: dialog pro výběr souboru není dostupný".to_string();
+                        view.editor_mut().status = tr!("error: dialog pro výběr souboru není dostupný", "error: the file picker is not available").to_string();
                         cx.notify();
                     });
                     return;
@@ -15321,23 +15421,23 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // `start_backup_session` clobber it by unconditionally overwriting
         // `self.modal`.
         if self.modal.is_some() {
-            self.editor_mut().status = "obnova zahozena — je otevřený jiný dialog".to_string();
+            self.editor_mut().status = tr!("obnova zahozena — je otevřený jiný dialog", "restore discarded — another dialog is open").to_string();
             cx.notify();
             return;
         }
         let current_ids: Vec<String> = self.config.connections.iter().map(|c| c.id.clone()).collect();
         if !backup::backup_dispatch_allowed(&connection_id, &current_ids) {
-            self.editor_mut().status = "připojení se během výběru změnilo — akce zrušena".to_string();
+            self.editor_mut().status = tr!("připojení se během výběru změnilo — akce zrušena", "the connection changed during selection — action cancelled").to_string();
             cx.notify();
             return;
         }
         let Some((cfg, secret)) = self.resolve_conn_for_backup(&connection_id) else {
-            self.editor_mut().status = "error: připojení nenalezeno".to_string();
+            self.editor_mut().status = tr!("error: připojení nenalezeno", "error: connection not found").to_string();
             cx.notify();
             return;
         };
         if cfg.read_only {
-            self.editor_mut().status = "error: připojení je pouze pro čtení — obnovu nelze spustit".to_string();
+            self.editor_mut().status = tr!("error: připojení je pouze pro čtení — obnovu nelze spustit", "error: the connection is read-only — restore cannot be started").to_string();
             cx.notify();
             return;
         }
@@ -15347,9 +15447,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         // showing a full `pg_restore`/`psql` command preview for a run that
         // is guaranteed to be refused later is misleading.
         if cfg.engine == dbc_state::Engine::Postgres && cfg.ssh.is_some() {
-            self.editor_mut().status =
-                "error: obnova přes SSH tunel zatím není podporována pro tento engine — použij přímé připojení"
-                    .to_string();
+            self.editor_mut().status = tr!(
+                "error: obnova přes SSH tunel zatím není podporována pro tento engine — použij přímé připojení",
+                "error: restore over an SSH tunnel is not supported for this engine yet — use a direct connection"
+            )
+            .to_string();
             cx.notify();
             return;
         }
@@ -15419,13 +15521,13 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
 
         let current_ids: Vec<String> = self.config.connections.iter().map(|c| c.id.clone()).collect();
         if !backup::backup_dispatch_allowed(&session.connection_id, &current_ids) {
-            self.editor_mut().status = "připojení se během výběru změnilo — akce zrušena".to_string();
+            self.editor_mut().status = tr!("připojení se během výběru změnilo — akce zrušena", "the connection changed during selection — action cancelled").to_string();
             self.close_modal(cx);
             cx.notify();
             return;
         }
         let Some((cfg, secret)) = self.resolve_conn_for_backup(&session.connection_id) else {
-            self.editor_mut().status = "error: připojení nenalezeno".to_string();
+            self.editor_mut().status = tr!("error: připojení nenalezeno", "error: connection not found").to_string();
             self.close_modal(cx);
             cx.notify();
             return;
@@ -15468,9 +15570,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         match plan {
             RestorePlan::PgTool { tool_name, args } => {
                 if cfg.ssh.is_some() {
-                    self.editor_mut().status =
-                        "error: obnova přes SSH tunel zatím není podporována pro tento engine — použij přímé připojení"
-                            .to_string();
+                    self.editor_mut().status = tr!(
+                        "error: obnova přes SSH tunel zatím není podporována pro tento engine — použij přímé připojení",
+                        "error: restore over an SSH tunnel is not supported for this engine yet — use a direct connection"
+                    )
+                    .to_string();
                     cx.notify();
                     return;
                 }
@@ -15900,7 +16004,7 @@ impl Render for AppView {
                             .cursor_pointer()
                             // Dim when clean — the save is a no-op then.
                             .text_color(if dirty { theme.text_primary } else { theme.border })
-                            .child("Uložit")
+                            .child(tr!("Uložit", "Save"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.on_save_script(&SaveScript, window, cx)
                             })),
@@ -15910,7 +16014,7 @@ impl Render for AppView {
                             .id("script-unbind")
                             .px_1()
                             .cursor_pointer()
-                            .child("Zavřít")
+                            .child(tr!("Zavřít", "Close"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.editor_load_guarded(PendingScriptAction::Unbind, cx)
                             })),
@@ -16152,7 +16256,7 @@ impl Render for AppView {
                         .id("btn-explain")
                         .cursor_pointer()
                         .text_color(color)
-                        .child("Vysvětlit")
+                        .child(tr!("Vysvětlit", "Explain"))
                         .on_click(cx.listener(move |view, _, _window, cx| {
                             if enabled {
                                 view.run_explain(false, cx);
@@ -16174,7 +16278,7 @@ impl Render for AppView {
                             .id("btn-analyze")
                             .cursor_pointer()
                             .text_color(color)
-                            .child("Analyzovat")
+                            .child(tr!("Analyzovat", "Analyze"))
                             .on_click(cx.listener(move |view, _, _window, cx| {
                                 if enabled {
                                     view.run_explain(true, cx);
@@ -16198,7 +16302,7 @@ impl Render for AppView {
                         .id("btn-run-sql-file")
                         .cursor_pointer()
                         .text_color(color)
-                        .child("SQL soubor…")
+                        .child(tr!("SQL soubor…", "SQL file…"))
                         .on_click(cx.listener(move |view, _, _window, cx| {
                             if enabled {
                                 view.start_script_pick(false, cx);
@@ -16212,7 +16316,7 @@ impl Render for AppView {
                         .id("btn-run-sql-folder")
                         .cursor_pointer()
                         .text_color(color)
-                        .child("SQL složku…")
+                        .child(tr!("SQL složku…", "SQL folder…"))
                         .on_click(cx.listener(move |view, _, _window, cx| {
                             if enabled {
                                 view.start_script_pick(true, cx);
@@ -16321,8 +16425,8 @@ enum RestorePlan {
 fn read_sniff_prefix(path: &str) -> Result<[u8; 16], String> {
     use std::io::Read;
     let mut header = [0u8; 16];
-    let mut f = std::fs::File::open(path).map_err(|e| format!("nelze číst {path}: {e}"))?;
-    f.read(&mut header).map_err(|e| format!("nelze číst {path}: {e}"))?;
+    let mut f = std::fs::File::open(path).map_err(|e| trf!("nelze číst {path}: {e}", "cannot read {path}: {e}"))?;
+    f.read(&mut header).map_err(|e| trf!("nelze číst {path}: {e}", "cannot read {path}: {e}"))?;
     Ok(header)
 }
 
@@ -16614,6 +16718,9 @@ fn main() {
         // every render() can read cx.theme(). `config.theme` is Copy; `config`
         // itself moves into the window closure below untouched.
         cx.set_global(theme::Theme::from_mode(config.theme));
+        // The UI language, for the same reason and at the same moment: the
+        // very first frame must already be in it.
+        apply_language(&config);
 
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         let window_handle = cx
@@ -16697,13 +16804,13 @@ fn main() {
                         // other startup notice — there is no config to be
                         // corrupt and no view prefs to have failed.
                         let status = if blocked_start {
-                            connections_ui::WORKSPACE_MISSING_STATUS.to_string()
+                            connections_ui::workspace_missing_status().to_string()
                         } else if let Some(detail) = &config_load_error {
-                            format!("error: config.toml je poškozený – oprav nebo smaž soubor ({detail})")
+                            trf!("error: config.toml je poškozený – oprav nebo smaž soubor ({detail})", "error: config.toml is corrupted – fix or delete the file ({detail})")
                         } else if let Some(detail) = &history_open_error {
-                            format!("error: historie nedostupná ({detail})")
+                            trf!("error: historie nedostupná ({detail})", "error: history unavailable ({detail})")
                         } else if let Some(detail) = &view_prefs_open_error {
-                            format!("error: view prefs nedostupné ({detail})")
+                            trf!("error: view prefs nedostupné ({detail})", "error: view prefs unavailable ({detail})")
                         } else {
                             "ready".into()
                         };
@@ -16721,7 +16828,7 @@ fn main() {
                             });
                         }
                         cx.subscribe(&tree, AppView::on_tree_event).detach();
-                        let history_search = cx.new(|cx| connections_ui::TextField::new(cx, "Hledat…", false));
+                        let history_search = cx.new(|cx| connections_ui::TextField::new(cx, tr!("Hledat…", "Search…"), false));
                         // G11 T6 binding carry-forward (BackupHandle has no
                         // Drop/kill-on-drop): the app-quit hook is the
                         // teardown path for "window close" — cancel any
@@ -18380,7 +18487,7 @@ mod keymap_audit {
                 bound.iter().any(|(c, _)| c == sc.chord),
                 "keymap documents {:?} ({}) but nothing binds it",
                 sc.chord,
-                sc.label
+                sc.label()
             );
         }
     }
@@ -19152,7 +19259,12 @@ mod config_save_guard_audit {
         // mirror of `end_sidebar_resize` — guarded arm (position-verified
         // by this test's own loop), drag END only, and the same equality
         // check so a bare click on the splitter writes nothing.
-        assert_eq!(sites, 13, "config.toml writer count changed — re-audit, do not just bump");
+        //
+        // 13 → 14 on 2026-10-27: `set_language` persists the UI language.
+        // Re-audited, not bumped: guarded arm (position-verified by this
+        // test's own loop), the same shape as `set_theme` — a deliberate
+        // click on a radio, and it writes only when the value changed.
+        assert_eq!(sites, 14, "config.toml writer count changed — re-audit, do not just bump");
     }
 
     /// The widening is only worth anything if it actually reaches past the
@@ -19765,8 +19877,8 @@ mod script_binding_tests {
     /// T8 review MAJOR-2's refusal text: not an „error:" — nothing failed.
     #[test]
     fn the_second_concurrent_save_is_refused_in_plain_words() {
-        assert_eq!(SCRIPT_SAVE_IN_FLIGHT, "ukládání skriptu už probíhá");
-        assert!(!SCRIPT_SAVE_IN_FLIGHT.starts_with("error:"));
+        assert_eq!(script_save_in_flight(), "ukládání skriptu už probíhá");
+        assert!(!script_save_in_flight().starts_with("error:"));
     }
 
     /// T9 review MAJOR-1. Ctrl+S must be refused whenever a dialog is on
@@ -19788,9 +19900,9 @@ mod script_binding_tests {
         assert!(!save_guard::script_save_allowed(false, false, true), "a discard prompt blocks it");
         assert!(!save_guard::script_save_allowed(true, true, true));
         // Refused out loud, and not as an „error:" — nothing failed.
-        assert_eq!(SCRIPT_SAVE_BLOCKED, "nejprve zavřete otevřený dialog");
-        assert!(!SCRIPT_SAVE_BLOCKED.starts_with("error:"));
-        assert!(!SCRIPT_SAVE_BLOCKED.is_empty(), "a silent refusal is the banned shape");
+        assert_eq!(script_save_blocked(), "nejprve zavřete otevřený dialog");
+        assert!(!script_save_blocked().starts_with("error:"));
+        assert!(!script_save_blocked().is_empty(), "a silent refusal is the banned shape");
     }
 
     // ---------- T9: the binding stays coherent with the filesystem ----------

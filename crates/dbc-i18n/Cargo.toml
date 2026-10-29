@@ -1,0 +1,10 @@
+[package]
+name = "dbc-i18n"
+version = "0.1.0"
+edition.workspace = true
+description = "The UI language switch: tr!/trf! pick the Czech or English text at the call site"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

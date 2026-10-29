@@ -115,8 +115,12 @@ pub(crate) use dbc_state::conn_label as history_conn_label;
 pub use dbc_state::KIND_CLI;
 
 /// The panel's section headings.
-pub const SECTION_APP: &str = "V aplikaci";
-pub const SECTION_CLI: &str = "Z příkazové řádky";
+pub fn section_app() -> &'static str {
+    dbc_i18n::tr!("V aplikaci", "In the app")
+}
+pub fn section_cli() -> &'static str {
+    dbc_i18n::tr!("Z příkazové řádky", "From the command line")
+}
 
 /// One rendered row: either a heading or an index into the entry cache.
 ///
@@ -145,9 +149,9 @@ pub fn history_rows(entries: &[HistoryEntry]) -> Vec<HistoryRow> {
         return (0..entries.len()).map(HistoryRow::Entry).collect();
     }
     let mut out = Vec::with_capacity(entries.len() + 2);
-    out.push(HistoryRow::Section(SECTION_APP));
+    out.push(HistoryRow::Section(section_app()));
     out.extend(app.into_iter().map(HistoryRow::Entry));
-    out.push(HistoryRow::Section(SECTION_CLI));
+    out.push(HistoryRow::Section(section_cli()));
     out.extend(cli.into_iter().map(HistoryRow::Entry));
     out
 }
@@ -211,7 +215,7 @@ pub fn format_meta_line(entry: &HistoryEntry) -> (String, bool) {
     } else {
         let rows = entry.row_count.map(|r| r.to_string()).unwrap_or_else(|| "?".into());
         let dur = entry.duration_ms.map(|d| d.to_string()).unwrap_or_else(|| "?".into());
-        (format!("{} · {rows} řádků · {dur} ms", entry.connection), false)
+        (dbc_i18n::trf!("{} · {rows} řádků · {dur} ms", "{} · {rows} rows · {dur} ms", entry.connection), false)
     };
     // ONE line, always — see `META_COLLAPSE_MAX_CHARS`. Applied to both
     // branches, not just the error one: a long connection name would
@@ -316,10 +320,10 @@ impl AppView {
         self.history_clear_confirm = false;
         let status = match self.history.as_mut() {
             Some(h) => match h.clear(keep_starred) {
-                Ok(n) => format!("historie vymazána ({n} položek)"),
-                Err(e) => format!("error: historii se nepodařilo vymazat ({})", e.message),
+                Ok(n) => dbc_i18n::trf!("historie vymazána ({n} položek)", "history cleared ({n} items)"),
+                Err(e) => dbc_i18n::trf!("error: historii se nepodařilo vymazat ({})", "error: could not clear the history ({})", e.message),
             },
-            None => "historie není k dispozici".to_string(),
+            None => dbc_i18n::tr!("historie není k dispozici", "history is not available").to_string(),
         };
         self.editor_mut().status = status;
         self.refresh_history_cache(cx);
@@ -331,7 +335,7 @@ impl AppView {
     pub(crate) fn delete_history_entry(&mut self, id: i64, cx: &mut Context<Self>) {
         if let Some(h) = self.history.as_mut() {
             if let Err(e) = h.delete(id) {
-                self.editor_mut().status = format!("error: položku se nepodařilo smazat ({})", e.message);
+                self.editor_mut().status = dbc_i18n::trf!("error: položku se nepodařilo smazat ({})", "error: could not delete the item ({})", e.message);
             }
         }
         self.refresh_history_cache(cx);
@@ -356,17 +360,17 @@ impl AppView {
         let strip = div().px_2().py_1().flex().flex_row().items_center().gap_2();
         if self.history_clear_confirm {
             return strip
-                .child(div().flex_1().min_w_0().text_color(theme.text_primary).child("Smazat historii dotazů?"))
+                .child(div().flex_1().min_w_0().text_color(theme.text_primary).child(dbc_i18n::tr!("Smazat historii dotazů?", "Delete query history?")))
                 .child(
-                    button("history-clear-all", "Vše")
+                    button("history-clear-all", dbc_i18n::tr!("Vše", "All"))
                         .text_color(theme.danger)
                         .on_click(cx.listener(|view, _, _, cx| view.clear_history(false, cx))),
                 )
                 .child(
-                    button("history-clear-keep", "Kromě ★")
+                    button("history-clear-keep", dbc_i18n::tr!("Kromě ★", "Except ★"))
                         .on_click(cx.listener(|view, _, _, cx| view.clear_history(true, cx))),
                 )
-                .child(button("history-clear-cancel", "Zrušit").on_click(cx.listener(|view, _, _, cx| {
+                .child(button("history-clear-cancel", dbc_i18n::tr!("Zrušit", "Cancel")).on_click(cx.listener(|view, _, _, cx| {
                     view.history_clear_confirm = false;
                     cx.notify();
                 })))
@@ -374,7 +378,7 @@ impl AppView {
         }
         strip
             .child(div().flex_1().min_w_0().child(self.history_search.clone()))
-            .child(button("history-clear", "Vymazat…").on_click(cx.listener(|view, _, _, cx| {
+            .child(button("history-clear", dbc_i18n::tr!("Vymazat…", "Clear…")).on_click(cx.listener(|view, _, _, cx| {
                 view.history_clear_confirm = true;
                 cx.notify();
             })))

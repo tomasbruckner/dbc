@@ -386,27 +386,36 @@ pub fn ordered_checked(
 /// so and asks for a narrower filter. `None` when nothing is hidden.
 /// Appended to `targets_footer` by the render, not folded into it.
 pub fn cap_note(shown: usize, total: usize) -> Option<String> {
-    (total > shown).then(|| format!("zobrazeno {shown} z {total}, zpřesni filtr"))
+    (total > shown).then(|| {
+        dbc_i18n::trf!("zobrazeno {shown} z {total}, zpřesni filtr", "showing {shown} of {total}, narrow the filter")
+    })
 }
 
 /// The Targets picker's footer line (spec §3): what is checked, and the
 /// two chords the picker adds on top of Ctrl+D's.
 pub fn targets_footer(checked: &BTreeSet<(String, String)>) -> String {
     if checked.is_empty() {
-        return "Nic nevybráno · mezerník přepíná · Ctrl+Shift+A vše zobrazené · Esc zavře".to_string();
+        return dbc_i18n::tr!(
+            "Nic nevybráno · mezerník přepíná · Ctrl+Shift+A vše zobrazené · Esc zavře",
+            "Nothing selected · Space toggles · Ctrl+Shift+A all shown · Esc closes"
+        )
+        .to_string();
     }
     let servers = checked.iter().map(|(c, _)| c).collect::<BTreeSet<_>>().len();
     let n = checked.len();
-    let noun = match n {
-        1 => "cíl",
-        2..=4 => "cíle",
-        _ => "cílů",
-    };
-    let srv = match servers {
-        1 => "serveru",
-        _ => "serverech",
-    };
-    format!("Vybráno {n} {noun} na {servers} {srv} · Enter spustí · příště Ctrl+Alt+Enter spustí nad stejnou sadou")
+    dbc_i18n::trf!(
+        "Vybráno {n} {noun} na {servers} {srv} · Enter spustí · příště Ctrl+Alt+Enter spustí nad stejnou sadou",
+        "Selected {n} {noun} on {servers} {srv} · Enter runs · next time Ctrl+Alt+Enter runs over the same set",
+        noun = match n {
+            1 => dbc_i18n::tr!("cíl", "target"),
+            2..=4 => dbc_i18n::tr!("cíle", "targets"),
+            _ => dbc_i18n::tr!("cílů", "targets"),
+        },
+        srv = match servers {
+            1 => dbc_i18n::tr!("serveru", "server"),
+            _ => dbc_i18n::tr!("serverech", "servers"),
+        }
+    )
 }
 
 /// The fixed action rows, in display order, with their Czech labels (brief
@@ -440,55 +449,55 @@ pub fn fixed_actions(
     vault_lockable: bool,
 ) -> Vec<(String, PaletteAction)> {
     let mut actions = vec![
-        ("Spustit dotaz".to_string(), PaletteAction::RunQuery),
-        ("Vybrat databázi… (Ctrl+D)".to_string(), PaletteAction::PickDatabase),
-        ("Spustit nad více databázemi… (Ctrl+Shift+D)".to_string(), PaletteAction::PickTargets),
-        ("Přepnout strom".to_string(), PaletteAction::ToggleTree),
-        ("Historie (Ctrl+H)".to_string(), PaletteAction::ShowHistory),
-        ("Nové spojení…".to_string(), PaletteAction::NewConnection),
-        ("Obnovit schéma".to_string(), PaletteAction::RefreshSchema),
-        ("ER diagram".to_string(), PaletteAction::ShowErDiagram),
-        ("Porovnat databáze…".to_string(), PaletteAction::OpenCompare),
-        ("Spustit SQL soubor…".to_string(), PaletteAction::RunSqlFile),
-        ("Spustit SQL složku…".to_string(), PaletteAction::RunSqlFolder),
+        (dbc_i18n::tr!("Spustit dotaz", "Run query").to_string(), PaletteAction::RunQuery),
+        (dbc_i18n::tr!("Vybrat databázi… (Ctrl+D)", "Choose database… (Ctrl+D)").to_string(), PaletteAction::PickDatabase),
+        (dbc_i18n::tr!("Spustit nad více databázemi… (Ctrl+Shift+D)", "Run over multiple databases… (Ctrl+Shift+D)").to_string(), PaletteAction::PickTargets),
+        (dbc_i18n::tr!("Přepnout strom", "Toggle tree").to_string(), PaletteAction::ToggleTree),
+        (dbc_i18n::tr!("Historie (Ctrl+H)", "History (Ctrl+H)").to_string(), PaletteAction::ShowHistory),
+        (dbc_i18n::tr!("Nové spojení…", "New connection…").to_string(), PaletteAction::NewConnection),
+        (dbc_i18n::tr!("Obnovit schéma", "Refresh schema").to_string(), PaletteAction::RefreshSchema),
+        (dbc_i18n::tr!("ER diagram", "ER diagram").to_string(), PaletteAction::ShowErDiagram),
+        (dbc_i18n::tr!("Porovnat databáze…", "Compare databases…").to_string(), PaletteAction::OpenCompare),
+        (dbc_i18n::tr!("Spustit SQL soubor…", "Run SQL file…").to_string(), PaletteAction::RunSqlFile),
+        (dbc_i18n::tr!("Spustit SQL složku…", "Run SQL folder…").to_string(), PaletteAction::RunSqlFolder),
         // Part S §8: kept among the LEADING unconditional rows, never
         // appended — `backup_restore_actions_present_and_last_when_
         // connection_active` pins the last two rows.
-        ("Uložit skript".to_string(), PaletteAction::SaveScript),
+        (dbc_i18n::tr!("Uložit skript", "Save script").to_string(), PaletteAction::SaveScript),
         // G14 T10: unconditional — always listed, kept ahead of the
         // conditional monitor/backup/restore rows below so
         // `backup_restore_actions_present_and_last_when_connection_active`'s
         // "last two rows" assumption keeps holding.
-        ("Přepnout motiv".to_string(), PaletteAction::ToggleTheme),
-        ("Otevřít log".to_string(), PaletteAction::ShowLog),
-        ("Vymazat mezipaměť schémat".to_string(), PaletteAction::ClearSchemaCache),
-        ("Vymazat historii dotazů…".to_string(), PaletteAction::ClearHistory),
+        (dbc_i18n::tr!("Přepnout motiv", "Toggle theme").to_string(), PaletteAction::ToggleTheme),
+        (dbc_i18n::tr!("Otevřít log", "Open log").to_string(), PaletteAction::ShowLog),
+        (dbc_i18n::tr!("Vymazat mezipaměť schémat", "Clear schema cache").to_string(), PaletteAction::ClearSchemaCache),
+        (dbc_i18n::tr!("Vymazat historii dotazů…", "Clear query history…").to_string(), PaletteAction::ClearHistory),
         // Unconditional: export refuses on its own terms when there is
         // nothing saved (with a sentence naming the profile), and import
         // is exactly what an EMPTY app needs most.
-        ("Vyvézt nastavení…".to_string(), PaletteAction::ExportSettings),
-        ("Načíst nastavení…".to_string(), PaletteAction::ImportSettings),
+        (dbc_i18n::tr!("Vyvézt nastavení…", "Export settings…").to_string(), PaletteAction::ExportSettings),
+        (dbc_i18n::tr!("Načíst nastavení…", "Import settings…").to_string(), PaletteAction::ImportSettings),
     ];
     if monitor_available {
-        actions.push(("Monitor serveru".to_string(), PaletteAction::OpenMonitor));
+        actions.push((dbc_i18n::tr!("Monitor serveru", "Server monitor").to_string(), PaletteAction::OpenMonitor));
     }
     // G10 T4 (design §2, resolved design ambiguity 4): Hidden AND Disabled
     // both omit the row — only Enabled shows it.
     if admin == crate::admin_panel::AdminEntry::Enabled {
-        actions.push(("Správa serveru".to_string(), PaletteAction::OpenServerAdmin));
+        actions.push((dbc_i18n::tr!("Správa serveru", "Server administration").to_string(), PaletteAction::OpenServerAdmin));
     }
     if chart_available {
-        actions.push(("Graf z výsledku".to_string(), PaletteAction::OpenChart));
+        actions.push((dbc_i18n::tr!("Graf z výsledku", "Chart from result").to_string(), PaletteAction::OpenChart));
     }
     if vault_unlockable {
-        actions.push(("Odemknout trezor".to_string(), PaletteAction::UnlockVault));
+        actions.push((dbc_i18n::tr!("Odemknout trezor", "Unlock vault").to_string(), PaletteAction::UnlockVault));
     }
     if vault_lockable {
-        actions.push(("Zamknout trezor".to_string(), PaletteAction::LockVault));
+        actions.push((dbc_i18n::tr!("Zamknout trezor", "Lock vault").to_string(), PaletteAction::LockVault));
     }
     if connection_active {
-        actions.push(("Zálohovat databázi…".to_string(), PaletteAction::BackupDatabase));
-        actions.push(("Obnovit databázi ze zálohy…".to_string(), PaletteAction::RestoreDatabase));
+        actions.push((dbc_i18n::tr!("Zálohovat databázi…", "Back up database…").to_string(), PaletteAction::BackupDatabase));
+        actions.push((dbc_i18n::tr!("Obnovit databázi ze zálohy…", "Restore database from backup…").to_string(), PaletteAction::RestoreDatabase));
     }
     actions
 }

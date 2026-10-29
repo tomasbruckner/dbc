@@ -23,6 +23,7 @@
 //! destructive operation in the app is not discoverability, it is a
 //! liability.
 
+use dbc_i18n::{tr, trf};
 use dbc_core::{Dialect, SchemaSnapshot, TableKind};
 use dbc_state::FavouriteObject;
 
@@ -139,26 +140,26 @@ pub fn menu_for(row: &SidebarRow, ctx: &MenuCtx) -> Vec<MenuEntry> {
         SidebarRow::Database { conn_id, db } => database_menu(conn_id, db, ctx),
         SidebarRow::Inner { node, .. } | SidebarRow::Pinned(node) => inner_menu(node, ctx),
         SidebarRow::ScriptsRoot => vec![
-            item("Nový skript…", TreeEvent::ScriptCreate { parent_rel: String::new() }),
+            item(tr!("Nový skript…", "New script…"), TreeEvent::ScriptCreate { parent_rel: String::new() }),
             MenuEntry::Separator,
-            item("Obnovit", TreeEvent::ScriptsRefresh),
+            item(tr!("Obnovit", "Refresh"), TreeEvent::ScriptsRefresh),
         ],
         SidebarRow::ScriptFolder { rel } => vec![
-            item("Nový skript zde…", TreeEvent::ScriptCreate { parent_rel: rel.clone() }),
+            item(tr!("Nový skript zde…", "New script here…"), TreeEvent::ScriptCreate { parent_rel: rel.clone() }),
             MenuEntry::Separator,
-            item("Přejmenovat…", TreeEvent::ScriptRename { rel: rel.clone(), is_dir: true }),
-            item("Kopírovat cestu", TreeEvent::CopyText { what: "cesta".into(), text: rel.clone() }),
+            item(tr!("Přejmenovat…", "Rename…"), TreeEvent::ScriptRename { rel: rel.clone(), is_dir: true }),
+            item(tr!("Kopírovat cestu", "Copy path"), TreeEvent::CopyText { what: tr!("cesta", "path").into(), text: rel.clone() }),
             MenuEntry::Separator,
-            danger("Smazat…", TreeEvent::ScriptDelete { rel: rel.clone(), is_dir: true }),
+            danger(tr!("Smazat…", "Delete…"), TreeEvent::ScriptDelete { rel: rel.clone(), is_dir: true }),
         ],
         SidebarRow::ScriptFile { rel } => vec![
-            item("Otevřít v editoru", TreeEvent::ScriptOpen { rel: rel.clone() }),
-            item("Spustit…", TreeEvent::ScriptRunFile { rel: rel.clone() }),
+            item(tr!("Otevřít v editoru", "Open in editor"), TreeEvent::ScriptOpen { rel: rel.clone() }),
+            item(tr!("Spustit…", "Run…"), TreeEvent::ScriptRunFile { rel: rel.clone() }),
             MenuEntry::Separator,
-            item("Přejmenovat…", TreeEvent::ScriptRename { rel: rel.clone(), is_dir: false }),
-            item("Kopírovat cestu", TreeEvent::CopyText { what: "cesta".into(), text: rel.clone() }),
+            item(tr!("Přejmenovat…", "Rename…"), TreeEvent::ScriptRename { rel: rel.clone(), is_dir: false }),
+            item(tr!("Kopírovat cestu", "Copy path"), TreeEvent::CopyText { what: tr!("cesta", "path").into(), text: rel.clone() }),
             MenuEntry::Separator,
-            danger("Smazat…", TreeEvent::ScriptDelete { rel: rel.clone(), is_dir: false }),
+            danger(tr!("Smazat…", "Delete…"), TreeEvent::ScriptDelete { rel: rel.clone(), is_dir: false }),
         ],
         SidebarRow::Folder { path } => folder_menu(path),
         // A notice row is a status message, not an object.
@@ -181,29 +182,29 @@ fn folder_menu(path: &[String]) -> Vec<MenuEntry> {
         // connections, so „make one here" is what a right click on it is
         // most often for. The folder is carried, so the dialog opens with
         // this path already in its „Slozka" field.
-        item("Nové připojení zde…", TreeEvent::ConnectionCreate { folder: p.clone() }),
-        item("Nová podsložka…", TreeEvent::FolderCreate { parent: p.clone() }),
+        item(tr!("Nové připojení zde…", "New connection here…"), TreeEvent::ConnectionCreate { folder: p.clone() }),
+        item(tr!("Nová podsložka…", "New subfolder…"), TreeEvent::FolderCreate { parent: p.clone() }),
         MenuEntry::Separator,
-        item("Přejmenovat…", TreeEvent::FolderRename { path: p.clone() }),
+        item(tr!("Přejmenovat…", "Rename…"), TreeEvent::FolderRename { path: p.clone() }),
         item(
-            "Kopírovat cestu",
-            TreeEvent::CopyText { what: "cesta".into(), text: p.join("/") },
+            tr!("Kopírovat cestu", "Copy path"),
+            TreeEvent::CopyText { what: tr!("cesta", "path").into(), text: p.join("/") },
         ),
         MenuEntry::Separator,
-        danger("Smazat složku…", TreeEvent::FolderDelete { path: p }),
+        danger(tr!("Smazat složku…", "Delete folder…"), TreeEvent::FolderDelete { path: p }),
     ]
 }
 
 fn connection_menu(conn_id: &str, ctx: &MenuCtx) -> Vec<MenuEntry> {
     let id = conn_id.to_string();
     let mut out = vec![
-        item("Nastavit jako aktivní", TreeEvent::SwitchToDatabase { conn_id: id.clone(), db: None }),
+        item(tr!("Nastavit jako aktivní", "Set as active"), TreeEvent::SwitchToDatabase { conn_id: id.clone(), db: None }),
         MenuEntry::Separator,
-        item("Správa serveru…", TreeEvent::OpenAdmin),
+        item(tr!("Správa serveru…", "Server administration…"), TreeEvent::OpenAdmin),
         item("Monitor…", TreeEvent::OpenMonitorFor { conn_id: id.clone() }),
-        item("Porovnat schémata…", TreeEvent::OpenCompareFor { conn_id: id.clone() }),
+        item(tr!("Porovnat schémata…", "Compare schemas…"), TreeEvent::OpenCompareFor { conn_id: id.clone() }),
         MenuEntry::Separator,
-        item("Záloha databáze…", TreeEvent::BackupFor { conn_id: id.clone(), db: None }),
+        item(tr!("Záloha databáze…", "Back up database…"), TreeEvent::BackupFor { conn_id: id.clone(), db: None }),
     ];
     // Restore WRITES. It is the one item here that can destroy an existing
     // database, so it follows the same read-only rule as DROP/TRUNCATE
@@ -211,25 +212,25 @@ fn connection_menu(conn_id: &str, ctx: &MenuCtx) -> Vec<MenuEntry> {
     // palette uses (that posture exists because a palette has no disabled
     // row; a context menu simply omits).
     if !ctx.read_only {
-        out.push(item("Obnovit ze zálohy…", TreeEvent::RestoreFor { conn_id: id.clone(), db: None }));
+        out.push(item(tr!("Obnovit ze zálohy…", "Restore from backup…"), TreeEvent::RestoreFor { conn_id: id.clone(), db: None }));
     }
     out.extend([
         MenuEntry::Separator,
-        item("Upravit připojení…", TreeEvent::EditConnection { conn_id: id.clone() }),
-        item("Kopírovat jméno", TreeEvent::CopyText { what: "jméno".into(), text: id.clone() }),
+        item(tr!("Upravit připojení…", "Edit connection…"), TreeEvent::EditConnection { conn_id: id.clone() }),
+        item(tr!("Kopírovat jméno", "Copy name"), TreeEvent::CopyText { what: tr!("jméno", "name").into(), text: id.clone() }),
         MenuEntry::Separator,
         item(
-            "Zobrazené databáze…",
+            tr!("Zobrazené databáze…", "Visible databases…"),
             TreeEvent::ChooseVisibleDatabases { conn_id: id.clone() },
         ),
-        item("Obnovit seznam databází", TreeEvent::LoadDatabases { conn_id: id.clone() }),
+        item(tr!("Obnovit seznam databází", "Refresh database list"), TreeEvent::LoadDatabases { conn_id: id.clone() }),
         // Last and after a separator, like every other destructive item —
         // and NOT gated on `read_only`, which is about the SERVER. This
         // deletes an entry from this app's own list (user report,
         // 2026-08-31: „nejde smazat connection při pravým kliku"); the
         // database it points at is not touched.
         MenuEntry::Separator,
-        danger("Smazat připojení…", TreeEvent::ConnectionDelete { conn_id: id }),
+        danger(tr!("Smazat připojení…", "Delete connection…"), TreeEvent::ConnectionDelete { conn_id: id }),
     ]);
     out
 }
@@ -238,7 +239,7 @@ fn database_menu(conn_id: &str, db: &str, ctx: &MenuCtx) -> Vec<MenuEntry> {
     let (id, dbn) = (conn_id.to_string(), db.to_string());
     let mut out = vec![
         item(
-            "Nastavit jako aktivní",
+            tr!("Nastavit jako aktivní", "Set as active"),
             TreeEvent::SwitchToDatabase { conn_id: id.clone(), db: Some(dbn.clone()) },
         ),
         MenuEntry::Separator,
@@ -251,24 +252,24 @@ fn database_menu(conn_id: &str, db: &str, ctx: &MenuCtx) -> Vec<MenuEntry> {
         out.push(item("ER diagram…", TreeEvent::OpenErDiagram { schema }));
     }
     out.push(item(
-        "Záloha…",
+        tr!("Záloha…", "Back up…"),
         TreeEvent::BackupFor { conn_id: id.clone(), db: Some(dbn.clone()) },
     ));
     if !ctx.read_only {
         out.push(item(
-            "Obnovit ze zálohy…",
+            tr!("Obnovit ze zálohy…", "Restore from backup…"),
             TreeEvent::RestoreFor { conn_id: id.clone(), db: Some(dbn.clone()) },
         ));
     }
     out.extend([
         MenuEntry::Separator,
-        item("Kopírovat jméno", TreeEvent::CopyText { what: "jméno".into(), text: dbn.clone() }),
+        item(tr!("Kopírovat jméno", "Copy name"), TreeEvent::CopyText { what: tr!("jméno", "name").into(), text: dbn.clone() }),
         MenuEntry::Separator,
         item(
-            "Zobrazená schémata…",
+            tr!("Zobrazená schémata…", "Visible schemas…"),
             TreeEvent::ChooseVisibleSchemas { conn_id: id.clone(), db: dbn.clone() },
         ),
-        item("Obnovit schéma", TreeEvent::LoadSchema { conn_id: id, db: dbn }),
+        item(tr!("Obnovit schéma", "Refresh schema"), TreeEvent::LoadSchema { conn_id: id, db: dbn }),
     ]);
     out
 }
@@ -278,11 +279,11 @@ fn inner_menu(node: &NodeId, ctx: &MenuCtx) -> Vec<MenuEntry> {
         NodeId::Schema(s) => vec![
             item("ER diagram…", TreeEvent::OpenErDiagram { schema: schema_opt(s) }),
             MenuEntry::Separator,
-            item("Kopírovat jméno", TreeEvent::CopyText { what: "jméno".into(), text: s.clone() }),
+            item(tr!("Kopírovat jméno", "Copy name"), TreeEvent::CopyText { what: tr!("jméno", "name").into(), text: s.clone() }),
             MenuEntry::Separator,
-            item("Obnovit", TreeEvent::RefreshRequested),
+            item(tr!("Obnovit", "Refresh"), TreeEvent::RefreshRequested),
         ],
-        NodeId::Section(..) => vec![item("Obnovit", TreeEvent::RefreshRequested)],
+        NodeId::Section(..) => vec![item(tr!("Obnovit", "Refresh"), TreeEvent::RefreshRequested)],
         NodeId::Table(schema, name) => table_menu(schema, name, ctx),
         NodeId::Column(schema, table, col) => column_menu(schema, table, col, ctx),
         NodeId::Routine(schema, name) => {
@@ -317,11 +318,11 @@ fn table_menu(schema: &str, name: &str, ctx: &MenuCtx) -> Vec<MenuEntry> {
         .is_some_and(|t| matches!(t.kind, TableKind::View | TableKind::MaterializedView));
     let mut out = vec![
         item(
-            "Otevřít data",
+            tr!("Otevřít data", "Open data"),
             TreeEvent::OpenPreviewHere { schema: s_opt.clone(), table: name.to_string() },
         ),
         item(
-            "Počet řádků",
+            tr!("Počet řádků", "Row count"),
             TreeEvent::CountRows { schema: s_opt.clone(), table: name.to_string() },
         ),
         MenuEntry::Separator,
@@ -345,7 +346,7 @@ fn table_menu(schema: &str, name: &str, ctx: &MenuCtx) -> Vec<MenuEntry> {
                 continue;
             }
             out.push(item(
-                format!("Generovat {label}"),
+                trf!("Generovat {label}", "Generate {label}"),
                 TreeEvent::GenerateSql {
                     kind,
                     sql: generate_sql(kind, dialect, s_opt.as_deref(), name, &cols),
@@ -353,8 +354,8 @@ fn table_menu(schema: &str, name: &str, ctx: &MenuCtx) -> Vec<MenuEntry> {
             ));
         }
         out.push(item(
-            "Kopírovat seznam sloupců",
-            TreeEvent::CopyText { what: "sloupce".into(), text: cols.join(", ") },
+            tr!("Kopírovat seznam sloupců", "Copy column list"),
+            TreeEvent::CopyText { what: tr!("sloupce", "columns").into(), text: cols.join(", ") },
         ));
     }
     if let Some(t) = ctx.table(schema, name) {
@@ -365,14 +366,14 @@ fn table_menu(schema: &str, name: &str, ctx: &MenuCtx) -> Vec<MenuEntry> {
         out.push(item("Zobrazit DDL", TreeEvent::OpenDdl { title: name.to_string(), ddl }));
     }
     out.push(item(
-        "Kopírovat jméno",
-        TreeEvent::CopyText { what: "jméno".into(), text: name.to_string() },
+        tr!("Kopírovat jméno", "Copy name"),
+        TreeEvent::CopyText { what: tr!("jméno", "name").into(), text: name.to_string() },
     ));
     if let Some(dialect) = ctx.dialect {
         out.push(item(
-            "Kopírovat kvalifikované jméno",
+            tr!("Kopírovat kvalifikované jméno", "Copy qualified name"),
             TreeEvent::CopyText {
-                what: "jméno".into(),
+                what: tr!("jméno", "name").into(),
                 text: dbc_core::quote_qualified_d(dialect, s_opt.as_deref(), name),
             },
         ));
@@ -381,12 +382,12 @@ fn table_menu(schema: &str, name: &str, ctx: &MenuCtx) -> Vec<MenuEntry> {
     out.push(MenuEntry::Separator);
     if !ctx.read_only {
         out.push(item(
-            "Import z CSV…",
+            tr!("Import z CSV…", "Import from CSV…"),
             TreeEvent::ImportCsv { schema: s_opt.clone(), table: name.to_string() },
         ));
     }
     out.push(item(
-        "Export do CSV…",
+        tr!("Export do CSV…", "Export to CSV…"),
         TreeEvent::ExportCsv { schema: s_opt.clone(), table: name.to_string() },
     ));
     let fav_kind = if is_view { "view" } else { "table" };
@@ -418,11 +419,11 @@ fn column_menu(schema: &str, table: &str, col: &str, ctx: &MenuCtx) -> Vec<MenuE
         .and_then(|t| t.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col)))
         .map(|c| c.data_type.clone());
     let mut out = vec![item(
-        "Kopírovat jméno",
-        TreeEvent::CopyText { what: "jméno".into(), text: col.to_string() },
+        tr!("Kopírovat jméno", "Copy name"),
+        TreeEvent::CopyText { what: tr!("jméno", "name").into(), text: col.to_string() },
     )];
     if let Some(ty) = ty {
-        out.push(item("Kopírovat typ", TreeEvent::CopyText { what: "typ".into(), text: ty }));
+        out.push(item(tr!("Kopírovat typ", "Copy type"), TreeEvent::CopyText { what: tr!("typ", "type").into(), text: ty }));
     }
     out.extend([
         MenuEntry::Separator,
@@ -431,7 +432,7 @@ fn column_menu(schema: &str, table: &str, col: &str, ctx: &MenuCtx) -> Vec<MenuE
             // editor (user, 2026-09-02) — „Kopírovat jméno" above stays
             // raw on purpose: that one answers „what is this column
             // called", not „paste this into SQL".
-            "Vložit do editoru",
+            tr!("Vložit do editoru", "Insert into editor"),
             TreeEvent::InsertAtCursor {
                 // No active connection means no dialect to quote FOR, and
                 // this menu's rule for that case is „never guess" — the
@@ -461,7 +462,7 @@ fn object_menu(
     if let Some(ddl) = ctx.routine_ddl(schema, name) {
         out.push(item("Zobrazit DDL", TreeEvent::OpenDdl { title: name.to_string(), ddl }));
     }
-    out.push(item("Kopírovat jméno", TreeEvent::CopyText { what: "jméno".into(), text: name.to_string() }));
+    out.push(item(tr!("Kopírovat jméno", "Copy name"), TreeEvent::CopyText { what: tr!("jméno", "name").into(), text: name.to_string() }));
     out.push(favourite_item(fav_kind, schema, name, ctx));
     if !ctx.read_only {
         out.push(MenuEntry::Separator);
@@ -476,7 +477,7 @@ fn object_menu(
 fn favourite_item(kind: &str, schema: &str, name: &str, ctx: &MenuCtx) -> MenuEntry {
     let starred = ctx.is_favourite(kind, schema, name);
     item(
-        if starred { "Odebrat z oblíbených" } else { "Přidat do oblíbených" },
+        if starred { tr!("Odebrat z oblíbených", "Remove from favourites") } else { tr!("Přidat do oblíbených", "Add to favourites") },
         TreeEvent::ToggleFavourite(FavouriteObject {
             connection_id: ctx.conn_id.to_string(),
             database: ctx.database.clone(),
@@ -519,7 +520,10 @@ pub fn generate_sql(
             // The WHERE is deliberately present and deliberately false-y:
             // an UPDATE skeleton without one is a whole-table update waiting
             // to be run by accident.
-            format!("UPDATE {target}\nSET\n{sets}\nWHERE 1 = 0 -- doplňte podmínku")
+            trf!(
+                "UPDATE {target}\nSET\n{sets}\nWHERE 1 = 0 -- doplňte podmínku",
+                "UPDATE {target}\nSET\n{sets}\nWHERE 1 = 0 -- fill in the condition"
+            )
         }
     }
 }

@@ -610,7 +610,7 @@ pub fn assemble_snapshot(r: RefreshResults, fetched_at: std::time::Instant) -> R
         (all.iter().any(|x| x.is_ok()), all.iter().find_map(|x| x.as_ref().err().cloned()))
     };
     if !any_ok {
-        return Err(first_err.unwrap_or_else(|| "prázdná odpověď monitoru".to_string()));
+        return Err(first_err.unwrap_or_else(|| tr!("prázdná odpověď monitoru", "empty monitor response").to_string()));
     }
     // BLOCKER 2 fix: `build_blocking_tree` now returns `(forest, truncated)`
     // — split out here so `MonitorSnapshot::blocking_truncated` can carry
@@ -1185,3 +1185,4 @@ mod tests {
         assert_eq!(fmt_uptime(-5), "0m"); // clock skew clamps, never panics
     }
 }
+use dbc_i18n::tr;

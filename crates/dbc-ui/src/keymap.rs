@@ -64,14 +64,21 @@ pub enum Scope {
     Palette,
 }
 
+impl Shortcut {
+    /// The label in the current UI language.
+    pub fn label(&self) -> &'static str {
+        (self.label_fn)()
+    }
+}
+
 impl Scope {
     pub fn title(self) -> &'static str {
         match self {
-            Scope::Global => "Kdekoliv",
-            Scope::Editor => "Editor SQL",
-            Scope::Tree => "Strom schémat",
-            Scope::Results => "Výsledky",
-            Scope::Palette => "Paleta příkazů",
+            Scope::Global => dbc_i18n::tr!("Kdekoliv", "Anywhere"),
+            Scope::Editor => dbc_i18n::tr!("Editor SQL", "SQL editor"),
+            Scope::Tree => dbc_i18n::tr!("Strom schémat", "Schema tree"),
+            Scope::Results => dbc_i18n::tr!("Výsledky", "Results"),
+            Scope::Palette => dbc_i18n::tr!("Paleta příkazů", "Command palette"),
         }
     }
 }
@@ -80,50 +87,50 @@ pub struct Shortcut {
     /// EXACTLY as passed to `KeyBinding::new` — the audit compares strings,
     /// so a prettier spelling here would read as an unbound chord.
     pub chord: &'static str,
-    pub label: &'static str,
+    label_fn: fn() -> &'static str,
     pub scope: Scope,
     /// Shown in the always-visible strip. Reserved for the handful worth
     /// permanent screen space; everything else lives in F1.
     pub in_strip: bool,
 }
 
-const fn s(chord: &'static str, label: &'static str, scope: Scope, in_strip: bool) -> Shortcut {
-    Shortcut { chord, label, scope, in_strip }
+const fn s(chord: &'static str, label_fn: fn() -> &'static str, scope: Scope, in_strip: bool) -> Shortcut {
+    Shortcut { chord, label_fn, scope, in_strip }
 }
 
 pub const SHORTCUTS: &[Shortcut] = &[
     // --- Global ---
-    s("ctrl-enter", "Spustit dotaz", Scope::Global, true),
-    s("ctrl-shift-enter", "Spustit bez limitu řádků", Scope::Global, false),
-    s("escape", "Zrušit běžící dotaz", Scope::Global, false),
-    s("ctrl-k", "Paleta příkazů", Scope::Global, true),
-    s("ctrl-space", "Napovídání", Scope::Global, true),
-    s("ctrl-shift-f", "Naformátovat SQL", Scope::Global, true),
-    s("ctrl-shift-e", "Rozbalit * na sloupce", Scope::Global, true),
-    s("ctrl-s", "Uložit skript", Scope::Global, false),
-    s("ctrl-b", "Zobrazit/skrýt strom", Scope::Global, false),
-    s("ctrl-h", "Otevřít historii", Scope::Global, false),
-    s("f1", "Přehled zkratek", Scope::Global, true),
-    s("ctrl-1", "Přejít do editoru", Scope::Global, false),
-    s("ctrl-2", "Přejít do stromu", Scope::Global, false),
-    s("ctrl-3", "Přejít do výsledků", Scope::Global, false),
+    s("ctrl-enter", || dbc_i18n::tr!("Spustit dotaz", "Run query"), Scope::Global, true),
+    s("ctrl-shift-enter", || dbc_i18n::tr!("Spustit bez limitu řádků", "Run without row limit"), Scope::Global, false),
+    s("escape", || dbc_i18n::tr!("Zrušit běžící dotaz", "Cancel running query"), Scope::Global, false),
+    s("ctrl-k", || dbc_i18n::tr!("Paleta příkazů", "Command palette"), Scope::Global, true),
+    s("ctrl-space", || dbc_i18n::tr!("Napovídání", "Autocomplete"), Scope::Global, true),
+    s("ctrl-shift-f", || dbc_i18n::tr!("Naformátovat SQL", "Format SQL"), Scope::Global, true),
+    s("ctrl-shift-e", || dbc_i18n::tr!("Rozbalit * na sloupce", "Expand * to columns"), Scope::Global, true),
+    s("ctrl-s", || dbc_i18n::tr!("Uložit skript", "Save script"), Scope::Global, false),
+    s("ctrl-b", || dbc_i18n::tr!("Zobrazit/skrýt strom", "Show/hide tree"), Scope::Global, false),
+    s("ctrl-h", || dbc_i18n::tr!("Otevřít historii", "Open history"), Scope::Global, false),
+    s("f1", || dbc_i18n::tr!("Přehled zkratek", "Shortcut overview"), Scope::Global, true),
+    s("ctrl-1", || dbc_i18n::tr!("Přejít do editoru", "Go to editor"), Scope::Global, false),
+    s("ctrl-2", || dbc_i18n::tr!("Přejít do stromu", "Go to tree"), Scope::Global, false),
+    s("ctrl-3", || dbc_i18n::tr!("Přejít do výsledků", "Go to results"), Scope::Global, false),
     // Editor tabs (2026-09-02): every chord was unbound before.
-    s("ctrl-n", "Nový tab s dotazem", Scope::Global, false),
-    s("ctrl-w", "Zavřít tab s dotazem", Scope::Global, false),
-    s("ctrl-tab", "Další tab", Scope::Global, false),
-    s("ctrl-shift-tab", "Předchozí tab", Scope::Global, false),
-    s("ctrl-d", "Vybrat databázi", Scope::Global, false),
-    s("ctrl-shift-d", "Spustit nad více databázemi", Scope::Global, false),
+    s("ctrl-n", || dbc_i18n::tr!("Nový tab s dotazem", "New query tab"), Scope::Global, false),
+    s("ctrl-w", || dbc_i18n::tr!("Zavřít tab s dotazem", "Close query tab"), Scope::Global, false),
+    s("ctrl-tab", || dbc_i18n::tr!("Další tab", "Next tab"), Scope::Global, false),
+    s("ctrl-shift-tab", || dbc_i18n::tr!("Předchozí tab", "Previous tab"), Scope::Global, false),
+    s("ctrl-d", || dbc_i18n::tr!("Vybrat databázi", "Choose database"), Scope::Global, false),
+    s("ctrl-shift-d", || dbc_i18n::tr!("Spustit nad více databázemi", "Run over multiple databases"), Scope::Global, false),
     // --- Results ---
     // Not „Ctrl+C kopíruje". THAT the grid has a search, that Enter walks
     // the hits, and that Delete stages a row deletion rather than doing one
     // — those are the news.
-    s("ctrl-f", "Hledat ve výsledku", Scope::Results, true),
-    s("enter", "Další nález", Scope::Results, false),
-    s("shift-enter", "Předchozí nález", Scope::Results, false),
-    s("delete", "Označit řádek ke smazání", Scope::Results, false),
+    s("ctrl-f", || dbc_i18n::tr!("Hledat ve výsledku", "Search in result"), Scope::Results, true),
+    s("enter", || dbc_i18n::tr!("Další nález", "Next match"), Scope::Results, false),
+    s("shift-enter", || dbc_i18n::tr!("Předchozí nález", "Previous match"), Scope::Results, false),
+    s("delete", || dbc_i18n::tr!("Označit řádek ke smazání", "Mark row for deletion"), Scope::Results, false),
     // --- Tree ---
-    s("escape", "Zrušit hledání ve stromu", Scope::Tree, false),
+    s("escape", || dbc_i18n::tr!("Zrušit hledání ve stromu", "Cancel tree search"), Scope::Tree, false),
 ];
 
 /// Chords bound with context `None` that the cheat sheet deliberately does
@@ -291,7 +298,7 @@ mod tests {
             assert_eq!(sc.chord, sc.chord.to_lowercase(), "{}", sc.chord);
             assert!(!sc.chord.contains(' '), "{}", sc.chord);
             assert!(!sc.chord.contains('+'), "{} — gpui uses '-'", sc.chord);
-            assert!(!sc.label.is_empty());
+            assert!(!sc.label().is_empty());
         }
     }
 }

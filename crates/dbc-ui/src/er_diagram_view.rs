@@ -112,7 +112,7 @@ impl ErDiagramView {
     /// at most `DIAGRAM_TABLE_CAP` nodes is small.
     fn start_export_svg(&mut self, cx: &mut Context<Self>) {
         let suggested_name = format!("{}.svg", self.schema_label);
-        self.status_note = Some("volím cíl exportu…".to_string());
+        self.status_note = Some(dbc_i18n::tr!("volím cíl exportu…", "choosing export target…").to_string());
         cx.notify();
         let dialog = cx.prompt_for_new_path(&std::path::PathBuf::new(), Some(&suggested_name));
         let layout = self.layout.clone();
@@ -122,14 +122,14 @@ impl ErDiagramView {
                 Ok(Ok(Some(p))) => p,
                 Ok(Ok(None)) => {
                     let _ = this.update(cx, |v, cx| {
-                        v.status_note = Some("export zrušen".to_string());
+                        v.status_note = Some(dbc_i18n::tr!("export zrušen", "export cancelled").to_string());
                         cx.notify();
                     });
                     return;
                 }
                 _ => {
                     let _ = this.update(cx, |v, cx| {
-                        v.status_note = Some("error: export dialog selhal".to_string());
+                        v.status_note = Some(dbc_i18n::tr!("error: export dialog selhal", "error: export dialog failed").to_string());
                         cx.notify();
                     });
                     return;
@@ -139,7 +139,7 @@ impl ErDiagramView {
             let result = std::fs::write(&path, svg);
             let _ = this.update(cx, |v, cx| {
                 v.status_note = Some(match result {
-                    Ok(()) => format!("exportováno: {}", path.display()),
+                    Ok(()) => dbc_i18n::trf!("exportováno: {}", "exported: {}", path.display()),
                     Err(e) => format!("error: {e}"),
                 });
                 cx.notify();
@@ -280,7 +280,7 @@ impl Render for ErDiagramView {
             .text_color(cx.theme().text_primary)
             .child(format!("ER: {schema_label}"))
             .child(
-                ui::button("er-diagram-export", "Export…", *cx.theme())
+                ui::button("er-diagram-export", dbc_i18n::tr!("Export…", "Export…"), *cx.theme())
                     .on_click(cx.listener(|v, _, _window, cx| v.start_export_svg(cx))),
             );
 
@@ -540,7 +540,7 @@ fn paint_node(
     }
     let hidden = total_pk_fk.saturating_sub(MAX_VISIBLE_COLS);
     if hidden > 0 {
-        let footer = format!("+{hidden} dalších");
+        let footer = dbc_i18n::trf!("+{hidden} dalších", "+{hidden} more");
         let row_origin = to_screen(origin, (n.x, n.y + row_y), pan, zoom);
         paint_text_line(row_origin + point(pad_x, px(0.0)), &footer, theme.text_disabled, false, row_font_size, row_font_size, window, app);
     }

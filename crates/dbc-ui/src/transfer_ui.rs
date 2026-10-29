@@ -16,20 +16,32 @@
 use dbc_state::bundle::Summary;
 
 /// Settings block heading.
-pub(crate) const TRANSFER_SETTINGS_HEADING: &str = "Přenos na jiný počítač";
+pub(crate) fn transfer_settings_heading() -> &'static str {
+    dbc_i18n::tr!("Přenos na jiný počítač", "Transfer to another computer")
+}
 /// Opens the save dialog. Writes a file, touches nothing in the app.
-pub(crate) const TRANSFER_SETTINGS_EXPORT: &str = "Vyvézt nastavení…";
+pub(crate) fn transfer_settings_export() -> &'static str {
+    dbc_i18n::tr!("Vyvézt nastavení…", "Export settings…")
+}
 /// Opens the open dialog, then the confirm below.
-pub(crate) const TRANSFER_SETTINGS_IMPORT: &str = "Načíst nastavení…";
+pub(crate) fn transfer_settings_import() -> &'static str {
+    dbc_i18n::tr!("Načíst nastavení…", "Import settings…")
+}
 
 /// The standing explanation, rendered in Settings BEFORE either dialog
 /// opens — the same posture as [`crate::connections_ui::WORKSPACE_GIT_WARNING`]:
 /// the thing a person needs in order to decide is on screen before the
 /// picker takes over the window.
-pub(crate) const TRANSFER_SETTINGS_NOTE: &str =
-    "Vyveze se seznam připojení a trezor tak, jak je — pořád zašifrovaný, \
-     takže se export na master heslo neptá a v souboru žádné čitelné heslo není. \
-     Na druhém počítači ho otevřeš tím samým master heslem jako tady.";
+pub(crate) fn transfer_settings_note() -> &'static str {
+    dbc_i18n::tr!(
+        "Vyveze se seznam připojení a trezor tak, jak je — pořád zašifrovaný, \
+         takže se export na master heslo neptá a v souboru žádné čitelné heslo není. \
+         Na druhém počítači ho otevřeš tím samým master heslem jako tady.",
+        "The connection list and the vault are exported as they are — still encrypted, \
+         so the export does not ask for the master password and the file contains no readable password. \
+         On the other computer you open it with the same master password as here."
+    )
+}
 
 /// Suggested filename in the save dialog. The pinned GPUI rev's
 /// `prompt_for_new_path` has no extension filter (grounded in
@@ -39,9 +51,15 @@ pub(crate) fn export_suggested_name() -> String {
     format!("dbc-nastaveni.{}", dbc_state::bundle::EXT)
 }
 
-pub(crate) const IMPORT_CONFIRM_TITLE: &str = "Načíst nastavení";
-pub(crate) const IMPORT_CONFIRM_OK: &str = "Nahradit nastavení";
-pub(crate) const IMPORT_CONFIRM_CANCEL: &str = "Zrušit";
+pub(crate) fn import_confirm_title() -> &'static str {
+    dbc_i18n::tr!("Načíst nastavení", "Import settings")
+}
+pub(crate) fn import_confirm_ok() -> &'static str {
+    dbc_i18n::tr!("Nahradit nastavení", "Replace settings")
+}
+pub(crate) fn import_confirm_cancel() -> &'static str {
+    dbc_i18n::tr!("Zrušit", "Cancel")
+}
 
 /// How many connection names the dialog lists before it stops naming them.
 ///
@@ -63,41 +81,62 @@ const NAME_CAP: usize = 10;
 pub(crate) fn import_confirm_lines(summary: &Summary, replacing: bool) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(match summary.connections.len() {
-        0 => "Soubor neobsahuje žádná připojení.".to_string(),
-        n => format!("Soubor obsahuje {n} připojení:"),
+        0 => dbc_i18n::tr!("Soubor neobsahuje žádná připojení.", "The file contains no connections.").to_string(),
+        n => dbc_i18n::trf!("Soubor obsahuje {n} připojení:", "The file contains {n} connections:"),
     });
     for name in summary.connections.iter().take(NAME_CAP) {
         lines.push(format!("  {name}"));
     }
     if summary.connections.len() > NAME_CAP {
-        lines.push(format!("  … a další ({} celkem)", summary.connections.len()));
+        lines.push(dbc_i18n::trf!("  … a další ({} celkem)", "  … and more ({} in total)", summary.connections.len()));
     }
 
     if summary.has_vault {
         lines.push(
-            "Trezor uvnitř zůstal zašifrovaný — po načtení se otevírá master heslem \
-             z původního počítače, ne tím zdejším."
-                .to_string(),
+            dbc_i18n::tr!(
+                "Trezor uvnitř zůstal zašifrovaný — po načtení se otevírá master heslem \
+                 z původního počítače, ne tím zdejším.",
+                "The vault inside stayed encrypted — after import it opens with the master password \
+                 from the original computer, not this one."
+            )
+            .to_string(),
         );
     } else {
         lines.push(
-            "V souboru není trezor, takže žádná hesla nepřijdou — u každého připojení \
-             je budeš muset zadat znovu."
-                .to_string(),
+            dbc_i18n::tr!(
+                "V souboru není trezor, takže žádná hesla nepřijdou — u každého připojení \
+                 je budeš muset zadat znovu.",
+                "The file has no vault, so no passwords come along — you will have to enter \
+                 them again for each connection."
+            )
+            .to_string(),
         );
     }
 
     if replacing {
         lines.push(
-            "Tvoje současná připojení a trezor budou nahrazené. Původní soubory se \
-             nemažou — odloží se vedle pod jménem *.pred-importem-<čas>."
-                .to_string(),
+            dbc_i18n::tr!(
+                "Tvoje současná připojení a trezor budou nahrazené. Původní soubory se \
+                 nemažou — odloží se vedle pod jménem *.pred-importem-<čas>.",
+                "Your current connections and vault will be replaced. The original files are \
+                 not deleted — they are set aside next to them as *.pred-importem-<time>."
+            )
+            .to_string(),
         );
     } else {
-        lines.push("Tenhle profil je zatím prázdný, takže se nic nepřepíše.".to_string());
+        lines.push(
+            dbc_i18n::tr!("Tenhle profil je zatím prázdný, takže se nic nepřepíše.", "This profile is still empty, so nothing is overwritten.")
+                .to_string(),
+        );
     }
 
-    lines.push("Historie, hodnoty parametrů ani cesty k psql/sqlcmd se nepřenášejí.".to_string());
+    lines.push(
+        dbc_i18n::tr!(
+            "Historie, hodnoty parametrů ani cesty k psql/sqlcmd se nepřenášejí.",
+            "History, parameter values and psql/sqlcmd paths are not transferred."
+        )
+        .to_string(),
+    );
     lines
 }
 
@@ -105,7 +144,7 @@ pub(crate) fn import_confirm_lines(summary: &Summary, replacing: bool) -> Vec<St
 /// save dialog's directory is not always the one the user thought they
 /// picked, and this is the only place it is ever shown.
 pub(crate) fn export_done_status(path: &std::path::Path, connections: usize) -> String {
-    format!("nastavení vyvezeno: {} ({connections} připojení)", path.display())
+    dbc_i18n::trf!("nastavení vyvezeno: {} ({connections} připojení)", "settings exported: {} ({connections} connections)", path.display())
 }
 
 /// The status-bar line after a successful import.
@@ -117,12 +156,18 @@ pub(crate) fn export_done_status(path: &std::path::Path, connections: usize) -> 
 /// action on a connection prompts — and a prompt that arrives unexplained
 /// reads as a bug rather than as the design.
 pub(crate) fn import_done_status(connections: usize, backed_up: usize, has_vault: bool) -> String {
-    let mut s = format!("nastavení načteno: {connections} připojení");
+    let mut s = dbc_i18n::trf!("nastavení načteno: {connections} připojení", "settings imported: {connections} connections");
     if backed_up > 0 {
-        s.push_str(&format!(" — původní odloženo jako *.pred-importem ({backed_up} soubory)"));
+        s.push_str(&dbc_i18n::trf!(
+            " — původní odloženo jako *.pred-importem ({backed_up} soubory)",
+            " — originals set aside as *.pred-importem ({backed_up} files)"
+        ));
     }
     if has_vault {
-        s.push_str(" — trezor je zamčený, odemkne se master heslem z původního počítače");
+        s.push_str(dbc_i18n::tr!(
+            " — trezor je zamčený, odemkne se master heslem z původního počítače",
+            " — the vault is locked, unlock it with the master password from the original computer"
+        ));
     }
     s
 }

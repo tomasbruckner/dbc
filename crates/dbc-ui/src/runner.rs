@@ -1,3 +1,4 @@
+use dbc_i18n::{tr, trf};
 use std::time::{Duration, Instant};
 
 use dbc_core::arrow::array::RecordBatch;
@@ -86,8 +87,9 @@ pub enum MonitorEvent {
 /// Design §0/§9.1: the app-level read_only flag is the ONLY kill
 /// enforcement — this exact message is what the background task returns
 /// when it independently refuses a Kill.
-pub const MONITOR_READ_ONLY_KILL_MSG: &str =
-    "spojení je pouze pro čtení — zabití procesu odmítnuto";
+pub fn monitor_read_only_kill_msg() -> &'static str {
+    tr!("spojení je pouze pro čtení — zabití procesu odmítnuto", "the connection is read-only — process kill refused")
+}
 
 /// G12 T2: transaction discipline for `QueryRunner::run_script` (design §2
 /// matrix). `None` = every statement autocommits individually (no
@@ -432,7 +434,7 @@ impl QueryRunner {
             ConnectSpec::Config { cfg, .. } => cfg.engine,
             ConnectSpec::Url(_) => {
                 let _ = tx.send(Err(QueryError::msg(
-                    "výpis databází není pro CLI připojení k dispozici",
+                    tr!("výpis databází není pro CLI připojení k dispozici", "database listing is not available for CLI connections"),
                 )));
                 return rx;
             }
@@ -1127,8 +1129,11 @@ fn compose_diff_select(
     };
     if !dbc_core::is_read_statement_d(&sql, dialect) {
         return Err(QueryError::msg(
-            "WHERE výraz nelze spustit — musí jít o čistě čtecí SQL (žádné oddělené příkazy)"
-                .to_string(),
+            tr!(
+                "WHERE výraz nelze spustit — musí jít o čistě čtecí SQL (žádné oddělené příkazy)",
+                "the WHERE expression cannot be run — it must be purely read-only SQL (no separate statements)"
+            )
+            .to_string(),
         ));
     }
     Ok(sql)
@@ -1162,8 +1167,9 @@ async fn fetch_diff_side_inner(
             Ok(b) => {
                 buf.push(b).map_err(|e| QueryError::msg(e.to_string()))?;
                 if buf.row_count() > dbc_diff::data_diff::DIFF_ROW_CAP {
-                    return Err(QueryError::msg(format!(
+                    return Err(QueryError::msg(trf!(
                         "tabulka má víc než {} řádků — porovnání dat na tak velké tabulce zatím není podporováno; zúžete výběr přes WHERE",
+                        "the table has more than {} rows — comparing data on such a large table is not supported yet; narrow the selection with WHERE",
                         dbc_diff::data_diff::DIFF_ROW_CAP
                     )));
                 }
@@ -1177,7 +1183,9 @@ async fn fetch_diff_side_inner(
 /// Exact rollback message the brief mandates for an affected-rows mismatch
 /// (PK-based optimistic check — a row changed/vanished under us since the
 /// Apply dialog's statements were generated).
-const AFFECTED_MISMATCH_MSG: &str = "řádek se mezitím změnil — aplikace zrušena";
+fn affected_mismatch_msg() -> &'static str {
+    tr!("řádek se mezitím změnil — aplikace zrušena", "the row has changed in the meantime — apply cancelled")
+}
 
 /// G5 Task 4: pure guard behind `run_write_transaction`'s belt-and-braces
 /// read-only refusal (brief contract #5). The UI never even offers edit
@@ -1188,7 +1196,7 @@ const AFFECTED_MISMATCH_MSG: &str = "řádek se mezitím změnil — aplikace zr
 /// tested without spinning up a connection.
 pub fn guard_not_read_only(read_only: bool) -> Result<(), QueryError> {
     if read_only {
-        Err(QueryError::msg("připojení je jen pro čtení"))
+        Err(QueryError::msg(tr!("připojení je jen pro čtení", "the connection is read-only")))
     } else {
         Ok(())
     }
@@ -1387,7 +1395,7 @@ async fn drive_write_sequence(
             Ok(affected) => {
                 if affected_mismatch(st.expected_affected, affected) {
                     let _ = conn.execute(dbc_core::tx_rollback_sql(dialect), cancel.clone()).await;
-                    return Err(QueryError::msg(AFFECTED_MISMATCH_MSG));
+                    return Err(QueryError::msg(affected_mismatch_msg()));
                 }
                 total += affected;
             }
@@ -1399,8 +1407,9 @@ async fn drive_write_sequence(
                 // must never appear in any error/status/log/history string.
                 // For sandbox statements display_sql == exec_sql, so G5's
                 // error surface just gains helpful statement context.
-                return Err(QueryError::msg(format!(
+                return Err(QueryError::msg(trf!(
                     "{} — příkaz: {}",
+                    "{} — statement: {}",
                     e.message, st.display_sql
                 )));
             }
@@ -1474,7 +1483,7 @@ async fn drive_write_sequence_bounded(
                     let _ =
                         tokio::time::timeout(Duration::from_secs(ROLLBACK_GRACE_SECS), rollback)
                             .await;
-                    Err(QueryError::msg(format!("[timeout] aplikace překročila {t}s")))
+                    Err(QueryError::msg(trf!("[timeout] aplikace překročila {t}s", "[timeout] apply exceeded {t}s")))
                 }
             }
         }
@@ -1530,7 +1539,7 @@ async fn drain_single_text_cell(
         || payload_col >= buf.column_count()
         || buf.cell_is_null(0, payload_col)
     {
-        return Err(QueryError::msg("EXPLAIN ANALYZE nevrátil žádný řádek"));
+        return Err(QueryError::msg(tr!("EXPLAIN ANALYZE nevrátil žádný řádek", "EXPLAIN ANALYZE returned no row")));
     }
     Ok(buf.cell_text(0, payload_col))
 }
@@ -1552,7 +1561,7 @@ async fn drain_stream_single_text_cell(
         buf.push(item?).map_err(|e| QueryError::msg(e.to_string()))?;
     }
     if buf.row_count() == 0 || buf.cell_is_null(0, 0) {
-        return Err(QueryError::msg("plán nevrátil žádná data"));
+        return Err(QueryError::msg(tr!("plán nevrátil žádná data", "the plan returned no data")));
     }
     Ok(buf.cell_text(0, 0))
 }
@@ -1681,7 +1690,7 @@ async fn run_mssql_plan_inner(
         // or a sqlite file path only) — defensive only; unreachable via the
         // UI (`dispatch_mssql_plan` is only ever reached for a saved MSSQL
         // connection).
-        return Err(QueryError::msg("MSSQL plán vyžaduje uložené připojení"));
+        return Err(QueryError::msg(tr!("MSSQL plán vyžaduje uložené připojení", "an MSSQL plan requires a saved connection")));
     };
     // Pure string building — no I/O, no `spawn_blocking` needed; the ssh /
     // integrated-auth refusals fire here exactly like `open_config`'s arm
@@ -1702,9 +1711,9 @@ async fn run_mssql_plan_inner(
             // exceeded), even on the estimated (non-analyze) path, which
             // never runs an analysis at all.
             QueryError::msg(if analyze {
-                format!("[timeout] analýza překročila {t}s")
+                trf!("[timeout] analýza překročila {t}s", "[timeout] analysis exceeded {t}s")
             } else {
-                format!("[timeout] vysvětlení plánu překročilo {t}s")
+                trf!("[timeout] vysvětlení plánu překročilo {t}s", "[timeout] plan explanation exceeded {t}s")
             })
         })?,
         None => run.await,
@@ -1768,7 +1777,7 @@ async fn drive_analyze_write_bounded(
                     let _ =
                         tokio::time::timeout(Duration::from_secs(ROLLBACK_GRACE_SECS), rollback)
                             .await;
-                    Err(QueryError::msg(format!("[timeout] analýza překročila {t}s")))
+                    Err(QueryError::msg(trf!("[timeout] analýza překročila {t}s", "[timeout] analysis exceeded {t}s")))
                 }
             }
         }
@@ -1798,9 +1807,10 @@ async fn run_analyze_write_inner(
         // ("each layer holds on its own") — the refusal fires BEFORE
         // open_spec, so not even a connection is constructed. Pinned by
         // duckdb_query_sessions_do_not_see_execute_transactions.
-        return Err(QueryError::msg(
+        return Err(QueryError::msg(tr!(
             "EXPLAIN ANALYZE zápisu není pro DuckDB podporováno — analyzovaný zápis nelze bezpečně vrátit",
-        ));
+            "EXPLAIN ANALYZE of a write is not supported for DuckDB — an analyzed write cannot be safely rolled back"
+        )));
     }
     // Captured BEFORE `spec` moves into `open_spec` (G15 T5).
     let dialect = spec_dialect(&spec);
@@ -1863,8 +1873,9 @@ pub fn resolve_tool_path(configured: Option<&str>, name: &str) -> Result<String,
         return if std::path::Path::new(path).is_file() {
             Ok(absolutize(path))
         } else {
-            Err(QueryError::msg(format!(
-                "nakonfigurovaná cesta k {name} neexistuje: {path} — nastavte ji znovu"
+            Err(QueryError::msg(trf!(
+                "nakonfigurovaná cesta k {name} neexistuje: {path} — nastavte ji znovu",
+                "the configured path to {name} does not exist: {path} — set it again"
             )))
         };
     }
@@ -1888,10 +1899,10 @@ pub fn resolve_tool_path(configured: Option<&str>, name: &str) -> Result<String,
             if full.is_file() {
                 Ok(full.to_string_lossy().to_string())
             } else {
-                Err(QueryError::msg(format!("{name} nenalezen — nastavte cestu ručně")))
+                Err(QueryError::msg(trf!("{name} nenalezen — nastavte cestu ručně", "{name} not found — set the path manually")))
             }
         }
-        None => Err(QueryError::msg(format!("{name} nenalezen — nastavte cestu ručně"))),
+        None => Err(QueryError::msg(trf!("{name} nenalezen — nastavte cestu ručně", "{name} not found — set the path manually"))),
     }
 }
 
@@ -1928,10 +1939,10 @@ async fn run_mssql_backup_inner(
     )
     .await?;
     if exists.trim() != "1" {
-        return Err(QueryError::msg(
-            "BACKUP DATABASE nahlásilo úspěch, ale soubor zálohy se na serveru nenašel \
-             (ověřeno přes xp_fileexist) — zkuste zálohu spustit znovu",
-        ));
+        return Err(QueryError::msg(tr!(
+            "BACKUP DATABASE nahlásilo úspěch, ale soubor zálohy se na serveru nenašel (ověřeno přes xp_fileexist) — zkuste zálohu spustit znovu",
+            "BACKUP DATABASE reported success, but the backup file was not found on the server (checked via xp_fileexist) — try running the backup again"
+        )));
     }
     Ok(())
 }
@@ -2017,10 +2028,10 @@ async fn run_mssql_restore_inner(
         .await;
     restore_result?;
     if !online {
-        return Err(QueryError::msg(
-            "RESTORE DATABASE nahlásilo úspěch, ale databáze nepřešla do stavu ONLINE \
-             (zůstala RESTORING) ani po 15s čekání",
-        ));
+        return Err(QueryError::msg(tr!(
+            "RESTORE DATABASE nahlásilo úspěch, ale databáze nepřešla do stavu ONLINE (zůstala RESTORING) ani po 15s čekání",
+            "RESTORE DATABASE reported success, but the database did not reach the ONLINE state (it stayed RESTORING) even after waiting 15s"
+        )));
     }
     Ok(())
 }
@@ -2058,7 +2069,7 @@ fn run_sqlite_restore_inner(db_path: &str, backup_path: &str, read_only: bool) -
     use std::io::Read;
     let n = f.read(&mut header).map_err(|e| QueryError::msg(e.to_string()))?;
     if !backup::sqlite_magic_header_ok(&header[..n]) {
-        return Err(QueryError::msg("soubor není SQLite databáze"));
+        return Err(QueryError::msg(tr!("soubor není SQLite databáze", "the file is not a SQLite database")));
     }
     drop(f);
     std::fs::copy(backup_path, db_path).map_err(|e| QueryError::msg(e.to_string()))?;
@@ -2120,7 +2131,7 @@ fn run_duckdb_restore_inner(db_path: &str, backup_path: &str, read_only: bool) -
     use std::io::Read;
     let n = f.read(&mut header).map_err(|e| QueryError::msg(e.to_string()))?;
     if !backup::duckdb_magic_ok(&header[..n]) {
-        return Err(QueryError::msg("soubor není DuckDB databáze"));
+        return Err(QueryError::msg(tr!("soubor není DuckDB databáze", "the file is not a DuckDB database")));
     }
     drop(f);
     std::fs::copy(backup_path, db_path).map_err(|e| QueryError::msg(e.to_string()))?;
@@ -2220,7 +2231,7 @@ async fn run_script_statement(
 fn split_error_message(e: &dbc_core::SplitError) -> String {
     match e {
         dbc_core::SplitError::UnsupportedGoCount => {
-            "GO s počtem opakování není podporováno".to_string()
+            tr!("GO s počtem opakování není podporováno", "GO with a repeat count is not supported").to_string()
         }
         other => format!("{other:?}"),
     }
@@ -2234,21 +2245,22 @@ async fn read_and_split_file(
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<String>, QueryError> {
         use std::io::Read;
         let mut file = std::fs::File::open(&path)
-            .map_err(|e| QueryError::msg(format!("[soubor] {}: {e}", path.display())))?;
+            .map_err(|e| QueryError::msg(trf!("[soubor] {}: {e}", "[file] {}: {e}", path.display())))?;
         let mut splitter = dbc_core::StatementSplitter::new(dialect);
         let mut stmts = Vec::new();
         let mut chunk = vec![0u8; SCRIPT_READ_CHUNK];
         loop {
             let n = file
                 .read(&mut chunk)
-                .map_err(|e| QueryError::msg(format!("[soubor] {}: {e}", path.display())))?;
+                .map_err(|e| QueryError::msg(trf!("[soubor] {}: {e}", "[file] {}: {e}", path.display())))?;
             if n == 0 {
                 match splitter.finish() {
                     Ok(Some(tail)) => stmts.push(tail),
                     Ok(None) => {}
                     Err(e) => {
-                        return Err(QueryError::msg(format!(
+                        return Err(QueryError::msg(trf!(
                             "[skript] neúplný SQL konstrukt na konci souboru: {}",
+                            "[script] incomplete SQL construct at the end of the file: {}",
                             split_error_message(&e)
                         )));
                     }
@@ -2258,8 +2270,9 @@ async fn read_and_split_file(
             match splitter.push(&chunk[..n]) {
                 Ok(mut more) => stmts.append(&mut more),
                 Err(e) => {
-                    return Err(QueryError::msg(format!(
+                    return Err(QueryError::msg(trf!(
                         "[soubor] {}: {}",
+                        "[file] {}: {}",
                         path.display(),
                         split_error_message(&e)
                     )))
@@ -2270,7 +2283,7 @@ async fn read_and_split_file(
     .await;
     match result {
         Ok(inner) => inner,
-        Err(_) => Err(QueryError::msg("[soubor] čtení souboru selhalo (panic)")),
+        Err(_) => Err(QueryError::msg(tr!("[soubor] čtení souboru selhalo (panic)", "[file] reading the file failed (panic)"))),
     }
 }
 
@@ -3464,13 +3477,13 @@ async fn monitor_loop(
                 // permission question. `kill_sql`'s own `debug_assert!(pid
                 // > 0)` stays as the last-resort backstop.
                 let result = if pid <= 0 {
-                    Err(QueryError::msg("neplatné PID procesu"))
+                    Err(QueryError::msg(tr!("neplatné PID procesu", "invalid process PID")))
                 } else if read_only {
-                    Err(QueryError::msg(MONITOR_READ_ONLY_KILL_MSG))
+                    Err(QueryError::msg(monitor_read_only_kill_msg()))
                 } else {
                     match crate::monitor_sql::kill_sql(engine, pid) {
                         Some(sql) => conn.execute(&sql, CancelToken::new()).await,
-                        None => Err(QueryError::msg("kill není pro tento engine k dispozici")),
+                        None => Err(QueryError::msg(tr!("kill není pro tento engine k dispozici", "kill is not available for this engine"))),
                     }
                 };
                 if event_tx.send(MonitorEvent::KillResult { generation, pid, result }).await.is_err() {
@@ -3544,7 +3557,7 @@ async fn run_monitor_refresh(
         // unreachable today (`monitor_available` gates `open_monitor` to
         // Postgres/MSSQL-once-flipped), message unchanged.
         dbc_state::Engine::Sqlite | dbc_state::Engine::Duckdb => {
-            let err = || Err("monitor není pro tento engine k dispozici".to_string());
+            let err = || Err(tr!("monitor není pro tento engine k dispozici", "the monitor is not available for this engine").to_string());
             monitor::RefreshResults {
                 connections: err(), locks: err(), data_size: err(), wal_size: err(),
                 perf: err(), running: err(), blocking: err(), tables: err(),
@@ -3776,7 +3789,7 @@ mod write_transaction_tests {
             ws("UPDATE t SET name = 'z' WHERE id = 1", Some(2)),
         ];
         let err = drive_write_sequence(&mut *conn, &stmts, CancelToken::new(), dbc_core::Dialect::Sqlite).await.unwrap_err();
-        assert_eq!(err.message, AFFECTED_MISMATCH_MSG);
+        assert_eq!(err.message, affected_mismatch_msg());
 
         assert_eq!(read_one(&mut *conn, "SELECT name FROM t WHERE id = 1").await, Some("a".to_string()));
     }
@@ -3796,7 +3809,7 @@ mod write_transaction_tests {
             ws("UPDATE no_such_table SET name = 'x'", None),
         ];
         let err = drive_write_sequence(&mut *conn, &stmts, CancelToken::new(), dbc_core::Dialect::Sqlite).await.unwrap_err();
-        assert_ne!(err.message, AFFECTED_MISMATCH_MSG);
+        assert_ne!(err.message, affected_mismatch_msg());
 
         assert_eq!(read_one(&mut *conn, "SELECT name FROM t WHERE id = 1").await, Some("a".to_string()));
     }
@@ -5376,7 +5389,7 @@ mod monitor_tests {
             MonitorEvent::KillResult { generation, pid, result } => {
                 assert_eq!(generation, 7);
                 assert_eq!(pid, 42);
-                assert_eq!(result.unwrap_err().message, MONITOR_READ_ONLY_KILL_MSG);
+                assert_eq!(result.unwrap_err().message, monitor_read_only_kill_msg());
             }
             other => panic!("expected KillResult, got {other:?}"),
         }
@@ -5461,7 +5474,7 @@ mod monitor_tests {
                 MonitorEvent::KillResult { pid, result: Err(e), .. } => {
                     assert_eq!(pid, bad_pid);
                     assert_ne!(
-                        e.message, MONITOR_READ_ONLY_KILL_MSG,
+                        e.message, monitor_read_only_kill_msg(),
                         "pid {bad_pid} must be refused for being invalid, not mistaken for the \
                          read-only refusal"
                     );
@@ -5597,7 +5610,7 @@ mod monitor_tests {
         let ev = tokio::time::timeout(Duration::from_secs(5), event_rx.recv()).await.unwrap().unwrap();
         match ev {
             MonitorEvent::KillResult { result, .. } => {
-                assert_eq!(result.unwrap_err().message, MONITOR_READ_ONLY_KILL_MSG);
+                assert_eq!(result.unwrap_err().message, monitor_read_only_kill_msg());
             }
             other => panic!("expected KillResult, got {other:?}"),
         }

@@ -170,7 +170,7 @@ pub fn staged_cell_display(staged: Option<&Option<String>>) -> Option<String> {
 /// `"(NULL)"`; a staged value (`Some(Some(s))`) shows `s`.
 pub fn insert_cell_display(cell: &Option<Option<String>>) -> String {
     match cell {
-        None => "(výchozí)".to_string(),
+        None => dbc_i18n::tr!("(výchozí)", "(default)").to_string(),
         Some(None) => "(NULL)".to_string(),
         Some(Some(s)) => s.clone(),
     }

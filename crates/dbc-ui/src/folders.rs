@@ -54,7 +54,7 @@ pub fn visible_folders(conns: &[ConnectionConfig], declared: &[Vec<String>]) -> 
 /// A folder path as one displayable string. The empty path is the root,
 /// which has no name of its own.
 pub fn label(path: &[String]) -> String {
-    if path.is_empty() { "kořen".to_string() } else { path.join(" / ") }
+    if path.is_empty() { dbc_i18n::tr!("kořen", "root").to_string() } else { path.join(" / ") }
 }
 
 /// Is `path` inside `root` (or equal to it)?
@@ -71,8 +71,8 @@ pub enum FolderError {
 impl FolderError {
     pub fn message(&self) -> &'static str {
         match self {
-            FolderError::EmptyName => "Název složky nesmí být prázdný.",
-            FolderError::AlreadyExists => "Složka s tímto názvem už tady je.",
+            FolderError::EmptyName => dbc_i18n::tr!("Název složky nesmí být prázdný.", "The folder name must not be empty."),
+            FolderError::AlreadyExists => dbc_i18n::tr!("Složka s tímto názvem už tady je.", "A folder with this name already exists here."),
         }
     }
 }

@@ -34,6 +34,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+use dbc_i18n::{tr, trf};
 use dbc_buffer::ResultBuffer;
 use dbc_state::{ConnectionConfig, Engine, MssqlOptions, PgOptions, PgSslMode, SshTunnelConfig, Vault};
 use gpui::{
@@ -1729,7 +1730,7 @@ pub enum ModalState {
         /// „Najít složku…" is an ADOPT: it points the app at a workspace
         /// folder it did not previously own, exactly like Settings' adopt,
         /// which shows „Trezor tohoto prostoru se odemyká jeho vlastním
-        /// master heslem." and [`WORKSPACE_GIT_WARNING`] before committing
+        /// master heslem." and [`workspace_git_warning()`] before committing
         /// (§W3.3/§W6.3 — „renders STATICALLY wherever the folder-pick flow
         /// is offered"). Recovery used to write the pointer and swap the
         /// context the instant the picker returned, so the user adopted a
@@ -1870,22 +1871,31 @@ pub(crate) enum ScriptNameMode {
 
 pub(crate) fn script_name_title(mode: ScriptNameMode) -> &'static str {
     match mode {
-        ScriptNameMode::NewScript => "Nový skript",
-        ScriptNameMode::NewFolder => "Nová složka",
-        ScriptNameMode::Rename => "Přejmenovat",
+        ScriptNameMode::NewScript => tr!("Nový skript", "New script"),
+        ScriptNameMode::NewFolder => tr!("Nová složka", "New folder"),
+        ScriptNameMode::Rename => tr!("Přejmenovat", "Rename"),
     }
 }
 
 pub(crate) fn script_delete_text(name: &str, is_dir: bool) -> String {
-    let kind = if is_dir { "složku" } else { "skript" };
-    format!("Smazat {kind} {name}? Akce je nevratná (maže se z disku, ne do koše).")
+    if is_dir {
+        trf!(
+            "Smazat složku {name}? Akce je nevratná (maže se z disku, ne do koše).",
+            "Delete folder {name}? This cannot be undone (it is removed from disk, not sent to the recycle bin)."
+        )
+    } else {
+        trf!(
+            "Smazat skript {name}? Akce je nevratná (maže se z disku, ne do koše).",
+            "Delete script {name}? This cannot be undone (it is removed from disk, not sent to the recycle bin)."
+        )
+    }
 }
 
 /// Part S §4's resolved simplification: when the target IS the dirty-bound
 /// file, the delete confirm carries a second line instead of stacking a
 /// discard confirm in front of it — one modal, both facts.
 pub(crate) fn script_delete_dirty_line() -> &'static str {
-    "Skript má neuložené změny v editoru."
+    tr!("Skript má neuložené změny v editoru.", "The script has unsaved changes in the editor.")
 }
 
 /// The connection-delete confirm's body.
@@ -1898,15 +1908,27 @@ pub(crate) fn script_delete_dirty_line() -> &'static str {
 /// any certificate.
 pub(crate) fn pg_ssl_mode_hint(mode: PgSslMode) -> &'static str {
     match mode {
-        PgSslMode::Disable => "bez šifrování",
-        PgSslMode::Prefer => "šifrovat, pokud to server umí; certifikát se neověřuje",
-        PgSslMode::Require => "vždy šifrovat; certifikát se neověřuje",
-        PgSslMode::VerifyFull => "vždy šifrovat a ověřit certifikát i název serveru (úložiště Windows)",
+        PgSslMode::Disable => tr!("bez šifrování", "no encryption"),
+        PgSslMode::Prefer => tr!(
+            "šifrovat, pokud to server umí; certifikát se neověřuje",
+            "encrypt if the server supports it; the certificate is not verified"
+        ),
+        PgSslMode::Require => tr!(
+            "vždy šifrovat; certifikát se neověřuje",
+            "always encrypt; the certificate is not verified"
+        ),
+        PgSslMode::VerifyFull => tr!(
+            "vždy šifrovat a ověřit certifikát i název serveru (úložiště Windows)",
+            "always encrypt and verify the certificate and server name (Windows store)"
+        ),
     }
 }
 
 pub(crate) fn connection_delete_text(name: &str) -> String {
-    format!("Smazat připojení {name}? Databáze ani její data se nijak nezmění — mizí jen tento záznam v aplikaci.")
+    trf!(
+        "Smazat připojení {name}? Databáze ani její data se nijak nezmění — mizí jen tento záznam v aplikaci.",
+        "Delete connection {name}? The database and its data are not changed in any way — only this entry in the app disappears."
+    )
 }
 
 /// The second line, shown ONLY when the vault is locked at confirm time.
@@ -1917,15 +1939,18 @@ pub(crate) fn connection_delete_text(name: &str) -> String {
 /// to any more — unreachable, but not gone, and the user is the one who
 /// gets to decide whether that is good enough.
 pub(crate) fn connection_delete_secret_line() -> &'static str {
-    "Trezor je zamčený, takže uložené heslo v něm zůstane (zašifrované, bez záznamu, který by na ně odkazoval). Odemkni trezor před smazáním, ať zmizí i ono."
+    tr!(
+        "Trezor je zamčený, takže uložené heslo v něm zůstane (zašifrované, bez záznamu, který by na ně odkazoval). Odemkni trezor před smazáním, ať zmizí i ono.",
+        "The vault is locked, so the stored password stays in it (encrypted, with no entry referring to it). Unlock the vault before deleting to remove it too."
+    )
 }
 
 /// The name dialog's PRIMARY BUTTON — distinct from its title (a rename's
 /// title and button happen to coincide; a create's do not).
 pub(crate) fn script_name_confirm_label(mode: ScriptNameMode) -> &'static str {
     match mode {
-        ScriptNameMode::Rename => "Přejmenovat",
-        ScriptNameMode::NewScript | ScriptNameMode::NewFolder => "Vytvořit",
+        ScriptNameMode::Rename => tr!("Přejmenovat", "Rename"),
+        ScriptNameMode::NewScript | ScriptNameMode::NewFolder => tr!("Vytvořit", "Create"),
     }
 }
 
@@ -1933,20 +1958,26 @@ pub(crate) fn script_name_confirm_label(mode: ScriptNameMode) -> &'static str {
 /// its arm exists only to keep the match total.
 pub(crate) fn script_kind_label(mode: ScriptNameMode) -> &'static str {
     match mode {
-        ScriptNameMode::NewFolder => "Složka",
-        ScriptNameMode::NewScript | ScriptNameMode::Rename => "Skript",
+        ScriptNameMode::NewFolder => tr!("Složka", "Folder"),
+        ScriptNameMode::NewScript | ScriptNameMode::Rename => tr!("Skript", "Script"),
     }
 }
 
 /// Shown on the primary button while the background fs op is in flight —
 /// `running` is VISIBLE, not merely enforced (the `WorkspaceConfirm`
 /// precedent).
-pub(crate) const SCRIPT_MODAL_RUNNING: &str = "Pracuji…";
+pub(crate) fn script_modal_running() -> &'static str {
+    tr!("Pracuji…", "Working…")
+}
 /// Both scripts modals' secondary button.
-pub(crate) const SCRIPT_MODAL_CANCEL: &str = "Zrušit";
+pub(crate) fn script_modal_cancel() -> &'static str {
+    tr!("Zrušit", "Cancel")
+}
 /// The delete confirm's primary button — the last gate before an
 /// unrecoverable disk delete, so it names the act rather than saying „OK".
-pub(crate) const SCRIPT_DELETE_CONFIRM: &str = "Smazat";
+pub(crate) fn script_delete_confirm() -> &'static str {
+    tr!("Smazat", "Delete")
+}
 
 /// T9 review MINOR-3: the run confirm's disclosure when its target is the
 /// script the editor holds with UNSAVED changes.
@@ -1958,8 +1989,12 @@ pub(crate) const SCRIPT_DELETE_CONFIRM: &str = "Smazat";
 /// carries `script_delete_dirty_line()` for an action whose blast radius
 /// is a single file — was the inconsistency. Same „one modal, both facts"
 /// reasoning, applied to the bigger blast radius.
-pub(crate) const SCRIPT_RUN_DIRTY_LINE: &str =
-    "Editor má neuložené změny — spustí se obsah na disku.";
+pub(crate) fn script_run_dirty_line() -> &'static str {
+    tr!(
+        "Editor má neuložené změny — spustí se obsah na disku.",
+        "The editor has unsaved changes — the content on disk will be run."
+    )
+}
 
 /// Is an in-modal notice an ERROR, or a REFUSAL?
 ///
@@ -1970,7 +2005,7 @@ pub(crate) const SCRIPT_RUN_DIRTY_LINE: &str =
 /// pins exist to protect. A refusal is „try again in a moment", and reads
 /// as `warn`.
 pub(crate) fn script_modal_notice_is_error(message: &str) -> bool {
-    message != crate::SCRIPT_SAVE_IN_FLIGHT && message != crate::SCRIPT_SAVE_BLOCKED
+    message != crate::script_save_in_flight() && message != crate::script_save_blocked()
 }
 
 /// The Enter policy for `ModalState::ScriptName`, factored out so it can be
@@ -2207,7 +2242,7 @@ impl AppView {
         if let Some(url) = &self.conn_url {
             return url.clone();
         }
-        "Bez připojení".to_string()
+        tr!("Bez připojení", "No connection").to_string()
     }
 
     /// Recompute the cached folder/favourite grouping from `self.config`.
@@ -2310,7 +2345,7 @@ impl AppView {
                     .bg(if self.dropdown_open { theme.bg_hover } else { theme.bg_app })
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.bg_hover))
-                    .child(div().text_color(theme.text_muted).child("Připojení"))
+                    .child(div().text_color(theme.text_muted).child(tr!("Připojení", "Connection")))
                     .child(div().child(label))
                     .child(div().text_color(theme.text_muted).child("▾"))
                     .on_click(cx.listener(|view, _, _, cx| {
@@ -2325,12 +2360,12 @@ impl AppView {
             .child(div().flex_1())
             // Panel toggles. Lit = open, so the bar always says which
             // panels exist even when they are hidden.
-            .child(ui::toolbar_button("top-bar-tree", "Strom", tree_on, true, theme).on_click(
+            .child(ui::toolbar_button("top-bar-tree", tr!("Strom", "Tree"), tree_on, true, theme).on_click(
                 cx.listener(|view, _, window, cx| {
                     view.on_toggle_tree(&crate::ToggleTree, window, cx)
                 }),
             ))
-            .child(ui::toolbar_button("top-bar-history", "Historie", history_on, true, theme).on_click(
+            .child(ui::toolbar_button("top-bar-history", tr!("Historie", "History"), history_on, true, theme).on_click(
                 cx.listener(|view, _, _window, cx| view.open_history_tab(cx)),
             ))
             .child(ui::toolbar_separator(theme))
@@ -2339,7 +2374,7 @@ impl AppView {
             // engine and formatting by the wrong dialect would reflow the
             // user's SQL against the wrong lexical rules.
             .child(
-                ui::toolbar_button("top-bar-format", "Formátovat", false, format_enabled, theme).on_click(
+                ui::toolbar_button("top-bar-format", tr!("Formátovat", "Format"), false, format_enabled, theme).on_click(
                     cx.listener(|view, _, window, cx| {
                         view.on_format_sql(&crate::FormatSql, window, cx);
                     }),
@@ -2379,13 +2414,13 @@ impl AppView {
             }));
 
         if !grouped.favourites.is_empty() {
-            panel = panel.child(div().text_color(cx.theme().warn).child("Oblíbené"));
+            panel = panel.child(div().text_color(cx.theme().warn).child(tr!("Oblíbené", "Favourites")));
             for c in &grouped.favourites {
                 panel = panel.child(dropdown_item(c, 1, cx));
             }
         }
         for folder in &grouped.folders {
-            let header = if folder.path.is_empty() { "Bez složky".to_string() } else { folder.path.join("/") };
+            let header = if folder.path.is_empty() { tr!("Bez složky", "No folder").to_string() } else { folder.path.join("/") };
             let depth = folder.path.len();
             panel = panel.child(
                 div()
@@ -2403,7 +2438,7 @@ impl AppView {
                 .cursor_pointer()
                 .text_color(cx.theme().success)
                 .hover(|s| s.bg(cx.theme().bg_hover))
-                .child("Nové spojení…")
+                .child(tr!("Nové spojení…", "New connection…"))
                 .on_click(cx.listener(|view, _, window, cx| {
                     view.open_connection_dialog(None, window, cx);
                 })),
@@ -2628,21 +2663,61 @@ impl AppView {
         // at the theme radios; nothing above changed.
         let mut panel = ui::panel(360., *cx.theme())
             .id("settings-panel")
-            .child(div().text_size(px(16.)).child("Nastavení"))
-            .child(div().text_color(cx.theme().text_muted).child("Motiv"))
-            .child(radio("settings-theme-dark", "Tmavý", dbc_state::ThemeMode::Dark, mode, cx))
-            .child(radio("settings-theme-light", "Světlý", dbc_state::ThemeMode::Light, mode, cx));
+            .child(div().text_size(px(16.)).child(tr!("Nastavení", "Settings")))
+            .child(div().text_color(cx.theme().text_muted).child(tr!("Motiv", "Theme")))
+            .child(radio("settings-theme-dark", tr!("Tmavý", "Dark"), dbc_state::ThemeMode::Dark, mode, cx))
+            .child(radio("settings-theme-light", tr!("Světlý", "Light"), dbc_state::ThemeMode::Light, mode, cx));
+
+        // The language block. Its heading is in BOTH languages on purpose:
+        // whoever is looking for it is, by definition, reading the UI in
+        // the language they do not want. The language names are each in
+        // their own language, for the same reason.
+        let language = self.config.language;
+        let lang_radio = |id: &'static str,
+                          label: &'static str,
+                          value: Option<dbc_state::UiLanguage>,
+                          cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .bg(if value == language { cx.theme().bg_selected } else { cx.theme().bg_hover })
+                .child(if value == language { "●" } else { "○" })
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_language(value, cx)))
+        };
+        panel = panel
+            .child(div().mt_2().text_color(cx.theme().text_muted).child("Jazyk / Language"))
+            .child(lang_radio(
+                "settings-lang-system",
+                dbc_i18n::tr!("Podle Windows", "Same as Windows"),
+                None,
+                cx,
+            ))
+            .child(lang_radio(
+                "settings-lang-cs",
+                "Čeština", // i18n-ok: language names are shown in their own language
+                Some(dbc_state::UiLanguage::Cs),
+                cx,
+            ))
+            .child(lang_radio("settings-lang-en", "English", Some(dbc_state::UiLanguage::En), cx));
 
         // Design §W3 — the „Pracovní prostor" block. Task 7 puts „Složka
         // skriptů" BELOW this one (it is subsumed in workspace mode, §W8).
         let ws_root = self.workspace_root.clone();
         panel = panel
-            .child(div().mt_2().text_color(cx.theme().text_muted).child(WORKSPACE_SETTINGS_HEADING))
+            .child(div().mt_2().text_color(cx.theme().text_muted).child(workspace_settings_heading()))
             .child(div().child(workspace_settings_mode_line(ws_root.as_deref())));
         // T5 review MINOR-2: the LAST pick refusal, in full, HERE — inside
         // the 360 px panel the user is already looking at, where it wraps
         // and can actually be read. The status bar got a short sentinel
-        // (`WORKSPACE_PICK_FAILED_STATUS`) instead. This is the phase's
+        // (`workspace_pick_failed_status()`) instead. This is the phase's
         // own convention: every other long explanation lives in a modal
         // body for exactly this reason.
         if let Some(e) = self.workspace_pick_error.clone() {
@@ -2654,24 +2729,24 @@ impl AppView {
             // has (§W3.2 copies from the PROFILE); the way out is the
             // profile and back.
             Some(_) => panel.child(
-                ui::row_button("settings-workspace-leave", WORKSPACE_SETTINGS_LEAVE, *cx.theme())
+                ui::row_button("settings-workspace-leave", workspace_settings_leave(), *cx.theme())
                     .on_click(cx.listener(|this, _, _, cx| this.start_leave_workspace(cx))),
             ),
             None => panel
                 .child(
-                    ui::row_button("settings-workspace-pick", WORKSPACE_SETTINGS_PICK, *cx.theme())
+                    ui::row_button("settings-workspace-pick", workspace_settings_pick(), *cx.theme())
                         .on_click(cx.listener(|this, _, _, cx| this.start_workspace_pick(cx))),
                 )
                 // §W6.3(b): the warning renders STATICALLY wherever the
                 // folder-pick flow is offered — not only inside the confirm
                 // modal, so it is on screen BEFORE the picker opens.
-                .child(div().text_color(cx.theme().text_muted).child(WORKSPACE_GIT_WARNING)),
+                .child(div().text_color(cx.theme().text_muted).child(workspace_git_warning())),
         };
 
         // Design §W8 — „Složka skriptů", BELOW the „Pracovní prostor"
         // block because in workspace mode it is subsumed by it.
         panel = panel
-            .child(div().mt_2().text_color(cx.theme().text_muted).child(SCRIPTS_SETTINGS_HEADING));
+            .child(div().mt_2().text_color(cx.theme().text_muted).child(scripts_settings_heading()));
         panel = match &ws_root {
             // §W8: in workspace mode this is a fixed read-only line — no
             // picker, no „Odebrat". The root is a convention, not a
@@ -2682,22 +2757,22 @@ impl AppView {
                 // Unreachable by construction — `effective_scripts_root` is
                 // `Some` whenever `workspace_root` is — but a render fn
                 // says so honestly instead of unwrapping.
-                None => SCRIPTS_SETTINGS_UNSET.to_string(),
+                None => scripts_settings_unset().to_string(),
             })),
             None => {
                 let current = self
                     .config
                     .scripts_dir
                     .clone()
-                    .unwrap_or_else(|| SCRIPTS_SETTINGS_UNSET.to_string());
+                    .unwrap_or_else(|| scripts_settings_unset().to_string());
                 panel
                     .child(div().text_color(cx.theme().text_muted).child(current))
                     .child(
-                        ui::row_button("settings-scripts-pick", SCRIPTS_SETTINGS_PICK, *cx.theme())
+                        ui::row_button("settings-scripts-pick", scripts_settings_pick(), *cx.theme())
                             .on_click(cx.listener(|this, _, _, cx| this.start_scripts_dir_pick(cx))),
                     )
                     .child(
-                        ui::row_button("settings-scripts-clear", SCRIPTS_SETTINGS_CLEAR, *cx.theme())
+                        ui::row_button("settings-scripts-clear", scripts_settings_clear(), *cx.theme())
                             .on_click(cx.listener(|this, _, _, cx| this.clear_scripts_dir(cx))),
                     )
             }
@@ -2705,16 +2780,22 @@ impl AppView {
 
         // „Trezor" — the auto-unlock consent (PRIVACY.md, „Credentials").
         // It is GIVEN in the unlock prompt; this is where it is taken back.
-        panel = panel.child(div().mt_2().text_color(cx.theme().text_muted).child("Trezor")).child(
+        panel = panel.child(div().mt_2().text_color(cx.theme().text_muted).child(tr!("Trezor", "Vault"))).child(
             div().child(if self.vault_key_stored {
-                "Klíč k trezoru je uložen ve Windows Credential Manageru — trezor se při startu odemkne sám."
+                tr!(
+                    "Klíč k trezoru je uložen ve Windows Credential Manageru — trezor se při startu odemkne sám.",
+                    "The vault key is stored in Windows Credential Manager — the vault unlocks itself at startup."
+                )
             } else {
-                "Klíč k trezoru není uložen — master heslo se zadává při každém spuštění."
+                tr!(
+                    "Klíč k trezoru není uložen — master heslo se zadává při každém spuštění.",
+                    "The vault key is not stored — the master password is asked for at every launch."
+                )
             }),
         );
         if self.vault_key_stored {
             panel = panel.child(
-                ui::row_button("settings-forget-vault-key", "Zapomenout uložený klíč", *cx.theme())
+                ui::row_button("settings-forget-vault-key", tr!("Zapomenout uložený klíč", "Forget stored key"), *cx.theme())
                     .on_click(cx.listener(|this, _, _, cx| this.forget_vault_key(cx))),
             );
         }
@@ -2722,11 +2803,11 @@ impl AppView {
         // „Aktualizace" — the one switch that decides whether dbc talks to
         // GitHub at all (PRIVACY.md, „Updates").
         panel = panel
-            .child(div().mt_2().text_color(cx.theme().text_muted).child("Aktualizace"))
+            .child(div().mt_2().text_color(cx.theme().text_muted).child(tr!("Aktualizace", "Updates")))
             .child(
                 ui::checkbox(
                     "settings-update-check",
-                    "Kontrolovat aktualizace při startu (GitHub)",
+                    tr!("Kontrolovat aktualizace při startu (GitHub)", "Check for updates at startup (GitHub)"),
                     !self.config.disable_update_check,
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_update_check(cx))),
@@ -2740,7 +2821,7 @@ impl AppView {
                 div()
                     .mt_2()
                     .text_color(cx.theme().text_muted)
-                    .child(crate::transfer_ui::TRANSFER_SETTINGS_HEADING),
+                    .child(crate::transfer_ui::transfer_settings_heading()),
             )
             // On screen BEFORE either dialog opens — same posture as
             // WORKSPACE_GIT_WARNING: the fact you need in order to decide
@@ -2748,20 +2829,20 @@ impl AppView {
             .child(
                 div()
                     .text_color(cx.theme().text_muted)
-                    .child(crate::transfer_ui::TRANSFER_SETTINGS_NOTE),
+                    .child(crate::transfer_ui::transfer_settings_note()),
             )
             .child(
-                ui::row_button("settings-transfer-export", crate::transfer_ui::TRANSFER_SETTINGS_EXPORT, *cx.theme())
+                ui::row_button("settings-transfer-export", crate::transfer_ui::transfer_settings_export(), *cx.theme())
                     .on_click(cx.listener(|this, _, _, cx| this.start_settings_export(cx))),
             )
             .child(
-                ui::row_button("settings-transfer-import", crate::transfer_ui::TRANSFER_SETTINGS_IMPORT, *cx.theme())
+                ui::row_button("settings-transfer-import", crate::transfer_ui::transfer_settings_import(), *cx.theme())
                     .on_click(cx.listener(|this, _, _, cx| this.start_settings_import(cx))),
             );
 
         panel
             .child(
-                ui::row_button("settings-close", "Zavřít", *cx.theme())
+                ui::row_button("settings-close", tr!("Zavřít", "Close"), *cx.theme())
                     .mt_2()
                     .on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))),
             )
@@ -2783,14 +2864,14 @@ impl AppView {
         if self.modal.is_some() {
             return;
         }
-        let name = cx.new(|cx| TextField::form_field(cx, "např. Produkce", false));
+        let name = cx.new(|cx| TextField::form_field(cx, tr!("např. Produkce", "e.g. Production"), false));
         let host = cx.new(|cx| TextField::form_field(cx, "localhost", false));
         let port = cx.new(|cx| TextField::form_field(cx, "5432", false));
         let database = cx.new(|cx| TextField::form_field(cx, "", false));
         let user = cx.new(|cx| TextField::form_field(cx, "", false));
         let password = cx.new(|cx| TextField::form_field(cx, "", true));
         let folder = cx.new(|cx| TextField::form_field(cx, "a/b", false));
-        let timeout_secs = cx.new(|cx| TextField::form_field(cx, "prázdné = připojení 60 s, dotazy bez limitu", false));
+        let timeout_secs = cx.new(|cx| TextField::form_field(cx, tr!("prázdné = připojení 60 s, dotazy bez limitu", "empty = connect 60 s, queries unlimited"), false));
         let auto_limit = cx.new(|cx| TextField::form_field(cx, "1000", false));
         let ssh_host = cx.new(|cx| TextField::form_field(cx, "", false));
         let ssh_port = cx.new(|cx| TextField::form_field(cx, "22", false));
@@ -3120,7 +3201,7 @@ impl AppView {
         let identity = self.current_conn_identity();
         self.editor_mut().results.open(crate::tabs::ResultTab {
             id: 0,
-            title: crate::tabs::collapse_title(&format!("Porovnání: {label_a} ↔ {label_b}")),
+            title: crate::tabs::collapse_title(&trf!("Porovnání: {label_a} ↔ {label_b}", "Compare: {label_a} ↔ {label_b}")),
             pinned: false,
             preview_key: None,
             conn_identity: identity,
@@ -3269,7 +3350,7 @@ impl AppView {
             self.vault.is_some(),
             Vault::exists(&self.vault_path),
         ) {
-            let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
+            let input = cx.new(|cx| TextField::form_field(cx, tr!("Heslo", "Password"), true));
             let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt {
                 input,
@@ -3341,7 +3422,7 @@ impl AppView {
                                 ui.testing = false;
                                 ui.test_result = Some(match result {
                                     Ok(Ok(())) => {
-                                        TestOutcome::Ok(format!("Připojeno ({engine_lbl})"))
+                                        TestOutcome::Ok(trf!("Připojeno ({engine_lbl})", "Connected ({engine_lbl})"))
                                     }
                                     // pwchange (spec §1): Test NIKDY neotvírá
                                     // druhý modal (single-modal invariant) —
@@ -3355,7 +3436,7 @@ impl AppView {
                                     // this is not our cancel — the runtime
                                     // dropped the task.
                                     Err(_) => TestOutcome::Failed(
-                                        "connect zrušen".to_string(),
+                                        tr!("connect zrušen", "connect cancelled").to_string(),
                                     ),
                                 });
                             }
@@ -3376,7 +3457,7 @@ impl AppView {
             return;
         }
         if Vault::exists(&self.vault_path) {
-            let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
+            let input = cx.new(|cx| TextField::form_field(cx, tr!("Heslo", "Password"), true));
             let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt {
                 input,
@@ -3386,8 +3467,8 @@ impl AppView {
             });
             window.focus(&focus, cx);
         } else {
-            let input1 = cx.new(|cx| TextField::form_field(cx, "Nové heslo", true));
-            let input2 = cx.new(|cx| TextField::form_field(cx, "Zopakujte heslo", true));
+            let input1 = cx.new(|cx| TextField::form_field(cx, tr!("Nové heslo", "New password"), true));
+            let input2 = cx.new(|cx| TextField::form_field(cx, tr!("Zopakujte heslo", "Repeat password"), true));
             let focus = input1.focus_handle(cx);
             self.modal = Some(ModalState::CreateMasterPassword {
                 input1,
@@ -3472,8 +3553,9 @@ impl AppView {
             // moved aside on the strength of it. Refuse and let the user
             // retry once whatever holds the file lets go.
             dbc_state::ConfigVerdict::Unreadable(e) => {
-                self.editor_mut().status = format!(
+                self.editor_mut().status = trf!(
                     "error: config.toml se nepodařilo přečíst ({}) – uložení zrušeno",
+                    "error: could not read config.toml ({}) – save cancelled",
                     e.message
                 );
                 cx.notify();
@@ -3492,8 +3574,9 @@ impl AppView {
         // hand.
         let backup = self.config_path.with_extension("toml.corrupt-bak");
         if let Err(e) = std::fs::rename(&self.config_path, &backup) {
-            self.editor_mut().status = format!(
-                "error: nelze zálohovat poškozený config.toml ({e}) – uložení zrušeno                  (důvod: {defect})"
+            self.editor_mut().status = trf!(
+                "error: nelze zálohovat poškozený config.toml ({e}) – uložení zrušeno                  (důvod: {defect})",
+                "error: cannot back up the corrupt config.toml ({e}) – save cancelled (reason: {defect})"
             );
             cx.notify();
             return None;
@@ -3505,7 +3588,11 @@ impl AppView {
             Ok(guard) => Some(guard),
             Err(e) => {
                 self.editor_mut().status =
-                    format!("error: config.toml nelze zapsat ({}) – uložení zrušeno", e.message);
+                    trf!(
+                        "error: config.toml nelze zapsat ({}) – uložení zrušeno",
+                        "error: cannot write config.toml ({}) – save cancelled",
+                        e.message
+                    );
                 cx.notify();
                 None
             }
@@ -3537,7 +3624,7 @@ impl AppView {
             self.config.connections.push(cfg);
         }
         self.editor_mut().status = match self.config.save(&self.config_path, &guard) {
-            Ok(()) => "Uloženo".to_string(),
+            Ok(()) => tr!("Uloženo", "Saved").to_string(),
             Err(e) => format!("error saving config: {}", e.message),
         };
         self.refresh_grouped_cache(cx);
@@ -3559,7 +3646,7 @@ impl AppView {
         };
         c.favourite = !c.favourite;
         self.editor_mut().status = match self.config.save(&self.config_path, &guard) {
-            Ok(()) => "Uloženo".to_string(),
+            Ok(()) => tr!("Uloženo", "Saved").to_string(),
             Err(e) => format!("error saving config: {}", e.message),
         };
         self.refresh_grouped_cache(cx);
@@ -3583,7 +3670,7 @@ impl AppView {
         if self.modal.is_some() {
             return;
         }
-        let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
+        let input = cx.new(|cx| TextField::form_field(cx, tr!("Heslo", "Password"), true));
         let focus = input.focus_handle(cx);
         self.modal = Some(ModalState::MasterPasswordPrompt {
             input,
@@ -3665,7 +3752,10 @@ impl AppView {
                     self.vault_key_stored = true;
                     None
                 }
-                Err(e) => Some(format!("trezor odemčen, ale klíč se nepodařilo uložit ({e})")),
+                Err(e) => Some(trf!(
+                    "trezor odemčen, ale klíč se nepodařilo uložit ({e})",
+                    "vault unlocked, but the key could not be stored ({e})"
+                )),
             },
             KeyAction::Forget => self.forget_vault_key_inner(),
             KeyAction::Nothing => None,
@@ -3679,7 +3769,10 @@ impl AppView {
                 self.remember_vault_key = false;
                 None
             }
-            Err(e) => Some(format!("error: uložený klíč se nepodařilo smazat ({e})")),
+            Err(e) => Some(trf!(
+                "error: uložený klíč se nepodařilo smazat ({e})",
+                "error: could not delete the stored key ({e})"
+            )),
         }
     }
 
@@ -3688,7 +3781,13 @@ impl AppView {
     pub(crate) fn forget_vault_key(&mut self, cx: &mut Context<Self>) {
         self.editor_mut().status = self
             .forget_vault_key_inner()
-            .unwrap_or_else(|| "uložený klíč smazán — příští start se zeptá na master heslo".to_string());
+            .unwrap_or_else(|| {
+                tr!(
+                    "uložený klíč smazán — příští start se zeptá na master heslo",
+                    "stored key deleted — the next start will ask for the master password"
+                )
+                .to_string()
+            });
         cx.notify();
     }
 
@@ -3700,7 +3799,7 @@ impl AppView {
             .find(|c| c.id == id)
             .is_some_and(|c| !engine_is_file_based(c.engine));
         if connect_needs_vault_prompt(needs_secret, self.vault.is_some(), Vault::exists(&self.vault_path)) {
-            let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
+            let input = cx.new(|cx| TextField::form_field(cx, tr!("Heslo", "Password"), true));
             let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt {
                 input,
@@ -3754,7 +3853,7 @@ impl AppView {
             // Design §4: the proactive unlock has nothing to resume — just
             // report the unlock itself.
             PendingAfterUnlock::Nothing => {
-                self.editor_mut().status = "Trezor odemčen".into();
+                self.editor_mut().status = tr!("Trezor odemčen", "Vault unlocked").into();
                 cx.notify();
             }
         }
@@ -3878,11 +3977,11 @@ impl AppView {
         let p1 = input1.read(cx).text();
         let p2 = input2.read(cx).text();
         if p1.is_empty() {
-            self.set_create_master_error("Heslo nesmí být prázdné.", cx);
+            self.set_create_master_error(tr!("Heslo nesmí být prázdné.", "The password must not be empty."), cx);
             return;
         }
         if p1 != p2 {
-            self.set_create_master_error("Hesla se neshodují.", cx);
+            self.set_create_master_error(tr!("Hesla se neshodují.", "The passwords do not match."), cx);
             return;
         }
         // Vault::create silently overwrites an existing vault file, so this
@@ -3891,7 +3990,7 @@ impl AppView {
         // of the app created one), fall back to unlocking it instead of
         // clobbering it.
         if Vault::exists(&self.vault_path) {
-            let input = cx.new(|cx| TextField::form_field(cx, "Heslo", true));
+            let input = cx.new(|cx| TextField::form_field(cx, tr!("Heslo", "Password"), true));
             let focus = input.focus_handle(cx);
             self.modal = Some(ModalState::MasterPasswordPrompt { input, error: None, verifying: false, pending });
             window.focus(&focus, cx);
@@ -3948,7 +4047,11 @@ impl AppView {
         let Some(view) = self.monitor_view_for_tab(tab_id) else {
             // Tab closed under the dialog — nothing to kill against.
             self.modal = None;
-            self.editor_mut().status = "monitor tab už není otevřený — ukončení zrušeno".into();
+            self.editor_mut().status = tr!(
+                "monitor tab už není otevřený — ukončení zrušeno",
+                "the monitor tab is no longer open — kill cancelled"
+            )
+            .into();
             cx.notify();
             return;
         };
@@ -4155,7 +4258,7 @@ fn save_needs_vault_prompt(password_field_empty: bool, vault_unlocked: bool) -> 
 /// `modal_confirm_kind_tests`'s note above `AppView` render helpers).
 fn apply_lock(vault: &mut Option<Vault>) -> &'static str {
     *vault = None;
-    "Trezor zamčen"
+    tr!("Trezor zamčen", "Vault locked")
 }
 
 /// Whether `on_test_clicked` must prompt for the master password before
@@ -4489,19 +4592,19 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
 }
 
 fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppView>) -> AnyElement {
-    let title = if ui.editing_id.is_some() { "Připojení — úprava" } else { "Připojení — nové" };
+    let title = if ui.editing_id.is_some() { tr!("Připojení — úprava", "Connection — edit") } else { tr!("Připojení — nové", "Connection — new") };
     // While `testing`, the in-flight-status line takes priority over
     // whatever the previous `test_result` was (a stale ✓/✗ from an earlier
     // click shouldn't linger under a fresh "testuji…").
     let test_line = if ui.testing {
-        Some(("testuji…".to_string(), None))
+        Some((tr!("testuji…", "testing…").to_string(), None))
     } else {
         ui.test_result.clone().map(|r| match r {
             TestOutcome::Ok(msg) => (format!("✓ {msg}"), Some(true)),
             TestOutcome::Failed(e) => (format!("✗ {e}"), Some(false)),
             // Muted and unmarked, like „testuji…": no ✓ and above all no
             // ✗, because nothing failed — the user simply stopped asking.
-            TestOutcome::Cancelled => ("test zrušen".to_string(), None),
+            TestOutcome::Cancelled => (tr!("test zrušen", "test cancelled").to_string(), None),
         })
     };
     let testing = ui.testing;
@@ -4514,7 +4617,7 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
 
     let mut panel: Div = ui::panel(480., *cx.theme())
         .child(div().text_size(px(16.)).child(title))
-        .child(ui::field_row("Název", ui.name.clone(), *cx.theme()))
+        .child(ui::field_row(tr!("Název", "Name"), ui.name.clone(), *cx.theme()))
         .child(
             ui::labelled_row("Engine", ui::FIELD_LABEL_W, *cx.theme())
                 // Segmented row, not a dropdown: with four options a popup
@@ -4541,7 +4644,11 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
         // meaningless (one file, one database), so the plain label stays
         // alongside G16's file-path hint row below.
         .child(ui::field_row(
-            if engine_is_file_based(ui.engine) { "Databáze" } else { "Databáze (výchozí)" },
+            if engine_is_file_based(ui.engine) {
+                tr!("Databáze", "Database")
+            } else {
+                tr!("Databáze (výchozí)", "Database (default)")
+            },
             ui.database.clone(),
             *cx.theme(),
         ));
@@ -4553,20 +4660,23 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
         panel = panel.child(
             div()
                 .text_color(cx.theme().text_muted)
-                .child("u SQLite/DuckDB: cesta k databázovému souboru (host/port/heslo se nepoužijí)"),
+                .child(tr!(
+                    "u SQLite/DuckDB: cesta k databázovému souboru (host/port/heslo se nepoužijí)",
+                    "for SQLite/DuckDB: path to the database file (host/port/password are not used)"
+                )),
         );
     }
     panel = panel
-        .child(ui::field_row("Uživatel", ui.user.clone(), *cx.theme()))
-        .child(ui::field_row("Heslo", ui.password.clone(), *cx.theme()))
-        .child(ui::field_row("Složka", ui.folder.clone(), *cx.theme()))
+        .child(ui::field_row(tr!("Uživatel", "User"), ui.user.clone(), *cx.theme()))
+        .child(ui::field_row(tr!("Heslo", "Password"), ui.password.clone(), *cx.theme()))
+        .child(ui::field_row(tr!("Složka", "Folder"), ui.folder.clone(), *cx.theme()))
         .child(ui::field_row("Timeout (s)", ui.timeout_secs.clone(), *cx.theme()))
-        .child(ui::field_row("Auto-limit řádků", ui.auto_limit.clone(), *cx.theme()))
+        .child(ui::field_row(tr!("Auto-limit řádků", "Auto-limit rows"), ui.auto_limit.clone(), *cx.theme()))
         .child(
             ui::checkbox_row()
-                .child(ui::checkbox("chk-read-only", "Pouze pro čtení", ui.read_only).on_click(cx.listener(|v, _, _, cx| v.toggle_read_only(cx))))
-                .child(ui::checkbox("chk-favourite", "Oblíbené", ui.favourite).on_click(cx.listener(|v, _, _, cx| v.toggle_favourite(cx))))
-                .child(ui::checkbox("chk-mcp", "Dostupné pro AI (MCP)", ui.mcp).on_click(cx.listener(|v, _, _, cx| v.toggle_mcp(cx)))),
+                .child(ui::checkbox("chk-read-only", tr!("Pouze pro čtení", "Read-only"), ui.read_only).on_click(cx.listener(|v, _, _, cx| v.toggle_read_only(cx))))
+                .child(ui::checkbox("chk-favourite", tr!("Oblíbené", "Favourite"), ui.favourite).on_click(cx.listener(|v, _, _, cx| v.toggle_favourite(cx))))
+                .child(ui::checkbox("chk-mcp", tr!("Dostupné pro AI (MCP)", "Available to AI (MCP)"), ui.mcp).on_click(cx.listener(|v, _, _, cx| v.toggle_mcp(cx)))),
         );
     // The switch stays clickable — the choice is remembered — but a ticked
     // box that `dbc-mcp` will ignore anyway must say so (`mcp_visible` in
@@ -4575,12 +4685,15 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
         panel = panel.child(
             div()
                 .text_color(cx.theme().text_muted)
-                .child("MCP zatím neumí SQL Server ani připojení přes SSH tunel — AI toto připojení neuvidí"),
+                .child(tr!(
+                    "MCP zatím neumí SQL Server ani připojení přes SSH tunel — AI toto připojení neuvidí",
+                    "MCP does not support SQL Server or connections over an SSH tunnel yet — AI will not see this connection"
+                )),
         );
     }
     panel = panel
         .child(
-            ui::checkbox("chk-ssh", "SSH tunel (jen klíč/agent)", ui.ssh_enabled)
+            ui::checkbox("chk-ssh", tr!("SSH tunel (jen klíč/agent)", "SSH tunnel (key/agent only)"), ui.ssh_enabled)
                 .on_click(cx.listener(|v, _, _, cx| v.toggle_ssh_enabled(cx))),
         );
 
@@ -4588,8 +4701,8 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
         panel = panel
             .child(ui::field_row("SSH host", ui.ssh_host.clone(), *cx.theme()))
             .child(ui::field_row("SSH port", ui.ssh_port.clone(), *cx.theme()))
-            .child(ui::field_row("SSH uživatel", ui.ssh_user.clone(), *cx.theme()))
-            .child(ui::field_row("SSH klíč (cesta)", ui.ssh_key_path.clone(), *cx.theme()));
+            .child(ui::field_row(tr!("SSH uživatel", "SSH user"), ui.ssh_user.clone(), *cx.theme()))
+            .child(ui::field_row(tr!("SSH klíč (cesta)", "SSH key (path)"), ui.ssh_key_path.clone(), *cx.theme()));
     }
 
     if ui.engine == Engine::Postgres {
@@ -4617,24 +4730,30 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
             .child(
                 ui::checkbox_row()
                     .child(
-                        ui::checkbox("chk-mssql-encrypt", "Šifrovat připojení (Encrypt)", ui.mssql_encrypt)
+                        ui::checkbox("chk-mssql-encrypt", tr!("Šifrovat připojení (Encrypt)", "Encrypt connection (Encrypt)"), ui.mssql_encrypt)
                             .on_click(cx.listener(|v, _, _, cx| v.toggle_mssql_encrypt(cx))),
                     )
                     .child(
                         ui::checkbox(
                             "chk-mssql-trust",
-                            "Důvěřovat certifikátu serveru (TrustServerCertificate)",
+                            tr!(
+                                "Důvěřovat certifikátu serveru (TrustServerCertificate)",
+                                "Trust server certificate (TrustServerCertificate)"
+                            ),
                             ui.mssql_trust_cert,
                         )
                         .on_click(cx.listener(|v, _, _, cx| v.toggle_mssql_trust(cx))),
                     ),
             )
-            .child(ui::field_row("ODBC driver (volitelné)", ui.mssql_driver.clone(), *cx.theme()))
+            .child(ui::field_row(tr!("ODBC driver (volitelné)", "ODBC driver (optional)"), ui.mssql_driver.clone(), *cx.theme()))
             // Read-only honesty, UI half (§1a): rendered only for MSSQL.
             .child(
                 div()
                     .text_color(cx.theme().text_muted)
-                    .child("Pouze pro čtení: u MSSQL vynuceno pouze na straně klienta"),
+                    .child(tr!(
+                        "Pouze pro čtení: u MSSQL vynuceno pouze na straně klienta",
+                        "Read-only: for MSSQL enforced on the client side only"
+                    )),
             );
     }
 
@@ -4655,7 +4774,7 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
         if let Some(raw) = test_error_text {
             panel = panel.child(
                 div().flex().flex_row().justify_end().child(
-                    ui::row_button("dlg-test-copy", "Kopírovat chybu", *cx.theme()).on_click(
+                    ui::row_button("dlg-test-copy", tr!("Kopírovat chybu", "Copy error"), *cx.theme()).on_click(
                         cx.listener(move |_, _, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(raw.clone()));
                         }),
@@ -4665,7 +4784,7 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
         }
     }
 
-    let test_label = if testing { "Testuji…" } else { "Test" };
+    let test_label = if testing { tr!("Testuji…", "Testing…") } else { "Test" };
     let mut buttons = div().flex().flex_row().gap_2().justify_end().mt_2().child(
         // Dimmed rather than replaced by „Zrušit test": a button that turns
         // into its own opposite under a cursor already resting on it means
@@ -4675,14 +4794,14 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
     );
     if testing {
         buttons = buttons.child(
-            ui::button("dlg-test-cancel", "Zrušit test", *cx.theme())
+            ui::button("dlg-test-cancel", tr!("Zrušit test", "Cancel test"), *cx.theme())
                 .on_click(cx.listener(|v, _, _, cx| v.cancel_test(cx))),
         );
     }
     panel = panel.child(
         buttons
-            .child(ui::button("dlg-save", "Uložit", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_save_clicked(window, cx))))
-            .child(ui::button("dlg-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx)))),
+            .child(ui::button("dlg-save", tr!("Uložit", "Save"), *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_save_clicked(window, cx))))
+            .child(ui::button("dlg-cancel", tr!("Zrušit", "Cancel"), *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx)))),
     );
 
     panel.into_any_element()
@@ -4702,14 +4821,15 @@ fn render_visibility_panel(
 ) -> AnyElement {
     let theme = *cx.theme();
     let title = match db {
-        None => "Zobrazené databáze".to_string(),
-        Some(db) => format!("Zobrazená schémata — {db}"),
+        None => tr!("Zobrazené databáze", "Shown databases").to_string(),
+        Some(db) => trf!("Zobrazená schémata — {db}", "Shown schemas — {db}"),
     };
     let mut panel: Div = ui::panel(420., theme)
         .child(div().text_size(px(16.)).child(title))
-        .child(div().text_color(theme.text_muted).child(
+        .child(div().text_color(theme.text_muted).child(tr!(
             "Odškrtnuté se ve stromu neukazují. Nic se tím nemaže a nové položky              na serveru se objeví samy.",
-        ));
+            "Unticked items are hidden in the tree. Nothing is deleted, and new items on the server appear by themselves."
+        )));
     if all.is_empty() {
         // The candidates come from what the tree has already fetched, so
         // there is a state with nothing to offer — and saying so beats an
@@ -4717,7 +4837,10 @@ fn render_visibility_panel(
         panel = panel.child(
             div()
                 .text_color(theme.text_muted)
-                .child("Zatím není co vybírat — rozbal to nejdřív ve stromu."),
+                .child(tr!(
+                    "Zatím není co vybírat — rozbal to nejdřív ve stromu.",
+                    "Nothing to pick yet — expand it in the tree first."
+                )),
         );
     } else {
         let mut list = div()
@@ -4747,17 +4870,17 @@ fn render_visibility_panel(
                 .flex_row()
                 .gap_2()
                 .mt_2()
-                .child(ui::row_button("vis-all", "Vše", theme).on_click(
+                .child(ui::row_button("vis-all", tr!("Vše", "All"), theme).on_click(
                     cx.listener(|v, _, _, cx| v.set_all_visible(true, cx)),
                 ))
-                .child(ui::row_button("vis-none", "Nic", theme).on_click(
+                .child(ui::row_button("vis-none", tr!("Nic", "None"), theme).on_click(
                     cx.listener(|v, _, _, cx| v.set_all_visible(false, cx)),
                 ))
                 .child(div().flex_1())
-                .child(ui::button("vis-save", "Uložit", theme).on_click(
+                .child(ui::button("vis-save", tr!("Uložit", "Save"), theme).on_click(
                     cx.listener(|v, _, _, cx| v.confirm_visibility(cx)),
                 ))
-                .child(ui::button("vis-cancel", "Zrušit", theme).on_click(
+                .child(ui::button("vis-cancel", tr!("Zrušit", "Cancel"), theme).on_click(
                     cx.listener(|v, _, _, cx| v.close_modal(cx)),
                 )),
         )
@@ -4782,14 +4905,14 @@ fn render_pw_change_panel(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let mut panel: Div = ui::panel(420., *cx.theme())
-        .child(div().text_size(px(16.)).child("Změna hesla na serveru"))
+        .child(div().text_size(px(16.)).child(tr!("Změna hesla na serveru", "Change password on the server")))
         .child(div().text_color(cx.theme().text_muted).child(crate::pwchange::dialog_body(kind, user)))
-        .child(ui::field_row("Nové heslo", new1, *cx.theme()))
-        .child(ui::field_row("Nové heslo znovu", new2, *cx.theme()));
+        .child(ui::field_row(tr!("Nové heslo", "New password"), new1, *cx.theme()))
+        .child(ui::field_row(tr!("Nové heslo znovu", "New password again"), new2, *cx.theme()));
     if kind == crate::pwchange::PwChangeKind::PgMaybeExpired {
         panel = panel
-            .child(ui::field_row("Admin uživatel", admin_user, *cx.theme()))
-            .child(ui::field_row("Admin heslo", admin_password, *cx.theme()))
+            .child(ui::field_row(tr!("Admin uživatel", "Admin user"), admin_user, *cx.theme()))
+            .child(ui::field_row(tr!("Admin heslo", "Admin password"), admin_password, *cx.theme()))
             .child(
                 div().text_color(cx.theme().text_muted).child(crate::pwchange::pg_rescue_display(user)),
             );
@@ -4797,10 +4920,10 @@ fn render_pw_change_panel(
     if let Some(e) = error {
         panel = panel.child(div().text_color(cx.theme().danger).child(e));
     }
-    let mut cancel = ui::button("pwch-cancel", "Zrušit", *cx.theme());
+    let mut cancel = ui::button("pwch-cancel", tr!("Zrušit", "Cancel"), *cx.theme());
     let mut submit = ui::button(
         "pwch-submit",
-        if running { "měním heslo…" } else { "Změnit heslo" },
+        if running { tr!("měním heslo…", "changing password…") } else { tr!("Změnit heslo", "Change password") },
         *cx.theme(),
     );
     if !running {
@@ -4881,7 +5004,7 @@ fn caption_button(kind: CaptionButton, theme: crate::theme::Theme) -> gpui::Stat
 }
 
 fn folder_label(path: &[String]) -> String {
-    if path.is_empty() { "kořen".to_string() } else { path.join(" / ") }
+    if path.is_empty() { tr!("kořen", "root").to_string() } else { path.join(" / ") }
 }
 
 fn render_folder_name_panel(
@@ -4892,13 +5015,16 @@ fn render_folder_name_panel(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let (title, hint) = match &rename_of {
-        Some(path) => ("Přejmenovat složku".to_string(), folder_label(path)),
-        None => ("Nová složka".to_string(), format!("v {}", folder_label(&parent))),
+        Some(path) => (tr!("Přejmenovat složku", "Rename folder").to_string(), folder_label(path)),
+        None => (
+            tr!("Nová složka", "New folder").to_string(),
+            trf!("v {}", "in {}", folder_label(&parent)),
+        ),
     };
     let mut panel = ui::panel(420., *cx.theme())
         .child(div().text_size(px(16.)).child(title))
         .child(div().text_color(cx.theme().text_muted).child(hint))
-        .child(ui::field_row("Název", field, *cx.theme()));
+        .child(ui::field_row(tr!("Název", "Name"), field, *cx.theme()));
     if let Some(e) = error {
         panel = panel.child(div().text_color(cx.theme().danger).child(e));
     }
@@ -4910,13 +5036,13 @@ fn render_folder_name_panel(
                 .gap_2()
                 .justify_end()
                 .mt_2()
-                .child(ui::button("folder-name-cancel", "Zrušit", *cx.theme()).on_click(
+                .child(ui::button("folder-name-cancel", tr!("Zrušit", "Cancel"), *cx.theme()).on_click(
                     cx.listener(|v, _, _, cx| {
                         v.modal = None;
                         cx.notify();
                     }),
                 ))
-                .child(ui::button("folder-name-ok", "Uložit", *cx.theme()).on_click(
+                .child(ui::button("folder-name-ok", tr!("Uložit", "Save"), *cx.theme()).on_click(
                     cx.listener(|v, _, _, cx| v.confirm_folder_name(cx)),
                 )),
         )
@@ -4932,12 +5058,19 @@ fn render_folder_delete_panel(
     // saved connections reads like a threat; saying where they go turns it
     // back into a tidy-up.
     let note = match moving {
-        0 => "Složka je prázdná.".to_string(),
-        1 => "1 připojení se přesune o úroveň výš. Nic se nesmaže.".to_string(),
-        n => format!("{n} připojení se přesune o úroveň výš. Nic se nesmaže."),
+        0 => tr!("Složka je prázdná.", "The folder is empty.").to_string(),
+        1 => tr!(
+            "1 připojení se přesune o úroveň výš. Nic se nesmaže.",
+            "1 connection will move up one level. Nothing is deleted."
+        )
+        .to_string(),
+        n => trf!(
+            "{n} připojení se přesune o úroveň výš. Nic se nesmaže.",
+            "{n} connections will move up one level. Nothing is deleted."
+        ),
     };
     ui::panel(460., *cx.theme())
-        .child(div().text_size(px(16.)).child("Smazat složku"))
+        .child(div().text_size(px(16.)).child(tr!("Smazat složku", "Delete folder")))
         .child(div().text_color(cx.theme().text_muted).child(folder_label(&path)))
         .child(div().child(note))
         .child(
@@ -4947,13 +5080,13 @@ fn render_folder_delete_panel(
                 .gap_2()
                 .justify_end()
                 .mt_2()
-                .child(ui::button("folder-del-cancel", "Zrušit", *cx.theme()).on_click(
+                .child(ui::button("folder-del-cancel", tr!("Zrušit", "Cancel"), *cx.theme()).on_click(
                     cx.listener(|v, _, _, cx| {
                         v.modal = None;
                         cx.notify();
                     }),
                 ))
-                .child(ui::button("folder-del-ok", "Smazat složku", *cx.theme()).on_click(
+                .child(ui::button("folder-del-ok", tr!("Smazat složku", "Delete folder"), *cx.theme()).on_click(
                     cx.listener(|v, _, _, cx| v.confirm_folder_delete(cx)),
                 )),
         )
@@ -4966,7 +5099,7 @@ fn render_connection_delete_panel(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let mut panel: Div = ui::panel(460., *cx.theme())
-        .child(div().text_size(px(16.)).child("Smazat připojení"))
+        .child(div().text_size(px(16.)).child(tr!("Smazat připojení", "Delete connection")))
         .child(div().child(connection_delete_text(name)));
     if secret_stays {
         panel = panel
@@ -4980,13 +5113,13 @@ fn render_connection_delete_panel(
                 .gap_2()
                 .justify_end()
                 .mt_2()
-                .child(ui::button("conn-del-cancel", "Zrušit", *cx.theme()).on_click(
+                .child(ui::button("conn-del-cancel", tr!("Zrušit", "Cancel"), *cx.theme()).on_click(
                     cx.listener(|v, _, _, cx| {
                         v.modal = None;
                         cx.notify();
                     }),
                 ))
-                .child(ui::button("conn-del-ok", "Smazat připojení", *cx.theme()).on_click(
+                .child(ui::button("conn-del-ok", tr!("Smazat připojení", "Delete connection"), *cx.theme()).on_click(
                     cx.listener(|v, _, _, cx| v.confirm_connection_delete(cx)),
                 )),
         )
@@ -5003,7 +5136,7 @@ fn render_settings_import_panel(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let mut panel: Div = ui::panel(560., *cx.theme())
-        .child(div().text_size(px(16.)).child(crate::transfer_ui::IMPORT_CONFIRM_TITLE))
+        .child(div().text_size(px(16.)).child(crate::transfer_ui::import_confirm_title()))
         .child(div().text_color(cx.theme().text_muted).child(path.display().to_string()));
     for line in lines {
         panel = panel.child(div().child(line.clone()));
@@ -5025,7 +5158,7 @@ fn render_settings_import_panel(
                 .child(
                     ui::button(
                         "settings-import-cancel",
-                        crate::transfer_ui::IMPORT_CONFIRM_CANCEL,
+                        crate::transfer_ui::import_confirm_cancel(),
                         *cx.theme(),
                     )
                     .on_click(cx.listener(|v, _, _, cx| {
@@ -5036,7 +5169,7 @@ fn render_settings_import_panel(
                 .child(
                     ui::button(
                         "settings-import-ok",
-                        crate::transfer_ui::IMPORT_CONFIRM_OK,
+                        crate::transfer_ui::import_confirm_ok(),
                         *cx.theme(),
                     )
                     .on_click(cx.listener(|v, _, _, cx| v.confirm_settings_import(cx))),
@@ -5045,9 +5178,19 @@ fn render_settings_import_panel(
         .into_any_element()
 }
 
-const REMEMBER_VAULT_KEY_LABEL: &str = "Zapamatovat na tomto počítači (Windows Credential Manager)";
-const REMEMBER_VAULT_KEY_NOTE: &str = "Trezor se pak při startu odemkne sám — kdokoli přihlášený \
-     pod vaším účtem Windows otevře i uložená hesla. Zrušit jde v Nastavení.";
+fn remember_vault_key_label() -> &'static str {
+    tr!(
+        "Zapamatovat na tomto počítači (Windows Credential Manager)",
+        "Remember on this computer (Windows Credential Manager)"
+    )
+}
+fn remember_vault_key_note() -> &'static str {
+    tr!(
+        "Trezor se pak při startu odemkne sám — kdokoli přihlášený \
+     pod vaším účtem Windows otevře i uložená hesla. Zrušit jde v Nastavení.",
+        "The vault will then unlock itself at startup — anyone signed in to your Windows account will also open the stored passwords. You can turn this off in Settings."
+    )
+}
 
 fn render_master_password_panel(
     input: Entity<TextField>,
@@ -5057,20 +5200,23 @@ fn render_master_password_panel(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let mut panel: Div = ui::panel(360., *cx.theme())
-        .child(div().text_size(px(16.)).child("Odemknout trezor"))
+        .child(div().text_size(px(16.)).child(tr!("Odemknout trezor", "Unlock vault")))
         .child(
             div()
                 .text_color(cx.theme().text_muted)
-                .child("Master heslo platí pro celou aplikaci — zadáte ho nejvýše jednou za spuštění."),
+                .child(tr!(
+                    "Master heslo platí pro celou aplikaci — zadáte ho nejvýše jednou za spuštění.",
+                    "The master password applies to the whole app — you enter it at most once per launch."
+                )),
         )
-        .child(ui::field_row("Heslo", input, *cx.theme()))
+        .child(ui::field_row(tr!("Heslo", "Password"), input, *cx.theme()))
         .child(
-            ui::checkbox("mpp-remember", REMEMBER_VAULT_KEY_LABEL, remember)
+            ui::checkbox("mpp-remember", remember_vault_key_label(), remember)
                 .on_click(cx.listener(|v, _, _, cx| v.toggle_remember_vault_key(cx))),
         );
     if remember {
         // The cost of the convenience, on screen before the choice is made.
-        panel = panel.child(div().text_color(cx.theme().text_muted).child(REMEMBER_VAULT_KEY_NOTE));
+        panel = panel.child(div().text_color(cx.theme().text_muted).child(remember_vault_key_note()));
     }
     if let Some(e) = error {
         panel = panel.child(div().text_color(cx.theme().danger).child(e));
@@ -5079,7 +5225,7 @@ fn render_master_password_panel(
         // Naming the reason turns a freeze into a feature: told that the
         // wait IS the protection, nobody suspects the app hung.
         panel = panel.child(div().text_color(cx.theme().text_muted).child(
-            "Ověřuji heslo…",
+            tr!("Ověřuji heslo…", "Verifying password…"),
         ));
     }
     panel = panel.child(
@@ -5089,11 +5235,11 @@ fn render_master_password_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(ui::button("mpp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.cancel_master_password_prompt(cx))))
+            .child(ui::button("mpp-cancel", tr!("Zrušit", "Cancel"), *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.cancel_master_password_prompt(cx))))
             .child(
                 ui::button(
                     "mpp-submit",
-                    if verifying { "Ověřuji…" } else { "Odemknout" },
+                    if verifying { tr!("Ověřuji…", "Verifying…") } else { tr!("Odemknout", "Unlock") },
                     *cx.theme(),
                 )
                 .on_click(cx.listener(|v, _, window, cx| v.on_master_password_submit(window, cx))),
@@ -5109,14 +5255,17 @@ fn render_create_master_password_panel(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let mut panel: Div = ui::panel(360., *cx.theme())
-        .child(div().text_size(px(16.)).child("Vytvořit master heslo"))
+        .child(div().text_size(px(16.)).child(tr!("Vytvořit master heslo", "Create master password")))
         .child(
             div()
                 .text_color(cx.theme().text_muted)
-                .child("Master heslo platí pro celou aplikaci — zadáte ho nejvýše jednou za spuštění."),
+                .child(tr!(
+                    "Master heslo platí pro celou aplikaci — zadáte ho nejvýše jednou za spuštění.",
+                    "The master password applies to the whole app — you enter it at most once per launch."
+                )),
         )
-        .child(ui::field_row("Nové heslo", input1, *cx.theme()))
-        .child(ui::field_row("Zopakujte heslo", input2, *cx.theme()));
+        .child(ui::field_row(tr!("Nové heslo", "New password"), input1, *cx.theme()))
+        .child(ui::field_row(tr!("Zopakujte heslo", "Repeat password"), input2, *cx.theme()));
     if let Some(e) = error {
         panel = panel.child(div().text_color(cx.theme().danger).child(e));
     }
@@ -5127,8 +5276,8 @@ fn render_create_master_password_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(ui::button("cmp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
-            .child(ui::button("cmp-submit", "Vytvořit", *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_create_master_password_submit(window, cx)))),
+            .child(ui::button("cmp-cancel", tr!("Zrušit", "Cancel"), *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+            .child(ui::button("cmp-submit", tr!("Vytvořit", "Create"), *cx.theme()).on_click(cx.listener(|v, _, window, cx| v.on_create_master_password_submit(window, cx)))),
     );
     panel.into_any_element()
 }
@@ -5164,7 +5313,7 @@ fn render_query_params_panel(
 
     let mut panel: Div = ui::panel(480., *cx.theme())
         .max_h(px(520.))
-        .child(div().text_size(px(16.)).child("Hodnoty parametrů"));
+        .child(div().text_size(px(16.)).child(tr!("Hodnoty parametrů", "Parameter values")));
 
     for (i, name) in names.iter().enumerate() {
         let input = inputs[i].clone();
@@ -5199,7 +5348,7 @@ fn render_query_params_panel(
             .whitespace_normal()
             .child(match &preview {
                 Ok(sql) => sql.clone(),
-                Err(e) => format!("náhled: {e}"),
+                Err(e) => trf!("náhled: {e}", "preview: {e}"),
             }),
     );
 
@@ -5214,8 +5363,8 @@ fn render_query_params_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(ui::button("qp-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.cancel_query_params(cx))))
-            .child(ui::button("qp-run", "Spustit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.confirm_query_params(cx)))),
+            .child(ui::button("qp-cancel", tr!("Zrušit", "Cancel"), *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.cancel_query_params(cx))))
+            .child(ui::button("qp-run", tr!("Spustit", "Run"), *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.confirm_query_params(cx)))),
     );
     panel.into_any_element()
 }
@@ -5319,8 +5468,11 @@ fn render_kill_confirm_panel(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let mut panel: Div = ui::panel(520., *cx.theme())
-        .child(div().text_size(px(16.)).child("Ukončit proces"))
-        .child(format!("Opravdu ukončit proces {pid} ({label})?"))
+        .child(div().text_size(px(16.)).child(tr!("Ukončit proces", "Kill process")))
+        .child(trf!(
+            "Opravdu ukončit proces {pid} ({label})?",
+            "Really kill process {pid} ({label})?"
+        ))
         .child(
             div()
                 .id("kill-sql-preview")
@@ -5337,10 +5489,10 @@ fn render_kill_confirm_panel(
     }
 
     let confirm_button = if dispatched {
-        ui::button_state("kill-confirm", "Ukončuji…", false, *cx.theme())
+        ui::button_state("kill-confirm", tr!("Ukončuji…", "Killing…"), false, *cx.theme())
             .into_any_element()
     } else {
-        ui::button("kill-confirm", "Ukončit proces", *cx.theme())
+        ui::button("kill-confirm", tr!("Ukončit proces", "Kill process"), *cx.theme())
             .bg(cx.theme().diff_deleted_bg) // danger tint — DELETED_ROW_BG family
             .on_click(cx.listener(|v, _, _, cx| v.confirm_kill_confirm(cx)))
             .into_any_element()
@@ -5354,7 +5506,7 @@ fn render_kill_confirm_panel(
             .justify_end()
             .mt_2()
             .child(
-                ui::button("kill-cancel", "Zrušit", *cx.theme())
+                ui::button("kill-cancel", tr!("Zrušit", "Cancel"), *cx.theme())
                     .on_click(cx.listener(|v, _, _, cx| v.cancel_kill_confirm(cx))),
             )
             .child(confirm_button),
@@ -5387,12 +5539,15 @@ fn render_analyze_write_confirm_panel(
     let sql = sql.to_string();
     let mut panel = ui::panel(520., *cx.theme())
         .id("analyze-write-confirm")
-        .child(div().text_size(px(16.)).child("Analyzovat (EXPLAIN ANALYZE)"))
-        .child(div().text_color(cx.theme().warn).child(
+        .child(div().text_size(px(16.)).child(tr!("Analyzovat (EXPLAIN ANALYZE)", "Analyze (EXPLAIN ANALYZE)")))
+        .child(div().text_color(cx.theme().warn).child(tr!(
             "Toto SQL bude SKUTEČNĚ PROVEDENO, aby bylo možné změřit skutečný plán, a poté vráceno \
              zpět (ROLLBACK). Vedlejší efekty MIMO transakci (např. hodnoty sekvencí/IDENTITY, \
              volání externích funkcí) NEBUDOU vráceny zpět.",
-        ))
+            "This SQL will ACTUALLY BE EXECUTED in order to measure the real plan, and then rolled \
+             back (ROLLBACK). Side effects OUTSIDE the transaction (e.g. sequence/IDENTITY values, \
+             calls to external functions) will NOT be rolled back."
+        )))
         .child(
             div()
                 .id("analyze-write-sql-preview")
@@ -5405,7 +5560,7 @@ fn render_analyze_write_confirm_panel(
         );
 
     if running {
-        panel = panel.child(div().text_color(cx.theme().warn).child("analyzuji (BEGIN…ROLLBACK)…"));
+        panel = panel.child(div().text_color(cx.theme().warn).child(tr!("analyzuji (BEGIN…ROLLBACK)…", "analyzing (BEGIN…ROLLBACK)…")));
     }
     if let Some(err) = error {
         panel = panel.child(div().text_color(cx.theme().danger).child(format!("error: {err}")));
@@ -5419,7 +5574,7 @@ fn render_analyze_write_confirm_panel(
             .justify_end()
             .mt_2()
             .child(
-                ui::button_state("analyze-write-cancel", "Zrušit", !running, *cx.theme())
+                ui::button_state("analyze-write-cancel", tr!("Zrušit", "Cancel"), !running, *cx.theme())
                     // The handler is attached only while enabled, so the
                     // dimming and the refusal are the same fact rather
                     // than two that could disagree.
@@ -5444,7 +5599,7 @@ fn render_analyze_write_confirm_panel(
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .child(if running { "Analyzuji…" } else { "Analyzovat" }),
+                    .child(if running { tr!("Analyzuji…", "Analyzing…") } else { tr!("Analyzovat", "Analyze") }),
             ),
     );
     panel.into_any_element()
@@ -5465,10 +5620,11 @@ fn render_multi_target_write_confirm_panel(
     let theme = *cx.theme();
     let mut panel = ui::panel(520., theme)
         .id("multi-target-write-confirm")
-        .child(div().text_size(px(16.)).child(format!("Zapsat do {} cílů", targets.len())))
-        .child(div().text_color(theme.warn).child(
+        .child(div().text_size(px(16.)).child(trf!("Zapsat do {} cílů", "Write to {} targets", targets.len())))
+        .child(div().text_color(theme.warn).child(tr!(
             "Tohle SQL zapisuje. Spustí se na každém z těchto cílů zvlášť, bez společné transakce.",
-        ));
+            "This SQL writes. It will run on each of these targets separately, without a shared transaction."
+        )));
     let mut list = div()
         .flex()
         .flex_col()
@@ -5481,7 +5637,7 @@ fn render_multi_target_write_confirm_panel(
         list = list.child(t.label());
     }
     if targets.len() > 12 {
-        list = list.child(format!("… a dalších {}", targets.len() - 12));
+        list = list.child(trf!("… a dalších {}", "… and {} more", targets.len() - 12));
     }
     panel = panel.child(list).child(
         div()
@@ -5500,7 +5656,7 @@ fn render_multi_target_write_confirm_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(ui::button_state("multi-target-cancel", "Zrušit", true, theme).on_click(cx.listener(
+            .child(ui::button_state("multi-target-cancel", tr!("Zrušit", "Cancel"), true, theme).on_click(cx.listener(
                 |v, _, _, cx| {
                     v.modal = None;
                     cx.notify();
@@ -5516,7 +5672,7 @@ fn render_multi_target_write_confirm_panel(
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .child("Zapsat")
+                    .child(tr!("Zapsat", "Write"))
                     .on_click(cx.listener(|v, _, _, cx| v.on_confirm_multi_target_write(cx))),
             ),
     );
@@ -5526,11 +5682,16 @@ fn render_multi_target_write_confirm_panel(
 /// Design §W4 deliverable text — quoted verbatim in the spec, so it lives
 /// as a `const` with a byte-pinned test (`workspace_missing_text_tests`)
 /// rather than as a literal buried in a render fn no unit test can reach.
-pub(crate) const WORKSPACE_MISSING_TITLE: &str = "Pracovní prostor nenalezen";
+pub(crate) fn workspace_missing_title() -> &'static str {
+    tr!(
+        "Pracovní prostor nenalezen",
+        "Workspace not found"
+    )
+}
 /// Shown when the POINTER itself could not be read, so there is no folder
 /// path to display.
 ///
-/// **CROSS-CRATE TWIN of `dbc-mcp`'s `WORKSPACE_MISSING_NO_PATH`**
+/// **CROSS-CRATE TWIN of `dbc-mcp`'s `workspace_missing_no_path()`**
 /// (`crates/dbc-mcp/src/main.rs`, byte-pinned there too, and carrying the
 /// reciprocal pointer back to this const). The blocking GUI modal (§W4)
 /// and the headless server describe the SAME condition. The two sentences
@@ -5540,24 +5701,52 @@ pub(crate) const WORKSPACE_MISSING_TITLE: &str = "Pracovní prostor nenalezen";
 /// stay in agreement about WHAT is unreadable. A copy sweep that rewords
 /// one must look at the other; both are byte-pinned, so neither side can
 /// be changed quietly.
-pub(crate) const WORKSPACE_MISSING_NO_PATH: &str = "ukazatel na pracovní prostor je nečitelný";
+pub(crate) fn workspace_missing_no_path() -> &'static str {
+    tr!(
+        "ukazatel na pracovní prostor je nečitelný",
+        "the workspace pointer is unreadable"
+    )
+}
 /// §W4 choice 1 — "the workspace moved", never "make a new one".
-pub(crate) const WORKSPACE_MISSING_FIND: &str = "Najít složku…";
+pub(crate) fn workspace_missing_find() -> &'static str {
+    tr!(
+        "Najít složku…",
+        "Find folder…"
+    )
+}
 /// §W4: the honest consequence, printed ABOVE the profile button — the
 /// user must read what „lokální profil" actually means before clicking it.
-pub(crate) const WORKSPACE_MISSING_PROFILE_HINT: &str =
-    "Otevře se lokální profil — jiná připojení a nastavení než v pracovním prostoru.";
+pub(crate) fn workspace_missing_profile_hint() -> &'static str {
+    tr!(
+        "Otevře se lokální profil — jiná připojení a nastavení než v pracovním prostoru.",
+        "The local profile will open — different connections and settings than in the workspace."
+    )
+}
 /// §W4 choice 2 — the EXPLICIT action that a silent fallback would have
 /// taken for the user.
-pub(crate) const WORKSPACE_MISSING_PROFILE: &str = "Použít lokální profil";
+pub(crate) fn workspace_missing_profile() -> &'static str {
+    tr!(
+        "Použít lokální profil",
+        "Use local profile"
+    )
+}
 /// §W4 choice 3.
-pub(crate) const WORKSPACE_MISSING_QUIT: &str = "Ukončit";
+pub(crate) fn workspace_missing_quit() -> &'static str {
+    tr!(
+        "Ukončit",
+        "Quit"
+    )
+}
 /// The status-bar line on a BLOCKED start (T4 review NIT-9). „ready" was a
 /// lie behind a modal saying the workspace was not found — and it is the
 /// line left on screen once the modal is dealt with. Carries the `error:`
 /// status prefix, like every other startup failure notice.
-pub(crate) const WORKSPACE_MISSING_STATUS: &str =
-    "error: pracovní prostor nenalezen — vyberte složku, nebo použijte lokální profil";
+pub(crate) fn workspace_missing_status() -> &'static str {
+    tr!(
+        "error: pracovní prostor nenalezen — vyberte složku, nebo použijte lokální profil",
+        "error: workspace not found — pick a folder or use the local profile"
+    )
+}
 
 /// Design §W4 — the blocking „Pracovní prostor nenalezen" panel. Three
 /// explicit choices, no implicit ones: Enter is `Ignore`
@@ -5614,7 +5803,7 @@ fn render_workspace_missing_panel(
     let path_line = root
         .as_ref()
         .map(|r| dbc_state::workspace::one_line_reason(&r.display().to_string()))
-        .unwrap_or_else(|| WORKSPACE_MISSING_NO_PATH.to_string());
+        .unwrap_or_else(|| workspace_missing_no_path().to_string());
     let reason = dbc_state::workspace::one_line_reason(reason);
     // T4 review NIT-11: a BLOCKING dialog must be operable without a
     // mouse — otherwise a keyboard-only user's only exit from an app with
@@ -5641,7 +5830,7 @@ fn render_workspace_missing_panel(
         // Tab reaches the three choices instead of the window at large.
         .track_focus(panel_focus)
         .tab_group()
-        .child(div().text_size(px(16.)).child(WORKSPACE_MISSING_TITLE))
+        .child(div().text_size(px(16.)).child(workspace_missing_title()))
         .child(div().text_color(cx.theme().text_muted).child(path_line))
         .child(div().text_color(cx.theme().danger).child(format!("error: {reason}")));
     if let Some(e) = error {
@@ -5649,7 +5838,7 @@ fn render_workspace_missing_panel(
     }
     panel
         .child(
-            button(0, "workspace-missing-find", WORKSPACE_MISSING_FIND, focus, cx)
+            button(0, "workspace-missing-find", workspace_missing_find(), focus, cx)
                 .on_click(cx.listener(|this, _, _, cx| this.pick_workspace_for_recovery(cx)))
                 .on_action(cx.listener(|this, _: &ActivateChoice, _, cx| {
                     this.pick_workspace_for_recovery(cx)
@@ -5661,9 +5850,9 @@ fn render_workspace_missing_panel(
                     }
                 })),
         )
-        .child(div().text_color(cx.theme().text_muted).child(WORKSPACE_MISSING_PROFILE_HINT))
+        .child(div().text_color(cx.theme().text_muted).child(workspace_missing_profile_hint()))
         .child(
-            button(1, "workspace-missing-profile", WORKSPACE_MISSING_PROFILE, focus, cx)
+            button(1, "workspace-missing-profile", workspace_missing_profile(), focus, cx)
                 .on_click(cx.listener(|this, _, _, cx| this.use_local_profile(cx)))
                 .on_action(
                     cx.listener(|this, _: &ActivateChoice, _, cx| this.use_local_profile(cx)),
@@ -5676,7 +5865,7 @@ fn render_workspace_missing_panel(
                 })),
         )
         .child(
-            button(2, "workspace-missing-quit", WORKSPACE_MISSING_QUIT, focus, cx)
+            button(2, "workspace-missing-quit", workspace_missing_quit(), focus, cx)
                 .on_click(cx.listener(|_this, _, _, cx| cx.quit()))
                 .on_action(cx.listener(|_this, _: &ActivateChoice, _, cx| cx.quit()))
                 .on_key_down(cx.listener(|_this, ev: &KeyDownEvent, _, cx| {
@@ -5693,7 +5882,12 @@ fn render_workspace_missing_panel(
 /// returns to the three choices of the panel above. `WorkspaceMissing` is
 /// the one modal that cannot be closed, and a cancel label that suggests
 /// otherwise would be a promise the design deliberately does not keep.
-pub(crate) const WORKSPACE_RECOVERY_BACK: &str = "Zpět";
+pub(crate) fn workspace_recovery_back() -> &'static str {
+    tr!(
+        "Zpět",
+        "Back"
+    )
+}
 
 /// FINAL-REVIEW MINOR-1 — the SECOND state of the §W4 blocking modal: a
 /// workspace folder has been picked and classified, and the user is being
@@ -5765,7 +5959,7 @@ fn render_workspace_recovery_confirm_panel(
             workspace_choice_button(
                 1,
                 "workspace-recovery-back",
-                WORKSPACE_RECOVERY_BACK,
+                workspace_recovery_back(),
                 focus,
                 cx,
             )
@@ -5797,11 +5991,16 @@ fn render_workspace_recovery_confirm_panel(
 ///
 /// §W6.4 is why it is prose and not a recipe: this string is rendered,
 /// never executed, and the app owns no git integration to offer.
-pub(crate) const WORKSPACE_GIT_WARNING: &str = "Upozornění: složku verzujete sami — git zůstává zcela mimo aplikaci. \
+pub(crate) fn workspace_git_warning() -> &'static str {
+    tr!(
+        "Upozornění: složku verzujete sami — git zůstává zcela mimo aplikaci. \
 Historie gitu je trvalá: jednou commitnutý trezor (vault.bin) z ní nelze \
 nikdy spolehlivě odstranit. Bezpečnost celé složky se pak rovná síle vašeho \
 master hesla. Repozitář držte privátní, nebo vault.bin vyřaďte z verzování \
-(.gitignore ve složce má připravený zakomentovaný řádek).";
+(.gitignore ve složce má připravený zakomentovaný řádek).",
+        "Warning: you version the folder yourself — git stays entirely outside the app. Git history is permanent: a vault (vault.bin) that was committed once can never be reliably removed from it. The security of the whole folder then equals the strength of your master password. Keep the repository private, or exclude vault.bin from version control (the folder's .gitignore has a commented-out line ready)."
+    )
+}
 
 /// §W3 case 3 — the refusal for a folder with real content and no marker.
 ///
@@ -5814,51 +6013,103 @@ master hesla. Repozitář držte privátní, nebo vault.bin vyřaďte z verzová
 /// wrong folder", and the user never discovers that emptying the folder is
 /// the way out. The app deliberately does NOT delete anything itself — the
 /// never-destructive rail holds even for files the app created.
-pub(crate) const WORKSPACE_PICK_NONEMPTY: &str = "složka není pracovní prostor dbc a není prázdná — vyberte prázdnou složku \
+pub(crate) fn workspace_pick_nonempty() -> &'static str {
+    tr!(
+        "složka není pracovní prostor dbc a není prázdná — vyberte prázdnou složku \
 nebo existující pracovní prostor; pokud v této složce dříve selhalo nebo bylo \
 přerušeno vytváření prostoru, zůstaly v ní nedokončené soubory aplikace — \
-smažte obsah složky a zkuste to znovu";
+smažte obsah složky a zkuste to znovu",
+        "the folder is not a dbc workspace and is not empty — pick an empty folder or an existing workspace; if creating a workspace in this folder failed or was interrupted earlier, unfinished app files were left in it — delete the folder contents and try again"
+    )
+}
 
 /// T5 review MINOR-2: the status-bar SENTINEL for a refused folder pick.
 /// Short by design — the status bar is one unwrapped flex row, and
-/// `WORKSPACE_PICK_NONEMPTY` is ~230 characters of prose whose payload
+/// `workspace_pick_nonempty()` is ~230 characters of prose whose payload
 /// half would fall off the end of it. The prose goes to
 /// `AppView::workspace_pick_error`, rendered inside the Settings block;
 /// this line only has to carry the `error:` colour sentinel and point at
 /// where the explanation is.
-pub(crate) const WORKSPACE_PICK_FAILED_STATUS: &str =
-    "error: vybranou složku nelze použít — podrobnosti v Nastavení";
+pub(crate) fn workspace_pick_failed_status() -> &'static str {
+    tr!(
+        "error: vybranou složku nelze použít — podrobnosti v Nastavení",
+        "error: the selected folder cannot be used — details in Settings"
+    )
+}
 
 /// T5 review MAJOR-1: a folder pick whose classification landed while some
 /// OTHER dialog owned the screen. Deliberately the same shape as
 /// `start_script_pick`'s „výběr skriptu zahozen — je otevřený jiný dialog"
 /// and `start_csv_import`'s „výběr CSV zahozen — …".
-pub(crate) const WORKSPACE_PICK_DISCARDED: &str =
-    "výběr složky zahozen — je otevřený jiný dialog";
+pub(crate) fn workspace_pick_discarded() -> &'static str {
+    tr!(
+        "výběr složky zahozen — je otevřený jiný dialog",
+        "folder selection discarded — another dialog is open"
+    )
+}
 
 /// Settings block heading (§W3).
-pub(crate) const WORKSPACE_SETTINGS_HEADING: &str = "Pracovní prostor";
+pub(crate) fn workspace_settings_heading() -> &'static str {
+    tr!(
+        "Pracovní prostor",
+        "Workspace"
+    )
+}
 /// Profile-mode button: opens the folder picker (§W3).
-pub(crate) const WORKSPACE_SETTINGS_PICK: &str = "Použít složku…";
+pub(crate) fn workspace_settings_pick() -> &'static str {
+    tr!(
+        "Použít složku…",
+        "Use folder…"
+    )
+}
 /// Workspace-mode button: the reverse switch (§W3.4).
-pub(crate) const WORKSPACE_SETTINGS_LEAVE: &str = "Přejít na lokální profil";
+pub(crate) fn workspace_settings_leave() -> &'static str {
+    tr!(
+        "Přejít na lokální profil",
+        "Switch to local profile"
+    )
+}
 
 /// A scripts-folder pick that came back while a workspace had become
 /// active (§W8: `scripts_dir` is inert there, so the pick cannot be
-/// honoured). Same „… zahozen — …" idiom as [`WORKSPACE_PICK_DISCARDED`]
+/// honoured). Same „… zahozen — …" idiom as [`workspace_pick_discarded()`]
 /// and `start_csv_import`'s refusal: the user acted, so the user hears
 /// back. T7 review MINOR-2 — the guard used to `return` silently.
-pub(crate) const SCRIPTS_PICK_DISCARDED_WORKSPACE: &str =
-    "výběr složky zahozen — je aktivní pracovní prostor";
+pub(crate) fn scripts_pick_discarded_workspace() -> &'static str {
+    tr!(
+        "výběr složky zahozen — je aktivní pracovní prostor",
+        "folder selection discarded — a workspace is active"
+    )
+}
 
 /// Settings block heading for the scripts library (Part S §2 / §W8).
-pub(crate) const SCRIPTS_SETTINGS_HEADING: &str = "Složka skriptů";
+pub(crate) fn scripts_settings_heading() -> &'static str {
+    tr!(
+        "Složka skriptů",
+        "Scripts folder"
+    )
+}
 /// Profile-mode placeholder shown when `AppConfig.scripts_dir` is `None`.
-pub(crate) const SCRIPTS_SETTINGS_UNSET: &str = "nenastavena";
+pub(crate) fn scripts_settings_unset() -> &'static str {
+    tr!(
+        "nenastavena",
+        "not set"
+    )
+}
 /// Profile-mode button: opens the directory picker (Part S §2).
-pub(crate) const SCRIPTS_SETTINGS_PICK: &str = "Vybrat složku…";
+pub(crate) fn scripts_settings_pick() -> &'static str {
+    tr!(
+        "Vybrat složku…",
+        "Choose folder…"
+    )
+}
 /// Profile-mode button: clears `scripts_dir` (Part S §2).
-pub(crate) const SCRIPTS_SETTINGS_CLEAR: &str = "Odebrat";
+pub(crate) fn scripts_settings_clear() -> &'static str {
+    tr!(
+        "Odebrat",
+        "Remove"
+    )
+}
 
 /// The WORKSPACE-mode scripts line (§W8) — read-only, no picker.
 ///
@@ -5868,7 +6119,7 @@ pub(crate) const SCRIPTS_SETTINGS_CLEAR: &str = "Odebrat";
 /// `AppView::effective_scripts_root`); a second `root.join(SCRIPTS_SUBDIR)`
 /// spelling could not disagree with it today, but it is a second spelling.
 pub(crate) fn scripts_settings_workspace_line(scripts_root: &std::path::Path) -> String {
-    format!("Skripty: {}", scripts_root.display())
+    trf!("Skripty: {}", "Scripts: {}", scripts_root.display())
 }
 
 /// The Settings block's mode line. `None` ⇒ profile mode, and the profile
@@ -5876,8 +6127,12 @@ pub(crate) fn scripts_settings_workspace_line(scripts_root: &std::path::Path) ->
 /// path the user can open. Pure so the copy is byte-pinned.
 pub(crate) fn workspace_settings_mode_line(root: Option<&std::path::Path>) -> String {
     match root {
-        Some(r) => format!("Pracovní prostor: {}", r.display()),
-        None => format!("Lokální profil ({})", dbc_state::workspace::profile_dir().display()),
+        Some(r) => trf!("Pracovní prostor: {}", "Workspace: {}", r.display()),
+        None => trf!(
+            "Lokální profil ({})",
+            "Local profile ({})",
+            dbc_state::workspace::profile_dir().display()
+        ),
     }
 }
 
@@ -5899,9 +6154,9 @@ pub(crate) enum WorkspaceConfirmMode {
 /// Confirm-modal title per mode (§W3.2/§W3.3/§W3.4).
 pub(crate) fn workspace_confirm_title(mode: WorkspaceConfirmMode) -> &'static str {
     match mode {
-        WorkspaceConfirmMode::Init => "Vytvořit pracovní prostor",
-        WorkspaceConfirmMode::Adopt => "Otevřít pracovní prostor",
-        WorkspaceConfirmMode::ToProfile => "Přejít na lokální profil",
+        WorkspaceConfirmMode::Init => tr!("Vytvořit pracovní prostor", "Create workspace"),
+        WorkspaceConfirmMode::Adopt => tr!("Otevřít pracovní prostor", "Open workspace"),
+        WorkspaceConfirmMode::ToProfile => tr!("Přejít na lokální profil", "Switch to local profile"),
     }
 }
 
@@ -5910,27 +6165,36 @@ pub(crate) fn workspace_confirm_title(mode: WorkspaceConfirmMode) -> &'static st
 /// a folder the app did not previously own (§W3.2).
 pub(crate) fn workspace_confirm_button(mode: WorkspaceConfirmMode) -> &'static str {
     match mode {
-        WorkspaceConfirmMode::Init => "Rozumím, vytvořit",
-        WorkspaceConfirmMode::Adopt => "Otevřít",
-        WorkspaceConfirmMode::ToProfile => "Přejít",
+        WorkspaceConfirmMode::Init => tr!("Rozumím, vytvořit", "I understand, create"),
+        WorkspaceConfirmMode::Adopt => tr!("Otevřít", "Open"),
+        WorkspaceConfirmMode::ToProfile => tr!("Přejít", "Switch"),
     }
 }
 
 /// The body lines of the confirm modal, in render order — pure, so the
 /// deliverable copy is testable without GPUI.
 pub(crate) fn workspace_confirm_lines(mode: WorkspaceConfirmMode) -> Vec<&'static str> {
-    let mut lines = vec!["Aktivní připojení bude odpojeno."];
+    let mut lines = vec![tr!("Aktivní připojení bude odpojeno.", "The active connection will be disconnected.")];
     match mode {
         WorkspaceConfirmMode::Init => {
-            lines.push("Nastavení, připojení a trezor se do složky ZKOPÍRUJÍ; původní soubory zůstanou beze změny.");
-            lines.push(WORKSPACE_GIT_WARNING);
+            lines.push(tr!(
+                "Nastavení, připojení a trezor se do složky ZKOPÍRUJÍ; původní soubory zůstanou beze změny.",
+                "Settings, connections and the vault are COPIED into the folder; the original files stay unchanged."
+            ));
+            lines.push(workspace_git_warning());
         }
         WorkspaceConfirmMode::Adopt => {
-            lines.push("Trezor tohoto prostoru se odemyká jeho vlastním master heslem.");
-            lines.push(WORKSPACE_GIT_WARNING);
+            lines.push(tr!(
+                "Trezor tohoto prostoru se odemyká jeho vlastním master heslem.",
+                "This workspace's vault is unlocked with its own master password."
+            ));
+            lines.push(workspace_git_warning());
         }
         WorkspaceConfirmMode::ToProfile => {
-            lines.push("Soubory v pracovním prostoru zůstanou beze změny.");
+            lines.push(tr!(
+                "Soubory v pracovním prostoru zůstanou beze změny.",
+                "The files in the workspace stay unchanged."
+            ));
         }
     }
     lines
@@ -5953,9 +6217,12 @@ pub(crate) fn workspace_pick_outcome(
         C::Empty => Ok(WorkspaceConfirmMode::Init),
         // Never scatter app files into someone's Documents folder by
         // misclick; never adopt a folder we cannot vouch for (§W3 case 3).
-        C::NonEmpty => Err(WORKSPACE_PICK_NONEMPTY.to_string()),
+        C::NonEmpty => Err(workspace_pick_nonempty().to_string()),
         C::FutureFormat(f) => {
-            Err(format!("pracovní prostor vyžaduje novější verzi aplikace (formát {f})"))
+            Err(trf!(
+                "pracovní prostor vyžaduje novější verzi aplikace (formát {f})",
+                "the workspace requires a newer version of the app (format {f})"
+            ))
         }
         C::Unreadable(m) => Err(m),
     }
@@ -6147,16 +6414,19 @@ pub(crate) fn context_switch_refusal(
     other_modal_open: bool,
 ) -> Option<&'static str> {
     if run_in_flight {
-        return Some("nejprve dokončete běžící dotaz");
+        return Some(tr!("nejprve dokončete běžící dotaz", "finish the running query first"));
     }
     if dirty_script {
-        return Some("skript má neuložené změny — nejprve jej uložte nebo zavřete");
+        return Some(tr!(
+            "skript má neuložené změny — nejprve jej uložte nebo zavřete",
+            "the script has unsaved changes — save or close it first"
+        ));
     }
     if pending_edits {
-        return Some("nejprve dokončete rozpracované úpravy");
+        return Some(tr!("nejprve dokončete rozpracované úpravy", "finish the pending edits first"));
     }
     if other_modal_open {
-        return Some("nejprve zavřete otevřený dialog");
+        return Some(tr!("nejprve zavřete otevřený dialog", "close the open dialog first"));
     }
     None
 }
@@ -6202,7 +6472,7 @@ fn render_workspace_confirm_panel(
         .child(
             ui::row_button(
                 "workspace-confirm-ok",
-                if running { "Pracuji…" } else { workspace_confirm_button(mode) },
+                if running { tr!("Pracuji…", "Working…") } else { workspace_confirm_button(mode) },
                 *cx.theme(),
             )
             // Overridden, not parameterised: this is the only confirm whose
@@ -6221,7 +6491,7 @@ fn render_workspace_confirm_panel(
             // change" makes that a defect, not a nit. Cancelling the
             // WRITE itself is not offered because it cannot be honoured:
             // the copy is already under way and nothing is ever deleted.
-            ui::row_button("workspace-confirm-cancel", "Zrušit", *cx.theme())
+            ui::row_button("workspace-confirm-cancel", tr!("Zrušit", "Cancel"), *cx.theme())
                 .when(running, |d| d.text_color(cx.theme().text_muted))
                 .on_click(cx.listener(|this, _, _, cx| this.cancel_workspace_confirm(cx))),
         )
@@ -6277,7 +6547,7 @@ fn render_compare_dialog_panel(
     let both_picked = conn_a.is_some() && conn_b.is_some();
     let mut panel = ui::panel(680., *cx.theme())
         .id("compare-dialog")
-        .child(div().text_size(px(16.)).child("Porovnat databáze…"))
+        .child(div().text_size(px(16.)).child(tr!("Porovnat databáze…", "Compare databases…")))
         .child(
             div()
                 .flex()
@@ -6285,7 +6555,7 @@ fn render_compare_dialog_panel(
                 .gap_3()
                 .child(render_compare_picker_column(
                     "compare-col-a",
-                    "Databáze A",
+                    tr!("Databáze A", "Database A"),
                     CompareSide::A,
                     &conn_a,
                     &grouped,
@@ -6294,7 +6564,7 @@ fn render_compare_dialog_panel(
                 ))
                 .child(render_compare_picker_column(
                     "compare-col-b",
-                    "Databáze B",
+                    tr!("Databáze B", "Database B"),
                     CompareSide::B,
                     &conn_b,
                     &grouped,
@@ -6308,11 +6578,11 @@ fn render_compare_dialog_panel(
     }
 
     let confirm_button = if both_picked {
-        ui::button("compare-confirm", "Spustit porovnání", *cx.theme())
+        ui::button("compare-confirm", tr!("Spustit porovnání", "Run compare"), *cx.theme())
             .on_click(cx.listener(|v, _, _, cx| v.confirm_compare_dialog(cx)))
             .into_any_element()
     } else {
-        ui::button_state("compare-confirm", "Spustit porovnání", false, *cx.theme())
+        ui::button_state("compare-confirm", tr!("Spustit porovnání", "Run compare"), false, *cx.theme())
             .into_any_element()
     };
 
@@ -6323,7 +6593,7 @@ fn render_compare_dialog_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(ui::button("compare-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| {
+            .child(ui::button("compare-cancel", tr!("Zrušit", "Cancel"), *cx.theme()).on_click(cx.listener(|v, _, _, cx| {
                 v.modal = None;
                 cx.notify();
             })))
@@ -6359,7 +6629,7 @@ fn render_compare_picker_column(
     // non-default databases; connections without a cached list offer only
     // their default row.
     if !grouped.favourites.is_empty() {
-        list = list.child(div().text_color(cx.theme().warn).child("Oblíbené"));
+        list = list.child(div().text_color(cx.theme().warn).child(tr!("Oblíbené", "Favourites")));
         for c in &grouped.favourites {
             list = list.child(compare_picker_row(c, side, selected, cx));
             if let Some((_, dbs)) = db_lists.iter().find(|(cid, _)| cid == &c.id) {
@@ -6370,7 +6640,7 @@ fn render_compare_picker_column(
         }
     }
     for folder in &grouped.folders {
-        let header = if folder.path.is_empty() { "Bez složky".to_string() } else { folder.path.join("/") };
+        let header = if folder.path.is_empty() { tr!("Bez složky", "No folder").to_string() } else { folder.path.join("/") };
         list = list.child(div().text_color(cx.theme().text_disabled).child(header));
         for c in &folder.connections {
             list = list.child(compare_picker_row(c, side, selected, cx));
@@ -6455,8 +6725,8 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
     use crate::backup::{BackupKind, BackupStatus};
 
     let title = match session.kind {
-        BackupKind::Backup => "Zálohovat databázi",
-        BackupKind::Restore => "Obnovit databázi ze zálohy",
+        BackupKind::Backup => tr!("Zálohovat databázi", "Back up database"),
+        BackupKind::Restore => tr!("Obnovit databázi ze zálohy", "Restore database from backup"),
     };
     let status = session.status.borrow().clone();
 
@@ -6491,21 +6761,22 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
             // straight in `Running`).
             if let Some(input) = &session.confirm_input {
                 panel = panel
-                    .child(div().text_color(cx.theme().warn).child(format!(
+                    .child(div().text_color(cx.theme().warn).child(trf!(
                         "Pro potvrzení napište přesný název databáze: {}",
+                        "To confirm, type the exact database name: {}",
                         session.expected_name
                     )))
-                    .child(ui::field_row("Název databáze", input.clone(), *cx.theme()));
+                    .child(ui::field_row(tr!("Název databáze", "Database name"), input.clone(), *cx.theme()));
             }
             let typed = session.confirm_input.as_ref().map(|f| f.read(cx).text()).unwrap_or_default();
             let allowed = crate::backup::confirm_matches(&typed, &session.expected_name);
             let confirm_button = if allowed {
-                ui::button("backup-restore-confirm", "Obnovit", *cx.theme())
+                ui::button("backup-restore-confirm", tr!("Obnovit", "Restore"), *cx.theme())
                     .bg(cx.theme().diff_deleted_bg)
                     .on_click(cx.listener(|v, _, _, cx| v.confirm_restore(cx)))
                     .into_any_element()
             } else {
-                ui::button_state("backup-restore-confirm", "Obnovit", false, *cx.theme())
+                ui::button_state("backup-restore-confirm", tr!("Obnovit", "Restore"), false, *cx.theme())
                     .into_any_element()
             };
             panel = panel.child(
@@ -6516,7 +6787,7 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
                     .justify_end()
                     .mt_2()
                     .child(
-                        ui::button("backup-restore-cancel", "Zrušit", *cx.theme())
+                        ui::button("backup-restore-cancel", tr!("Zrušit", "Cancel"), *cx.theme())
                             .on_click(cx.listener(|v, _, _, cx| v.cancel_backup_restore(cx))),
                     )
                     .child(confirm_button),
@@ -6524,7 +6795,7 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
         }
         BackupStatus::Running => {
             let elapsed = session.started_at.elapsed().as_secs();
-            panel = panel.child(div().text_color(cx.theme().warn).child(format!("probíhá… ({elapsed} s)")));
+            panel = panel.child(div().text_color(cx.theme().warn).child(trf!("probíhá… ({elapsed} s)", "running… ({elapsed} s)")));
 
             let log = session.log.borrow();
             let log_len = log.lines.len();
@@ -6540,7 +6811,7 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
                     div()
                         .text_size(px(11.))
                         .text_color(cx.theme().text_disabled)
-                        .child("… (starší řádky zahozeny)"),
+                        .child(tr!("… (starší řádky zahozeny)", "… (older lines discarded)")),
                 );
             }
             if log_len > 0 {
@@ -6570,26 +6841,26 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
             // same "dimmed div, no `.on_click`" pattern this file already
             // uses for a disabled Confirming-state "Obnovit".
             let cancel_button = if session.can_cancel() {
-                ui::button("backup-restore-cancel-running", "Zrušit", *cx.theme())
+                ui::button("backup-restore-cancel-running", tr!("Zrušit", "Cancel"), *cx.theme())
                     .on_click(cx.listener(|v, _, _, cx| v.cancel_backup_restore(cx)))
                     .into_any_element()
             } else {
-                ui::button_state("backup-restore-cancel-running", "nelze přerušit — čeká se na dokončení", false, *cx.theme())
+                ui::button_state("backup-restore-cancel-running", tr!("nelze přerušit — čeká se na dokončení", "cannot be interrupted — waiting for it to finish"), false, *cx.theme())
                     .into_any_element()
             };
             panel = panel.child(div().flex().flex_row().justify_end().mt_2().child(cancel_button));
         }
         BackupStatus::Succeeded | BackupStatus::Failed(_) | BackupStatus::Cancelled => {
             let (line, color) = match &status {
-                BackupStatus::Succeeded => ("hotovo".to_string(), cx.theme().success),
+                BackupStatus::Succeeded => (tr!("hotovo", "done").to_string(), cx.theme().success),
                 BackupStatus::Failed(e) => (format!("error: {e}"), cx.theme().danger),
-                BackupStatus::Cancelled => ("přerušeno uživatelem".to_string(), cx.theme().warn),
+                BackupStatus::Cancelled => (tr!("přerušeno uživatelem", "cancelled by user").to_string(), cx.theme().warn),
                 _ => unreachable!(),
             };
             panel = panel.child(div().text_color(color).child(line));
             panel = panel.child(
                 div().flex().flex_row().justify_end().mt_2().child(
-                    ui::button("backup-restore-close", "Zavřít", *cx.theme())
+                    ui::button("backup-restore-close", tr!("Zavřít", "Close"), *cx.theme())
                         .on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))),
                 ),
             );
@@ -6706,9 +6977,9 @@ fn render_script_name_panel(
 ) -> AnyElement {
     let theme = *cx.theme();
     let context_line = match mode {
-        ScriptNameMode::Rename => format!("původní název: {target_rel}"),
-        _ if parent_rel.is_empty() => "v kořeni knihovny".to_string(),
-        _ => format!("ve složce: {parent_rel}"),
+        ScriptNameMode::Rename => trf!("původní název: {target_rel}", "original name: {target_rel}"),
+        _ if parent_rel.is_empty() => tr!("v kořeni knihovny", "in the library root").to_string(),
+        _ => trf!("ve složce: {parent_rel}", "in folder: {parent_rel}"),
     };
     let mut panel = ui::panel(420., theme)
         .id("script-name-panel")
@@ -6751,7 +7022,7 @@ fn render_script_name_panel(
         );
     }
 
-    panel = panel.child(ui::field_row("Název", field, theme));
+    panel = panel.child(ui::field_row(tr!("Název", "Name"), field, theme));
     if let Some(e) = error {
         panel = panel.child(div().text_color(script_modal_notice_color(e, theme)).child(e.clone()));
     }
@@ -6765,7 +7036,7 @@ fn render_script_name_panel(
                 .justify_end()
                 .mt_2()
                 .child(
-                    ui::button_state("script-name-cancel", SCRIPT_MODAL_CANCEL, !running, theme)
+                    ui::button_state("script-name-cancel", script_modal_cancel(), !running, theme)
                         .on_click(cx.listener(|v, _, _, cx| v.cancel_script_modal(cx))),
                 )
                 .child(
@@ -6776,7 +7047,7 @@ fn render_script_name_panel(
                         .rounded_md()
                         .bg(if running { theme.bg_selected } else { theme.bg_hover })
                         .when(!running, |d| d.cursor_pointer())
-                        .child(if running { SCRIPT_MODAL_RUNNING } else { confirm_label })
+                        .child(if running { script_modal_running() } else { confirm_label })
                         .on_click(cx.listener(|v, _, _, cx| v.confirm_script_name(cx))),
                 ),
         )
@@ -6815,7 +7086,7 @@ fn render_script_delete_panel(
                 .justify_end()
                 .mt_2()
                 .child(
-                    ui::button_state("script-delete-cancel", SCRIPT_MODAL_CANCEL, !running, theme)
+                    ui::button_state("script-delete-cancel", script_modal_cancel(), !running, theme)
                         .on_click(cx.listener(|v, _, _, cx| v.cancel_script_modal(cx))),
                 )
                 .child(
@@ -6827,9 +7098,9 @@ fn render_script_delete_panel(
                         .bg(if running { theme.bg_selected } else { theme.bg_hover })
                         .when(!running, |d| d.cursor_pointer())
                         .child(if running {
-                            SCRIPT_MODAL_RUNNING
+                            script_modal_running()
                         } else {
-                            SCRIPT_DELETE_CONFIRM
+                            script_delete_confirm()
                         })
                         .on_click(cx.listener(|v, _, _, cx| v.confirm_script_delete(cx))),
                 ),
@@ -6865,13 +7136,17 @@ fn render_script_run_confirm_panel(
     for (path, count) in files.iter().zip(file_counts.iter()) {
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string());
         file_list = file_list.child(
-            div().text_color(cx.theme().text_muted).child(format!("{name} — {count} příkazů")),
+            div().text_color(cx.theme().text_muted).child(if *count == 1 {
+                trf!("{name} — {count} příkaz", "{name} — {count} statement")
+            } else {
+                trf!("{name} — {count} příkazů", "{name} — {count} statements")
+            }),
         );
     }
 
     let mut conn_line = div().flex().flex_row().gap_2().text_color(cx.theme().text_muted).child(conn_label.to_string());
     if read_only {
-        conn_line = conn_line.child(div().text_color(cx.theme().warn).child("jen pro čtení"));
+        conn_line = conn_line.child(div().text_color(cx.theme().warn).child(tr!("jen pro čtení", "read-only")));
     }
 
     let tx_option = |id: &'static str, label: &'static str, value: TxScope, current: TxScope| {
@@ -6908,35 +7183,39 @@ fn render_script_run_confirm_panel(
     };
 
     let timeout_line = match timeout_secs {
-        Some(t) => format!("timeout na příkaz: {t}s"),
-        None => "bez timeoutu".to_string(),
+        Some(t) => trf!("timeout na příkaz: {t}s", "timeout per statement: {t}s"),
+        None => tr!("bez timeoutu", "no timeout").to_string(),
     };
 
     let panel = ui::panel(560., *cx.theme())
         .id("script-run-confirm")
-        .child(div().text_size(px(16.)).child(format!("Spustit skript: {source_label}")))
+        .child(div().text_size(px(16.)).child(trf!("Spustit skript: {source_label}", "Run script: {source_label}")))
         .child(conn_line)
         .child(file_list)
-        .child(div().text_color(cx.theme().text_muted).child(format!("celkem: {total} příkazů")))
+        .child(div().text_color(cx.theme().text_muted).child(if total == 1 {
+            trf!("celkem: {total} příkaz", "total: {total} statement")
+        } else {
+            trf!("celkem: {total} příkazů", "total: {total} statements")
+        }))
         // T9 review MINOR-3: only when it is true, so an unbound or clean
         // editor renders exactly as before.
         .when(dirty_bound, |d| {
-            d.child(div().text_color(cx.theme().warn).child(SCRIPT_RUN_DIRTY_LINE))
+            d.child(div().text_color(cx.theme().warn).child(script_run_dirty_line()))
         })
         .child(
             div()
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(div().text_color(cx.theme().text_muted).child("Transakce"))
+                .child(div().text_color(cx.theme().text_muted).child(tr!("Transakce", "Transaction")))
                 .child(
                     div()
                         .flex()
                         .flex_row()
                         .gap_2()
-                        .child(tx_option("script-tx-none", "žádná transakce", TxScope::None, tx_scope))
-                        .child(tx_option("script-tx-perfile", "transakce na soubor", TxScope::PerFile, tx_scope))
-                        .child(tx_option("script-tx-whole", "jedna transakce na celý běh", TxScope::WholeRun, tx_scope)),
+                        .child(tx_option("script-tx-none", tr!("žádná transakce", "no transaction"), TxScope::None, tx_scope))
+                        .child(tx_option("script-tx-perfile", tr!("transakce na soubor", "one transaction per file"), TxScope::PerFile, tx_scope))
+                        .child(tx_option("script-tx-whole", tr!("jedna transakce na celý běh", "one transaction for the whole run"), TxScope::WholeRun, tx_scope)),
                 ),
         )
         .child(
@@ -6944,14 +7223,14 @@ fn render_script_run_confirm_panel(
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(div().text_color(cx.theme().text_muted).child("Při chybě"))
+                .child(div().text_color(cx.theme().text_muted).child(tr!("Při chybě", "On error")))
                 .child(
                     div()
                         .flex()
                         .flex_row()
                         .gap_2()
-                        .child(policy_option("script-err-stop", "zastavit", ErrorPolicy::Stop, error_policy))
-                        .child(policy_option("script-err-continue", "pokračovat", ErrorPolicy::Continue, error_policy)),
+                        .child(policy_option("script-err-stop", tr!("zastavit", "stop"), ErrorPolicy::Stop, error_policy))
+                        .child(policy_option("script-err-continue", tr!("pokračovat", "continue"), ErrorPolicy::Continue, error_policy)),
                 ),
         )
         .child(div().text_color(cx.theme().text_muted).child(timeout_line))
@@ -6962,9 +7241,9 @@ fn render_script_run_confirm_panel(
                 .gap_2()
                 .justify_end()
                 .mt_2()
-                .child(ui::button("script-run-cancel-modal", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+                .child(ui::button("script-run-cancel-modal", tr!("Zrušit", "Cancel"), *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
                 .child(
-                    ui::button("script-run-confirm-btn", "Spustit", *cx.theme())
+                    ui::button("script-run-confirm-btn", tr!("Spustit", "Run"), *cx.theme())
                         .on_click(cx.listener(|v, _, _, cx| v.confirm_script_run(cx))),
                 ),
         );
@@ -7004,7 +7283,7 @@ fn render_csv_import_panel(
             .flatten()
             .and_then(|t| columns.get(t))
             .map(|c| c.name.clone())
-            .unwrap_or_else(|| "(přeskočit)".to_string());
+            .unwrap_or_else(|| tr!("(přeskočit)", "(skip)").to_string());
         mapping_rows = mapping_rows.child(
             ui::labelled_row(header.clone(), 160., *cx.theme())
                 .child(
@@ -7023,18 +7302,22 @@ fn render_csv_import_panel(
 
     let mut panel = ui::panel(600., *cx.theme())
         .id("csv-import-modal")
-        .child(div().text_size(px(16.)).child(format!("Import CSV do {table}")))
-        .child(div().text_color(cx.theme().text_muted).child(format!("připojení: {conn_label}")))
+        .child(div().text_size(px(16.)).child(trf!("Import CSV do {table}", "Import CSV into {table}")))
+        .child(div().text_color(cx.theme().text_muted).child(trf!("připojení: {conn_label}", "connection: {conn_label}")))
         .child(div().text_color(cx.theme().text_muted).child(path.display().to_string()))
         .child(mapping_rows)
-        .child(div().text_color(cx.theme().text_muted).child(format!(
+        .child(div().text_color(cx.theme().text_muted).child(trf!(
             "{row_count} řádků · dávka: {} řádků",
+            "{row_count} rows · batch: {} rows",
             crate::csv_import::CSV_IMPORT_BATCH_SIZE
         )))
         .child(
             div()
                 .text_color(cx.theme().text_muted)
-                .child("prázdné pole → NULL; hlavičkový řádek je povinný"),
+                .child(tr!(
+                    "prázdné pole → NULL; hlavičkový řádek je povinný",
+                    "empty field → NULL; the header row is required"
+                )),
         );
 
     if let Some(sql) = sample_sql {
@@ -7058,11 +7341,11 @@ fn render_csv_import_panel(
 
     let can_run = error.is_none() && sample_sql.is_some();
     let confirm_btn = if can_run {
-        ui::button("csv-import-confirm-btn", "Spustit import", *cx.theme())
+        ui::button("csv-import-confirm-btn", tr!("Spustit import", "Run import"), *cx.theme())
             .on_click(cx.listener(|v, _, _, cx| v.confirm_csv_import(cx)))
             .into_any_element()
     } else {
-        ui::button_state("csv-import-confirm-btn", "Spustit import", false, *cx.theme())
+        ui::button_state("csv-import-confirm-btn", tr!("Spustit import", "Run import"), false, *cx.theme())
             .into_any_element()
     };
 
@@ -7073,7 +7356,7 @@ fn render_csv_import_panel(
             .gap_2()
             .justify_end()
             .mt_2()
-            .child(ui::button("csv-import-cancel", "Zrušit", *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
+            .child(ui::button("csv-import-cancel", tr!("Zrušit", "Cancel"), *cx.theme()).on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))))
             .child(confirm_btn),
     );
     panel.into_any_element()
@@ -7106,16 +7389,16 @@ fn render_chart_picker_panel(
     let mut panel = ui::panel(460., theme)
         .id("chart-picker-panel")
         .max_h(px(560.))
-        .child(div().text_size(px(16.)).child(format!("Graf: {source_title}")))
+        .child(div().text_size(px(16.)).child(trf!("Graf: {source_title}", "Chart: {source_title}")))
         .child(
             div()
                 .flex()
                 .flex_row()
                 .gap_2()
-                .child(kind_button("chart-picker-kind-bar", "Sloupcový", ChartKind::Bar, cx))
-                .child(kind_button("chart-picker-kind-line", "Čárový", ChartKind::Line, cx)),
+                .child(kind_button("chart-picker-kind-bar", tr!("Sloupcový", "Bar"), ChartKind::Bar, cx))
+                .child(kind_button("chart-picker-kind-line", tr!("Čárový", "Line"), ChartKind::Line, cx)),
         )
-        .child(div().text_color(theme.text_muted).child("Osa X"));
+        .child(div().text_color(theme.text_muted).child(tr!("Osa X", "X axis")));
 
     let mut x_list = div().id("chart-picker-x-list").flex().flex_col().gap_1().max_h(px(120.)).overflow_hidden();
     for (i, (name, _numeric)) in columns.iter().enumerate() {
@@ -7134,10 +7417,10 @@ fn render_chart_picker_panel(
                 .on_click(cx.listener(move |v, _, _, cx| v.set_chart_x_col(i, cx))),
         );
     }
-    panel = panel.child(x_list).child(div().text_color(theme.text_muted).child("Osa Y (číselné sloupce)"));
+    panel = panel.child(x_list).child(div().text_color(theme.text_muted).child(tr!("Osa Y (číselné sloupce)", "Y axis (numeric columns)")));
 
     if numeric_count == 0 {
-        panel = panel.child(div().text_color(theme.danger).child("výsledek nemá žádný číselný sloupec"));
+        panel = panel.child(div().text_color(theme.danger).child(tr!("výsledek nemá žádný číselný sloupec", "the result has no numeric column")));
     }
     let mut y_list = div().id("chart-picker-y-list").flex().flex_col().gap_1().max_h(px(160.)).overflow_hidden();
     for (i, (name, numeric)) in columns.iter().enumerate() {
@@ -7168,11 +7451,11 @@ fn render_chart_picker_panel(
             .gap_2()
             .mt_2()
             .child(
-                ui::button("chart-picker-cancel", "Zrušit", theme)
+                ui::button("chart-picker-cancel", tr!("Zrušit", "Cancel"), theme)
                     .on_click(cx.listener(|v, _, _, cx| v.close_modal(cx))),
             )
             .child(
-                ui::button("chart-picker-confirm", if is_edit { "Použít" } else { "Vytvořit graf" }, theme)
+                ui::button("chart-picker-confirm", if is_edit { tr!("Použít", "Apply") } else { tr!("Vytvořit graf", "Create chart") }, theme)
                     .on_click(cx.listener(|v, _, _, cx| v.confirm_chart_picker(cx))),
             ),
     );
@@ -7733,9 +8016,9 @@ mod modal_confirm_kind_tests {
         );
         assert_eq!(script_kind_label(ScriptNameMode::NewScript), "Skript");
         assert_eq!(script_kind_label(ScriptNameMode::NewFolder), "Složka");
-        assert_eq!(SCRIPT_MODAL_RUNNING, "Pracuji…");
-        assert_eq!(SCRIPT_MODAL_CANCEL, "Zrušit");
-        assert_eq!(SCRIPT_DELETE_CONFIRM, "Smazat");
+        assert_eq!(script_modal_running(), "Pracuji…");
+        assert_eq!(script_modal_cancel(), "Zrušit");
+        assert_eq!(script_delete_confirm(), "Smazat");
     }
 
     /// T9 review NIT-2: the notice slot carries both errors and REFUSALS,
@@ -7743,8 +8026,8 @@ mod modal_confirm_kind_tests {
     /// Painting them in the error colour contradicted those pins.
     #[test]
     fn a_refusal_is_not_painted_as_an_error() {
-        assert!(!script_modal_notice_is_error(crate::SCRIPT_SAVE_IN_FLIGHT));
-        assert!(!script_modal_notice_is_error(crate::SCRIPT_SAVE_BLOCKED));
+        assert!(!script_modal_notice_is_error(crate::script_save_in_flight()));
+        assert!(!script_modal_notice_is_error(crate::script_save_blocked()));
         // Real failures from the fs ops still read as errors.
         for e in ["název už existuje", "složka není prázdná — smažte nejdřív její obsah"] {
             assert!(script_modal_notice_is_error(e), "{e}");
@@ -7757,13 +8040,13 @@ mod modal_confirm_kind_tests {
     #[test]
     fn the_run_confirm_discloses_that_the_editor_and_the_disk_differ() {
         assert_eq!(
-            SCRIPT_RUN_DIRTY_LINE,
+            script_run_dirty_line(),
             "Editor má neuložené změny — spustí se obsah na disku."
         );
-        assert!(SCRIPT_RUN_DIRTY_LINE.contains("na disku"));
-        assert!(!SCRIPT_RUN_DIRTY_LINE.starts_with("error:"));
+        assert!(script_run_dirty_line().contains("na disku"));
+        assert!(!script_run_dirty_line().starts_with("error:"));
         for promise in ["uloží", "uložit"] {
-            assert!(!SCRIPT_RUN_DIRTY_LINE.contains(promise), "must not promise a save");
+            assert!(!script_run_dirty_line().contains(promise), "must not promise a save");
         }
     }
 
@@ -7794,17 +8077,17 @@ mod workspace_missing_text_tests {
 
     #[test]
     fn the_workspace_missing_texts_are_byte_pinned() {
-        assert_eq!(WORKSPACE_MISSING_TITLE, "Pracovní prostor nenalezen");
-        assert_eq!(WORKSPACE_MISSING_NO_PATH, "ukazatel na pracovní prostor je nečitelný");
-        assert_eq!(WORKSPACE_MISSING_FIND, "Najít složku…");
+        assert_eq!(workspace_missing_title(), "Pracovní prostor nenalezen");
+        assert_eq!(workspace_missing_no_path(), "ukazatel na pracovní prostor je nečitelný");
+        assert_eq!(workspace_missing_find(), "Najít složku…");
         assert_eq!(
-            WORKSPACE_MISSING_PROFILE_HINT,
+            workspace_missing_profile_hint(),
             "Otevře se lokální profil — jiná připojení a nastavení než v pracovním prostoru."
         );
-        assert_eq!(WORKSPACE_MISSING_PROFILE, "Použít lokální profil");
-        assert_eq!(WORKSPACE_MISSING_QUIT, "Ukončit");
+        assert_eq!(workspace_missing_profile(), "Použít lokální profil");
+        assert_eq!(workspace_missing_quit(), "Ukončit");
         assert_eq!(
-            WORKSPACE_MISSING_STATUS,
+            workspace_missing_status(),
             "error: pracovní prostor nenalezen — vyberte složku, nebo použijte lokální profil"
         );
     }
@@ -7816,11 +8099,11 @@ mod workspace_missing_text_tests {
     /// sentinel, so dropping it would silently de-escalate the message.
     #[test]
     fn the_blocked_start_status_is_an_error_not_ready() {
-        assert!(WORKSPACE_MISSING_STATUS.starts_with("error: "));
-        assert_ne!(WORKSPACE_MISSING_STATUS, "ready");
+        assert!(workspace_missing_status().starts_with("error: "));
+        assert_ne!(workspace_missing_status(), "ready");
         // It must name both ways out, so the status alone is actionable.
-        assert!(WORKSPACE_MISSING_STATUS.contains("složku"));
-        assert!(WORKSPACE_MISSING_STATUS.contains("lokální profil"));
+        assert!(workspace_missing_status().contains("složku"));
+        assert!(workspace_missing_status().contains("lokální profil"));
     }
 
     #[test]
@@ -7829,7 +8112,7 @@ mod workspace_missing_text_tests {
         // them into one label, the user loses the ability to tell "the
         // workspace moved" apart from "abandon the workspace".
         let labels =
-            [WORKSPACE_MISSING_FIND, WORKSPACE_MISSING_PROFILE, WORKSPACE_MISSING_QUIT];
+            [workspace_missing_find(), workspace_missing_profile(), workspace_missing_quit()];
         for (i, a) in labels.iter().enumerate() {
             assert!(!a.is_empty());
             for b in labels.iter().skip(i + 1) {
@@ -7858,7 +8141,7 @@ mod workspace_confirm_tests {
     #[test]
     fn workspace_git_warning_is_byte_pinned() {
         assert_eq!(
-            WORKSPACE_GIT_WARNING,
+            workspace_git_warning(),
             "Upozornění: složku verzujete sami — git zůstává zcela mimo aplikaci. \
              Historie gitu je trvalá: jednou commitnutý trezor (vault.bin) z ní nelze \
              nikdy spolehlivě odstranit. Bezpečnost celé složky se pak rovná síle vašeho \
@@ -7891,9 +8174,9 @@ mod workspace_confirm_tests {
             "password=",
             "heslo:",
         ] {
-            assert!(!WORKSPACE_GIT_WARNING.contains(banned), "warning must not contain {banned:?}");
+            assert!(!workspace_git_warning().contains(banned), "warning must not contain {banned:?}");
         }
-        assert!(WORKSPACE_GIT_WARNING.contains("git"), "the warning is ABOUT git");
+        assert!(workspace_git_warning().contains("git"), "the warning is ABOUT git");
     }
 
     #[test]
@@ -7923,10 +8206,10 @@ mod workspace_confirm_tests {
             .contains(&"Trezor tohoto prostoru se odemyká jeho vlastním master heslem."));
         // §W6.3: the git warning renders on the two folder-facing modes;
         // going back to the profile writes nothing into any folder.
-        assert!(workspace_confirm_lines(WorkspaceConfirmMode::Init).contains(&WORKSPACE_GIT_WARNING));
-        assert!(workspace_confirm_lines(WorkspaceConfirmMode::Adopt).contains(&WORKSPACE_GIT_WARNING));
+        assert!(workspace_confirm_lines(WorkspaceConfirmMode::Init).contains(&workspace_git_warning()));
+        assert!(workspace_confirm_lines(WorkspaceConfirmMode::Adopt).contains(&workspace_git_warning()));
         assert!(!workspace_confirm_lines(WorkspaceConfirmMode::ToProfile)
-            .contains(&WORKSPACE_GIT_WARNING));
+            .contains(&workspace_git_warning()));
     }
 
     /// FINAL-REVIEW MINOR-1. „Najít složku…" in the §W4 blocking modal is
@@ -7969,7 +8252,7 @@ mod workspace_confirm_tests {
         );
         // And that vector is the one carrying both disclosures.
         let lines = workspace_confirm_lines(WorkspaceConfirmMode::Adopt);
-        assert!(lines.contains(&WORKSPACE_GIT_WARNING));
+        assert!(lines.contains(&workspace_git_warning()));
         assert!(lines.contains(&"Trezor tohoto prostoru se odemyká jeho vlastním master heslem."));
 
         // The NEGATIVE half, and it is not an oversight: the three-choice
@@ -7977,9 +8260,9 @@ mod workspace_confirm_tests {
         // that the warning appears at decision points and never on
         // startup. The user has not chosen a folder yet at that screen.
         let panel = slice("fn render_workspace_missing_panel(");
-        assert!(panel.contains("WORKSPACE_MISSING_FIND"), "the sliced body is not the real one");
+        assert!(panel.contains("workspace_missing_find()"), "the sliced body is not the real one");
         assert!(
-            !panel.contains("WORKSPACE_GIT_WARNING"),
+            !panel.contains("workspace_git_warning()"),
             "the startup panel must stay warning-free (§W6.3: never on startup)"
         );
     }
@@ -8058,7 +8341,7 @@ mod workspace_confirm_tests {
         assert_eq!(workspace_pick_outcome(Classification::Empty), Ok(WorkspaceConfirmMode::Init));
         assert_eq!(
             workspace_pick_outcome(Classification::NonEmpty),
-            Err(WORKSPACE_PICK_NONEMPTY.to_string())
+            Err(workspace_pick_nonempty().to_string())
         );
         assert_eq!(
             workspace_pick_outcome(Classification::FutureFormat(7)),
@@ -8080,20 +8363,20 @@ mod workspace_confirm_tests {
     #[test]
     fn the_non_empty_refusal_names_the_interrupted_init_it_may_have_caused() {
         assert_eq!(
-            WORKSPACE_PICK_NONEMPTY,
+            workspace_pick_nonempty(),
             "složka není pracovní prostor dbc a není prázdná — vyberte prázdnou složku \
              nebo existující pracovní prostor; pokud v této složce dříve selhalo nebo bylo \
              přerušeno vytváření prostoru, zůstaly v ní nedokončené soubory aplikace — \
              smažte obsah složky a zkuste to znovu"
         );
         // The two halves that must survive any future rewording.
-        assert!(WORKSPACE_PICK_NONEMPTY.contains("vyberte prázdnou složku"));
-        assert!(WORKSPACE_PICK_NONEMPTY.contains("přerušeno vytváření prostoru"));
+        assert!(workspace_pick_nonempty().contains("vyberte prázdnou složku"));
+        assert!(workspace_pick_nonempty().contains("přerušeno vytváření prostoru"));
         // A refusal, not a recipe: the app never deletes for the user, and
         // never grows a git instruction (§W6.4) — the folder is emptied by
         // the user, with whatever tool they like.
         for banned in ["git ", "del ", "rmdir", "Remove-Item"] {
-            assert!(!WORKSPACE_PICK_NONEMPTY.contains(banned), "must not contain {banned:?}");
+            assert!(!workspace_pick_nonempty().contains(banned), "must not contain {banned:?}");
         }
     }
 
@@ -8192,17 +8475,17 @@ mod workspace_confirm_tests {
     #[test]
     fn the_status_sentinel_is_short_and_the_prose_lives_in_the_panel() {
         assert_eq!(
-            WORKSPACE_PICK_FAILED_STATUS,
+            workspace_pick_failed_status(),
             "error: vybranou složku nelze použít — podrobnosti v Nastavení"
         );
-        assert!(WORKSPACE_PICK_FAILED_STATUS.starts_with("error: "));
-        assert!(WORKSPACE_PICK_FAILED_STATUS.contains("Nastavení"), "point at the panel");
+        assert!(workspace_pick_failed_status().starts_with("error: "));
+        assert!(workspace_pick_failed_status().contains("Nastavení"), "point at the panel");
         // The whole point: the sentinel is a fraction of the prose.
-        assert!(WORKSPACE_PICK_FAILED_STATUS.chars().count() < 70);
-        assert!(WORKSPACE_PICK_NONEMPTY.chars().count() > 150);
+        assert!(workspace_pick_failed_status().chars().count() < 70);
+        assert!(workspace_pick_nonempty().chars().count() > 150);
         assert!(
-            WORKSPACE_PICK_FAILED_STATUS.chars().count() * 2
-                < WORKSPACE_PICK_NONEMPTY.chars().count(),
+            workspace_pick_failed_status().chars().count() * 2
+                < workspace_pick_nonempty().chars().count(),
             "if these ever converge, the status bar is carrying the prose again"
         );
     }
@@ -8212,20 +8495,20 @@ mod workspace_confirm_tests {
     /// three read as one family rather than three inventions.
     #[test]
     fn the_discarded_pick_status_matches_its_sibling_flows() {
-        assert_eq!(WORKSPACE_PICK_DISCARDED, "výběr složky zahozen — je otevřený jiný dialog");
-        assert!(WORKSPACE_PICK_DISCARDED.ends_with("zahozen — je otevřený jiný dialog"));
+        assert_eq!(workspace_pick_discarded(), "výběr složky zahozen — je otevřený jiný dialog");
+        assert!(workspace_pick_discarded().ends_with("zahozen — je otevřený jiný dialog"));
         // Not an `error:` — a discarded pick is a refusal to act, not a
         // failure, exactly like its two siblings.
-        assert!(!WORKSPACE_PICK_DISCARDED.starts_with("error: "));
+        assert!(!workspace_pick_discarded().starts_with("error: "));
     }
 
     /// The Settings block's own copy (§W3), byte-pinned like every other
     /// deliverable string in this phase.
     #[test]
     fn the_settings_workspace_block_copy_is_byte_pinned() {
-        assert_eq!(WORKSPACE_SETTINGS_HEADING, "Pracovní prostor");
-        assert_eq!(WORKSPACE_SETTINGS_PICK, "Použít složku…");
-        assert_eq!(WORKSPACE_SETTINGS_LEAVE, "Přejít na lokální profil");
+        assert_eq!(workspace_settings_heading(), "Pracovní prostor");
+        assert_eq!(workspace_settings_pick(), "Použít složku…");
+        assert_eq!(workspace_settings_leave(), "Přejít na lokální profil");
         assert_eq!(
             workspace_settings_mode_line(Some(std::path::Path::new("D:\\ws"))),
             "Pracovní prostor: D:\\ws"
@@ -8238,12 +8521,12 @@ mod workspace_confirm_tests {
     /// the same way.
     #[test]
     fn the_settings_scripts_block_copy_is_byte_pinned() {
-        assert_eq!(SCRIPTS_SETTINGS_HEADING, "Složka skriptů");
-        assert_eq!(SCRIPTS_SETTINGS_UNSET, "nenastavena");
-        assert_eq!(SCRIPTS_SETTINGS_PICK, "Vybrat složku…");
-        assert_eq!(SCRIPTS_SETTINGS_CLEAR, "Odebrat");
+        assert_eq!(scripts_settings_heading(), "Složka skriptů");
+        assert_eq!(scripts_settings_unset(), "nenastavena");
+        assert_eq!(scripts_settings_pick(), "Vybrat složku…");
+        assert_eq!(scripts_settings_clear(), "Odebrat");
         assert_eq!(
-            SCRIPTS_PICK_DISCARDED_WORKSPACE,
+            scripts_pick_discarded_workspace(),
             "výběr složky zahozen — je aktivní pracovní prostor"
         );
     }
@@ -8253,8 +8536,8 @@ mod workspace_confirm_tests {
     /// sentinel as its „… zahozen — …" sibling.
     #[test]
     fn the_discarded_scripts_pick_is_not_an_error_status() {
-        assert!(!SCRIPTS_PICK_DISCARDED_WORKSPACE.starts_with("error: "));
-        assert!(!WORKSPACE_PICK_DISCARDED.starts_with("error: "));
+        assert!(!scripts_pick_discarded_workspace().starts_with("error: "));
+        assert!(!workspace_pick_discarded().starts_with("error: "));
     }
 
     /// T7 review NIT-1: the workspace line renders whatever THE resolver
@@ -8332,8 +8615,10 @@ mod analyze_write_confirm_tests {
 /// label with the percentage; otherwise nothing.
 fn update_bar(ready: Option<&str>, downloading: Option<&(String, i16)>) -> (Option<String>, Option<String>) {
     match (ready, downloading) {
-        (Some(version), _) => (None, Some(format!("Aktualizovat na v{version}"))),
-        (None, Some((version, percent))) => (Some(format!("v{version} · stahuje se {percent} %")), None),
+        (Some(version), _) => (None, Some(dbc_i18n::trf!("Aktualizovat na v{version}", "Update to v{version}"))),
+        (None, Some((version, percent))) => {
+            (Some(dbc_i18n::trf!("v{version} · stahuje se {percent} %", "v{version} · downloading {percent} %")), None)
+        }
         (None, None) => (None, None),
     }
 }

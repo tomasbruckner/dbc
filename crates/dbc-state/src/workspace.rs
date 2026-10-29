@@ -45,6 +45,7 @@ pub const WORKSPACE_FORMAT: u32 = 1;
 /// enumeration silently stops covering the next store that is added;
 /// `*.tmp` cannot drift out of date, and the file is the user's to edit
 /// from the moment it is written.
+// i18n-ok: content of a file written to the user's workspace, not UI text
 pub const GITIGNORE_TEMPLATE: &str = "# dbc workspace — pracovní prostor aplikace dbc.\n\
 # Git zde spravujete výhradně vy; aplikace s gitem nikdy nepracuje.\n\
 \n\
@@ -237,15 +238,16 @@ fn read_pointer_probed(
         Ok(false) => return Ok(None),
         Ok(true) => {}
         Err(e) => {
-            return Err(err(format!(
+            return Err(err(dbc_i18n::trf!(
                 "ukazatel na pracovní prostor nelze ověřit ({}): {e}",
+                "the workspace pointer cannot be verified ({}): {e}",
                 pointer.display()
             )));
         }
     }
     let raw = std::fs::read_to_string(pointer)?;
     let p: PointerFile = toml::from_str(&raw)
-        .map_err(|e| err(format!("ukazatel na pracovní prostor je poškozený: {e}")))?;
+        .map_err(|e| err(dbc_i18n::trf!("ukazatel na pracovní prostor je poškozený: {e}", "the workspace pointer is corrupted: {e}")))?;
     Ok(Some(PathBuf::from(p.path)))
 }
 
@@ -259,14 +261,16 @@ fn read_pointer_probed(
 /// instead of being papered over by `display().to_string()`.
 pub fn write_pointer(pointer: &Path, root: &Path) -> Result<(), StateError> {
     if !root.is_absolute() {
-        return Err(err(format!(
+        return Err(err(dbc_i18n::trf!(
             "cesta k pracovnímu prostoru musí být absolutní: {}",
+            "the workspace path must be absolute: {}",
             root.display()
         )));
     }
     let Some(root_str) = root.to_str() else {
-        return Err(err(format!(
+        return Err(err(dbc_i18n::trf!(
             "cesta k pracovnímu prostoru obsahuje znaky, které nelze uložit: {}",
+            "the workspace path contains characters that cannot be saved: {}",
             root.display()
         )));
     };
@@ -295,9 +299,9 @@ pub fn classify(root: &Path) -> Classification {
         // (typing `…\ws\config.toml` into the picker), and a path that
         // cannot be probed at all.
         return match root.try_exists() {
-            Ok(true) => Classification::Unreadable("cesta není složka".to_string()),
-            Ok(false) => Classification::Unreadable("složka neexistuje".to_string()),
-            Err(e) => Classification::Unreadable(format!("složku nelze ověřit: {e}")),
+            Ok(true) => Classification::Unreadable(dbc_i18n::tr!("cesta není složka", "the path is not a folder").to_string()),
+            Ok(false) => Classification::Unreadable(dbc_i18n::tr!("složka neexistuje", "the folder does not exist").to_string()),
+            Err(e) => Classification::Unreadable(dbc_i18n::trf!("složku nelze ověřit: {e}", "the folder cannot be verified: {e}")),
         };
     }
     let marker = root.join(MARKER_FILE);
@@ -320,7 +324,7 @@ fn classify_probed(root: &Path, marker: &Path, probe: std::io::Result<bool>) -> 
         Ok(true) => {}
         Ok(false) => return classify_unmarked(root),
         Err(e) => {
-            return Classification::Unreadable(format!("{MARKER_FILE} nelze ověřit: {e}"));
+            return Classification::Unreadable(dbc_i18n::trf!("{MARKER_FILE} nelze ověřit: {e}", "{MARKER_FILE} cannot be verified: {e}"));
         }
     }
     let raw = match std::fs::read_to_string(marker) {
@@ -333,7 +337,7 @@ fn classify_probed(root: &Path, marker: &Path, probe: std::io::Result<bool>) -> 
         // be adopted silently.
         Ok(m) if (1..=WORKSPACE_FORMAT).contains(&m.format) => Classification::Workspace,
         Ok(m) if m.format > WORKSPACE_FORMAT => Classification::FutureFormat(m.format),
-        Ok(m) => Classification::Unreadable(format!("{MARKER_FILE}: neplatný formát {}", m.format)),
+        Ok(m) => Classification::Unreadable(dbc_i18n::trf!("{MARKER_FILE}: neplatný formát {}", "{MARKER_FILE}: invalid format {}", m.format)),
         Err(e) => Classification::Unreadable(format!("{MARKER_FILE}: {e}")),
     }
 }
@@ -377,11 +381,11 @@ fn resolve_from_pointer(read: Result<Option<PathBuf>, StateError>) -> Resolution
             Resolution::Workspace { root, paths }
         }
         Classification::Empty | Classification::NonEmpty => {
-            Resolution::Broken { root: Some(root), reason: format!("chybí {MARKER_FILE}") }
+            Resolution::Broken { root: Some(root), reason: dbc_i18n::trf!("chybí {MARKER_FILE}", "{MARKER_FILE} is missing") }
         }
         Classification::FutureFormat(f) => Resolution::Broken {
             root: Some(root),
-            reason: format!("pracovní prostor vyžaduje novější verzi aplikace (formát {f})"),
+            reason: dbc_i18n::trf!("pracovní prostor vyžaduje novější verzi aplikace (formát {f})", "the workspace requires a newer version of the app (format {f})"),
         },
         Classification::Unreadable(m) => Resolution::Broken { root: Some(root), reason: m },
     }
@@ -400,7 +404,7 @@ fn copy_one(src: &Path, root: &Path, name: &str) -> Result<(), StateError> {
         return Ok(());
     }
     if entry_exists_ci(root, name)? {
-        return Err(err(format!("cíl už existuje: {name}")));
+        return Err(err(dbc_i18n::trf!("cíl už existuje: {name}", "target already exists: {name}")));
     }
     let dst = join_component(root, name)?;
     let bytes = std::fs::read(src)?;
@@ -428,9 +432,9 @@ pub fn init_contents(root: &Path, from: &Paths) -> Result<(), StateError> {
         // failure).
         Classification::Unreadable(m) => return Err(err(m)),
         Classification::Workspace | Classification::FutureFormat(_) => {
-            return Err(err("složka už je pracovní prostor"));
+            return Err(err(dbc_i18n::tr!("složka už je pracovní prostor", "the folder is already a workspace")));
         }
-        Classification::NonEmpty => return Err(err("složka není prázdná")),
+        Classification::NonEmpty => return Err(err(dbc_i18n::tr!("složka není prázdná", "the folder is not empty"))),
     }
     copy_one(&from.config, root, "config.toml")?;
     copy_one(&from.vault, root, "vault.bin")?;
@@ -439,7 +443,7 @@ pub fn init_contents(root: &Path, from: &Paths) -> Result<(), StateError> {
     // history.sqlite is deliberately NOT copied (§W5).
     let scripts = join_component(root, SCRIPTS_SUBDIR)?;
     if !scripts.is_dir() {
-        std::fs::create_dir(&scripts).map_err(|e| err(format!("vytvoření složky selhalo: {e}")))?;
+        std::fs::create_dir(&scripts).map_err(|e| err(dbc_i18n::trf!("vytvoření složky selhalo: {e}", "creating the folder failed: {e}")))?;
     }
     if !entry_exists_ci(root, GITIGNORE_FILE)? {
         let gi = join_component(root, GITIGNORE_FILE)?;

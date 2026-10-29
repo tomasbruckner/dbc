@@ -52,6 +52,7 @@
 //! `bundle_never_contains_a_plaintext_secret` is the rail on the first
 //! claim, and it is deliberately written so it cannot pass vacuously.
 
+use dbc_i18n::{tr, trf};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -123,7 +124,7 @@ fn read_optional(path: &Path) -> Result<Option<String>, StateError> {
     match std::fs::read_to_string(path) {
         Ok(s) => Ok(Some(s)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(err(format!("{} nejde přečíst: {e}", path.display()))),
+        Err(e) => Err(err(trf!("{} nejde přečíst: {e}", "cannot read {}: {e}", path.display()))),
     }
 }
 
@@ -148,16 +149,18 @@ fn now_unix() -> u64 {
 ///   active, and finding that out now beats finding it out later.
 pub fn build(paths: &Paths, app_version: &str) -> Result<Bundle, StateError> {
     let mut config = AppConfig::load(&paths.config).map_err(|e| {
-        err(format!(
+        err(trf!(
             "nastavení ({}) nejde přečíst, takže není co vyvézt: {}",
+            "settings ({}) cannot be read, so there is nothing to export: {}",
             paths.config.display(),
             e.message
         ))
     })?;
     if config.connections.is_empty() {
-        return Err(err(format!(
+        return Err(err(trf!(
             "v {} nejsou žádná uložená připojení — zkontroluj, jestli je aktivní ten profil, \
              který jsi čekal",
+            "there are no saved connections in {} — check that the profile you expected is the active one",
             paths.config.display()
         )));
     }
@@ -168,7 +171,7 @@ pub fn build(paths: &Paths, app_version: &str) -> Result<Bundle, StateError> {
     config.scripts_dir = None;
 
     let config_toml = toml::to_string_pretty(&config)
-        .map_err(|e| err(format!("nastavení nejde zapsat do balíčku: {e}")))?;
+        .map_err(|e| err(trf!("nastavení nejde zapsat do balíčku: {e}", "settings cannot be written to the bundle: {e}")))?;
 
     let vault_bin = match read_optional(&paths.vault)? {
         Some(text) => {
@@ -179,9 +182,10 @@ pub fn build(paths: &Paths, app_version: &str) -> Result<Bundle, StateError> {
             // machine, which is the single outcome that must not happen
             // quietly.
             if !crate::vault::text_is_sealed_envelope(&text) {
-                return Err(err(format!(
+                return Err(err(trf!(
                     "soubor trezoru ({}) nemá tvar zašifrované obálky — export zastaven, \
                      aby se nevyvezlo něco čitelného",
+                    "the vault file ({}) is not a sealed envelope — export stopped so that nothing readable is exported",
                     paths.vault.display()
                 )));
             }
@@ -202,7 +206,7 @@ pub fn build(paths: &Paths, app_version: &str) -> Result<Bundle, StateError> {
 }
 
 pub fn to_json(bundle: &Bundle) -> Result<String, StateError> {
-    serde_json::to_string_pretty(bundle).map_err(|e| err(format!("balíček nejde zapsat: {e}")))
+    serde_json::to_string_pretty(bundle).map_err(|e| err(trf!("balíček nejde zapsat: {e}", "the bundle cannot be written: {e}")))
 }
 
 /// Read a bundle and validate it COMPLETELY.
@@ -214,26 +218,29 @@ pub fn to_json(bundle: &Bundle) -> Result<String, StateError> {
 /// „refuse after destroying something".
 pub fn parse(text: &str) -> Result<Bundle, StateError> {
     let bundle: Bundle = serde_json::from_str(text)
-        .map_err(|_| err("tohle není soubor s nastavením dbc"))?;
+        .map_err(|_| err(tr!("tohle není soubor s nastavením dbc", "this is not a dbc settings file")))?;
     if bundle.format != FORMAT {
-        return Err(err(format!(
+        return Err(err(trf!(
             "cizí formát „{}“ — čekal jsem „{FORMAT}“",
+            "unknown format “{}” — expected “{FORMAT}”",
             bundle.format
         )));
     }
     if bundle.version > VERSION {
-        return Err(err(format!(
+        return Err(err(trf!(
             "balíček je z novější verze aplikace (formát {}, tahle umí {VERSION}) — aktualizuj dbc",
+            "the bundle comes from a newer version of the app (format {}, this one supports {VERSION}) — update dbc",
             bundle.version
         )));
     }
     toml::from_str::<AppConfig>(&bundle.config_toml)
-        .map_err(|e| err(format!("nastavení uvnitř balíčku nejde přečíst: {e}")))?;
+        .map_err(|e| err(trf!("nastavení uvnitř balíčku nejde přečíst: {e}", "the settings inside the bundle cannot be read: {e}")))?;
     if let Some(v) = &bundle.vault_bin {
         if !crate::vault::text_is_sealed_envelope(v) {
-            return Err(err(
+            return Err(err(tr!(
                 "trezor uvnitř balíčku nemá tvar zašifrované obálky — balíček odmítnut",
-            ));
+                "the vault inside the bundle is not a sealed envelope — bundle rejected"
+            )));
         }
     }
     Ok(bundle)
@@ -246,7 +253,7 @@ pub fn parse(text: &str) -> Result<Bundle, StateError> {
 /// `Bundle` some other way.
 pub fn summary(bundle: &Bundle) -> Result<Summary, StateError> {
     let config: AppConfig = toml::from_str(&bundle.config_toml)
-        .map_err(|e| err(format!("nastavení uvnitř balíčku nejde přečíst: {e}")))?;
+        .map_err(|e| err(trf!("nastavení uvnitř balíčku nejde přečíst: {e}", "the settings inside the bundle cannot be read: {e}")))?;
     Ok(Summary {
         connections: config.connections.into_iter().map(|c| c.name).collect(),
         has_vault: bundle.vault_bin.is_some(),
@@ -271,7 +278,7 @@ pub fn write(bundle: &Bundle, path: &Path) -> Result<(), StateError> {
 
 pub fn read(path: &Path) -> Result<Bundle, StateError> {
     let text = std::fs::read_to_string(path)
-        .map_err(|e| err(format!("{} nejde přečíst: {e}", path.display())))?;
+        .map_err(|e| err(trf!("{} nejde přečíst: {e}", "cannot read {}: {e}", path.display())))?;
     parse(&text)
 }
 
@@ -335,8 +342,9 @@ pub fn apply(bundle: &Bundle, paths: &Paths) -> Result<Applied, StateError> {
             let bak = backup_path(target, stamp);
             if let Err(e) = std::fs::rename(target, &bak) {
                 rollback(&written, &backed_up);
-                return Err(err(format!(
+                return Err(err(trf!(
                     "{} nejde odložit stranou, nic se nezměnilo: {e}",
+                    "{} cannot be set aside, nothing was changed: {e}",
                     target.display()
                 )));
             }
@@ -357,8 +365,9 @@ pub fn apply(bundle: &Bundle, paths: &Paths) -> Result<Applied, StateError> {
         })();
         if let Err(e) = attempt {
             rollback(&written, &backed_up);
-            return Err(err(format!(
+            return Err(err(trf!(
                 "{} nejde zapsat — původní nastavení vráceno zpět: {e}",
+                "{} cannot be written — the original settings were restored: {e}",
                 target.display()
             )));
         }

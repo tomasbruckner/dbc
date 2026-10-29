@@ -195,7 +195,7 @@ pub fn generate_insert_batches_d(
     for &(_, target_ix) in &pairs {
         if !seen_targets.insert(target_ix) {
             let name = columns.get(target_ix).map(|c| c.name.as_str()).unwrap_or("?");
-            return Err(format!("sloupec {name} je namapován vícekrát"));
+            return Err(dbc_i18n::trf!("sloupec {name} je namapován vícekrát", "column {name} is mapped more than once"));
         }
     }
 

@@ -20,6 +20,7 @@ pub mod targets;
 pub mod fanout;
 
 use tunnel::Tunnel;
+use dbc_i18n::{tr, trf};
 
 use std::time::Duration;
 
@@ -200,9 +201,10 @@ pub fn open_config(
             // (`connections_ui::engine_is_file_based` keeps the prompt
             // away at every call site).
             if is_in_memory_duckdb_path(&cfg.database) {
-                return Err(QueryError::msg(
+                return Err(QueryError::msg(tr!(
                     "in-memory DuckDB databáze není podporována — zadejte cestu k souboru",
-                ));
+                    "in-memory DuckDB databases are not supported — enter a file path"
+                )));
             }
             // Dual read-only enforcement, same as sqlite: engine-side
             // AccessMode::ReadOnly here (driver-proven by its
@@ -399,9 +401,10 @@ pub fn normalise_mssql_host(
         _ => trimmed,
     };
     if stripped.is_empty() {
-        return Err(QueryError::msg(
+        return Err(QueryError::msg(tr!(
             "MSSQL: vyplň Host — adresa serveru chybí (jméno nebo IP, port patří do pole Port)",
-        ));
+            "MSSQL: fill in Host — the server address is missing (name or IP; the port goes in the Port field)"
+        )));
     }
 
     let bracketed_or_ipv6 = stripped.contains('[') || stripped.matches(':').count() > 1;
@@ -414,8 +417,9 @@ pub fn normalise_mssql_host(
             let (a, rest) = stripped.split_at(i);
             let p = rest[1..].trim();
             let parsed = p.parse::<u16>().ok().filter(|n| *n != 0).ok_or_else(|| {
-                QueryError::msg(format!(
-                    "MSSQL: v poli Host je za oddělovačem „{p}“, což není číslo portu —                      napiš do Hostu jen jméno serveru nebo IP a port dej do pole Port"
+                QueryError::msg(trf!(
+                    "MSSQL: v poli Host je za oddělovačem „{p}“, což není číslo portu —                      napiš do Hostu jen jméno serveru nebo IP a port dej do pole Port",
+                    "MSSQL: the Host field has “{p}” after the separator, which is not a port number — put only the server name or IP in Host and the port in the Port field"
                 ))
             })?;
             (a.trim(), Some(parsed))
@@ -424,13 +428,15 @@ pub fn normalise_mssql_host(
     };
 
     if addr.is_empty() {
-        return Err(QueryError::msg(
+        return Err(QueryError::msg(tr!(
             "MSSQL: v poli Host je jen port — doplň jméno serveru nebo IP",
-        ));
+            "MSSQL: the Host field contains only a port — add the server name or IP"
+        )));
     }
     if addr.chars().any(char::is_whitespace) {
-        return Err(QueryError::msg(format!(
-            "MSSQL: Host „{addr}“ obsahuje mezeru — adresa serveru žádnou mít nemůže"
+        return Err(QueryError::msg(trf!(
+            "MSSQL: Host „{addr}“ obsahuje mezeru — adresa serveru žádnou mít nemůže",
+            "MSSQL: Host “{addr}” contains a space — a server address cannot"
         )));
     }
 
@@ -441,8 +447,9 @@ pub fn normalise_mssql_host(
         (Some(from_host), Some(from_field))
             if from_host != from_field && from_field != DEFAULT_MSSQL_PORT =>
         {
-            return Err(QueryError::msg(format!(
-                "MSSQL: port je zadaný dvakrát a pokaždé jinak — v Hostu {from_host},                  v poli Port {from_field}. Nech ho jen na jednom místě."
+            return Err(QueryError::msg(trf!(
+                "MSSQL: port je zadaný dvakrát a pokaždé jinak — v Hostu {from_host},                  v poli Port {from_field}. Nech ho jen na jednom místě.",
+                "MSSQL: the port is given twice and differs — {from_host} in Host, {from_field} in Port. Keep it in one place only."
             )))
         }
         (Some(from_host), _) => from_host,
@@ -462,15 +469,17 @@ pub fn mssql_config_from_config(
     // downgrade path. Fail honest; same message pattern as the
     // backup-over-tunnel gates in main.rs.
     if cfg.ssh.is_some() {
-        return Err(QueryError::msg(
+        return Err(QueryError::msg(tr!(
             "SSH tunel pro MSSQL zatím není podporován — použij přímé připojení",
-        ));
+            "SSH tunnel for MSSQL is not supported yet — use a direct connection"
+        )));
     }
     // §0 non-goal: SQL auth only in v1 (no Trusted_Connection).
     if cfg.user.trim().is_empty() {
-        return Err(QueryError::msg(
+        return Err(QueryError::msg(tr!(
             "MSSQL: zadejte uživatele — ověření přes Windows účet zatím není podporováno",
-        ));
+            "MSSQL: enter a user — Windows account authentication is not supported yet"
+        )));
     }
     let opts = cfg.mssql.clone().unwrap_or_default();
     let (host, port) = normalise_mssql_host(&cfg.host, cfg.port)?;
@@ -528,10 +537,13 @@ pub fn mssql_im002_hint(e: QueryError) -> QueryError {
     }
     QueryError {
         code: e.code.clone(),
-        message: format!(
+        message: trf!(
             "ODBC Driver 18 for SQL Server není nainstalován — stáhněte ho z \
              https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server \
              (nebo v nastavení připojení zadejte název nainstalovaného driveru): {}",
+            "ODBC Driver 18 for SQL Server is not installed — download it from \
+             https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server \
+             (or enter the name of an installed driver in the connection settings): {}",
             e.message
         ),
         position: e.position,
