@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "dbc-cli"
-version = "0.39.1"
+version = "0.40.0"
 dependencies = [
  "dbc-buffer",
  "dbc-connect",
@@ -2290,7 +2290,7 @@ dependencies = [
 
 [[package]]
 name = "dbc-connect"
-version = "0.39.1"
+version = "0.40.0"
 dependencies = [
  "dbc-core",
  "dbc-driver-duckdb",
@@ -2385,7 +2385,7 @@ version = "0.1.0"
 
 [[package]]
 name = "dbc-mcp"
-version = "0.39.1"
+version = "0.40.0"
 dependencies = [
  "async-trait",
  "dbc-buffer",
@@ -2431,7 +2431,7 @@ dependencies = [
 
 [[package]]
 name = "dbc-ui"
-version = "0.39.1"
+version = "0.40.0"
 dependencies = [
  "async-trait",
  "csv",

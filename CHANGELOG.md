@@ -6,6 +6,10 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-10-30
+
+The whole UI can be switched to English, and the result grid is easier to read and resize.
+
 ### Added
 
 - English UI: Settings → „Jazyk / Language" switches between Czech and English; until you pick one, dbc follows the Windows display language (Czech or Slovak Windows → Czech, anything else → English)
