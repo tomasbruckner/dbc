@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dbc-core", "crates/dbc-i18n", "crates/dbc-buffer", "crates/dbc-ui", "crates/dbc-driver-sqlite", "crates/dbc-driver-postgres", "crates/dbc-driver-mssql", "crates/dbc-driver-duckdb", "crates/dbc-state", "crates/dbc-mcp", "crates/dbc-diff", "crates/dbc-connect", "crates/dbc-cli"]
+members = ["crates/dbc-core", "crates/dbc-i18n", "crates/dbc-buffer", "crates/dbc-ui", "crates/dbc-driver-sqlite", "crates/dbc-driver-postgres", "crates/dbc-driver-mssql", "crates/dbc-driver-duckdb", "crates/dbc-state", "crates/dbc-mcp", "crates/dbc-diff", "crates/dbc-connect", "crates/dbc-cli", "crates/dbc-workspace-hack"]
 
 [workspace.package]
 edition = "2021"

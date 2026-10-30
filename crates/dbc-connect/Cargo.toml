@@ -16,6 +16,7 @@ dbc-driver-postgres = { path = "../dbc-driver-postgres" }
 dbc-driver-mssql = { path = "../dbc-driver-mssql" }
 dbc-driver-duckdb = { path = "../dbc-driver-duckdb" }
 tokio.workspace = true
+dbc-workspace-hack = { version = "0.1", path = "../dbc-workspace-hack" }
 
 [dev-dependencies]
 tempfile.workspace = true

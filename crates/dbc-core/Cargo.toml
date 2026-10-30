@@ -13,6 +13,7 @@ async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 serde.workspace = true
+dbc-workspace-hack = { version = "0.1", path = "../dbc-workspace-hack" }
 
 [dev-dependencies]
 serde_json.workspace = true

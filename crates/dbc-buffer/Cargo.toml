@@ -11,6 +11,7 @@ authors.workspace = true
 dbc-core = { path = "../dbc-core" }
 tempfile = "3"
 tokio.workspace = true
+dbc-workspace-hack = { version = "0.1", path = "../dbc-workspace-hack" }
 
 [dev-dependencies]
 criterion = "0.5"

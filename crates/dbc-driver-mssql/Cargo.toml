@@ -22,6 +22,7 @@ async-trait.workspace = true
 odbc-api = { version = "29", default-features = false, features = ["odbc_version_3_80"] }
 # pwchange T1: wipes the UTF-16 old-password buffer in password.rs.
 zeroize.workspace = true
+dbc-workspace-hack = { version = "0.1", path = "../dbc-workspace-hack" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -2268,6 +2268,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "dbc-core",
+ "dbc-workspace-hack",
  "tempfile",
  "tokio",
 ]
@@ -2280,6 +2281,7 @@ dependencies = [
  "dbc-connect",
  "dbc-core",
  "dbc-state",
+ "dbc-workspace-hack",
  "keyring",
  "rpassword",
  "serde_json",
@@ -2299,6 +2301,7 @@ dependencies = [
  "dbc-driver-sqlite",
  "dbc-i18n",
  "dbc-state",
+ "dbc-workspace-hack",
  "tempfile",
  "tokio",
 ]
@@ -2309,6 +2312,7 @@ version = "0.1.0"
 dependencies = [
  "arrow 59.2.0",
  "async-trait",
+ "dbc-workspace-hack",
  "serde",
  "serde_json",
  "tokio",
@@ -2322,6 +2326,7 @@ dependencies = [
  "arrow 59.2.0",
  "dbc-buffer",
  "dbc-core",
+ "dbc-workspace-hack",
  "similar",
 ]
 
@@ -2331,6 +2336,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "dbc-core",
+ "dbc-workspace-hack",
  "duckdb",
  "tempfile",
  "tokio",
@@ -2342,6 +2348,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "dbc-core",
+ "dbc-workspace-hack",
  "odbc-api",
  "testcontainers",
  "testcontainers-modules",
@@ -2356,6 +2363,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dbc-core",
+ "dbc-workspace-hack",
  "futures-util",
  "rust_decimal",
  "rustls",
@@ -2374,6 +2382,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "dbc-core",
+ "dbc-workspace-hack",
  "rusqlite",
  "tempfile",
  "tokio",
@@ -2382,6 +2391,9 @@ dependencies = [
 [[package]]
 name = "dbc-i18n"
 version = "0.1.0"
+dependencies = [
+ "dbc-workspace-hack",
+]
 
 [[package]]
 name = "dbc-mcp"
@@ -2394,6 +2406,7 @@ dependencies = [
  "dbc-driver-postgres",
  "dbc-driver-sqlite",
  "dbc-state",
+ "dbc-workspace-hack",
  "dirs",
  "keyring",
  "rmcp",
@@ -2419,6 +2432,7 @@ dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
  "dbc-i18n",
+ "dbc-workspace-hack",
  "dirs",
  "rand 0.9.5",
  "rusqlite",
@@ -2445,6 +2459,7 @@ dependencies = [
  "dbc-driver-sqlite",
  "dbc-i18n",
  "dbc-state",
+ "dbc-workspace-hack",
  "dirs",
  "gpui",
  "gpui_platform",
@@ -2463,6 +2478,82 @@ dependencies = [
  "winreg",
  "winresource",
  "zeroize",
+]
+
+[[package]]
+name = "dbc-workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "cast",
+ "cc",
+ "chacha20",
+ "chrono",
+ "collections",
+ "crypto-common 0.2.2",
+ "either",
+ "fastrand",
+ "flate2",
+ "form_urlencoded",
+ "futures-channel",
+ "futures-core",
+ "futures-io",
+ "futures-sink",
+ "futures-util",
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
+ "gpui",
+ "half",
+ "hashbrown 0.17.1",
+ "http_client",
+ "httparse",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "indexmap 2.14.0",
+ "log",
+ "memchr",
+ "miniz_oxide",
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "once_cell",
+ "percent-encoding",
+ "postgres-types",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "regex-syntax",
+ "rust_decimal",
+ "rustls",
+ "schemars 1.2.2",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "simd-adler32",
+ "slab",
+ "smallvec",
+ "syn 2.0.119",
+ "syn 3.0.3",
+ "sync_wrapper",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "toml 1.1.4+spec-1.1.0",
+ "tower",
+ "tracing",
+ "tracing-core",
+ "ureq",
+ "url",
+ "uuid",
+ "winapi",
+ "windows-core 0.61.2",
+ "windows-numerics 0.2.0",
+ "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
+ "zerocopy",
 ]
 
 [[package]]

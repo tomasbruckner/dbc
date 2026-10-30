@@ -49,6 +49,7 @@ velopack = "1.2.0"
 # master password) in the Windows Credential Manager, entry `dbc-ui` —
 # same crate and version as dbc-cli / dbc-mcp (vault_key.rs).
 keyring = "4"
+dbc-workspace-hack = { version = "0.1", path = "../dbc-workspace-hack" }
 
 # The install folder on the user's PATH from the Velopack hooks (user_path.rs):
 # HKCU\Environment read and written raw, so REG_EXPAND_SZ stays what it is.

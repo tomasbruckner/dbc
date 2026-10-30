@@ -31,6 +31,7 @@ dirs.workspace = true
 keyring = "4"
 rpassword = "7"
 zeroize.workspace = true
+dbc-workspace-hack = { version = "0.1", path = "../dbc-workspace-hack" }
 
 [dev-dependencies]
 tempfile.workspace = true

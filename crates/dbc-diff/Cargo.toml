@@ -12,3 +12,4 @@ dbc-core = { path = "../dbc-core" }
 dbc-buffer = { path = "../dbc-buffer" }
 arrow.workspace = true
 similar.workspace = true
+dbc-workspace-hack = { version = "0.1", path = "../dbc-workspace-hack" }
