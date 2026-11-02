@@ -3324,7 +3324,7 @@ impl AppView {
     /// reaching `run_query_with`, so intercepting here covers all three
     /// with one change rather than duplicating the check at each call site.
     fn run_query(&mut self, bypass_auto_limit: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let sql = self.editor().sql.read(cx).text();
+        let sql = self.editor().sql.read(cx).run_text();
         if sql.trim().is_empty() {
             return;
         }
@@ -4537,7 +4537,7 @@ impl AppView {
         if targets.is_empty() {
             return;
         }
-        let sql = self.editor().sql.read(cx).text();
+        let sql = self.editor().sql.read(cx).run_text();
         if sql.trim().is_empty() {
             return;
         }
@@ -6070,7 +6070,7 @@ impl AppView {
         if self.editor().cancel.is_some() {
             return;
         }
-        let sql = self.editor().sql.read(cx).text().to_string();
+        let sql = self.editor().sql.read(cx).run_text().to_string();
         if sql.trim().is_empty() {
             return;
         }
@@ -14257,29 +14257,39 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                             .child("✕")
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 cx.stop_propagation();
-                                // G5 Task 4 (folded T3 review issue 2 —
-                                // dirty guard): closing a dirty tab would
-                                // silently drop its staged edits.
-                                if let Some(n) = view.dirty_change_count_for_tab_id(id, cx) {
-                                    view.discard_confirm = Some(DiscardConfirmState {
-                                        change_count: n,
-                                        action: PendingDiscard::CloseTab { id },
-                                    });
-                                    // UX-polish §1.4: no-input prompt,
-                                    // cx-only site — defer focus to
-                                    // `AppView::render` via `modal_needs_focus`.
-                                    view.modal_needs_focus = true;
-                                    cx.notify();
-                                    return;
-                                }
-                                view.cancel_run_if_multi_target_tab(id);
-                                view.editor_mut().results.close(id);
-                                cx.notify();
+                                view.request_close_result_tab(id, cx);
                             })),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Middle,
+                        cx.listener(move |view, _: &MouseUpEvent, _, cx| {
+                            cx.stop_propagation();
+                            view.request_close_result_tab(id, cx);
+                        }),
                     ),
             );
         }
         strip
+    }
+
+    /// ✕ or middle click on a result tab.
+    fn request_close_result_tab(&mut self, id: u64, cx: &mut Context<Self>) {
+        // G5 Task 4 (folded T3 review issue 2 — dirty guard): closing a
+        // dirty tab would silently drop its staged edits.
+        if let Some(n) = self.dirty_change_count_for_tab_id(id, cx) {
+            self.discard_confirm = Some(DiscardConfirmState {
+                change_count: n,
+                action: PendingDiscard::CloseTab { id },
+            });
+            // UX-polish §1.4: no-input prompt, cx-only site — defer focus
+            // to `AppView::render` via `modal_needs_focus`.
+            self.modal_needs_focus = true;
+            cx.notify();
+            return;
+        }
+        self.cancel_run_if_multi_target_tab(id);
+        self.editor_mut().results.close(id);
+        cx.notify();
     }
 
     /// Only the active tab's content renders. `Grid` tabs render their own
@@ -15957,6 +15967,13 @@ impl Render for AppView {
                                     cx.stop_propagation();
                                     view.close_editor_tab(id, cx);
                                 })),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Middle,
+                            cx.listener(move |view, _: &MouseUpEvent, _, cx| {
+                                cx.stop_propagation();
+                                view.close_editor_tab(id, cx);
+                            }),
                         ),
                 );
             }

@@ -167,6 +167,13 @@ pub fn bind_keys(cx: &mut App) {
 /// buffer's own cursor — duplicated here (rather than added to
 /// text_model.rs) because the model's public surface is frozen for this
 /// task; see the file header.
+fn run_text_of(text: &str, selection: Option<Range<usize>>) -> String {
+    match selection.and_then(|r| text.get(r)) {
+        Some(sel) if !sel.trim().is_empty() => sel.to_string(),
+        _ => text.to_string(),
+    }
+}
+
 fn line_col_of(text: &str, offset: usize) -> (usize, usize) {
     let mut line = 0usize;
     let mut col = 0usize;
@@ -526,6 +533,12 @@ impl SqlInput {
     /// Real multiline text — no newline-to-space substitution.
     pub fn text(&self) -> String {
         self.buffer.text().to_string()
+    }
+
+    /// What Run / Explain execute: the selected text when the selection
+    /// holds anything but whitespace, otherwise the whole buffer.
+    pub fn run_text(&self) -> String {
+        run_text_of(self.buffer.text(), self.buffer.selection())
     }
 
     /// Replaces the whole buffer, destroying whatever the user had typed —
@@ -1558,6 +1571,25 @@ mod theme_audit {
         assert!(body.contains(".text_color(cx.theme().syntax.identifier)"));
         assert!(body.contains("cx.theme().bg_input_selection"), "selection must be seen on the input");
         assert!(!body.contains("cx.theme().bg_selection;"), "panel tint vanishes on the dark input");
+    }
+}
+
+#[cfg(test)]
+mod run_text_tests {
+    use super::run_text_of;
+
+    #[test]
+    fn a_selection_runs_only_the_selected_text() {
+        let text = "SELECT 1;\nSELECT 2;\nSELECT 3;";
+        assert_eq!(run_text_of(text, Some(10..19)), "SELECT 2;");
+    }
+
+    #[test]
+    fn no_or_blank_selection_runs_everything() {
+        let text = "SELECT 1;\n\nSELECT 2;";
+        assert_eq!(run_text_of(text, None), text);
+        assert_eq!(run_text_of(text, Some(9..11)), text);
+        assert_eq!(run_text_of(text, Some(3..3)), text);
     }
 }
 

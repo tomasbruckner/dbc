@@ -142,11 +142,24 @@ pub fn cursor_context(text: &str, cursor: usize) -> CursorContext {
     // boundary immediately preceding `start`.
     let qualifier = if start > 0 && text.as_bytes()[start - 1] == b'.' {
         let dot = start - 1;
-        let qbegin = walk_ident_prefix_start(text, dot);
-        if qbegin < dot {
-            Some(text[qbegin..dot].to_string())
+        let before = &text[..dot];
+        // `"orders".` / `[orders].` — the editor's own completion writes
+        // quoted names, so the dot after one has to work too.
+        let quoted = match before.as_bytes().last() {
+            Some(b'"') => Some('"'),
+            Some(b']') => Some('['),
+            _ => None,
+        };
+        if let Some(open) = quoted {
+            let inner = &before[..before.len() - 1];
+            inner.rfind(open).map(|p| inner[p + 1..].to_string()).filter(|q| !q.is_empty())
         } else {
-            None
+            let qbegin = walk_ident_prefix_start(text, dot);
+            if qbegin < dot {
+                Some(text[qbegin..dot].to_string())
+            } else {
+                None
+            }
         }
     } else {
         None
@@ -199,15 +212,19 @@ fn rank_and_cap(mut items: Vec<(u8, u8, u8, usize, Candidate)>) -> Vec<Candidate
     items.into_iter().take(MAX_CANDIDATES).map(|i| i.4).collect()
 }
 
-const KIND_TIER_SCHEMA_OBJECT: u8 = 0;
-const KIND_TIER_KEYWORD: u8 = 1;
+const KIND_TIER_COLUMN: u8 = 0;
+const KIND_TIER_SCHEMA_OBJECT: u8 = 1;
+const KIND_TIER_KEYWORD: u8 = 2;
 
+/// `columns` are already-scored bare-column rows (empty when the cursor is
+/// not where a column goes); they rank with everything else.
 fn keyword_and_table_candidates(
     prefix: &str,
     snapshot: Option<&SchemaSnapshot>,
     dialect: Dialect,
+    columns: Vec<(u8, u8, u8, usize, Candidate)>,
 ) -> Vec<Candidate> {
-    let mut scored: Vec<(u8, u8, u8, usize, Candidate)> = Vec::new();
+    let mut scored = columns;
 
     for (idx, kw) in KEYWORDS.iter().enumerate() {
         if let Some((mt, ct)) = match_score(kw, prefix) {
@@ -431,7 +448,16 @@ fn resolve_qualifier_table<'a>(
         .iter()
         .find(|(k, _)| k.to_lowercase() == qualifier_lower)
         .map(|(_, v)| v.clone())?;
+    resolve_table_ref(text, &target, snapshot)
+}
 
+/// The snapshot table a `FROM`/`JOIN` reference means, or `None` when that
+/// is not knowable (CTE shadowing, ambiguity, not in the snapshot).
+fn resolve_table_ref<'a>(
+    text: &str,
+    target: &TableRef,
+    snapshot: &'a SchemaSnapshot,
+) -> Option<&'a TableInfo> {
     // CTE shadowing (review round 1, finding 3): `resolve_aliases` is a
     // schema-blind text scan — it happily self-maps `FROM x` even when `x`
     // is actually a CTE name, not a real table. A CTE's result shape isn't
@@ -558,6 +584,124 @@ fn column_candidates(
     rank_and_cap(scored)
 }
 
+/// Words after which a TABLE name goes, not a column.
+const TABLE_POSITION_KEYWORDS: &[&str] = &["FROM", "JOIN", "INTO", "UPDATE", "TABLE"];
+
+/// True when the last clause keyword before `cursor` is one after which a
+/// column makes sense (`SELECT`, `WHERE`, `ON`, `SET`, ...), not a table.
+fn in_column_position(text: &str, cursor: usize) -> bool {
+    let masked = mask_for_source_scan(&text[..cursor]);
+    let chars: Vec<char> = masked.chars().collect();
+    let mut last_kw: Option<String> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '[' {
+            i = chars[i..].iter().position(|c| *c == ']').map_or(chars.len(), |p| i + p + 1);
+            continue;
+        }
+        if !is_ident_start(chars[i]) {
+            i += 1;
+            continue;
+        }
+        let Some((word, j)) = read_word(&chars, i) else { break };
+        let upper = word.to_uppercase();
+        // The word under the cursor is the prefix being typed, not a
+        // keyword the user has finished.
+        if j < chars.len() && (KEYWORDS.contains(&upper.as_str()) || is_alias_stopword(&upper)) {
+            last_kw = Some(upper);
+        }
+        i = j;
+    }
+    last_kw.is_some_and(|k| !TABLE_POSITION_KEYWORDS.contains(&k.as_str()))
+}
+
+/// Columns of every table the statement's `FROM`/`JOIN` names — the
+/// unqualified `SELECT tot|` / `WHERE st|` case. A table that cannot be
+/// pinned down (subquery, CTE, ambiguous name) contributes nothing; a
+/// subquery anywhere makes the scan refuse, so nothing is offered then.
+/// One row per column NAME: the same name in two tables is one thing to
+/// type, and the label says which tables have it.
+fn bare_column_candidates(
+    text: &str,
+    prefix: &str,
+    snapshot: Option<&SchemaSnapshot>,
+    dialect: Dialect,
+) -> Vec<(u8, u8, u8, usize, Candidate)> {
+    let Some(snapshot) = snapshot else { return Vec::new() };
+    let Some(sources) = sources_in_order(text) else { return Vec::new() };
+    let mut by_name: Vec<(String, Vec<String>, u8, u8)> = Vec::new();
+    for src in &sources {
+        let Some(table) = resolve_table_ref(text, &src.table, snapshot) else { continue };
+        for col in &table.columns {
+            let Some((mt, ct)) = match_score(&col.name, prefix) else { continue };
+            match by_name.iter_mut().find(|(n, ..)| n.eq_ignore_ascii_case(&col.name)) {
+                Some((_, owners, ..)) => {
+                    if !owners.iter().any(|o| o == src.qualifier()) {
+                        owners.push(src.qualifier().to_string());
+                    }
+                }
+                None => by_name.push((col.name.clone(), vec![src.qualifier().to_string()], mt, ct)),
+            }
+        }
+    }
+    by_name
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (name, owners, mt, ct))| {
+            (
+                mt,
+                ct,
+                KIND_TIER_COLUMN,
+                idx,
+                Candidate {
+                    insert: dbc_core::quote_ident_d(dialect, &name),
+                    label: format!("{name}  —  {}", owners.join(", ")),
+                    text: name,
+                    kind: CandidateKind::Column,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Byte range of the statement `cursor` sits in: between the `;`s around
+/// it, ignoring any inside strings, quoted names and comments. Completion
+/// looks only at this — another statement in the same tab reusing an alias,
+/// or holding a subquery, used to switch it off for the whole editor.
+fn statement_span(text: &str, cursor: usize) -> std::ops::Range<usize> {
+    let mut start = 0;
+    let mut quote: Option<char> = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut iter = text.char_indices().peekable();
+    while let Some((i, c)) = iter.next() {
+        let next = iter.peek().map(|(_, n)| *n);
+        if line_comment {
+            line_comment = c != '\n';
+        } else if block_comment {
+            if c == '*' && next == Some('/') {
+                iter.next();
+                block_comment = false;
+            }
+        } else if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else {
+            match c {
+                '\'' | '"' => quote = Some(c),
+                '[' => quote = Some(']'),
+                '-' if next == Some('-') => line_comment = true,
+                '/' if next == Some('*') => block_comment = true,
+                ';' if i < cursor => start = i + 1,
+                ';' => return start..i,
+                _ => {}
+            }
+        }
+    }
+    start..text.len()
+}
+
 /// True if the identifier prefix `cursor_context` would compute at `cursor`
 /// is immediately preceded by an (unclosed, from this local check's point of
 /// view) `"` — review round 3, MAJOR 2: tree-sitter's `suppresses_completion`
@@ -612,6 +756,11 @@ pub fn candidates_d(
         return Vec::new();
     }
 
+    // Everything below sees only the statement under the cursor.
+    let span = statement_span(text, cursor.min(text.len()));
+    let cursor = cursor.min(text.len()) - span.start;
+    let text = &text[span];
+
     // Checked unconditionally (even under `force`, review round 3 MAJOR 2):
     // a Ctrl+Space accept still goes through `completion_edit`'s REAL
     // `cursor_context`-derived range, not `force`'s empty-prefix bypass, so
@@ -664,7 +813,7 @@ pub fn candidates_d(
         if !out.is_empty() {
             let taken: HashSet<String> =
                 out.iter().filter_map(|c| c.text.split(' ').next().map(str::to_string)).collect();
-            for c in keyword_and_table_candidates(&prefix, snapshot, dialect) {
+            for c in keyword_and_table_candidates(&prefix, snapshot, dialect, Vec::new()) {
                 if out.len() >= MAX_CANDIDATES {
                     break;
                 }
@@ -677,7 +826,12 @@ pub fn candidates_d(
         }
     }
 
-    keyword_and_table_candidates(&prefix, snapshot, dialect)
+    let columns = if in_column_position(text, cursor) {
+        bare_column_candidates(text, &prefix, snapshot, dialect)
+    } else {
+        Vec::new()
+    };
+    keyword_and_table_candidates(&prefix, snapshot, dialect, columns)
 }
 
 // --- Alias resolution ---
@@ -795,6 +949,19 @@ fn insert_alias(map: &mut HashMap<String, TableRef>, key: String, value: TableRe
 /// NOT used for `cte_names` — see `mask_for_cte_scan` below, which needs a
 /// different tradeoff (quoted identifier content stays visible).
 pub(crate) fn mask_strings_and_comments(text: &str) -> String {
+    mask_impl(text, false)
+}
+
+/// The `FROM`/`JOIN` scan's mask: strings and comments blanked as above,
+/// but a double-quoted identifier kept, re-spelled in brackets
+/// (`"orders"` -> `[orders]`) so `read_word` reads it like a T-SQL name.
+/// Blanking it is what made `FROM "orders" o` bind `o` to a table called
+/// `o` — and on postgres the editor's own completion inserts `"orders"`.
+fn mask_for_source_scan(text: &str) -> String {
+    mask_impl(text, true)
+}
+
+fn mask_impl(text: &str, keep_quoted: bool) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(chars.len());
     let mut i = 0usize;
@@ -860,11 +1027,11 @@ pub(crate) fn mask_strings_and_comments(text: &str) -> String {
                     continue;
                 }
                 in_double = false;
-                out.push(' ');
+                out.push(if keep_quoted { ']' } else { ' ' });
                 i += 1;
                 continue;
             }
-            out.push(if c == '\n' { '\n' } else { ' ' });
+            out.push(if c == '\n' || (keep_quoted && c != ']') { c } else { ' ' });
             i += 1;
             continue;
         }
@@ -878,7 +1045,7 @@ pub(crate) fn mask_strings_and_comments(text: &str) -> String {
         }
         if c == '"' {
             in_double = true;
-            out.push(' ');
+            out.push(if keep_quoted { '[' } else { ' ' });
             i += 1;
             continue;
         }
@@ -1082,13 +1249,18 @@ impl Source {
 /// a shape this module does not model, and every caller would rather offer
 /// nothing than something wrong.
 pub fn sources_in_order(text: &str) -> Option<Vec<Source>> {
-    let masked = mask_strings_and_comments(text);
+    let masked = mask_for_source_scan(text);
     let chars: Vec<char> = masked.chars().collect();
     let len = chars.len();
     let mut out: Vec<Source> = Vec::new();
     let mut i = 0usize;
 
     while i < len {
+        // A quoted/bracketed name is never a keyword: `"from"` is a column.
+        if chars[i] == '[' {
+            i = chars[i..].iter().position(|c| *c == ']').map_or(len, |p| i + p + 1);
+            continue;
+        }
         if !is_ident_start(chars[i]) {
             i += 1;
             continue;
@@ -1397,13 +1569,86 @@ mod tests {
         assert!(cs.iter().all(|c| c.kind != CandidateKind::Column));
     }
 
+    fn at(sql: &str, marker: &str) -> usize {
+        sql.find(marker).expect("marker") + marker.len()
+    }
+
+    fn columns(cs: &[Candidate]) -> Vec<&str> {
+        cs.iter().filter(|c| c.kind == CandidateKind::Column).map(|c| c.text.as_str()).collect()
+    }
+
+    /// User report 2026-11-02 („napovídání moc nefunguje"): on postgres the
+    /// editor itself inserts `"orders"`, and the scan blanked quoted names,
+    /// so `FROM "orders" o` bound `o` to a table called `o`.
     #[test]
-    fn unqualified_bare_column_completion_is_a_non_goal_returns_no_columns() {
-        // design §2: bare column completion is explicitly out of scope for v1.
+    fn a_quoted_table_name_still_binds_its_alias() {
+        let sql = "SELECT o. FROM \"orders\" o";
+        let cs = candidates(sql, at(sql, "o."), Some(&snapshot_one_schema()), false, false);
+        assert_eq!(columns(&cs), ["id", "total"]);
+    }
+
+    #[test]
+    fn a_quoted_qualifier_before_the_dot_offers_columns() {
+        let sql = "SELECT \"orders\". FROM \"orders\"";
+        let ctx = cursor_context(sql, at(sql, "\"orders\"."));
+        assert_eq!(ctx.qualifier.as_deref(), Some("orders"));
+        let cs = candidates(sql, at(sql, "\"orders\"."), Some(&snapshot_one_schema()), false, false);
+        assert_eq!(columns(&cs), ["id", "total"]);
+    }
+
+    #[test]
+    fn a_quoted_keyword_lookalike_is_not_a_from() {
+        let sql = "SELECT \"from\" x, o. FROM orders o";
+        let cs = candidates(sql, at(sql, "o."), Some(&snapshot_one_schema()), false, false);
+        assert_eq!(columns(&cs), ["id", "total"]);
+    }
+
+    /// Several statements in one tab: another statement's aliases or
+    /// subqueries are not this one's business.
+    #[test]
+    fn only_the_statement_under_the_cursor_binds_aliases() {
+        let sql = "SELECT o. FROM orders o;\nSELECT * FROM users o;\nSELECT * FROM (SELECT 1) q;";
+        let cs = candidates(sql, at(sql, "o."), Some(&snapshot_one_schema()), false, false);
+        assert_eq!(columns(&cs), ["id", "total"]);
+    }
+
+    #[test]
+    fn a_semicolon_inside_a_string_does_not_split_the_statement() {
+        let sql = "SELECT o. FROM orders o WHERE o.total <> ';'";
+        let cs = candidates(sql, at(sql, "o."), Some(&snapshot_one_schema()), false, false);
+        assert_eq!(columns(&cs), ["id", "total"]);
+    }
+
+    #[test]
+    fn bare_column_completion_offers_the_from_tables_columns() {
         let sql = "SELECT tot FROM orders";
-        let cursor = 10; // inside "tot"
-        let cs = candidates(sql, cursor, Some(&snapshot_one_schema()), false, false);
-        assert!(cs.iter().all(|c| c.kind != CandidateKind::Column));
+        let cs = candidates(sql, at(sql, "tot"), Some(&snapshot_one_schema()), false, false);
+        assert_eq!(cs.first().map(|c| (&c.kind, c.text.as_str())), Some((&CandidateKind::Column, "total")));
+        assert_eq!(cs[0].insert, "\"total\"");
+    }
+
+    #[test]
+    fn bare_columns_follow_aliases_and_where() {
+        let sql = "SELECT * FROM orders o WHERE to";
+        let cs = candidates(sql, sql.len(), Some(&snapshot_one_schema()), false, false);
+        assert_eq!(columns(&cs), ["total"]);
+    }
+
+    #[test]
+    fn no_bare_columns_where_a_table_name_goes() {
+        let sql = "SELECT * FROM orders o JOIN ord";
+        let cs = candidates(sql, sql.len(), Some(&snapshot_one_schema()), false, false);
+        assert!(columns(&cs).is_empty());
+        let sql = "SELECT * FROM ord";
+        let cs = candidates(sql, sql.len(), Some(&snapshot_one_schema()), false, false);
+        assert!(columns(&cs).is_empty());
+    }
+
+    #[test]
+    fn no_bare_columns_when_the_from_is_a_subquery() {
+        let sql = "SELECT tot FROM (SELECT 1) x";
+        let cs = candidates(sql, at(sql, "tot"), Some(&snapshot_one_schema()), false, false);
+        assert!(columns(&cs).is_empty());
     }
 
     #[test]
@@ -1478,6 +1723,52 @@ mod tests {
         for c in &cs {
             assert!(!c.text.contains('.'), "would double the schema: {:?}", c.text);
             assert!(!c.label.contains('.'), "label repeats what was typed: {:?}", c.label);
+        }
+    }
+
+    /// User 2026-11-02: „musí fungovat i schemata typu dbo. nebo "dbo".".
+    #[test]
+    fn a_quoted_or_bracketed_schema_qualifier_offers_that_schemas_tables() {
+        let snap = snapshot_dbo_and_sales();
+        for sql in [
+            "SELECT * FROM \"dbo\".",
+            "SELECT * FROM [dbo].",
+            "SELECT * FROM DBO.",
+            "SELECT * FROM \"dbo\".ord",
+            "SELECT * FROM [dbo].ord",
+        ] {
+            assert!(cursor_context(sql, sql.len()).qualifier.is_some(), "popup would not open: {sql}");
+            let cs = candidates(sql, sql.len(), Some(&snap), false, false);
+            let names: Vec<&str> = cs.iter().map(|c| c.text.as_str()).collect();
+            assert!(names.contains(&"orders"), "{sql}: {names:?}");
+            assert!(!names.contains(&"regions"), "{sql}: other schema leaked: {names:?}");
+        }
+    }
+
+    #[test]
+    fn a_schema_qualifier_works_with_other_statements_in_the_editor() {
+        let snap = snapshot_dbo_and_sales();
+        let sql = "SELECT * FROM (SELECT 1) x;\nSELECT * FROM dbo.\n;SELECT * FROM sales.regions dbo";
+        let cs = candidates(sql, at(sql, "dbo."), Some(&snap), false, false);
+        let names: Vec<&str> = cs.iter().map(|c| c.text.as_str()).collect();
+        assert!(names.contains(&"orders"), "{names:?}");
+    }
+
+    #[test]
+    fn schema_qualified_tables_in_every_spelling_give_columns() {
+        let snap = snapshot_dbo_and_sales();
+        for sql in [
+            "SELECT o. FROM dbo.orders o",
+            "SELECT o. FROM \"dbo\".\"orders\" o",
+            "SELECT o. FROM [dbo].[orders] o",
+            "SELECT o. FROM \"dbo\".orders AS o",
+        ] {
+            let cs = candidates(sql, at(sql, "o."), Some(&snap), false, false);
+            assert_eq!(columns(&cs), ["id"], "{sql}");
+        }
+        for sql in ["SELECT i FROM dbo.orders", "SELECT i FROM \"dbo\".\"orders\""] {
+            let cs = candidates(sql, at(sql, "SELECT i"), Some(&snap), false, false);
+            assert_eq!(columns(&cs), ["id"], "{sql}");
         }
     }
 
