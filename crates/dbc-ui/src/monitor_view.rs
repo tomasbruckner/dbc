@@ -634,28 +634,25 @@ impl MonitorView {
     /// Read-only query-text overlay (design §5 point 7). Local to this
     /// entity, NOT `AppView::modal` (same reasoning as grid's `cell_detail`
     /// field comment, grid.rs:286-289). Mirrors
-    /// `grid.rs::render_cell_detail_overlay` (grid.rs:1825): a centred
-    /// `.occlude()`d panel with "Kopírovat" + an explicit "Zavřít" close —
-    /// deviation from the plan's prose ("close on backdrop click"): the
-    /// cited precedent it mirrors has no backdrop-click dismissal either
-    /// (only the existing modal overlays in this codebase, e.g.
-    /// `connections_ui::render_modal_overlay`, close via an explicit
-    /// button), so this follows the ACTUAL precedent rather than the
-    /// prose description.
+    /// `grid.rs::render_cell_detail_overlay`: a `modal::frame` dialog with
+    /// no inset and a filling body (the text clips, "Kopírovat" + "Zavřít"
+    /// stay pinned). Closed by the explicit "Zavřít" (or Esc), not by a
+    /// backdrop click — only about / shortcuts close on a click.
     fn render_detail_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = *cx.theme();
         let text = self.detail.clone()?;
         let text_for_copy = text.clone();
         let panel = div()
+            .flex_1()
+            .min_h_0()
             .flex()
             .flex_col()
             .child(
-                // Not clipped any more: the frame's body scrolls, so a long
-                // query is readable by scrolling (or by making the dialog
-                // taller) instead of being cut off at the 420 px cap.
                 div()
                     .id("mon-detail-body")
                     .font_family("Consolas")
+                    .flex_1()
+                    .overflow_hidden()
                     .p_2()
                     .text_color(theme.text_primary)
                     .child(text),
@@ -682,7 +679,13 @@ impl MonitorView {
                     ),
             );
 
-        Some(modal::frame("monitor-detail", 560., panel).max_h(420.).into_any_element())
+        Some(
+            modal::frame("monitor-detail", 560., panel)
+                .max_h(420.)
+                .padding(0.)
+                .body_fills()
+                .into_any_element(),
+        )
     }
 }
 

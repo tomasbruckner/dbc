@@ -2017,16 +2017,17 @@ impl PlanView {
         let detail = self.node_detail.as_ref()?;
         let theme = *cx.theme();
         let panel = div()
+            .flex_1()
+            .min_h_0()
             .flex()
             .flex_col()
             .child(
-                // Not clipped any more: the frame's body scrolls, so a long
-                // detail is readable by scrolling (or by making the dialog
-                // taller) instead of being cut off at the 420 px cap.
                 div()
                     .id("plan-node-detail-body")
                     .flex()
                     .flex_col()
+                    .flex_1()
+                    .overflow_hidden()
                     .p_2()
                     .text_color(theme.text_primary)
                     .child(detail.text.clone()),
@@ -2040,7 +2041,15 @@ impl PlanView {
                         })),
                 ),
             );
-        Some(modal::frame("plan-node-detail", 560., panel).max_h(420.).into_any_element())
+        // No inset and a filling body, as before the frame: the text clips,
+        // "Zavřít" stays pinned, a height drag grows the text area.
+        Some(
+            modal::frame("plan-node-detail", 560., panel)
+                .max_h(420.)
+                .padding(0.)
+                .body_fills()
+                .into_any_element(),
+        )
     }
 }
 

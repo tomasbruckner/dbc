@@ -164,10 +164,16 @@ pub(crate) fn frame(id: &'static str, default_w: f32, body: impl IntoElement) ->
         default_w,
         body: body.into_any_element(),
         max_h: None,
+        padding: DEFAULT_PADDING,
+        body_fills: false,
         decorate: None,
         close_on_click: None,
     }
 }
+
+/// The panel's inset when a dialog does not ask for another: `p_4`, what
+/// `ui::panel` gave every form dialog.
+const DEFAULT_PADDING: f32 = 16.0;
 
 type ClickHandler = Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
 
@@ -177,11 +183,31 @@ pub(crate) struct ModalFrame {
     default_w: f32,
     body: AnyElement,
     max_h: Option<f32>,
+    padding: f32,
+    body_fills: bool,
     decorate: Option<Box<dyn FnOnce(Div) -> Div>>,
     close_on_click: Option<ClickHandler>,
 }
 
 impl ModalFrame {
+    /// The panel's inset on all four sides (default 16). A dialog whose
+    /// children carry their own padding — rows highlighted edge to edge,
+    /// a separator under an input — passes 0.
+    pub(crate) fn padding(mut self, p: f32) -> Self {
+        self.padding = p;
+        self
+    }
+
+    /// The body fills the panel's height instead of scrolling as a whole:
+    /// it gets a definite height to lay out in, so a `flex_1` +
+    /// `overflow_hidden` child takes what is left and the rest (an input,
+    /// a footer, the buttons) stays pinned. For dialogs that scroll or clip
+    /// their own content; a height drag grows that `flex_1` part.
+    pub(crate) fn body_fills(mut self) -> Self {
+        self.body_fills = true;
+        self
+    }
+
     /// Cap on the height of a dialog that was never heightened (the window
     /// caps it anyway).
     pub(crate) fn max_h(mut self, cap: f32) -> Self {
@@ -209,7 +235,8 @@ impl ModalFrame {
 
 impl RenderOnce for ModalFrame {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let Self { id, default_w, body, max_h, decorate, close_on_click } = self;
+        let Self { id, default_w, body, max_h, padding, body_fills, decorate, close_on_click } =
+            self;
         let theme = *cx.theme();
         let win = window.viewport_size();
         let state = window.use_keyed_state(format!("modal-drag-{id}"), cx, |_, _| FrameState {
@@ -231,7 +258,7 @@ impl RenderOnce for ModalFrame {
             .relative()
             .flex()
             .flex_col()
-            .p_4()
+            .p(px(padding))
             .text_color(theme.text_primary)
             .w(px(w));
         panel = match h {
@@ -303,8 +330,15 @@ impl RenderOnce for ModalFrame {
         .absolute()
         .size_0();
 
+        // A filling body must itself be `flex_1().min_h_0()` (a flex column)
+        // for the height to reach its own `flex_1` part.
+        let body = if body_fills {
+            div().flex_1().min_h_0().flex().flex_col().child(body).into_any_element()
+        } else {
+            scrollbar::scroll_y(format!("modal-body-{id}"), body).into_any_element()
+        };
         let panel = panel
-            .child(scrollbar::scroll_y(format!("modal-body-{id}"), body))
+            .child(body)
             .child(right)
             .child(bottom)
             .child(corner)
@@ -458,6 +492,11 @@ mod frame_tests {
         close: Option<Rc<Cell<usize>>>,
         /// Counts right mouse-downs seen by a `.decorate` listener.
         decorated: Option<Rc<Cell<usize>>>,
+        padding: Option<f32>,
+        /// `.body_fills()`, with a body made of a `flex_1` +
+        /// `overflow_hidden` part holding 2000 px of content (probed as
+        /// `body`) and a 30 px footer probed here.
+        fills_with_footer: Option<Probe>,
     }
 
     struct View {
@@ -468,18 +507,36 @@ mod frame_tests {
 
     impl Render for View {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            fn probed(p: Probe) -> impl IntoElement {
+                canvas(move |b, _, _| p.set(Some(b)), |_, _, _, _| {}).absolute().size_full()
+            }
             let probe = self.body.clone();
-            let body = crate::ui::panel_body()
-                .w_full()
-                .h(px(if self.setup.tall { 2000. } else { 200. }))
-                .child(
-                    canvas(move |b, _, _| probe.set(Some(b)), |_, _, _, _| {})
-                        .absolute()
-                        .size_full(),
-                );
-            let mut f = frame("t", 400., body);
+            let mut f = match self.setup.fills_with_footer.clone() {
+                Some(footer) => {
+                    let content = div().w_full().h(px(2000.)).flex_shrink_0().child(probed(probe));
+                    let body = div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .child(div().flex_1().overflow_hidden().child(content))
+                        .child(div().relative().h(px(30.)).flex_shrink_0().child(probed(footer)));
+                    frame("t", 400., body).body_fills()
+                }
+                None => frame(
+                    "t",
+                    400.,
+                    crate::ui::panel_body()
+                        .w_full()
+                        .h(px(if self.setup.tall { 2000. } else { 200. }))
+                        .child(probed(probe)),
+                ),
+            };
             if let Some(cap) = self.setup.max_h {
                 f = f.max_h(cap);
+            }
+            if let Some(p) = self.setup.padding {
+                f = f.padding(p);
             }
             if let Some(n) = self.setup.close.clone() {
                 f = f.close_on_click(move |_, _, _| n.set(n.get() + 1));
@@ -647,6 +704,56 @@ mod frame_tests {
             open(cx, Setup { decorated: Some(n.clone()), ..Setup::default() });
         cx.simulate_mouse_down(at(500., 100.), MouseButton::Right, Modifiers::none());
         assert_eq!(n.get(), 1);
+    }
+
+    /// Panel x is 300 (400 wide in a 1000 window) plus a 1 px border: the
+    /// body starts at 317 by default (panel 400 x 234, y 283) and at the
+    /// border edge with `.padding(0.)`.
+    #[gpui::test]
+    fn padding_default_is_16(cx: &mut TestAppContext) {
+        let Opened { body, .. } = open(cx, Setup::default());
+        let b = body.get().expect("body painted");
+        assert_eq!((f32::from(b.origin.x), f32::from(b.origin.y)), (317., 300.));
+    }
+
+    #[gpui::test]
+    fn padding_option_changes_the_panel_inset(cx: &mut TestAppContext) {
+        let Opened { body, .. } = open(cx, Setup { padding: Some(0.), ..Setup::default() });
+        let b = body.get().expect("body painted");
+        // 200 tall body + 2 border: panel y 299..501, body from 300.
+        assert_eq!((f32::from(b.origin.x), f32::from(b.origin.y)), (301., 300.));
+        assert_eq!(f32::from(b.size.width), 398., "body runs border to border");
+    }
+
+    /// A filling body lays out inside the capped panel (300 tall: y
+    /// 250..550) with its footer pinned at the bottom, and nothing scrolls
+    /// it as a whole.
+    #[gpui::test]
+    fn body_fills_does_not_scroll_and_pins_a_footer(cx: &mut TestAppContext) {
+        let footer: Probe = Rc::new(Cell::new(None));
+        let setup =
+            Setup { max_h: Some(300.), fills_with_footer: Some(footer.clone()), ..Setup::default() };
+        let Opened { mut cx, body, .. } = open(cx, setup);
+        let f0 = footer.get().expect("footer painted");
+        let c0 = body.get().expect("content painted");
+        let bottom = f32::from(f0.origin.y + f0.size.height);
+        // Panel 250..550, minus 1 border and 16 padding.
+        assert_eq!(bottom, 533., "footer pinned to the panel's inner bottom: {f0:?}");
+        assert_eq!(f32::from(c0.origin.y), 267., "content starts at the inner top");
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: at(500., 400.),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-200.))),
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: f0.center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-200.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        assert_eq!(footer.get(), Some(f0), "the footer did not scroll");
+        assert_eq!(body.get(), Some(c0), "the content did not scroll either");
     }
 }
 

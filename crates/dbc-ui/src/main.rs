@@ -1683,7 +1683,7 @@ struct ApplyDialogState {
     /// `on_open_apply_dialog` can `window.focus` it in the SAME update the
     /// overlay appears in (same convention `render_palette_overlay`'s/the
     /// connection dialogs' own `TextField` focus already follow) and
-    /// `render_apply_dialog_overlay` can `.track_focus` the panel with the
+    /// `render_apply_dialog_overlay` can `.track_focus` the frame with the
     /// SAME handle — without this, focus stays on the SQL editor
     /// underneath, and a stray Enter/keystroke while the dialog is open
     /// would land there instead of being inert. `open_admin_apply_dialog`
@@ -7958,6 +7958,8 @@ impl AppView {
         }
 
         let body = div()
+            .flex_1()
+            .min_h_0()
             .flex()
             .flex_col()
             .child(div().px_2().py_2().border_b_1().border_color(theme.border).child(input))
@@ -7984,8 +7986,13 @@ impl AppView {
         let toggle = cx.listener(Self::on_palette_toggle);
         let toggle_all = cx.listener(Self::on_palette_toggle_all);
         Some(
+            // No inset (the input's separator and the row highlights run
+            // edge to edge) and a filling body: the list clips, the input
+            // and the targets footer stay pinned.
             modal::frame("palette", 560., body)
                 .max_h(420.)
+                .padding(0.)
+                .body_fills()
                 .decorate(move |backdrop| {
                     backdrop
                         .key_context("Palette")
@@ -14594,8 +14601,8 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     }
 
     /// G5 Task 4 (folded T3 review issue 2): the "Neuložené změny ({n}) —
-    /// zahodit?" confirm prompt — same centered-overlay `.occlude()`
-    /// convention as every other modal in this file (`render_modal_overlay`,
+    /// zahodit?" confirm prompt — rendered through `modal::frame` like
+    /// every other modal (`render_modal_overlay`,
     /// `render_palette_overlay`). No text input, so no `window.focus` call
     /// is needed here (unlike those two) — Esc/click are the only ways to
     /// answer it, and Esc is wired in `on_cancel_query`.
@@ -14642,6 +14649,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let focus = self.modal_focus_handle.clone();
         Some(
             modal::frame("discard-confirm", 420., panel)
+                .padding(8.)
                 .decorate(move |backdrop| {
                     // UX-polish §1.4: same shared focus target as
                     // `render_modal_overlay` — holds keyboard focus so stray
@@ -14655,7 +14663,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
     }
 
     /// G5 Task 4, brief contract #1/#3/#4: the Apply confirmation dialog —
-    /// same centered-overlay `.occlude()` shape as every other modal, body
+    /// rendered through `modal::frame` like every other modal, body
     /// reuses the `TabContent::Text`/cell-detail "plain wrapped monospace
     /// lines" pattern (brief: "monospace, scrollable — reuse Text-tab body
     /// pattern"; a `max_h` + `overflow_hidden` block stands in for real
@@ -14752,6 +14760,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         Some(
             modal::frame("apply-changes", 640., panel)
                 .max_h(480.)
+                .padding(8.)
                 .decorate(move |backdrop| {
                     // G5 Task 4 review fix (MINOR 4): same handle
                     // `on_open_apply_dialog` moved `window` focus onto — keeps

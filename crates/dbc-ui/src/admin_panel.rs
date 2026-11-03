@@ -2047,16 +2047,16 @@ impl AdminPanel {
 
     fn render_modal_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = *cx.theme();
-        let modal = self.modal.as_ref()?;
+        let dialog = self.modal.as_ref()?;
         // One dialog id for all four (they share this renderer, so they
         // share a remembered size); each keeps its own default width.
-        let width = match modal {
+        let width = match dialog {
             AdminModal::DropSchema { .. } => 420.,
             AdminModal::NewRole { .. }
             | AdminModal::ChangePassword { .. }
             | AdminModal::NewSchema { .. } => 360.,
         };
-        let panel = match modal {
+        let panel = match dialog {
             AdminModal::NewRole { name, password, login, superuser, createdb, createrole } => {
                 let flags = [
                     (RoleFlagKind::Login, "LOGIN", *login),
@@ -2252,6 +2252,7 @@ impl AdminPanel {
         let prev = cx.listener(Self::on_modal_focus_prev);
         Some(
             modal::frame("admin-dialog", width, panel)
+                .padding(8.)
                 .decorate(move |backdrop| {
                     backdrop
                         .key_context("ModalForm")
@@ -2306,6 +2307,7 @@ impl AdminPanel {
         let focus = self.modal_focus_handle.clone();
         Some(
             modal::frame("admin-discard-confirm", 360., panel)
+                .padding(8.)
                 .decorate(move |backdrop| {
                     // UX-polish §1.4: same shared focus target as
                     // `render_modal_overlay` — holds keyboard focus. NO key

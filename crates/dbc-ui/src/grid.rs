@@ -19,11 +19,6 @@ use crate::sandbox::{self, EditState, Editable};
 use crate::theme::ActiveTheme;
 use crate::{modal, ui};
 
-/// Height of the cell-detail text block: the 420 px panel cap minus the
-/// frame's padding and border and the button row, so a never-resized
-/// dialog shows as much text as it did before the frame.
-const CELL_DETAIL_TEXT_MAX_H: f32 = 340.0;
-
 pub const ROW_HEIGHT: f32 = 24.0;
 pub const DEFAULT_COL_WIDTH: f32 = 160.0;
 /// G5 Task 3: leftmost per-row affordance column on an editable tab — "✕"
@@ -2138,9 +2133,10 @@ impl ResultGrid {
         panel.into_any_element()
     }
 
-    /// Cell-detail popup (brief contract #3): same centered-overlay shape
-    /// as `connections_ui::render_modal_overlay`/`AppView::render_palette_overlay`
-    /// (`.occlude()` blocks clicks reaching the grid underneath), owned
+    /// Cell-detail popup (brief contract #3): rendered through
+    /// `modal::frame` like every other modal (its backdrop blocks clicks
+    /// reaching the grid underneath), with no inset and a filling body so
+    /// the text takes the panel's height and the buttons stay pinned. Owned
     /// on `ResultGrid` rather than `AppView::modal` since it's tied to this
     /// specific tab's grid (see `cell_detail`'s doc comment). Text is
     /// rendered line-by-line with wheel-driven `scroll_lines`, exactly like
@@ -2157,11 +2153,7 @@ impl ResultGrid {
             .font_family("Consolas")
             .flex()
             .flex_col()
-            // Capped, not `flex_1`: inside the frame's scrolling body there
-            // is no definite height to shrink into, and this block scrolls
-            // itself by line (`scroll_lines`), so it must clip — that keeps
-            // the buttons on screen, as the 420 px panel did before.
-            .max_h(px(CELL_DETAIL_TEXT_MAX_H))
+            .flex_1()
             .overflow_hidden()
             .p_2()
             .text_color(theme.text_primary)
@@ -2183,6 +2175,8 @@ impl ResultGrid {
         }
 
         let panel = div()
+            .flex_1()
+            .min_h_0()
             .flex()
             .flex_col()
             .child(body)
@@ -2201,7 +2195,13 @@ impl ResultGrid {
                 ),
             );
 
-        Some(modal::frame("cell-detail", 560., panel).max_h(420.).into_any_element())
+        Some(
+            modal::frame("cell-detail", 560., panel)
+                .max_h(420.)
+                .padding(0.)
+                .body_fills()
+                .into_any_element(),
+        )
     }
 
     /// G5 Task 3: "✕" gutter click on a real row — toggles that row's
@@ -2467,7 +2467,7 @@ impl ResultGrid {
                 ),
             );
 
-        Some(modal::frame("cell-editor", 480., panel).max_h(360.).into_any_element())
+        Some(modal::frame("cell-editor", 480., panel).max_h(360.).padding(8.).into_any_element())
     }
 
     /// Skips hidden source columns entirely (brief: "header + cells +
