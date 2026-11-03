@@ -70,6 +70,15 @@ pub(crate) fn panel(width: f32, theme: Theme) -> Div {
         .text_color(theme.text_primary)
 }
 
+/// The content column of a dialog: what [`panel`] lays its children out
+/// in, without the surface, width or padding — those are
+/// [`crate::modal::frame`]'s.
+// Used by the modal migration in the next commits; until then only tests.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn panel_body() -> Div {
+    div().flex().flex_col().gap_2()
+}
+
 /// A small floating surface: context menus, dropdowns, hover cards.
 ///
 /// Tighter than [`panel`] on purpose — a menu is a list of short lines and
