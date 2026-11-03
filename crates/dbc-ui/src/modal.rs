@@ -99,6 +99,17 @@ pub(crate) struct ModalSizes(pub BTreeMap<String, ModalSize>);
 
 impl Global for ModalSizes {}
 
+/// What to write to `config.toml` after the store changed: the whole map when
+/// it differs from `saved`, `None` when there is nothing to save. The store
+/// is seeded from the config at startup, so it is a superset of what was
+/// loaded and unknown dialog ids survive without any merging.
+pub(crate) fn sizes_to_persist(
+    store: &ModalSizes,
+    saved: &BTreeMap<String, ModalSize>,
+) -> Option<BTreeMap<String, ModalSize>> {
+    (store.0 != *saved).then(|| store.0.clone())
+}
+
 /// Above every other deferred layer (menus use 1).
 const MODAL_PRIORITY: usize = 10;
 /// Thickness of the edge handles; the corner is twice this square.
@@ -636,5 +647,39 @@ mod frame_tests {
             open(cx, Setup { decorated: Some(n.clone()), ..Setup::default() });
         cx.simulate_mouse_down(at(500., 100.), MouseButton::Right, Modifiers::none());
         assert_eq!(n.get(), 1);
+    }
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+
+    fn map(entries: &[(&str, u16, Option<u16>)]) -> BTreeMap<String, ModalSize> {
+        entries.iter().map(|(k, w, h)| (k.to_string(), ModalSize { w: *w, h: *h })).collect()
+    }
+
+    #[test]
+    fn sizes_to_persist_none_when_equal() {
+        let saved = map(&[("a", 500, Some(300))]);
+        assert_eq!(sizes_to_persist(&ModalSizes(saved.clone()), &saved), None);
+    }
+
+    #[test]
+    fn sizes_to_persist_some_when_changed() {
+        let saved = map(&[("a", 500, Some(300))]);
+        let store = ModalSizes(map(&[("a", 600, Some(300))]));
+        assert_eq!(sizes_to_persist(&store, &saved), Some(store.0.clone()));
+    }
+
+    #[test]
+    fn sizes_to_persist_keeps_unknown_keys() {
+        // The store is seeded from config, so a key no dialog uses is still in
+        // it and survives a round in which another dialog changed.
+        let saved = map(&[("old-dialog", 410, None), ("a", 500, None)]);
+        let mut store = ModalSizes(saved.clone());
+        store.0.insert("a".into(), ModalSize { w: 520, h: Some(250) });
+        let out = sizes_to_persist(&store, &saved).expect("changed");
+        assert_eq!(out.get("old-dialog"), Some(&ModalSize { w: 410, h: None }));
+        assert_eq!(out.get("a"), Some(&ModalSize { w: 520, h: Some(250) }));
     }
 }

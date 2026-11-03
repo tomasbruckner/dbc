@@ -7226,7 +7226,24 @@ impl AppView {
         cx.notify();
     }
 
-    fn on_show_history(&mut self, _: &ShowHistory, _window: &mut Window, cx: &mut Context<Self>) {
+    /// The `ModalSizes` global changed (a dialog drag ended with a new size):
+    /// write it to `config.toml`. The frame only writes the global on drag
+    /// END and only when the size changed, so this never runs mid-drag. On a
+    /// failed save the size stays for the session and the status says why.
+    fn persist_modal_sizes(&mut self, cx: &mut Context<Self>) {
+        let Some(sizes) = modal::sizes_to_persist(cx.global::<modal::ModalSizes>(), &self.config.modal_sizes) else {
+            return;
+        };
+        self.config.modal_sizes = sizes;
+        if let Some(guard) = self.guard_corrupt_config(cx) {
+            if let Err(e) = self.config.save(&self.config_path, &guard) {
+                self.editor_mut().status = trf!("error: velikost dialogu se nepodařilo uložit: {e}", "error: could not save dialog size: {e}");
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_show_history(&mut self, _: &ShowHistory,_window: &mut Window, cx: &mut Context<Self>) {
         self.open_history_tab(cx);
     }
 
@@ -16742,6 +16759,9 @@ fn main() {
         // every render() can read cx.theme(). `config.theme` is Copy; `config`
         // itself moves into the window closure below untouched.
         cx.set_global(theme::Theme::from_mode(config.theme));
+        // The remembered dialog sizes, seeded from the config so the store is
+        // always a superset of what was loaded (unknown ids survive a save).
+        cx.set_global(modal::ModalSizes(config.modal_sizes.clone()));
         // The UI language, for the same reason and at the same moment: the
         // very first frame must already be in it.
         apply_language(&config);
@@ -16907,6 +16927,8 @@ fn main() {
                         let sidebar_width = sidebar_width_from(config.sidebar_width);
                         let editor_height = editor_height_from(config.editor_height);
                         editors.active_mut().payload.status = status.clone();
+                        cx.observe_global::<modal::ModalSizes>(|view, cx| view.persist_modal_sizes(cx))
+                            .detach();
                         AppView {
                             update: None,
                             update_downloading: None,
@@ -19288,7 +19310,14 @@ mod config_save_guard_audit {
         // Re-audited, not bumped: guarded arm (position-verified by this
         // test's own loop), the same shape as `set_theme` — a deliberate
         // click on a radio, and it writes only when the value changed.
-        assert_eq!(sites, 14, "config.toml writer count changed — re-audit, do not just bump");
+        //
+        // 14 → 15 on 2026-11-03: `persist_modal_sizes` persists the remembered
+        // dialog sizes. Re-audited, not bumped: guarded arm (position-verified
+        // by this test's own loop), the same shape as `end_editor_resize`;
+        // the frame sets the `ModalSizes` global on drag END only and only
+        // when the size changed, and `sizes_to_persist` re-checks against the
+        // saved map, so a bare click on a handle writes nothing.
+        assert_eq!(sites, 15, "config.toml writer count changed — re-audit, do not just bump");
     }
 
     /// The widening is only worth anything if it actually reaches past the
