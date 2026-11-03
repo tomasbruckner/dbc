@@ -1411,6 +1411,11 @@ pub enum PendingAfterUnlock {
     /// Cancel drops the run; the tab's `last_targets` already remembers
     /// the set (spec §5).
     RunOnTargets { sql: String, targets: Vec<dbc_connect::targets::Target>, editor_id: u64 },
+    /// „Duplikovat připojení…" on a locked vault: the copy is pre-filled
+    /// with the source's password, which only an unlocked vault can supply.
+    /// Opening it without would leave a copy that cannot log in and no hint
+    /// why. Cancel drops it — nothing was opened yet.
+    DuplicateConnection(String),
     /// App-wide master password UX design §2/§4: the proactive "Odemknout
     /// trezor" palette action has no interrupted action to resume — it
     /// opens the prompt on its own, not as a side effect of some other
@@ -2977,6 +2982,70 @@ impl AppView {
         }
     }
 
+    /// „Duplikovat připojení…". A locked vault is unlocked FIRST, because
+    /// the copy carries the source's password and only the vault has it.
+    pub(crate) fn request_duplicate_connection(
+        &mut self,
+        conn_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal.is_some() {
+            return;
+        }
+        let needs_secret = self
+            .config
+            .connections
+            .iter()
+            .find(|c| c.id == conn_id)
+            .is_some_and(|c| !engine_is_file_based(c.engine));
+        if connect_needs_vault_prompt(needs_secret, self.vault.is_some(), Vault::exists(&self.vault_path)) {
+            let input = cx.new(|cx| TextField::form_field(cx, tr!("Heslo", "Password"), true));
+            let focus = input.focus_handle(cx);
+            self.modal = Some(ModalState::MasterPasswordPrompt {
+                input,
+                error: None,
+                verifying: false,
+                pending: PendingAfterUnlock::DuplicateConnection(conn_id),
+            });
+            window.focus(&focus, cx);
+            cx.notify();
+            return;
+        }
+        self.open_duplicate_connection_dialog(&conn_id, window, cx);
+    }
+
+    /// The same dialog `EditConnection` opens, turned into a NEW one: no
+    /// `editing_id` (so saving mints a fresh id instead of overwriting the
+    /// source), a name that does not collide, and the source's password in
+    /// the password field — saving stores it under the new id like any
+    /// typed password. Everything else is the source's, folder included,
+    /// so the copy lands next to it.
+    pub(crate) fn open_duplicate_connection_dialog(
+        &mut self,
+        conn_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = self.config.connections.iter().find(|c| c.id == conn_id).cloned() else {
+            self.editor_mut().status = tr!("error: připojení už neexistuje", "error: the connection no longer exists").into();
+            cx.notify();
+            return;
+        };
+        let secret = self.vault.as_ref().and_then(|v| v.get_secret(&source.id));
+        let name = duplicate_name(&source.name, self.config.connections.iter().map(|c| c.name.as_str()));
+        self.open_connection_dialog(Some(source), window, cx);
+        if let Some(ModalState::ConnectionDialog(ui)) = &mut self.modal {
+            ui.editing_id = None;
+            let (name_field, password_field) = (ui.name.clone(), ui.password.clone());
+            name_field.update(cx, |f, cx| f.set_text(&name, cx));
+            if let Some(secret) = secret {
+                password_field.update(cx, |f, cx| f.set_text(&secret, cx));
+            }
+            cx.notify();
+        }
+    }
+
     pub(crate) fn close_modal(&mut self, cx: &mut Context<Self>) {
         // G11 T6 binding carry-forward: backstop for every path that closes
         // the modal — cancels a still-`Running` backup/restore's handle
@@ -3850,6 +3919,9 @@ impl AppView {
                     self.run_on_targets_with_sql(editor_id, sql, targets, cx);
                 }
             }
+            PendingAfterUnlock::DuplicateConnection(id) => {
+                self.open_duplicate_connection_dialog(&id, window, cx)
+            }
             // Design §4: the proactive unlock has nothing to resume — just
             // report the unlock itself.
             PendingAfterUnlock::Nothing => {
@@ -4234,6 +4306,20 @@ fn test_connect_spec(cfg: ConnectionConfig, secret: Option<String>) -> Result<Co
 /// `needs_secret` is the caller's own `engine != Sqlite` lookup on the
 /// target connection — this fn doesn't know about connections, only the
 /// three booleans the gate actually reduces to.
+/// The name a duplicated connection starts with: „X (kopie)", then
+/// „X (kopie 2)", … — the first one no saved connection already uses
+/// (case-insensitively, as `dbc query <name>` resolves names). A unique
+/// name matters because the CLI and MCP address connections by name, and a
+/// duplicate there is an ambiguity error, not a pick.
+pub(crate) fn duplicate_name<'a>(source: &str, existing: impl Iterator<Item = &'a str>) -> String {
+    let taken: std::collections::HashSet<String> = existing.map(|n| n.to_lowercase()).collect();
+    let word = tr!("kopie", "copy");
+    (1..)
+        .map(|n| if n == 1 { format!("{source} ({word})") } else { format!("{source} ({word} {n})") })
+        .find(|candidate| !taken.contains(&candidate.to_lowercase()))
+        .expect("an unbounded range always yields a free name")
+}
+
 pub(crate) fn connect_needs_vault_prompt(needs_secret: bool, vault_unlocked: bool, vault_file_exists: bool) -> bool {
     needs_secret && !vault_unlocked && vault_file_exists
 }
@@ -4277,6 +4363,24 @@ fn test_needs_vault_prompt(
     vault_file_exists: bool,
 ) -> bool {
     password_field_empty && !engine_is_file_based(engine) && !vault_unlocked && vault_file_exists
+}
+
+#[cfg(test)]
+mod duplicate_name_tests {
+    use super::duplicate_name;
+
+    #[test]
+    fn the_first_copy_is_plain_kopie() {
+        assert_eq!(duplicate_name("Prod", ["Prod", "Test"].into_iter()), "Prod (kopie)");
+    }
+
+    /// Duplicating twice — or duplicating the copy's source again — must
+    /// not produce two connections the CLI cannot tell apart.
+    #[test]
+    fn a_taken_name_is_skipped_case_insensitively() {
+        let existing = ["Prod", "prod (KOPIE)", "Prod (kopie 2)"];
+        assert_eq!(duplicate_name("Prod", existing.into_iter()), "Prod (kopie 3)");
+    }
 }
 
 #[cfg(test)]

@@ -217,6 +217,7 @@ fn connection_menu(conn_id: &str, ctx: &MenuCtx) -> Vec<MenuEntry> {
     out.extend([
         MenuEntry::Separator,
         item(tr!("Upravit připojení…", "Edit connection…"), TreeEvent::EditConnection { conn_id: id.clone() }),
+        item(tr!("Duplikovat připojení…", "Duplicate connection…"), TreeEvent::DuplicateConnection { conn_id: id.clone() }),
         item(tr!("Kopírovat jméno", "Copy name"), TreeEvent::CopyText { what: tr!("jméno", "name").into(), text: id.clone() }),
         MenuEntry::Separator,
         item(
@@ -1005,6 +1006,25 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Duplicating writes only `config.toml`, so read-only does not hide it,
+    /// and it names the row it was opened on.
+    #[test]
+    fn a_connection_can_be_duplicated_read_only_or_not() {
+        let s = snap();
+        for read_only in [false, true] {
+            let m = menu_for(&SidebarRow::Connection { conn_id: "c1".into() }, &ctx(&s, read_only));
+            assert!(
+                m.iter().any(|e| matches!(
+                    e,
+                    MenuEntry::Item(i) if i.label.starts_with("Duplikovat připojení")
+                        && i.event == TreeEvent::DuplicateConnection { conn_id: "c1".into() }
+                )),
+                "ro={read_only}: {:?}",
+                labels(&m)
+            );
         }
     }
 

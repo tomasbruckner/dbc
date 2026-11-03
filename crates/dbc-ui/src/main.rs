@@ -13960,6 +13960,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             // Opens the same dialog `EditConnection` does, so it needs a
             // `Window` for the same reason and parks the same way.
             | TreeEvent::ConnectionCreate { .. }
+            | TreeEvent::DuplicateConnection { .. }
             | TreeEvent::DropObject { .. }
             | TreeEvent::TruncateTable { .. } => {
                 self.pending_menu_action = Some(event.clone());
@@ -14084,6 +14085,9 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                         cx.notify();
                     }
                 }
+            }
+            TreeEvent::DuplicateConnection { conn_id } => {
+                self.request_duplicate_connection(conn_id, window, cx)
             }
             TreeEvent::DropObject { kind, schema, name } => {
                 self.open_destructive_confirm(

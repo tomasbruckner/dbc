@@ -225,6 +225,10 @@ pub enum TreeEvent {
     BackupFor { conn_id: String, db: Option<String> },
     RestoreFor { conn_id: String, db: Option<String> },
     EditConnection { conn_id: String },
+    /// Opens the connection dialog as a NEW connection pre-filled from this
+    /// one (password included). Nothing is saved until the user clicks
+    /// „Uložit", so cancelling leaves no half-made copy behind.
+    DuplicateConnection { conn_id: String },
     /// Delete a SAVED connection (`config.toml` + its vault secret). Opens
     /// `ModalState::ConnectionDeleteConfirm`; emitting this never touches
     /// disk on its own. Nothing on the SERVER is touched — this removes an
@@ -3373,6 +3377,7 @@ pub(crate) fn event_target(ev: &TreeEvent) -> String {
         | TreeEvent::OpenMonitorFor { conn_id }
         | TreeEvent::OpenCompareFor { conn_id }
         | TreeEvent::EditConnection { conn_id }
+        | TreeEvent::DuplicateConnection { conn_id }
         | TreeEvent::ConnectionDelete { conn_id } => conn_id.clone(),
         TreeEvent::LoadSchema { conn_id, db }
         | TreeEvent::ChooseVisibleSchemas { conn_id, db } => format!("{conn_id}/{db}"),
