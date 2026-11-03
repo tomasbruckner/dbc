@@ -198,8 +198,6 @@ impl ModalFrame {
 
     /// Calls `f` on any left mouse-down in the dialog or on the backdrop,
     /// except on a resize handle (about / shortcuts close this way).
-    // Used from Task 6: the about and shortcuts overlays close this way.
-    #[allow(dead_code)]
     pub(crate) fn close_on_click(
         mut self,
         f: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
@@ -683,5 +681,64 @@ mod persist_tests {
         let out = sizes_to_persist(&store, &saved).expect("changed");
         assert_eq!(out.get("old-dialog"), Some(&ModalSize { w: 410, h: None }));
         assert_eq!(out.get("a"), Some(&ModalSize { w: 520, h: Some(250) }));
+    }
+}
+
+/// Source audit: every dialog goes through [`frame`]. A hand-built
+/// backdrop is how the overlays drifted apart in the first place (each with
+/// its own width, padding, scroll and click blocking), and none of them
+/// could be resized.
+#[cfg(test)]
+mod audit_tests {
+    /// Every `src/**/*.rs` of this crate, read at test time rather than
+    /// listed by hand, so a file added later is audited too.
+    fn crate_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(path) = stack.pop() {
+            if path.is_dir() {
+                for ent in std::fs::read_dir(&path).expect("readable src dir") {
+                    stack.push(ent.expect("readable entry").path());
+                }
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let rel =
+                path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+            let text = std::fs::read_to_string(&path).expect("readable source");
+            out.push((rel, text));
+        }
+        out
+    }
+
+    #[test]
+    fn no_modal_builds_its_own_backdrop() {
+        // Built at runtime — written as literals, these would match this
+        // test's own source.
+        let backdrop = format!("{}_{}", "bg", "backdrop");
+        let panel = format!("ui::{}(", "panel");
+        let sources = crate_sources();
+        for must in ["main.rs", "modal.rs", "theme.rs", "grid.rs"] {
+            assert!(sources.iter().any(|(n, _)| n == must), "audit did not see {must}");
+        }
+        let mut offenders = Vec::new();
+        for (name, src) in &sources {
+            for (i, line) in src.lines().enumerate() {
+                let own_backdrop =
+                    line.contains(&backdrop) && name != "modal.rs" && name != "theme.rs";
+                if own_backdrop || line.contains(&panel) {
+                    offenders.push(format!("{name}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a dialog builds its own backdrop / panel instead of going through \
+             `modal::frame`:\n{}",
+            offenders.join("\n")
+        );
     }
 }

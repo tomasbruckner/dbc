@@ -1792,12 +1792,12 @@ ALTER DATABASE postgres SET min_parallel_table_scan_size = 0;"
 use std::collections::HashSet;
 use std::rc::Rc;
 use gpui::{
-    div, prelude::*, px, uniform_list, App, ClickEvent, Context, EventEmitter, FocusHandle,
-    Focusable, Window,
+    div, prelude::*, px, uniform_list, AnyElement, App, ClickEvent, Context, EventEmitter,
+    FocusHandle, Focusable, Window,
 };
 
 use crate::theme::ActiveTheme;
-use crate::ui;
+use crate::{modal, ui};
 
 /// Stable pre-order index into `PlanView`'s `index` (`build_index`'s
 /// output) — NOT a path (see the perf deviation note above). Stable for
@@ -2009,6 +2009,39 @@ impl PlanView {
         }
         self.node_detail = Some(PlanNodeDetail { text: lines.join("\n"), scroll_lines: 0 });
     }
+
+    /// The node-detail dialog, or `None` when no node is open. This view
+    /// still owns it (it decides when it is open and closes it), but it
+    /// paints window-wide through `modal::frame`.
+    fn render_detail_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let detail = self.node_detail.as_ref()?;
+        let theme = *cx.theme();
+        let panel = div()
+            .flex()
+            .flex_col()
+            .child(
+                // Not clipped any more: the frame's body scrolls, so a long
+                // detail is readable by scrolling (or by making the dialog
+                // taller) instead of being cut off at the 420 px cap.
+                div()
+                    .id("plan-node-detail-body")
+                    .flex()
+                    .flex_col()
+                    .p_2()
+                    .text_color(theme.text_primary)
+                    .child(detail.text.clone()),
+            )
+            .child(
+                div().flex().flex_row().justify_end().gap_2().p_2().child(
+                    ui::button("plan-node-detail-close", tr!("Zavřít", "Close"), theme)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.node_detail = None;
+                            cx.notify();
+                        })),
+                ),
+            );
+        Some(modal::frame("plan-node-detail", 560., panel).max_h(420.).into_any_element())
+    }
 }
 
 impl EventEmitter<PlanViewEvent> for PlanView {}
@@ -2187,50 +2220,8 @@ impl Render for PlanView {
             .flex_1(),
         );
 
-        if let Some(detail) = &self.node_detail {
-            let panel = ui::surface(theme)
-                .id("plan-node-detail-panel")
-                .w(px(560.))
-                .max_h(px(420.))
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .id("plan-node-detail-body")
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .overflow_hidden()
-                        .p_2()
-                        .text_color(theme.text_primary)
-                        .child(detail.text.clone()),
-                )
-                .child(
-                    div().flex().flex_row().justify_end().gap_2().p_2().child(
-                        ui::button("plan-node-detail-close", tr!("Zavřít", "Close"), theme)
-                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                this.node_detail = None;
-                                cx.notify();
-                            })),
-                    ),
-                );
-
-            root = root.child(
-                div()
-                    .id("plan-node-detail")
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(theme.bg_backdrop)
-                    .occlude()
-                    .py_4()
-                    .child(crate::scrollbar::scroll_y("modal-plan", panel)),
-            );
+        if let Some(overlay) = self.render_detail_overlay(cx) {
+            root = root.child(overlay);
         }
         root
     }

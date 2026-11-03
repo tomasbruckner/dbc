@@ -17,7 +17,12 @@ use crate::fk_join::{self, JoinSpec, VirtualCol};
 use crate::row_view::{self, RowView};
 use crate::sandbox::{self, EditState, Editable};
 use crate::theme::ActiveTheme;
-use crate::ui;
+use crate::{modal, ui};
+
+/// Height of the cell-detail text block: the 420 px panel cap minus the
+/// frame's padding and border and the button row, so a never-resized
+/// dialog shows as much text as it did before the frame.
+const CELL_DETAIL_TEXT_MAX_H: f32 = 340.0;
 
 pub const ROW_HEIGHT: f32 = 24.0;
 pub const DEFAULT_COL_WIDTH: f32 = 160.0;
@@ -2152,7 +2157,11 @@ impl ResultGrid {
             .font_family("Consolas")
             .flex()
             .flex_col()
-            .flex_1()
+            // Capped, not `flex_1`: inside the frame's scrolling body there
+            // is no definite height to shrink into, and this block scrolls
+            // itself by line (`scroll_lines`), so it must clip — that keeps
+            // the buttons on screen, as the 420 px panel did before.
+            .max_h(px(CELL_DETAIL_TEXT_MAX_H))
             .overflow_hidden()
             .p_2()
             .text_color(theme.text_primary)
@@ -2173,10 +2182,7 @@ impl ResultGrid {
             body = body.child(div().whitespace_normal().child(line.to_string()));
         }
 
-        let panel = ui::surface(theme)
-            .id("cell-detail-panel")
-            .w(px(560.))
-            .max_h(px(420.))
+        let panel = div()
             .flex()
             .flex_col()
             .child(body)
@@ -2195,22 +2201,7 @@ impl ResultGrid {
                 ),
             );
 
-        Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.bg_backdrop)
-                .occlude()
-                .py_4()
-                .child(crate::scrollbar::scroll_y("modal-grid-a", panel))
-                .into_any_element(),
-        )
+        Some(modal::frame("cell-detail", 560., panel).max_h(420.).into_any_element())
     }
 
     /// G5 Task 3: "✕" gutter click on a real row — toggles that row's
@@ -2428,15 +2419,7 @@ impl ResultGrid {
         let currently_staged_null = ed.currently_staged_null;
         let input = ed.input.clone();
 
-        let panel = ui::surface(theme)
-            .id("cell-editor-panel")
-            .w(px(480.))
-            .max_h(px(360.))
-            .flex()
-            .flex_col()
-            .p_2()
-            .gap_2()
-            .text_color(theme.text_primary)
+        let panel = ui::panel_body()
             .child(div().text_color(theme.warn).child(column_name))
             .child(
                 div()
@@ -2484,22 +2467,7 @@ impl ResultGrid {
                 ),
             );
 
-        Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.bg_backdrop)
-                .occlude()
-                .py_4()
-                .child(crate::scrollbar::scroll_y("modal-grid-b", panel))
-                .into_any_element(),
-        )
+        Some(modal::frame("cell-editor", 480., panel).max_h(360.).into_any_element())
     }
 
     /// Skips hidden source columns entirely (brief: "header + cells +

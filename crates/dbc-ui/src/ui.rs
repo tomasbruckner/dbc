@@ -21,7 +21,8 @@
 //! ## What is here and what deliberately is not
 //!
 //! Here: the things that repeat with no meaningful variation — the
-//! surface, the two panel flavours built on it, the three button
+//! surface (which [`crate::modal::frame`] and [`popover`] are built on),
+//! a dialog's content column, the three button
 //! flavours, the checkbox, the labelled field row.
 //!
 //! Not here: [`crate::connections_ui`]'s caption buttons (window
@@ -43,44 +44,24 @@ use crate::theme::Theme;
 /// The raised surface every floating thing sits on: panel colour, hairline
 /// border, corner radius. Nothing else — no size, no padding, no layout.
 ///
-/// Split out from [`panel`] because the third family of call sites (the
-/// grid's dropdowns, the monitor's popups) wants the surface and its own
-/// scroll body, and would otherwise have to un-set `panel`'s padding.
+/// Shared by [`crate::modal::frame`]'s dialog panel, [`popover`], and the
+/// call sites (the grid's dropdowns, the monitor's popups) that want the
+/// surface with their own scroll body and padding.
 pub(crate) fn surface(theme: Theme) -> Div {
     div().bg(theme.bg_panel).border_1().border_color(theme.border).rounded_md()
 }
 
-/// A modal dialog panel of a fixed width.
-///
-/// Fixed, not fluid, and that is the design: a dialog that resizes with
-/// the window makes its own line lengths unpredictable, and every one of
-/// these is a form or a paragraph. The width is the ONE thing that varies
-/// between dialogs, so it is the one argument.
-///
-/// Chain `.id(…)` for a dialog that needs to be interactive as a whole and
-/// `.max_h(…)` for one whose body can grow past the window — both compose,
-/// because this returns a plain `Div`.
-pub(crate) fn panel(width: f32, theme: Theme) -> Div {
-    surface(theme)
-        .w(px(width))
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_color(theme.text_primary)
-}
-
-/// The content column of a dialog: what [`panel`] lays its children out
-/// in, without the surface, width or padding — those are
-/// [`crate::modal::frame`]'s.
+/// The content column of a dialog. The surface, width, padding and
+/// scrolling are [`crate::modal::frame`]'s — every modal dialog is
+/// rendered through it, so there is no separate "dialog panel" component.
 pub(crate) fn panel_body() -> Div {
     div().flex().flex_col().gap_2()
 }
 
 /// A small floating surface: context menus, dropdowns, hover cards.
 ///
-/// Tighter than [`panel`] on purpose — a menu is a list of short lines and
-/// `p_4` around it reads as a dialog that forgot its buttons.
+/// Tighter than a dialog (`p_4`) on purpose — a menu is a list of short
+/// lines and `p_4` around it reads as a dialog that forgot its buttons.
 pub(crate) fn popover(theme: Theme) -> Div {
     surface(theme).p_2().flex().flex_col().gap_1().text_color(theme.text_primary)
 }
@@ -369,19 +350,28 @@ mod tests {
         assert!(!body.contains("gpui::black()"), "same, via `black()`");
     }
 
-    /// `panel` and `popover` must both be built on `surface`, so „what a
-    /// floating thing looks like" stays one decision. Two independent
-    /// chains would drift exactly the way the 22 copies did.
+    /// The modal frame's panel and `popover` must both be built on
+    /// `surface`, so „what a floating thing looks like" stays one decision.
+    /// Two independent chains would drift exactly the way the 22 copies did.
     #[test]
     fn both_panel_flavours_are_built_on_the_shared_surface() {
-        let src = include_str!("ui.rs");
+        let src = include_str!("ui.rs").replace('\r', "");
         let body = src.split("mod tests").next().unwrap_or("");
-        for f in ["fn panel(", "fn popover("] {
-            let after = body.split(f).nth(1).expect(f);
-            let end = after.find("\n}").unwrap_or(after.len());
+        let modal = include_str!("modal.rs").replace('\r', "");
+        let frame_render = modal
+            .split("impl RenderOnce for ModalFrame")
+            .nth(1)
+            .expect("ModalFrame renders");
+        // (file, source, fn, the fn's closing line at its indentation)
+        for (what, src, f, close) in [
+            ("ui.rs", body, "fn popover(", "\n}"),
+            ("modal.rs", frame_render, "fn render(", "\n    }\n"),
+        ] {
+            let after = src.split(f).nth(1).unwrap_or_else(|| panic!("{what}: {f}"));
+            let end = after.find(close).unwrap_or(after.len());
             assert!(
                 after[..end].contains("surface(theme)"),
-                "`{f}` does not build on `surface` — the two would drift"
+                "`{f}` in {what} does not build on `surface` — the two would drift"
             );
         }
     }

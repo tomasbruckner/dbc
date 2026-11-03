@@ -6946,36 +6946,20 @@ impl AppView {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| tr!("(žádný)", "(none)").to_string());
-        let panel = ui::surface(theme)
-            .w(px(620.))
-            .p_4()
-            .flex()
-            .flex_col()
-            .gap_2()
+        let body = ui::panel_body()
             .child(div().text_size(px(16.)).text_color(theme.text_primary).child("dbc"))
             .child(row(tr!("Verze", "Version"), env!("CARGO_PKG_VERSION").to_string()))
             .child(row(tr!("Profil", "Profile"), profile))
             .child(row("Log", log))
             .child(row(tr!("Pracovní prostor", "Workspace"), workspace))
             .child(div().mt_2().text_color(theme.text_faint).child(tr!("Esc zavře", "Esc closes")));
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .occlude()
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|view, _, _, cx| {
-                    view.about_open = false;
-                    cx.notify();
-                }),
-            )
-            .py_4()
-            .child(crate::scrollbar::scroll_y("modal-about", panel))
+        // Any left click closes it, inside or out — it is a read-only card
+        // (the design keeps click-to-close for this one and the shortcuts).
+        modal::frame("about", 620., body)
+            .close_on_click(cx.listener(|view, _, _, cx| {
+                view.about_open = false;
+                cx.notify();
+            }))
             .into_any_element()
     }
 
@@ -6991,7 +6975,7 @@ impl AppView {
         // simply did not exist. Splitting the scopes across two columns
         // makes the whole sheet fit at once, which is what a cheat sheet is
         // for: you look, you do not scroll.
-        let mut panel = ui::panel(860., theme)
+        let mut panel = ui::panel_body()
             .child(
                 div()
                     .flex()
@@ -7055,24 +7039,11 @@ impl AppView {
                 .child(render_column(&left))
                 .child(render_column(&right)),
         );
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .occlude()
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|view, _, _, cx| {
-                    view.shortcuts_open = false;
-                    cx.notify();
-                }),
-            )
-            .py_4()
-            .child(crate::scrollbar::scroll_y("modal-shortcuts", panel))
+        modal::frame("shortcuts", 860., panel)
+            .close_on_click(cx.listener(|view, _, _, cx| {
+                view.shortcuts_open = false;
+                cx.notify();
+            }))
             .into_any_element()
     }
 
@@ -7918,9 +7889,9 @@ impl AppView {
         self.set_theme(next, cx);
     }
 
-    /// Centered overlay (brief contract #1), same full-screen-backdrop +
-    /// `.occlude()` shape as `connections_ui::render_modal_overlay` — key
-    /// context "Palette" on the panel wraps the input so Up/Down/Enter/Esc
+    /// Centered overlay (brief contract #1) through `modal::frame`, like
+    /// `connections_ui::render_modal_overlay` — key context "Palette" on
+    /// the frame's backdrop wraps the input so Up/Down/Enter/Esc
     /// (`palette::bind_keys`) resolve even though focus sits on the input's
     /// own nested "TextField" context. `None` (renders nothing) both when
     /// the palette is closed and — belt and suspenders alongside the guard
@@ -7986,23 +7957,13 @@ impl AppView {
             );
         }
 
-        let panel = ui::surface(theme)
-            .id("palette-panel")
-            .key_context("Palette")
-            .w(px(560.))
-            .max_h(px(420.))
+        let body = div()
             .flex()
             .flex_col()
-            .on_action(cx.listener(Self::on_palette_up))
-            .on_action(cx.listener(Self::on_palette_down))
-            .on_action(cx.listener(Self::on_palette_confirm))
-            .on_action(cx.listener(Self::on_palette_close))
-            .on_action(cx.listener(Self::on_palette_toggle))
-            .on_action(cx.listener(Self::on_palette_toggle_all))
             .child(div().px_2().py_2().border_b_1().border_color(theme.border).child(input))
             .child(list)
-            .when(targets_mode, |panel| {
-                panel.child(
+            .when(targets_mode, |body| {
+                body.child(
                     div()
                         .px_2()
                         .py_1()
@@ -8016,20 +7977,25 @@ impl AppView {
                 )
             });
 
+        let up = cx.listener(Self::on_palette_up);
+        let down = cx.listener(Self::on_palette_down);
+        let confirm = cx.listener(Self::on_palette_confirm);
+        let close = cx.listener(Self::on_palette_close);
+        let toggle = cx.listener(Self::on_palette_toggle);
+        let toggle_all = cx.listener(Self::on_palette_toggle_all);
         Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.bg_backdrop)
-                .occlude()
-                .py_4()
-                .child(crate::scrollbar::scroll_y("modal-main-b", panel))
+            modal::frame("palette", 560., body)
+                .max_h(420.)
+                .decorate(move |backdrop| {
+                    backdrop
+                        .key_context("Palette")
+                        .on_action(up)
+                        .on_action(down)
+                        .on_action(confirm)
+                        .on_action(close)
+                        .on_action(toggle)
+                        .on_action(toggle_all)
+                })
                 .into_any_element(),
         )
     }
@@ -14648,14 +14614,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             discard_confirm_question(if is_script { self.binding_rel() } else { None }.as_deref(), n);
         let theme = *cx.theme();
 
-        let panel = ui::surface(theme)
-            .id("discard-confirm-panel")
-            .w(px(420.))
-            .flex()
-            .flex_col()
-            .p_2()
-            .gap_2()
-            .text_color(theme.text_primary)
+        let panel = ui::panel_body()
             .child(question)
             .child(
                 div()
@@ -14680,26 +14639,17 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
                     ),
             );
 
+        let focus = self.modal_focus_handle.clone();
         Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.bg_backdrop)
-                // UX-polish §1.4: same shared focus target as
-                // `render_modal_overlay` — holds keyboard focus so stray
-                // typing can't reach the SQL editor underneath. NO key
-                // context here or ever: Enter must stay structurally inert
-                // on discard-confirm (§3-novela / Global Constraints).
-                .track_focus(&self.modal_focus_handle)
-                .occlude()
-                .py_4()
-                .child(crate::scrollbar::scroll_y("modal-main-c", panel))
+            modal::frame("discard-confirm", 420., panel)
+                .decorate(move |backdrop| {
+                    // UX-polish §1.4: same shared focus target as
+                    // `render_modal_overlay` — holds keyboard focus so stray
+                    // typing can't reach the SQL editor underneath. NO key
+                    // context here or ever: Enter must stay structurally inert
+                    // on discard-confirm (§3-novela / Global Constraints).
+                    backdrop.track_focus(&focus)
+                })
                 .into_any_element(),
         )
     }
@@ -14743,20 +14693,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             body = body.child(div().whitespace_normal().child(line.clone()));
         }
 
-        let mut panel = ui::surface(theme)
-            .id("apply-dialog-panel")
-            // G5 Task 4 review fix (MINOR 4): same handle
-            // `on_open_apply_dialog` moved `window` focus onto — keeps
-            // keyboard focus off the SQL editor underneath while the dialog
-            // is open.
-            .track_focus(&focus_handle)
-            .w(px(640.))
-            .max_h(px(480.))
-            .flex()
-            .flex_col()
-            .p_2()
-            .gap_2()
-            .text_color(theme.text_primary)
+        let mut panel = ui::panel_body()
             .child(if lines.len() == 1 {
                 tr!("Aplikovat 1 příkaz", "Apply 1 statement").to_string()
             } else {
@@ -14813,19 +14750,15 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         );
 
         Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.bg_backdrop)
-                .occlude()
-                .py_4()
-                .child(crate::scrollbar::scroll_y("modal-main-d", panel))
+            modal::frame("apply-changes", 640., panel)
+                .max_h(480.)
+                .decorate(move |backdrop| {
+                    // G5 Task 4 review fix (MINOR 4): same handle
+                    // `on_open_apply_dialog` moved `window` focus onto — keeps
+                    // keyboard focus off the SQL editor underneath while the
+                    // dialog is open.
+                    backdrop.track_focus(&focus_handle)
+                })
                 .into_any_element(),
         )
     }

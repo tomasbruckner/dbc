@@ -14,7 +14,7 @@ use crate::monitor;
 use crate::monitor_sql;
 use crate::runner;
 use crate::theme::{ActiveTheme, Theme};
-use crate::ui;
+use crate::{modal, ui};
 
 // Duration colour tiers (design §5 — constants live HERE, not monitor.rs).
 pub const DURATION_WARN_SECS: f64 = 1.0;
@@ -646,18 +646,16 @@ impl MonitorView {
         let theme = *cx.theme();
         let text = self.detail.clone()?;
         let text_for_copy = text.clone();
-        let panel = ui::surface(theme)
-            .id("mon-detail-panel")
-            .w(px(560.))
-            .max_h(px(420.))
+        let panel = div()
             .flex()
             .flex_col()
             .child(
+                // Not clipped any more: the frame's body scrolls, so a long
+                // query is readable by scrolling (or by making the dialog
+                // taller) instead of being cut off at the 420 px cap.
                 div()
                     .id("mon-detail-body")
                     .font_family("Consolas")
-                    .flex_1()
-                    .overflow_hidden()
                     .p_2()
                     .text_color(theme.text_primary)
                     .child(text),
@@ -684,22 +682,7 @@ impl MonitorView {
                     ),
             );
 
-        Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.bg_backdrop)
-                .occlude()
-                .py_4()
-                .child(crate::scrollbar::scroll_y("modal-monitor", panel))
-                .into_any_element(),
-        )
+        Some(modal::frame("monitor-detail", 560., panel).max_h(420.).into_any_element())
     }
 }
 

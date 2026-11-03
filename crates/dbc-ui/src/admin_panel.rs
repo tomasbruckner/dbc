@@ -47,7 +47,7 @@ use crate::admin_sql::{self, CellState, WriteStatement};
 use crate::theme::{ActiveTheme, Theme};
 use crate::connections_ui;
 use crate::runner::AdminCatalogRows;
-use crate::ui;
+use crate::{modal, ui};
 
 /// Tab-strip singleton dedup key (`tabs.rs::ResultTab::preview_key`) —
 /// there is only ever one admin tab per connection at a time (design §2:
@@ -2048,6 +2048,14 @@ impl AdminPanel {
     fn render_modal_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = *cx.theme();
         let modal = self.modal.as_ref()?;
+        // One dialog id for all four (they share this renderer, so they
+        // share a remembered size); each keeps its own default width.
+        let width = match modal {
+            AdminModal::DropSchema { .. } => 420.,
+            AdminModal::NewRole { .. }
+            | AdminModal::ChangePassword { .. }
+            | AdminModal::NewSchema { .. } => 360.,
+        };
         let panel = match modal {
             AdminModal::NewRole { name, password, login, superuser, createdb, createrole } => {
                 let flags = [
@@ -2070,14 +2078,8 @@ impl AdminPanel {
                             })),
                     );
                 }
-                ui::surface(theme)
+                ui::panel_body()
                     .id("admin-modal-new-role")
-                    .w(px(360.))
-                    .flex()
-                    .flex_col()
-                    .p_2()
-                    .gap_2()
-                    .text_color(theme.text_primary)
                     .child(tr!("Nová role", "New role"))
                     .child(name.clone())
                     .child(password.clone())
@@ -2116,14 +2118,8 @@ impl AdminPanel {
                             ),
                     )
             }
-            AdminModal::ChangePassword { role, password } => ui::surface(theme)
+            AdminModal::ChangePassword { role, password } => ui::panel_body()
                 .id("admin-modal-change-password")
-                .w(px(360.))
-                .flex()
-                .flex_col()
-                .p_2()
-                .gap_2()
-                .text_color(theme.text_primary)
                 .child(trf!("Změnit heslo — {role}", "Change password — {role}"))
                 .child(password.clone())
                 .child(
@@ -2159,14 +2155,8 @@ impl AdminPanel {
                                 })),
                         ),
                 ),
-            AdminModal::NewSchema { name } => ui::surface(theme)
+            AdminModal::NewSchema { name } => ui::panel_body()
                 .id("admin-modal-new-schema")
-                .w(px(360.))
-                .flex()
-                .flex_col()
-                .p_2()
-                .gap_2()
-                .text_color(theme.text_primary)
                 .child(tr!("Nové schéma", "New schema"))
                 .child(name.clone())
                 .child(
@@ -2204,14 +2194,8 @@ impl AdminPanel {
                 ),
             AdminModal::DropSchema { schema, cascade } => {
                 let mark = if *cascade { "☑" } else { "☐" };
-                ui::surface(theme)
+                ui::panel_body()
                     .id("admin-modal-drop-schema")
-                    .w(px(420.))
-                    .flex()
-                    .flex_col()
-                    .p_2()
-                    .gap_2()
-                    .text_color(theme.text_primary)
                     .child(trf!("Smazat schéma — {schema}", "Delete schema — {schema}"))
                     .child(
                         div()
@@ -2262,25 +2246,20 @@ impl AdminPanel {
             }
         };
 
+        let focus = self.modal_focus_handle.clone();
+        let confirm = cx.listener(Self::on_modal_confirm);
+        let next = cx.listener(Self::on_modal_focus_next);
+        let prev = cx.listener(Self::on_modal_focus_prev);
         Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.bg_backdrop)
-                .key_context("ModalForm")
-                .track_focus(&self.modal_focus_handle)
-                .on_action(cx.listener(Self::on_modal_confirm))
-                .on_action(cx.listener(Self::on_modal_focus_next))
-                .on_action(cx.listener(Self::on_modal_focus_prev))
-                .occlude()
-                .py_4()
-                .child(crate::scrollbar::scroll_y("modal-admin", panel))
+            modal::frame("admin-dialog", width, panel)
+                .decorate(move |backdrop| {
+                    backdrop
+                        .key_context("ModalForm")
+                        .track_focus(&focus)
+                        .on_action(confirm)
+                        .on_action(next)
+                        .on_action(prev)
+                })
                 .into_any_element(),
         )
     }
@@ -2289,68 +2268,52 @@ impl AdminPanel {
         let theme = *cx.theme();
         self.discard_confirm.as_ref()?;
         let n = self.change_count();
+        let panel = ui::panel_body()
+            .child(trf!("Zahodit neuložené změny? ({n})", "Discard unsaved changes? ({n})"))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("admin-discard-confirm-yes")
+                            .cursor_pointer()
+                            .bg(theme.bg_hover)
+                            .px_2()
+                            .rounded_md()
+                            .text_color(theme.danger)
+                            .child(tr!("Zahodit", "Discard"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.discard_confirm_yes(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("admin-discard-confirm-no")
+                            .cursor_pointer()
+                            .bg(theme.bg_hover)
+                            .px_2()
+                            .rounded_md()
+                            .text_color(theme.text_primary)
+                            .child(tr!("Zpět", "Back"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.discard_confirm_no(cx);
+                            })),
+                    ),
+            );
+        let focus = self.modal_focus_handle.clone();
         Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.bg_backdrop)
-                // UX-polish §1.4: same shared focus target as
-                // `render_modal_overlay` — holds keyboard focus. NO key
-                // context here or ever: Enter must stay structurally inert
-                // on discard-confirm, admin or app (§3-novela / Global
-                // Constraints).
-                .track_focus(&self.modal_focus_handle)
-                .occlude()
-                .child(
-                    ui::surface(theme)
-                        .id("admin-discard-confirm-panel")
-                        .w(px(360.))
-                        .flex()
-                        .flex_col()
-                        .p_2()
-                        .gap_2()
-                        .text_color(theme.text_primary)
-                        .child(trf!("Zahodit neuložené změny? ({n})", "Discard unsaved changes? ({n})"))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .justify_end()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .id("admin-discard-confirm-yes")
-                                        .cursor_pointer()
-                                        .bg(theme.bg_hover)
-                                        .px_2()
-                                        .rounded_md()
-                                        .text_color(theme.danger)
-                                        .child(tr!("Zahodit", "Discard"))
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                            this.discard_confirm_yes(cx);
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .id("admin-discard-confirm-no")
-                                        .cursor_pointer()
-                                        .bg(theme.bg_hover)
-                                        .px_2()
-                                        .rounded_md()
-                                        .text_color(theme.text_primary)
-                                        .child(tr!("Zpět", "Back"))
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                            this.discard_confirm_no(cx);
-                                        })),
-                                ),
-                        ),
-                )
+            modal::frame("admin-discard-confirm", 360., panel)
+                .decorate(move |backdrop| {
+                    // UX-polish §1.4: same shared focus target as
+                    // `render_modal_overlay` — holds keyboard focus. NO key
+                    // context here or ever: Enter must stay structurally inert
+                    // on discard-confirm, admin or app (§3-novela / Global
+                    // Constraints).
+                    backdrop.track_focus(&focus)
+                })
                 .into_any_element(),
         )
     }
