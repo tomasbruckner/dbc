@@ -37,6 +37,9 @@
 #![allow(clippy::type_complexity)]
 
 mod i18n_audit;
+// The component lands in the next commits; until then only the tests use it.
+#[cfg_attr(not(test), allow(dead_code))]
+mod modal;
 mod admin_panel;
 mod admin_sql;
 mod autocomplete;
