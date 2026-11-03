@@ -180,6 +180,17 @@ pub enum UiLanguage {
     En,
 }
 
+/// A resized modal dialog's remembered size, in logical pixels. Whole pixels
+/// for the same reason as `sidebar_width` (`AppConfig` derives `Eq`). `h` is
+/// `None` while only the width was ever dragged: the dialog then keeps sizing
+/// its height to its content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModalSize {
+    pub w: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h: Option<u16>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ToolPaths {
     #[serde(default)]
@@ -239,6 +250,12 @@ pub struct AppConfig {
     /// whole pixels, `None` = never dragged, use the built-in eight lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_height: Option<u16>,
+    /// Remembered size of each resizable modal dialog, keyed by a stable
+    /// dialog id (`[modal_sizes]` / `connection = { w = 640, h = 520 }`).
+    /// A dialog never resized has no entry and keeps its built-in look.
+    /// Unknown ids are kept as-is and ignored, so a downgrade loses nothing.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub modal_sizes: std::collections::BTreeMap<String, ModalSize>,
     /// UI language (2026-10-27, for colleagues and winget users who do not
     /// read Czech). `None` = never picked: follow the Windows display
     /// language, so an existing Czech install stays Czech and a fresh one
@@ -624,6 +641,10 @@ mod tests {
                 },
             )]),
             disable_update_check: true,
+            modal_sizes: std::collections::BTreeMap::from([
+                ("connection".to_string(), ModalSize { w: 640, h: Some(520) }),
+                ("palette".to_string(), ModalSize { w: 700, h: None }),
+            ]),
         }
     }
 
@@ -718,6 +739,22 @@ mod tests {
         assert_eq!(loaded.editor_height, None, "never dragged = the built-in eight lines");
         assert_eq!(loaded.language, None, "never picked = follow Windows");
         assert_eq!(loaded.tree_grouping, TreeGrouping::Schema, "the original tree shape");
+    }
+
+    #[test]
+    fn old_config_without_modal_sizes_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "theme = \"dark\"
+").unwrap();
+        let loaded = AppConfig::load(&p).unwrap();
+        assert!(loaded.modal_sizes.is_empty());
+    }
+
+    #[test]
+    fn empty_modal_sizes_is_not_written() {
+        let raw = toml::to_string(&AppConfig::default()).unwrap();
+        assert!(!raw.contains("modal_sizes"), "raw: {raw}");
     }
 
     #[test]
