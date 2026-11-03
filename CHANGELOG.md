@@ -6,6 +6,14 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-11-03
+
+A saved connection can be duplicated from the sidebar.
+
+### Added
+
+- „Duplicate connection…" in a connection's right-click menu opens the connection dialog as a new connection pre-filled from the original, password included; the copy is named „(copy)", „(copy 2)", … and nothing is saved until you click Save
+
 ## [0.40.1] - 2026-11-03
 
 Running a selection runs only the selection, and SQL completion works in many more places.
