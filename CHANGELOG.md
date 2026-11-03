@@ -6,6 +6,18 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.40.1] - 2026-11-03
+
+Running a selection runs only the selection, and SQL completion works in many more places.
+
+### Fixed
+
+- with part of the editor selected, Run (and Explain, and running on several targets) executes only the selected text instead of the whole editor
+- a middle click closes a result tab or an editor tab
+- completion works with quoted names: after `FROM "orders" o`, `o.` offers the columns, and `"orders".`, `"dbo".` and `[dbo].` complete like `orders.` and `dbo.`
+- completion looks only at the statement under the cursor, so another statement in the same tab (a reused alias, a subquery) no longer switches it off
+- completion offers the columns of the `FROM`/`JOIN` tables without a qualifier too (`SELECT tot…`, `WHERE st…`)
+
 ## [0.40.0] - 2026-10-30
 
 The whole UI can be switched to English, and the result grid is easier to read and resize.
