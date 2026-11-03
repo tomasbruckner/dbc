@@ -2614,7 +2614,7 @@ impl AppView {
         let next = cx.listener(AppView::on_modal_focus_next);
         let prev = cx.listener(AppView::on_modal_focus_prev);
         let focus = self.modal_focus_handle.clone();
-        let mut frame = modal::frame(id, width, panel).decorate(move |backdrop| {
+        let mut frame = modal::frame(id, width, panel).own_focus().decorate(move |backdrop| {
             // UX-polish §1.4: hold keyboard focus while a modal is open
             // so stray typing can't reach the SQL editor underneath
             // (sweep item 8). Input-owning modals still focus their own
@@ -4712,8 +4712,9 @@ pub(crate) fn modal_spec(state: &ModalState) -> (&'static str, f32) {
         ModalState::CsvImport { .. } => ("csv-import", 600.0),
         ModalState::Settings => ("settings", 360.0),
         ModalState::ChartPicker { .. } => ("chart-picker", 460.0),
-        // Both sub-states (the missing-folder choice and its recovery
-        // confirm) were 460 wide, so they share one remembered size.
+        // One variant, two screens: `WorkspaceMissing`'s own sub-states
+        // (the missing-folder choice and its recovery confirm) share this
+        // one remembered size. Every other row here is its own dialog.
         ModalState::WorkspaceMissing { .. } => ("workspace-missing", 460.0),
         ModalState::WorkspaceConfirm { .. } => ("workspace-confirm", 460.0),
         ModalState::ScriptName { .. } => ("script-name", 420.0),

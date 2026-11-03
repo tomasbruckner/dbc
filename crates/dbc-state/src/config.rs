@@ -253,7 +253,10 @@ pub struct AppConfig {
     /// Remembered size of each resizable modal dialog, keyed by a stable
     /// dialog id (`[modal_sizes]` / `connection = { w = 640, h = 520 }`).
     /// A dialog never resized has no entry and keeps its built-in look.
-    /// Unknown ids are kept as-is and ignored, so a downgrade loses nothing.
+    /// Unknown ids are kept as-is and ignored, so a build that knows fewer
+    /// dialogs keeps the others' sizes. A build older than this field does
+    /// not know the table at all and drops it on its next save of
+    /// `config.toml`; the dialogs then open at their built-in size again.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub modal_sizes: std::collections::BTreeMap<String, ModalSize>,
     /// UI language (2026-10-27, for colleagues and winget users who do not

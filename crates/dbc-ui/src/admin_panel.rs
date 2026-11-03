@@ -2253,6 +2253,7 @@ impl AdminPanel {
         Some(
             modal::frame("admin-dialog", width, panel)
                 .padding(8.)
+                .own_focus()
                 .decorate(move |backdrop| {
                     backdrop
                         .key_context("ModalForm")
@@ -2308,6 +2309,7 @@ impl AdminPanel {
         Some(
             modal::frame("admin-discard-confirm", 360., panel)
                 .padding(8.)
+                .own_focus()
                 .decorate(move |backdrop| {
                     // UX-polish §1.4: same shared focus target as
                     // `render_modal_overlay` — holds keyboard focus. NO key

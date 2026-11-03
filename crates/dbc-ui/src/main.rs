@@ -6721,6 +6721,22 @@ impl AppView {
                         }
                     }
                 }
+                // Same as the `Grid` arm: Esc closes the monitor's
+                // query-text dialog / the plan's node-detail dialog.
+                TabContent::Monitor { view } => {
+                    let closed = view.update(cx, |m, cx| m.close_overlay_if_open(cx));
+                    if closed {
+                        cx.notify();
+                        return;
+                    }
+                }
+                TabContent::Plan { view } => {
+                    let closed = view.update(cx, |p, cx| p.close_overlay_if_open(cx));
+                    if closed {
+                        cx.notify();
+                        return;
+                    }
+                }
                 _ => {}
             }
         }
@@ -11163,6 +11179,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             Err(e) => (AppConfig::default(), Some(e.to_string())),
         };
         self.config = config;
+        // The dialog sizes follow the context, wholesale: the store must
+        // equal the NEW config's map, or the next drag end would write the
+        // old context's sizes into this config.toml. `persist_modal_sizes`
+        // then sees the two equal and writes nothing.
+        modal::reseed(&self.config.modal_sizes, cx);
         self.config_load_error = config_load_error;
         apply_language(&self.config);
         // Existing degrade-to-None postures, unchanged.
@@ -14650,6 +14671,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         Some(
             modal::frame("discard-confirm", 420., panel)
                 .padding(8.)
+                .own_focus()
                 .decorate(move |backdrop| {
                     // UX-polish §1.4: same shared focus target as
                     // `render_modal_overlay` — holds keyboard focus so stray
@@ -14761,6 +14783,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             modal::frame("apply-changes", 640., panel)
                 .max_h(480.)
                 .padding(8.)
+                .own_focus()
                 .decorate(move |backdrop| {
                     // G5 Task 4 review fix (MINOR 4): same handle
                     // `on_open_apply_dialog` moved `window` focus onto — keeps
@@ -16701,7 +16724,7 @@ fn main() {
         cx.set_global(theme::Theme::from_mode(config.theme));
         // The remembered dialog sizes, seeded from the config so the store is
         // always a superset of what was loaded (unknown ids survive a save).
-        cx.set_global(modal::ModalSizes(config.modal_sizes.clone()));
+        modal::reseed(&config.modal_sizes, cx);
         // The UI language, for the same reason and at the same moment: the
         // very first frame must already be in it.
         apply_language(&config);
@@ -19865,6 +19888,48 @@ mod script_binding_tests {
              `set_script_binding(None)` bumps nothing when nothing was bound, so an \
              `open_script` dispatched against the OLD root would land and bind it"
         );
+    }
+
+    /// Resizable-modal final review, Important 1: a context switch reseeds
+    /// the `ModalSizes` store from the NEW config, after `self.config` is
+    /// replaced, so the next drag end cannot write the old context's sizes
+    /// into the new `config.toml`. The behaviour itself (reseed, then the
+    /// observer's `sizes_to_persist` decision) is driven in a GPUI test in
+    /// `modal.rs` (`a_context_switch_reseeds_and_the_next_drag_saves_only_
+    /// the_new_context`); this pins that `apply_context` and
+    /// `persist_modal_sizes` are wired to it. `confirm_settings_import`
+    /// goes through `apply_context`.
+    #[test]
+    fn apply_context_reseeds_the_modal_sizes() {
+        let src = include_str!("main.rs");
+        let body = src.split("fn apply_context(").nth(1).expect("apply_context exists");
+        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
+        let swap = body.find("self.config = config;").expect("apply_context replaces the config");
+        let reseed = body
+            .find("modal::reseed(&self.config.modal_sizes, cx)")
+            .expect("apply_context reseeds the modal sizes");
+        assert!(reseed > swap, "reseed from the NEW config, after it is in place");
+        let persist = src.split("fn persist_modal_sizes(").nth(1).expect("persist_modal_sizes exists");
+        let persist = &persist[..persist.find("\n    fn ").unwrap_or(persist.len())];
+        assert!(persist.contains("modal::sizes_to_persist("), "the observer decides through sizes_to_persist");
+        let import = src.split("fn confirm_settings_import(").nth(1).expect("confirm_settings_import exists");
+        let import = &import[..import.find("\n    fn ").unwrap_or(import.len())];
+        assert!(import.contains("apply_context("), "a settings import goes through apply_context");
+    }
+
+    /// Resizable-modal final review, Minor 5: Esc closes the monitor's and
+    /// the plan's detail dialogs, like the grid's cell detail.
+    #[test]
+    fn esc_closes_the_monitor_and_plan_detail_dialogs() {
+        let src = include_str!("main.rs");
+        let body = src.split("fn on_cancel_query(").nth(1).expect("on_cancel_query exists");
+        let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
+        for arm in [
+            "TabContent::Monitor { view } => {\n                    let closed = view.update(cx, |m, cx| m.close_overlay_if_open(cx));",
+            "TabContent::Plan { view } => {\n                    let closed = view.update(cx, |p, cx| p.close_overlay_if_open(cx));",
+        ] {
+            assert!(body.contains(arm), "on_cancel_query lacks {arm}");
+        }
     }
 
     /// T8 review MAJOR-2's refusal text: not an „error:" — nothing failed.

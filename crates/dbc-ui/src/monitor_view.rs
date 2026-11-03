@@ -122,6 +122,18 @@ impl MonitorView {
         view
     }
 
+    /// Esc: closes the query-text dialog when it is open and reports
+    /// whether it did, so `AppView::on_cancel_query` stops there instead of
+    /// also cancelling a query (the `ResultGrid::close_overlay_if_open`
+    /// shape — an unscoped `escape` binding wins, so this IS the mechanism).
+    pub fn close_overlay_if_open(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.detail.take().is_none() {
+            return false;
+        }
+        cx.notify();
+        true
+    }
+
     fn dispatch_refresh(&mut self) {
         self.refresh_generation += 1;
         // try_send: the loop drains promptly; a full channel just means a
@@ -636,8 +648,9 @@ impl MonitorView {
     /// field comment, grid.rs:286-289). Mirrors
     /// `grid.rs::render_cell_detail_overlay`: a `modal::frame` dialog with
     /// no inset and a filling body (the text clips, "Kopírovat" + "Zavřít"
-    /// stay pinned). Closed by the explicit "Zavřít" (or Esc), not by a
-    /// backdrop click — only about / shortcuts close on a click.
+    /// stay pinned). Closed by the explicit "Zavřít" or Esc (via
+    /// [`Self::close_overlay_if_open`]), not by a backdrop click — only
+    /// about / shortcuts close on a click.
     fn render_detail_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = *cx.theme();
         let text = self.detail.clone()?;

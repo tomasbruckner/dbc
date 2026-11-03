@@ -6,6 +6,10 @@
 //! steals its clicks). A drag reads the pointer from window-wide listeners,
 //! so it survives the pointer leaving the handle, the dialog or the window,
 //! and it is stored only on release.
+//!
+//! The frame also holds keyboard focus for a dialog that has no focus
+//! target of its own (see [`ModalFrame::own_focus`]), so typing never
+//! reaches the covered editor underneath.
 
 use std::{
     cell::{Cell, RefCell},
@@ -16,8 +20,8 @@ use std::{
 use dbc_state::ModalSize;
 use gpui::{
     anchored, canvas, deferred, div, point, prelude::*, px, AnyElement, App, BorrowAppContext,
-    Bounds, CursorStyle, DispatchPhase, Div, Global, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Size, Window,
+    Bounds, CursorStyle, DispatchPhase, Div, FocusHandle, Global, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Size, Window,
 };
 
 use crate::{scrollbar, theme::ActiveTheme, ui};
@@ -53,19 +57,31 @@ pub(crate) fn effective_size(
         stored.and_then(|s| s.h).map(f32::from),
         default_w,
         window,
+        MODAL_MIN_H,
     )
 }
 
 /// The clamp behind [`effective_size`], for any size — a stored one or the
 /// one a drag in progress has reached. Painting a live drag and committing
 /// it both go through here, so the stored size is the one the user saw.
+/// `min_h` is the height floor: `MODAL_MIN_H`, or lower for a drag that
+/// started on a dialog already shorter than that (see [`Drag::shown`]).
 /// A NaN `w` or `h` falls to its lower bound.
-fn fit(w: f32, h: Option<f32>, default_w: f32, window: Size<Pixels>) -> (f32, Option<f32>) {
+fn fit(
+    w: f32,
+    h: Option<f32>,
+    default_w: f32,
+    window: Size<Pixels>,
+    min_h: f32,
+) -> (f32, Option<f32>) {
     let max_w = (f32::from(window.width) - 2.0 * MODAL_MARGIN).max(0.0);
     let min_w = default_w.min(max_w);
     let w = if w.is_nan() { min_w } else { w.clamp(min_w, max_w) };
     let max_h = max_height(window);
-    let h = h.map(|h| if h.is_nan() { MODAL_MIN_H } else { h.clamp(MODAL_MIN_H, max_h) });
+    // `max_h` is never below `MODAL_MIN_H`, so a `min_h` within
+    // `[0, MODAL_MIN_H]` keeps `clamp`'s bounds ordered.
+    let min_h = if min_h.is_nan() { MODAL_MIN_H } else { min_h.clamp(0.0, MODAL_MIN_H) };
+    let h = h.map(|h| if h.is_nan() { min_h } else { h.clamp(min_h, max_h) });
     (w, h)
 }
 
@@ -110,9 +126,21 @@ pub(crate) fn sizes_to_persist(
     (store.0 != *saved).then(|| store.0.clone())
 }
 
+/// Replaces the whole store with `saved`, the sizes of the `config.toml` now
+/// in use: at startup and on every context switch (another workspace, a
+/// settings import). Sizes are per context like `editor_height`, and the
+/// store must equal the new config's map, else the next drag end would
+/// write the old context's sizes into the new file. The persisting
+/// observer then finds the two equal and writes nothing.
+pub(crate) fn reseed(saved: &BTreeMap<String, ModalSize>, cx: &mut App) {
+    cx.set_global(ModalSizes(saved.clone()));
+}
+
 /// Above every other deferred layer (menus use 1).
 const MODAL_PRIORITY: usize = 10;
-/// Thickness of the edge handles; the corner is twice this square.
+/// Thickness of the edge handles; the corner handle is this square too,
+/// diagonally outside the panel's corner, filling the gap the two edge
+/// handles leave.
 const HANDLE: f32 = 6.0;
 
 /// A resize drag in progress. `start` is the panel's painted size when the
@@ -133,7 +161,10 @@ impl Drag {
         self.edge != Edge::Right || stored.is_some_and(|s| s.h.is_some())
     }
 
-    /// The (clamped) size this drag shows for an unclamped `size`.
+    /// The (clamped) size this drag shows for an unclamped `size`. The
+    /// height floor is `MODAL_MIN_H`, or the grab height when the dialog was
+    /// already shorter (a one-line prompt): such a dialog does not jump to
+    /// the floor on the first move, and a small drag is not lost to it.
     fn shown(
         &self,
         size: (f32, f32),
@@ -141,16 +172,28 @@ impl Drag {
         default_w: f32,
         window: Size<Pixels>,
     ) -> (f32, Option<f32>) {
-        fit(size.0, self.fixes_height(stored).then_some(size.1), default_w, window)
+        let min_h = MODAL_MIN_H.min(self.start.1);
+        fit(size.0, self.fixes_height(stored).then_some(size.1), default_w, window, min_h)
     }
 }
 
-/// Per-dialog state that outlives a frame: the drag, and the panel's
-/// painted bounds (a never-heightened panel's height is only known after
-/// layout, and a drag starts from what is on screen).
+/// Per-dialog state that lives while the dialog is on screen: the drag,
+/// the panel's painted bounds (a never-heightened panel's height is only
+/// known after layout, and a drag starts from what is on screen) and the
+/// fallback focus.
 struct FrameState {
     drag: Rc<RefCell<Option<Drag>>>,
     panel: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Tracked on the backdrop unless the caller has [`ModalFrame::own_focus`].
+    focus: FocusHandle,
+    /// Whether this opening already decided about focus. Decided once per
+    /// opening, so two dialogs on screen at once never take focus from each
+    /// other on every frame.
+    claimed: Cell<bool>,
+    /// What held focus before the frame took it. Given back when the dialog
+    /// closes, if focus is still the frame's own (an owner that moved focus
+    /// elsewhere on close keeps its choice).
+    prev: Rc<RefCell<Option<FocusHandle>>>,
 }
 
 /// The one modal dialog: dimmed window-wide backdrop, centred panel with a
@@ -168,6 +211,7 @@ pub(crate) fn frame(id: &'static str, default_w: f32, body: impl IntoElement) ->
         body_fills: false,
         decorate: None,
         close_on_click: None,
+        own_focus: false,
     }
 }
 
@@ -187,6 +231,7 @@ pub(crate) struct ModalFrame {
     body_fills: bool,
     decorate: Option<Box<dyn FnOnce(Div) -> Div>>,
     close_on_click: Option<ClickHandler>,
+    own_focus: bool,
 }
 
 impl ModalFrame {
@@ -217,8 +262,29 @@ impl ModalFrame {
 
     /// Adds the caller's own focus, key context and actions to the
     /// backdrop — they are typed to the caller's entity, so they stay its.
+    /// A `track_focus` in here needs [`Self::own_focus`] as well.
     pub(crate) fn decorate(mut self, f: impl FnOnce(Div) -> Div + 'static) -> Self {
         self.decorate = Some(Box::new(f));
+        self
+    }
+
+    /// The caller tracks its own focus handle on the backdrop (in
+    /// [`Self::decorate`]) and moves focus there itself; the frame then
+    /// leaves focus alone.
+    ///
+    /// Without it the frame holds focus for the dialog: it tracks a handle
+    /// of its own on the backdrop and, after the first frame of an opening
+    /// is drawn, focuses it unless focus already sits inside the dialog (a
+    /// field the owner focused when it opened the dialog keeps it). So keys
+    /// never reach the editor underneath, while the owner's key contexts
+    /// and actions still see them: the backdrop is deferred, which keeps
+    /// its place in the owner's dispatch path. On close, focus goes back to
+    /// what had it, if it is still on the frame's handle. An explicit flag
+    /// rather than a guess, because GPUI keeps one tracked handle per
+    /// element and the frame cannot see whether `decorate` set one (an
+    /// audit test pins that every `track_focus` caller sets this).
+    pub(crate) fn own_focus(mut self) -> Self {
+        self.own_focus = true;
         self
     }
 
@@ -235,17 +301,43 @@ impl ModalFrame {
 
 impl RenderOnce for ModalFrame {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let Self { id, default_w, body, max_h, padding, body_fills, decorate, close_on_click } =
-            self;
+        let Self {
+            id,
+            default_w,
+            body,
+            max_h,
+            padding,
+            body_fills,
+            decorate,
+            close_on_click,
+            own_focus,
+        } = self;
         let theme = *cx.theme();
         let win = window.viewport_size();
-        let state = window.use_keyed_state(format!("modal-drag-{id}"), cx, |_, _| FrameState {
-            drag: Rc::new(RefCell::new(None)),
-            panel: Rc::new(Cell::new(None)),
+        let state = window.use_keyed_state(format!("modal-drag-{id}"), cx, |window, cx| {
+            // The state lives exactly while the dialog is rendered, so its
+            // release is the dialog closing.
+            cx.on_release_in(window, |s: &mut FrameState, window, cx| {
+                let prev = s.prev.borrow_mut().take();
+                if let Some(prev) = prev {
+                    if s.focus.is_focused(window) {
+                        window.focus(&prev, cx);
+                    }
+                }
+            })
+            .detach();
+            FrameState {
+                drag: Rc::new(RefCell::new(None)),
+                panel: Rc::new(Cell::new(None)),
+                focus: cx.focus_handle(),
+                claimed: Cell::new(false),
+                prev: Rc::new(RefCell::new(None)),
+            }
         });
-        let (drag, panel_bounds) = {
+        let (drag, panel_bounds, focus, first_frame, prev_focus) = {
             let s = state.read(cx);
-            (s.drag.clone(), s.panel.clone())
+            let first = !s.claimed.replace(true);
+            (s.drag.clone(), s.panel.clone(), s.focus.clone(), first, s.prev.clone())
         };
         let stored = cx.try_global::<ModalSizes>().and_then(|s| s.0.get(id).copied());
         let current = *drag.borrow();
@@ -292,7 +384,7 @@ impl RenderOnce for ModalFrame {
         );
         let corner = handle(
             Edge::Corner,
-            div().right(px(-HANDLE)).bottom(px(-HANDLE)).size(px(2.0 * HANDLE)),
+            div().right(px(-HANDLE)).bottom(px(-HANDLE)).size(px(HANDLE)),
             CursorStyle::ResizeUpLeftDownRight,
         );
 
@@ -357,6 +449,21 @@ impl RenderOnce for ModalFrame {
         if let Some(f) = close_on_click {
             backdrop = backdrop.on_mouse_down(MouseButton::Left, f);
         }
+        if !own_focus {
+            backdrop = backdrop.track_focus(&focus);
+            if first_frame {
+                // After this frame is drawn: only then does the dispatch
+                // tree know what lies inside the dialog, including a field
+                // the owner focused while opening it.
+                window.defer(cx, move |window, cx| {
+                    if focus.contains_focused(window, cx) {
+                        return;
+                    }
+                    *prev_focus.borrow_mut() = window.focused(cx);
+                    window.focus(&focus, cx);
+                });
+            }
+        }
         if let Some(f) = decorate {
             backdrop = f(backdrop);
         }
@@ -367,7 +474,10 @@ impl RenderOnce for ModalFrame {
 
 /// Ends the drag in `slot` and stores the size it showed — only when that
 /// differs from the size at the grab and from what is stored, so a bare
-/// click on a handle writes nothing.
+/// click on a handle writes nothing. The grab size goes through the same
+/// `shown` as the release size, and its height floor never lifts the grab
+/// height itself (see [`Drag::shown`]), so a few pixels on a short dialog
+/// still count as a change.
 fn finish(
     slot: &RefCell<Option<Drag>>,
     id: &'static str,
@@ -488,6 +598,8 @@ mod frame_tests {
     struct Setup {
         /// Body taller than the window, so the body scrolls.
         tall: bool,
+        /// A 40 px body: a one-line prompt, shorter than `MODAL_MIN_H`.
+        short: bool,
         max_h: Option<f32>,
         close: Option<Rc<Cell<usize>>>,
         /// Counts right mouse-downs seen by a `.decorate` listener.
@@ -528,7 +640,11 @@ mod frame_tests {
                     400.,
                     crate::ui::panel_body()
                         .w_full()
-                        .h(px(if self.setup.tall { 2000. } else { 200. }))
+                        .h(px(match (self.setup.tall, self.setup.short) {
+                            (true, _) => 2000.,
+                            (_, true) => 40.,
+                            _ => 200.,
+                        }))
                         .child(probed(probe)),
                 ),
             };
@@ -755,6 +871,289 @@ mod frame_tests {
         assert_eq!(footer.get(), Some(f0), "the footer did not scroll");
         assert_eq!(body.get(), Some(c0), "the content did not scroll either");
     }
+
+    /// The corner handle lies wholly outside the panel: a press just inside
+    /// the panel's bottom-right corner (on the last row of a dialog with no
+    /// inset) resizes nothing. Panel 400 x 202 with `.padding(0.)`: x
+    /// 300..700, y 299..501.
+    #[gpui::test]
+    fn corner_handle_stays_outside_the_panel(cx: &mut TestAppContext) {
+        let Opened { mut cx, writes, .. } = open(cx, Setup { padding: Some(0.), ..Setup::default() });
+        cx.simulate_mouse_down(at(697., 498.), L, Modifiers::none());
+        cx.simulate_mouse_move(at(737., 538.), L, Modifiers::none());
+        cx.simulate_mouse_up(at(737., 538.), L, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(stored(&mut cx), None);
+        assert_eq!(writes.get(), 0);
+        // …while the handle itself, just outside that corner, does.
+        cx.simulate_mouse_down(at(703., 504.), L, Modifiers::none());
+        cx.simulate_mouse_move(at(713., 514.), L, Modifiers::none());
+        cx.simulate_mouse_up(at(713., 514.), L, Modifiers::none());
+        assert_eq!(stored(&mut cx), Some(ModalSize { w: 420, h: Some(222) }));
+    }
+
+    /// A dialog shorter than `MODAL_MIN_H` (40 px body: panel 400 x 74, y
+    /// 363..437, bottom handle 437..443, body from y 380) follows the
+    /// pointer from its own height: no jump to 120 on the first move, and a
+    /// 5 px drag is stored, not discarded against a floored grab size.
+    #[gpui::test]
+    fn a_short_dialog_resizes_from_its_own_height(cx: &mut TestAppContext) {
+        let Opened { mut cx, body, writes } = open(cx, Setup { short: true, ..Setup::default() });
+        assert_eq!(f32::from(body.get().expect("body painted").origin.y), 380.);
+        cx.simulate_mouse_down(at(500., 440.), L, Modifiers::none());
+        cx.simulate_mouse_move(at(500., 445.), L, Modifiers::none());
+        cx.run_until_parked();
+        // 74 + 2 x 5 = 84 tall, centred: y 358, body from 375 (a jump to
+        // 120 would put it at 357).
+        assert_eq!(f32::from(body.get().unwrap().origin.y), 375., "no jump mid-drag");
+        cx.simulate_mouse_up(at(500., 445.), L, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(stored(&mut cx), Some(ModalSize { w: 400, h: Some(84) }));
+        assert_eq!(writes.get(), 1);
+    }
+
+    /// Shrinking a short dialog stops at its own height, so the drag shows
+    /// and stores nothing.
+    #[gpui::test]
+    fn a_short_dialog_does_not_shrink_below_its_height(cx: &mut TestAppContext) {
+        let Opened { mut cx, writes, .. } = open(cx, Setup { short: true, ..Setup::default() });
+        cx.simulate_mouse_down(at(500., 440.), L, Modifiers::none());
+        cx.simulate_mouse_move(at(500., 420.), L, Modifiers::none());
+        cx.simulate_mouse_up(at(500., 420.), L, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(stored(&mut cx), None);
+        assert_eq!(writes.get(), 0);
+    }
+
+    /// Final-review Important 1: a context switch replaces the store
+    /// wholesale. `Owner` stands in for `AppView` (whose construction lives
+    /// inline in `main()` and needs the whole app): it holds the saved map
+    /// as `AppView.config.modal_sizes` does, swaps it and calls [`reseed`]
+    /// in `apply_context`'s order, and its observer makes
+    /// `persist_modal_sizes`'s decision through the same
+    /// [`sizes_to_persist`]. The `main.rs` side is source-pinned by
+    /// `apply_context_reseeds_the_modal_sizes`.
+    #[gpui::test]
+    fn a_context_switch_reseeds_and_the_next_drag_saves_only_the_new_context(
+        cx: &mut TestAppContext,
+    ) {
+        type Map = BTreeMap<String, ModalSize>;
+        struct Owner {
+            saved: Map,
+            writes: Vec<Map>,
+        }
+        let m = |e: &[(&str, u16)]| -> Map {
+            e.iter().map(|(k, w)| (k.to_string(), ModalSize { w: *w, h: None })).collect()
+        };
+        let a = m(&[("a-only", 610), ("t", 650)]);
+        let b = m(&[("b-only", 420)]);
+
+        let Opened { mut cx, .. } = open(cx, Setup::default());
+        let owner = cx.update(|_, cx| {
+            let owner = cx.new(|cx| {
+                cx.observe_global::<ModalSizes>(|o: &mut Owner, cx| {
+                    if let Some(s) = sizes_to_persist(cx.global::<ModalSizes>(), &o.saved) {
+                        o.saved = s.clone();
+                        o.writes.push(s);
+                    }
+                })
+                .detach();
+                Owner { saved: Map::new(), writes: Vec::new() }
+            });
+            owner.update(cx, |o, _| o.saved = a.clone());
+            reseed(&a, cx);
+            owner
+        });
+        cx.run_until_parked();
+        // Context A's dialog "t" is 650 wide; switch to B, the same way
+        // `apply_context` does: config first, then the store.
+        cx.update(|window, cx| {
+            owner.update(cx, |o, _| o.saved = b.clone());
+            reseed(&b, cx);
+            window.refresh();
+        });
+        cx.run_until_parked();
+        assert!(owner.read_with(&cx, |o, _| o.writes.is_empty()), "a reseed alone writes nothing");
+
+        // "t" is back at its built-in 400 (B has no entry), so the right
+        // handle is at RIGHT_X again.
+        cx.simulate_mouse_down(at(RIGHT_X, 400.), L, Modifiers::none());
+        cx.simulate_mouse_move(at(RIGHT_X + 50., 400.), L, Modifiers::none());
+        cx.simulate_mouse_up(at(RIGHT_X + 50., 400.), L, Modifiers::none());
+        cx.run_until_parked();
+        let writes = owner.read_with(&cx, |o, _| o.writes.clone());
+        let mut want = b.clone();
+        want.insert("t".into(), ModalSize { w: 500, h: None });
+        assert_eq!(writes, vec![want], "B's entries plus the change, nothing of A's");
+    }
+}
+
+/// Final-review Important 2: the frame holds focus for a dialog that has
+/// no focus target of its own.
+#[cfg(test)]
+mod focus_tests {
+    use super::*;
+    use crate::theme::Theme;
+    use gpui::{div, px, Context, FocusHandle, KeyBinding, Render, TestAppContext, Window};
+    use std::{cell::Cell, rc::Rc};
+
+    gpui::actions!(modal_focus_test, [Poke, Dismiss]);
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Body {
+        /// Static text only, like about / cell detail.
+        Plain,
+        /// A focusable field the owner focuses when it opens the dialog.
+        Field,
+        /// `.own_focus()` + a `decorate` tracking the owner's own handle.
+        Owned,
+    }
+
+    /// An "editor" that counts the `Poke`s it receives, and a dialog over
+    /// it. The root counts `Dismiss` the way `AppView`'s root handles Esc.
+    struct Host {
+        editor: FocusHandle,
+        field: FocusHandle,
+        owned: FocusHandle,
+        open: bool,
+        body: Body,
+        pokes: Rc<Cell<usize>>,
+        dismissed: Rc<Cell<usize>>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let (pokes, dismissed) = (self.pokes.clone(), self.dismissed.clone());
+            let mut root = div()
+                .size_full()
+                .key_context("ModalFocusTest")
+                .on_action(move |_: &Dismiss, _, _| dismissed.set(dismissed.get() + 1))
+                .child(
+                    div()
+                        .track_focus(&self.editor)
+                        .on_action(move |_: &Poke, _, _| pokes.set(pokes.get() + 1))
+                        .w(px(100.))
+                        .h(px(100.)),
+                );
+            if self.open {
+                let mut body = div().h(px(200.)).child("text");
+                if self.body == Body::Field {
+                    body = body.child(div().track_focus(&self.field).h(px(20.)));
+                }
+                let mut f = frame("focus-test", 400., body);
+                if self.body == Body::Owned {
+                    let owned = self.owned.clone();
+                    f = f.own_focus().decorate(move |d| d.track_focus(&owned));
+                }
+                root = root.child(f);
+            }
+            root
+        }
+    }
+
+    struct Opened {
+        cx: gpui::VisualTestContext,
+        host: gpui::Entity<Host>,
+        pokes: Rc<Cell<usize>>,
+        dismissed: Rc<Cell<usize>>,
+    }
+
+    /// The editor holds focus, then the dialog opens; for `Body::Field`
+    /// the owner focuses the field in the same update, as owners do.
+    fn open_over_editor(cx: &mut TestAppContext, body: Body) -> Opened {
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+            cx.set_global(ModalSizes::default());
+            // Scoped to the test root, so `keymap_audit` (which reads every
+            // `KeyBinding::new` in the crate) sees no new global chord.
+            cx.bind_keys([
+                KeyBinding::new("x", Poke, Some("ModalFocusTest")),
+                KeyBinding::new("escape", Dismiss, Some("ModalFocusTest")),
+            ]);
+        });
+        let pokes = Rc::new(Cell::new(0));
+        let dismissed = Rc::new(Cell::new(0));
+        let (p, d) = (pokes.clone(), dismissed.clone());
+        let (host, vcx) = cx.add_window_view(move |_, cx| Host {
+            editor: cx.focus_handle(),
+            field: cx.focus_handle(),
+            owned: cx.focus_handle(),
+            open: false,
+            body,
+            pokes: p,
+            dismissed: d,
+        });
+        let mut cx = vcx.clone();
+        cx.update(|window, cx| {
+            let editor = host.read(cx).editor.clone();
+            window.focus(&editor, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("x");
+        assert_eq!(pokes.get(), 1, "sanity: the focused editor gets keys");
+        cx.update(|window, cx| {
+            host.update(cx, |h, cx| {
+                h.open = true;
+                if h.body == Body::Field {
+                    window.focus(&h.field, cx);
+                }
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        Opened { cx, host, pokes, dismissed }
+    }
+
+    fn focused(cx: &mut gpui::VisualTestContext, host: &gpui::Entity<Host>) -> (bool, bool, bool) {
+        cx.update(|window, cx| {
+            let h = host.read(cx);
+            (h.editor.is_focused(window), h.field.is_focused(window), h.owned.is_focused(window))
+        })
+    }
+
+    #[gpui::test]
+    fn keys_do_not_reach_the_editor_under_a_plain_dialog(cx: &mut TestAppContext) {
+        let Opened { mut cx, host, pokes, dismissed } = open_over_editor(cx, Body::Plain);
+        assert!(!focused(&mut cx, &host).0, "the editor lost focus");
+        cx.simulate_keystrokes("x");
+        assert_eq!(pokes.get(), 1, "the covered editor got no key");
+        // The owner's actions still see keys from inside the dialog: Esc
+        // reaches the root the dialog is rendered under.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(dismissed.get(), 1);
+
+        // Closing gives focus back to the editor.
+        cx.update(|_, cx| {
+            host.update(cx, |h, cx| {
+                h.open = false;
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        // Test-harness lag only: the test platform draws at the very end of
+        // `flush_effects`, so the frame state dropped by that draw is
+        // released on the NEXT effect cycle. The app draws from
+        // `on_request_frame`, whose own update flushes the release at once.
+        cx.update(|_, _| {});
+        assert!(focused(&mut cx, &host).0, "focus went back to the editor");
+        cx.simulate_keystrokes("x");
+        assert_eq!(pokes.get(), 2);
+    }
+
+    #[gpui::test]
+    fn a_field_focused_inside_the_dialog_keeps_focus(cx: &mut TestAppContext) {
+        let Opened { mut cx, host, pokes, .. } = open_over_editor(cx, Body::Field);
+        assert_eq!(focused(&mut cx, &host), (false, true, false));
+        cx.simulate_keystrokes("x");
+        assert_eq!(pokes.get(), 1);
+    }
+
+    #[gpui::test]
+    fn own_focus_leaves_focus_to_the_caller(cx: &mut TestAppContext) {
+        let Opened { mut cx, host, .. } = open_over_editor(cx, Body::Owned);
+        // The frame did not move focus anywhere; the caller decides.
+        assert_eq!(focused(&mut cx, &host), (true, false, false));
+    }
 }
 
 #[cfg(test)]
@@ -847,5 +1246,31 @@ mod audit_tests {
              `modal::frame`:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// A caller whose `decorate` tracks its own focus handle must say so
+    /// with `.own_focus()`: GPUI keeps one tracked handle per element, so
+    /// otherwise the frame's fallback handle and the caller's would fight
+    /// over the backdrop. Each `modal::frame(` call is read up to its
+    /// `.into_any_element()`.
+    #[test]
+    fn every_frame_that_tracks_focus_says_own_focus() {
+        let call = format!("modal::{}(", "frame");
+        let (track, own) = (format!(".{}(", "track_focus"), format!(".{}()", "own_focus"));
+        let mut seen = 0;
+        let mut offenders = Vec::new();
+        for (name, src) in crate_sources() {
+            for (at, _) in src.match_indices(&call) {
+                let rest = &src[at..];
+                let chain = &rest[..rest.find(".into_any_element()").unwrap_or(rest.len())];
+                seen += 1;
+                if chain.contains(&track) && !chain.contains(&own) {
+                    let line = src[..at].lines().count();
+                    offenders.push(format!("{name}:{line}"));
+                }
+            }
+        }
+        assert!(seen >= 12, "the audit found only {seen} `modal::frame` calls");
+        assert!(offenders.is_empty(), "track_focus without .own_focus(): {offenders:?}");
     }
 }

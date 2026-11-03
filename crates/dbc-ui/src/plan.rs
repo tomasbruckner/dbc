@@ -1988,6 +1988,17 @@ impl PlanView {
         self.rows_cache = flatten_plan(&self.index, &self.expanded);
     }
 
+    /// Esc: closes the node-detail dialog when it is open and reports
+    /// whether it did, so `AppView::on_cancel_query` stops there (the
+    /// `ResultGrid::close_overlay_if_open` shape).
+    pub fn close_overlay_if_open(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.node_detail.take().is_none() {
+            return false;
+        }
+        cx.notify();
+        true
+    }
+
     fn open_node_detail(&mut self, flat_ix: usize) {
         let Some(flat) = self.rows_cache.get(flat_ix) else { return };
         let mut lines = vec![format!("operation: {}", flat.operation)];
@@ -2274,6 +2285,20 @@ mod plan_view_tests {
         assert!(all.contains(&0)); // root
         assert!(all.contains(&1)); // child_a (orders)
         assert!(all.contains(&2)); // child_b (users)
+    }
+
+    /// Esc (`AppView::on_cancel_query`'s `Plan` arm) closes the node
+    /// detail, and reports nothing to close when none is open.
+    #[gpui::test]
+    fn close_overlay_if_open_closes_the_node_detail(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(|cx| PlanView::new(Rc::new(sample_result()), cx));
+        view.update(cx, |v, cx| {
+            assert!(!v.close_overlay_if_open(cx), "nothing open");
+            v.open_node_detail(0);
+            assert!(v.node_detail.is_some());
+            assert!(v.close_overlay_if_open(cx));
+            assert!(v.node_detail.is_none());
+        });
     }
 
     #[test]
