@@ -198,6 +198,8 @@ impl ModalFrame {
 
     /// Calls `f` on any left mouse-down in the dialog or on the backdrop,
     /// except on a resize handle (about / shortcuts close this way).
+    // Used from Task 6: the about and shortcuts overlays close this way.
+    #[allow(dead_code)]
     pub(crate) fn close_on_click(
         mut self,
         f: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,

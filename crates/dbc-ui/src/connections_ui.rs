@@ -50,6 +50,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::backup;
 use crate::chart_data::ChartKind;
+use crate::modal;
 use crate::runner::ConnectSpec;
 use crate::text_model::MultilineBuffer;
 use crate::ui;
@@ -2453,6 +2454,8 @@ impl AppView {
 
     pub(crate) fn render_modal_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.modal.clone()?;
+        let (id, width) = modal_spec(&modal);
+        let max_h = modal_max_h(&modal);
         let panel = match modal {
             ModalState::ConnectionDialog(ui) => render_connection_dialog_panel(ui, cx),
             ModalState::MasterPasswordPrompt { input, error, verifying, .. } => {
@@ -2607,32 +2610,27 @@ impl AppView {
                 render_settings_import_panel(&path, &lines, &error, cx)
             }
         };
-        Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(cx.theme().bg_backdrop)
-                // UX-polish §1.4: hold keyboard focus while a modal is open
-                // so stray typing can't reach the SQL editor underneath
-                // (sweep item 8). Input-owning modals still focus their own
-                // first field at open time; this is the shared fallback
-                // target for the no-input dialogs (see `modal_needs_focus`).
-                .track_focus(&self.modal_focus_handle)
+        let confirm = cx.listener(AppView::on_modal_confirm);
+        let next = cx.listener(AppView::on_modal_focus_next);
+        let prev = cx.listener(AppView::on_modal_focus_prev);
+        let focus = self.modal_focus_handle.clone();
+        let mut frame = modal::frame(id, width, panel).decorate(move |backdrop| {
+            // UX-polish §1.4: hold keyboard focus while a modal is open
+            // so stray typing can't reach the SQL editor underneath
+            // (sweep item 8). Input-owning modals still focus their own
+            // first field at open time; this is the shared fallback
+            // target for the no-input dialogs (see `modal_needs_focus`).
+            backdrop
+                .track_focus(&focus)
                 .key_context("ModalForm")
-                .on_action(cx.listener(AppView::on_modal_confirm))
-                .on_action(cx.listener(AppView::on_modal_focus_next))
-                .on_action(cx.listener(AppView::on_modal_focus_prev))
-                .occlude()
-                .py_4()
-                .child(crate::scrollbar::scroll_y("modal-main", panel))
-                .into_any_element(),
-        )
+                .on_action(confirm)
+                .on_action(next)
+                .on_action(prev)
+        });
+        if let Some(cap) = max_h {
+            frame = frame.max_h(cap);
+        }
+        Some(frame.into_any_element())
     }
 
     /// G14 T10: theme row only, for now (design's minimal `ModalState::Settings`
@@ -2666,7 +2664,7 @@ impl AppView {
         // (two different shapes per mode), which a single `div().child(..)`
         // chain cannot express — hence the rebindable local. Split exactly
         // at the theme radios; nothing above changed.
-        let mut panel = ui::panel(360., *cx.theme())
+        let mut panel = ui::panel_body()
             .id("settings-panel")
             .child(div().text_size(px(16.)).child(tr!("Nastavení", "Settings")))
             .child(div().text_color(cx.theme().text_muted).child(tr!("Motiv", "Theme")))
@@ -4695,6 +4693,49 @@ fn dropdown_item(c: &ConnectionConfig, depth: usize, cx: &mut Context<AppView>) 
         })
 }
 
+/// The stable dialog id (the key its size is remembered under) and the
+/// never-resized width of a `ModalState` dialog. Exhaustive on purpose: a
+/// new variant cannot get a dialog without choosing an id here.
+pub(crate) fn modal_spec(state: &ModalState) -> (&'static str, f32) {
+    match state {
+        ModalState::ConnectionDialog(..) => ("connection", 560.0),
+        ModalState::MasterPasswordPrompt { .. } => ("master-password", 360.0),
+        ModalState::CreateMasterPassword { .. } => ("create-master-password", 360.0),
+        ModalState::QueryParams { .. } => ("query-params", 480.0),
+        ModalState::KillConfirm { .. } => ("kill-confirm", 520.0),
+        ModalState::AnalyzeWriteConfirm { .. } => ("analyze-write-confirm", 520.0),
+        ModalState::MultiTargetWriteConfirm { .. } => ("multi-target-write-confirm", 520.0),
+        ModalState::ChangeServerPassword { .. } => ("server-password", 420.0),
+        ModalState::CompareDialog { .. } => ("compare", 680.0),
+        ModalState::BackupRestore(..) => ("backup-restore", 560.0),
+        ModalState::ScriptRun { .. } => ("script-run", 560.0),
+        ModalState::CsvImport { .. } => ("csv-import", 600.0),
+        ModalState::Settings => ("settings", 360.0),
+        ModalState::ChartPicker { .. } => ("chart-picker", 460.0),
+        // Both sub-states (the missing-folder choice and its recovery
+        // confirm) were 460 wide, so they share one remembered size.
+        ModalState::WorkspaceMissing { .. } => ("workspace-missing", 460.0),
+        ModalState::WorkspaceConfirm { .. } => ("workspace-confirm", 460.0),
+        ModalState::ScriptName { .. } => ("script-name", 420.0),
+        ModalState::ScriptDeleteConfirm { .. } => ("script-delete", 420.0),
+        ModalState::VisibilityPicker { .. } => ("visibility", 420.0),
+        ModalState::FolderName { .. } => ("folder-name", 420.0),
+        ModalState::FolderDeleteConfirm { .. } => ("folder-delete", 460.0),
+        ModalState::ConnectionDeleteConfirm { .. } => ("connection-delete", 460.0),
+        ModalState::SettingsImportConfirm { .. } => ("settings-import", 560.0),
+    }
+}
+
+/// The height cap a never-heightened dialog keeps from before the shared
+/// frame: only the two panels that set one themselves.
+fn modal_max_h(state: &ModalState) -> Option<f32> {
+    match state {
+        ModalState::QueryParams { .. } => Some(520.0),
+        ModalState::ChartPicker { .. } => Some(560.0),
+        _ => None,
+    }
+}
+
 fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppView>) -> AnyElement {
     let title = if ui.editing_id.is_some() { tr!("Připojení — úprava", "Connection — edit") } else { tr!("Připojení — nové", "Connection — new") };
     // While `testing`, the in-flight-status line takes priority over
@@ -4721,7 +4762,7 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
 
     // 560, not 480: the four postgres SSL modes did not fit on one line
     // beside the label column (user screenshot, 2026-11-03).
-    let mut panel: Div = ui::panel(560., *cx.theme())
+    let mut panel: Div = ui::panel_body()
         .child(div().text_size(px(16.)).child(title))
         .child(ui::field_row(tr!("Název", "Name"), ui.name.clone(), *cx.theme()))
         .child(
@@ -4930,7 +4971,7 @@ fn render_visibility_panel(
         None => tr!("Zobrazené databáze", "Shown databases").to_string(),
         Some(db) => trf!("Zobrazená schémata — {db}", "Shown schemas — {db}"),
     };
-    let mut panel: Div = ui::panel(420., theme)
+    let mut panel: Div = ui::panel_body()
         .child(div().text_size(px(16.)).child(title))
         .child(div().text_color(theme.text_muted).child(tr!(
             "Odškrtnuté se ve stromu neukazují. Nic se tím nemaže a nové položky              na serveru se objeví samy.",
@@ -5010,7 +5051,7 @@ fn render_pw_change_panel(
     running: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let mut panel: Div = ui::panel(420., *cx.theme())
+    let mut panel: Div = ui::panel_body()
         .child(div().text_size(px(16.)).child(tr!("Změna hesla na serveru", "Change password on the server")))
         .child(div().text_color(cx.theme().text_muted).child(crate::pwchange::dialog_body(kind, user)))
         .child(ui::field_row(tr!("Nové heslo", "New password"), new1, *cx.theme()))
@@ -5127,7 +5168,7 @@ fn render_folder_name_panel(
             trf!("v {}", "in {}", folder_label(&parent)),
         ),
     };
-    let mut panel = ui::panel(420., *cx.theme())
+    let mut panel = ui::panel_body()
         .child(div().text_size(px(16.)).child(title))
         .child(div().text_color(cx.theme().text_muted).child(hint))
         .child(ui::field_row(tr!("Název", "Name"), field, *cx.theme()));
@@ -5175,7 +5216,7 @@ fn render_folder_delete_panel(
             "{n} connections will move up one level. Nothing is deleted."
         ),
     };
-    ui::panel(460., *cx.theme())
+    ui::panel_body()
         .child(div().text_size(px(16.)).child(tr!("Smazat složku", "Delete folder")))
         .child(div().text_color(cx.theme().text_muted).child(folder_label(&path)))
         .child(div().child(note))
@@ -5204,7 +5245,7 @@ fn render_connection_delete_panel(
     secret_stays: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let mut panel: Div = ui::panel(460., *cx.theme())
+    let mut panel: Div = ui::panel_body()
         .child(div().text_size(px(16.)).child(tr!("Smazat připojení", "Delete connection")))
         .child(div().child(connection_delete_text(name)));
     if secret_stays {
@@ -5241,7 +5282,7 @@ fn render_settings_import_panel(
     error: &Option<String>,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let mut panel: Div = ui::panel(560., *cx.theme())
+    let mut panel: Div = ui::panel_body()
         .child(div().text_size(px(16.)).child(crate::transfer_ui::import_confirm_title()))
         .child(div().text_color(cx.theme().text_muted).child(path.display().to_string()));
     for line in lines {
@@ -5305,7 +5346,7 @@ fn render_master_password_panel(
     remember: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let mut panel: Div = ui::panel(360., *cx.theme())
+    let mut panel: Div = ui::panel_body()
         .child(div().text_size(px(16.)).child(tr!("Odemknout trezor", "Unlock vault")))
         .child(
             div()
@@ -5360,7 +5401,7 @@ fn render_create_master_password_panel(
     error: Option<String>,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let mut panel: Div = ui::panel(360., *cx.theme())
+    let mut panel: Div = ui::panel_body()
         .child(div().text_size(px(16.)).child(tr!("Vytvořit master heslo", "Create master password")))
         .child(
             div()
@@ -5417,8 +5458,7 @@ fn render_query_params_panel(
         .collect();
     let preview = crate::build_param_sql(&sql_template, &names, &values);
 
-    let mut panel: Div = ui::panel(480., *cx.theme())
-        .max_h(px(520.))
+    let mut panel: Div = ui::panel_body()
         .child(div().text_size(px(16.)).child(tr!("Hodnoty parametrů", "Parameter values")));
 
     for (i, name) in names.iter().enumerate() {
@@ -5573,7 +5613,7 @@ fn render_kill_confirm_panel(
     dispatched: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let mut panel: Div = ui::panel(520., *cx.theme())
+    let mut panel: Div = ui::panel_body()
         .child(div().text_size(px(16.)).child(tr!("Ukončit proces", "Kill process")))
         .child(trf!(
             "Opravdu ukončit proces {pid} ({label})?",
@@ -5643,7 +5683,7 @@ fn render_analyze_write_confirm_panel(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let sql = sql.to_string();
-    let mut panel = ui::panel(520., *cx.theme())
+    let mut panel = ui::panel_body()
         .id("analyze-write-confirm")
         .child(div().text_size(px(16.)).child(tr!("Analyzovat (EXPLAIN ANALYZE)", "Analyze (EXPLAIN ANALYZE)")))
         .child(div().text_color(cx.theme().warn).child(tr!(
@@ -5724,7 +5764,7 @@ fn render_multi_target_write_confirm_panel(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let theme = *cx.theme();
-    let mut panel = ui::panel(520., theme)
+    let mut panel = ui::panel_body()
         .id("multi-target-write-confirm")
         .child(div().text_size(px(16.)).child(trf!("Zapsat do {} cílů", "Write to {} targets", targets.len())))
         .child(div().text_color(theme.warn).child(tr!(
@@ -5927,7 +5967,7 @@ fn render_workspace_missing_panel(
     // otherwise consume the keystroke before any listener ran. `space`
     // has no binding anywhere, so it still arrives as a plain key event.
     let button = workspace_choice_button;
-    let mut panel = ui::panel(460., *cx.theme())
+    let mut panel = ui::panel_body()
         .id("workspace-missing-panel")
         // T4 review NIT-11: the panel is a TAB GROUP tracking its own
         // handle, and `AppView::render` focuses that handle when the modal
@@ -6027,7 +6067,7 @@ fn render_workspace_recovery_confirm_panel(
     // one unwrapped flex column with no text wrapping, and a picked path
     // can carry anything the filesystem allows.
     let path_line = dbc_state::workspace::one_line_reason(&picked.display().to_string());
-    let mut panel = ui::panel(460., *cx.theme())
+    let mut panel = ui::panel_body()
         .id("workspace-recovery-confirm-panel")
         .track_focus(panel_focus)
         .tab_group()
@@ -6558,7 +6598,7 @@ fn render_workspace_confirm_panel(
     running: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let mut panel = ui::panel(460., *cx.theme())
+    let mut panel = ui::panel_body()
         .id("workspace-confirm-panel")
         .child(div().text_size(px(16.)).child(workspace_confirm_title(mode)));
     if let Some(r) = root {
@@ -6651,7 +6691,7 @@ fn render_compare_dialog_panel(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let both_picked = conn_a.is_some() && conn_b.is_some();
-    let mut panel = ui::panel(680., *cx.theme())
+    let mut panel = ui::panel_body()
         .id("compare-dialog")
         .child(div().text_size(px(16.)).child(tr!("Porovnat databáze…", "Compare databases…")))
         .child(
@@ -6836,7 +6876,7 @@ fn render_backup_restore_panel(session: &crate::backup::BackupSession, cx: &mut 
     };
     let status = session.status.borrow().clone();
 
-    let mut panel = ui::panel(560., *cx.theme())
+    let mut panel = ui::panel_body()
         .id("backup-restore-panel")
         .child(div().text_size(px(16.)).child(title))
         .child(format!(
@@ -7087,7 +7127,7 @@ fn render_script_name_panel(
         _ if parent_rel.is_empty() => tr!("v kořeni knihovny", "in the library root").to_string(),
         _ => trf!("ve složce: {parent_rel}", "in folder: {parent_rel}"),
     };
-    let mut panel = ui::panel(420., theme)
+    let mut panel = ui::panel_body()
         .id("script-name-panel")
         .child(div().text_size(px(16.)).child(script_name_title(mode)))
         .child(div().text_color(theme.text_muted).child(context_line));
@@ -7174,7 +7214,7 @@ fn render_script_delete_panel(
 ) -> AnyElement {
     let theme = *cx.theme();
     let name = rel.rsplit('/').next().unwrap_or(rel);
-    let mut panel = ui::panel(420., theme)
+    let mut panel = ui::panel_body()
         .id("script-delete-panel")
         .child(div().text_size(px(16.)).child(script_delete_text(name, is_dir)));
     if dirty_bound {
@@ -7293,7 +7333,7 @@ fn render_script_run_confirm_panel(
         None => tr!("bez timeoutu", "no timeout").to_string(),
     };
 
-    let panel = ui::panel(560., *cx.theme())
+    let panel = ui::panel_body()
         .id("script-run-confirm")
         .child(div().text_size(px(16.)).child(trf!("Spustit skript: {source_label}", "Run script: {source_label}")))
         .child(conn_line)
@@ -7406,7 +7446,7 @@ fn render_csv_import_panel(
         );
     }
 
-    let mut panel = ui::panel(600., *cx.theme())
+    let mut panel = ui::panel_body()
         .id("csv-import-modal")
         .child(div().text_size(px(16.)).child(trf!("Import CSV do {table}", "Import CSV into {table}")))
         .child(div().text_color(cx.theme().text_muted).child(trf!("připojení: {conn_label}", "connection: {conn_label}")))
@@ -7492,9 +7532,8 @@ fn render_chart_picker_panel(
             .on_click(cx.listener(move |v, _, _, cx| v.set_chart_kind(this_kind, cx)))
     };
 
-    let mut panel = ui::panel(460., theme)
+    let mut panel = ui::panel_body()
         .id("chart-picker-panel")
-        .max_h(px(560.))
         .child(div().text_size(px(16.)).child(trf!("Graf: {source_title}", "Chart: {source_title}")))
         .child(
             div()
@@ -8748,5 +8787,75 @@ mod update_bar_tests {
     fn downloaded_is_the_button_even_if_a_progress_is_left() {
         let d = ("0.40.0".to_string(), 100);
         assert_eq!(update_bar(Some("0.40.0"), Some(&d)), (None, Some("Aktualizovat na v0.40.0".into())));
+    }
+}
+
+#[cfg(test)]
+mod modal_spec_tests {
+    use super::*;
+
+    /// Every `"id"` literal the `modal_spec` match returns, in source order.
+    fn ids_in_source() -> Vec<String> {
+        let src = include_str!("connections_ui.rs");
+        let start = src.find("pub(crate) fn modal_spec(").expect("modal_spec exists");
+        let body = &src[start..];
+        let end = body.find("\n}\n").expect("modal_spec is closed");
+        let body = &body[..end];
+        assert!(!body.contains("_ =>"), "modal_spec must stay exhaustive: a new variant needs an id");
+        body.lines()
+            .filter(|l| l.contains("=>"))
+            .filter_map(|l| {
+                let after = l.split("=> (\"").nth(1)?;
+                Some(after.split('"').next()?.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn modal_ids_are_unique_and_kebab_case() {
+        let mut ids = ids_in_source();
+        // One arm per variant: the 23 ids of the plan, each declared once.
+        assert_eq!(ids.len(), 23, "one id per ModalState variant: {ids:?}");
+        for id in &ids {
+            let mut chars = id.chars();
+            assert!(chars.next().is_some_and(|c| c.is_ascii_lowercase()), "{id}");
+            assert!(id.chars().all(|c| c.is_ascii_lowercase() || c == '-'), "{id}");
+        }
+        ids.sort();
+        let n = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "duplicate dialog id");
+    }
+
+    #[test]
+    fn plain_variants_get_their_old_widths() {
+        let spec = |m: ModalState| modal_spec(&m);
+        assert_eq!(spec(ModalState::Settings), ("settings", 360.0));
+        assert_eq!(
+            spec(ModalState::FolderDeleteConfirm { path: vec![], moving: 0 }),
+            ("folder-delete", 460.0)
+        );
+        assert_eq!(
+            spec(ModalState::ConnectionDeleteConfirm {
+                conn_id: String::new(),
+                name: String::new(),
+                secret_stays: false
+            }),
+            ("connection-delete", 460.0)
+        );
+        assert_eq!(
+            spec(ModalState::AnalyzeWriteConfirm {
+                sql: String::new(),
+                engine: Engine::Postgres,
+                running: false,
+                error: None
+            }),
+            ("analyze-write-confirm", 520.0)
+        );
+    }
+
+    #[test]
+    fn only_the_two_capped_dialogs_have_a_height_cap() {
+        assert_eq!(modal_max_h(&ModalState::Settings), None);
     }
 }
