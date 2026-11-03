@@ -4719,7 +4719,9 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
         _ => None,
     };
 
-    let mut panel: Div = ui::panel(480., *cx.theme())
+    // 560, not 480: the four postgres SSL modes did not fit on one line
+    // beside the label column (user screenshot, 2026-11-03).
+    let mut panel: Div = ui::panel(560., *cx.theme())
         .child(div().text_size(px(16.)).child(title))
         .child(ui::field_row(tr!("Název", "Name"), ui.name.clone(), *cx.theme()))
         .child(
@@ -4727,7 +4729,7 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
                 // Segmented row, not a dropdown: with four options a popup
                 // costs an extra click and an overlay to dismiss, and hides
                 // the very thing the user complained was hidden.
-                .child(ALL_ENGINES.iter().fold(div().flex().gap_1(), |row, &e| {
+                .child(ALL_ENGINES.iter().fold(ui::segmented_row(), |row, &e| {
                     let selected = ui.engine == e;
                     row.child(
                         ui::segmented_option(
@@ -4813,7 +4815,7 @@ fn render_connection_dialog_panel(ui: ConnectionDialogUi, cx: &mut Context<AppVi
         panel = panel
             .child(
                 ui::labelled_row("SSL", ui::FIELD_LABEL_W, *cx.theme()).child(
-                    PgSslMode::ALL.iter().fold(div().flex().gap_1(), |row, &m| {
+                    PgSslMode::ALL.iter().fold(ui::segmented_row(), |row, &m| {
                         row.child(
                             ui::segmented_option(
                                 SharedString::from(format!("pg-ssl-{}", m.as_libpq())),

@@ -221,6 +221,19 @@ pub(crate) fn segmented_option(
         .child(label.into())
 }
 
+/// The container for a row of [`segmented_option`]s beside a label: the
+/// same wrap-instead-of-spill rule as [`checkbox_row`], for the same reason.
+/// The four postgres SSL modes did not fit beside [`FIELD_LABEL_W`] in the
+/// then 480 px connection dialog and „verify-full" was painted past its edge
+/// (user screenshot, 2026-11-03). The real fix was a wider dialog — the user
+/// wants the options on one line — so this is the fallback for a label
+/// lengthened later, not the intended look. `flex_1` + `min_w_0` give the
+/// row the width left after the label, which is what `flex_wrap` wraps
+/// against.
+pub(crate) fn segmented_row() -> Div {
+    div().flex().flex_row().flex_wrap().flex_1().min_w_0().gap_1()
+}
+
 /// A row of checkboxes that WRAPS instead of running off the panel.
 ///
 /// It exists because the obvious hand-written version does not work and
