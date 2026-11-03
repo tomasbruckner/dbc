@@ -31,6 +31,14 @@ pub(crate) const MODAL_MARGIN: f32 = 32.0;
 /// A dialog never gets shorter than this.
 pub(crate) const MODAL_MIN_H: f32 = 120.0;
 
+/// The floor for a STORED height below [`MODAL_MIN_H`]. Such a height only
+/// comes from a drag that started on a dialog already shorter than 120 px
+/// (see [`Drag::shown`]), and it must survive the release and a reopen —
+/// otherwise the dialog snaps back to 120 the moment the button goes up.
+/// This floor is only there so a hand-edited `h = 1` cannot shrink a
+/// dialog to a line.
+const MODAL_STORED_MIN_H: f32 = 40.0;
+
 /// Which handle is being dragged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Edge {
@@ -44,21 +52,19 @@ pub(crate) enum Edge {
 /// Width is the stored one (else `default_w`), kept within
 /// `[min(default_w, max_w), max_w]` where `max_w` leaves `MODAL_MARGIN` free
 /// on both sides of the window. Height is the stored one within
-/// `[MODAL_MIN_H, window height - 2 * MODAL_MARGIN]`, `None` when never
-/// stored. `f32::max`/`min` drop a NaN operand and the bounds are never NaN,
-/// so `clamp` cannot panic (same reasoning as `clamp_editor_height`).
+/// `[MODAL_MIN_H, window height - 2 * MODAL_MARGIN]` — or, for a height
+/// stored below `MODAL_MIN_H` (a short dialog the user resized), that height
+/// itself down to `MODAL_STORED_MIN_H` — and `None` when never stored.
+/// `f32::max`/`min` drop a NaN operand and the bounds are never NaN, so
+/// `clamp` cannot panic (same reasoning as `clamp_editor_height`).
 pub(crate) fn effective_size(
     stored: Option<ModalSize>,
     default_w: f32,
     window: Size<Pixels>,
 ) -> (f32, Option<f32>) {
-    fit(
-        stored.map_or(default_w, |s| f32::from(s.w)),
-        stored.and_then(|s| s.h).map(f32::from),
-        default_w,
-        window,
-        MODAL_MIN_H,
-    )
+    let h = stored.and_then(|s| s.h).map(f32::from);
+    let min_h = h.map_or(MODAL_MIN_H, |h| h.clamp(MODAL_STORED_MIN_H, MODAL_MIN_H));
+    fit(stored.map_or(default_w, |s| f32::from(s.w)), h, default_w, window, min_h)
 }
 
 /// The clamp behind [`effective_size`], for any size — a stored one or the
@@ -548,8 +554,16 @@ mod geometry_tests {
     fn height_has_a_floor() {
         assert_eq!(
             effective_size(ms(640, Some(10)), 560., win(1200., 800.)).1,
-            Some(120.)
+            Some(40.)
         );
+    }
+
+    /// A short dialog the user resized keeps that height after the release
+    /// and on reopen (Codex review 2026-11-03: it used to snap to 120).
+    #[test]
+    fn a_stored_short_height_is_kept() {
+        assert_eq!(effective_size(ms(640, Some(84)), 560., win(1200., 800.)).1, Some(84.));
+        assert_eq!(effective_size(ms(640, Some(300)), 560., win(1200., 800.)).1, Some(300.));
     }
 
     #[test]
@@ -910,6 +924,9 @@ mod frame_tests {
         cx.run_until_parked();
         assert_eq!(stored(&mut cx), Some(ModalSize { w: 400, h: Some(84) }));
         assert_eq!(writes.get(), 1);
+        // And it STAYS 84 once the drag is over — no snap to 120 on release.
+        cx.run_until_parked();
+        assert_eq!(f32::from(body.get().unwrap().origin.y), 375., "no jump on release");
     }
 
     /// Shrinking a short dialog stops at its own height, so the drag shows
