@@ -6,6 +6,21 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-11-04
+
+Dialogs can be resized, and each one remembers its size.
+
+### Added
+
+- every dialog can be resized by dragging its right edge, bottom edge or bottom-right corner; each dialog remembers its own size, also after a restart, and always fits the window
+- the cell detail, cell editor, plan node detail, monitor detail and admin dialogs dim the whole window like the other dialogs, and the About and shortcut overlays get the dimmed background too
+
+### Fixed
+
+- the connection dialog is wider, so all four postgres SSL modes fit
+- while the cell, plan or monitor detail is open, typing no longer reaches the editor underneath
+- Esc closes the monitor and plan detail
+
 ## [0.41.0] - 2026-11-03
 
 A saved connection can be duplicated from the sidebar.
