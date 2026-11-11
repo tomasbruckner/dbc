@@ -6,6 +6,14 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-11-11
+
+The command line can run statements without a time limit.
+
+### Added
+
+- `dbc query --timeout 0` runs each statement without a time limit (like `--limit 0` for rows), so long migrations and backfills no longer need a guessed upper bound; the default stays 60 s
+
 ## [0.42.0] - 2026-11-04
 
 Dialogs can be resized, and each one remembers its size.
