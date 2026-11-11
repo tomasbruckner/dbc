@@ -106,7 +106,7 @@ pub struct Args {
 /// than silently truncating.
 pub const DEFAULT_ROW_LIMIT: usize = 1000;
 
-/// The default per-statement timeout.
+/// The default per-statement timeout. `--timeout 0` lifts it entirely.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
 pub const USAGE: &str = "\
@@ -141,7 +141,7 @@ VOLBY
     --write                  povolí i zapisující příkazy (viz níže)
     --format table|json|csv  podoba výstupu (výchozí table)
     --limit <n>              strop řádků (výchozí 1000, 0 = bez stropu)
-    --timeout <s>            časový limit na příkaz (výchozí 60)
+    --timeout <s>            časový limit na příkaz (výchozí 60, 0 = bez limitu)
     --force                  u `import`: přepiš i existující nastavení
     --keep-starred           u `history clear`: ponech položky s ★
     --config <cesta>         jiný config.toml
@@ -352,9 +352,6 @@ pub fn parse(argv: Vec<String>) -> Result<Args, ParseError> {
                 timeout_secs = raw
                     .parse()
                     .map_err(|_| err(format!("--timeout chce nezáporné číslo, ne {raw}")))?;
-                if timeout_secs == 0 {
-                    return Err(err("--timeout 0 by znamenalo okamžité vypršení"));
-                }
             }
             "-h" | "--help" => return Ok(simple(Command::Help)),
             "-V" | "--version" => return Ok(simple(Command::Version)),
@@ -635,11 +632,14 @@ mod tests {
     }
 
     #[test]
-    fn numeric_flags_reject_junk_and_a_zero_timeout() {
+    fn numeric_flags_reject_junk_and_zero_means_no_cap() {
         assert!(p(&["connections", "--limit", "x"]).unwrap_err().message.contains("--limit"));
         assert!(p(&["connections", "--timeout", "x"]).unwrap_err().message.contains("--timeout"));
-        assert!(p(&["connections", "--timeout", "0"]).unwrap_err().message.contains("vypršení"));
         assert_eq!(p(&["connections", "--limit", "0"]).unwrap().row_limit, 0);
+        // Like `--limit 0`: a long migration or backfill must be runnable
+        // without guessing an upper bound.
+        assert_eq!(p(&["connections", "--timeout", "0"]).unwrap().timeout_secs, 0);
+        assert_eq!(p(&["connections", "--timeout", "3600"]).unwrap().timeout_secs, 3600);
     }
 
     #[test]

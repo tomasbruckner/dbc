@@ -512,7 +512,13 @@ async fn run_one_target(
         history: Vec::new(),
         elapsed_ms: 0,
     };
-    let timeout = std::time::Duration::from_secs(limits.timeout_secs);
+    // `--timeout 0` = no limit, like `--limit 0`. `tokio::time::timeout`
+    // arms no timer at all when `now + duration` overflows, so `MAX` never
+    // fires.
+    let timeout = match limits.timeout_secs {
+        0 => std::time::Duration::MAX,
+        s => std::time::Duration::from_secs(s),
+    };
     for (i, stmt) in plan.iter().enumerate() {
         let started_at = hist::Recorder::now_secs();
         let clock = std::time::Instant::now();
