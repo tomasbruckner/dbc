@@ -6,6 +6,14 @@ entries are the `feat:`/`fix:` commit titles that landed in each version, so
 
 ## [Unreleased]
 
+## [0.44.0] - 2026-11-13
+
+Ctrl+C copies the name of whatever is selected.
+
+### Added
+
+- Ctrl+C copies the selected item's name in the sidebar tree (connection, database, schema, table, column, script…), in Server administration (role, schema) and in the ER diagram (table)
+
 ## [0.43.0] - 2026-11-11
 
 The command line can run statements without a time limit.
