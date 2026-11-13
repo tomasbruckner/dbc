@@ -167,6 +167,35 @@ pub fn menu_for(row: &SidebarRow, ctx: &MenuCtx) -> Vec<MenuEntry> {
     }
 }
 
+/// What Ctrl+C on a selected row copies: the object's own name, the same
+/// text „Kopírovat jméno" copies, without schema or quoting. `None` for rows
+/// that name nothing (notices, section headers, the CLI root), where Ctrl+C
+/// then does nothing rather than copying a label like „Tabulky".
+///
+/// Folders and scripts copy their LAST segment — the name shown on the row;
+/// the full path stays the context menu's „Kopírovat cestu".
+pub fn copy_name_for(row: &SidebarRow) -> Option<String> {
+    let last = |rel: &str| rel.rsplit('/').next().unwrap_or(rel).to_string();
+    match row {
+        SidebarRow::Folder { path } => path.last().cloned(),
+        SidebarRow::Connection { conn_id } if conn_id == crate::CLI_CONN_IDENTITY => None,
+        SidebarRow::Connection { conn_id } => Some(conn_id.clone()),
+        SidebarRow::Database { db, .. } => Some(db.clone()),
+        SidebarRow::Inner { node, .. } | SidebarRow::Pinned(node) => match node {
+            NodeId::Schema(s) => (!s.is_empty()).then(|| s.clone()),
+            NodeId::Table(_, n)
+            | NodeId::Routine(_, n)
+            | NodeId::Trigger(_, n)
+            | NodeId::Sequence(_, n)
+            | NodeId::Favourite(_, _, n) => Some(n.clone()),
+            NodeId::Column(_, _, c) | NodeId::Index(_, _, c) => Some(c.clone()),
+            NodeId::Section(..) | NodeId::FavouriteSection | NodeId::AdminRoot => None,
+        },
+        SidebarRow::ScriptFolder { rel } | SidebarRow::ScriptFile { rel } => Some(last(rel)),
+        SidebarRow::ScriptsRoot | SidebarRow::Notice { .. } | SidebarRow::ScriptNotice { .. } => None,
+    }
+}
+
 /// A folder holds saved connections, which live in `config.toml` — nothing
 /// here touches a database, so nothing here is gated on `read_only`, which
 /// is about the SERVER.
@@ -1048,6 +1077,31 @@ mod tests {
                 &ctx(&s, read_only),
             ));
             assert!(!db.iter().any(|l| l.starts_with("Smazat")), "ro={read_only}: {db:?}");
+        }
+    }
+
+    #[test]
+    fn ctrl_c_copies_the_bare_name_of_named_rows_only() {
+        let inner = |node| SidebarRow::Inner { conn_id: "c".into(), db: "d".into(), node };
+        let cases = [
+            (SidebarRow::Connection { conn_id: "prod".into() }, Some("prod")),
+            (SidebarRow::Database { conn_id: "c".into(), db: "sales".into() }, Some("sales")),
+            (SidebarRow::Folder { path: vec!["a".into(), "b".into()] }, Some("b")),
+            (inner(NodeId::Schema("dbo".into())), Some("dbo")),
+            (inner(NodeId::Table("dbo".into(), "orders".into())), Some("orders")),
+            (inner(NodeId::Column("dbo".into(), "orders".into(), "id".into())), Some("id")),
+            (inner(NodeId::Index("dbo".into(), "orders".into(), "ix_a".into())), Some("ix_a")),
+            (SidebarRow::Pinned(NodeId::Favourite("table".into(), "".into(), "t".into())), Some("t")),
+            (SidebarRow::ScriptFile { rel: "x/y/q.sql".into() }, Some("q.sql")),
+            (SidebarRow::ScriptFolder { rel: "x".into() }, Some("x")),
+            (inner(NodeId::Section("dbo".into(), "Tabulky")), None),
+            (SidebarRow::Pinned(NodeId::AdminRoot), None),
+            (SidebarRow::ScriptsRoot, None),
+            (SidebarRow::Connection { conn_id: crate::CLI_CONN_IDENTITY.into() }, None),
+            (SidebarRow::Notice { conn_id: "c".into(), db: None, text: "x".into(), retry: false }, None),
+        ];
+        for (row, want) in cases {
+            assert_eq!(copy_name_for(&row).as_deref(), want, "{row:?}");
         }
     }
 }

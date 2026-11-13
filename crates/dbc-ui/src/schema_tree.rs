@@ -2030,7 +2030,7 @@ fn emit_schema_slot(
 // GPUI entity.
 // ---------------------------------------------------------------------
 
-actions!(schema_tree, [TreeEscape]);
+actions!(schema_tree, [TreeEscape, CopyName]);
 
 /// Binds the tree's own "escape clears the filter, then blurs to the
 /// editor" action, scoped to context "SchemaTree" so it takes priority over
@@ -2045,8 +2045,25 @@ actions!(schema_tree, [TreeEscape]);
 /// unscoped `CancelQuery` binding directly and cancels a running query as
 /// normal.
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("escape", TreeEscape, Some("SchemaTree"))]);
+    cx.bind_keys([
+        KeyBinding::new("escape", TreeEscape, Some("SchemaTree")),
+    ]);
+    // „Ctrl+C copies the selected item's name" — one action shared by every
+    // view whose selection is a named object. Scoped per context, so each
+    // wins over `SqlInput`'s unscoped `ctrl-c` only while that view holds
+    // focus (same precedence argument as `escape` above); a `TextField`
+    // inside one of them is deeper in the focus path and keeps its own copy.
+    for ctx in COPY_NAME_CONTEXTS {
+        cx.bind_keys([
+            KeyBinding::new("ctrl-c", CopyName, Some(ctx)),
+            KeyBinding::new("cmd-c", CopyName, Some(ctx)),
+        ]);
+    }
 }
+
+/// Key contexts that bind Ctrl+C to [`CopyName`]: the sidebar tree, the
+/// server-administration panel and the ER diagram.
+pub const COPY_NAME_CONTEXTS: [&str; 3] = ["SchemaTree", "AdminPanel", "ErDiagram"];
 
 pub struct SchemaTree {
     /// Overlay scrollbar for the list below — `scrollbar.rs`.
@@ -3083,6 +3100,16 @@ impl SchemaTree {
         }
     }
 
+    /// Ctrl+C: copies the selected row's name through the same `CopyText`
+    /// event the context menu's „Kopírovat jméno" emits, so the clipboard
+    /// write and the status line live in one place (`main.rs`).
+    fn on_copy_name(&mut self, _: &CopyName, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.selected.as_ref().and_then(crate::tree_menu::copy_name_for) else {
+            return;
+        };
+        cx.emit(TreeEvent::CopyText { what: dbc_i18n::tr!("jméno", "name").into(), text });
+    }
+
     /// Speed search (contract #5/#7): printable characters append to
     /// `filter`, Backspace removes the last one. Bound as a raw
     /// `on_key_down` listener (not an action) precisely so it only reacts
@@ -3572,6 +3599,7 @@ impl Render for SchemaTree {
             .size_full()
             .bg(cx.theme().bg_panel)
             .on_action(cx.listener(Self::on_tree_escape))
+            .on_action(cx.listener(Self::on_copy_name))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(
                 MouseButton::Left,

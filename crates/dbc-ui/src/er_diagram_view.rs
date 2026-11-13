@@ -19,7 +19,7 @@
 //! was needed.
 
 use gpui::{
-    canvas, div, point, prelude::*, px, size, App, Bounds, Context, EventEmitter, Hsla,
+    canvas, div, point, prelude::*, px, size, App, Bounds, Context, EventEmitter, FocusHandle, Hsla,
     PathBuilder, Pixels, Point, ScrollDelta, TextRun, Window,
 };
 
@@ -84,10 +84,18 @@ pub struct ErDiagramView {
     /// "export zrušen" / "error: …"), same "status_note, shown once" idiom
     /// `ResultGrid` already establishes (`main.rs::render_tab_content`).
     pub(crate) status_note: Option<String>,
+    /// Taken by a click on a node, so the canvas's `ErDiagram` key context
+    /// (Ctrl+C → copy the selected table's name) is live.
+    focus_handle: FocusHandle,
 }
 
 impl ErDiagramView {
-    pub fn new(layout: DiagramLayout, tables: Vec<TableInfo>, schema_label: String) -> Self {
+    pub fn new(
+        layout: DiagramLayout,
+        tables: Vec<TableInfo>,
+        schema_label: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             layout,
             tables,
@@ -100,6 +108,16 @@ impl ErDiagramView {
             drag_state: None,
             truncated_notice: None,
             status_note: None,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn on_copy_name(&mut self, _: &crate::schema_tree::CopyName, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(key) = &self.selected {
+            cx.emit(TreeEvent::CopyText {
+                what: dbc_i18n::tr!("jméno", "name").into(),
+                text: key.name.clone(),
+            });
         }
     }
 
@@ -175,11 +193,15 @@ impl Render for ErDiagramView {
 
         let mut canvas_area = div()
             .id("er-diagram-root")
+            .key_context("ErDiagram")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::on_copy_name))
             .flex_1()
             .bg(cx.theme().bg_panel)
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|this, e: &gpui::MouseDownEvent, _window, cx| {
+                cx.listener(|this, e: &gpui::MouseDownEvent, window, cx| {
+                    window.focus(&this.focus_handle, cx);
                     if let Some(key) = hit_test(&this.hit_boxes, e.position) {
                         this.selected = Some(key.clone());
                         this.drag_state = None;

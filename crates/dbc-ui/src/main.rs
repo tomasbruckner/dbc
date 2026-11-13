@@ -12680,6 +12680,15 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         cx.notify();
     }
 
+    /// Clipboard write + „{what} zkopírováno" status — the one place every
+    /// „copy a name" path (tree menu, Ctrl+C in the tree, admin panel, ER
+    /// diagram) ends up in.
+    fn copy_text_with_status(&mut self, what: &str, text: &str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+        self.editor_mut().status = trf!("{what} zkopírováno", "{what} copied");
+        cx.notify();
+    }
+
     /// `AdminPanel` → `AppView` (the panel doesn't own the runner or the
     /// confirm dialog — same "view emits, AppView owns the I/O" shape
     /// `CompareView`/`MonitorView` already use).
@@ -12696,6 +12705,11 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             admin_panel::AdminEvent::RequestApply { statements, warning } => {
                 self.open_admin_apply_dialog(panel, statements.clone(), warning.clone(), cx);
             }
+            admin_panel::AdminEvent::CopyText { text } => self.copy_text_with_status(
+                tr!("jméno", "name"),
+                text,
+                cx,
+            ),
         }
     }
 
@@ -13179,8 +13193,8 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         let label = schema.clone().unwrap_or_else(|| tr!("(bez schématu)", "(no schema)").to_string());
         let graph = dbc_core::erd::build_graph(&scoped);
         let layout = dbc_core::erd::layout::compute_layout(&graph);
-        let view = cx.new(|_cx| {
-            let mut v = er_diagram_view::ErDiagramView::new(layout, scoped, label.clone());
+        let view = cx.new(|cx| {
+            let mut v = er_diagram_view::ErDiagramView::new(layout, scoped, label.clone(), cx);
             v.truncated_notice = truncated_notice;
             v
         });
@@ -13208,6 +13222,10 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
         event: &TreeEvent,
         cx: &mut Context<Self>,
     ) {
+        if let TreeEvent::CopyText { what, text } = event {
+            self.copy_text_with_status(what, text, cx);
+            return;
+        }
         if let TreeEvent::OpenDdl { title, ddl } = event {
             let identity = self.current_conn_identity();
             self.editor_mut().results.open(ResultTab {
@@ -13925,11 +13943,7 @@ fn autocomplete_popup_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
             }
 
             // --- Context menu (2026-08-29) ---
-            TreeEvent::CopyText { what, text } => {
-                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                self.editor_mut().status = trf!("{what} zkopírováno", "{what} copied");
-                cx.notify();
-            }
+            TreeEvent::CopyText { what, text } => self.copy_text_with_status(what, text, cx),
             TreeEvent::InsertAtCursor { text } => {
                 let text = text.clone();
                 self.editor().sql.update(cx, |input, cx| input.insert_text(&text, cx));

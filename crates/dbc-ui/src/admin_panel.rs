@@ -822,6 +822,9 @@ pub enum AdminEvent {
     /// and dispatches through `run_write_transaction` on confirm. `warning`
     /// is T6's red CASCADE line; always `None` from this sub-view.
     RequestApply { statements: Vec<WriteStatement>, warning: Option<String> },
+    /// Ctrl+C on a selected role/schema — main.rs writes the clipboard and
+    /// the status line, the same handling as the tree's „Kopírovat jméno".
+    CopyText { text: String },
 }
 
 pub struct AdminPanel {
@@ -860,6 +863,9 @@ pub struct AdminPanel {
     /// stays empty/unbuilt until both are set, see `apply_catalog`).
     selected_schema: Option<String>,
     selected_grantee: Option<String>,
+    /// Which Privileges chip row was clicked last, so Ctrl+C copies that
+    /// one: `true` = the grantee, `false` = the schema.
+    priv_pick_grantee: bool,
     /// T5: pg only — parsed out of the `db_acl` batch's `database` column
     /// (design §1: that query is scoped to `current_database()`, so every
     /// row it returns carries the SAME name) since `MatrixState`'s own
@@ -893,7 +899,8 @@ pub struct AdminPanel {
     /// změny?" prompt instead of proceeding silently (design §2).
     discard_confirm: Option<PendingAdminAction>,
 
-    #[allow(dead_code)] // reserved for future keyboard/escape handling, same posture as SchemaTree's.
+    /// Taken by a click on a selectable row, so the panel's `AdminPanel`
+    /// key context (Ctrl+C → copy the selected name) is live.
     focus_handle: FocusHandle,
     /// UX-polish: focus target for the no-input DropSchema modal —
     /// panel-local twin of AppView's modal_focus_handle (§1.4).
@@ -918,6 +925,7 @@ impl AdminPanel {
             schemas: Vec::new(),
             selected_schema: None,
             selected_grantee: None,
+            priv_pick_grantee: false,
             current_database: None,
             matrix: MatrixState::default(),
             db_sizes: Vec::new(),
@@ -1184,6 +1192,22 @@ impl AdminPanel {
     fn discard_confirm_no(&mut self, cx: &mut Context<Self>) {
         self.discard_confirm = None;
         cx.notify();
+    }
+
+    /// What Ctrl+C copies: the selection of the CURRENT sub-view only, so a
+    /// role picked on „Role" is never copied while „Databáze" is on screen.
+    fn copy_target(&self) -> Option<String> {
+        copy_target(
+            self.sub_view,
+            [&self.selected_role, &self.selected_schema, &self.selected_grantee, &self.selected_size_schema],
+            self.priv_pick_grantee,
+        )
+    }
+
+    fn on_copy_name(&mut self, _: &crate::schema_tree::CopyName, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.copy_target() {
+            cx.emit(AdminEvent::CopyText { text });
+        }
     }
 
     fn select_role(&mut self, name: String, cx: &mut Context<Self>) {
@@ -1540,7 +1564,8 @@ impl AdminPanel {
                     .hover(|s| s.bg(theme.bg_hover))
                     .text_color(theme.text_primary)
                     .child(r.name.clone())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        window.focus(&this.focus_handle, cx);
                         this.select_role(name_for_click.clone(), cx);
                     })),
             );
@@ -1679,7 +1704,9 @@ impl AdminPanel {
                     .hover(|s| s.bg(theme.bg_hover))
                     .text_color(theme.text_primary)
                     .child(s.clone())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        window.focus(&this.focus_handle, cx);
+                        this.priv_pick_grantee = false;
                         this.request_select_schema(s_for_click.clone(), cx);
                     })),
             );
@@ -1701,7 +1728,9 @@ impl AdminPanel {
                     .hover(|s| s.bg(theme.bg_hover))
                     .text_color(theme.text_primary)
                     .child(r.name.clone())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        window.focus(&this.focus_handle, cx);
+                        this.priv_pick_grantee = true;
                         this.request_select_grantee(r_for_click.clone(), cx);
                     })),
             );
@@ -1904,7 +1933,8 @@ impl AdminPanel {
                 .gap_2()
                 .when(is_sel, |d| d.bg(theme.bg_selected))
                 .hover(|s| s.bg(theme.bg_hover))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    window.focus(&this.focus_handle, cx);
                     this.select_size_schema(name_for_click.clone(), cx);
                 }));
             row = row.child(div().w(px(180.)).overflow_hidden().text_color(theme.text_primary).child(name.clone()));
@@ -2323,6 +2353,21 @@ impl AdminPanel {
     }
 }
 
+/// [`AdminPanel::copy_target`]'s decision, GPUI-free so it is testable:
+/// `[role, priv_schema, priv_grantee, size_schema]` are the panel's four
+/// selections; only the current sub-view's ones count.
+fn copy_target(view: AdminSubView, sel: [&Option<String>; 4], pick_grantee: bool) -> Option<String> {
+    let [role, schema, grantee, size_schema] = sel;
+    match view {
+        AdminSubView::Roles => role.clone(),
+        AdminSubView::Privileges => {
+            let (first, second) = if pick_grantee { (grantee, schema) } else { (schema, grantee) };
+            first.clone().or_else(|| second.clone())
+        }
+        AdminSubView::Databases => size_schema.clone(),
+    }
+}
+
 impl EventEmitter<AdminEvent> for AdminPanel {}
 
 impl Focusable for AdminPanel {
@@ -2336,7 +2381,9 @@ impl Render for AdminPanel {
         let theme = *cx.theme();
         let mut root = div()
             .id("admin-panel")
+            .key_context("AdminPanel")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::on_copy_name))
             .flex()
             .flex_col()
             .size_full()
@@ -2376,6 +2423,22 @@ impl Render for AdminPanel {
 mod tests {
     use super::*;
     use dbc_state::Engine;
+
+    #[test]
+    fn ctrl_c_copies_only_the_current_sub_views_selection() {
+        let s = |v: &str| Some(v.to_string());
+        let (role, schema, grantee, size) = (s("app_rw"), s("sales"), s("bob"), s("archive"));
+        let sel = [&role, &schema, &grantee, &size];
+        assert_eq!(copy_target(AdminSubView::Roles, sel, false), s("app_rw"));
+        assert_eq!(copy_target(AdminSubView::Databases, sel, false), s("archive"));
+        assert_eq!(copy_target(AdminSubView::Privileges, sel, false), s("sales"));
+        assert_eq!(copy_target(AdminSubView::Privileges, sel, true), s("bob"));
+        // The last-clicked row is empty → fall back to the other one.
+        let none = None;
+        assert_eq!(copy_target(AdminSubView::Privileges, [&none, &schema, &none, &none], true), s("sales"));
+        // A role picked on another sub-view is not copied here.
+        assert_eq!(copy_target(AdminSubView::Databases, [&role, &none, &none, &none], false), None);
+    }
 
     // CURATION item 6's REQUIRED UI-level test: entry point hidden for
     // SQLite, disabled for read-only, enabled otherwise.
